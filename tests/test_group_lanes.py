@@ -7,9 +7,10 @@ patched.
 
 WHAT IS REAL AND WHAT IS OWED. This box has ONE card. Proven here on the RTX 4070: the
 fuse/split bookkeeping and every typed pin refusal; the per-device ledger rows and the MIN
-ceiling; the chooser refusing the ladder under a group; a group is ONE seat and the wire at
-this minor is untouched; the author's opt-in reaching the descriptor and its fixed-point
-scan; an executor sealed to `0,1` reading both entries and NVLS-off from its own `/proc`
+ceiling; the chooser refusing the ladder under a group; a group is ONE seat and the wire
+(`lanes[]`, `device_lane_id`, `device_pins`; proto-024) says so; the author's opt-in
+reaching the descriptor and its fixed-point scan; an executor sealed to `0,1` reading both
+entries and NVLS-off from its own `/proc`
 environment; the seal, degree and construction refusals of a group prepare; the reclaim
 proof iterating K devices; a degree-1 prepare byte-identical to a plain one. Proven on GLOO
 (torch in this interpreter, CPU process group, real follower executor processes): the
@@ -59,6 +60,7 @@ from cozy_runtime.internal.worker.session import (
     WorkerOptions,
     executor_prepare_command,
 )
+from cozy_runtime.protocol import documents as documents_
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import PACKAGE, _config, _workspace
 from test_end_to_end import NO_EXECUTOR
@@ -339,12 +341,24 @@ def _placement(placement_id: str, lane_id: str = "") -> Placement:
     )
 
 
-def test_a_group_is_one_seat_and_the_wire_is_untouched_at_this_minor() -> None:
+def _lane_rows(target: pb.ObservedWorkerState | pb.WorkerSnapshotBody) -> list[dict[str, Any]]:
+    return [
+        {
+            "lane_id": lane.lane_id,
+            "device_ordinals": list(lane.device_ordinals),
+            "available_attempt_slots": lane.available_attempt_slots,
+            "placement_ids": list(lane.placement_ids),
+        }
+        for lane in target.lanes
+    ]
+
+
+def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
     """cr-066's Σ-lanes rule holds verbatim: a 2-device envelope as two lanes advertises
     two seats; fused into one group it advertises ONE. The group's seat is taken by a held
-    attempt like any other. At this vendored minor neither `lanes[]` nor `device_lane_id`
-    exists on the wire, and the adapters touch nothing — the observed state serializes to
-    the same bytes with the group as without."""
+    attempt like any other. The wire (proto-024) carries exactly what the runtime holds:
+    `ObservedWorkerState.lanes[]` is the lane documents, the worker-level count is their
+    sum, and `PlacementStatus.device_lane_id` names the group."""
     with _workspace() as root:
         worker = Worker(
             _config(root / "home"),
@@ -354,6 +368,7 @@ def test_a_group_is_one_seat_and_the_wire_is_untouched_at_this_minor() -> None:
         try:
             worker.phase = pb.WorkerPhase.WORKER_PHASE_ONLINE
             worker.fence.dispatch_open = True
+            worker.fence.wire_minor = lane_wire.LANES_WIRE_MINOR
             worker.accepted.mode = "serving"
             primary = _placement("p0", "lane-0")
             hosted = _placement("p1", "lane-1")
@@ -364,8 +379,13 @@ def test_a_group_is_one_seat_and_the_wire_is_untouched_at_this_minor() -> None:
             worker.lanes.lanes[0].placements.add("p0")
             worker.lanes.lanes[1].placements.add("p1")
             assert worker.available_attempt_slots() == 2
-            before = worker.observed_state().SerializeToString(deterministic=True)
+            before = worker.observed_state()
             assert [row["lane_id"] for row in worker.lane_documents()] == ["lane-0", "lane-1"]
+            assert _lane_rows(before) == worker.lane_documents()
+            assert before.available_attempt_slots == sum(
+                lane.available_attempt_slots for lane in before.lanes
+            )
+            assert [s.device_lane_id for s in before.placements] == ["lane-0", "lane-1"]
             # the same envelope as ONE group: p1 leaves, p0 takes both devices
             epoch = worker.admission_epoch
             worker.hosted.pop("p1").supervision.close()
@@ -390,18 +410,16 @@ def test_a_group_is_one_seat_and_the_wire_is_untouched_at_this_minor() -> None:
             held.state = "running"
             worker.engine.history[held.key()] = held
             assert worker.available_attempt_slots() == 0, "one attempt at a time across K"
+            taken = worker.observed_state()
+            assert _lane_rows(taken) == [dict(documents[0], available_attempt_slots=0)]
+            assert taken.available_attempt_slots == 0
             del worker.engine.history[held.key()]
-            # the wire: no field at this minor, so nothing on it moved
-            after = worker.observed_state().SerializeToString(deterministic=True)
-            assert not lane_wire.lanes_on_wire(worker.fence.wire_minor)
-            assert "lanes" not in {f.name for f in pb.ObservedWorkerState.DESCRIPTOR.fields}
-            assert "device_lane_id" not in {f.name for f in pb.PlacementStatus.DESCRIPTOR.fields}
+            assert lane_wire.lanes_on_wire(worker.fence.wire_minor)
             observed = worker.observed_state()
+            assert _lane_rows(observed) == documents
             assert observed.available_attempt_slots == 1
-            assert after != before, "the seat count moved from 2 to 1"
-            status = worker.placement_status()
-            lane_wire.emit_device_lane_id(status, primary.lane_id)
-            assert status.SerializeToString() == worker.placement_status().SerializeToString()
+            (status,) = observed.placements
+            assert status.device_lane_id == "lane-0+1"
             assert worker.admission_epoch == epoch, "fusing by hand bumps nothing; assign does"
             # release SPLITS the group and bumps the admission epoch once
             worker._release_lane("p0")
@@ -459,6 +477,140 @@ def test_a_pin_through_the_worker_fuses_and_bumps_the_admission_epoch() -> None:
             assert weightless.lane_id == "lane-1" and worker.admission_epoch == epoch
         finally:
             worker.supervision.close()
+
+
+def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
+    """proto-024's runtime-side conformance vector: a two-lane serving worker's
+    `WorkerSnapshotBody` carries one `DeviceLane` per lane and a worker-level count that
+    is their sum, through the same digest-fenced canonical document the RecordOwner
+    acknowledges; a one-lane worker's body is the pre-22 body plus exactly `lanes[]`."""
+    with _workspace() as root:
+        worker = Worker(
+            _config(root / "home"),
+            WorkerOptions(root=root / "worker", devices="0,1", no_warm=True),
+            InMemoryControlHost(),
+        )
+        try:
+            worker.phase = pb.WorkerPhase.WORKER_PHASE_ONLINE
+            worker.fence.dispatch_open = True
+            worker.fence.wire_minor = lane_wire.LANES_WIRE_MINOR
+            worker.accepted.mode = "serving"
+            primary = _placement("p0", "lane-0")
+            hosted = _placement("p1", "lane-1")
+            worker.placement = primary
+            worker.hosted["p1"] = HostedPlacement(
+                placement=hosted, supervision=worker._new_placement_supervision("p1")
+            )
+            worker.lanes.lanes[0].placements.add("p0")
+            worker.lanes.lanes[1].placements.add("p1")
+            body = worker.snapshot_body()
+            assert _lane_rows(body) == [
+                {
+                    "lane_id": "lane-0",
+                    "device_ordinals": [0],
+                    "available_attempt_slots": 1,
+                    "placement_ids": ["p0"],
+                },
+                {
+                    "lane_id": "lane-1",
+                    "device_ordinals": [1],
+                    "available_attempt_slots": 1,
+                    "placement_ids": ["p1"],
+                },
+            ]
+            assert body.available_attempt_slots == 2
+            canonical_bytes, digest = documents_.identity(body)
+            document = documents_.read(canonical_bytes, pb.WorkerSnapshotBody)
+            assert document["format"] == "cozy.worker.v1.WorkerSnapshotBody/1"
+            assert document["lanes"] == [
+                {
+                    "available_attempt_slots": 1,
+                    "device_ordinals": [0],
+                    "lane_id": "lane-0",
+                    "placement_ids": ["p0"],
+                },
+                {
+                    "available_attempt_slots": 1,
+                    "device_ordinals": [1],
+                    "lane_id": "lane-1",
+                    "placement_ids": ["p1"],
+                },
+            ]
+            assert document["available_attempt_slots"] == sum(
+                row["available_attempt_slots"] for row in document["lanes"]
+            )
+            assert documents_.identity(body)[1] == digest, "the document is deterministic"
+            # admission CLOSED (the barrier not yet passed) is zero on every lane, so the
+            # sum stays the worker-level count and no lane shows a seat the worker denies
+            worker.fence.dispatch_open = False
+            closed = worker.snapshot_body()
+            assert closed.admission_state == pb.AdmissionState.ADMISSION_STATE_CLOSED
+            assert closed.available_attempt_slots == 0
+            assert [lane.available_attempt_slots for lane in closed.lanes] == [0, 0]
+        finally:
+            for slot in worker.hosted.values():
+                slot.supervision.close()
+            worker.supervision.close()
+    with _workspace() as root:
+        worker = Worker(
+            _config(root / "home"),
+            WorkerOptions(root=root / "worker", devices="0", no_warm=True),
+            InMemoryControlHost(),
+        )
+        try:
+            worker.phase = pb.WorkerPhase.WORKER_PHASE_ONLINE
+            worker.fence.dispatch_open = True
+            worker.fence.wire_minor = lane_wire.LANES_WIRE_MINOR
+            worker.accepted.mode = "serving"
+            worker.placement = _placement("p0", "lane-0")
+            worker.lanes.lanes[0].placements.add("p0")
+            body = worker.snapshot_body()
+            assert _lane_rows(body) == [
+                {
+                    "lane_id": "lane-0",
+                    "device_ordinals": [0],
+                    "available_attempt_slots": 1,
+                    "placement_ids": ["p0"],
+                }
+            ]
+            document = documents_.read(documents_.identity(body)[0], pb.WorkerSnapshotBody)
+            older = pb.WorkerSnapshotBody()
+            older.CopyFrom(body)
+            del older.lanes[:]
+            for status in older.placements:
+                status.device_lane_id = ""
+            before_22 = documents_.read(documents_.identity(older)[0], pb.WorkerSnapshotBody)
+            assert {k: v for k, v in document.items() if k not in ("lanes", "placements")} == {
+                k: v for k, v in before_22.items() if k not in ("lanes", "placements")
+            }
+            assert [
+                {k: v for k, v in status.items() if k != "device_lane_id"}
+                for status in document["placements"]
+            ] == before_22["placements"]
+            assert document["placements"][0]["device_lane_id"] == "lane-0"
+        finally:
+            worker.supervision.close()
+
+
+def test_device_pins_are_read_as_sent() -> None:
+    """`DesiredPlacementSet.device_pins` reaches `LaneSet.assign` exactly as the
+    RecordOwner sent it; the worker validates, never normalizes, a pin."""
+    desired_set = pb.DesiredPlacementSet(
+        device_pins=[
+            pb.PlacementDevicePin(placement_id="g", device_ordinals=[0, 1]),
+            pb.PlacementDevicePin(placement_id="w", device_ordinals=[1]),
+            pb.PlacementDevicePin(placement_id="bad", device_ordinals=[1, 0, 1]),
+        ]
+    )
+    assert lane_wire.read_device_pins(desired_set) == {"g": (0, 1), "w": (1,), "bad": (1, 0, 1)}
+    assert lane_wire.read_device_pins(pb.DesiredPlacementSet()) == {}
+    lane_set = lanes.LaneSet.from_envelope("0,1", worker_pid=os.getpid())
+    with pytest.raises(lanes.LaneRefusal) as refused:
+        lane_set.assign(
+            "bad", model_bearing=True, declared_bytes=1, measured=MEASURED, pin=(1, 0, 1)
+        )
+    assert refused.value.code == "device_pin_infeasible"
+    assert [lane.lane_id for lane in lane_set.lanes] == ["lane-0", "lane-1"]
 
 
 def test_the_prepare_command_carries_the_degree_only_above_one() -> None:

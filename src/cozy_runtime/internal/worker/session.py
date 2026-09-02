@@ -151,7 +151,8 @@ REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 #: outcome awaiting `AttemptOutcomeAck`, so a RecordOwner that stops acking starves its own
 #: admission instead of growing this worker's held set. The dual defect — one count of N
 #: over N lanes, where an offer can use only its placement's — is why a multi-lane worker
-#: REFUSES to serve until proto-024 puts the seats on the wire (`device_lanes_unsupported`).
+#: REFUSES to serve a RecordOwner whose negotiated minor cannot read `lanes[]`
+#: (`device_lanes_unsupported`, proto-024 minor 22).
 
 
 def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
@@ -295,8 +296,8 @@ class Placement:
     #: fallback capability is a PRECONDITION of replacement, not a nicety.
     retained_fallback_placement_set_digest: bytes = b""
     #: The lane this placement's executor is sealed to (cr-066): assigned by the worker by
-    #: measured fit before activation, empty while unassigned. proto-024 carries it as
-    #: `PlacementStatus.device_lane_id`; at this wire minor it is worker-local truth.
+    #: measured fit (or the RecordOwner's pin) before activation, empty while unassigned;
+    #: on the wire as `PlacementStatus.device_lane_id` (proto-024).
     lane_id: str = ""
 
     @property
@@ -426,8 +427,7 @@ class AcceptedDesiredState:
     drain_grace_ms: int = 0
     mode: str = ""  # the DesiredWorkerState `mode` oneof this worker APPLIED
     #: placement_id -> the ordinals the RecordOwner pinned it to (proto-024 `device_pins`,
-    #: cr-068). Beside the digest-fenced document, never inside it; empty at a minor that
-    #: cannot carry pins.
+    #: cr-068). Beside the digest-fenced document, never inside it.
     device_pins: dict[str, tuple[int, ...]] = field(default_factory=dict)
     #: The revision whose placements are all materially STAGED and DISPATCHABLE. It may NEVER
     #: advance past a placement that is not — the field is a DERIVED fact, and a worker that
@@ -1257,9 +1257,8 @@ class Worker:
             self.bump_admission(f"a group lane split when {placement_id!r} left it")
 
     def lane_documents(self) -> list[dict[str, Any]]:
-        """`lanes[]` as the wire will spell it (proto-024): every device or group lane of
-        the envelope with its seats now, sorted by lane_id. The runtime's own document at
-        this minor; `lane_wire.emit_lanes` puts it on the wire at 22."""
+        """`lanes[]` (proto-024): every device or group lane of the envelope with its seats
+        now, sorted by lane_id; `lane_wire.emit_lanes` writes it, the records carry it."""
         return sorted(
             (lane_wire.lane_document(lane, self._lane_slots(lane)) for lane in self.lanes.lanes),
             key=lambda row: str(row["lane_id"]),
@@ -1344,7 +1343,11 @@ class Worker:
         return any(self._placement_dispatchable(placement_id) for placement_id in lane.placements)
 
     def _lane_slots(self, lane: DeviceLane) -> int:
-        """Free seats on ONE lane, now: `LANE_SEATS` less what its held attempts occupy."""
+        """Free seats on ONE lane, now: `LANE_SEATS` less what its held attempts occupy,
+        and NONE while the worker's admission is CLOSED — that is one structural fact per
+        worker, and `lanes[]` must never show a seat the worker-level count denies."""
+        if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN:
+            return 0
         if not self._lane_dispatchable(lane):
             return 0
         return max(0, LANE_SEATS - self._lane_held(lane))
@@ -1756,11 +1759,10 @@ class Worker:
         AND by an outcome awaiting `AttemptOutcomeAck`, so a RecordOwner that stops acking
         runs itself out of admission instead of growing this worker's held set. On the
         one-lane worker this is exactly the old single window; on a multi-lane worker the
-        sum is honest only once the owner can read which lane an offer draws from
-        (proto-024), which is why serving on more than one lane refuses until then.
+        sum is honest only for an owner that reads which lane an offer draws from
+        (`lanes[]`, proto-024), which is why serving on more than one lane refuses an owner
+        below minor 22. CLOSED admission is zero on every lane, so the sum is zero.
         """
-        if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN:
-            return 0
         return sum(self._lane_slots(lane) for lane in self.lanes)
 
     def set_phase(self, phase: pb.WorkerPhase, why: str) -> None:
@@ -2582,16 +2584,15 @@ class Worker:
         self.accepted.device_pins = lane_wire.read_device_pins(desired_set)
         if self.lanes.wide and not lane_wire.lanes_on_wire(self.fence.wire_minor):
             # THE FENCE (cr-066 step 0, ruling R3). This worker drives one lane per device
-            # of its envelope, but the wire at this minor carries ONE `available_attempt_slots`
-            # and no lane per placement: an owner reading the sum over lanes would offer
-            # seats a placement cannot use, and an owner reading one lane would leave the
-            # paid cards idle — silently, since nothing on the wire says a card is idle.
-            # Refusing typed is the "never advertise capacity it cannot use" rule applied
-            # to the silent-GPU-0 defect; jobs keep the whole envelope and are untouched.
-            # proto-024 (`ObservedWorkerState.lanes`, `PlacementStatus.device_lane_id`,
-            # `DesiredPlacementSet.device_pins`) is what lifts this, by making the lanes
-            # readable: the condition is `lane_wire.lanes_on_wire` - the vendored bindings
-            # carry lanes AND the owner negotiated that minor (cr-068).
+            # of its envelope; a RecordOwner below minor 22 reads ONE `available_attempt_slots`
+            # and no lane per placement: reading the sum over lanes it would offer seats a
+            # placement cannot use, and reading one lane it would leave the paid cards idle —
+            # silently, since nothing it reads says a card is idle. Refusing typed is the
+            # "never advertise capacity it cannot use" rule applied to the silent-GPU-0
+            # defect; jobs keep the whole envelope and are untouched. An owner at 22 reads
+            # `lanes[]` and pins placements to devices (`DesiredPlacementSet.device_pins`),
+            # and `LaneSet.assign` decides per placement (ruling 3: a model-bearing placement
+            # with no pin on a wide envelope refuses `device_group_unsupported`).
             self.latched = "device_lanes_unsupported"
             self._published_latch = self.latched  # this fault IS the publication
             self.engine.fault(
@@ -2601,11 +2602,12 @@ class Worker:
                     reason=self.latched,
                     detail=(
                         f"this worker's envelope {self.options.devices!r} is "
-                        f"{len(self.lanes.entries)} device lanes and wire minor "
-                        f"{self.fence.wire_minor} (vendored {WIRE_MINOR}) can report one; "
-                        "a serving set here would idle every card but one, so it is refused "
-                        f"until proto-024 (minor {lane_wire.LANES_WIRE_MINOR}) puts per-lane "
-                        "seats on the wire (jobs still take the whole envelope)"
+                        f"{len(self.lanes.entries)} device lanes and the RecordOwner "
+                        f"negotiated wire minor {self.fence.wire_minor}, which carries no "
+                        "per-lane seats (proto-024 `lanes[]` is minor "
+                        f"{lane_wire.LANES_WIRE_MINOR}); a serving set here would idle "
+                        "every card but one, so it is refused (jobs still take the whole "
+                        "envelope)"
                     ),
                 )
             )

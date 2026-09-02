@@ -38,7 +38,7 @@ from cozy_runtime.internal.local import (
     development_source_digest,
     run_slice,
 )
-from cozy_runtime.internal.worker import lanes
+from cozy_runtime.internal.worker import lane_wire, lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import (
@@ -80,7 +80,7 @@ def _workspace() -> Iterator[Path]:
 
 
 def _slice(
-    root: Path, *, devices: str, kind: str, hook: Any = None
+    root: Path, *, devices: str, kind: str, hook: Any = None, owner_hook: Any = None
 ) -> tuple[SliceOutcome, list[str]]:
     """One marco-polo request through `run_slice`, exactly as `cozy-runtime run`/`job`
     builds it, with the worker's device envelope chosen by the arm."""
@@ -122,9 +122,11 @@ def _slice(
     )
     seals: list[str] = []
 
-    def capture(_owner: LocalRecordOwner, worker: Worker) -> None:
+    def capture(owner: LocalRecordOwner, worker: Worker) -> None:
         # The harness reads the child's OWN report of its sealed environment at the moment
         # the supervision publishes it — the same `hello` the worker digest-checks.
+        if owner_hook is not None:
+            owner_hook(owner)
         publish = worker.supervision.on_change
 
         def on_change(executor: Any) -> None:
@@ -165,24 +167,86 @@ def test_one_lane_serves_sealed_to_its_device() -> None:
     assert seals == ["0"], seals
 
 
+def _owner_below_lanes(owner: LocalRecordOwner) -> None:
+    """Re-author the local owner as one that negotiates the minor BEFORE device lanes
+    (proto-024, 22): the queued claim and every desired state it will send say 21. This
+    is the older peer's exact bytes, not a switch inside the runtime."""
+    older = lane_wire.LANES_WIRE_MINOR - 1
+    queued = owner.host.inbound.get_nowait()
+    assert queued is not None and queued.WhichOneof("msg") == "claim"
+    claim = queued.claim
+    owner.host.deliver(
+        pb.RecordOwnerFrame(
+            claim=pb.Claim(
+                record_owner_epoch=claim.record_owner_epoch,
+                record_owner_id=claim.record_owner_id,
+                wire_minor=older,
+            )
+        )
+    )
+    desired_state = owner._desired_state
+
+    def _desired_state() -> pb.DesiredWorkerState:
+        directive = desired_state()
+        directive.wire_minor = older
+        return directive
+
+    owner._desired_state = _desired_state  # type: ignore[method-assign]
+
+
 @needs_executor
-def test_a_two_device_serving_envelope_refuses_typed_and_stays_online() -> None:
-    """THE FENCE. A serving set on a two-lane worker refuses `device_lanes_unsupported`,
-    the fault names proto-024 as what lifts it, no executor is ever spawned, and the
-    worker stays ONLINE (it answered; it did not fail)."""
+def test_a_two_device_serving_envelope_refuses_an_owner_below_minor_22() -> None:
+    """THE FENCE. A serving set from a RecordOwner that negotiated minor 21 on a two-lane
+    worker refuses `device_lanes_unsupported` (that owner reads one count over two lanes),
+    the fault names the minor that carries `lanes[]`, no executor is ever spawned, and
+    the worker stays ONLINE (it answered; it did not fail)."""
     workers: list[Worker] = []
     with _workspace() as root:
-        outcome, seals = _slice(root, devices="0,1", kind="entrypoint", hook=workers.append)
+        outcome, seals = _slice(
+            root,
+            devices="0,1",
+            kind="entrypoint",
+            hook=workers.append,
+            owner_hook=_owner_below_lanes,
+        )
     assert outcome.result is None
     assert "device_lanes_unsupported" in outcome.error, outcome.error
-    assert "proto-024" in outcome.error, outcome.error
+    assert "negotiated wire minor 21" in outcome.error, outcome.error
     reasons = [fault["reason"] for fault in outcome.faults]
     assert "device_lanes_unsupported" in reasons, reasons
     assert seals == [], f"an executor was spawned behind the fence: {seals}"
     (worker,) = workers
     assert worker.phase == pb.WorkerPhase.WORKER_PHASE_ONLINE
     assert worker.latched == "device_lanes_unsupported"
+    assert worker.fence.wire_minor == lane_wire.LANES_WIRE_MINOR - 1
     assert worker.supervision.spawns == 0
+
+
+@needs_executor
+def test_a_two_device_serving_envelope_serves_an_owner_at_minor_22_per_lane() -> None:
+    """The fence LIFTED. The same set from an owner at 22 is served: the weightless
+    placement lands on lane-0 (fewest placements), sealed to device 0 alone, and every
+    observed state the owner read carries both lanes, the placement's `device_lane_id`,
+    and a worker-level count that is the SUM over lanes."""
+    owners: list[LocalRecordOwner] = []
+    with _workspace() as root:
+        outcome, seals = _slice(root, devices="0,1", kind="entrypoint", owner_hook=owners.append)
+    assert outcome.result == {"message": "polo"}, (outcome.error, outcome.faults)
+    assert seals == ["0"], seals
+    (owner,) = owners
+    served = [r for r in owner.reports if r.lanes and r.placements]
+    assert served, "no observed state carried lanes and a placement"
+    for report in served:
+        assert [lane.lane_id for lane in report.lanes] == ["lane-0", "lane-1"]
+        assert [list(lane.device_ordinals) for lane in report.lanes] == [[0], [1]]
+        assert report.available_attempt_slots == sum(
+            lane.available_attempt_slots for lane in report.lanes
+        )
+        (status,) = report.placements
+        assert status.device_lane_id == "lane-0"
+        assert list(report.lanes[0].placement_ids) == [status.placement_id]
+        assert list(report.lanes[1].placement_ids) == []
+    assert report.applied_wire_minor == lane_wire.LANES_WIRE_MINOR
 
 
 @needs_executor
