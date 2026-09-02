@@ -1710,6 +1710,8 @@ class Executor:
         residency_document = self.residency.document() if self.residency is not None else {}
         peak_vram = max(peak_vram, int(residency_document.get("attempt_absolute_peak_bytes", 0)))
         # step 3: the lease releases here, and nothing after this line touches the device.
+        # DEVICE RELEASE IS THIS REPLY (cr-079): the handler registered its outputs as raw
+        # host frames, so `device_lease_ms` is device time and the encode is the worker's.
         lease_ms = (time.perf_counter() - lease_acquired) * 1000
         quiescent = self._quiescent() if torch is not None else True
         self.attempts += 1
@@ -1747,6 +1749,10 @@ class Executor:
             **_env_document(),
             "poisoned": self.poisoned,
             "outputs": outputs,
+            # cr-079: the host frames the saves REGISTERED. No codec ran in this process;
+            # the worker's post thread encodes them after the device is released.
+            "frames": [frame.row() for frame in record.frames.values()],
+            "max_output_bytes": record.max_output_bytes,
             "result_ref": result_ref,
             "result_schema_digest": self._result_schema_digest(surface),
             "adjustments": [
@@ -2111,6 +2117,8 @@ class Executor:
             **_env_document(),
             "poisoned": self.poisoned,
             "outputs": outputs,
+            "frames": [frame.row() for frame in record.frames.values()],
+            "max_output_bytes": record.max_output_bytes,
             "result_ref": result_ref,
             "result_schema_digest": self._result_schema_digest(surface),
             "adjustments": [],
@@ -2466,8 +2474,9 @@ def _serialize_result(
     msgspec encodes the whole annotated result struct — nested structs, lists and all — in
     one pass, so nothing is stringified on the way out and a nested typed value survives as
     a typed value. Assets are the one thing that cannot go on the wire as themselves: the
-    hook replaces each with its MANIFEST ROW (`asset_ref`, digest, media type, size), which
-    is exactly what `Asset.row()` already publishes and carries no local path.
+    hook replaces each with its MANIFEST ROW (`asset_ref`, kind, media type — and digest and
+    size once encoded; a frame the post phase still owes carries neither, cr-079), which is
+    exactly what `Asset.row()` already publishes and carries no local path.
 
     Output identity comes from the result's own FIELD PATH (`image`, `pair.thumb`,
     `frames.0`) — a stable name the RecordOwner can grant against. It is never a list index
@@ -2491,13 +2500,7 @@ def _serialize_result(
     def hook(value: object) -> object:
         if isinstance(value, Asset):
             row = value.row()
-            return {
-                "asset_ref": row["ref"],
-                "kind": row["kind"],
-                "media_type": row["media_type"],
-                "size_bytes": row["size_bytes"],
-                "digest": row["digest"],
-            }
+            return {"asset_ref": row.pop("ref"), **row}
         raise TypeError(f"{type(value).__name__} has no wire spelling in a result")
 
     document = json.loads(msgspec.json.encode(envelope.result, enc_hook=hook))

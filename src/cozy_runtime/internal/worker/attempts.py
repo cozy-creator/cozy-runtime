@@ -6,8 +6,11 @@ worker-protocol/02 fixes:
     VALIDATING  fences, digest recomputation over the resident bytes, local safety
     PREPARING   the PlanChooser fixes ONE plan; the ExecutorPreparer applies it
     ACCEPTED    acceptance recorded (spec + plan + model-construction digests) FIRST
-    TERMINAL    the canonical TerminalBody recorded BEFORE it is sent, replayed byte-for-
-                byte until a TerminalAck echoes its id AND its digest
+    RELEASED    the executor answered: device metrics, ledger probe/close and every
+                executor-side consequence taken on the lane thread; the device is free
+    TERMINAL    the post phase (encode, bound, write under the grant) on the lane's post
+                thread; the canonical TerminalBody recorded BEFORE it is sent, replayed
+                byte-for-byte until a TerminalAck echoes its id AND its digest
     CLOSED      closure recorded
 
 Two things are deliberately NOT here, because they are not the worker's: retryability (a
@@ -39,8 +42,10 @@ from dataclasses import field as dataclasses_field
 from pathlib import Path
 from typing import Any, cast
 
-from cozy_runtime.author._errors import DEVICE_OOM
+from cozy_runtime.author import _codec
+from cozy_runtime.author._errors import DEVICE_OOM, OutputError
 from cozy_runtime.author._observations import EventRing, Observation
+from cozy_runtime.author._services import MAX_OUTPUT_BYTES
 from cozy_runtime.internal import canonical, fill, seam
 from cozy_runtime.internal import descriptor as package_descriptor
 from cozy_runtime.internal import weights_sink as weights_bridge
@@ -188,6 +193,18 @@ class InlineResult:
     canonical: bytes
     schema_digest: str
     adjustments: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Released:
+    """ONE attempt off the device (cr-079): the executor's reply and what the post phase
+    needs to turn it into a terminal. Built on the lane thread at device release, consumed
+    on the lane's post thread; nothing in it reaches the executor again."""
+
+    attempt: AttemptRecord
+    reply: dict[str, Any]
+    spool: Path
+    key: str
 
 
 class AttemptRefusal(Exception):
@@ -349,7 +366,7 @@ class AttemptRecord:
     def begin_reclaim(self) -> bool:
         """Win the completion race, or report that natural finalization won first."""
         with self.transition_lock:
-            if self.state in ("finalizing", "outcome", "closed"):
+            if self.state in ("finalizing", "released", "outcome", "closed"):
                 return False
             self.state = "reclaiming"
             return True
@@ -1209,11 +1226,15 @@ class AttemptEngine:
 
     # ------------------------------------------------------------------ execute
 
-    def execute(self, attempt: AttemptRecord) -> pb.AttemptOutcome:
-        """Run ONE accepted attempt. Closing it against the ledger happens inside
-        `terminal()`, because the triage bundle the terminal REFERENCES has to carry the
-        reconciliation — a bundle that stops one statement short of the numbers an operator
-        needs is a bundle they have to leave to go find them."""
+    def execute(self, attempt: AttemptRecord) -> pb.AttemptOutcome | Released:
+        """Run ONE accepted attempt through its DEVICE PHASE.
+
+        Answers a terminal when nothing reached the device or the executor died under it,
+        and a `Released` record otherwise: the device is free the moment this returns, and
+        `finish` — the post phase, on the lane's post thread — turns the record into the
+        terminal. The ledger closes HERE, at release, while the executor that ran the
+        attempt is still the one on the lane; the triage bundle the terminal REFERENCES
+        carries that reconciliation."""
         if attempt.canceling:
             # Cancelled between arrival and dispatch — while it queued, or while admission
             # was fetching and hydrating it. Nothing reached the device, so the caller's
@@ -1489,8 +1510,8 @@ class AttemptEngine:
                 )
             )
 
-    def _run(self, attempt: AttemptRecord) -> pb.AttemptOutcome:
-        """ONE attempt: dispatch, freeze point, tail, recorded terminal.
+    def _run(self, attempt: AttemptRecord) -> pb.AttemptOutcome | Released:
+        """ONE attempt: dispatch, freeze point, release.
 
         ONE pipeline for both lanes. They differ in the COMMAND they send and in nothing
         after the executor answers, and keeping two copies of everything after it had
@@ -1578,7 +1599,7 @@ class AttemptEngine:
             # half-written can reach a granted destination.
             grants.abort_outputs(spool)
             return self.abandon(attempt, str(exc))
-        return self._finish(attempt, reply, spool, key)
+        return self.release(attempt, reply, spool, key)
 
     @staticmethod
     def _subject(attempt: AttemptRecord) -> str:
@@ -1652,10 +1673,16 @@ class AttemptEngine:
             "max_input_bytes": attempt.declared.max_input_bytes,
         }
 
-    def _finish(
+    def release(
         self, attempt: AttemptRecord, reply: dict[str, Any], spool: Path, key: str
-    ) -> pb.AttemptOutcome:
-        """Everything after the executor answers. Identical for both lanes, and now once."""
+    ) -> Released:
+        """DEVICE RELEASE (cr-079 §3): the executor answered, and this is everything that
+        must happen while it is still the executor that ran the attempt — on the lane
+        thread, under the device. The reply's telemetry is absorbed and applied to the
+        ledger, every executor-side consequence of the reply is taken (unproven quiescence,
+        a broken env seal, a poisoned generation), and the ledger row is probed and closed.
+        Nothing after this touches the executor: the post phase is immune to what
+        residency does to it next."""
         # A buffered reply and the watchdog's forceful escalation can arrive together.
         # Exactly one transition wins: finalization either closes the signal window first,
         # or waits until cgroup, process and driver reclaim have all been proved.
@@ -1696,7 +1723,40 @@ class AttemptEngine:
                         "before its terminal telemetry could be applied; successor telemetry "
                         "was left untouched",
                     )
+        if reply.get("ok") and executor is not None:
+            supervision = self.supervision_for(attempt)
+            if not reply.get("quiescent"):
+                # No terminal is recorded while author computation might still mutate GPU
+                # or output state. Unproven quiescence is an executor fault, not a success.
+                supervision.invalidate(executor, "unproven quiescence")
+            elif not reply.get("env_intact", True):
+                supervision.invalidate(executor, "env seal broken")
+            elif reply.get("poisoned"):
+                supervision.invalidate(executor, str(reply["poisoned"]))
+        # ONE ENVELOPE, ONE CLOSE, at release: the probe reads the executor's after-state
+        # for THIS attempt, before the lane hands the device to the next one.
+        if attempt.opened:
+            self.reconcile(attempt)
+            attempt.opened = {}
+        attempt.state = "released"
+        return Released(attempt, reply, spool, key)
 
+    def finish(self, released: Released) -> pb.AttemptOutcome:
+        """THE POST PHASE: everything after device release, on the lane's post thread.
+
+        Identical for both lanes, and once. The executor is not consulted — every fact it
+        had to give was taken at release — so a failure here is the WORKER's, and the
+        executor is never poisoned by it."""
+        attempt, reply, spool, key = released.attempt, released.reply, released.spool, released.key
+        self.monitor.start(f"{key}/post", "post")
+        try:
+            return self._terminal(attempt, reply, spool, key)
+        finally:
+            self.monitor.end(f"{key}/post", attempt.state)
+
+    def _terminal(
+        self, attempt: AttemptRecord, reply: dict[str, Any], spool: Path, key: str
+    ) -> pb.AttemptOutcome:
         if attempt.canceling:
             return self.finish_cancel(attempt, attempt.canceling)
         if not reply.get("ok"):
@@ -1710,10 +1770,7 @@ class AttemptEngine:
                 shortfall=reply.get("shortfall") or None,
             )
         if not reply.get("quiescent"):
-            # No terminal is recorded while author computation might still mutate GPU or
-            # output state. Unproven quiescence is an executor fault, not a success.
-            if attempt.executor is not None:
-                self.supervision_for(attempt).invalidate(attempt.executor, "unproven quiescence")
+            grants.abort_outputs(spool)
             return self.outcome(
                 attempt,
                 STATUS.OUTCOME_STATUS_FAILED,
@@ -1724,8 +1781,7 @@ class AttemptEngine:
                 "that may still be moving",
             )
         if not reply.get("env_intact", True):
-            if attempt.executor is not None:
-                self.supervision_for(attempt).invalidate(attempt.executor, "env seal broken")
+            grants.abort_outputs(spool)
             changed = ", ".join(str(name) for name in (reply.get("env_changed") or ()))
             names = f"; changed sealed names: {changed}" if changed else ""
             return self.outcome(
@@ -1748,8 +1804,6 @@ class AttemptEngine:
                     "wire counters are the worker's and this claim is dropped",
                 )
             )
-        if reply.get("poisoned") and attempt.executor is not None:
-            self.supervision_for(attempt).invalidate(attempt.executor, str(reply["poisoned"]))
 
         outcome = reply["outcome"]
         status, cause = _TERMINAL[outcome["terminal"]]
@@ -1809,14 +1863,17 @@ class AttemptEngine:
                     ORIGIN.CAUSE_ORIGIN_EXECUTOR,
                     result_error,
                 )
-            manifest, tail_error = self._tail(attempt, reply)
+            manifest, tail_error = self._tail(attempt, reply, key)
             if tail_error is not None:
+                # The device phase DID run and its numbers are real; a post-phase fault
+                # keeps them, so a failed encode still banks its device_lease_ms.
                 return self.outcome(
                     attempt,
                     STATUS.OUTCOME_STATUS_FAILED,
                     CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
                     ORIGIN.CAUSE_ORIGIN_WORKER,
                     tail_error,
+                    metrics=reply.get("metrics", {}),
                 )
         else:
             grants.abort_outputs(spool)
@@ -1990,14 +2047,15 @@ class AttemptEngine:
         return value
 
     def _tail(
-        self, attempt: AttemptRecord, reply: dict[str, Any]
+        self, attempt: AttemptRecord, reply: dict[str, Any], key: str = ""
     ) -> tuple[pb.OutputManifest | None, str | None]:
-        """§3.4 steps 4-5, worker-side: the device lease is already released, the bytes
-        are already immutable in the attempt spool, and this is where they are written under
-        the exact output grant and become a durable manifest.
+        """§3.4 steps 4-5, worker-side: the device lease is already released, the raw
+        snapshots are already immutable in the attempt spool, and this is where they are
+        ENCODED (cr-079: the codec runs here, never in the handler), bounded on the encoded
+        bytes, written under the exact output grant and become a durable manifest.
 
-        The tail runs SYNCHRONOUSLY with the attempt (launch). Overlapping it with the next
-        attempt's GPU work is cr-018's door and is not claimed here.
+        The tail runs on the lane's POST THREAD, overlapping the next attempt's device
+        phase; it takes no device lock and consults no executor.
 
         Outputs bind to granted destinations by STABLE OUTPUT ID — the result's own field
         path (`image`, `pair.thumb`, `frames.0`) — with EXACT SET EQUALITY against the
@@ -2022,6 +2080,10 @@ class AttemptEngine:
                 "RecordOwner did not grant is unwritable however it was produced, and a "
                 "granted destination the attempt never filled is not a success"
             )
+        encode_error = self._encode_frames(attempt, spool, reply, key)
+        if encode_error is not None:
+            grants.abort_outputs(spool)
+            return None, encode_error
         entries = []
         try:
             for output_id in sorted(produced):
@@ -2073,13 +2135,77 @@ class AttemptEngine:
             outputs=tuple(entries),
         )
 
-    @staticmethod
-    def _blob(spool: Path, ref: str) -> Path | None:
-        tail = ref.rsplit("/", 2)
-        if len(tail) < 3:
+    def _encode_frames(
+        self, attempt: AttemptRecord, spool: Path, reply: Mapping[str, Any], key: str
+    ) -> str | None:
+        """Encode every host frame the handler REGISTERED (cr-079 §5): first-party codecs,
+        the aggregate ceiling re-checked on the ENCODED bytes, each blob taking its
+        handle's spool name so the write below finds it as it always did. A fault here is
+        typed and the worker's own; the executor was not involved."""
+        frames = list(reply.get("frames") or ())
+        if not frames:
             return None
-        candidate = spool / f"{tail[-2]}-{tail[-1]}"
-        return candidate if candidate.is_file() else None
+        budget = int(reply.get("max_output_bytes") or MAX_OUTPUT_BYTES)
+        total = sum(
+            int(row.get("size_bytes") or 0)
+            for row in reply.get("outputs", ())
+            if str(row.get("asset_ref")) not in {str(f.get("handle")) for f in frames}
+        )
+        for index, frame in enumerate(frames):
+            handle = str(frame.get("handle", ""))
+            name = str(frame.get("raw", ""))
+            blob = self._blob_path(spool, handle)
+            if blob is None or not name or name != Path(name).name:
+                return f"output_frame_invalid: frame {handle!r} names no spool blob"
+            raw = spool / name
+            try:
+                data = raw.read_bytes()
+                if len(data) != int(frame.get("raw_bytes", -1)):
+                    return (
+                        f"output_frame_invalid: {handle} registered {frame.get('raw_bytes')} "
+                        f"raw bytes and the spool holds {len(data)}"
+                    )
+                started = time.perf_counter()
+                encoded = _codec.encode_frame(
+                    str(frame.get("codec", "")), dict(frame.get("facts") or {}), data
+                )
+                del data
+                total += len(encoded)
+                if total > budget:
+                    return (
+                        f"output_too_large: {handle} encodes to {len(encoded)} B, bringing "
+                        f"the attempt to {total} B over its {budget} B aggregate ceiling"
+                    )
+                blob.write_bytes(encoded)
+                raw.unlink(missing_ok=True)
+            except OutputError as exc:
+                return f"{exc.code}: {exc}"
+            except OSError as exc:
+                return f"output_encode_io: {handle}: {type(exc).__name__}: {exc}"
+            except Exception as exc:  # a codec's own fault is typed, never a dead post thread
+                return f"output_encode: {handle}: {type(exc).__name__}: {exc}"
+            self.monitor.advance(f"{key}/post", index + 1)
+            attempt.ring.emit(
+                "log",
+                f"encoded {handle} as {frame.get('codec')}",
+                "info",
+                raw_bytes=int(frame.get("raw_bytes", 0)),
+                encoded_bytes=len(encoded),
+                encode_ms=round((time.perf_counter() - started) * 1000, 3),
+            )
+        return None
+
+    @staticmethod
+    def _blob_path(spool: Path, ref: str) -> Path | None:
+        tail = ref.rsplit("/", 2)
+        if len(tail) < 3 or not tail[-1] or tail[-1] != Path(tail[-1]).name:
+            return None
+        return spool / f"{tail[-2]}-{tail[-1]}"
+
+    @classmethod
+    def _blob(cls, spool: Path, ref: str) -> Path | None:
+        candidate = cls._blob_path(spool, ref)
+        return candidate if candidate is not None and candidate.is_file() else None
 
     # ------------------------------------------------------------------ terminals
 
@@ -2448,8 +2574,8 @@ class AttemptEngine:
         if held.digest != message.invocation_spec_digest:
             return "dropped: cancel digest does not match the recorded acceptance"
         with held.transition_lock:
-            if held.state in ("finalizing", "outcome", "closed"):
-                return "ignored: the attempt already reached natural finalization"
+            if held.state in ("finalizing", "released", "outcome", "closed"):
+                return "ignored: the attempt already left the device"
             held.canceling = {
                 pb.CancelReason.CANCEL_REASON_CLIENT: "client",
                 pb.CancelReason.CANCEL_REASON_DRAIN: "drain",
@@ -2659,7 +2785,12 @@ class AttemptEngine:
         return [a for a in self.history.values() if a.state == "outcome"]
 
     #: Every state in which this worker still holds an attempt and owes the owner something.
-    HELD = ("accepted", "running", "reclaiming", "finalizing", "outcome")
+    HELD = ("accepted", "running", "reclaiming", "finalizing", "released", "outcome")
+    #: The states that HOLD THE LANE'S DEVICE (cr-079 D3): from the offer's hold to device
+    #: release. A queued offer is the device's next occupant and counts.
+    ON_DEVICE = ("queued", "accepted", "running", "reclaiming", "finalizing")
+    #: Off the device and not yet acknowledged: the post phase and the unacked outcome.
+    RELEASED = ("released", "outcome")
 
     def snapshot_entries(self) -> list[pb.HeldAttempt]:
         """Every attempt this worker still holds — accepted, running, or outcome-pending-ack.
@@ -2672,9 +2803,9 @@ class AttemptEngine:
     def active(self) -> list[pb.HeldAttempt]:
         """The attempts this worker HOLDS, for the ObservedWorkerState tick.
 
-        Running attempts AND outcomes pending ack — the same set the snapshot carries and
-        the same set `available_attempt_slots` counts, because a seat held by an unacked
-        outcome is a seat (§5). Reading only `live` under-reported exactly those: `close()`
+        Running attempts, released ones in their post phase, AND outcomes pending ack — the
+        same set the snapshot carries; `available_attempt_slots` reads the same states by
+        phase (cr-079 D3). Reading only `live` under-reported exactly those: `close()`
         drops the attempt from `live`, but an outcome nobody acked is still owed.
 
         A queued one is deliberately absent: acceptance is what makes an attempt a claim,

@@ -77,6 +77,41 @@ class ProgressFrame:
     step_ms: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class HostFrame:
+    """One output a save REGISTERED and nobody has encoded yet (cr-079).
+
+    The raw host snapshot sits in the attempt spool beside the facts its codec needs; the
+    handler returned without a codec running, so the device phase ends at the reply. The
+    worker's post thread encodes it, bounds the ENCODED bytes and writes them under the
+    grant. `charge` is what the registration counted against the attempt's aggregate
+    output ceiling: the raw bytes for a lossless codec (never smaller than its output),
+    nothing for a lossy one, whose only pre-encode bound is the snapshot ceiling.
+    """
+
+    handle: str
+    codec: str
+    raw: Path
+    raw_bytes: int
+    charge: int
+    facts: dict[str, Any]
+
+    @property
+    def media_type(self) -> str:
+        return _codec.FRAME_MEDIA_TYPES[self.codec]
+
+    def row(self) -> dict[str, Any]:
+        """The seam row: a spool FILE NAME and facts, never an absolute path."""
+        return {
+            "handle": self.handle,
+            "codec": self.codec,
+            "media_type": self.media_type,
+            "raw": self.raw.name,
+            "raw_bytes": self.raw_bytes,
+            "facts": dict(self.facts),
+        }
+
+
 @dataclass(slots=True)
 class Attempt:
     """The output/adjustment transaction one attempt owns. Runtime-side, never injected."""
@@ -85,6 +120,12 @@ class Attempt:
     spool: Path
     max_output_bytes: int = MAX_OUTPUT_BYTES
     closed: bool = False
+    frames: dict[str, HostFrame] = field(default_factory=dict)
+    """handle -> the registered host frame awaiting its codec. In the executor these cross
+    the seam and the worker's post thread settles them; the asset in `pending` carries
+    the media type and no size or digest until then."""
+    settle_at_save: bool = False
+    """Encode at the save instead (a fake harness: there is no worker to defer to)."""
     entered: bool = False
     """Whether the package handler itself was entered. Pre-entry refusals never poison a
     healthy executor; one structural bit is safer than duplicating refusal-code lists."""
@@ -238,6 +279,31 @@ def encode_png(frame: ImageFrame) -> bytes:
     return _codec.encode_png(frame.width, frame.height, frame.rgb)
 
 
+def settle_frame(attempt: Attempt, handle: str) -> Asset:
+    """Encode ONE registered frame in place: the blob takes the handle's spool name, the
+    asset takes its size and digest, the raw snapshot goes. The worker's post thread does
+    the same over the seam row; this is the in-process form a fake harness uses."""
+    frame = attempt.frames.pop(handle)
+    asset = attempt.pending[handle]
+    data = _codec.encode_frame(frame.codec, frame.facts, frame.raw.read_bytes())
+    settled = sum(a.size_bytes for a in attempt.pending.values()) + sum(
+        f.charge for f in attempt.frames.values()
+    )
+    if settled + len(data) > attempt.max_output_bytes:
+        raise OutputError(
+            f"output {handle} encodes to {len(data)} bytes, bringing the attempt to "
+            f"{settled + len(data)} bytes over its {attempt.max_output_bytes}-byte limit",
+            code="output_too_large",
+        )
+    blob = attempt.spool / f"{asset.kind}-{handle.rsplit('/', 1)[-1]}"
+    blob.write_bytes(data)
+    frame.raw.unlink(missing_ok=True)
+    asset.size_bytes = len(data)
+    asset.digest = digest_bytes(data)
+    asset._local = blob
+    return asset
+
+
 # --------------------------------------------------------------------------- services
 
 
@@ -255,20 +321,21 @@ class Outputs(_Bound):
 
     def save_image(self, image: object, *, format: str = "png") -> ImageAsset:
         frame = as_frame(image)
-        if format == "png":
-            return self._register(encode_png(frame), ImageAsset, "image/png")
-        if format == "webp":
-            return self._register(
-                _codec.encode_webp(frame.width, frame.height, frame.rgb), ImageAsset, "image/webp"
+        if format not in ("png", "webp"):
+            raise OutputError(
+                f"image format {format!r} has no encoder: choose png or lossless webp",
+                code="encoder_unavailable",
             )
-        raise OutputError(
-            f"image format {format!r} has no encoder: choose png or lossless webp",
-            code="encoder_unavailable",
+        return self._register_frame(
+            ImageAsset,
+            format,
+            frame.rgb,
+            {"width": frame.width, "height": frame.height},
+            charge=len(frame.rgb),
         )
 
     def save_audio(self, waveform: object, *, sample_rate: int, format: str = "flac") -> AudioAsset:
         self._attempt.check_open("Outputs.save_audio")
-        _codec.require_encoder()
         if format != "flac":
             raise OutputError(
                 f"audio format {format!r} has no encoder: flac is the audio product and "
@@ -278,7 +345,14 @@ class Outputs(_Bound):
         self._check_rate(sample_rate)
         planar, clipped = _codec.snapshot_audio(waveform, self._attempt.max_output_bytes)
         self._clip_row(clipped)
-        return self._register(_codec.encode_flac(planar, sample_rate), AudioAsset, "audio/flac")
+        channels, samples = planar.shape
+        return self._register_frame(
+            AudioAsset,
+            "flac",
+            planar.data,
+            {"channels": channels, "samples": samples, "sample_rate": sample_rate},
+            charge=len(planar.data),
+        )
 
     def save_video(
         self,
@@ -290,7 +364,6 @@ class Outputs(_Bound):
         format: str = "mp4",
     ) -> VideoAsset:
         self._attempt.check_open("Outputs.save_video")
-        _codec.require_encoder()
         if format != "mp4":
             raise OutputError(
                 f"video format {format!r} has no encoder: the one A/V product is the muxed "
@@ -311,8 +384,18 @@ class Outputs(_Bound):
             self._check_rate(sample_rate)
             planar, clipped = _codec.snapshot_audio(audio, self._attempt.max_output_bytes)
             self._clip_row(clipped)
-        data = _codec.encode_mp4(video, float(fps), planar, sample_rate)
-        return self._register(data, VideoAsset, "video/mp4")
+        facts: dict[str, Any] = {
+            "shape": list(video.shape),
+            "fps": float(fps),
+            "video_bytes": len(video.data),
+            "audio_channels": planar.shape[0] if planar is not None else 0,
+            "audio_samples": planar.shape[1] if planar is not None else 0,
+            "sample_rate": int(sample_rate or 0),
+        }
+        raw = video.data + (planar.data if planar is not None else b"")
+        # h264/aac are lossy: the raw snapshot bounds nothing about the container, so the
+        # registration charges nothing and the post phase bounds the encoded bytes.
+        return self._register_frame(VideoAsset, "mp4", raw, facts, charge=0)
 
     def save_video_stream(self, events: Iterator[DecodedMediaEvent]) -> SavedVideo:
         """Consume one canonical event stream into one bounded, probed, atomic MP4."""
@@ -583,8 +666,34 @@ class Outputs(_Bound):
         self._attempt.pending[handle] = asset
         return asset
 
+    def _register_frame(
+        self, kind: type[A], codec: str, raw: bytes, facts: dict[str, Any], *, charge: int
+    ) -> A:
+        """REGISTER a host frame: the raw snapshot lands in the spool, the aggregate ceiling
+        is charged now, and the codec runs later — in the worker's post phase, or here
+        when the attempt settles at the save."""
+        self._attempt.check_open("Outputs.save")
+        if self._pending_bytes() + charge > self._attempt.max_output_bytes:
+            raise OutputError(
+                f"output would bring the attempt to {self._pending_bytes() + charge} bytes, "
+                f"over its {self._attempt.max_output_bytes}-byte aggregate limit",
+                code="output_too_large",
+            )
+        handle = self._attempt.next_handle(kind.kind)
+        path = self._attempt.spool / f"{kind.kind}-{handle.rsplit('/', 1)[-1]}.raw"
+        path.write_bytes(raw)
+        frame = HostFrame(handle, codec, path, len(raw), charge, facts)
+        asset = kind(handle, media_type=frame.media_type, attempt=self._attempt.request_id)
+        self._attempt.pending[handle] = asset
+        self._attempt.frames[handle] = frame
+        if self._attempt.settle_at_save:
+            settle_frame(self._attempt, handle)
+        return asset
+
     def _pending_bytes(self) -> int:
-        return sum(asset.size_bytes for asset in self._attempt.pending.values())
+        return sum(asset.size_bytes for asset in self._attempt.pending.values()) + sum(
+            frame.charge for frame in self._attempt.frames.values()
+        )
 
     @staticmethod
     def _measure_file(path: Path) -> tuple[int, str]:
