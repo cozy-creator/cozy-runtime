@@ -356,7 +356,9 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
                 "package bindings descriptor",
             )
             table = binding_table.read_table(project / "package.toml")
-            slots = _descriptor_slots(body)
+            descriptor_slots = _descriptor_slots(body)
+            slots = descriptor_slots
+            optional = frozenset(slot.path for slot in descriptor_slots if slot.job)
         except (OSError, ConformanceError) as exc:
             raise CliError(
                 "validation",
@@ -375,12 +377,13 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
                 "a package's surface must be valid before its bindings can resolve (§1.0)",
                 Exit.validation,
             ) from exc
-        slots = [
-            slot
+        slots = [slot for surface in found.surfaces for slot in surface.model_bindings]
+        optional = frozenset(
+            slot.path
             for surface in found.surfaces
-            if surface.kind == "entrypoint"
+            if surface.kind == "job"
             for slot in surface.model_bindings
-        ]
+        )
         table = found.bindings
         visible = [
             surface
@@ -402,11 +405,12 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
         )
         return [], plans
     try:
-        # ONE resolve over the WHOLE declared slot set, which is what a serving deployment
-        # does: the selection is checked against every slot the release declares, so a
-        # binding for a slot that does not exist refuses here rather than being silently
-        # unused by whichever entrypoint happened to be asked for.
-        resolved = binding_table.resolve(slots, table)
+        # ONE resolve over the WHOLE declared slot set — jobs' included — which is what a
+        # serving deployment does: the selection is checked against every slot the release
+        # declares, so a binding for a slot that does not exist refuses here rather than
+        # being silently unused by whichever entrypoint happened to be asked for. A job's
+        # slot is declared but its source binds per invocation, so it may stay unbound.
+        resolved = binding_table.resolve(slots, table, optional=optional)
     except ConformanceError as exc:
         raise CliError(
             "validation",
@@ -416,7 +420,9 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
         ) from exc
     records: list[dict[str, Any]] = []
     for slot in sorted(slots, key=lambda s: s.path):
-        chosen = resolved[slot.path]
+        chosen = resolved.get(slot.path)
+        if chosen is None:  # an unbound job slot: declared, selected per invocation
+            continue
         records.append(
             {
                 "model_binding_path": slot.path,
@@ -435,39 +441,47 @@ class _DescriptorSlot:
     path: str
     param: str
     class_key: str
+    job: bool
 
 
 def _descriptor_slots(body: Mapping[str, Any]) -> list[_DescriptorSlot]:
-    """Recover the binding vocabulary already frozen into PackageDescriptor/1."""
+    """Recover the binding vocabulary already frozen into PackageDescriptor/1.
+
+    Jobs' model slots are declared exactly like entrypoints' — the jobs array is read
+    wherever the entrypoints array is — a job's slot just binds per invocation.
+    """
     out: dict[str, _DescriptorSlot] = {}
-    rows = body.get("entrypoints")
-    if not isinstance(rows, list):
-        raise ConformanceError("descriptor entrypoints are malformed", code="descriptor")
-    for entrypoint in rows:
-        if not isinstance(entrypoint, dict):
-            raise ConformanceError("descriptor entrypoint is malformed", code="descriptor")
-        models = entrypoint.get("models", [])
-        if not isinstance(models, list):
-            raise ConformanceError("descriptor model slots are malformed", code="descriptor")
-        for model in models:
-            if not isinstance(model, dict):
-                raise ConformanceError("descriptor model slot is malformed", code="descriptor")
-            path, class_key = model.get("path"), model.get("class")
-            if not isinstance(path, str) or not isinstance(class_key, str) or not class_key:
+    for collection, job in (("entrypoints", False), ("jobs", True)):
+        rows = body.get(collection, [])
+        if not isinstance(rows, list):
+            raise ConformanceError(f"descriptor {collection} are malformed", code="descriptor")
+        for callable_ in rows:
+            if not isinstance(callable_, dict):
                 raise ConformanceError(
-                    "descriptor model slot identity is malformed", code="descriptor"
+                    f"descriptor {collection} entry is malformed", code="descriptor"
                 )
-            prefix = f"{entrypoint.get('name', '')}.models."
-            if not path.startswith(prefix) or not path.removeprefix(prefix):
-                raise ConformanceError(
-                    f"descriptor model slot {path!r} is malformed", code="descriptor"
-                )
-            slot = _DescriptorSlot(path, path.removeprefix(prefix), class_key)
-            if path in out and out[path] != slot:
-                raise ConformanceError(
-                    f"descriptor model slot {path!r} conflicts", code="descriptor"
-                )
-            out[path] = slot
+            models = callable_.get("models", [])
+            if not isinstance(models, list):
+                raise ConformanceError("descriptor model slots are malformed", code="descriptor")
+            for model in models:
+                if not isinstance(model, dict):
+                    raise ConformanceError("descriptor model slot is malformed", code="descriptor")
+                path, class_key = model.get("path"), model.get("class")
+                if not isinstance(path, str) or not isinstance(class_key, str) or not class_key:
+                    raise ConformanceError(
+                        "descriptor model slot identity is malformed", code="descriptor"
+                    )
+                prefix = f"{callable_.get('name', '')}.models."
+                if not path.startswith(prefix) or not path.removeprefix(prefix):
+                    raise ConformanceError(
+                        f"descriptor model slot {path!r} is malformed", code="descriptor"
+                    )
+                slot = _DescriptorSlot(path, path.removeprefix(prefix), class_key, job)
+                if path in out and out[path] != slot:
+                    raise ConformanceError(
+                        f"descriptor model slot {path!r} conflicts", code="descriptor"
+                    )
+                out[path] = slot
     return [out[path] for path in sorted(out)]
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -66,8 +67,15 @@ def resolve(
     *,
     overrides: Mapping[str, str] | None = None,
     deploy: Mapping[str, str] | None = None,
+    optional: AbstractSet[str] = frozenset(),
 ) -> dict[str, Binding]:
-    """Resolve every declared slot, or refuse naming the slot nothing binds."""
+    """Resolve every declared slot, or refuse naming the slot nothing binds.
+
+    `optional` names declared slots that MAY stay unbound — a job's source binds per
+    invocation (--model / JobDirective), so its package.toml entry is a default, not a
+    requirement. An unbound optional slot is simply absent from the result; a bound one
+    resolves exactly like any other, and an entry for an undeclared path still refuses.
+    """
     ladder = ((overrides or {}, "--model"), (deploy or {}, "deploy binding"))
     paths = {s.path for s in slots}
     for key in sorted(set(table) - paths):
@@ -96,6 +104,8 @@ def resolve(
             if ref is not None:
                 chosen = Binding(slot.path, ref, chosen.lane if chosen else None, source)
         if chosen is None:
+            if slot.path in optional:
+                continue
             raise ConformanceError(
                 f"{slot.path} ({slot.class_key}) has no binding: code states capability, "
                 "bindings state selection — name it in package.toml or pass --model",
