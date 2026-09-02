@@ -296,6 +296,49 @@ class ComponentResidency:
                 self.fences.setdefault(name, Fence()).event = event
         self.active = None
 
+    # ------------------------------------------------------------------ the lane's call
+
+    def vacate(self) -> dict[str, Any]:
+        """FREE every evictable component: the LANE handed the device to another tenant.
+
+        Not an attempt's admission and not a rung's doing (cr-022's swap arm). A rung is
+        an attempt's promise about its OWN weights — `all_resident` frees nothing to keep
+        that promise — while this is the worker's decision, between attempts, about whose
+        weights hold the card; the seat guarantees no scope is active here. Two things do
+        not bend for it: the completion fence (a component a kernel may still be reading
+        stays, and is reported as held) and the encoded-leaf refusal (a component this
+        build cannot re-stage is never freed, for the reason `evict` gives). Eviction
+        FREES — weights are immutable, there is no copy-out — and the next admission on
+        this generation re-stages from the store like any other.
+        """
+        self._require_clean("vacate")
+        freed: dict[str, int] = {}
+        held: dict[str, str] = {}
+        allocated = self._allocated()
+        started = time.perf_counter()
+        for name in sorted(
+            list(self.backend.components), key=lambda n: self.fences.get(n, Fence()).last_used
+        ):
+            if not self._evictable(name):
+                held[name] = "the completion fence has not fired"
+                continue
+            try:
+                freed[name] = self.backend.evict(name)
+            except FillRefusal as exc:
+                held[name] = f"{exc.code}: {exc}"[:200]
+                continue
+            self.evictions += 1
+        accel.release_cached(self.torch, self.kind)
+        took = (time.perf_counter() - started) * 1000
+        self.evicted_ms += took
+        return {
+            "freed": freed,
+            "held": held,
+            "freed_bytes": sum(freed.values()),
+            "allocator_delta_bytes": self._allocated() - allocated,
+            "vacate_ms": round(took, 2),
+        }
+
     # ------------------------------------------------------------------ poison
 
     def _fault(self, code: str, detail: str) -> None:

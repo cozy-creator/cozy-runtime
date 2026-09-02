@@ -306,6 +306,10 @@ class Ledger:
         self.device_reserved = int(facts.get("reserved_bytes", -1))
         self.resident = {k: int(v) for k, v in (facts.get("resident") or {}).items()}
         self.parked = tuple(str(name) for name in (facts.get("parked") or ()))
+        # Parked components WITH their sizes, from the construction that parked them: what
+        # the next attempt may have to stage in is priced from the first plan, not from
+        # the first probe.
+        self.evicted = {k: int(v) for k, v in (facts.get("evicted") or {}).items()}
         self.accelerator = str(facts.get("gpu_name", ""))
         self.declared_scopes = {
             str(method): tuple(str(name) for name in names)
@@ -405,6 +409,39 @@ class Ledger:
         if isinstance(residency, dict):
             self.resident = {k: int(v) for k, v in (residency.get("resident") or {}).items()}
             self.evicted = {k: int(v) for k, v in (residency.get("evicted") or {}).items()}
+
+    def observe_vacate(self, reply: dict[str, Any], why: str) -> int:
+        """The lane took this generation's device bytes for another tenant (cr-022).
+
+        The reply is the executor's probe after the eviction, so every device class is
+        re-read from the process that owns the context, and the resident/evicted maps say
+        what is left. The BASELINE MOVES to the new allocated line and the move is
+        recorded: the next attempt on this generation re-stages on purpose and declares
+        that transition, so it reconciles against where the vacate left the device, not
+        against the construction's fill. Returns the bytes the executor reports freed.
+        """
+        before = self.device_allocated
+        self.observe_probe(reply)
+        vacated = reply.get("vacated") or {}
+        freed = int(vacated.get("freed_bytes", 0))
+        if self.device_allocated >= 0:
+            shift = self.device_allocated - before if before >= 0 else 0
+            self.device_baseline = self.device_allocated
+            self.baseline_notes.append(f"vacated ({why}): {shift:+d} B allocator, {freed} B freed")
+            del self.baseline_notes[:-8]
+        return freed
+
+    def observe_device_free(self, free: int, total: int) -> None:
+        """The driver's view of the whole device, read by the WORKER through NVML now.
+
+        `device_free` is otherwise a number the executor reported at its last probe, and
+        between probes other tenants of the lane move gigabytes. A chooser pricing a rung
+        against that number would price against a device that no longer exists; the lane
+        refreshes it before pricing (cr-022), with the same meter cr-066 assigns ceilings
+        from. The allocator classes stay the executor's own.
+        """
+        self.device_free = int(free)
+        self.device_total = int(total)
 
     def refuse_placement(self, placement: str, reason: str) -> None:
         """Bank one measured generation/rung capacity falsification."""
