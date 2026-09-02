@@ -82,14 +82,14 @@ class Asset:
         return self._local.read_bytes()
 
     def row(self) -> dict[str, Any]:
-        """The manifest row. Names the fields it emits, so no local path can leak."""
-        return {
-            "ref": self.ref,
-            "kind": self.kind,
-            "media_type": self.media_type,
-            "size_bytes": self.size_bytes,
-            "digest": self.digest,
-        }
+        """The manifest row. Names the fields it emits, so no local path can leak. A
+        registered frame nobody has encoded yet (cr-079) has no size or digest to claim,
+        and the row says so by omission: the output manifest is where those facts live."""
+        row: dict[str, Any] = {"ref": self.ref, "kind": self.kind, "media_type": self.media_type}
+        if self.digest:
+            row["size_bytes"] = self.size_bytes
+            row["digest"] = self.digest
+        return row
 
 
 class ImageAsset(Asset):

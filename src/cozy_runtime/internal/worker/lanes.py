@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.accel import DeviceMemory
 from cozy_runtime.internal.worker import child
-from cozy_runtime.internal.worker.attempts import AttemptRecord
+from cozy_runtime.internal.worker.attempts import AttemptRecord, Released
 from cozy_runtime.internal.worker.ledger import DeviceFacts, Ledger
 from cozy_runtime.internal.worker.plan import PlanChooser
 
@@ -57,7 +57,14 @@ from cozy_runtime.internal.worker.plan import PlanChooser
 #: group of devices under one attempt), and a second held attempt on it could only wait in a
 #: state the wire cannot spell. This is the structural fact `ADMISSION_WINDOW` used to hold
 #: for the whole worker; the worker-level count is now the SUM over its lanes.
+#:
+#: THE SEAT IS THE DEVICE SEAT (cr-079 D3): it is held from the offer's hold to DEVICE
+#: RELEASE — the executor's reply — and not through the ack. The post phase (encode, write,
+#: outcome, hold to ack) is bounded structurally instead: one released attempt per lane may
+#: be unacknowledged while the device takes its next occupant, so an owner that stops
+#: acking idles its own device rather than growing this worker's held set.
 LANE_SEATS = 1
+LANE_RELEASED = 1
 
 #: The lane name a job's executor is sealed under: the whole envelope, one seat.
 ENVELOPE_LANE = "envelope"
@@ -129,10 +136,13 @@ class DeviceLane:
         #: placement ids assigned to this lane, whether or not they are dispatchable yet
         self.placements: set[str] = set()
         self.work: queue.Queue[AttemptRecord | ExecutorDeath | None] = queue.Queue()
+        #: the POST PHASE (cr-079): released attempts, one thread per lane, in release
+        #: order. It never takes `device`: everything it reads left the executor at release.
+        self.post: queue.Queue[Released | None] = queue.Queue()
         #: this lane's gate: has it STOPPED moving? A rebuild on another lane leaves it set.
         self.settled = threading.Event()
         #: THE DEVICE, as a lock: held by the lane thread from an attempt's admission to its
-        #: terminal, and by any model-bearing prepare on this lane. Residency arbitration
+        #: device release, and by any model-bearing prepare on this lane. Residency arbitration
         #: vacates co-tenants under it, so a tenant is never evicted while its own attempt
         #: is on the card. Re-entrant because the lane thread rebuilds (prepares) inside
         #: its own hold.

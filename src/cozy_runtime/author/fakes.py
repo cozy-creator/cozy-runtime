@@ -69,9 +69,9 @@ def fake_attempt(
     directory, and it cannot read one it was never told.
     """
     if spool is None:
-        return Attempt(request_id, _spool(request_id), max_output_bytes)
+        return Attempt(request_id, _spool(request_id), max_output_bytes, settle_at_save=True)
     spool.mkdir(parents=True, exist_ok=True)
-    return Attempt(request_id, spool, max_output_bytes)
+    return Attempt(request_id, spool, max_output_bytes, settle_at_save=True)
 
 
 def fake_input[AssetT: Asset](
@@ -254,7 +254,8 @@ def invoke_with_fakes(
             assets=assets or {},
             max_output_bytes=max_output_bytes,
         ),
-        Attempt(request_id, spool, max_output_bytes),
+        # No worker stands behind a fake, so every registered frame is encoded at the save.
+        Attempt(request_id, spool, max_output_bytes, settle_at_save=True),
     )
 
 

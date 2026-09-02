@@ -24,6 +24,7 @@ import io
 import math
 import os
 from array import array
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
@@ -351,6 +352,43 @@ def encode_mp4(video: Planar, fps: float, audio: Planar | None, sample_rate: int
                 container.mux(astream.encode(aframe))
             container.mux(astream.encode())
     return buf.getvalue()
+
+
+#: The codecs a REGISTERED host frame is encoded with (cr-079), by the format a save
+#: names. A save registers the raw snapshot and returns; the codec runs in the worker's
+#: post phase — or at the save, in a fake harness that has no worker.
+FRAME_MEDIA_TYPES: dict[str, str] = {
+    "png": "image/png",
+    "webp": "image/webp",
+    "flac": "audio/flac",
+    "mp4": "video/mp4",
+}
+
+
+def encode_frame(codec: str, facts: Mapping[str, Any], raw: bytes) -> bytes:
+    """Encode ONE registered host frame from its raw snapshot and the facts its codec needs.
+
+    One function under both callers — the worker's post thread and a fake's settle-at-save
+    — so the bytes an author's test sees are the bytes the worker writes. Every shape here
+    was validated at registration; this only encodes.
+    """
+    if codec == "png":
+        return encode_png(int(facts["width"]), int(facts["height"]), raw)
+    if codec == "webp":
+        return encode_webp(int(facts["width"]), int(facts["height"]), raw)
+    if codec == "flac":
+        planar = Planar(raw, (int(facts["channels"]), int(facts["samples"])))
+        return encode_flac(planar, int(facts["sample_rate"]))
+    if codec == "mp4":
+        split = int(facts["video_bytes"])
+        video = Planar(raw[:split], tuple(int(d) for d in facts["shape"]))
+        audio = None
+        sample_rate = None
+        if int(facts.get("audio_channels", 0)):
+            audio = Planar(raw[split:], (int(facts["audio_channels"]), int(facts["audio_samples"])))
+            sample_rate = int(facts["sample_rate"])
+        return encode_mp4(video, float(facts["fps"]), audio, sample_rate)
+    raise OutputError(f"{codec!r} is not a registered-frame codec", code="encoder_unavailable")
 
 
 @dataclass(frozen=True, slots=True)

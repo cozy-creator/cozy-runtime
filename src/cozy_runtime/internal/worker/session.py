@@ -80,6 +80,7 @@ from cozy_runtime.internal.worker.attempts import (
     AttemptRecord,
     AttemptRefusal,
     AttemptSlot,
+    Released,
     safe,
 )
 from cozy_runtime.internal.worker.child import (
@@ -94,6 +95,7 @@ from cozy_runtime.internal.worker.control import (
     WatchFanout,
 )
 from cozy_runtime.internal.worker.lanes import (
+    LANE_RELEASED,
     LANE_SEATS,
     DeviceLane,
     ExecutorDeath,
@@ -147,9 +149,12 @@ REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 #: rev-2 makes the SHAPE of the bound structural rather than advisory (§6): per-placement
 #: `attempt_credits` are gone — N counters over ONE serialized device advertised N x the real
 #: capacity. The principle is one counter per SERIALIZED RESOURCE, and with cr-066 that
-#: resource is the device LANE: one seat per lane, consumed by a running attempt AND by an
-#: outcome awaiting `AttemptOutcomeAck`, so a RecordOwner that stops acking starves its own
-#: admission instead of growing this worker's held set. The dual defect — one count of N
+#: resource is the device LANE: one seat per lane, consumed from the offer's hold to DEVICE
+#: RELEASE (cr-079 D3: the executor's reply; the encode is the post thread's). A released
+#: attempt holds no seat, but the post phase is bounded one-per-lane: while more than
+#: `LANE_RELEASED` released attempts on a lane await `AttemptOutcomeAck`, the lane advertises
+#: nothing, so a RecordOwner that stops acking idles its own device instead of growing this
+#: worker's held set. The dual defect — one count of N
 #: over N lanes, where an offer can use only its placement's — is why a multi-lane worker
 #: REFUSES to serve a RecordOwner whose negotiated minor cannot read `lanes[]`
 #: (`device_lanes_unsupported`, proto-024 minor 22).
@@ -1334,12 +1339,17 @@ class Worker:
         if lane is not None:
             lane.row(placement_id).ledger.begin_generation(executor.pid if executor else 0)
 
-    def _lane_held(self, lane: DeviceLane) -> int:
-        return sum(
-            1
-            for held in list(self.engine.history.values())
-            if held.state in self.engine.HELD and held.lane_id == lane.lane_id
-        )
+    def _lane_phases(self, lane: DeviceLane) -> tuple[int, int]:
+        """(attempts holding the device, released attempts awaiting ack) on ONE lane."""
+        on_device = released = 0
+        for held in list(self.engine.history.values()):
+            if held.lane_id != lane.lane_id:
+                continue
+            if held.state in self.engine.ON_DEVICE:
+                on_device += 1
+            elif held.state in self.engine.RELEASED:
+                released += 1
+        return on_device, released
 
     def _lane_dispatchable(self, lane: DeviceLane) -> bool:
         """Whether THIS lane has a placement that takes offers (job mode: the envelope)."""
@@ -1348,14 +1358,18 @@ class Worker:
         return any(self._placement_dispatchable(placement_id) for placement_id in lane.placements)
 
     def _lane_slots(self, lane: DeviceLane) -> int:
-        """Free seats on ONE lane, now: `LANE_SEATS` less what its held attempts occupy,
-        and NONE while the worker's admission is CLOSED — that is one structural fact per
-        worker, and `lanes[]` must never show a seat the worker-level count denies."""
+        """Free seats on ONE lane, now: `LANE_SEATS` less what holds its device, NONE while
+        more than `LANE_RELEASED` released attempts await their ack (cr-079 D3), and NONE
+        while the worker's admission is CLOSED — that is one structural fact per worker,
+        and `lanes[]` must never show a seat the worker-level count denies."""
         if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN:
             return 0
         if not self._lane_dispatchable(lane):
             return 0
-        return max(0, LANE_SEATS - self._lane_held(lane))
+        on_device, released = self._lane_phases(lane)
+        if released > LANE_RELEASED:
+            return 0
+        return max(0, LANE_SEATS - on_device)
 
     def _hosted_set_serving(self, placement_id: str, state: pb.ServingState, why: str = "") -> None:
         hosted = self.hosted.get(placement_id)
@@ -1763,9 +1777,10 @@ class Worker:
     def available_attempt_slots(self) -> int:
         """Free seats across this worker's lanes, NOW — the SUM of each lane's free seat.
 
-        BOUNDEDNESS IS STRUCTURAL, NOT A PROMISE (§5): a seat is held by a running attempt
-        AND by an outcome awaiting `AttemptOutcomeAck`, so a RecordOwner that stops acking
-        runs itself out of admission instead of growing this worker's held set. On the
+        BOUNDEDNESS IS STRUCTURAL, NOT A PROMISE (§5): a seat is held from an offer's hold
+        to DEVICE RELEASE, and a lane whose released attempts awaiting `AttemptOutcomeAck`
+        exceed `LANE_RELEASED` advertises none (cr-079 D3), so a RecordOwner that stops
+        acking runs itself out of admission instead of growing this worker's held set. On the
         one-lane worker this is exactly the old single window; on a multi-lane worker the
         sum is honest only for an owner that reads which lane an offer draws from
         (`lanes[]`, proto-024), which is why serving on more than one lane refuses an owner
@@ -2396,8 +2411,9 @@ class Worker:
             self.send(self.weights.upload(inner))
 
     def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:
-        """A closed outcome FREES ITS ADMISSION SEAT — and that is a SLOT COUNT change, not
-        a change in admission MEANING, so it does NOT bump `admission_epoch` (§6).
+        """A closed outcome leaves the lane's RELEASED set — a SLOT COUNT change when the
+        device was waiting on it (cr-079 D3), not a change in admission MEANING, so it does
+        NOT bump `admission_epoch` (§6).
 
         The distinction is load-bearing and it cost a live run to find. `admission_epoch`
         moves when the meaning of an offer changes — executor respawn, window resize, phase
@@ -2427,6 +2443,7 @@ class Worker:
         self.outbound.put(None)
         for lane in self.lanes:
             lane.work.put(None)
+            lane.post.put(None)
 
     def shutdown_from_stream(self) -> None:
         self.request_stop()
@@ -4302,7 +4319,7 @@ class Worker:
                 "lane: it is held, and its acceptance publishes when the lane admits it",
             )
             return
-        if attempt.state in ("accepted", "running", "finalizing"):
+        if attempt.state in ("accepted", "running", "reclaiming", "finalizing", "released"):
             self.note(
                 "attempt",
                 "duplicate AttemptOffer for a held attempt: re-accepting "
@@ -4335,14 +4352,15 @@ class Worker:
             self.refuse(
                 offered,
                 "no_capacity",
-                f"{lane.lane_id} admits {LANE_SEATS} attempt at a time and its seat is "
+                f"{lane.lane_id} admits {LANE_SEATS} attempt to its device at a time and "
                 + (
-                    f"held by {other.request_id}#{other.attempt} ({other.state})"
+                    f"holds {other.request_id}#{other.attempt} ({other.state})"
                     if other is not None
-                    else "closed"
+                    else "its seat is closed"
                 )
-                + "; a seat is held by a running attempt AND by an outcome awaiting "
-                "AttemptOutcomeAck, so acking frees one",
+                + "; the seat frees at device release, and the device waits while more "
+                f"than {LANE_RELEASED} released attempt awaits AttemptOutcomeAck, so acking "
+                "frees one",
                 CAUSE.CAUSE_CODE_NO_CAPACITY,
             )
             return
@@ -4438,15 +4456,27 @@ class Worker:
                 continue
             attempt = item
             self.await_settled(attempt)
-            # THE DEVICE IS HELD from admission to the terminal (cr-022): a co-tenant's
-            # prepare on this lane waits here rather than vacating an executor whose
-            # attempt is on the card.
+            # THE DEVICE IS HELD from admission to DEVICE RELEASE (cr-022, cr-079): a
+            # co-tenant's prepare on this lane waits here rather than vacating an executor
+            # whose attempt is on the card. The post phase runs on `post_lane` and never
+            # takes this lock: at release the attempt's bytes have left the executor.
             with lane.device:
                 if self.admit(attempt):
-                    self.execute(attempt)
+                    self.execute(attempt, lane)
             # Rebuild on REFUSALS too (#458): a poisoned generation refuses every attempt,
             # so a rebuild gated on admission could never run again.
             self.rebuild_if_needed(attempt.placement_id)
+
+    def post_lane(self, lane: DeviceLane) -> None:
+        """THE POST PHASE, one thread per lane (cr-079 D4): encode, bound, write under the
+        grant, journal the outcome, send it. It overlaps the next attempt's device phase on
+        the same lane, and its failure is a typed WORKER outcome, never a poisoned executor.
+        """
+        while not self.stop.is_set():
+            item = lane.post.get()
+            if item is None:
+                return
+            self.finish(item)
 
     def admit(self, attempt: AttemptRecord) -> bool:
         """FETCH -> HYDRATE -> CHOOSE -> ACCEPT, or a typed terminal. Never a silence."""
@@ -4546,14 +4576,20 @@ class Worker:
         self.send(pb.WorkerFrame(attempt_accepted=accepted))
         return True
 
-    def execute(self, attempt: AttemptRecord) -> None:
-        """RUN -> OUTCOME -> RECONCILE. The ledger closes inside `outcome()`."""
+    def execute(self, attempt: AttemptRecord, lane: DeviceLane) -> None:
+        """RUN -> RELEASE. The ledger closes at release; the post thread takes it from there.
+
+        A terminal built here is one the device phase itself produced (cancelled before
+        dispatch, the executor died, the worker faulted) and is sent at once. A released
+        attempt is handed to `post_lane`, and the seat it held is advertised free in the
+        same breath so the owner can offer the next attempt while this one encodes.
+        """
         try:
-            outcome = self.engine.execute(attempt)
+            released = self.engine.execute(attempt)
         except Exception as exc:
             self.note("attempt", f"execution faulted: {type(exc).__name__}: {exc}")
             try:
-                outcome = self.engine.abandon(
+                released = self.engine.abandon(
                     attempt, f"the worker faulted while running this attempt: {exc}"
                 )
             except Exception as inner:
@@ -4561,6 +4597,36 @@ class Worker:
                 self.fail_machine(f"{type(inner).__name__}")
                 self.terminate(attempt, self.engine.last_resort, f"{type(inner).__name__}: {inner}")
                 return
+        if not isinstance(released, Released):
+            self.send(pb.WorkerFrame(attempt_outcome=released))
+            return
+        lane.post.put(released)
+        if self.connected.is_set():
+            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+
+    def finish(self, released: Released) -> None:
+        """POST PHASE -> OUTCOME -> SEND, on the lane's post thread.
+
+        A fault here is the WORKER's: the executor gave everything it had at release and is
+        not consulted, so it is never invalidated for a codec or a write that failed after
+        it was done — the attempt on the device now is untouched.
+        """
+        attempt = released.attempt
+        try:
+            outcome = self.engine.finish(released)
+        except Exception as exc:
+            self.note("attempt", f"post phase faulted: {type(exc).__name__}: {exc}")
+            if attempt.spool is not None:
+                grants.abort_outputs(attempt.spool)
+            self.terminate(
+                attempt,
+                self.engine.outcome,
+                STATUS.OUTCOME_STATUS_FAILED,
+                CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
+                ORIGIN.CAUSE_ORIGIN_WORKER,
+                f"post_phase_faulted: {type(exc).__name__}: {exc}",
+            )
+            return
         self.send(pb.WorkerFrame(attempt_outcome=outcome))
 
     def terminate(
@@ -4975,6 +5041,11 @@ class Worker:
                     target=self._lane(lane.lane_id, self.device_lane, lane),
                     daemon=True,
                     name=f"device-{lane.lane_id}",
+                ).start()
+                threading.Thread(
+                    target=self._lane(f"post-{lane.lane_id}", self.post_lane, lane),
+                    daemon=True,
+                    name=f"post-{lane.lane_id}",
                 ).start()
             threading.Thread(
                 target=self._lane("convergence", self.convergence_lane),

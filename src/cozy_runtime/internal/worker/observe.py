@@ -31,6 +31,9 @@ from cozy_runtime.author._observations import EventRing, Observation, Scalar
 #: The CLOSED boot-step vocabulary (§3.3). `derive` is named even though no torchcg issue
 #: measures it — an unnamed step is a cost nobody can see.
 BOOT_STEPS = ("download", "load", "warm", "derive")
+#: The two phases of one attempt (cr-079): the device phase, and the post phase that
+#: encodes and writes its outputs after device release.
+ATTEMPT_STEPS = ("invoke", "post")
 
 
 @dataclass(slots=True)
@@ -79,8 +82,8 @@ class SilenceMonitor:
     def start(self, subject: str, step: str) -> Cursor:
         """Open a subject and emit `started` AT POSITION 0 — a pre-first-unit wedge must
         render, and it cannot if nothing was ever said about the subject."""
-        if step not in BOOT_STEPS and step != "invoke":
-            raise ValueError(f"{step!r} is not a typed step {(*BOOT_STEPS, 'invoke')}")
+        if step not in BOOT_STEPS and step not in ATTEMPT_STEPS:
+            raise ValueError(f"{step!r} is not a typed step {(*BOOT_STEPS, *ATTEMPT_STEPS)}")
         cursor = self.cursors[subject] = Cursor(subject, step)
         self.ring.emit("boot", "started", 0, subject=subject, step=step)
         return cursor
