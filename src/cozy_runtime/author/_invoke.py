@@ -736,9 +736,16 @@ def _validate_result(surface: Surface, result: object, attempt: Attempt) -> None
             f"schema is {getattr(surface.result_type, '__name__', surface.result_type)}",
             code="result_schema",
         )
-    declared = {n.name: n.annotation for n in walk(surface.result_type) if "." not in n.path}
+    declared = {n.name: n for n in walk(surface.result_type) if "." not in n.path}
     for name, value in field_values(result).items():
-        annotation = declared.get(name, object)
+        node = declared.get(name)
+        if node is None:
+            continue
+        # The walker unwraps Optional into (annotation, optional); a None in an
+        # optional field is the declared shape, not a violation.
+        if value is None and node.optional:
+            continue
+        annotation = node.annotation
         if isinstance(annotation, type) and not isinstance(value, annotation):
             raise OutputError(
                 f"{surface.name}.{name} is {type(value).__name__}, declared {annotation.__name__}",
