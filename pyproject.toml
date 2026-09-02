@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.0.37"
+version = "0.1.0"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 requires-python = ">=3.12,<3.13"
 # The worker speaks `cozy.worker.v1` (worker-protocol/01), so the bindings' two runtimes are
@@ -21,7 +21,16 @@ dependencies = [
 [dependency-groups]
 # Pinned dev tooling: CI needs these on the venv, not behind an ad-hoc `--with` on
 # every invocation.
-dev = ["mypy>=1.13", "pytest>=8.4", "ruff>=0.16", "types-protobuf>=6.30", "av>=18.1,<19"]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.4",
+    "ruff>=0.16",
+    "types-protobuf>=6.30",
+    "av>=18.1,<19",
+    # `cozy_runtime.derive` is numpy code; the checking venv installs numpy so mypy checks
+    # the real array types instead of Any. The base package still declares no numpy.
+    "numpy>=1.26",
+]
 
 [project.scripts]
 cozy-runtime = "cozy_runtime.cli.main:main"

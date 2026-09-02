@@ -50,6 +50,9 @@ DENY_TOKENS = (
 # Per-package import fences. Values are forbidden module prefixes.
 PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
     "author": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
+    # Public derivation surface (cr-071): job packages import it directly. It builds only
+    # on the author surface — never the worker planes, the CLI, or TensorFS.
+    "derive": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
     "internal": ("cozy_runtime.cli",),
     "cli": (),
 }
@@ -790,7 +793,7 @@ def fence_supervised_worker_lanes() -> list[str]:
 #: cr-067 hard guard: topology derivation must NEVER run on pod prep. The worker's
 #: preparation plane may not import the derive machinery or TensorFS's author facade —
 #: cold boot pays for staging and venv materialization, never for a meta-device load.
-WORKER_DERIVE_FORBIDDEN = ("cozy_runtime.internal.derive", "tensorfs")
+WORKER_DERIVE_FORBIDDEN = ("cozy_runtime.internal.derive", "cozy_runtime.derive", "tensorfs")
 
 
 def worker_derive_free_violations(worker_dir: pathlib.Path) -> list[str]:
