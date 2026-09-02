@@ -1546,7 +1546,7 @@ class Worker:
                     document=dict(entry),
                     installed=materialized[0] if materialized else None,
                 )
-                revision = stored.execution_digest
+                revision = str(stored.development.get("local_revision_digest", ""))
                 if revision != documents.spell(request.package.local_revision_digest):
                     raise package_prepare.PreparationRefusal(
                         "local_package_revision_mismatch",
@@ -3138,9 +3138,8 @@ class Worker:
             )
             return None
         if placement.development:
-            prepared = self.local_revisions.get(
-                (placement.placement_id, placement.execution_digest)
-            )
+            revision = str(placement.development.get("local_revision_digest", ""))
+            prepared = self.local_revisions.get((placement.placement_id, revision))
             if prepared is None:
                 self._materialization_failed(
                     placement,

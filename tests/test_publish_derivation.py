@@ -259,25 +259,24 @@ def test_pod_prep_requires_the_exact_published_interface(tmp_path: Path) -> None
     interface_bytes = package_interface.canonical_bytes(
         {"format": package_interface.SCHEMA, "application": "a:b", "entrypoints": [], "jobs": []}
     )
-    interface_ref: dict[str, object] = {
-        "digest": "sha256:" + hashlib.sha256(interface_bytes).hexdigest(),
-        "length": len(interface_bytes),
-    }
+    interface_digest = "sha256:" + hashlib.sha256(interface_bytes).hexdigest()
 
     interface_path = view / package_interface.FILENAME
     interface_row = pb.LocalDownloadFile(
-        digest=bytes.fromhex(str(interface_ref["digest"])[7:]),
+        digest=bytes.fromhex(interface_digest[7:]),
         filename=package_interface.FILENAME,
         kind=pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE,
-        length=int(interface_ref["length"]),
+        length=len(interface_bytes),
         path=str(interface_path),
     )
+    files: list[pb.LocalDownloadFile] = [row, interface_row]
+    files.sort(key=lambda value: value.digest)
 
     def prep() -> pb.PreparePackageSetResult:
         return prepare_package_set(
             pb.PreparePackageSetRequest(
                 download_delegation=_delegation("paul/thing", "1.0.0"),
-                files=sorted([row, interface_row], key=lambda value: value.digest),
+                files=files,
                 environment_root=str(tmp_path / "environment"),
             ),
             artifact_cache=artifact_cache,
