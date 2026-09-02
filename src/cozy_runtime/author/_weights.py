@@ -469,6 +469,12 @@ class WeightsSink:
         self._cancel = cancel
         self._spent: set[str] = set()
 
+    @property
+    def models(self) -> Mapping[str, Model[object]]:
+        """This job's granted model inputs by parameter name — the exact objects
+        `structure` and `open` accept as sources (read-only copy)."""
+        return dict(self._models)
+
     def structure(self, source: Model[object]) -> WeightsSource:
         """Return bounded tensor geometry for one exact source already granted to this job."""
         from cozy_runtime.author._services import Attempt
