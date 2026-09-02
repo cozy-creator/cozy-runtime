@@ -12,7 +12,10 @@ from __future__ import annotations
 import msgspec
 import pytest
 
-from cozy_runtime.author._invoke import OutputError, _validate_result
+from pathlib import Path
+
+from cozy_runtime.author import OutputError
+from cozy_runtime.author._invoke import _validate_result
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.author._signature import Surface
 
@@ -35,16 +38,16 @@ def _surface() -> Surface:
     )
 
 
-def _attempt(tmp_path) -> Attempt:
+def _attempt(tmp_path: Path) -> Attempt:
     return Attempt(request_id="req-test", spool=tmp_path)
 
 
-def test_an_optional_result_field_may_be_none(tmp_path) -> None:
+def test_an_optional_result_field_may_be_none(tmp_path: Path) -> None:
     result = _Result(digest="sha256:ab", master_audio_digest=None)
     _validate_result(_surface(), result, _attempt(tmp_path))
 
 
-def test_a_required_result_field_still_refuses_none(tmp_path) -> None:
+def test_a_required_result_field_still_refuses_none(tmp_path: Path) -> None:
     with pytest.raises(OutputError) as caught:
         _validate_result(
             _surface(), _Result(digest=None, master_audio_digest="x"), _attempt(tmp_path)  # type: ignore[arg-type]
