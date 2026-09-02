@@ -156,6 +156,18 @@ WORKER_CHILD_PLATFORM_ENV = {
 }
 
 
+def inherited_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """THIS process's whole environment, for a child that IS this process again (cr-068).
+
+    A follower rank is spawned by rank 0 of a group lane's executor and must run under
+    exactly rank 0's sealed environment - the worker sealed it once, and a second seal
+    would be a second authority. Nothing is erased or imposed here: the seal already
+    happened, and `seal_snapshot` is how the child proves it inherited the same one.
+    """
+    env = os.environ if environ is None else environ
+    return dict(env)
+
+
 def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """The device-child SEAL names as this process actually received them (cr-007).
 

@@ -66,6 +66,7 @@ from cozy_runtime.internal.worker import (
     child,
     downloads,
     grants,
+    lane_wire,
     model_source_prepare,
     observe,
     triage,
@@ -99,6 +100,7 @@ from cozy_runtime.internal.worker.lanes import (
     LaneRefusal,
     LaneRow,
     LaneSet,
+    fold_memory,
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.plan import (
@@ -423,6 +425,10 @@ class AcceptedDesiredState:
     posture: pb.Posture = pb.Posture.POSTURE_UNSPECIFIED
     drain_grace_ms: int = 0
     mode: str = ""  # the DesiredWorkerState `mode` oneof this worker APPLIED
+    #: placement_id -> the ordinals the RecordOwner pinned it to (proto-024 `device_pins`,
+    #: cr-068). Beside the digest-fenced document, never inside it; empty at a minor that
+    #: cannot carry pins.
+    device_pins: dict[str, tuple[int, ...]] = field(default_factory=dict)
     #: The revision whose placements are all materially STAGED and DISPATCHABLE. It may NEVER
     #: advance past a placement that is not — the field is a DERIVED fact, and a worker that
     #: advances it while observed state disagrees is in breach, not merely optimistic (§8).
@@ -843,7 +849,11 @@ def _placement_profile(entry: dict[str, Any]) -> None:
 
 
 def executor_prepare_command(
-    binding: DeclaredBinding, *, devices: str, authorized_device_limit_bytes: int = 0
+    binding: DeclaredBinding,
+    *,
+    devices: str,
+    authorized_device_limit_bytes: int = 0,
+    sequence_parallel_degree: int = 1,
 ) -> dict[str, Any]:
     """Translate one resolved callable binding into the executor's closed prepare shape.
 
@@ -851,7 +861,8 @@ def executor_prepare_command(
     can refuse `env_seal_broken` if it is preparing under any other seal than its lane's.
     `authorized_device_limit_bytes` is the ceiling the worker ASSIGNED for this prepare
     (cr-025/cr-066); the executor fits under the smaller of it and what it measures, and
-    never derives one of its own.
+    never derives one of its own. `sequence_parallel_degree` rides only when > 1 (cr-068):
+    a group lane's K, the ONE new fact its executor receives; a plain prepare is unchanged.
     """
 
     models = []
@@ -889,6 +900,8 @@ def executor_prepare_command(
         "devices": devices,
         "authorized_device_limit_bytes": int(authorized_device_limit_bytes),
     }
+    if sequence_parallel_degree > 1:
+        command["sequence_parallel_degree"] = int(sequence_parallel_degree)
     if not models:
         command.update(
             {
@@ -1177,17 +1190,29 @@ class Worker:
         """
         model_bearing = any(not binding.weightless for binding in bindings.values())
         declared = sum(binding.model_weight_bytes for binding in bindings.values())
-        measured: dict[str, accel.DeviceMemory] = {}
+        measured: dict[int, accel.DeviceMemory] = {}
         if model_bearing:
             kind = accel.host_backend_family()
-            for lane in self.lanes.lanes:
-                measured[lane.lane_id] = accel.device_memory(lane.devices, kind)
+            for ordinal, entry in enumerate(self.lanes.entries):
+                measured[ordinal] = accel.device_memory(entry, kind)
+        # THE PIN (cr-068): the RecordOwner's placement of this placement on THIS worker,
+        # validated here and never chosen here. The declared degrees are the package's.
+        pin = self.accepted.device_pins.get(placement.placement_id)
+        degrees: set[int] | None = None
+        for binding in bindings.values():
+            if binding.weightless:
+                continue
+            held = set(binding.sequence_parallel_degrees())
+            degrees = held if degrees is None else degrees & held
+        revision = self.lanes.revision
         try:
             lane = self.lanes.assign(
                 placement.placement_id,
                 model_bearing=model_bearing,
                 declared_bytes=declared,
                 measured=measured,
+                pin=pin,
+                degrees=tuple(sorted(degrees or ())),
             )
         except LaneRefusal as exc:
             placement.lane_id = ""
@@ -1205,22 +1230,40 @@ class Worker:
         row = lane.row(placement.placement_id)
         row.model_bearing = model_bearing
         row.supervision = supervision
+        row.ledger.observe_devices(lane.device_facts(measured))
         tenants = [slot for slot in lane.model_bearing_slots() if slot != placement.placement_id]
         self.note(
             "materialization",
             f"{placement.placement_id!r} assigned to {lane.lane_id} "
             f"(CUDA_VISIBLE_DEVICES={lane.devices!r}; "
             + ("model-bearing" if model_bearing else "weightless")
+            + (f"; a {lane.degree}-device GROUP, one seat" if lane.group else "")
             + (f"; shares the device with {tenants} by residency arbitration" if tenants else "")
             + ")",
         )
+        if self.lanes.revision != revision:
+            self.bump_admission(
+                f"{lane.lane_id} fused from {list(lane.ordinals)} for {placement.placement_id!r}"
+            )
         return True
 
     def _release_lane(self, placement_id: str) -> None:
         placement = self._placement_by_id(placement_id)
         if placement is not None:
             placement.lane_id = ""
+        revision = self.lanes.revision
         self.lanes.release(placement_id)
+        if self.lanes.revision != revision:
+            self.bump_admission(f"a group lane split when {placement_id!r} left it")
+
+    def lane_documents(self) -> list[dict[str, Any]]:
+        """`lanes[]` as the wire will spell it (proto-024): every device or group lane of
+        the envelope with its seats now, sorted by lane_id. The runtime's own document at
+        this minor; `lane_wire.emit_lanes` puts it on the wire at 22."""
+        return sorted(
+            (lane_wire.lane_document(lane, self._lane_slots(lane)) for lane in self.lanes.lanes),
+            key=lambda row: str(row["lane_id"]),
+        )
 
     def _bind_attempt_slot(self, attempt: AttemptRecord) -> AttemptSlot:
         """Capture the placement slot an attempt is admitted against — once, under the lock.
@@ -2164,6 +2207,8 @@ class Worker:
         if self.placement is not None:
             body.placements.append(self.placement_status())
         body.held_attempts.extend(self.engine.snapshot_entries())
+        if self.accepted.mode == "serving":
+            lane_wire.emit_lanes(body, self.lane_documents())
         return body
 
     def _send_snapshot(self, send: Callable[[pb.WorkerFrame], None]) -> None:
@@ -2534,7 +2579,8 @@ class Worker:
         )
         self.accepted.accepted_placement_set_digest = desired_set.placement_set_digest
         self.accepted.placement_set_canonical_bytes = desired_set.placement_set_canonical_bytes
-        if len(self.lanes) > 1:
+        self.accepted.device_pins = lane_wire.read_device_pins(desired_set)
+        if self.lanes.wide and not lane_wire.lanes_on_wire(self.fence.wire_minor):
             # THE FENCE (cr-066 step 0, ruling R3). This worker drives one lane per device
             # of its envelope, but the wire at this minor carries ONE `available_attempt_slots`
             # and no lane per placement: an owner reading the sum over lanes would offer
@@ -2543,7 +2589,9 @@ class Worker:
             # Refusing typed is the "never advertise capacity it cannot use" rule applied
             # to the silent-GPU-0 defect; jobs keep the whole envelope and are untouched.
             # proto-024 (`ObservedWorkerState.lanes`, `PlacementStatus.device_lane_id`,
-            # `Placement.device_pin`) is what lifts this, by making the lanes readable.
+            # `DesiredPlacementSet.device_pins`) is what lifts this, by making the lanes
+            # readable: the condition is `lane_wire.lanes_on_wire` - the vendored bindings
+            # carry lanes AND the owner negotiated that minor (cr-068).
             self.latched = "device_lanes_unsupported"
             self._published_latch = self.latched  # this fault IS the publication
             self.engine.fault(
@@ -2553,17 +2601,19 @@ class Worker:
                     reason=self.latched,
                     detail=(
                         f"this worker's envelope {self.options.devices!r} is "
-                        f"{len(self.lanes)} device lanes and wire minor {WIRE_MINOR} can "
-                        "report one; a serving set here would idle every card but one, "
-                        "so it is refused until proto-024 puts per-lane seats on the wire "
-                        "(jobs still take the whole envelope)"
+                        f"{len(self.lanes.entries)} device lanes and wire minor "
+                        f"{self.fence.wire_minor} (vendored {WIRE_MINOR}) can report one; "
+                        "a serving set here would idle every card but one, so it is refused "
+                        f"until proto-024 (minor {lane_wire.LANES_WIRE_MINOR}) puts per-lane "
+                        "seats on the wire (jobs still take the whole envelope)"
                     ),
                 )
             )
             self.note(
                 "desired_state",
-                f"revision {desired.revision} REFUSED: {self.latched} ({len(self.lanes)} "
-                f"lanes over {self.options.devices!r}); the worker stays ONLINE",
+                f"revision {desired.revision} REFUSED: {self.latched} "
+                f"({len(self.lanes.entries)} lanes over {self.options.devices!r}); the worker "
+                "stays ONLINE",
             )
             self.bump_admission(f"revision {desired.revision} refused: {self.latched}")
             self._settle()
@@ -3628,7 +3678,10 @@ class Worker:
         try:
             reply = executor.call(
                 executor_prepare_command(
-                    first, devices=lane.devices, authorized_device_limit_bytes=authorized
+                    first,
+                    devices=lane.devices,
+                    authorized_device_limit_bytes=authorized,
+                    sequence_parallel_degree=lane.degree if lane.group else 1,
                 ),
                 timeout=None,
                 on_progress=lambda frame: self.monitor.advance(
@@ -3967,6 +4020,10 @@ class Worker:
             "PYTORCH_CUDA_ALLOC_CONF": self.options.alloc_conf,
             "OMP_NUM_THREADS": str(self.options.threads),
         }
+        if lane.group:
+            # A GROUP's K ranks form an NCCL communicator (cr-068); NVLS multicast is off
+            # BEFORE it forms, by the seal, and every rank asserts it (pgw#929).
+            imposed["NCCL_NVLS_ENABLE"] = "0"
         # The FILL runs in the executor, so its capture directory has to cross the seal or
         # it instruments the one process that never reserves a destination. Projected only
         # when one is configured: an empty value is an imposition of nothing.
@@ -4003,21 +4060,32 @@ class Worker:
         """
         if binding.weightless:
             return 0
-        memory = accel.device_memory(lane.devices, accel.host_backend_family())
+        measured = lane.measure(accel.host_backend_family())
+        memory = fold_memory(measured)
         if memory.state != "measured":
+            unreadable = [
+                f"{lane.entries[index]!r}"
+                for index, ordinal in enumerate(lane.ordinals)
+                if measured[ordinal].state != "measured"
+            ]
             raise LaneRefusal(
                 "device_capacity_unreadable",
                 f"{lane.lane_id}: the driver could not report free bytes for "
-                f"{lane.devices!r}, so no residence ceiling can be assigned (nvidia-smi "
-                "--query-gpu=memory.free is the reading)",
+                f"{', '.join(unreadable)}, so no residence ceiling can be assigned (NVML "
+                "nvmlDeviceGetMemoryInfo, else nvidia-smi --query-gpu=memory.free, is the "
+                "reading); a lane with any unreadable device is unreadable",
             )
+        # THE MIN OVER THE LANE'S DEVICES (cr-068): every rank of a group holds the full
+        # weights, so the ceiling every rank is assigned is what the tightest card has.
         free = memory.free_bytes
+        lane.row(slot).ledger.observe_devices(lane.device_facts(measured))
         granted = lane.authorize(slot, free)
         self.note(
             "boot",
             f"{lane.lane_id}: authorized {granted} B for {slot!r} from {free} B measured "
-            f"free on {lane.devices!r} ({lane.outstanding_bytes() - granted} B outstanding "
-            "to other executors)",
+            f"free on {lane.devices!r}"
+            + (f" (MIN over {lane.degree} devices)" if lane.group else "")
+            + f" ({lane.outstanding_bytes() - granted} B outstanding to other executors)",
         )
         return granted
 
@@ -4070,7 +4138,7 @@ class Worker:
         placement's serving state do not move; its next attempt re-stages on demand.
         """
         kind = accel.host_backend_family()
-        memory = accel.device_memory(lane.devices, kind)
+        memory = lane.memory(kind)
         if memory.state != "measured" or fits(memory):
             return
         for victim, row in lane.victims(slot):
@@ -4079,7 +4147,7 @@ class Worker:
                 continue
             before = memory.free_bytes
             freed = self._vacate(victim, row, executor, why)
-            memory = accel.device_memory(lane.devices, kind)
+            memory = lane.memory(kind)
             self.note(
                 "residency",
                 f"{lane.lane_id}: {victim!r} (epoch {executor.epoch} pid {executor.pid}) "
@@ -4692,6 +4760,7 @@ class Worker:
                 observed.placements.append(self.placement_status())
             for placement_id in sorted(self.hosted):
                 observed.placements.append(self.placement_status(placement_id))
+            lane_wire.emit_lanes(observed, self.lane_documents())
         return observed
 
     def converged_revision(self) -> int:
@@ -4783,6 +4852,7 @@ class Worker:
                 raise RuntimeError("dispatchable placement has incomplete invocation identity")
         if placement.acquisition.ListFields():
             status.acquisition.CopyFrom(placement.acquisition)
+        lane_wire.emit_device_lane_id(status, placement.lane_id)
         return status
 
     def job_capacity(self) -> pb.JobCapacity:

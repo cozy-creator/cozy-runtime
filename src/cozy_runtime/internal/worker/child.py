@@ -243,6 +243,14 @@ class ReclaimEvidence:
 
     exit_status: int
     device: accel.ProcessMemory
+    #: every birth the scope held when it was frozen - rank 0 AND its followers under a
+    #: group (cr-068) - each proven gone from the OS and from the driver's table
+    members: tuple[int, ...] = ()
+    #: per device of the lane's seal: the fold of every member's driver row on THAT card.
+    #: Evidence for the record; the merged table over every device is what the reclaim
+    #: waited on. In a PID namespace the driver names host pids, so `absent` here never
+    #: overrides the OS-state half - it can only agree with it.
+    devices: dict[str, accel.ProcessMemory] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +310,9 @@ class ExecutorSupervision:
         self.spawns = 0
         self.socket_path = str(root / "executor.sock")
         self.cancel_path = root / "executor.cancel"
+        #: the seal's `CUDA_VISIBLE_DEVICES` entries of the current spawn: the devices a
+        #: reclaim proves absence on, one row each (cr-068)
+        self.devices: tuple[str, ...] = ()
         self._listener: socket.socket | None = None
         self._lifecycle = threading.Lock()
         self._closed = False
@@ -727,6 +738,11 @@ class ExecutorSupervision:
         conn: socket.socket | None = None
         exit_published: threading.Event | None = None
         try:
+            self.devices = tuple(
+                entry.strip()
+                for entry in imposed.get("CUDA_VISIBLE_DEVICES", "").split(",")
+                if entry.strip()
+            )
             imposed = {
                 **imposed,
                 **self._prepare_jit_cache(),
@@ -1107,11 +1123,41 @@ class ExecutorSupervision:
             raise ExecutorGone(f"could not remove reclaimed executor scope: {exc}") from exc
         self._clear_owner(owner)
 
+    def _device_evidence(
+        self, known: set[proctree.ProcessIdentity]
+    ) -> dict[str, accel.ProcessMemory]:
+        """The per-device half of the record: for each entry of the seal, every known birth
+        folded to one row - present if any is, unreadable if any is, else absent."""
+        pids = {process.pid for process in known}
+        if not pids or not self.devices or self._device_process is not None:
+            return {}
+        rows: dict[str, accel.ProcessMemory] = {}
+        by_device = accel.process_memories_by_device(
+            pids, accel.host_backend_family(), self.devices
+        )
+        for device in self.devices:
+            states = {row.state for row in by_device[device].values()}
+            if "present" in states:
+                rows[device] = accel.ProcessMemory(
+                    "present", sum(max(row.bytes, 0) for row in by_device[device].values())
+                )
+            elif "unreadable" in states:
+                rows[device] = accel.ProcessMemory("unreadable")
+            else:
+                rows[device] = accel.ProcessMemory("absent", 0)
+        return rows
+
     def _reclaim_owner(self, owner: OwnerRecord, why: str) -> ReclaimEvidence:
         owner, known, device = self._stop_and_observe_reclaim(owner, why)
+        devices = self._device_evidence(known)
         status = self._reap_and_prove_absent(known, owner.process)
         self._remove_scope_and_owner(owner)
-        return ReclaimEvidence(status, device)
+        return ReclaimEvidence(
+            status,
+            device,
+            members=tuple(sorted(process.pid for process in known)),
+            devices=devices,
+        )
 
     def retire_current(self, expected: Executor, why: str) -> ReclaimEvidence | None:
         """Withdraw, kill, and prove reclaim of exactly `expected`.

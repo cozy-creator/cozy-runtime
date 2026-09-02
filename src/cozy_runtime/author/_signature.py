@@ -66,6 +66,8 @@ class ModelBinding:
     stamps: Mapping[str, str]
     components: Mapping[str, tuple[str, ...]]
     source_profile: str | None = None
+    sequence_parallel: tuple[int, ...] = ()
+    """`@sequence_parallel(degrees=...)` on the class: the degrees it shards at (cr-068)."""
 
     @property
     def class_key(self) -> str:
@@ -120,6 +122,7 @@ class Surface:
                     stamps=annotation.__stamps__,
                     components=component_use(annotation),
                     source_profile=self.source_profiles.get(p.name),
+                    sequence_parallel=tuple(annotation.__sequence_parallel__),
                 )
             )
         return tuple(bindings)

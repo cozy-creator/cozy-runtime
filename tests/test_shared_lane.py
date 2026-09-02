@@ -739,6 +739,9 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
             primary = worker._placement_from_entry({**document, "placement_id": "plc-p"}, b"")
             worker.placement = primary
             worker.bindings = dict(staged.declared_bindings)
+            # a WIDE envelope: the RecordOwner pins (cr-068); the worker validates the pin
+            # against the driver's reading of that card and never picks one itself
+            worker.accepted.device_pins = {"plc-p": (0,)}
             assert worker._assign_lane(primary, worker.bindings, worker.supervision)
             assert primary.lane_id == "lane-0"
             with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):
@@ -770,14 +773,17 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
             # it and the fit rule would (rightly) never choose it. The assignment step alone
             # is handed a reading for it — what a second real card would report — so the
             # step-1 rule can be shown choosing the empty lane over sharing lane 0.
+            # PINNED to ordinal 1 (cr-068): on a wide envelope the RecordOwner names the
+            # device; the worker validates the pin against the reading and never chooses.
             lane_q = worker.lanes.assign(
                 "plc-q",
                 model_bearing=True,
                 declared_bytes=store.weight_bytes,
                 measured={
-                    "lane-0": accel.device_memory("0", accel.host_backend_family()),
-                    "lane-1": accel.DeviceMemory("measured", 8 << 30, 8 << 30),
+                    0: accel.device_memory("0", accel.host_backend_family()),
+                    1: accel.DeviceMemory("measured", 8 << 30, 8 << 30),
                 },
+                pin=(1,),
             )
             assert lane_q.lane_id == "lane-1", lane_q
             hosted_placement.lane_id = "lane-1"

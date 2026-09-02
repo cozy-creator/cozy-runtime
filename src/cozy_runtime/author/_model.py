@@ -165,9 +165,28 @@ class ModelTestHarness:
             raise AssertionError(f"component scopes were {got}, expected {expected}")
 
 
+class GroupMirror(Protocol):
+    """The runtime's sequence-parallel seam, installed beside the residency plane.
+
+    Under a group lane (cr-068) the runtime holds K replicas of one model in K processes;
+    the handler runs on rank 0 alone and every OUTERMOST component-use method it enters is
+    mirrored to the others with the same arguments, so the ranks' collectives pair up.
+    Absent everywhere but under a group: a single-device generation carries `None` and
+    the wrapper below calls nothing.
+    """
+
+    def enter(
+        self, method: str, args: tuple[object, ...], kwargs: Mapping[str, object]
+    ) -> None: ...
+
+    def leave(self, method: str, failed: bool) -> None: ...
+
+
 class _ScopedModel(Protocol):
     """What `@uses_components` needs from the instance it wraps — so the decorator is
     ParamSpec-preserving and fully typed without an `Any` seam (§1.7)."""
+
+    _cozy_group: GroupMirror | None
 
     def _cozy_scope(self, method: str, components: tuple[str, ...]) -> _Scope: ...
 
@@ -258,6 +277,47 @@ def uses_components(
     return decorate
 
 
+def sequence_parallel(*, degrees: Sequence[int]) -> Callable[[type[ModelT]], type[ModelT]]:
+    """Declare that this Model class's attention is head-shardable at `degrees` (cr-068).
+
+    The author's statement, and only the author can make it: at each degree K the class's
+    attention heads divide by K, its quantization is shard-invariant (rowwise activation
+    scales), and the whole pipeline is built identically on every rank. The runtime reads
+    it into the descriptor slot (`sequence_parallel.degrees`); a RecordOwner pins a
+    placement to K devices only at a declared K, and the worker never chooses a degree.
+    "Qualified" is the measured half, recorded per device class like any other proof.
+    """
+    if not degrees:
+        raise ConformanceError(
+            "@sequence_parallel(degrees=()) declares nothing: omit the decorator instead",
+            code="sequence_parallel_degrees",
+        )
+    values: list[int] = []
+    for degree in degrees:
+        if isinstance(degree, bool) or not isinstance(degree, int) or degree < 2:
+            raise ConformanceError(
+                f"@sequence_parallel(degrees={list(degrees)!r}): a degree is an int >= 2",
+                code="sequence_parallel_degrees",
+            )
+        values.append(degree)
+    if values != sorted(set(values)):
+        raise ConformanceError(
+            f"@sequence_parallel(degrees={list(degrees)!r}): degrees are sorted and unique",
+            code="sequence_parallel_degrees",
+        )
+
+    def decorate(cls: type[ModelT]) -> type[ModelT]:
+        if not (inspect.isclass(cls) and issubclass(cls, Model)):
+            raise ConformanceError(
+                "@sequence_parallel decorates a Model class",
+                code="sequence_parallel_placement",
+            )
+        cls.__sequence_parallel__ = tuple(values)
+        return cls
+
+    return decorate
+
+
 def _is_async(fn: Callable[..., object]) -> bool:
     return inspect.iscoroutinefunction(inspect.unwrap(fn))
 
@@ -268,7 +328,16 @@ def _sync_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> R:
         with self._cozy_scope(fn.__name__, components):
-            result = fn(self, *args, **kwargs)
+            mirror = self._cozy_group
+            if mirror is not None:
+                mirror.enter(fn.__name__, args, kwargs)
+            failed = True
+            try:
+                result = fn(self, *args, **kwargs)
+                failed = False
+            finally:
+                if mirror is not None:
+                    mirror.leave(fn.__name__, failed)
             _refuse_lazy(fn.__name__, result)
             return result
 
@@ -283,7 +352,16 @@ def _async_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     async def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> object:
         with self._cozy_scope(fn.__name__, components):
-            result = await fn(self, *args, **kwargs)  # type: ignore[misc]
+            mirror = self._cozy_group
+            if mirror is not None:
+                mirror.enter(fn.__name__, args, kwargs)
+            failed = True
+            try:
+                result = await fn(self, *args, **kwargs)  # type: ignore[misc]
+                failed = False
+            finally:
+                if mirror is not None:
+                    mirror.leave(fn.__name__, failed)
             _refuse_lazy(fn.__name__, result)
             return result
 
@@ -324,6 +402,10 @@ class Model[PipelineT]:
 
     __stamps__: Mapping[str, str] = {}
 
+    __sequence_parallel__: tuple[int, ...] = ()
+    """`@sequence_parallel(degrees=...)`: the degrees this class shards at. Empty is the
+    honest default - a class that said nothing is never sharded."""
+
     __encoded_leaves__: str = "refuse"
     """The class's `encoded_leaves=` declaration, defaulted to the conservative answer.
 
@@ -347,6 +429,8 @@ class Model[PipelineT]:
     _cozy_residency: Residency | None = None
     """Runtime-installed. Absent under `for_test` and in derive mode, which is the whole
     reason a scope works without one: a test double has no bytes to stage."""
+    _cozy_group: GroupMirror | None = None
+    """Runtime-installed under a group lane only (cr-068): the sequence-parallel mirror."""
 
     def __init_subclass__(cls, /, **stamps: str) -> None:
         """The class-keyword plane: one keyword per REQUIRED stamp, open vocabulary.

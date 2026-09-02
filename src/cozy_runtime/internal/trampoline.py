@@ -16,7 +16,9 @@ Order matters and is the point:
    and (2) the parent could have died, and pdeathsig only fires on future deaths. The
    re-check is what closes that race.
 3. **containment** — join the worker-created cgroup-v2 scope, or prove the exact inherited
-   process-tree token in a positively qualified credential-unwritable container.
+   process-tree token in a positively qualified credential-unwritable container — or, for
+   a follower rank of a group lane (cr-068, `inherit`), keep rank 0's scope and PGID exactly
+   as inherited: a follower is a child of the executor, never of the worker.
 4. **no_new_privs** — after this, exec can never gain privileges; setuid bits are inert.
 5. **oom_score_adj** — the EXECUTOR raises its OWN score. The worker stays a bare
    interpreter at the default score so the kernel's OOM victim ordering picks the disposable
@@ -85,9 +87,9 @@ def main(argv: list[str]) -> None:
     if scope_backend == "cgroup_v2":
         if not cgroup_path or cgroup_inode <= 0:
             _fail("an exact cgroup-v2 executor scope is required", Exit.structural)
-    elif scope_backend == "process_tree":
+    elif scope_backend in ("process_tree", "inherit"):
         if cgroup_path or cgroup_inode:
-            _fail("a process-tree scope cannot also name a cgroup", Exit.structural)
+            _fail(f"a {scope_backend} scope cannot also name a cgroup", Exit.structural)
     else:
         _fail(f"unknown containment backend {scope_backend!r}", Exit.structural)
 
@@ -135,8 +137,11 @@ def main(argv: list[str]) -> None:
 
     # Keep executor-directed signals out of the worker's group. Under process-tree
     # containment, stop before package import so the parent can fsync this exact birth and
-    # PGID before allowing any first-party descendant to exist.
-    proctree.own_process_group()
+    # PGID before allowing any first-party descendant to exist. A FOLLOWER RANK (cr-068,
+    # `inherit`) is spawned by rank 0 inside rank 0's scope: it keeps rank 0's cgroup and
+    # PGID by inheritance, so it dies with the group under either backend, and joins nothing.
+    if scope_backend != "inherit":
+        proctree.own_process_group()
     if scope_backend == "process_tree":
         os.kill(os.getpid(), signal.SIGSTOP)
     for number in (signal.SIGTERM, signal.SIGINT, signal.SIGXFSZ, signal.SIGPIPE):

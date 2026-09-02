@@ -1198,6 +1198,7 @@ def development_placement_documents(
                     stamps=selected.stamps,
                     model_weight_bytes=selected.model_weight_bytes,
                     custody=selected.custody,
+                    sequence_parallel_degrees=tuple(selected.slot.sequence_parallel),
                 )
             )
         slots.sort(key=lambda row: row.slot)

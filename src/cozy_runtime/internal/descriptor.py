@@ -111,6 +111,10 @@ def _model(binding: ModelBinding) -> dict[str, Json]:
     }
     if binding.source_profile is not None:
         doc["source_profile"] = binding.source_profile
+    if binding.sequence_parallel:
+        # The author's opt-in to a group lane (cr-068): the degrees the class's attention
+        # shards at. Closed and optional; a slot without it is never sharded.
+        doc["sequence_parallel"] = {"degrees": list(binding.sequence_parallel)}
     return doc
 
 
@@ -355,10 +359,14 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                 slot = _closed(
                     model,
                     {"class", "component_use", "path", "stamps"},
-                    {"source_profile"},
+                    {"source_profile", "sequence_parallel"},
                     source,
                     model_path,
                 )
+                if "sequence_parallel" in slot:
+                    _sequence_parallel(
+                        slot["sequence_parallel"], source, f"{model_path}.sequence_parallel"
+                    )
                 prefix = f"{name}.models."
                 if (
                     not isinstance(slot["path"], str)
@@ -582,6 +590,19 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
             _invalid(source, f"{path}.literal", "must be an array")
     elif not isinstance(child, str) or not child:
         _invalid(source, f"{path}.{form}", "must be a non-empty string")
+
+
+def _sequence_parallel(value: Json, source: str, path: str) -> None:
+    """`{"degrees": [K, ...]}`: non-empty, ints >= 2, sorted unique (cr-068)."""
+    declared = _closed(value, {"degrees"}, set(), source, path)
+    degrees = declared["degrees"]
+    if (
+        not isinstance(degrees, list)
+        or not degrees
+        or not all(isinstance(d, int) and not isinstance(d, bool) and d >= 2 for d in degrees)
+        or degrees != sorted(set(degrees))
+    ):
+        _invalid(source, f"{path}.degrees", "must be a non-empty sorted unique list of ints >= 2")
 
 
 def _closed(

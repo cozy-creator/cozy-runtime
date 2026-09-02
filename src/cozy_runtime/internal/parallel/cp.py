@@ -1,0 +1,310 @@
+"""Installing Ulysses sequence parallelism on a generation - the runtime's job, never the
+package's.
+
+Installing CP puts split/all-to-all/gather hooks ON THE MODULES, so from that moment EVERY
+forward through them issues collectives - and the model's component-use method is the only
+seam that supplies participants on the other ranks. A forward from anywhere else (a warm
+compile, a mint seed, a probe, a package calling a component by hand) runs on rank 0 alone
+and HANGS the whole group in NCCL. `gated_call` marks the dynamic extent in which
+collectives have participants; the guard installed on every sharded component refuses a
+forward outside it (`ungated_sharded_forward`) instead of hanging.
+
+The ordering is FORCED: set the attention backend, enable parallelism, then compile -
+compiling AFTER the hooks puts the split/all-to-all/gather inside the traced graph. CP and
+CPU offload do not compose (diffusers #12533), so an offloaded pipeline refuses. Ring
+attention is not installed (it needs the attention kernel's LSE); this is Ulysses only.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import threading
+from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import Any, cast
+
+from cozy_runtime.internal.parallel.plan import GroupRefusal
+
+_tls = threading.local()
+
+
+class gated_call:
+    """Mark the dynamic extent in which collectives have participants on every rank."""
+
+    def __enter__(self) -> None:
+        _tls.active = getattr(_tls, "active", 0) + 1
+
+    def __exit__(self, *exc: object) -> None:
+        _tls.active = max(0, getattr(_tls, "active", 1) - 1)
+
+
+def in_gated_call() -> bool:
+    return bool(getattr(_tls, "active", 0))
+
+
+class ContextParallelUnavailable(GroupRefusal):
+    """This generation cannot be sharded, named exactly."""
+
+    default_code = "context_parallel_unavailable"
+
+
+class UngatedShardedForward(GroupRefusal):
+    """A forward through a CP-sharded module outside the group's call gate."""
+
+    default_code = "ungated_sharded_forward"
+
+
+@dataclass(frozen=True, slots=True)
+class CpComms:
+    """The GROUP's communication facts, passed explicitly - never the default group read
+    ambiently (pgw#773's cross-group corruption)."""
+
+    pg: Any
+    rank: int
+    device: Any
+
+
+class _GroupMesh:
+    """The mesh shape diffusers' `ParallelConfig.setup` reads: ONE Ulysses axis of `size`
+    over the group's process group; the ring axis is degree 1 and refuses if asked for."""
+
+    def __init__(self, pg: Any, size: int, local_rank: int, *, axis: str = "ulysses") -> None:
+        self._pg = pg
+        self._size = int(size)
+        self._local_rank = int(local_rank)
+        self._axis = axis
+
+    def size(self) -> int:
+        return self._size
+
+    def get_group(self) -> Any:
+        if self._axis == "ring":
+            raise ContextParallelUnavailable(
+                "ring attention is not supported: the runtime installs Ulysses sequence "
+                "parallelism only (ring_degree=1)"
+            )
+        return self._pg
+
+    def get_local_rank(self) -> int:
+        return self._local_rank
+
+    def _flatten(self) -> _GroupMesh:
+        return _GroupMesh(self._pg, self._size, self._local_rank)
+
+    def __getitem__(self, key: Any) -> _GroupMesh:
+        if isinstance(key, tuple) or key == "ulysses":
+            return _GroupMesh(self._pg, self._size, self._local_rank)
+        if key == "ring":
+            return _GroupMesh(self._pg, 1, 0, axis="ring")
+        raise KeyError(key)
+
+
+_CP_PLAN_ATTR = "_cp_plan"
+_GUARD_ATTR = "_cozy_cp_gate_guard"
+
+
+def _modules_of(model: Any) -> Iterator[tuple[str, Any]]:
+    """Every torch module reachable from the model's DECLARED state, and the components
+    of any pipeline among them. Declared state is the author's statement of what the
+    model holds (§1.1); nothing else is walked."""
+    from cozy_runtime.author._model import _declared_state
+
+    seen: set[int] = set()
+    for name in _declared_state(type(model)):
+        held = getattr(model, name, None)
+        if held is None:
+            continue
+        candidates = [(name, held)]
+        components = getattr(held, "components", None)
+        if isinstance(components, dict):
+            candidates += [(f"{name}.{key}", value) for key, value in components.items()]
+        for extra in ("transformer", "transformer_2"):
+            if hasattr(held, extra):
+                candidates.append((f"{name}.{extra}", getattr(held, extra)))
+        for label, module in candidates:
+            if module is None or id(module) in seen or not hasattr(module, "named_modules"):
+                continue
+            seen.add(id(module))
+            yield label, module
+
+
+def sharding_candidates(model: Any) -> list[tuple[str, Any]]:
+    """The components that DECLARE a context-parallel plan and can be told to shard."""
+    return [
+        (name, module)
+        for name, module in _modules_of(model)
+        if getattr(module, _CP_PLAN_ATTR, None) and hasattr(module, "enable_parallelism")
+    ]
+
+
+def install_context_parallel(model: Any, *, degree: int, comms: CpComms | None) -> tuple[str, ...]:
+    """Install Ulysses sequence parallelism at `degree` on every declaring component."""
+    if int(degree) <= 1:
+        return ()
+    components = sharding_candidates(model)
+    if not components:
+        raise ContextParallelUnavailable(
+            "no declared component carries a `_cp_plan`; this model has not been adapted "
+            "for context parallelism and sharding it would produce silently wrong output"
+        )
+    _refuse_if_offloaded(model)
+    if comms is None:
+        raise ContextParallelUnavailable(
+            "context parallelism at degree>1 requires the group's explicit process group "
+            "(CpComms); installing against the default process group is exactly the "
+            "pgw#773 cross-group corruption"
+        )
+    refuse_unless_shard_invariant_quant(model, degree=int(degree))
+    installed: list[str] = []
+    for name, component in components:
+        refuse_unless_divisible(tokens=0, heads=_declared_heads(component), degree=int(degree))
+        _install_on_component(component, degree=int(degree), comms=comms)
+        _install_gate_guard(component, name)
+        installed.append(name)
+    return tuple(installed)
+
+
+def _install_gate_guard(component: Any, name: str) -> None:
+    if getattr(component, _GUARD_ATTR, None) is not None:
+        return
+
+    def guard(module: Any, args: Any, kwargs: Any = None) -> None:
+        if in_gated_call():
+            return
+        raise UngatedShardedForward(
+            f"forward through the context-parallel component {name!r} outside the group's "
+            "call gate: this rank would issue collectives no other rank is in. Every forward "
+            "at degree>1 goes through a mirrored component-use method (compile warmups, mint "
+            "seeds, probes and direct component calls are refused under context parallelism)"
+        )
+
+    handle = component.register_forward_pre_hook(guard, with_kwargs=True)
+    with contextlib.suppress(Exception):  # a frozen module keeps the hook anyway
+        setattr(component, _GUARD_ATTR, handle)
+
+
+def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> None:
+    import torch
+
+    try:
+        from diffusers.hooks.context_parallel import apply_context_parallel
+        from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelConfig
+        from diffusers.models.attention import AttentionModuleMixin
+        from diffusers.models.attention_dispatch import (
+            AttentionBackendName,
+            _AttentionBackendRegistry,
+        )
+        from diffusers.models.attention_processor import Attention
+    except Exception as exc:  # version drift must be typed
+        raise ContextParallelUnavailable(
+            f"diffusers CP surface unavailable: {type(exc).__name__}: {exc}"
+        ) from exc
+    attention_classes: tuple[type, ...] = (Attention, AttentionModuleMixin)
+
+    cp_config = ContextParallelConfig(ulysses_degree=int(degree))
+    config = ParallelConfig(context_parallel_config=cp_config)
+    for module in component.modules():
+        if not isinstance(module, attention_classes):
+            continue
+        processor = getattr(module, "processor", None)
+        if processor is None or not hasattr(processor, "_attention_backend"):
+            continue
+        backend = processor._attention_backend
+        if backend is None:
+            backend, _ = _AttentionBackendRegistry.get_active_backend()
+        else:
+            backend = AttentionBackendName(backend)
+        if not _AttentionBackendRegistry._is_context_parallel_available(backend):
+            supported = sorted(_AttentionBackendRegistry._supports_context_parallel)
+            raise ContextParallelUnavailable(
+                f"attention backend {backend.value!r} does not support context parallelism; "
+                f"set one of {supported} before arming"
+            )
+        break
+
+    device = (
+        comms.device if isinstance(comms.device, torch.device) else torch.device(str(comms.device))
+    )
+    mesh = _GroupMesh(comms.pg, int(degree), int(comms.rank))
+    config.setup(int(comms.rank), int(degree), device, mesh=cast(Any, mesh))
+    component._parallel_config = config
+    for module in component.modules():
+        if not isinstance(module, attention_classes):
+            continue
+        processor = getattr(module, "processor", None)
+        if processor is not None and hasattr(processor, "_parallel_config"):
+            processor._parallel_config = config
+    plan = getattr(component, _CP_PLAN_ATTR, None)
+    if not plan:
+        raise ContextParallelUnavailable(
+            f"{type(component).__name__} lost its `_cp_plan` between candidate discovery "
+            "and install"
+        )
+    apply_context_parallel(component, cp_config, plan)
+
+
+def _refuse_if_offloaded(model: Any) -> None:
+    for name, module in _modules_of(model):
+        for marker in ("_all_hooks", "_offload_gpu_id", "hf_device_map"):
+            if getattr(module, marker, None):
+                raise ContextParallelUnavailable(
+                    f"{name} carries {marker!r}: CPU offload and context parallelism do not "
+                    "compose (diffusers #12533); a generation that needs offload serves at "
+                    "degree 1"
+                )
+
+
+def _declared_heads(component: Any) -> int:
+    config = getattr(component, "config", None)
+    for attr in ("num_attention_heads", "num_heads", "attention_heads"):
+        for holder in (config, component):
+            if holder is None:
+                continue
+            try:
+                heads = int(getattr(holder, attr, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if heads > 0:
+                return heads
+    return 0
+
+
+def refuse_unless_divisible(*, tokens: int, heads: int, degree: int) -> None:
+    """The diffusers #12536 assertion, checked BEFORE a device is committed."""
+    d = int(degree)
+    if d <= 1:
+        return
+    if int(tokens) % d:
+        raise ContextParallelUnavailable(
+            f"sequence length {tokens} is not divisible by ulysses_degree {d}"
+        )
+    if int(heads) % d:
+        raise ContextParallelUnavailable(
+            f"attention head count {heads} is not divisible by ulysses_degree {d}"
+        )
+
+
+def refuse_unless_shard_invariant_quant(model: Any, *, degree: int) -> None:
+    """W8A8 composes with CP with one typed exception: `rowwise` derives a scale per TOKEN,
+    a function of that token alone and identical whichever rank holds it; `pertensor`
+    derives one scalar from the LOCAL shard, so two ranks quantize the same logical tensor
+    differently and the group produces silently wrong output. That is the quiet failure
+    mode, which is why this refuses rather than warns."""
+    if int(degree) <= 1:
+        return
+    bad: list[str] = []
+    for name, module in _modules_of(model):
+        for inner_name, inner in module.named_modules():
+            mode = getattr(inner, "gemm_mode", "")
+            if mode and mode != "rowwise":
+                bad.append(f"{name}.{inner_name}={mode}")
+                if len(bad) >= 4:
+                    break
+        if len(bad) >= 4:
+            break
+    if bad:
+        raise ContextParallelUnavailable(
+            "w8a8 gemm_mode must be `rowwise` under context parallelism: a per-tensor "
+            "activation scale is derived from the local sequence shard, so each rank "
+            f"quantizes differently and the output is silently wrong. Found {', '.join(bad)}"
+        )

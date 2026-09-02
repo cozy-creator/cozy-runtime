@@ -87,6 +87,15 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "selected a device, and every executor saw the whole envelope and used card 0",
     ),
     ProjectedVar(
+        "NCCL_NVLS_ENABLE",
+        "worker.device_lane",
+        "FORCED to 0 in a GROUP lane's seal (cr-068, pgw#929): NCCL enables NVLink SHARP "
+        "multicast by default on NVSwitch hosts, binding it needs a privilege our containers "
+        "lack, and the first all-to-all then dies with CUDA error 401. Ulysses never uses "
+        "it. Erased then imposed, so no image or operator export can turn it back on; the "
+        "executor's every rank refuses to form a communicator under any other value",
+    ),
+    ProjectedVar(
         "PYTORCH_CUDA_ALLOC_CONF",
         "plan.allocator_policy",
         "the CUDA caching allocator reads this once at init; late imposition is a no-op",

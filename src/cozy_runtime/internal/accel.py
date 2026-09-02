@@ -105,16 +105,7 @@ def process_memories(pids: set[int], kind: str) -> dict[int, ProcessMemory]:
                     table[int(parts[0])] = int(parts[1]) * 1024 * 1024
                 except ValueError:
                     table[int(parts[0])] = -1
-    return {
-        pid: (
-            ProcessMemory("absent", 0)
-            if pid not in table
-            else ProcessMemory("present", table[pid])
-            if table[pid] >= 0
-            else ProcessMemory("unreadable")
-        )
-        for pid in pids
-    }
+    return _table_rows(pids, table)
 
 
 class _NvmlProcessInfo(ctypes.Structure):
@@ -151,6 +142,44 @@ def _nvml_library() -> ctypes.CDLL | None:
         return library
 
 
+def _nvml_handle(library: ctypes.CDLL, device: str) -> ctypes.c_void_p | None:
+    """One envelope entry's handle: an index by index, anything else by UUID."""
+    handle = ctypes.c_void_p()
+    try:
+        if device.isdigit():
+            answer = library.nvmlDeviceGetHandleByIndex_v2(int(device), ctypes.byref(handle))
+        else:
+            answer = library.nvmlDeviceGetHandleByUUID(device.encode(), ctypes.byref(handle))
+    except (OverflowError, ctypes.ArgumentError, UnicodeEncodeError):
+        return None
+    return handle if answer == _NVML_SUCCESS else None
+
+
+def _nvml_device_compute_table(
+    library: ctypes.CDLL, handle: ctypes.c_void_p
+) -> dict[int, int] | None:
+    """One device's compute processes: pid -> used bytes (-1 when the driver does not
+    account it). None when the driver would not answer for this device."""
+    table: dict[int, int] = {}
+    rows = ctypes.c_uint(0)
+    answer = library.nvmlDeviceGetComputeRunningProcesses_v3(handle, ctypes.byref(rows), None)
+    if answer == _NVML_SUCCESS:
+        return table
+    if answer != _NVML_ERROR_INSUFFICIENT_SIZE:
+        return None
+    # The count is a snapshot; a process can start between the two calls. Ask for room.
+    rows = ctypes.c_uint(rows.value * 2 + 8)
+    infos = (_NvmlProcessInfo * rows.value)()
+    answer = library.nvmlDeviceGetComputeRunningProcesses_v3(handle, ctypes.byref(rows), infos)
+    if answer != _NVML_SUCCESS:
+        return None
+    for info in infos[: rows.value]:
+        used = int(info.usedGpuMemory)
+        # NVML reports "not available" as all bits set.
+        table[int(info.pid)] = -1 if used == (1 << 64) - 1 else used
+    return table
+
+
 def _nvml_compute_table() -> dict[int, int] | None:
     """Every compute process on every device: pid -> used bytes (-1 when the driver does
     not account it). None when NVML is unavailable, so the caller falls back."""
@@ -165,23 +194,82 @@ def _nvml_compute_table() -> dict[int, int] | None:
         handle = ctypes.c_void_p()
         if library.nvmlDeviceGetHandleByIndex_v2(index, ctypes.byref(handle)) != _NVML_SUCCESS:
             return None
-        rows = ctypes.c_uint(0)
-        answer = library.nvmlDeviceGetComputeRunningProcesses_v3(handle, ctypes.byref(rows), None)
-        if answer == _NVML_SUCCESS:
-            continue
-        if answer != _NVML_ERROR_INSUFFICIENT_SIZE:
+        rows = _nvml_device_compute_table(library, handle)
+        if rows is None:
             return None
-        # The count is a snapshot; a process can start between the two calls. Ask for room.
-        rows = ctypes.c_uint(rows.value * 2 + 8)
-        infos = (_NvmlProcessInfo * rows.value)()
-        answer = library.nvmlDeviceGetComputeRunningProcesses_v3(handle, ctypes.byref(rows), infos)
-        if answer != _NVML_SUCCESS:
-            return None
-        for info in infos[: rows.value]:
-            used = int(info.usedGpuMemory)
-            # NVML reports "not available" as all bits set.
-            table[int(info.pid)] = -1 if used == (1 << 64) - 1 else used
+        table.update(rows)
     return table
+
+
+def _table_rows(pids: set[int], table: dict[int, int]) -> dict[int, ProcessMemory]:
+    return {
+        pid: (
+            ProcessMemory("absent", 0)
+            if pid not in table
+            else ProcessMemory("present", table[pid])
+            if table[pid] >= 0
+            else ProcessMemory("unreadable")
+        )
+        for pid in pids
+    }
+
+
+def process_memories_by_device(
+    pids: set[int], kind: str, devices: tuple[str, ...]
+) -> dict[str, dict[int, ProcessMemory]]:
+    """`process_memories`, PER DEVICE of a lane (cr-068): entry -> pid -> the driver's row.
+
+    A group lane's executor is K processes over K cards, and its reclaim is proved absent
+    on every one of them. The merged table is what the reclaim loop waits on (absent on
+    every device the driver has is absent on these); this is the per-entry evidence the
+    record carries. An entry the driver does not have, or a query it refuses, is
+    UNREADABLE for every pid - never absent by omission. In a PID namespace the driver
+    reports HOST pids, so a row here can only ever confirm the OS-state half, never
+    replace it.
+    """
+    if not pids or kind == "mps":
+        return {device: {pid: ProcessMemory("unreadable") for pid in pids} for device in devices}
+    library = _nvml_library()
+    out: dict[str, dict[int, ProcessMemory]] = {}
+    for device in devices:
+        table: dict[int, int] | None = None
+        if library is not None:
+            handle = _nvml_handle(library, device)
+            table = _nvml_device_compute_table(library, handle) if handle is not None else None
+        else:
+            try:
+                lines = (
+                    subprocess.run(
+                        [
+                            "nvidia-smi",
+                            f"--id={device}",
+                            "--query-compute-apps=pid,used_memory",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    .stdout.strip()
+                    .splitlines()
+                )
+            except (OSError, subprocess.SubprocessError):
+                lines = None
+            if lines is not None:
+                table = {}
+                for line in lines:
+                    parts = [part.strip() for part in line.split(",")]
+                    if len(parts) == 2 and parts[0].isdigit():
+                        try:
+                            table[int(parts[0])] = int(parts[1]) * 1024 * 1024
+                        except ValueError:
+                            table[int(parts[0])] = -1
+        out[device] = (
+            {pid: ProcessMemory("unreadable") for pid in pids}
+            if table is None
+            else _table_rows(pids, table)
+        )
+    return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,15 +301,8 @@ def _nvml_device_memory(device: str) -> DeviceMemory | None:
     library = _nvml_library()
     if library is None:
         return None
-    handle = ctypes.c_void_p()
-    try:
-        if device.isdigit():
-            answer = library.nvmlDeviceGetHandleByIndex_v2(int(device), ctypes.byref(handle))
-        else:
-            answer = library.nvmlDeviceGetHandleByUUID(device.encode(), ctypes.byref(handle))
-    except (OverflowError, ctypes.ArgumentError, UnicodeEncodeError):
-        return DeviceMemory("unreadable")
-    if answer != _NVML_SUCCESS:
+    handle = _nvml_handle(library, device)
+    if handle is None:
         return DeviceMemory("unreadable")
     memory = _NvmlMemory()
     if library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) != _NVML_SUCCESS:

@@ -97,6 +97,7 @@ from cozy_runtime.author._model import (
     ModelRegistry,
     ModelTestHarness,
     ScopeCall,
+    sequence_parallel,
     uses_components,
 )
 from cozy_runtime.author._services import (
@@ -250,5 +251,6 @@ __all__ = [
     "prepare",
     "register_adapter",
     "registered_adapters",
+    "sequence_parallel",
     "uses_components",
 ]
