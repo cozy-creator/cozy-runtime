@@ -815,6 +815,116 @@ def fence_worker_derive_free() -> list[str]:
     return worker_derive_free_violations(SRC / "internal" / "worker")
 
 
+#: cr-080 (residency-aware-routing.md §5): residency crosses to an orchestrator as TWO SETS —
+#: `DeviceLane.resident_placement_ids`, `ObservedWorkerState.held_manifests` — and nothing that
+#: would let it price VRAM. The emitter names none of the ledger's pricing vocabulary, and the
+#: three residency-bearing messages are constructed with exactly their vendored fields.
+RESIDENCY_EMITTER = pathlib.Path("src/cozy_runtime/internal/worker/lane_wire.py")
+RESIDENCY_MESSAGES = ("DeviceLane", "ObservedWorkerState", "WorkerSnapshotBody")
+DEVICE_LANE_FIELDS = {
+    "lane_id": 1,
+    "device_ordinals": 2,
+    "available_attempt_slots": 3,
+    "placement_ids": 4,
+    "resident_placement_ids": 5,
+}
+PRICING_NAMES = frozenset(
+    {
+        "resident_bytes",
+        "authorized",
+        "authorize",
+        "authorized_device_limit_bytes",
+        "outstanding",
+        "outstanding_bytes",
+        "allocatable",
+        "headroom",
+        "free_bytes",
+        "total_bytes",
+        "ledger",
+        "chooser",
+        "victims",
+        "last_used",
+    }
+)
+
+
+def _residency_words(tree: ast.AST) -> list[tuple[int, str]]:
+    """Every name, attribute, keyword or string literal in `tree` that is a pricing word."""
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in PRICING_NAMES:
+            found.append((node.lineno, node.id))
+        elif isinstance(node, ast.Attribute) and node.attr in PRICING_NAMES:
+            found.append((node.lineno, node.attr))
+        elif isinstance(node, ast.keyword) and node.arg in PRICING_NAMES:
+            found.append((node.value.lineno, node.arg))
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in PRICING_NAMES
+        ):
+            found.append((node.lineno, node.value))
+    return found
+
+
+def fence_residency_sets_only() -> list[str]:
+    """Two sets, no bytes: the residency emitter and every construction of a residency-
+    bearing message carry membership only (cr-080's grep-level fence, as an AST scan).
+
+    Three arms. (1) `lane_wire.py` names no pricing word anywhere — not as a name, an
+    attribute, a keyword or a document key, so a planted `"resident_bytes"` row key is
+    refused as surely as a planted constructor argument. (2) Every `pb.DeviceLane(...)`,
+    `pb.ObservedWorkerState(...)` and `pb.WorkerSnapshotBody(...)` call under `src/` passes
+    keywords from the vendored descriptor only, none of them a pricing word. (3) The
+    positional proof: the vendored `DeviceLane` carries exactly the five proto-026 fields
+    at their numbers, so a field added to the wire message is refused here before any
+    emitter could fill it.
+    """
+    bad: list[str] = []
+    emitter = ROOT / RESIDENCY_EMITTER
+    for line, word in _residency_words(ast.parse(emitter.read_text())):
+        bad.append(
+            f"{RESIDENCY_EMITTER}:{line}: the residency emitter names {word!r} — the wire "
+            "carries two SETS (resident placements, held manifests) and no pricing fact"
+        )
+    sys.path.insert(0, str(ROOT / "src"))
+    try:
+        from cozy.worker.v1 import worker_pb2 as pb
+    finally:
+        sys.path.pop(0)
+    fields = {
+        name: {f.name: f.number for f in getattr(pb, name).DESCRIPTOR.fields}
+        for name in RESIDENCY_MESSAGES
+    }
+    if fields["DeviceLane"] != DEVICE_LANE_FIELDS:
+        bad.append(
+            f"vendored DeviceLane carries {fields['DeviceLane']}; proto-026 fixes it at "
+            f"{DEVICE_LANE_FIELDS} — a residency field beyond the two sets is refused"
+        )
+    for name, numbered in fields.items():
+        for word in sorted(set(numbered) & PRICING_NAMES):
+            bad.append(f"vendored {name}.{word} prices residency on the wire")
+    for path in py_files():
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in RESIDENCY_MESSAGES or _dotted(node.func.value) != "pb":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    bad.append(
+                        f"{path.relative_to(ROOT)}:{node.lineno}: pb.{node.func.attr}(**...) "
+                        "hides its fields from the residency fence"
+                    )
+                elif keyword.arg not in fields[node.func.attr] or keyword.arg in PRICING_NAMES:
+                    bad.append(
+                        f"{path.relative_to(ROOT)}:{node.lineno}: pb.{node.func.attr}("
+                        f"{keyword.arg}=...) is not a vendored field of the message"
+                    )
+    return bad
+
+
 FENCES = {
     "forbidden-dependency": fence_forbidden_dependency,
     "one-attempt-kernel": fence_one_attempt_kernel,
@@ -833,6 +943,7 @@ FENCES = {
     "supervised-worker-lanes": fence_supervised_worker_lanes,
     "base-distributions": fence_base_distributions,
     "worker-derive-free": fence_worker_derive_free,
+    "residency-sets-only": fence_residency_sets_only,
 }
 
 

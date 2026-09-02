@@ -1,9 +1,18 @@
 """Device lanes ON THE WIRE (proto-024, minor 22): the read and emit sites, isolated.
 
-* `read_device_pins`    - `DesiredPlacementSet.device_pins[4]` -> {placement_id: ordinals}
-* `emit_lanes`          - `ObservedWorkerState.lanes[26]` / `WorkerSnapshotBody.lanes[12]`
-* `emit_device_lane_id` - `PlacementStatus.device_lane_id[19]`
-* `lanes_on_wire`       - the fence condition: the NEGOTIATED minor carries lanes
+* `read_device_pins`      - `DesiredPlacementSet.device_pins[4]` -> {placement_id: ordinals}
+* `emit_lanes`            - `ObservedWorkerState.lanes[26]` / `WorkerSnapshotBody.lanes[12]`,
+                            each row with its `resident_placement_ids[5]` (proto-026)
+* `emit_held_manifests`   - `ObservedWorkerState.held_manifests[27]` /
+                            `WorkerSnapshotBody.held_manifests[13]` (proto-026)
+* `emit_device_lane_id`   - `PlacementStatus.device_lane_id[19]`
+* `lanes_on_wire`         - the fence condition: the NEGOTIATED minor carries lanes
+
+RESIDENCY CROSSES AS TWO SETS AND NOTHING ELSE (residency-aware-routing.md §5, cr-080):
+the placements resident on a lane and the manifests the verified store holds. No bytes,
+ceiling, headroom, plan or LRU order is named in this module — `checks/architecture.py`'s
+`residency-sets-only` fence refuses the vocabulary here and on every construction of the
+three residency-bearing messages.
 
 The vendored bindings carry every field; what varies per session is the RecordOwner's
 minor. An owner below 22 cannot read `lanes[]` (one worker-level count over N lanes is the
@@ -49,6 +58,7 @@ def lane_document(lane: DeviceLane, available_attempt_slots: int) -> dict[str, A
         "device_ordinals": list(lane.ordinals),
         "available_attempt_slots": int(available_attempt_slots),
         "placement_ids": sorted(lane.placements),
+        "resident_placement_ids": lane.resident_placement_ids(),
     }
 
 
@@ -63,8 +73,16 @@ def emit_lanes(
                 device_ordinals=[int(o) for o in row["device_ordinals"]],
                 available_attempt_slots=int(row["available_attempt_slots"]),
                 placement_ids=[str(p) for p in row["placement_ids"]],
+                resident_placement_ids=[str(p) for p in row["resident_placement_ids"]],
             )
         )
+
+
+def emit_held_manifests(
+    target: pb.ObservedWorkerState | pb.WorkerSnapshotBody, digests: list[str]
+) -> None:
+    """`held_manifests`: the manifests the verified store holds complete, sorted unique."""
+    target.held_manifests.extend(sorted(set(str(d) for d in digests)))
 
 
 def emit_device_lane_id(status: pb.PlacementStatus, lane_id: str) -> None:

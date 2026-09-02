@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
@@ -140,6 +140,67 @@ class VerifiedArtifactCache:
         with self._lock:
             self._files[digest] = receipt
         return receipt
+
+
+class HeldManifests:
+    """The worker's ONE index of the TensorFS manifests its verified store holds COMPLETE
+    (cr-080, residency-aware-routing.md §2): `ObservedWorkerState.held_manifests` and the
+    snapshot's copy read it. Membership only — a manifest is held when TensorFS's own
+    verified walk (`acquire_cozytensors`, the walk the model leg already ends on) admits
+    every object of its runtime closure, whether or not a current placement uses it.
+
+    Two writers: `observe`, when a placement's model leg settles a manifest, and `rebuild`
+    at boot, which re-walks the store without a network. A manifest leaves the set when a
+    walk finds it incomplete (the bytes went); nothing here removes bytes.
+    """
+
+    def __init__(self, on_change: Callable[[], None] | None = None) -> None:
+        self._lock = Lock()
+        self._held: set[str] = set()
+        self._on_change = on_change
+
+    def digests(self) -> list[str]:
+        with self._lock:
+            return sorted(self._held)
+
+    def observe(self, store: Any, digest: str) -> bool:
+        """Re-ask the store whether `digest` is complete and verified; record the answer."""
+        try:
+            store.acquire_cozytensors(digest).release()
+            held = True
+        except Exception:
+            held = False
+        with self._lock:
+            before = digest in self._held
+            (self._held.add if held else self._held.discard)(digest)
+        if held != before and self._on_change is not None:
+            self._on_change()
+        return held
+
+    def rebuild(self, store: Any, root: Path) -> tuple[int, int]:
+        """Walk every manifest the store's shard layout names and keep the complete ones.
+        Returns (held, named). The layout read here only NAMES candidates — the store's
+        Python facade has no listing door — and TensorFS's verified walk decides each."""
+        named = sorted(
+            f"sha256:{path.stem}"
+            for path in (root / "manifests").glob("*/*/*.json")
+            if len(path.stem) == 64 and all(c in "0123456789abcdef" for c in path.stem)
+        )
+        held = {digest for digest in named if self._complete(store, digest)}
+        with self._lock:
+            changed = held != self._held
+            self._held = held
+        if changed and self._on_change is not None:
+            self._on_change()
+        return len(held), len(named)
+
+    @staticmethod
+    def _complete(store: Any, digest: str) -> bool:
+        try:
+            store.acquire_cozytensors(digest).release()
+        except Exception:
+            return False
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +372,7 @@ class Acquirer:
         base: base_observation.Observation | None = None,
         installed_environment: package_environment.InstalledEnvironment | None = None,
         verified_cache: VerifiedArtifactCache | None = None,
+        held_manifests: HeldManifests | None = None,
         on_observation: Any = None,
         native_environment: Mapping[str, str] | None = None,
         native_device_index: int = 0,
@@ -324,6 +386,7 @@ class Acquirer:
         self.base = base or package_environment.observe_base(python)
         self.installed_environment = installed_environment
         self.verified_cache = verified_cache or VerifiedArtifactCache()
+        self.held_manifests = held_manifests or HeldManifests()
         self.native_environment = native_environment
         self.native_device_index = native_device_index
         self.fetched_bytes = self.verified_bytes = self.trusted_reuse_bytes = self.wheels = 0
@@ -565,7 +628,9 @@ class Acquirer:
                         downloaded=outcome.bytes_moved,
                         reused=max(0, outcome.bytes_total - outcome.bytes_moved),
                     )
-                else:
+                # The leg ends on TensorFS's verified walk over the manifest's runtime
+                # closure; the same walk is the residency fact `held_manifests` reports.
+                if not self.held_manifests.observe(store, manifest_digest):
                     store.acquire_cozytensors(manifest_digest).release()
                 count += len(closure)
             return count
