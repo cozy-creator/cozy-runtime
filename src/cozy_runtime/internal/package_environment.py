@@ -418,13 +418,14 @@ def materialize(
             reused=True,
             python=python,
         )
-        _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+        booted = _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
         _qualify_native_environment(
             installed,
             inspected,
             observed,
             native_environment,
             native_device_index,
+            booted,
         )
         return installed
     reused = final.exists()
@@ -448,13 +449,14 @@ def materialize(
                 reused=False,
                 base=observed,
             )
-            _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
+            booted = _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
             _qualify_native_environment(
                 staged,
                 inspected,
                 observed,
                 native_environment,
                 native_device_index,
+                booted,
             )
             _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
             _make_read_only(staging)
@@ -481,13 +483,14 @@ def materialize(
         python=python,
     )
     if reused:
-        _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+        booted = _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
         _qualify_native_environment(
             installed,
             inspected,
             observed,
             native_environment,
             native_device_index,
+            booted,
         )
     return installed
 
@@ -566,6 +569,7 @@ def _qualify_native_environment(
     base: base_observation.Observation,
     environment: Mapping[str, str] | None,
     device_index: int,
+    boot_versions: Mapping[str, str] | None = None,
 ) -> None:
     native = tuple(item for item in inspected if item.native_members)
     if not native:
@@ -586,7 +590,11 @@ def _qualify_native_environment(
         inspection = native_wheel.inspect_tree(installed.site_packages, members)
         gpu = native_wheel.observe_gpu(device_index) if base.accelerator_backend != "none" else None
         seat = native_wheel.observe_seat(installed.python, environment)
-        native_wheel.verify_seat(base, seat, gpu=gpu)
+        venv_versions = {
+            **{item.wheel.distribution: item.wheel.version for item in inspected},
+            **(boot_versions or {}),
+        }
+        native_wheel.verify_seat(base, seat, gpu=gpu, venv_versions=venv_versions)
         native_wheel.qualify_host(
             inspection,
             gpu_sm=gpu["sm"] if gpu is not None else None,
@@ -1523,7 +1531,7 @@ def _install_with_uv(
 
 def _verify_boot_installs(
     site_packages: Path, boot_installs: Sequence[BootInstall], *, reused: bool
-) -> None:
+) -> dict[str, str]:
     """Prove every boot-installed distribution present and in range, then say so.
 
     Runs on EVERY open of a generation that needs boot rows — fresh or reused — because the
@@ -1531,8 +1539,9 @@ def _verify_boot_installs(
     content identity. A generation that predates this image's needs is named, not served.
     """
 
+    chosen_versions: dict[str, str] = {}
     if not boot_installs:
-        return
+        return chosen_versions
     installed: dict[str, str] = {}
     for entry in site_packages.glob("*.dist-info"):
         name, separator, version = entry.name.removesuffix(".dist-info").rpartition("-")
@@ -1558,12 +1567,14 @@ def _verify_boot_installs(
                 "package_environment_boot_install_out_of_range",
                 f"distribution={row.distribution} required={row.specifier} chosen={chosen}",
             )
+        chosen_versions[row.distribution] = chosen
         print(
             f"[package-environment] boot-install distribution={row.distribution} "
             f"image_version={row.image_version} required={row.specifier} "
             f"chosen={chosen} reused={str(reused).lower()}",
             flush=True,
         )
+    return chosen_versions
 
 
 def _receipt(source: Input, wheels: Sequence[Wheel], content_digest: str) -> dict[str, Any]:

@@ -566,8 +566,16 @@ def verify_seat(
     observation: Mapping[str, object],
     *,
     gpu: GPUObservation | None,
+    venv_versions: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
-    """Verify a native proof process still matches its observed package base."""
+    """Verify a native proof process still matches its observed package base.
+
+    `venv_versions` names the base distributions the package venv itself carries — its
+    own wheels and boot-installs — at the versions it installed. A `--system-site-packages`
+    venv shadows those image copies by ordinary precedence (cr-070), so the probe run under
+    the venv interpreter must measure the venv's version there and the image's everywhere
+    else; either disagreement names the distribution.
+    """
 
     if (
         observation.get("implementation") != "cpython"
@@ -618,11 +626,17 @@ def verify_seat(
                 )
             measured_distributions.append((name, version))
     measured_versions = dict(measured_distributions)
-    if any(measured_versions.get(name) != version for name, version in base.distributions):
-        raise NativeWheelRefusal(
-            "package_environment_native_base_inventory_mismatch",
-            f"measured={len(measured_distributions)} protected={len(base.distributions)}",
-        )
+    shadowed = venv_versions or {}
+    for name, image_version in base.distributions:
+        expected = shadowed.get(name, image_version)
+        measured = measured_versions.get(name)
+        if measured != expected:
+            origin = "venv" if name in shadowed else "image"
+            raise NativeWheelRefusal(
+                "package_environment_native_base_inventory_mismatch",
+                f"distribution={name} measured={measured or 'absent'} "
+                f"expected={expected} ({origin}) image_version={image_version}",
+            )
     torch_version = str(observation.get("torch_version", ""))
     if base.torch_release == "none":
         torch_release_ok = not torch_version
