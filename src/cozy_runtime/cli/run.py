@@ -512,14 +512,8 @@ def _render(
     if not saved:
         rows.append(("outputs", "0 assets"))
     accepted = outcome.accepted
-    if accepted:
-        rows.append(
-            (
-                "plan",
-                f"{accepted.get('delivery', '?')}/{accepted.get('placement', '?')} "
-                f"({accepted.get('compute_dtype', '?')})",
-            )
-        )
+    if accepted and accepted.get("lane_id"):
+        rows.append(("lane", str(accepted["lane_id"])))
     # The bind's CONFESSION, rendered where the person who ran it will see it. The runtime
     # already decided to ignore those keys; this is the "loudly" half of "loudly ignored".
     facts = _bind_facts(outcome)
@@ -543,7 +537,7 @@ def _render(
         "result": outcome.result,
         "outputs": saved,
         "invocation": outcome.invocation,
-        "plan": accepted,
+        "accepted": accepted,
         "ledger": outcome.ledger,
         "timings": outcome.timings,
         "warnings": warnings,

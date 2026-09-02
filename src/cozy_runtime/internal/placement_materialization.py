@@ -278,14 +278,14 @@ def package_environment_input(
     published = {"package", "project_wheel", "release", "release_digest"}
     development = {
         "package",
-        "private_revision_digest",
+        "local_revision_digest",
         "project_wheel",
         "release",
         "source_digest",
     }
     if fields not in (published, development):
         raise LaunchRefusal(
-            "package_invalid", f"fields={sorted(fields)} expected published or private development"
+            "package_invalid", f"fields={sorted(fields)} expected published or local development"
         )
     identity = package["package"]
     version = package["release"]
@@ -297,7 +297,7 @@ def package_environment_input(
         or not version
     ):
         raise LaunchRefusal("package_invalid", "package or release identity is invalid")
-    revision_field = "release_digest" if fields == published else "private_revision_digest"
+    revision_field = "release_digest" if fields == published else "local_revision_digest"
     _require_digest(package[revision_field], f"package.{revision_field}")
 
     _closed(environment, {"wheels"}, "environment")

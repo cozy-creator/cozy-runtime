@@ -465,7 +465,7 @@ flat binding record or pretends the local selection carries Tensorhub's hardware
 On a private rental, an editable checkout is not mounted or watched. Creator builds one exact
 ephemeral project wheel and closed dependency-wheel set, and pod-supervisor verifies their bounded
 WorkerControl chunks into local files. The loopback-only
-`RuntimePreparation.PreparePrivatePackage` method then calls the same wheel/base/venv/descriptor/
+`RuntimePreparation.PrepareLocalPackage` method then calls the same wheel/base/venv/descriptor/
 job-plan implementation as a published package. Its resulting Placement uses
 `DevelopmentPackage` source identity plus the measured project wheel and Environment, so it cannot
 masquerade as a Tensorhub release. Runtime receives no source path, URL, credential, or catalog

@@ -2414,33 +2414,16 @@ class AttemptEngine:
     def accepted_message(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
         """THE acceptance message — one constructor, for a first send and for a re-send.
 
-        There were three, one per lane plus this one, and they had already drifted: the job
-        one omitted `compute_dtype` and the construction digest, which a job plan carries as
-        empty anyway. AttemptAccepted always carries the digests that were JOURNALED, so a
-        re-send can never move them.
+        Acceptance is queue ADMISSION (minor 23, proto-026): journaled, hydrated, queued on
+        a lane. It binds neither a plan nor an executor epoch — both bind at device entry
+        and ride HeldAttempt from RUNNING on — so a re-send can never move anything.
         """
-        assert attempt.plan is not None
-        plan = attempt.plan
         return pb.AttemptAccepted(
             request_id=attempt.request_id,
             attempt_ordinal=attempt.attempt,
             invocation_spec_digest=attempt.digest,
-            plan_digest=documents.raw(plan.digest()),
-            # `model_construction_digest` (9) is left EMPTY: the MCC's logical-model digest
-            # is deleted (model-code-fit D12) and worker-protocol reserves the slot at
-            # minor 23. What was built is `constructed_model_digest`, in the journal.
-            plan=pb.AttemptPlanSummary(
-                delivery=plan.delivery,
-                materialization=plan.materialization,
-                compute_dtype=plan.compute_dtype,
-                placement=plan.placement,
-                reserved_device_memory_bytes=plan.reserved_vram_bytes,
-                decision_explanation=plan.decision_explanation,
-            ),
-            # ROUTING plus the epoch fence the attempt runs under, fixed at
-            # acceptance (#446/#454): the attempt never survives its executor epoch.
             placement_id=attempt.placement_id,
-            executor_epoch=attempt.executor_epoch,
+            lane_id=attempt.lane_id,
         )
 
     def wrap(self, attempt: AttemptRecord) -> pb.AttemptOutcome:

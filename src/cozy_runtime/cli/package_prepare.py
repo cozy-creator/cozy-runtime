@@ -205,7 +205,7 @@ def _values(args: list[str], required: set[str], repeatable: set[str]) -> dict[s
             raise CliError(
                 "usage",
                 f"invalid package preparation argument {flag!r}",
-                "Creator supplies the complete private package preparation command",
+                "Creator supplies the complete local package preparation command",
                 Exit.usage,
             )
         values.setdefault(flag, []).append(rest.pop(0))

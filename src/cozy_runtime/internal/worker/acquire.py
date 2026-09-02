@@ -605,7 +605,7 @@ class Acquirer:
         development = dict(getattr(placement, "development", {}))
         release_digest = str(
             placement.package.get("release_digest")
-            or development.get("private_revision_digest")
+            or development.get("local_revision_digest")
             or development.get("source_digest")
             or ""
         )

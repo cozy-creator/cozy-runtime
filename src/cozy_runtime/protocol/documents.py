@@ -63,7 +63,7 @@ EXPLICIT_REPEATED: dict[str, tuple[str, ...]] = {
     "cozy.worker.v1.Entrypoint": ("slots",),
     "cozy.worker.v1.Environment": ("wheels",),
     "cozy.worker.v1.Placement": ("entrypoints", "models"),
-    "cozy.worker.v1.PrivatePackageRevision": ("files",),
+    "cozy.worker.v1.LocalPackageRevision": ("files",),
     "cozy.worker.v1.Slot": ("components", "stamps"),
     "cozy.worker.v1.Stamp": ("values",),
     "cozy.worker.v1.WheelFact": ("import_roots", "tags"),

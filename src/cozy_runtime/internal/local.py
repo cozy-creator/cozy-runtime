@@ -488,40 +488,16 @@ class LocalRecordOwner:
             )
         if bytes(accepted.invocation_spec_digest) != self.spec_digest:
             raise RuntimeError("accepted invocation digest differs from the offered spec")
-        if len(bytes(accepted.plan_digest)) != hashlib.sha256().digest_size:
-            raise RuntimeError("accepted plan digest is not one SHA-256 identity")
-        if bytes(accepted.model_construction_digest):
-            raise RuntimeError("an acceptance carries the deleted model-construction identity")
-        if accepted.executor_epoch <= 0:
-            raise RuntimeError("accepted executor epoch is not positive")
+        # Acceptance is queue ADMISSION (minor 23, proto-026): it carries routing and the
+        # lane, never a plan or an executor epoch — those bind at device entry and ride
+        # HeldAttempt from RUNNING on.
         if self.request.kind == "job":
             if accepted.placement_id:
                 raise RuntimeError("a job acceptance carries a serving placement")
-            if (
-                accepted.plan.delivery != "job"
-                or accepted.plan.materialization != "run_to_completion"
-                or accepted.plan.placement != "job_attempt"
-            ):
-                raise RuntimeError("a job acceptance carries a serving attempt plan")
-        else:
-            if accepted.placement_id != LOCAL_PLACEMENT:
-                raise RuntimeError(
-                    f"accepted placement {accepted.placement_id!r}, offered {LOCAL_PLACEMENT!r}"
-                )
-            modeled = bool(
-                self.placement is not None
-                and any(
-                    entrypoint.name == self.request.entrypoint and entrypoint.slots
-                    for entrypoint in self.placement.entrypoints
-                )
+        elif accepted.placement_id != LOCAL_PLACEMENT:
+            raise RuntimeError(
+                f"accepted placement {accepted.placement_id!r}, offered {LOCAL_PLACEMENT!r}"
             )
-            if not modeled and (
-                accepted.plan.delivery != "native"
-                or accepted.plan.materialization
-                or accepted.plan.placement != "all_resident"
-                or accepted.plan.reserved_device_memory_bytes
-            ):
-                raise RuntimeError("a local weightless acceptance carries a model-bearing plan")
         self.accepted = accepted
         self.marks["accepted"] = time.perf_counter()
 
@@ -1589,15 +1565,8 @@ def _collect(
             "request_id": accepted.request_id,
             "attempt_ordinal": accepted.attempt_ordinal,
             "invocation_spec_digest": _spell(accepted.invocation_spec_digest),
-            "plan_digest": _spell(accepted.plan_digest),
-            "delivery": accepted.plan.delivery,
-            "materialization": accepted.plan.materialization,
-            "placement": accepted.plan.placement,
-            "compute_dtype": accepted.plan.compute_dtype,
-            "reserved_device_memory_bytes": accepted.plan.reserved_device_memory_bytes,
-            "decision_explanation": accepted.plan.decision_explanation,
             "placement_id": accepted.placement_id,
-            "executor_epoch": accepted.executor_epoch,
+            "lane_id": accepted.lane_id,
         }
     if record_owner.terminal is not None:
         outcome.terminal_digest = _spell(record_owner.terminal.outcome_digest)

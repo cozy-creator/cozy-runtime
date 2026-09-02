@@ -174,9 +174,9 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceResult.FromString,
                 _registered_method=True)
-        self.PreparePrivatePackage = channel.unary_unary(
-                '/cozy.worker.v1.RuntimePreparation/PreparePrivatePackage',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageRequest.SerializeToString,
+        self.PrepareLocalPackage = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/PrepareLocalPackage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareLocalPackageRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.FromString,
                 _registered_method=True)
         self.PreparePrivatePlacement = channel.unary_unary(
@@ -204,7 +204,7 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def PreparePrivatePackage(self, request, context):
+    def PrepareLocalPackage(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -229,9 +229,9 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceResult.SerializeToString,
             ),
-            'PreparePrivatePackage': grpc.unary_unary_rpc_method_handler(
-                    servicer.PreparePrivatePackage,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageRequest.FromString,
+            'PrepareLocalPackage': grpc.unary_unary_rpc_method_handler(
+                    servicer.PrepareLocalPackage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareLocalPackageRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.SerializeToString,
             ),
             'PreparePrivatePlacement': grpc.unary_unary_rpc_method_handler(
@@ -308,7 +308,7 @@ class RuntimePreparation(object):
             _registered_method=True)
 
     @staticmethod
-    def PreparePrivatePackage(request,
+    def PrepareLocalPackage(request,
             target,
             options=(),
             channel_credentials=None,
@@ -321,8 +321,8 @@ class RuntimePreparation(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/cozy.worker.v1.RuntimePreparation/PreparePrivatePackage',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageRequest.SerializeToString,
+            '/cozy.worker.v1.RuntimePreparation/PrepareLocalPackage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareLocalPackageRequest.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetResult.FromString,
             options,
             channel_credentials,
@@ -533,9 +533,9 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
                 _registered_method=True)
-        self.PreparePrivatePackage = channel.unary_stream(
-                '/cozy.worker.v1.PodHost/PreparePrivatePackage',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageCall.SerializeToString,
+        self.PrepareLocalPackage = channel.unary_stream(
+                '/cozy.worker.v1.PodHost/PrepareLocalPackage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareLocalPackageCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
                 _registered_method=True)
         self.PreparePrivatePlacement = channel.unary_stream(
@@ -553,15 +553,15 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
                 _registered_method=True)
-        self.PrivatePackageFetch = channel.unary_stream(
-                '/cozy.worker.v1.PodHost/PrivatePackageFetch',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFetchCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFileStatus.FromString,
+        self.LocalPackageFetch = channel.unary_stream(
+                '/cozy.worker.v1.PodHost/LocalPackageFetch',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFetchCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
                 _registered_method=True)
-        self.PrivatePackageAbort = channel.unary_unary(
-                '/cozy.worker.v1.PodHost/PrivatePackageAbort',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortStatus.FromString,
+        self.LocalPackageAbort = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/LocalPackageAbort',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortStatus.FromString,
                 _registered_method=True)
         self.WeightsTransfer = channel.unary_stream(
                 '/cozy.worker.v1.PodHost/WeightsTransfer',
@@ -604,7 +604,7 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def PreparePrivatePackage(self, request, context):
+    def PrepareLocalPackage(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -628,13 +628,13 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def PrivatePackageFetch(self, request, context):
+    def LocalPackageFetch(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def PrivatePackageAbort(self, request, context):
+    def LocalPackageAbort(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -654,9 +654,9 @@ def add_PodHostServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.SerializeToString,
             ),
-            'PreparePrivatePackage': grpc.unary_stream_rpc_method_handler(
-                    servicer.PreparePrivatePackage,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageCall.FromString,
+            'PrepareLocalPackage': grpc.unary_stream_rpc_method_handler(
+                    servicer.PrepareLocalPackage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareLocalPackageCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.SerializeToString,
             ),
             'PreparePrivatePlacement': grpc.unary_stream_rpc_method_handler(
@@ -674,15 +674,15 @@ def add_PodHostServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.SerializeToString,
             ),
-            'PrivatePackageFetch': grpc.unary_stream_rpc_method_handler(
-                    servicer.PrivatePackageFetch,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFetchCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFileStatus.SerializeToString,
+            'LocalPackageFetch': grpc.unary_stream_rpc_method_handler(
+                    servicer.LocalPackageFetch,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFetchCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.SerializeToString,
             ),
-            'PrivatePackageAbort': grpc.unary_unary_rpc_method_handler(
-                    servicer.PrivatePackageAbort,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortStatus.SerializeToString,
+            'LocalPackageAbort': grpc.unary_unary_rpc_method_handler(
+                    servicer.LocalPackageAbort,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortStatus.SerializeToString,
             ),
             'WeightsTransfer': grpc.unary_stream_rpc_method_handler(
                     servicer.WeightsTransfer,
@@ -753,7 +753,7 @@ class PodHost(object):
             _registered_method=True)
 
     @staticmethod
-    def PreparePrivatePackage(request,
+    def PrepareLocalPackage(request,
             target,
             options=(),
             channel_credentials=None,
@@ -766,8 +766,8 @@ class PodHost(object):
         return grpc.experimental.unary_stream(
             request,
             target,
-            '/cozy.worker.v1.PodHost/PreparePrivatePackage',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageCall.SerializeToString,
+            '/cozy.worker.v1.PodHost/PrepareLocalPackage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareLocalPackageCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
             options,
             channel_credentials,
@@ -861,7 +861,7 @@ class PodHost(object):
             _registered_method=True)
 
     @staticmethod
-    def PrivatePackageFetch(request,
+    def LocalPackageFetch(request,
             target,
             options=(),
             channel_credentials=None,
@@ -874,9 +874,9 @@ class PodHost(object):
         return grpc.experimental.unary_stream(
             request,
             target,
-            '/cozy.worker.v1.PodHost/PrivatePackageFetch',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFetchCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFileStatus.FromString,
+            '/cozy.worker.v1.PodHost/LocalPackageFetch',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFetchCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -888,7 +888,7 @@ class PodHost(object):
             _registered_method=True)
 
     @staticmethod
-    def PrivatePackageAbort(request,
+    def LocalPackageAbort(request,
             target,
             options=(),
             channel_credentials=None,
@@ -901,9 +901,9 @@ class PodHost(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/cozy.worker.v1.PodHost/PrivatePackageAbort',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortStatus.FromString,
+            '/cozy.worker.v1.PodHost/LocalPackageAbort',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageAbortStatus.FromString,
             options,
             channel_credentials,
             insecure,

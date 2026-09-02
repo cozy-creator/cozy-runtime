@@ -151,8 +151,8 @@ class GrpcControlHost:
         model_source_preparer: (
             Callable[[pb.PrepareModelSourceRequest], pb.PrepareModelSourceResult] | None
         ) = None,
-        private_package_preparer: (
-            Callable[[pb.PreparePrivatePackageRequest], pb.PreparePackageSetResult] | None
+        local_package_preparer: (
+            Callable[[pb.PrepareLocalPackageRequest], pb.PreparePackageSetResult] | None
         ) = None,
         private_placement_preparer: (
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
@@ -166,7 +166,7 @@ class GrpcControlHost:
         self.on_bound = on_bound
         self.preparer = preparer
         self.model_source_preparer = model_source_preparer
-        self.private_package_preparer = private_package_preparer
+        self.local_package_preparer = local_package_preparer
         self.private_placement_preparer = private_placement_preparer
         #: The loopback weights seam (proto-025), served only when a pod supervisor is the
         #: peer. Absent on a local run, where there is no supervisor to open `Exchange`.
@@ -186,7 +186,7 @@ class GrpcControlHost:
         loopback_services = (
             self.preparer is not None
             or self.model_source_preparer is not None
-            or self.private_package_preparer is not None
+            or self.local_package_preparer is not None
             or self.private_placement_preparer is not None
             or self.weights is not None
         )
@@ -195,14 +195,14 @@ class GrpcControlHost:
         if (
             self.preparer is not None
             or self.model_source_preparer is not None
-            or self.private_package_preparer is not None
+            or self.local_package_preparer is not None
             or self.private_placement_preparer is not None
         ):
             pb_grpc.add_RuntimePreparationServicer_to_server(
                 _PreparationServicer(
                     self.preparer,
                     self.model_source_preparer,
-                    self.private_package_preparer,
+                    self.local_package_preparer,
                     self.private_placement_preparer,
                 ),
                 self.server,
@@ -258,8 +258,8 @@ class _PreparationServicer:
         model_source_handler: (
             Callable[[pb.PrepareModelSourceRequest], pb.PrepareModelSourceResult] | None
         ),
-        private_package_handler: (
-            Callable[[pb.PreparePrivatePackageRequest], pb.PreparePackageSetResult] | None
+        local_package_handler: (
+            Callable[[pb.PrepareLocalPackageRequest], pb.PreparePackageSetResult] | None
         ),
         private_placement_handler: (
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
@@ -267,7 +267,7 @@ class _PreparationServicer:
     ) -> None:
         self.package_handler = package_handler
         self.model_source_handler = model_source_handler
-        self.private_package_handler = private_package_handler
+        self.local_package_handler = local_package_handler
         self.private_placement_handler = private_placement_handler
 
     def PreparePackageSet(self, request: pb.PreparePackageSetRequest, context: Any) -> Any:
@@ -300,13 +300,13 @@ class _PreparationServicer:
 
             context.abort(grpc.StatusCode.INTERNAL, type(exc).__name__)
 
-    def PreparePrivatePackage(self, request: pb.PreparePrivatePackageRequest, context: Any) -> Any:
-        handler = self.private_package_handler
+    def PrepareLocalPackage(self, request: pb.PrepareLocalPackageRequest, context: Any) -> Any:
+        handler = self.local_package_handler
         if handler is None:
             import grpc
 
             return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "private package preparation is unavailable"
+                grpc.StatusCode.UNIMPLEMENTED, "local package preparation is unavailable"
             )
         try:
             return handler(request)

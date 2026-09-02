@@ -143,7 +143,7 @@ def _published_descriptor(
     The published descriptor is the pod's authoritative wiring (cr-067). The manifest's
     identity IS the delegation's wire-trusted `release_digest` (the sha256 of the
     committed `cozy.package.manifest/1` bytes), and the descriptor ref is taken only
-    from inside the proven manifest -- the same trust pattern the private lane uses.
+    from inside the proven manifest -- the same trust pattern the local package lane uses.
     `LocalDownloadKind` is a closed wire enum, so both documents ride at conventional
     filenames in the set directory rather than as `files` rows.
     """
@@ -215,8 +215,8 @@ def _read_beside(path: Path, refusal: str) -> bytes:
         raise PreparationRefusal(refusal, f"{path}: {type(exc).__name__}") from exc
 
 
-def prepare_private_package(
-    request: pb.PreparePrivatePackageRequest,
+def prepare_local_package(
+    request: pb.PrepareLocalPackageRequest,
     *,
     artifact_cache: Path,
     environment_root: Path,
@@ -229,26 +229,24 @@ def prepare_private_package(
     native_device_index: int = 0,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
-    """Prepare one exact private wheel revision without inventing Hub provenance."""
+    """Prepare one exact local wheel revision without inventing Hub provenance."""
 
     if (
         Path(request.environment_root) != environment_root
         or not environment_root.is_absolute()
         or (job_plan_root is not None and not job_plan_root.is_absolute())
     ):
-        raise PreparationRefusal(
-            "private_package_environment_root_invalid", request.environment_root
-        )
+        raise PreparationRefusal("local_package_environment_root_invalid", request.environment_root)
     package = request.package
     if (
         _OPERATION_ID.fullmatch(request.operation_id) is None
         or package.package.count("/") != 1
         or not package.release
         or len(package.source_digest) != 32
-        or len(package.private_revision_digest) != 32
+        or len(package.local_revision_digest) != 32
         or package.HasField("project_wheel")
     ):
-        raise PreparationRefusal("private_package_identity_invalid", request.operation_id)
+        raise PreparationRefusal("local_package_identity_invalid", request.operation_id)
     if any(
         row.kind
         not in {
@@ -257,13 +255,13 @@ def prepare_private_package(
         }
         for row in request.files
     ):
-        raise PreparationRefusal("private_package_file_kind_invalid", request.operation_id)
+        raise PreparationRefusal("local_package_file_kind_invalid", request.operation_id)
     return prepare_package(
         package_name=package.package,
         release=package.release,
-        release_digest=documents.spell(package.private_revision_digest),
+        release_digest=documents.spell(package.local_revision_digest),
         files=request.files,
-        placement_seed=(request.operation_id.encode("ascii") + package.private_revision_digest),
+        placement_seed=(request.operation_id.encode("ascii") + package.local_revision_digest),
         artifact_cache=artifact_cache,
         environment_root=environment_root,
         python=python,
@@ -286,16 +284,16 @@ def prepare_private_placement(
     artifact_store: Path | None,
     verified: Callable[[str, int, Path], None],
 ) -> pb.PreparePackageSetResult:
-    """Bind verified models to one exact already-prepared private revision core."""
+    """Bind verified models to one exact already-prepared local revision core."""
 
     development = prepared.get("development")
     descriptor_ref = prepared.get("package_descriptor")
     if (
         _OPERATION_ID.fullmatch(request.operation_id) is None
-        or len(request.private_revision_digest) != 32
+        or len(request.local_revision_digest) != 32
         or not isinstance(development, dict)
-        or development.get("private_revision_digest")
-        != documents.spell(request.private_revision_digest)
+        or development.get("local_revision_digest")
+        != documents.spell(request.local_revision_digest)
         or not isinstance(descriptor_ref, dict)
         or not isinstance(descriptor_ref.get("digest"), str)
         or not isinstance(descriptor_ref.get("length"), int)
@@ -353,7 +351,7 @@ def prepare_private_placement(
     ):
         raise PreparationRefusal("private_placement_descriptor_invalid", digest)
     try:
-        descriptor_body = descriptor.read_bytes(descriptor_raw, "prepared private descriptor")
+        descriptor_body = descriptor.read_bytes(descriptor_raw, "prepared local package descriptor")
     except descriptor.RetiredDescriptorMember as exc:
         raise PreparationRefusal(exc.code, exc.message) from exc
     except descriptor.StalePackageDescriptor as exc:
@@ -414,7 +412,7 @@ def prepare_package(
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact package.
 
-    `materialized` receives the environment this preparation installed. A private revision's
+    `materialized` receives the environment this preparation installed. A local revision's
     wheels are the pod host's carriers, deleted once the PlacementSet is journaled, so the
     placement that follows cannot re-acquire them: the session retains the environment and
     serves the placement from it.
@@ -605,7 +603,7 @@ def prepare_package(
         raise PreparationRefusal("package_prepare_descriptor_invalid", str(exc)) from exc
     descriptor_ref = _stage(artifact_cache, descriptor_raw)
     if development is not None:
-        _verify_private_revision(development, descriptor_ref, rows)
+        _verify_local_revision(development, descriptor_ref, rows)
     jobs = _stage_job_plans(
         descriptor_body,
         root=job_plan_root,
@@ -624,7 +622,7 @@ def prepare_package(
             verified=verified,
         )
     else:
-        # Private transport freezes code, descriptor and Environment only. A later ordinary
+        # Local package transport freezes code, descriptor and Environment only. A later ordinary
         # PlacementSet supplies exact modeled serving bindings; JobDirective + InvocationSpec
         # supplies a job's exact model inputs. Weightless serving bindings need no later model
         # authority and are already exact consequences of this retained descriptor.
@@ -670,7 +668,7 @@ def prepare_package(
                 package=development.package,
                 release=development.release,
                 source_digest=development.source_digest,
-                private_revision_digest=development.private_revision_digest,
+                local_revision_digest=development.local_revision_digest,
                 project_wheel=_wheel_fact(project),
             )
         )
@@ -697,12 +695,12 @@ def _wheel_fact(wheel: package_environment.Wheel) -> pb.WheelFact:
     )
 
 
-def _verify_private_revision(
+def _verify_local_revision(
     development: pb.DevelopmentPackage,
     descriptor_ref: tuple[str, int],
     files: Sequence[pb.LocalDownloadFile],
 ) -> None:
-    revision = pb.PrivatePackageRevision(
+    revision = pb.LocalPackageRevision(
         package=development.package,
         release=development.release,
         source_digest=development.source_digest,
@@ -710,7 +708,7 @@ def _verify_private_revision(
             digest=documents.raw(descriptor_ref[0]), length=descriptor_ref[1]
         ),
         files=[
-            pb.PrivatePackageFileRef(
+            pb.LocalPackageFileRef(
                 digest=row.digest,
                 filename=row.filename,
                 kind=row.kind,
@@ -720,11 +718,11 @@ def _verify_private_revision(
         ],
     )
     _raw, measured = documents.identity(revision)
-    if measured != development.private_revision_digest:
+    if measured != development.local_revision_digest:
         raise PreparationRefusal(
-            "private_package_revision_mismatch",
+            "local_package_revision_mismatch",
             f"measured {documents.spell(measured)}, expected "
-            f"{documents.spell(development.private_revision_digest)}",
+            f"{documents.spell(development.local_revision_digest)}",
         )
 
 
