@@ -784,8 +784,8 @@ class Telemetry(_Bound):
             self._ctx.raise_if_cancelled()
             now = time.perf_counter()
             mark = attempt._step_mark
-            if mark:
-                attempt.attribution.step(name or "step", (now - mark) * 1000)
+            if mark and name is not None:
+                attempt.attribution.step(name, (now - mark) * 1000)
             attempt._step_mark = now
             step_ms = (now - mark) * 1000 if mark else 0.0
             if (
@@ -904,15 +904,18 @@ class Telemetry(_Bound):
         return value
 
     def _fraction(self, value: object, field: str) -> float | None:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or not 0.0 <= value <= 1.0
-        ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             self._diagnose(f"{field} must be a finite number in 0..1")
             return None
-        return round(float(value), 6)
+        try:
+            number = float(value)
+        except (OverflowError, ValueError):
+            self._diagnose(f"{field} must be a finite number in 0..1")
+            return None
+        if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+            self._diagnose(f"{field} must be a finite number in 0..1")
+            return None
+        return round(number, 6)
 
     def _overall(self, value: object | None) -> float | None:
         if value is None:
