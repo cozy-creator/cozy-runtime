@@ -1,13 +1,17 @@
-"""Author-side writer of publish-time derive evidence (cr-067).
+"""Author-side writer of publish-time slot facts (cr-077, was cr-067's pair evidence).
 
 Runs on the author's machine inside the project venv (`uv run --locked`), at publish.
-Per declared (model source x hardware variant) pair it delegates package import and
-derive-mode execution to one bounded child whose audit hooks allow no network, weight
-reads, writes, or subprocesses, and publishes one complete digest-addressed envelope --
-`result.json` index plus `contracts/` and `code-topologies/` sibling documents -- by
-atomic rename. The envelope binds the release VERSION, never a release digest: the
-digest only exists once tensorhub finalizes the upload this envelope rides in.
-The hub validates these documents statically and never executes package code (th-106).
+Per slot CLASS it delegates package import and derive-mode execution to one bounded
+child whose audit hooks allow no network, weight reads, writes, or subprocesses, and
+publishes exactly TWO facts per class -- the shape-only code topology (a TensorFS
+CodeTopology document, digest-addressed) and the acceptable encodings set -- as one
+digest-addressed envelope: `result.json` index plus `code-topologies/` sibling
+documents, by atomic rename. The construction SEED (the checkpoint snapshot/config the
+factory runs against, resolved by the publisher from the slot's default binding) is an
+input only: its identity never enters the published facts. The envelope binds the
+release VERSION, never a release digest: the digest only exists once tensorhub
+finalizes the upload this envelope rides in. The hub validates these documents
+statically and never executes package code (th-106).
 """
 
 from __future__ import annotations
@@ -38,7 +42,6 @@ from cozy_runtime.internal.encoding import TORCH_DTYPES, launch_providers
 from cozy_runtime.internal.exits import Exit
 
 INDEX_NAME = "result.json"
-CONTRACTS_DIR = "contracts"
 TOPOLOGIES_DIR = "code-topologies"
 RESULT_PREFIX = "COZY_MODEL_CONTRACT_PROOF="
 MEMORY_CAP_BYTES = 24 << 30
@@ -46,17 +49,17 @@ CPU_CAP_SECONDS = 600
 WALL_CAP_SECONDS = 900
 _VARIANT = re.compile(r"^(?:cpu|sm[0-9]{2,})$")
 
-INDEX_FORMAT = "cozy.package.derive-evidence/1"
+INDEX_FORMAT = "cozy.package.slot-facts/1"
 
 REQUEST_FIELDS = {
-    "bindings",
     "package_descriptor",
     "package",
     "project",
+    "slots",
 }
 REF_FIELDS = {"digest", "length"}
 LOCAL_REF_FIELDS = {"digest", "length", "path"}
-BINDING_FIELDS = {"config", "hardware_variants", "path", "snapshot"}
+SLOT_FIELDS = {"class", "config", "hardware_variants", "snapshot"}
 
 
 class ProofRefusal(Exception):
@@ -83,8 +86,12 @@ class LocalDocumentRef(DocumentRef):
 
 
 @dataclass(frozen=True, slots=True)
-class BindingRequest:
-    path: str
+class SlotRequest:
+    """One slot class's construction seed: which exact checkpoint snapshot/config the
+    class's factory runs against on the meta device. Seed identity is an input, never a
+    published fact."""
+
+    class_key: str
     snapshot: str
     config: LocalDocumentRef
     hardware_variants: tuple[str, ...]
@@ -95,7 +102,7 @@ class ProofRequest:
     project: Path
     package: Mapping[str, Any]
     package_descriptor: LocalDocumentRef
-    bindings: tuple[BindingRequest, ...]
+    slots: tuple[SlotRequest, ...]
 
     @property
     def release_identity(self) -> str:
@@ -132,13 +139,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # The author's own venv is the derivation environment: the parent runs inside
         # `uv run --locked`, so sys.executable resolves the exact locked interpreter.
         response = _run_child(Path(sys.executable), request_path)
-        index, contracts, topologies = _decode_child(response, request)
+        index, topologies = _decode_child(response, request)
         index_bytes = canonical.write(index)
-        _publish(output, index_bytes, contracts, topologies)
+        _publish(output, index_bytes, topologies)
         print(
             json.dumps(
                 {
-                    "contracts": len(contracts),
                     "code_topologies": len(topologies),
                     "digest": _sha(index_bytes),
                     "length": len(index_bytes),
@@ -195,28 +201,33 @@ def _read_request(path: Path) -> ProofRequest:
     if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
         fields = sorted(value) if isinstance(value, dict) else type(value).__name__
         raise _request_error(f"fields={fields} expected={sorted(REQUEST_FIELDS)}")
-    bindings_value = value["bindings"]
-    if not isinstance(bindings_value, list):
-        raise _request_error("bindings is not an array")
-    bindings = tuple(_binding(row, index) for index, row in enumerate(bindings_value))
-    paths = [row.path for row in bindings]
-    if len(paths) != len(set(paths)):
-        raise _request_error("bindings contains a duplicate descriptor model path")
+    slots_value = value["slots"]
+    if not isinstance(slots_value, list) or not slots_value:
+        raise _request_error("slots is not a non-empty array")
+    slots = tuple(_slot(row, index) for index, row in enumerate(slots_value))
+    classes = [row.class_key for row in slots]
+    if classes != sorted(set(classes)):
+        raise _request_error("slots must be sorted unique by class")
     return ProofRequest(
         project=_existing_directory(value["project"], "project"),
         package=_package(value["package"]),
         package_descriptor=_local_ref(value["package_descriptor"], "package_descriptor"),
-        bindings=bindings,
+        slots=slots,
     )
 
 
-def _binding(value: object, index: int) -> BindingRequest:
-    name = f"bindings[{index}]"
-    if not isinstance(value, dict) or set(value) != BINDING_FIELDS:
-        raise _request_error(f"{name} does not have the closed binding field set")
-    path = value["path"]
-    if not isinstance(path, str) or not path or len(path) > 512 or path.strip() != path:
-        raise _request_error(f"{name}.path is not one bounded non-empty string")
+def _slot(value: object, index: int) -> SlotRequest:
+    name = f"slots[{index}]"
+    if not isinstance(value, dict) or set(value) != SLOT_FIELDS:
+        raise _request_error(f"{name} does not have the closed slot field set")
+    class_key = value["class"]
+    if (
+        not isinstance(class_key, str)
+        or not class_key
+        or len(class_key) > 512
+        or class_key.strip() != class_key
+    ):
+        raise _request_error(f"{name}.class is not one bounded non-empty string")
     variants = value["hardware_variants"]
     if (
         not isinstance(variants, list)
@@ -227,8 +238,8 @@ def _binding(value: object, index: int) -> BindingRequest:
         raise _request_error(
             f"{name}.hardware_variants must be a sorted unique non-empty cpu|sm<major><minor> array"
         )
-    return BindingRequest(
-        path=path,
+    return SlotRequest(
+        class_key=class_key,
         snapshot=_digest(value["snapshot"], f"{name}.snapshot"),
         config=_local_ref(value["config"], f"{name}.config"),
         hardware_variants=tuple(variants),
@@ -448,7 +459,7 @@ def _child_entry(args: Sequence[str]) -> int:
                 "model_contract_package_descriptor_invalid",
                 "descriptor application does not name the discovered application",
             )
-        response = _derive_all(request, found, derived_descriptor)
+        response = _derive_facts(request, found, derived_descriptor)
     except CliError as err:
         _emit_child({"error": err.name, "detail": err.message})
         return int(err.code)
@@ -503,133 +514,81 @@ def _warm_tensorfs() -> None:
         )
 
 
-def _derive_all(
+def _derive_facts(
     request: ProofRequest, found: Any, descriptor_doc: Mapping[str, Any]
 ) -> dict[str, Any]:
-    surfaces = {surface.name: surface for surface in found.surfaces if not surface.hidden}
-    requested = {row.path: row for row in request.bindings}
-    owners = {
-        binding.path: surface.name
-        for surface in surfaces.values()
-        for binding in surface.model_bindings
-    }
-    unknown = sorted(set(requested) - set(owners))
-    selected_names = {owners[path] for path in requested if path in owners}
-    incomplete: dict[str, dict[str, list[str]]] = {}
-    for name in selected_names:
-        complete = {binding.path for binding in surfaces[name].model_bindings}
-        supplied = set(requested) & complete
-        if supplied != complete:
-            incomplete[name] = {
-                "missing": sorted(complete - supplied),
-                "extra": sorted(supplied - complete),
-            }
-    if not requested or unknown or incomplete:
+    """Derive the per-class slot facts: ONE shape-only code topology and ONE acceptable
+    encodings set per requested slot class (cr-077). The MCC is derived internally --
+    it is the machinery the topology projects from -- and is never published."""
+
+    del descriptor_doc  # byte-compared against the source by the caller; nothing pair-wise
+    bindings_by_class: dict[str, ModelBinding] = {}
+    for surface in found.surfaces:
+        if surface.hidden:
+            continue
+        for binding in surface.model_bindings:
+            bindings_by_class.setdefault(binding.class_key, binding)
+    unknown = sorted({row.class_key for row in request.slots} - set(bindings_by_class))
+    if unknown:
         raise ProofRefusal(
-            "model_contract_binding_set_mismatch",
-            f"unknown={unknown}, incomplete={incomplete}, selected={sorted(selected_names)}",
+            "slot_facts_class_unknown",
+            f"requested classes {unknown} are not model slot classes of this package "
+            f"(have {sorted(bindings_by_class)})",
         )
 
-    documents: dict[str, bytes] = {}
     topologies: dict[str, bytes] = {}
-    resources: dict[str, dict[str, Any]] = {}
-    functions: list[dict[str, Any]] = []
-    for collection in ("entrypoints", "jobs"):
-        entries = descriptor_doc[collection]
-        if not isinstance(entries, list):
+    slots: list[dict[str, Any]] = []
+    encodings = sorted(launch_providers())
+    for source in request.slots:
+        binding = bindings_by_class[source.class_key]
+        config_bytes = _read_exact(source.config, f"config for {source.class_key}")
+        try:
+            config_doc = canonical.parse_canonical(config_bytes)
+        except canonical.CanonicalError as err:
             raise ProofRefusal(
-                "model_contract_package_descriptor_invalid", f"{collection} is not an array"
+                "model_contract_config_invalid", f"{source.class_key}: {err}"
+            ) from err
+        if not isinstance(config_doc, dict):
+            raise ProofRefusal(
+                "model_contract_config_invalid",
+                f"{source.class_key}: config is not an object",
             )
-        for described in entries:
-            if not isinstance(described, dict) or not isinstance(described.get("name"), str):
-                raise ProofRefusal(
-                    "model_contract_package_descriptor_invalid", f"{collection} row is invalid"
-                )
-            name = described["name"]
-            surface = surfaces.get(name)
-            if surface is None:
-                raise ProofRefusal(
-                    "model_contract_package_descriptor_invalid",
-                    f"{collection} surface {name!r} is absent",
-                )
-            if name not in selected_names:
-                continue
-            binding_rows: list[dict[str, Any]] = []
-            for binding in surface.model_bindings:
-                source = requested[binding.path]
-                config_bytes = _read_exact(source.config, f"config for {binding.path}")
-                try:
-                    config_doc = canonical.parse_canonical(config_bytes)
-                except canonical.CanonicalError as err:
-                    raise ProofRefusal(
-                        "model_contract_config_invalid", f"{binding.path}: {err}"
-                    ) from err
-                if not isinstance(config_doc, dict):
-                    raise ProofRefusal(
-                        "model_contract_config_invalid", f"{binding.path}: config is not an object"
-                    )
-                config = Config._verified(config_doc, "config", source.config.digest)
-                contracts: list[dict[str, Any]] = []
-                for variant in source.hardware_variants:
-                    raw = _derive_twice(
-                        binding,
-                        source,
-                        config,
-                        release=request.release_identity,
-                        application=found.application,
-                        variant=variant,
-                    )
-                    digest = _sha(raw)
-                    previous = documents.setdefault(digest, raw)
-                    if previous != raw:
-                        raise ProofRefusal("model_contract_digest_collision", digest)
-                    if digest not in resources:
-                        resources[digest] = _resource_projection(raw)
-                    topology = _code_topology(raw)
-                    topology_digest = _sha(topology)
-                    previous_topology = topologies.setdefault(topology_digest, topology)
-                    if previous_topology != topology:
-                        raise ProofRefusal("model_contract_digest_collision", topology_digest)
-                    contracts.append(
-                        {
-                            "code_topology": {
-                                "digest": topology_digest,
-                                "length": len(topology),
-                            },
-                            "hardware_variant": variant,
-                            "model_construction_contract": {
-                                "digest": digest,
-                                "length": len(raw),
-                            },
-                        }
-                    )
-                binding_rows.append(
-                    {
-                        "class": binding.class_key,
-                        "config": source.config.render(),
-                        "param": binding.param,
-                        "path": binding.path,
-                        "snapshot": source.snapshot,
-                        "variants": contracts,
-                    }
-                )
-            functions.append(
-                {
-                    "bindings": binding_rows,
-                    "kind": surface.kind,
-                    "name": surface.name,
-                }
+        config = Config._verified(config_doc, "config", source.config.digest)
+        class_topologies: dict[str, bytes] = {}
+        for variant in source.hardware_variants:
+            raw = _derive_twice(
+                binding,
+                source,
+                config,
+                release=request.release_identity,
+                application=found.application,
+                variant=variant,
             )
+            topology = _code_topology(raw)
+            class_topologies[_sha(topology)] = topology
+        if len(class_topologies) != 1:
+            raise ProofRefusal(
+                "slot_facts_variant_divergent",
+                f"{source.class_key}: hardware variants produced {len(class_topologies)} "
+                "distinct shape topologies; one slot class carries exactly one topology "
+                "fact -- a hardware-conditional topology is unrepresentable as slot facts",
+            )
+        ((topology_digest, topology),) = class_topologies.items()
+        previous = topologies.setdefault(topology_digest, topology)
+        if previous != topology:
+            raise ProofRefusal("model_contract_digest_collision", topology_digest)
+        slots.append(
+            {
+                "class": source.class_key,
+                "code_topology": {
+                    "digest": topology_digest,
+                    "length": len(topology),
+                },
+                "encodings": encodings,
+            }
+        )
     return {
         "application": found.application,
-        "contracts": [
-            {
-                "bytes": base64.b64encode(raw).decode(),
-                "digest": digest,
-                "length": len(raw),
-            }
-            for digest, raw in sorted(documents.items())
-        ],
         "code_topologies": [
             {
                 "bytes": base64.b64encode(raw).decode(),
@@ -638,14 +597,13 @@ def _derive_all(
             }
             for digest, raw in sorted(topologies.items())
         ],
-        "functions": functions,
-        "resources": resources,
+        "slots": slots,
     }
 
 
 def _derive_twice(
     binding: ModelBinding,
-    source: BindingRequest,
+    source: SlotRequest,
     config: Config,
     *,
     release: str,
@@ -669,35 +627,15 @@ def _derive_twice(
     if first != second:
         raise ProofRefusal(
             "model_contract_nondeterministic",
-            f"{binding.path} for {variant} produced different canonical bytes on rebuild",
+            f"{binding.class_key} for {variant} produced different canonical bytes on rebuild",
         )
     parsed = contract.read_contract(first)
     if parsed.candidate.config_digest != source.config.digest:
         raise ProofRefusal(
             "model_contract_config_digest_mismatch",
-            f"{binding.path} for {variant} did not retain the exact config document identity",
+            f"{binding.class_key} for {variant} did not retain the exact config document identity",
         )
     return first
-
-
-def _resource_projection(raw: bytes) -> dict[str, Any]:
-    """Per-contract resident-byte and encoding-pin facts (was the hub's third container)."""
-
-    import tensorfs
-
-    parsed = contract.read_contract(raw)
-    widths = contract.tensorfs_destination_widths(tensorfs)
-    components: dict[str, int] = {}
-    tensors: list[contract.LogicalTensor | contract.DerivedTensor] = [
-        *parsed.logical_tensors,
-        *parsed.derived,
-    ]
-    for tensor in tensors:
-        count = widths[tensor.dtype or contract.DEFAULT_DTYPE]
-        for dimension in tensor.shape:
-            count *= dimension
-        components[tensor.component] = components.get(tensor.component, 0) + count
-    return {"components": components, "encoding_pins": sorted(launch_providers())}
 
 
 def _code_topology(raw: bytes) -> bytes:
@@ -773,40 +711,11 @@ def _emit_child(value: Mapping[str, Any]) -> None:
 def _decode_child(
     response: Mapping[str, Any],
     request: ProofRequest,
-) -> tuple[dict[str, Any], dict[str, bytes], dict[str, bytes]]:
-    if set(response) != {"application", "code_topologies", "contracts", "functions", "resources"}:
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    if set(response) != {"application", "code_topologies", "slots"}:
         raise ProofRefusal("model_contract_child_invalid", "child result has an open field set")
     if not isinstance(response["application"], str):
         raise ProofRefusal("model_contract_child_invalid", "child result application")
-    rows = response["contracts"]
-    if not isinstance(rows, list):
-        raise ProofRefusal("model_contract_child_invalid", "contracts is not an array")
-    documents: dict[str, bytes] = {}
-    for row in rows:
-        if not isinstance(row, dict) or set(row) != {"bytes", "digest", "length"}:
-            raise ProofRefusal("model_contract_child_invalid", "contract row field set")
-        digest = row["digest"]
-        length = row["length"]
-        encoded = row["bytes"]
-        if (
-            not isinstance(digest, str)
-            or canonical.DIGEST_RE.fullmatch(digest) is None
-            or not isinstance(length, int)
-            or isinstance(length, bool)
-            or length <= 0
-            or not isinstance(encoded, str)
-        ):
-            raise ProofRefusal("model_contract_child_invalid", "contract row values")
-        try:
-            raw = base64.b64decode(encoded, validate=True)
-        except ValueError as err:
-            raise ProofRefusal("model_contract_child_invalid", "contract bytes base64") from err
-        if len(raw) != length or _sha(raw) != digest:
-            raise ProofRefusal("model_contract_child_invalid", "contract stored-byte identity")
-        parsed = contract.read_contract(raw)
-        if parsed.candidate.release != request.release_identity:
-            raise ProofRefusal("model_contract_child_invalid", "contract release identity")
-        documents[digest] = raw
     topology_rows = response["code_topologies"]
     if not isinstance(topology_rows, list):
         raise ProofRefusal("model_contract_child_invalid", "code_topologies is not an array")
@@ -835,33 +744,47 @@ def _decode_child(
         if len(raw) != length or _sha(raw) != digest:
             raise ProofRefusal("model_contract_child_invalid", "code topology stored-byte identity")
         topologies[digest] = raw
-    functions = response["functions"]
-    if not isinstance(functions, list):
-        raise ProofRefusal("model_contract_child_invalid", "functions is not an array")
-    resources = response["resources"]
-    if not isinstance(resources, dict) or set(resources) != set(documents):
-        raise ProofRefusal(
-            "model_contract_child_invalid", "resources are not exactly one row per contract"
-        )
-    for projected in resources.values():
+    slots = response["slots"]
+    if not isinstance(slots, list) or not slots:
+        raise ProofRefusal("model_contract_child_invalid", "slots is not a non-empty array")
+    referenced: set[str] = set()
+    classes: list[str] = []
+    for row in slots:
+        if not isinstance(row, dict) or set(row) != {"class", "code_topology", "encodings"}:
+            raise ProofRefusal("model_contract_child_invalid", "slot row field set")
+        class_key = row["class"]
+        if not isinstance(class_key, str) or not class_key:
+            raise ProofRefusal("model_contract_child_invalid", "slot row class")
+        classes.append(class_key)
+        topology_ref = row["code_topology"]
         if (
-            not isinstance(projected, dict)
-            or set(projected) != {"components", "encoding_pins"}
-            or not isinstance(projected["components"], dict)
-            or not projected["components"]
-            or any(
-                not isinstance(name, str)
-                or not isinstance(count, int)
-                or isinstance(count, bool)
-                or count <= 0
-                for name, count in projected["components"].items()
-            )
-            or not isinstance(projected["encoding_pins"], list)
-            or not projected["encoding_pins"]
-            or any(not isinstance(pin, str) or not pin for pin in projected["encoding_pins"])
-            or projected["encoding_pins"] != sorted(set(projected["encoding_pins"]))
+            not isinstance(topology_ref, dict)
+            or set(topology_ref) != REF_FIELDS
+            or not isinstance(topology_ref["digest"], str)
+            or topology_ref["digest"] not in topologies
+            or topology_ref["length"] != len(topologies[topology_ref["digest"]])
         ):
-            raise ProofRefusal("model_contract_child_invalid", "resource projection shape")
+            raise ProofRefusal("model_contract_child_invalid", "slot row code topology ref")
+        referenced.add(topology_ref["digest"])
+        encodings = row["encodings"]
+        if (
+            not isinstance(encodings, list)
+            or not encodings
+            or any(
+                not isinstance(pin, str) or canonical.DIGEST_RE.fullmatch(pin) is None
+                for pin in encodings
+            )
+            or encodings != sorted(set(encodings))
+        ):
+            raise ProofRefusal("model_contract_child_invalid", "slot row encodings")
+    if classes != sorted(set(classes)):
+        raise ProofRefusal("model_contract_child_invalid", "slot rows are not sorted unique")
+    if set(classes) != {row.class_key for row in request.slots}:
+        raise ProofRefusal(
+            "model_contract_child_invalid", "slot rows do not answer the requested classes"
+        )
+    if referenced != set(topologies):
+        raise ProofRefusal("model_contract_child_invalid", "unreferenced code topology document")
     evidence = {
         "format": INDEX_FORMAT,
         "application": response["application"],
@@ -869,16 +792,14 @@ def _decode_child(
             request.package_descriptor.digest, request.package_descriptor.length
         ).render(),
         "package": dict(request.package),
-        "functions": functions,
-        "resources": resources,
+        "slots": slots,
     }
-    return evidence, documents, topologies
+    return evidence, topologies
 
 
 def _publish(
     output: Path,
     index: bytes,
-    documents: Mapping[str, bytes],
     topologies: Mapping[str, bytes],
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -887,19 +808,13 @@ def _publish(
     temporary = output.parent / f".model-contract-proof-{uuid.uuid4().hex}"
     try:
         temporary.mkdir(mode=0o700)
-        contracts_dir = temporary / CONTRACTS_DIR
-        contracts_dir.mkdir(mode=0o700)
         topologies_dir = temporary / TOPOLOGIES_DIR
         topologies_dir.mkdir(mode=0o700)
-        for digest, raw in sorted(documents.items()):
-            _write_durable(contracts_dir / f"{digest.removeprefix('sha256:')}.json", raw)
         for digest, raw in sorted(topologies.items()):
             _write_durable(topologies_dir / f"{digest.removeprefix('sha256:')}.json", raw)
         _write_durable(temporary / INDEX_NAME, index)
-        contracts_dir.chmod(0o500)
         topologies_dir.chmod(0o500)
         temporary.chmod(0o500)
-        _fsync_dir(contracts_dir)
         _fsync_dir(topologies_dir)
         _fsync_dir(temporary)
         try:

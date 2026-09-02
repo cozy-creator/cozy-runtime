@@ -8,10 +8,9 @@ parameter types, so there is no second document to drift (§1.0/§1.3/§1.7).
 from __future__ import annotations
 
 import inspect
-import re
 import typing
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal, get_args, get_origin
 
 import msgspec
@@ -28,9 +27,6 @@ Role = Literal["context", "payload", "preflight", "model", "service"]
 Kind = Literal["entrypoint", "job"]
 
 _PARAMETERIZED = {"settings": Settings, "secrets": Secrets}
-_SOURCE_PROFILE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$")
-MAX_SOURCE_PROFILES = 16
-MAX_SOURCE_PROFILE_BYTES = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +61,6 @@ class ModelBinding:
     model_class: type[Model[Any]]
     stamps: Mapping[str, str]
     components: Mapping[str, tuple[str, ...]]
-    source_profile: str | None = None
     sequence_parallel: tuple[int, ...] = ()
     """`@sequence_parallel(degrees=...)` on the class: the degrees it shards at (cr-068)."""
 
@@ -92,8 +87,6 @@ class Surface:
     weights_outputs: tuple[WeightsOutput, ...] = ()
     """What a JOB body may write, as its own declaration. Grants mint off the declaration,
     never off the kind (§2) — a job that declares neither cannot be granted a destination."""
-    source_profiles: Mapping[str, str] = field(default_factory=dict)
-    """Optional exact TensorFS source profile for every inferred model parameter."""
     demand_bound: Bound | None = None
     preflight: PreflightSpec | None = None
     hidden: bool = False
@@ -121,7 +114,6 @@ class Surface:
                     model_class=annotation,
                     stamps=annotation.__stamps__,
                     components=component_use(annotation),
-                    source_profile=self.source_profiles.get(p.name),
                     sequence_parallel=tuple(annotation.__sequence_parallel__),
                 )
             )
@@ -193,7 +185,6 @@ def analyze(
     publishes: bool = False,
     emits_media: bool = False,
     weights_outputs: tuple[WeightsOutput, ...] = (),
-    source_profiles: Mapping[str, str] | None = None,
     demand_bound: Bound | None = None,
     preflight: Callable[..., object] | None = None,
     hidden: bool = False,
@@ -246,34 +237,6 @@ def analyze(
                 f"{where}: service {capability!r} requested twice", code="service_arity"
             )
 
-    profiles = dict(source_profiles or {})
-    model_params = {p.name for p in params if p.role == "model"}
-    if profiles:
-        if any(not isinstance(parameter, str) for parameter in profiles):
-            raise ConformanceError(
-                f"{where}: source_profiles keys must be inferred Model parameter names",
-                code="source_profile_set",
-            )
-        if len(profiles) > MAX_SOURCE_PROFILES or set(profiles) != model_params:
-            raise ConformanceError(
-                f"{where}: source_profiles must name every inferred Model parameter exactly; "
-                f"expected {sorted(model_params)}, got {sorted(profiles)}",
-                code="source_profile_set",
-                fields=sorted(set(profiles) ^ model_params),
-            )
-        for profile_param, profile in profiles.items():
-            if (
-                not isinstance(profile, str)
-                or len(profile.encode("utf-8")) > MAX_SOURCE_PROFILE_BYTES
-                or _SOURCE_PROFILE.fullmatch(profile) is None
-            ):
-                raise ConformanceError(
-                    f"{where}: source profile for {profile_param} is not one bounded portable "
-                    "TensorFS profile",
-                    code="source_profile_invalid",
-                    fields=[profile_param],
-                )
-
     result = hints.get("return")
     if result is None or not is_struct(strip(result)[0]):
         raise ConformanceError(
@@ -298,7 +261,6 @@ def analyze(
         publishes=publishes,
         emits_media=emits_media,
         weights_outputs=weights_outputs,
-        source_profiles=dict(sorted(profiles.items())),
         demand_bound=demand_bound,
         preflight=spec,
         hidden=hidden,

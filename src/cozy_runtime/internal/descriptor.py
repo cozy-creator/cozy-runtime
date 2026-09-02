@@ -109,8 +109,6 @@ def _model(binding: ModelBinding) -> dict[str, Json]:
             method: sorted(names) for method, names in sorted(binding.components.items())
         },
     }
-    if binding.source_profile is not None:
-        doc["source_profile"] = binding.source_profile
     if binding.sequence_parallel:
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
@@ -353,13 +351,12 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
             models = item.get("models", [])
             if not isinstance(models, list) or len(models) > 16:
                 _invalid(source, f"{path}.models", "must be an array of at most 16 slots")
-            profiled_models = 0
             for model_index, model in enumerate(models):
                 model_path = f"{path}.models[{model_index}]"
                 slot = _closed(
                     model,
                     {"class", "component_use", "path", "stamps"},
-                    {"source_profile", "sequence_parallel"},
+                    {"sequence_parallel"},
                     source,
                     model_path,
                 )
@@ -376,9 +373,6 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     _invalid(source, f"{model_path}.path", f"must start with {prefix!r}")
                 if not isinstance(slot["class"], str) or not slot["class"]:
                     _invalid(source, f"{model_path}.class", "must be a non-empty string")
-                if "source_profile" in slot:
-                    _contract_value(slot["source_profile"], source, f"{model_path}.source_profile")
-                    profiled_models += 1
                 _string_map(slot["stamps"], source, f"{model_path}.stamps")
                 uses = slot["component_use"]
                 if not isinstance(uses, dict):
@@ -394,21 +388,9 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                             f"{model_path}.component_use",
                             "must map method names to component-name arrays",
                         )
-            if profiled_models not in (0, len(models)):
-                _invalid(
-                    source,
-                    f"{path}.models",
-                    "must either omit source_profile or declare it for every model slot",
-                )
             if kind == "job":
                 if not isinstance(item["publishes"], bool):
                     _invalid(source, f"{path}.publishes", "must be a boolean")
-                if profiled_models and "weights_outputs" not in item:
-                    _invalid(
-                        source,
-                        path,
-                        "source_profile requires descriptor-declared weight outputs",
-                    )
                 if "weights_outputs" in item:
                     weights_outputs = item["weights_outputs"]
                     if not isinstance(weights_outputs, list) or not 1 <= len(weights_outputs) <= 16:
@@ -455,22 +437,11 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
 
 
 _PORTABLE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-_CONTRACT_VALUE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$")
 
 
 def _portable_name(value: Json, source: str, path: str) -> str:
     if not isinstance(value, str) or _PORTABLE_NAME.fullmatch(value) is None:
         _invalid(source, path, "must be a portable lowercase name")
-    return value
-
-
-def _contract_value(value: Json, source: str, path: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value.encode("utf-8")) > 256
-        or _CONTRACT_VALUE.fullmatch(value) is None
-    ):
-        _invalid(source, path, "is not a bounded contract token")
     return value
 
 

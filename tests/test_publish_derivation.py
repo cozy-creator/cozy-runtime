@@ -1,13 +1,14 @@
-"""cr-067: the author derives, the pod serves from the PUBLISHED descriptor.
+"""cr-067/cr-077: the author derives, the pod serves from the PUBLISHED descriptor.
 
 Three planes, each driven for real:
 
-* the author surface — entrypoints declare `source_profiles` and the descriptor carries
-  them, exactly as jobs already could;
+* the author surface — capability is the slot's class annotation and NOTHING else: the
+  retired `source_profiles` door refuses typed, and the descriptor slot grammar no
+  longer admits the field (hard cut, cr-077);
 * the pod preparation plane — the hub-committed manifest + descriptor staged beside the
   set are the authoritative wiring, import-time derivation is a byte-compared cross-check,
   and NOTHING on this plane may load the derive machinery (the hard guard, proven red);
-* the evidence writer — `cozy-model-contract-proof`'s author-mode request grammar binds
+* the slot-facts writer — `cozy-model-contract-proof`'s author-mode request grammar binds
   the release VERSION and refuses the retired release-digest circularity.
 """
 
@@ -85,68 +86,47 @@ def _described(app: App) -> dict[str, object]:
     return descriptor.build(found)
 
 
-def test_entrypoint_source_profiles_reach_the_descriptor() -> None:
-    """The declared-pairs door: an entrypoint names the model source it is built against."""
+def test_source_profiles_refuse_typed_at_registration() -> None:
+    """cr-077 hard cut: the retired declared-pairs door refuses with ONE typed code on
+    both decorators, before any surface analysis runs."""
     app = App()
 
-    @app.entrypoint(source_profiles={"denoiser": "acme/sd-turbo/bf16"})
-    def generate(payload: Request, denoiser: Denoiser) -> Reply:
+    with pytest.raises(ConformanceError) as on_entrypoint:
+
+        @app.entrypoint(source_profiles={"denoiser": "acme/sd-turbo/1.0.0/bf16"})
+        def generate(payload: Request, denoiser: Denoiser) -> Reply:
+            return Reply(text="no")
+
+    assert on_entrypoint.value.code == "source_profiles_retired"
+    assert on_entrypoint.value.fields == ("denoiser",)
+
+    with pytest.raises(ConformanceError) as on_job:
+
+        @app.job(source_profiles={"denoiser": "acme/sd-turbo/1.0.0/bf16"})
+        def train(payload: Request, denoiser: Denoiser) -> Reply:
+            return Reply(text="no")
+
+    assert on_job.value.code == "source_profiles_retired"
+
+    # An explicit empty mapping is the absent case, not a declaration: registers fine.
+    @app.entrypoint(source_profiles={})
+    def clean(payload: Request, denoiser: Denoiser) -> Reply:
         return Reply(text="ok")
 
-    body = _described(app)
-    slots = body["entrypoints"][0]["models"]  # type: ignore[index]
-    assert [slot["source_profile"] for slot in slots] == ["acme/sd-turbo/bf16"]
-    # The grammar round-trips: the reader admits an entrypoint slot profile.
-    read = descriptor.read_bytes(descriptor.canonical_bytes(body))
-    first = read["entrypoints"][0]["models"][0]
-    assert first["source_profile"] == "acme/sd-turbo/bf16"
+    assert describe(app)
 
 
-def test_source_profile_refusals_hold() -> None:
-    """Wrong keys and bad grammar still refuse; the jobs-only weights rule is retained."""
+def test_descriptor_slot_grammar_refuses_the_retired_field() -> None:
+    """A stale descriptor still carrying source_profile refuses at read (closed set)."""
     app = App()
 
-    @app.entrypoint(source_profiles={"nosuch": "acme/sd-turbo/bf16"})
-    def miskeyed(payload: Request, denoiser: Denoiser) -> Reply:
-        return Reply(text="no")
-
-    with pytest.raises(ConformanceError) as wrong_keys:
-        describe(app)
-    assert wrong_keys.value.code == "source_profile_set"
-
-    fresh = App()
-
-    @fresh.entrypoint(source_profiles={"denoiser": "NOT A PROFILE"})
-    def malformed(payload: Request, denoiser: Denoiser) -> Reply:
-        return Reply(text="no")
-
-    with pytest.raises(ConformanceError) as bad_grammar:
-        describe(fresh)
-    assert bad_grammar.value.code == "source_profile_invalid"
-
-    jobs = App()
-
-    @jobs.job(source_profiles={"denoiser": "acme/sd-turbo/bf16"})
-    def train(payload: Request, denoiser: Denoiser) -> Reply:
-        return Reply(text="no")
-
-    with pytest.raises(ConformanceError) as weightless_job:
-        describe(jobs)
-    assert weightless_job.value.code == "source_profile_without_weights"
-
-
-def test_reader_holds_the_all_or_nothing_rule_per_callable() -> None:
-    app = App()
-
-    @app.entrypoint(source_profiles={"denoiser": "acme/sd-turbo/bf16"})
+    @app.entrypoint
     def generate(payload: Request, denoiser: Denoiser) -> Reply:
         return Reply(text="ok")
 
     body = json.loads(descriptor.canonical_bytes(_described(app)))
-    body["entrypoints"][0]["models"].append(
-        dict(body["entrypoints"][0]["models"][0], path="generate.models.second")
-    )
-    del body["entrypoints"][0]["models"][1]["source_profile"]
+    assert "source_profile" not in body["entrypoints"][0]["models"][0]
+    body["entrypoints"][0]["models"][0]["source_profile"] = "acme/sd-turbo/1.0.0/bf16"
     with pytest.raises(descriptor.StalePackageDescriptor):
         descriptor.read_bytes(canonical.write(body))
 
@@ -387,15 +367,15 @@ def test_author_evidence_request_binds_the_release_version(tmp_path: Path) -> No
 
     def request(package: dict[str, object]) -> Path:
         body = {
-            "bindings": [
+            "slots": [
                 {
+                    "class": "Denoiser",
                     "config": {
                         "digest": "sha256:" + "ab" * 32,
                         "length": 2,
                         "path": str(descriptor_path),
                     },
                     "hardware_variants": ["cpu"],
-                    "path": "generate.models.denoiser",
                     "snapshot": "sha256:" + "cd" * 32,
                 }
             ],

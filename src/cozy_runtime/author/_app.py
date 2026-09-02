@@ -36,6 +36,23 @@ class RegistrationError(ConformanceError):
     default_code = "registration"
 
 
+def _refuse_source_profiles(source_profiles: Mapping[str, str] | None) -> None:
+    """The retired declared-pair door (cr-077). HARD CUT: a package that still spells
+    `source_profiles=` gets one typed refusal, never a silent ignore or a shim.
+
+    Capability is the slot's class annotation — the publish-time slot facts (shape-only
+    code topology + acceptable encodings) derive from the class's own factory. Selection
+    defaults live in `package.toml [bindings]`; the actual binding is dispatch."""
+    if source_profiles:
+        raise ConformanceError(
+            "source_profiles is retired: capability is the slot's class annotation "
+            "(slot facts derive from the class at publish); declare selection defaults "
+            "in package.toml [bindings] and bind at dispatch (--model / JobDirective)",
+            code="source_profiles_retired",
+            fields=sorted(source_profiles),
+        )
+
+
 @dataclass(slots=True)
 class Registration:
     """One registered callable plus the doors it opened. cr-003 reads `surface`."""
@@ -46,7 +63,6 @@ class Registration:
     publishes: bool = False
     emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
-    source_profiles: Mapping[str, str] = field(default_factory=dict)
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
     hidden: bool = False
@@ -74,7 +90,6 @@ class Registration:
                 publishes=self.publishes,
                 emits_media=self.emits_media,
                 weights_outputs=self.weights_outputs,
-                source_profiles=self.source_profiles,
                 demand_bound=self.demand_bound,
                 preflight=self.preflight,
                 hidden=self.hidden,
@@ -120,17 +135,16 @@ class App:
         `hidden=True` declares a surface that is real but NOT READY: it is omitted from the
         published descriptor and gets no binding staged and no traffic (§1.2, #572d).
 
-        ``source_profiles`` declares, per inferred Model parameter, the reviewed TensorFS
-        profile this entrypoint is built and tested against. Publish-time derive evidence
-        is produced for exactly these declared pairs; it selects no provider, source
-        revision, checkpoint, destination, or placement (cr-067)."""
+        ``source_profiles`` is RETIRED (cr-077): capability is the slot's class annotation,
+        and the publish-time slot facts are derived from the class itself. Passing it
+        refuses with the typed code ``source_profiles_retired``."""
+        _refuse_source_profiles(source_profiles)
         return self._register(
             "entrypoint",
             fn,
             name,
             publishes=False,
             weights_outputs=(),
-            source_profiles=dict(source_profiles or {}),
             preflight=preflight,
             demand=demand,
             hidden=hidden,
@@ -172,10 +186,11 @@ class App:
         derived from the signature exactly as it is for an entrypoint. There is no
         JobContext, no second kernel and no serving loop.
 
-        ``source_profiles`` is the narrow source-first door: when present it maps every
-        inferred Model parameter to one reviewed TensorFS profile. It selects no provider,
-        source revision, checkpoint, destination, or placement.
+        ``source_profiles`` is RETIRED (cr-077): capability is the slot's class annotation,
+        and selection defaults live in ``package.toml [bindings]``. Passing it refuses with
+        the typed code ``source_profiles_retired``.
         """
+        _refuse_source_profiles(source_profiles)
         return self._register(
             "job",
             fn,
@@ -183,7 +198,6 @@ class App:
             publishes=publishes,
             emits_media=emits_media,
             weights_outputs=weights,
-            source_profiles=dict(source_profiles or {}),
             preflight=None,
             demand=demand,
         )
@@ -196,7 +210,6 @@ class App:
         *,
         publishes: bool,
         weights_outputs: tuple[WeightsOutput, ...],
-        source_profiles: Mapping[str, str],
         preflight: Callable[..., object] | None,
         demand: Bound | None,
         emits_media: bool = False,
@@ -220,7 +233,6 @@ class App:
                 publishes=publishes,
                 emits_media=emits_media,
                 weights_outputs=weights_outputs,
-                source_profiles=dict(source_profiles),
                 demand_bound=demand,
                 preflight=preflight,
                 hidden=hidden,
