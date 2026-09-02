@@ -18,14 +18,18 @@ must see. Nothing widens the table at runtime; a new call site is a new reviewed
 minted for one invocation and spent here, so nothing the package produced — and nothing a
 request body can influence — chooses where bytes land: a destination the table has no row
 for refuses typed. `scripts/worker-live.py grants` plants a presigned-looking metadata-address
-destination and observes `egress_blocked_address` through the real terminal. Every input row is
-`file://` today. The output row also admits the exact `https://` presigned URL
-already carried by `OutputAccess.url`: Tensorhub mints it, R2 sits behind it, and the worker
-never holds bucket credentials. `internal.egress` validates every resolved address and refuses
-a redirect-selected destination. That is what keeps the property; a `file://`-only table never
-did — `scripts/lifecycle-live.py
---only egress` watches a `ctypes` connect(2) LAND from inside the serving executor, so a
-hostile package already holds a socket. The rung is the fence's own, below: a careless
+destination and observes `egress_blocked_address` through the real terminal. An input row is
+`file://`, or — for the payload only — the document itself as a `data:` URL: the grant IS
+the bytes, so a record owner on the same host stages nothing on disk to hand them over. The
+output row admits the exact `file://` path or `https://` presigned URL already carried by
+`OutputAccess.url` (Tensorhub mints it, R2 sits behind it, and the worker never holds bucket
+credentials), or a `file://` DIRECTORY (trailing slash): the worker names the file there by
+its own content digest, `<sha256>.<ext>`, so the granted directory is the durable store
+itself and a regenerated file lands on the one already there. `internal.egress` validates
+every resolved address and refuses a redirect-selected destination. That is what keeps the
+property; a `file://`-only table never did — `scripts/lifecycle-live.py --only egress`
+watches a `ctypes` connect(2) LAND from inside the serving executor, so a hostile package
+already holds a socket. The rung is the fence's own, below: a careless
 package and a malicious GRANT, never a malicious package.
 
 cr-012 shipped an `https://` INPUT row and an `EgressPolicy` allowlist for it. Both are gone
@@ -43,6 +47,8 @@ bound on a buggy package, not a kernel bound on a hostile one.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import io
 import os
@@ -96,17 +102,18 @@ class HubCall:
 #: The COMPLETE set of calls this worker may make. Read it as the security boundary it
 #: is: anything not spelled here cannot be dialled, whoever asks.
 #:
-#: Input rows remain `file://`. The output row admits either the local path or the exact HTTPS
-#: capability the control plane minted. The path/query never appears in a refusal event because a
-#: presigned query is structurally secret. Armed by `scripts/worker-live.py grants` and
-#: `scripts/assets-live.py egress`.
+#: Input rows are `file://`, plus the inline `data:` form the payload may take. The output row
+#: admits the local path, the local directory, or the exact HTTPS capability the control plane
+#: minted. The path/query never appears in a refusal event because a presigned query is
+#: structurally secret, and a `data:` body never does because it is the request. Armed by
+#: `scripts/worker-live.py grants` and `scripts/assets-live.py egress`.
 HUB_CALLS: tuple[HubCall, ...] = (
     HubCall(
         "grant_input_read",
         "GET",
-        r"^file://(?P<path>/[\w./-]+)$",
+        r"^(?:file://(?P<path>/[\w./-]+)|data:application/json;base64,[A-Za-z0-9+/]*={0,2})$",
         ("input_id",),
-        "read one granted input asset (the payload rides the grant as an input)",
+        "read one granted input asset (the payload rides the grant as an input, inline or a file)",
     ),
     HubCall(
         "grant_tree_read",
@@ -120,7 +127,8 @@ HUB_CALLS: tuple[HubCall, ...] = (
         "PUT",
         r"^(?:file:///[\w./-]+|https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[^\s#]+)$",
         ("output_id", "length"),
-        "write one granted output destination under an exact output grant",
+        "write one granted output destination: an exact path or URL, or a directory the "
+        "file is named in by its content digest",
     ),
 )
 
@@ -198,6 +206,9 @@ class Authorizer:
 
 def _safe_url(url: str) -> str:
     """One credential-free URL spelling for faults and events."""
+    if url.startswith("data:"):
+        head, _, body = url.partition(",")
+        return f"{head},<{len(body)} chars>"
     try:
         parsed = urlparse(url)
     except ValueError:
@@ -492,8 +503,9 @@ def _transfer_granted(
 ) -> Any:
     """Authorize, stream, measure and verify one exact bound input.
 
-    `_local` refuses any scheme but `file://` before this reads a byte, which is the whole
-    transport decision: the worker's grant table has no network row (cr-042).
+    The payload may ride the grant inline (`data:`); every other input is `file://`, and
+    `_local` refuses any other scheme before this reads a byte, which is the whole transport
+    decision: the worker's grant table has no network row (cr-042).
     """
     from cozy_runtime.internal import egress
 
@@ -503,6 +515,8 @@ def _transfer_granted(
             f"the delivery grant expired at {grant.expires_at_unix}; a resolver fallback is "
             "a NEW attempt, never a patch to this one",
         )
+    if entry.url.startswith("data:"):
+        return _transfer_inline(entry, auth, sink, cap=cap, prefix_bytes=prefix_bytes)
     local_path = _local(entry.url, grant.file_base_url)
     absolute = f"file://{local_path}"
     try:
@@ -534,6 +548,47 @@ def _transfer_granted(
             "input_digest_mismatch",
             f"{entry.input_id}: content digest disagrees with the invocation spec — a "
             "grant never bypasses the local bytes check",
+        )
+    return receipt
+
+
+def _transfer_inline(
+    entry: BoundInput, auth: Authorizer, sink: Any, *, cap: int, prefix_bytes: int
+) -> Any:
+    """The payload as the grant carries it: decoded, bounded and digest-checked exactly as a
+    file would be. Only the payload is admitted inline — an asset is bytes the record owner
+    holds in its own store and grants by address."""
+    from cozy_runtime.internal import egress
+
+    if entry.input_id != PAYLOAD_INPUT:
+        raise GrantRefusal(
+            "grant_transport",
+            f"{entry.input_id}: only the payload rides the grant inline; an asset is granted "
+            "by address",
+        )
+    auth.authorize("grant_input_read", "GET", entry.url, {"input_id": entry.input_id})
+    try:
+        data = base64.b64decode(entry.url.partition(",")[2], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise GrantRefusal(
+            "grant_transport", f"{entry.input_id}: the inline payload is not base64"
+        ) from exc
+    try:
+        receipt = egress.copy_bounded(
+            iter((data,)),
+            sink,
+            expected_length=entry.length,
+            cap=cap,
+            prefix_bytes=prefix_bytes,
+            what=f"input {entry.input_id!r}",
+        )
+    except egress.EgressRefusal as exc:
+        raise GrantRefusal(exc.code, exc.detail) from exc
+    if receipt.sha256 != entry.digest:
+        raise GrantRefusal(
+            "input_digest_mismatch",
+            f"{entry.input_id}: content digest disagrees with the invocation spec — a "
+            "grant never bypasses the bytes check",
         )
     return receipt
 
@@ -799,6 +854,11 @@ def write_output(
     must be live, and the bytes must fit the destination's declared cap. Writing produces a
     manifest entry and NOTHING else — the runtime may write under an exact output grant and
     cannot authorize readers, publish media, or decide a winning attempt.
+
+    A `file://` destination ending in `/` is a DIRECTORY: the file is named there by its own
+    content digest and the closed extension table, `<sha256>.<ext>`, so the same bytes land
+    on the same name and an existing identical file is a replay, not a conflict. The record
+    owner recomputes that name from the manifest entry and reads exactly it.
     """
     from cozy_runtime.internal import egress
 
@@ -865,14 +925,18 @@ def write_output(
             mime_type=selected_media_type,
         )
 
+    from cozy_runtime.author._media import extension
+
+    named_by_digest = url.endswith("/")
     path = _local(destination.url, grant.file_base_url)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    directory = path if named_by_digest else path.parent
+    directory.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
         with (
             source.open("rb") as opened,
             tempfile.NamedTemporaryFile(
-                mode="w+b", dir=path.parent, prefix=".cozy-output-", delete=False
+                mode="w+b", dir=directory, prefix=".cozy-output-", delete=False
             ) as sink,
         ):
             temporary = Path(sink.name)
@@ -890,19 +954,26 @@ def write_output(
             # plane's own uid, not this worker's: a 0600 spool file behind a granted path is
             # an output nobody can fetch. Content, never a credential; readable is right.
             os.fchmod(sink.fileno(), 0o644)
+        if named_by_digest:
+            path = directory / (receipt.sha256.hex() + extension(selected_media_type))
         try:
             os.link(temporary, path)
-            if os.name == "posix":
-                directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
+            _fsync_directory(directory)
         except FileExistsError as exc:
-            raise GrantRefusal(
-                "output_destination_exists",
-                f"{output_id}: the granted destination already exists; outputs never overwrite",
-            ) from exc
+            if not named_by_digest:
+                raise GrantRefusal(
+                    "output_destination_exists",
+                    f"{output_id}: the granted destination already exists; outputs never overwrite",
+                ) from exc
+            # The name IS the digest: an existing file is the same bytes, or the store holds
+            # a file under a name it does not hash to, which is a conflict and never a
+            # silent overwrite.
+            if _sha256_of(path) != receipt.sha256:
+                raise GrantRefusal(
+                    "output_destination_conflict",
+                    f"{output_id}: {path.name} already exists in the granted directory with "
+                    "different bytes",
+                ) from exc
     except egress.EgressRefusal as exc:
         raise GrantRefusal(exc.code, exc.detail) from exc
     except GrantRefusal:
@@ -920,6 +991,26 @@ def write_output(
         length=receipt.length,
         mime_type=selected_media_type,
     )
+
+
+def _fsync_directory(directory: Path) -> None:
+    if os.name != "posix":
+        return
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sha256_of(path: Path) -> bytes:
+    from cozy_runtime.internal import egress
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(egress.CHUNK), b""):
+            digest.update(chunk)
+    return digest.digest()
 
 
 def _output_media_type(output_id: str, bound: str, produced: str) -> str:

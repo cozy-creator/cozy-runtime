@@ -59,6 +59,19 @@ SIGNATURES: tuple[tuple[int, bytes, str], ...] = (
 #: How many bytes a sniff needs. The furthest signature starts at 8 and is 8 long.
 SNIFF_BYTES = 32
 
+#: media type -> the filename suffix a DIGEST-NAMED output takes (`<sha256>.<ext>`). This
+#: is the one table cozy-creator's `resultfiles.Extension` also spells, and the two must
+#: stay equal: the worker names the file under a directory grant, the daemon looks for
+#: exactly that name at the terminal. An unlisted type gets no guessed suffix.
+EXTENSIONS: dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "audio/wav": ".wav",
+    "application/json": ".json",
+}
+
 #: The media types each ASSET KIND admits. `file` is deliberately open: `FileAsset` is the
 #: kind that promises nothing about its contents, and pretending otherwise would make the
 #: three specific kinds mean less.
@@ -99,3 +112,8 @@ def normalize(declared: str) -> str:
     media type with a parameter, not a different type, and a comparison that says
     otherwise refuses a well-formed declaration."""
     return declared.split(";")[0].strip().lower()
+
+
+def extension(media_type: str) -> str:
+    """`.png` from `image/png`; `""` for a type the closed table does not name."""
+    return EXTENSIONS.get(normalize(media_type), "")
