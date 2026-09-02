@@ -217,7 +217,7 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "pillow", specifier = ">=12,<13" },
     { name = "protobuf", specifier = ">=6.31" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.1,<1" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.1.2,<1" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
@@ -1024,11 +1024,11 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.1.0"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/37/cd/4d007ba7a4192734149e5f3e7d1c5afe86ecaf773f41f9d97248c04996d7/tensorfs-0.1.0.tar.gz", hash = "sha256:a8729d39ab5c100bb36397a9dc5a7912479db483b6ada3fcdf46fd5bfe2524ec", size = 401160, upload-time = "2026-09-02T02:53:59.955Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9c/cd/4738615c7d64e009cd33e51432385ad550638f37907d6ce6a074a81bdc44/tensorfs-0.1.2.tar.gz", hash = "sha256:d7ac67315a620abc03fb87752740b6710aa13e95f8a92e7944fa7d3f407721ad", size = 413864, upload-time = "2026-09-02T20:27:04.255Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/60/9e/477bd86cb8ecce04c8161de2ed5e1d687e131f45ad6b2ba9c2c52948fc1a/tensorfs-0.1.0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a751fe30bab3d556b40edeb918a310c6c140ec7c691961f3a663b1227081202d", size = 2407439, upload-time = "2026-09-02T02:53:58.202Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/29/a24b425b37398cb45858aa1cb9e33b8127f2db5c6823146f78928d8c2a0e/tensorfs-0.1.2-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:7cabe42ad5fe60d554610f41691f9b4050f2ad69e8e425e6de5a303fe1549e21", size = 2503409, upload-time = "2026-09-02T20:27:02.322Z" },
 ]
 
 [[package]]

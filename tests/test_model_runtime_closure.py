@@ -16,10 +16,6 @@ from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
 
 tensorfs = pytest.importorskip("tensorfs")
-if not all(hasattr(tensorfs.Store, name) for name in ("walk_cozytensors", "acquire_cozytensors")):
-    pytest.skip(
-        "installed TensorFS predates the CozyTensors runtime-closure API", allow_module_level=True
-    )
 
 
 # Canonical CozyTensors header produced by TensorFS itself. It contains one inline f32 tensor and
