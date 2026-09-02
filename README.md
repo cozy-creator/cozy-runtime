@@ -237,11 +237,11 @@ RecordOwner placement, qualification measurements, and the worker's observed mac
 descriptor reader rejects the retired `resources` key as an unknown field; format `/1` has one
 current grammar and no compatibility decoder.
 An ordinary `@app.job` may opt into source-first model production without introducing another
-workflow language, and an `@app.entrypoint` declares the model source it is built and tested
-against for publish-time derive evidence (cr-067). In both cases
-`source_profiles={"parameter": "reviewed/tensorfs/profile"}` must name every
-inferred `Model` parameter exactly; each profile is emitted on that model row, beside the class and
-component-use contract it prepares. Each `WeightsOutput` may declare `topology_digest=` and a
+workflow language. A slot's entire declaration is its class annotation (cr-077): the
+publish-time slot facts (shape-only code topology + acceptable encodings) derive from the
+class's own factory, selection defaults live in `package.toml [bindings]`, and the actual
+binding is dispatch. The retired `source_profiles=` decorator field refuses with the typed
+code `source_profiles_retired`. Each `WeightsOutput` may declare `topology_digest=` and a
 sorted `encodings=` tuple. Those exact requirements appear under the output's
 `required_contract`; Tensorhub derives both from the produced header before retention. The
 executor still receives only verified model capabilities, never the foreign source credential or
@@ -396,23 +396,27 @@ materialization, convergence, fallback, or readiness code. Cold proof checks int
 warm proof checks zero downloaded package bytes and exact verified reuse, while the real
 TensorFS cache proof checks non-empty model downloaded/reused accounting.
 
-`cozy-model-contract-proof REQUEST.json OUTPUT_DIR` is the author-side derive-evidence
-writer (cr-067). It runs on the publishing author's machine inside the project venv
-(`uv run --locked`), never on the hub: it compares the exact publishing descriptor with the
-project source and double-derives every requested model binding per declared hardware
-variant under the offline construction sandbox. The fresh output directory appears
-atomically as the derive-evidence envelope: a `cozy.package.derive-evidence/1` index in
-`result.json` plus exact digest-named documents under `contracts/` and `code-topologies/`,
-with per-contract `resources` (component resident bytes and encoding pins) in the index.
+`cozy-model-contract-proof REQUEST.json OUTPUT_DIR` is the author-side slot-facts
+writer (cr-077, was cr-067's pair evidence). It runs on the publishing author's machine
+inside the project venv (`uv run --locked`), never on the hub: it compares the exact
+publishing descriptor with the project source and double-derives every requested slot
+CLASS per active hardware variant under the offline construction sandbox, then publishes
+exactly TWO facts per class — the shape-only code topology (a TensorFS CodeTopology
+document) and the acceptable encodings set. The fresh output directory appears atomically
+as the slot-facts envelope: a `cozy.package.slot-facts/1` index in `result.json` plus
+exact digest-named documents under `code-topologies/`. The construction seed (the
+checkpoint snapshot/config each factory runs against, resolved by the publisher from the
+slot's default `package.toml [bindings]` entry) is an input only — its identity never
+enters the published facts, and hub-side compatibility is graded on demand from
+`grade(code topology × checkpoint topology)` plus encoding/device qualification.
 Tensorhub stores and statically validates those bytes; it never authors, reserializes, or
-re-derives an MCC. The Candidate binds the release VERSION (`org/package@1.0.0`), never a
-release digest — the digest exists only once Tensorhub finalizes the upload the envelope
-rides in.
+re-derives anything. The internal Candidate binds the release VERSION
+(`org/package@1.0.0`), never a release digest — the digest exists only once Tensorhub
+finalizes the upload the envelope rides in.
 
-The request is a closed local process input. Every descriptor model path appears exactly
-once; a function with no model is still recorded in the output index with `bindings: []`.
-Config and descriptor input refs bind exact local bytes for proof ingestion. Their generic
-`digest` is byte integrity and is never compared with semantic `package_descriptor_digest`:
+The request is a closed local process input, sorted unique by slot class. Config and
+descriptor input refs bind exact local bytes for proof ingestion. Their generic `digest`
+is byte integrity and is never compared with semantic `package_descriptor_digest`:
 
 ```json
 {
@@ -423,8 +427,8 @@ Config and descriptor input refs bind exact local bytes for proof ingestion. The
     "digest": "sha256:<64 lowercase hex>",
     "length": 5678
   },
-  "bindings": [{
-    "path": "generate.models.model",
+  "slots": [{
+    "class": "SdxlModel",
     "snapshot": "sha256:<64 lowercase hex>",
     "config": {
       "path": "/proof/model-config.json",
