@@ -367,7 +367,7 @@ def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None
 
         package_names = {"marco-polo", "annotated-doc"}
         rental_distributions = tuple(
-            (name, "0.0.37" if name == "cozy-runtime" else version)
+            (name, "0.1.0" if name == "cozy-runtime" else version)
             for name, version in observed.distributions
             if name not in package_names
         )
