@@ -373,6 +373,11 @@ def _run_child(python: Path, request: Path) -> dict[str, Any]:
         [
             str(python),
             "-I",
+            # -I implies -E, which DISCARDS PYTHONDONTWRITEBYTECODE from the child
+            # environment; -B is the flag form the isolation cannot strip. Without it,
+            # importing any module whose bytecode cache is stale trips the sandbox's
+            # no_filesystem_writes fence on the .pyc write (found live, cr-067 e2e).
+            "-B",
             "-m",
             "cozy_runtime.cli.model_contract_proof",
             "--derive-child",
