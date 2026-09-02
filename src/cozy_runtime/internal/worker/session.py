@@ -39,6 +39,7 @@ import json
 import os
 import queue
 import re
+import resource
 import signal
 import sys
 import threading
@@ -924,6 +925,26 @@ def executor_prepare_command(
     return command
 
 
+def _claim_descriptor_headroom() -> None:
+    """Raise the soft RLIMIT_NOFILE to what the host allows before the worker serves.
+
+    The TensorFS reader pins one verified descriptor per object for a lease's whole life
+    and refuses FD_HEADROOM rather than re-resolve a pathname (tfs-021); a container's
+    default soft limit (1024) is below one real checkpoint (paul/anima pins 979). The
+    worker claims the headroom here and every executor it spawns inherits it.
+    """
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard == resource.RLIM_INFINITY or soft >= hard:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (ValueError, OSError) as exc:
+        print(f"[worker] descriptor headroom stays at soft={soft}: {exc}", flush=True)
+        return
+    print(f"[worker] descriptor headroom soft={soft} -> {hard}", flush=True)
+
+
 class Worker:
     """The no-CUDA control parent — the machine's WORKER process (#455/#484; the name
     `Supervisor` is retired everywhere, and "supervision" survives only as the verb for its
@@ -935,6 +956,7 @@ class Worker:
         self.host = host
         self.root = Path(options.root)
         self.root.mkdir(parents=True, exist_ok=True)
+        _claim_descriptor_headroom()
         self.base = package_environment.observe_base(
             options.environment_python or Path(options.python or sys.executable)
         )
