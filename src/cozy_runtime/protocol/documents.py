@@ -55,6 +55,20 @@ _INT_TYPES = frozenset(
 )
 _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
 
+# Closed collection fields have one spelling even when empty (worker-protocol
+# scripts/canonical.py EXPLICIT_REPEATED; the same table in Creator's canonical writer).
+EXPLICIT_REPEATED: dict[str, tuple[str, ...]] = {
+    "cozy.worker.v1.Config": ("assets",),
+    "cozy.worker.v1.DownloadDelegation": ("models", "packages"),
+    "cozy.worker.v1.Entrypoint": ("slots",),
+    "cozy.worker.v1.Environment": ("wheels",),
+    "cozy.worker.v1.Placement": ("entrypoints", "models"),
+    "cozy.worker.v1.PrivatePackageRevision": ("files",),
+    "cozy.worker.v1.Slot": ("components", "stamps"),
+    "cozy.worker.v1.Stamp": ("values",),
+    "cozy.worker.v1.WheelFact": ("import_roots", "tags"),
+}
+
 
 def doc_format(full_name: str) -> str:
     """The pre-release `format` tag for a document kind: `<full.Name>/1`."""
@@ -127,7 +141,7 @@ def _field(fd: FD, value: Any, where: str) -> Any:
 
 
 def body(message: Message) -> dict[str, Any]:
-    """Set fields only, in no particular order — the writer sorts."""
+    """Set fields plus the explicit empty collections, in no particular order — the writer sorts."""
     out: dict[str, Any] = {}
     for fd, value in message.ListFields():
         where = fd.full_name
@@ -136,6 +150,8 @@ def body(message: Message) -> dict[str, Any]:
             if fd.is_repeated
             else _field(fd, value, where)
         )
+    for name in EXPLICIT_REPEATED.get(message.DESCRIPTOR.full_name, ()):
+        out.setdefault(name, [])
     return out
 
 
