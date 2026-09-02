@@ -1,11 +1,14 @@
 """cr-076: ``plan(components, encoding)`` + ``quantize(source, plan)`` at the dozen-line bar.
 
 One thin layer over the existing derivation math in ``.quantization`` — a per-family
-quantize job is its model class, one ``plan(...)``, and its threshold policy. ``quantize``
-opens one declared lane transaction, normalizes every plain float tensor to BF16, encodes
-the plan's selected GEMM weights, and runs the tier-1 tripwire INSIDE (per-tensor
+ingest producer is its model class, one ``plan(...)``, and its threshold policy.
+``quantize`` opens one declared lane transaction, normalizes every plain f32 tensor to
+BF16 as a recorded derivation (#695: fp16 stays fp16; ``keep``-listed components stay
+at source precision; per-tensor round-trip stats recorded on the cut), encodes the
+plan's selected GEMM weights, and runs the tier-1 tripwire INSIDE (per-tensor
 round-trip against the encoding bound, worst relative Frobenius against the declared
 threshold), refusing typed with code ``quantization_tripwire`` on encoding breakage.
+The ``encoding=None`` lane is the canonical ingest lane and its result says so.
 Plain non-normalizing derivation stays ``derive_fp8``/``derive_mxfp8``.
 """
 
@@ -43,14 +46,17 @@ from .quantization import (
 class QuantizePlan(msgspec.Struct, frozen=True):
     """One lane intent: BF16 normalization plus ``encoding`` over ``components``' weights.
 
-    ``encoding=None`` is the pure BF16 lane. ``max_relative_frobenius`` is the caller's
-    tier-1 threshold policy over the worst per-tensor round-trip; the encoding's own
+    ``encoding=None`` is the canonical plain lane (#695): f32 normalizes to bf16,
+    fp16/bf16/encoded tensors inherit, and ``keep``-listed components' f32 tensors
+    inherit at source precision. ``max_relative_frobenius`` is the caller's tier-1
+    threshold policy over the worst per-tensor round-trip; the encoding's own
     round-trip bound is always enforced underneath it.
     """
 
     components: tuple[str, ...]
     encoding: str | None
     max_relative_frobenius: float | None
+    keep: tuple[str, ...] = ()
 
 
 class QuantizeResult(msgspec.Struct):
@@ -67,16 +73,38 @@ class QuantizeResult(msgspec.Struct):
     new_bytes_written_this_run: int
     saturated_elements_this_run: int
     worst_relative_frobenius: float
+    #: f32 tensors held at source precision by the plan's keep list (#695).
+    kept_keys: int
+    #: worst per-tensor relative Frobenius of the fp32→bf16 cut — the recorded stat.
+    normalization_worst_relative_frobenius: float
+    #: True on the plain lane: the ingest record marks the canonical bf16 lane (#695).
+    canonical: bool
 
 
 def plan(
     components: Sequence[str] = (),
     encoding: str | None = None,
     *,
+    keep: Sequence[str] = (),
     max_relative_frobenius: float | None = None,
 ) -> QuantizePlan:
-    """Build one reviewed lane plan; selection resolves against the source in ``quantize``."""
+    """Build one reviewed lane plan; selection resolves against the source in ``quantize``.
+
+    ``keep`` is the ingest config's per-component keep list (#695): a named component's
+    f32 tensors inherit at source precision instead of normalizing to bf16.
+    """
     selected = tuple(components)
+    kept = tuple(keep)
+    if len(set(kept)) != len(kept) or any(not name for name in kept):
+        raise UnsupportedInput(
+            "keep must name unique non-empty components", code="quantization_plan"
+        )
+    overlap = sorted(set(kept) & set(selected))
+    if overlap:
+        raise UnsupportedInput(
+            f"components {overlap} are keep-listed and cannot also be quantized",
+            code="quantization_plan",
+        )
     if encoding is None:
         if selected:
             raise UnsupportedInput(
@@ -104,7 +132,7 @@ def plan(
                 "max_relative_frobenius must be one finite nonnegative value",
                 code="quantization_plan",
             )
-    return QuantizePlan(selected, encoding, max_relative_frobenius)
+    return QuantizePlan(selected, encoding, max_relative_frobenius, kept)
 
 
 def quantize(
@@ -123,7 +151,8 @@ def quantize(
     ``WeightsSink.structure`` view already fetched from it — both reach the same tensors.
     """
     model, structure = _resolve(source, sink)
-    bf16 = prepare_bf16(structure)
+    bf16 = prepare_bf16(structure, keep=plan.keep)
+    canonical = plan.encoding is None
     if plan.encoding is None:
         artifact = None
         selected: set[tuple[str, str]] = set()
@@ -173,11 +202,15 @@ def quantize(
                 new_bytes_written_this_run=0,
                 saturated_elements_this_run=0,
                 worst_relative_frobenius=0.0,
+                kept_keys=len(bf16.kept),
+                normalization_worst_relative_frobenius=0.0,
+                canonical=canonical,
             )
-        read = write_bf16(
+        normalization = write_bf16(
             transaction, ctx, tel, plan=bf16, source="source", excluded=selected or None
         )
-        written = sum(2 * math.prod(tensor.shape) for tensor in converted)
+        read = normalization.source_bytes_read
+        written = normalization.new_bytes_written
         saturated = 0
         worst = 0.0
         if artifact is not None and plan.encoding is not None:
@@ -214,6 +247,9 @@ def quantize(
         new_bytes_written_this_run=written,
         saturated_elements_this_run=saturated,
         worst_relative_frobenius=worst,
+        kept_keys=len(bf16.kept),
+        normalization_worst_relative_frobenius=normalization.worst_relative_frobenius,
+        canonical=canonical,
     )
 
 
