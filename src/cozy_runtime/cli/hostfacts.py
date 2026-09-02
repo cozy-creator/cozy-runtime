@@ -1,7 +1,9 @@
-"""`cozy-runtime fit` — local host facts and weightless structural verdicts.
+"""`cozy-runtime hostfacts` — local host facts and weightless structural verdicts.
 
-Model-bound capacity requires the exact selected Plan/RMB/MCC closure. This local verb does
-not mint or approximate that closure, so those rows remain explicitly unbound.
+Model-bound capacity requires the exact selected plan closure. This local verb does not
+mint or approximate that closure, so those rows remain explicitly unbound. Whether code
+FITS a checkpoint is `tensorfs.fit`'s answer (model-code-fit §3), asked by the worker at
+construction and by `cozy-runtime derive` + `tfs fit` by hand; nothing here fits anything.
 """
 
 from __future__ import annotations
@@ -81,7 +83,7 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
             if any(v["exact"] for v in verdicts)
             else ("note: no payload given — structural/range information only, not an exact fit",)
         ),
-        next=("cozy-runtime fit <function> <primary> key=value — the EXACT verdict",),
+        next=("cozy-runtime hostfacts <function> <primary> key=value — the EXACT verdict",),
     )
 
 
@@ -112,12 +114,12 @@ def _verdict(
         return {
             "function": surface.name,
             "exact": exact,
-            "rendered": "fits(native, all_resident) — weightless, no model binding",
-            "verdict": "fits",
+            "rendered": "runnable(native, all_resident) — weightless, no model binding",
+            "verdict": "runnable",
         }
     return {
         "function": surface.name,
         "exact": False,
-        "rendered": "unbound — capacity requires a canonical selected Plan/RMB/MCC closure",
+        "rendered": "unbound — capacity requires the selected plan closure",
         "verdict": "unbound",
     }

@@ -48,6 +48,7 @@ from typing import Any, TypeVar
 from cozy_runtime.internal import bindings as binding_table
 from cozy_runtime.internal import (
     canonical,
+    derive_child,
     descriptor,
     fill,
     liveness,
@@ -1166,6 +1167,7 @@ def development_placement_documents(
                     model_weight_bytes=selected.model_weight_bytes,
                     custody=selected.custody,
                     sequence_parallel_degrees=tuple(selected.slot.sequence_parallel),
+                    model=f"{selected.repo}/{selected.name}@{selected.version}/{selected.lane}",
                 )
             )
         slots.sort(key=lambda row: row.slot)
@@ -1201,6 +1203,7 @@ def development_placement_documents(
             development=True,
             model_weight_bytes=sum(model.model_weight_bytes for model in model_set),
             custody=first.custody if first is not None else "canonical",
+            package=f"{package}@{release}",
         )
     entrypoint_bodies = [documents.body(entrypoint) for entrypoint in entrypoints]
     bindings_digest = hashlib.sha256(
@@ -1305,10 +1308,9 @@ def _resolve_development_models(
             raise RuntimeError(
                 f"development_model_config_invalid: {binding.ref}: {type(exc).__name__}: {exc}"
             ) from exc
-        components_value = header.get("components")
-        if not isinstance(components_value, Mapping) or not components_value:
+        if not header.get("components"):
             raise RuntimeError(f"development_model_components_absent: {binding.ref}")
-        components = tuple(sorted(str(component) for component in components_value))
+        components = _derive_components(found.project, slot.path, config_bytes, config_digest)
         selected_assets = _development_assets(binding.ref, header.get("assets", {}))
         try:
             model_weight_bytes = sum(
@@ -1339,6 +1341,37 @@ def _resolve_development_models(
             model_weight_bytes=model_weight_bytes,
         )
     return resolved
+
+
+def _derive_components(
+    project: Path, slot: str, config_bytes: bytes, config_digest: str
+) -> tuple[str, ...]:
+    """`Slot.components` = what the derive constructs for this config document (D9), from
+    `cozy-runtime derive`'s bounded child in THIS venv — this process is the package venv's
+    own runtime, and `sys.executable` is its interpreter."""
+    import sys
+    import tempfile
+
+    scratch = Path(tempfile.mkdtemp(prefix="cozy-local-derive-"))
+    try:
+        config_path = scratch / "config.json"
+        config_path.write_bytes(config_bytes)
+        request = derive_child.DeriveRequest(
+            (
+                derive_child.SlotRequest(
+                    slot, derive_child.ConfigRef(config_path, config_digest, len(config_bytes))
+                ),
+            ),
+            project=Path(project).resolve(),
+        )
+        (held,) = derive_child.derive_in(Path(sys.executable), request, scratch)
+        return derive_child.constructed_components(held.document)
+    except derive_child.DeriveRefusal as exc:
+        raise RuntimeError(
+            f"development_model_derive_refused: {slot}: {exc.code}: {exc.detail}"
+        ) from exc
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _development_assets(binding_ref: str, value: object) -> Mapping[str, Mapping[str, Any]]:

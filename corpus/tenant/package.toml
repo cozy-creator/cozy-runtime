@@ -5,7 +5,7 @@
 [application]
 object = "tiny_tenant:app"
 
-[bindings."TenantModel"]
+[bindings."touch.models.model"]
 model = "cozytest/tenant"
 release = "1"
 lane = "bf16"

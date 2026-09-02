@@ -1,12 +1,12 @@
 """Author-side writer of the publish memo `cozy.package.code-topologies/1` (model-code-fit §3).
 
 Runs on the author's machine inside the project venv (`uv run --locked`), at publish. Per
-slot it derives the CODE TOPOLOGY — `census(factory(config_document))` on the meta device,
-in one bounded child whose audit hooks allow no network, weight reads, writes or
-subprocesses — and writes one digest-addressed envelope: `result.json` (the memo index:
-one row per (slot, config_digest)) plus `code-topologies/<sha256>.json` sibling documents,
-by atomic rename. The hub stores the memo and never grades it (D2); it is the only artefact
-a future "which checkpoints fit this slot" search could join on.
+slot class it runs `derive` — `census(factory(config_document))` on the meta device, in the
+one bounded child `cozy-runtime derive` uses (`internal/derive_child.py`) — and writes one
+digest-addressed envelope: `result.json` (the memo index: one row per (slot, config_digest))
+plus `code-topologies/<sha256>.json` sibling documents, each the canonical TensorFS
+CodeTopology `tfs fit` reads, by atomic rename. The hub stores the memo and never grades it
+(D2); it is the only artefact a future "which checkpoints fit this slot" search could join on.
 
 No ModelConstructionContract, no hardware variants, no snapshots, no verdict. The
 construction SEED is the config document of the slot's default binding, resolved by the
@@ -20,35 +20,29 @@ invokes today, and both members are ignored here. cl-094 replaces the call with
 
 from __future__ import annotations
 
-import base64
 import errno
 import hashlib
 import json
 import os
 import stat
-import subprocess
 import sys
+import tempfile
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.author import Artifact, Config, ConformanceError, ModelBinding
+from cozy_runtime.author import ConformanceError
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import canonical, sandbox
+from cozy_runtime.internal import canonical, derive_child
 from cozy_runtime.internal import descriptor as package_descriptor
-from cozy_runtime.internal.derive import DeriveError, derive
 from cozy_runtime.internal.descriptor import StalePackageDescriptor
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
 
 INDEX_NAME = "result.json"
 TOPOLOGIES_DIR = "code-topologies"
-RESULT_PREFIX = "COZY_CODE_TOPOLOGIES="
-MEMORY_CAP_BYTES = 24 << 30
-CPU_CAP_SECONDS = 600
-WALL_CAP_SECONDS = 900
 
 INDEX_FORMAT = "cozy.package.code-topologies/1"
 
@@ -113,9 +107,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Derive the code-topologies memo from one already materialized release environment."""
 
     args = list(sys.argv[1:] if argv is None else argv)
-    if args[:1] == ["--derive-child"]:
-        return _child_entry(args[1:])
-
     opts = Options()
     try:
         if len(args) != 2:
@@ -137,8 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         # The author's own venv is the derivation environment: the parent runs inside
         # `uv run --locked`, so sys.executable resolves the exact locked interpreter.
-        response = _run_child(Path(sys.executable), request_path)
-        index, topologies = _decode_child(response, request)
+        index, topologies = _derive(Path(sys.executable), request)
         index_bytes = canonical.write(index)
         _publish(output, index_bytes, topologies)
         print(
@@ -159,12 +149,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     except CliError as err:
         emit_error(err, opts)
         return int(err.code)
-    except ProofRefusal as err:
+    except (ProofRefusal, derive_child.DeriveRefusal) as err:
         emit_error(
             CliError(
                 err.code,
                 err.detail,
                 "repair the exact release descriptor/config inputs and run a fresh proof",
+                Exit.structural,
+            ),
+            opts,
+        )
+        return int(Exit.structural)
+    except (ConformanceError, StalePackageDescriptor) as err:
+        emit_error(
+            CliError(
+                str(getattr(err, "code", "code_topologies_conformance")),
+                str(err),
+                "repair the package source so its descriptor is the published one",
                 Exit.structural,
             ),
             opts,
@@ -357,235 +358,92 @@ def _document_bytes(path: Path, name: str) -> bytes:
     return raw
 
 
-def _run_child(python: Path, request: Path) -> dict[str, Any]:
-    child_env = sandbox.child_environment({})
-    child_env.update(
-        {
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONHASHSEED": "0",
-            "PYTHONNOUSERSITE": "1",
-        }
-    )
-    result = subprocess.run(
-        [
-            str(python),
-            "-I",
-            # -I implies -E, which DISCARDS PYTHONDONTWRITEBYTECODE from the child
-            # environment; -B is the flag form the isolation cannot strip. Without it,
-            # importing any module whose bytecode cache is stale trips the sandbox's
-            # no_filesystem_writes fence on the .pyc write (found live, cr-067 e2e).
-            "-B",
-            "-m",
-            "cozy_runtime.cli.code_topologies",
-            "--derive-child",
-            str(request),
-        ],
-        cwd="/",
-        env=child_env,
-        capture_output=True,
-        text=True,
-        timeout=WALL_CAP_SECONDS,
-        check=False,
-    )
-    encoded = next(
-        (
-            line.removeprefix(RESULT_PREFIX)
-            for line in reversed(result.stdout.splitlines())
-            if line.startswith(RESULT_PREFIX)
-        ),
-        "",
-    )
-    if not encoded:
-        detail = result.stderr.strip()[-1200:] or (
-            f"child exited {result.returncode} without a result"
-        )
-        raise ProofRefusal("code_topologies_child_failed", detail)
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-        response = canonical.parse_canonical(raw)
-    except (ValueError, canonical.CanonicalError) as err:
-        raise ProofRefusal("code_topologies_child_invalid", str(err)) from err
-    if not isinstance(response, dict):
-        raise ProofRefusal("code_topologies_child_invalid", "child result is not an object")
-    if "error" in response:
-        error_code = response.get("error")
-        error_detail = response.get("detail")
-        raise ProofRefusal(
-            str(error_code or "code_topologies_child_failed"), str(error_detail or "refused")
-        )
-    if result.returncode != 0:
-        raise ProofRefusal("code_topologies_child_failed", f"child exited {result.returncode}")
-    return response
-
-
-def _child_entry(args: Sequence[str]) -> int:
-    if len(args) != 1:
-        _emit_child({"error": "code_topologies_child_usage", "detail": "one request path required"})
-        return int(Exit.usage)
-    try:
-        request_path = _existing_file(args[0], "request")
-        request = _read_request(request_path)
-        descriptor_doc = _read_descriptor(request.package_descriptor)
-        application = descriptor_doc.get("application")
-        if not isinstance(application, str) or not application:
-            raise ProofRefusal(
-                "code_topologies_package_descriptor_invalid", "application is absent"
-            )
-        _warm_torch()
-        sandbox.install(allow_write_prefixes=())
-        sandbox.bound(address_bytes=MEMORY_CAP_BYTES, cpu_seconds=CPU_CAP_SECONDS)
-        found = discover(request.project)
-        derived_descriptor = package_descriptor.build(found)
-        package_descriptor.compare(
-            descriptor_doc,
-            derived_descriptor,
-            ("the publishing descriptor", "the project source"),
-        )
-        if found.application != application:
-            raise ProofRefusal(
-                "code_topologies_package_descriptor_invalid",
-                "descriptor application does not name the discovered application",
-            )
-        response = _derive_facts(request, found, derived_descriptor)
-    except CliError as err:
-        _emit_child({"error": err.name, "detail": err.message})
-        return int(err.code)
-    except ProofRefusal as err:
-        _emit_child({"error": err.code, "detail": err.detail})
-        return int(Exit.structural)
-    except (ConformanceError, StalePackageDescriptor) as err:
-        _emit_child(
-            {
-                "error": str(getattr(err, "code", "code_topologies_conformance")),
-                "detail": str(err),
-            }
-        )
-        return int(Exit.structural)
-    except (DeriveError, sandbox.FenceViolation) as err:
-        name = getattr(err, "construct", None) or getattr(err, "fence", None)
-        _emit_child(
-            {"error": str(name or "code_topologies_derivation_refused"), "detail": str(err)}
-        )
-        return int(Exit.structural)
-    except Exception as err:
-        _emit_child(
-            {
-                "error": "code_topologies_derivation_internal",
-                "detail": f"{type(err).__name__}: {err}",
-            }
-        )
-        return int(Exit.internal)
-    _emit_child(response)
-    return int(Exit.ok)
-
-
-def _warm_torch() -> None:
-    """Warm torch's own lazy imports before rlimits, never package code or a GPU."""
-
-    __import__("torch")
-    for name in ("torch._dynamo", "torch._refs"):
-        try:
-            __import__(name)
-        except ModuleNotFoundError as err:
-            if err.name != name:
-                raise
-
-
-def _derive_facts(
-    request: ProofRequest, found: Any, descriptor_doc: Mapping[str, Any]
-) -> dict[str, Any]:
-    """Derive one code topology per requested slot class and fan it out to every slot path
+def _derive(python: Path, request: ProofRequest) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Derive one CodeTopology per requested slot class and fan it out to every slot path
     of that class: the memo rows are keyed (slot, config_digest), the derive is per class
-    because one class has one factory."""
+    because one class has one factory.
 
-    del descriptor_doc  # byte-compared against the source by the caller
-    bindings_by_class: dict[str, ModelBinding] = {}
+    The publishing descriptor is byte-compared against the source first: the memo must
+    describe the release it rides with, and a source that describes differently is refused
+    here rather than shipped beside a descriptor it disagrees with.
+    """
+    descriptor_doc = _read_descriptor(request.package_descriptor)
+    application = descriptor_doc.get("application")
+    if not isinstance(application, str) or not application:
+        raise ProofRefusal("code_topologies_package_descriptor_invalid", "application is absent")
+    found = discover(request.project)
+    package_descriptor.compare(
+        descriptor_doc,
+        package_descriptor.build(found),
+        ("the publishing descriptor", "the project source"),
+    )
+    if found.application != application:
+        raise ProofRefusal(
+            "code_topologies_package_descriptor_invalid",
+            "descriptor application does not name the discovered application",
+        )
     paths_by_class: dict[str, list[str]] = {}
     for surface in found.surfaces:
         if surface.hidden:
             continue
         for binding in surface.model_bindings:
-            bindings_by_class.setdefault(binding.class_key, binding)
             paths_by_class.setdefault(binding.class_key, []).append(binding.path)
-    unknown = sorted({row.class_key for row in request.slots} - set(bindings_by_class))
+    unknown = sorted({row.class_key for row in request.slots} - set(paths_by_class))
     if unknown:
         raise ProofRefusal(
             "code_topologies_class_unknown",
             f"requested classes {unknown} are not model slot classes of this package "
-            f"(have {sorted(bindings_by_class)})",
+            f"(have {sorted(paths_by_class)})",
         )
+    for source in request.slots:
+        _read_exact(source.config, f"config for {source.class_key}")
+    slots = tuple(
+        derive_child.SlotRequest(
+            sorted(paths_by_class[source.class_key])[0],
+            derive_child.ConfigRef(source.config.path, source.config.digest, source.config.length),
+        )
+        for source in request.slots
+    )
+    by_slot = {slot.slot: source for slot, source in zip(slots, request.slots, strict=True)}
+    ordered = tuple(sorted(slots, key=lambda row: row.slot))
+    scratch = Path(tempfile.mkdtemp(prefix="cozy-code-topologies-"))
+    try:
+        derived = derive_child.derive_in(
+            python, derive_child.DeriveRequest(ordered, project=request.project), scratch
+        )
+    finally:
+        _remove_tree(scratch)
 
     topologies: dict[str, bytes] = {}
     rows: list[dict[str, Any]] = []
-    for source in request.slots:
-        binding = bindings_by_class[source.class_key]
-        config_bytes = _read_exact(source.config, f"config for {source.class_key}")
-        try:
-            config_doc = canonical.parse_canonical(config_bytes)
-        except canonical.CanonicalError as err:
-            raise ProofRefusal(
-                "code_topologies_config_invalid", f"{source.class_key}: {err}"
-            ) from err
-        if not isinstance(config_doc, dict):
-            raise ProofRefusal(
-                "code_topologies_config_invalid",
-                f"{source.class_key}: config is not an object",
-            )
-        config = Config._verified(config_doc, "config", source.config.digest)
-        topology = _derive_twice(binding, config, config_digest=source.config.digest)
-        topology_digest = _sha(topology)
-        previous = topologies.setdefault(topology_digest, topology)
-        if previous != topology:
-            raise ProofRefusal("code_topologies_digest_collision", topology_digest)
+    for held in derived:
+        source = by_slot[held.slot]
+        previous = topologies.setdefault(held.digest, held.document)
+        if previous != held.document:
+            raise ProofRefusal("code_topologies_digest_collision", held.digest)
         for path in paths_by_class[source.class_key]:
             rows.append(
                 {
                     "slot": path,
                     "class": source.class_key,
                     "config_digest": source.config.digest,
-                    "code_topology": {"digest": topology_digest, "length": len(topology)},
+                    "code_topology": {"digest": held.digest, "length": len(held.document)},
                 }
             )
     rows.sort(key=lambda row: (str(row["slot"]), str(row["config_digest"])))
-    return {
-        "code_topologies": [
-            {
-                "bytes": base64.b64encode(raw).decode(),
-                "digest": digest,
-                "length": len(raw),
-            }
-            for digest, raw in sorted(topologies.items())
-        ],
+    keys = [(str(row["slot"]), str(row["config_digest"])) for row in rows]
+    if keys != sorted(set(keys)):
+        raise ProofRefusal(
+            "code_topologies_child_invalid", "rows are not sorted unique by (slot, config_digest)"
+        )
+    memo = {
+        "format": INDEX_FORMAT,
+        "package": request.package["package"],
+        "release": request.package["release"],
+        "descriptor_digest": request.package_descriptor.digest,
         "rows": rows,
     }
-
-
-def _derive_twice(binding: ModelBinding, config: Config, *, config_digest: str) -> bytes:
-    """The derive is deterministic or it is not a fact: two runs, byte-identical."""
-
-    def run() -> bytes:
-        result = derive(
-            binding.model_class(),
-            Artifact("derive://" + config_digest, {}, config, custody="canonical"),
-            component_use=binding.components,
-        )
-        if result.config_digest != config_digest:
-            raise ProofRefusal(
-                "code_topologies_config_digest_mismatch",
-                f"{binding.class_key} did not retain the exact config document identity",
-            )
-        document = result.code_topology()
-        document["encoded_leaves"] = binding.encoded_leaves
-        return canonical.write(document)
-
-    first = run()
-    second = run()
-    if first != second:
-        raise ProofRefusal(
-            "code_topologies_nondeterministic",
-            f"{binding.class_key} produced different canonical bytes on rebuild",
-        )
-    return first
+    return memo, topologies
 
 
 def _read_exact(ref: LocalDocumentRef, name: str) -> bytes:
@@ -609,105 +467,6 @@ def _read_descriptor(ref: LocalDocumentRef) -> dict[str, Any]:
             f"package_descriptor at {ref.path} does not mean {ref.digest}/{ref.length}",
         )
     return document
-
-
-def _emit_child(value: Mapping[str, Any]) -> None:
-    raw = canonical.write(dict(value))
-    print(RESULT_PREFIX + base64.b64encode(raw).decode())
-
-
-def _decode_child(
-    response: Mapping[str, Any],
-    request: ProofRequest,
-) -> tuple[dict[str, Any], dict[str, bytes]]:
-    if set(response) != {"code_topologies", "rows"}:
-        raise ProofRefusal("code_topologies_child_invalid", "child result has an open field set")
-    topology_rows = response["code_topologies"]
-    if not isinstance(topology_rows, list):
-        raise ProofRefusal("code_topologies_child_invalid", "code_topologies is not an array")
-    topologies: dict[str, bytes] = {}
-    for row in topology_rows:
-        if not isinstance(row, dict) or set(row) != {"bytes", "digest", "length"}:
-            raise ProofRefusal("code_topologies_child_invalid", "code topology row field set")
-        digest = row["digest"]
-        length = row["length"]
-        encoded = row["bytes"]
-        if (
-            not isinstance(digest, str)
-            or canonical.DIGEST_RE.fullmatch(digest) is None
-            or not isinstance(length, int)
-            or isinstance(length, bool)
-            or length <= 0
-            or not isinstance(encoded, str)
-        ):
-            raise ProofRefusal("code_topologies_child_invalid", "code topology row values")
-        try:
-            raw = base64.b64decode(encoded, validate=True)
-        except ValueError as err:
-            raise ProofRefusal(
-                "code_topologies_child_invalid", "code topology bytes base64"
-            ) from err
-        if len(raw) != length or _sha(raw) != digest:
-            raise ProofRefusal(
-                "code_topologies_child_invalid", "code topology stored-byte identity"
-            )
-        topologies[digest] = raw
-    rows = response["rows"]
-    if not isinstance(rows, list) or not rows:
-        raise ProofRefusal("code_topologies_child_invalid", "rows is not a non-empty array")
-    referenced: set[str] = set()
-    keys: list[tuple[str, str]] = []
-    classes: set[str] = set()
-    for row in rows:
-        if not isinstance(row, dict) or set(row) != {
-            "slot",
-            "class",
-            "config_digest",
-            "code_topology",
-        }:
-            raise ProofRefusal("code_topologies_child_invalid", "memo row field set")
-        slot = row["slot"]
-        class_key = row["class"]
-        config_digest = row["config_digest"]
-        if (
-            not isinstance(slot, str)
-            or not slot
-            or not isinstance(class_key, str)
-            or not class_key
-            or not isinstance(config_digest, str)
-            or canonical.DIGEST_RE.fullmatch(config_digest) is None
-        ):
-            raise ProofRefusal("code_topologies_child_invalid", "memo row values")
-        ref = row["code_topology"]
-        if (
-            not isinstance(ref, dict)
-            or set(ref) != REF_FIELDS
-            or not isinstance(ref["digest"], str)
-            or ref["digest"] not in topologies
-            or ref["length"] != len(topologies[ref["digest"]])
-        ):
-            raise ProofRefusal("code_topologies_child_invalid", "memo row code topology ref")
-        referenced.add(ref["digest"])
-        keys.append((slot, config_digest))
-        classes.add(class_key)
-    if keys != sorted(set(keys)):
-        raise ProofRefusal(
-            "code_topologies_child_invalid", "rows are not sorted unique by (slot, config_digest)"
-        )
-    if classes != {row.class_key for row in request.slots}:
-        raise ProofRefusal(
-            "code_topologies_child_invalid", "rows do not answer the requested classes"
-        )
-    if referenced != set(topologies):
-        raise ProofRefusal("code_topologies_child_invalid", "unreferenced code topology document")
-    memo = {
-        "format": INDEX_FORMAT,
-        "package": request.package["package"],
-        "release": request.package["release"],
-        "descriptor_digest": request.package_descriptor.digest,
-        "rows": rows,
-    }
-    return memo, topologies
 
 
 def _publish(

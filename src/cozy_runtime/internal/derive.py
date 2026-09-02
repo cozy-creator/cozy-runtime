@@ -35,6 +35,7 @@ from types import ModuleType
 from typing import Any, Literal, cast
 
 from cozy_runtime.author._loader import Artifact, Census, Loader, census, loading
+from cozy_runtime.internal import code_topology
 
 SUBSTRATE = "meta-device"
 
@@ -165,8 +166,14 @@ def _refuse_compile() -> Iterator[None]:
 class _Capability:
     """The hardware variant answered instead of this box's card, and whether it was asked.
 
-    Under derive the answer is never meaningful: a construction that ASKS is refused (D3),
-    and `read` is how the harness knows. Under serve the executor answers its own card.
+    Under derive the answer is never meaningful: a construction that asks WHICH card is
+    refused (D3), and `read` is how the harness knows. Under serve the executor answers its
+    own card. Availability (`is_available`, `device_count`) is answered and NOT marked: a
+    library's import-time environment probe asks it (diffusers' `torch_utils.get_device()`
+    on first import, which a factory's lazy `from diffusers import …` triggers), it names no
+    card, and a construction that differed by availability would still be judged on its
+    real census at serve (D8) — while marking it refused every diffusers package whose
+    first diffusers import sits in the factory.
     """
 
     variant: str
@@ -193,9 +200,10 @@ def _capability(cap: _Capability) -> Iterator[None]:
         for name in ("get_device_capability", "get_device_name", "is_available", "device_count")
     }
 
-    def mark(value: object) -> Callable[..., object]:
+    def mark(value: object, *, read: bool = True) -> Callable[..., object]:
         def answer(*args: object, **kwargs: object) -> object:
-            cap.read = True
+            if read:
+                cap.read = True
             return value
 
         return answer
@@ -203,8 +211,8 @@ def _capability(cap: _Capability) -> Iterator[None]:
     cuda = cap.variant != "cpu"
     torch.cuda.get_device_capability = mark(cap.major_minor)  # type: ignore[assignment]
     torch.cuda.get_device_name = mark(cap.variant)  # type: ignore[assignment]
-    torch.cuda.is_available = mark(cuda)  # type: ignore[assignment]
-    torch.cuda.device_count = mark(1 if cuda else 0)  # type: ignore[assignment]
+    torch.cuda.is_available = mark(cuda, read=False)  # type: ignore[assignment]
+    torch.cuda.device_count = mark(1 if cuda else 0, read=False)  # type: ignore[assignment]
     try:
         yield
     finally:
@@ -926,21 +934,23 @@ class Derivation:
     def components(self) -> tuple[str, ...]:
         return tuple(d.component for d in self.destination_sets)
 
+    def rows(self) -> list[code_topology.Row]:
+        """The code destinations as `(component, key, dtype?, shape)` — the one projection
+        `tensorfs.code_topology` reads, shared with the serving census."""
+        return [
+            (t.component, t.key[len(t.component) + 1 :], t.dtype, t.shape)
+            for t in self.logical_tensors
+        ]
+
     def code_topology(self) -> dict[str, Any]:
-        """`component → key → {shape, dtype?}` as a canonical document: the shape census
-        the memo and `tensorfs.fit` read. Sorted by (component, key); no candidate term."""
-        out: dict[str, dict[str, Any]] = {}
-        for tensor in sorted(self.logical_tensors, key=lambda t: (t.component, t.key)):
-            local = tensor.key[len(tensor.component) + 1 :]
-            row: dict[str, Any] = {"shape": list(tensor.shape)}
-            if tensor.dtype is not None:
-                row["dtype"] = tensor.dtype
-            out.setdefault(tensor.component, {})[local] = row
-        return {
-            "format": "cozy.runtime.code-topology/1",
-            "components": out,
-            "constructed": list(self.components),
-        }
+        """`component → key → {shape, dtype?}` in the runtime's memo spelling."""
+        return code_topology.memo_document(self.rows(), self.components)
+
+    def tensorfs_bytes(self, *, encoded_leaves: str) -> bytes:
+        """The canonical TensorFS CodeTopology `tensorfs.fit` and the memo consume."""
+        return code_topology.tensorfs_bytes(
+            self.rows(), self.components, encoded_leaves=encoded_leaves
+        )
 
 
 def derive(

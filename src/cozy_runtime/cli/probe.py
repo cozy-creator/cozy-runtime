@@ -258,6 +258,12 @@ class _LaneBackend:
         self._label = label
         self._index = index
 
+    def fit(self, walked: Any, *, encoded_leaves: str) -> None:
+        """A lane tree is safetensors, not a cozytensors header: there is no checkpoint
+        document for `tensorfs.fit` to judge, so nothing is judged. A destination the tree
+        does not supply, or supplies at another shape, refuses at `fill` by name."""
+        return None
+
     def materialize(self, obj: object, walked: Any, *, encoded_leaves: str = "refuse") -> Any:
         return walked.live
 
@@ -266,8 +272,23 @@ class _LaneBackend:
 
         from cozy_runtime.derive import safetensors_io
 
+        if key not in self._index:
+            raise CliError(
+                "validation",
+                f"lane {self._label!r} supplies no {key!r}; the code constructs it",
+                "a lane tree supplies every destination the entrypoint's model constructs",
+                Exit.validation,
+            )
         path, header, base = self._index[key]
         row = header[key]
+        if tuple(int(x) for x in row["shape"]) != tuple(destination.shape):
+            raise CliError(
+                "validation",
+                f"lane {self._label!r}: {key} is stored {list(row['shape'])}, the code "
+                f"constructs {list(destination.shape)}",
+                "a lane tree supplies every destination at the shape the code constructs",
+                Exit.validation,
+            )
         raw = safetensors_io.read_raw(path, header, base, key)
         values = safetensors_io.to_f32(raw, str(row["dtype"]), [int(x) for x in row["shape"]])
         with torch.no_grad():

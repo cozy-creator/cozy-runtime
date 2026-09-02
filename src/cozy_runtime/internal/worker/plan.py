@@ -272,6 +272,9 @@ class ModelBinding:
     sequence_parallel_degrees: tuple[int, ...] = ()
     """The descriptor slot's `sequence_parallel.degrees` (cr-068): what the author said the
     class shards at. A placement pinned to K devices needs K here."""
+    model: str = ""
+    """`org/name@release/lane` — the checkpoint's catalog name, for the one line a person
+    reads when the code does not fit it (model-code-fit §3). Resolution, never identity."""
 
     def snapshot_for(self, component: str) -> str:
         return self.snapshots.get(component, self.reference_snapshot)
@@ -373,6 +376,9 @@ class DeclaredBinding:
     confessed — model-code-fit D5). RESOLUTION: custody is how THIS machine came to hold
     these bytes, which is exactly what an index row records and what a record-writer on
     another machine cannot know."""
+    package: str = ""
+    """`org/name@release` — the package this binding belongs to, for the fit refusal's
+    one human line. Resolution, never identity."""
     max_input_bytes: int = 64 << 20
     """cr-012: the DEPLOYMENT's per-input-asset ceiling, checked pre-accept against the
     grant's declared length. A field's own `AssetBound` narrows it and never widens it."""

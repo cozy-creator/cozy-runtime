@@ -285,6 +285,10 @@ class _RecordingBackend:
     def filled_bytes(self) -> int:
         return sum(e.nbytes for e in self.events)
 
+    def fit(self, walked: Census, *, encoded_leaves: str) -> None:
+        """A stand-in holds no checkpoint header, so there is nothing to judge against."""
+        return None
+
     def materialize(
         self, obj: object, walked: Census, *, encoded_leaves: str = "refuse"
     ) -> Mapping[str, TensorLike]:
