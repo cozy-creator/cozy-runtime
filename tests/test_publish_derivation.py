@@ -8,8 +8,9 @@ Three planes, each driven for real:
 * the pod preparation plane — the hub-committed manifest + descriptor staged beside the
   set are the authoritative wiring, import-time derivation is a byte-compared cross-check,
   and NOTHING on this plane may load the derive machinery (the hard guard, proven red);
-* the slot-facts writer — `cozy-model-contract-proof`'s author-mode request grammar binds
-  the release VERSION and refuses the retired release-digest circularity.
+* the code-topologies memo writer — `cozy-model-contract-proof`'s request grammar binds
+  the release VERSION, refuses the retired release-digest circularity, and reads past
+  the two request members that named the deleted MCC plane.
 """
 
 from __future__ import annotations
@@ -146,8 +147,10 @@ def test_lane_words_are_not_selection_leaks() -> None:
     assert leaked_release.value.code == "fixed_point"
 
 
-def test_descriptor_slot_grammar_refuses_the_retired_field() -> None:
-    """A stale descriptor still carrying source_profile refuses at read (closed set)."""
+def test_descriptor_slot_grammar_refuses_the_retired_members() -> None:
+    """The slot is `{path, class, component_use, encoded_leaves}` (model-code-fit §1). A
+    descriptor carrying `source_profile`, or a `stamps` VALUE, refuses typed with the hub's
+    own names; the empty `stamps` map every pre-cut release ships reads as nothing."""
     app = App()
 
     @app.entrypoint
@@ -155,10 +158,55 @@ def test_descriptor_slot_grammar_refuses_the_retired_field() -> None:
         return Reply(text="ok")
 
     body = json.loads(descriptor.canonical_bytes(_described(app)))
-    assert "source_profile" not in body["entrypoints"][0]["models"][0]
-    body["entrypoints"][0]["models"][0]["source_profile"] = "acme/sd-turbo/1.0.0/bf16"
-    with pytest.raises(descriptor.StalePackageDescriptor):
-        descriptor.read_bytes(canonical.write(body))
+    slot = body["entrypoints"][0]["models"][0]
+    assert set(slot) == {"path", "class", "component_use", "encoded_leaves"}
+    assert slot["encoded_leaves"] == "refuse"
+
+    def planted(**members: object) -> bytes:
+        mutated = json.loads(json.dumps(body))
+        mutated["entrypoints"][0]["models"][0].update(members)
+        return canonical.write(mutated)
+
+    assert descriptor.read_bytes(planted(stamps={}))
+    with pytest.raises(descriptor.RetiredDescriptorMember) as stamped:
+        descriptor.read_bytes(planted(stamps={"task": "fl2va"}))
+    assert stamped.value.code == "descriptor.stamps_retired"
+    assert "task" in str(stamped.value)
+    with pytest.raises(descriptor.RetiredDescriptorMember) as profiled:
+        descriptor.read_bytes(planted(source_profile="acme/sd-turbo/1.0.0/bf16"))
+    assert profiled.value.code == "descriptor.source_profile_retired"
+    with pytest.raises(descriptor.StalePackageDescriptor) as unknown:
+        descriptor.read_bytes(planted(encoded_leaves="maybe"))
+    assert unknown.value.code == "malformed_package_descriptor"
+
+
+def test_model_class_carries_exactly_one_keyword() -> None:
+    """`encoded_leaves` is the whole class-keyword plane; a stamp refuses typed (D1)."""
+    with pytest.raises(ConformanceError) as stamped:
+
+        class Stamped(Model[Pipeline], task="fl2va"):
+            pass
+
+    assert stamped.value.code == "class_keyword"
+    assert stamped.value.fields == ("task",)
+
+    with pytest.raises(ConformanceError) as structured:
+
+        class Structured(Model[Pipeline], structure="sdxl"):
+            pass
+
+    assert structured.value.code == "class_keyword"
+
+    class Consenting(Model[Pipeline], encoded_leaves="accept"):
+        pass
+
+    assert Consenting.__encoded_leaves__ == "accept"
+    with pytest.raises(ConformanceError) as closed:
+
+        class Vague(Model[Pipeline], encoded_leaves="maybe"):
+            pass
+
+    assert closed.value.code == "encoded_leaves_value"
 
 
 def _architecture_module() -> object:
@@ -384,10 +432,12 @@ def test_pod_serves_the_published_descriptor_and_refuses_a_disagreement() -> Non
         assert "published sha256:" in disagreed.value.detail
 
 
-def test_author_evidence_request_binds_the_release_version(tmp_path: Path) -> None:
-    """The evidence request is closed on {package, project_wheel, release}: the digest
-    circularity is structurally unrepresentable (the digest exists only after finalize)."""
-    from cozy_runtime.cli import model_contract_proof as proof
+def test_memo_request_binds_the_release_version(tmp_path: Path) -> None:
+    """The memo request is closed on {package, project_wheel, release}: the digest
+    circularity is structurally unrepresentable (the digest exists only after finalize).
+    The two slot members cozy-creator still sends for the deleted MCC plane
+    (`snapshot`, `hardware_variants`) are read past, not required."""
+    from cozy_runtime.cli import code_topologies as proof
 
     descriptor_bytes = descriptor.canonical_bytes(
         {"format": descriptor.SCHEMA, "application": "a:b", "entrypoints": [], "jobs": []}
@@ -440,3 +490,5 @@ def test_author_evidence_request_binds_the_release_version(tmp_path: Path) -> No
         request({"package": "paul/thing", "release": "1.0.0", "project_wheel": wheel})
     )
     assert versioned.release_identity == "paul/thing@1.0.0"
+    assert [row.class_key for row in versioned.slots] == ["Denoiser"]
+    assert proof.INDEX_FORMAT == "cozy.package.code-topologies/1"

@@ -180,21 +180,12 @@ CASES = (
         note="the packed/scales pair IS the derived topology for that variant",
     ),
     Case(
-        "hardware_gate_declared",
-        "construction branching on device capability, with the variant set declared",
-        _capability_gate,
-        "derived-correct",
-        variant="sm89",
-        declared_variants=("sm89", "sm90"),
-        ground_truth=False,
-    ),
-    Case(
-        "hardware_gate_undeclared",
-        "the same gate with NO declared variant set",
+        "hardware_gate",
+        "construction branching on device capability — a code topology is a function of "
+        "the config document alone (model-code-fit D3)",
         _capability_gate,
         "typed-refusal",
         names="hardware-conditional",
-        variant="sm89",
         ground_truth=False,
     ),
     Case(

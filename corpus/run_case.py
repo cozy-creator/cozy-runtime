@@ -18,7 +18,7 @@ import traceback
 from typing import Any
 
 from corpus.harness import Case, diff, ground_truth_census, model_for, weights_for
-from cozy_runtime.internal import sandbox
+from cozy_runtime.internal import canonical, sandbox
 from cozy_runtime.internal.derive import ConstructionFault, HarnessGap, derive
 
 MEMORY_CAP = 24 << 30
@@ -56,15 +56,7 @@ def run(case: Case) -> dict[str, Any]:
 
     started = time.perf_counter()
     try:
-        result = derive(
-            model_for(case),
-            artifact,
-            release="sha256:" + "0" * 64,
-            application="corpus:app",
-            hardware_variant=case.variant,
-            declared_variants=case.declared_variants,
-            component_use=case.component_use,
-        )
+        result = derive(model_for(case), artifact, component_use=case.component_use)
     except HarnessGap as exc:
         out.update(verdict="typed-harness-gap", named=exc.construct, detail=exc.message[:200])
     except ConstructionFault as exc:
@@ -79,16 +71,16 @@ def run(case: Case) -> dict[str, Any]:
             traceback=traceback.format_exc()[-1200:],
         )
     else:
-        out["digest"] = result.contract.digest
-        out["destinations"] = len(result.contract.logical_tensors)
-        out["derived_tensors"] = len(result.contract.derived)
-        out["components"] = list(result.contract.components)
+        out["digest"] = canonical.digest(result.code_topology())
+        out["destinations"] = len(result.logical_tensors)
+        out["derived_tensors"] = len(result.derived)
+        out["components"] = list(result.components)
         if truth is None:
             out["verdict"] = "derived-correct"
             out["unverified"] = "no ground truth on this box"
         else:
-            divergence = diff(result.contract.logical_tensors, truth.logical) + diff(
-                result.contract.derived, truth.derived
+            divergence = diff(result.logical_tensors, truth.logical) + diff(
+                result.derived, truth.derived
             )
             out["verdict"] = "derived-correct" if not divergence else "silent-wrong"
             if divergence:

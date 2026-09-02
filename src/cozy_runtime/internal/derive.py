@@ -30,24 +30,19 @@ import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from types import ModuleType
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from cozy_runtime.author._loader import Artifact, Census, Loader, census, loading
-from cozy_runtime.internal.contract import (
-    DEFAULT_DTYPE,
-    Candidate,
-    DeclaredCache,
-    DerivedTensor,
-    DestinationSet,
-    LogicalTensor,
-    ModelConstructionAttestation,
-    ModelConstructionContract,
-    check_agreement,
-)
 
 SUBSTRATE = "meta-device"
+
+#: The dtype-diet rule, shared with the checkpoint header's plain/1-absence rule (§1.1):
+#: dtype is serialized ONLY where it deviates from bf16. Absence means bf16.
+DEFAULT_DTYPE = "bfloat16"
+
+TensorKind = Literal["parameter", "buffer"]
 
 #: A non-persistent buffer this size is not a rope table — it is a hidden cache, and the
 #: authoring rule says a GB-scale tensor is a NAMED saved component (§1.1).
@@ -168,12 +163,10 @@ def _refuse_compile() -> Iterator[None]:
 
 @dataclass(slots=True)
 class _Capability:
-    """The DECLARED hardware variant, answered instead of this box's card.
+    """The hardware variant answered instead of this box's card, and whether it was asked.
 
-    Construction that gates on CPU vs CUDA or `sm89` vs `sm90` derives PER VARIANT
-    (cr-004): one contract each, never one contract for both. `read` records whether the
-    construction actually asked — an undeclared variant on a construction that asks is a
-    refusal, and a declared variant on one that never asks is simply the same contract twice.
+    Under derive the answer is never meaningful: a construction that ASKS is refused (D3),
+    and `read` is how the harness knows. Under serve the executor answers its own card.
     """
 
     variant: str
@@ -520,6 +513,89 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         yield cap
 
 
+# ---------------------------------------------------------------------------- rows
+
+#: Fusion, permutation, re-keying, quantization and subclass reconstruction are
+#: UNREPRESENTABLE here: a `LogicalTensor` carries ONE name and no source key, part list,
+#: transform, scale reference or converter. Those are AOT artifact work (§1.1).
+#: `_prove_unrepresentable()` runs at import and holds each row's field set to an EQUALITY,
+#: so a new fact enters only through a diff that touches this table.
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalTensor:
+    """One logical tensor the construction demands, and the ONE destination it lands in."""
+
+    key: str
+    component: str
+    shape: tuple[int, ...]
+    kind: TensorKind
+    module_class: str
+    alias_group: int | None
+    dtype: str | None
+    """Present only where it deviates from bf16 (the dtype-diet rule). Where present it is
+    the destination's COMPUTE/interface contract and the decode target."""
+
+
+@dataclass(frozen=True, slots=True)
+class DerivedTensor:
+    """A tensor the construction BUILDS and no checkpoint fills — a non-persistent buffer.
+
+    It carries NO device, and neither does `LogicalTensor`: placement is platform policy
+    derived from measurement (§1), so a device is never a construction fact.
+    """
+
+    key: str
+    component: str
+    shape: tuple[int, ...]
+    dtype: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DestinationSet:
+    """The COMPLETE destination set of one named component, in construction order."""
+
+    component: str
+    module_class: str
+    training: bool
+    compiled: bool
+    keys: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DeclaredCache:
+    """A `loader.cache(...)` handle: memory-only, declared-bounded (§1.3)."""
+
+    name: str
+    max_entries: int
+    max_bytes: int
+
+
+_ROW_FIELDS: Mapping[type, frozenset[str]] = {
+    LogicalTensor: frozenset(
+        {"key", "component", "shape", "kind", "module_class", "alias_group", "dtype"}
+    ),
+    DerivedTensor: frozenset({"key", "component", "shape", "dtype"}),
+    DestinationSet: frozenset({"component", "module_class", "training", "compiled", "keys"}),
+    DeclaredCache: frozenset({"name", "max_entries", "max_bytes"}),
+}
+
+
+def _prove_unrepresentable() -> None:
+    for row, expected in _ROW_FIELDS.items():
+        actual = {f.name for f in fields(row)}
+        if actual != expected:
+            raise HarnessGap(
+                "row shape",
+                f"{row.__name__} fields are {sorted(actual)}, the reviewed set is "
+                f"{sorted(expected)} — destination-side fusion, permutation, re-key, "
+                "quantization and subclass reconstruction stay UNREPRESENTABLE",
+            )
+
+
+_prove_unrepresentable()
+
+
 # -------------------------------------------------------------------------- census
 
 
@@ -829,32 +905,63 @@ def _refuse_wrapper(name: str, member: Any) -> None:
 
 @dataclass(frozen=True, slots=True)
 class Derivation:
-    contract: ModelConstructionContract
-    attestation: ModelConstructionAttestation
+    """The CODE TOPOLOGY one `load()` derives, plus the load's own bookkeeping.
+
+    It is a pure function of (factory, config document): no candidate, no snapshot, no
+    hardware variant and no verdict (model-code-fit §3, D3). The `factory` and
+    `config_digest` are the derive/serve fence's terms; `logical_tensors` are the rows a
+    checkpoint header is matched against.
+    """
+
+    factory: str
+    config_digest: str
+    logical_tensors: tuple[LogicalTensor, ...]
+    destination_sets: tuple[DestinationSet, ...]
+    derived: tuple[DerivedTensor, ...]
+    caches: tuple[DeclaredCache, ...]
+    component_use: Mapping[str, tuple[str, ...]]
     observations: Observations
+
+    @property
+    def components(self) -> tuple[str, ...]:
+        return tuple(d.component for d in self.destination_sets)
+
+    def code_topology(self) -> dict[str, Any]:
+        """`component → key → {shape, dtype?}` as a canonical document: the shape census
+        the memo and `tensorfs.fit` read. Sorted by (component, key); no candidate term."""
+        out: dict[str, dict[str, Any]] = {}
+        for tensor in sorted(self.logical_tensors, key=lambda t: (t.component, t.key)):
+            local = tensor.key[len(tensor.component) + 1 :]
+            row: dict[str, Any] = {"shape": list(tensor.shape)}
+            if tensor.dtype is not None:
+                row["dtype"] = tensor.dtype
+            out.setdefault(tensor.component, {})[local] = row
+        return {
+            "format": "cozy.runtime.code-topology/1",
+            "components": out,
+            "constructed": list(self.components),
+        }
 
 
 def derive(
     model: Any,
     artifact: Artifact,
     *,
-    release: str,
-    application: str,
-    hardware_variant: str,
-    declared_variants: Sequence[str] = (),
     component_use: Mapping[str, Sequence[str]] | None = None,
-    timestep_plans: Mapping[str, str] | None = None,
     mode: str = "derive",
     backend: Any = None,
     substrate_device: str = "meta",
 ) -> Derivation:
-    """Execute `model.load(loader)` on the meta substrate and derive its exact contract.
+    """Execute `model.load(loader)` on the meta substrate and derive its code topology.
 
     `mode="serve"` runs the IDENTICAL substrate and the identical walk, and differs only in
     that the fill path runs. That is the derive/serve fence made mechanical rather than
-    argued: the two modes cannot produce different contract bytes, because there is one
-    factory, one substrate and one census, and the only branch between them is whether
-    bytes are moved into destinations the census has already agreed on.
+    argued: the two modes cannot produce different rows, because there is one factory, one
+    substrate and one census, and the only branch between them is whether bytes are moved
+    into destinations the census has already agreed on.
+
+    A construction that reads the device is refused (D3): a code topology is
+    hardware-independent, and a factory that branches on the card has no single one.
     """
     torch = torch_module()
     if mode == "derive" and torch.cuda.is_initialized():
@@ -864,18 +971,18 @@ def derive(
             "live context means the fence did not hold",
         )
     seen = Observations()
-    with meta_substrate(hardware_variant, seen) as cap:
+    with meta_substrate("cpu", seen) as cap:
         loader = Loader(artifact, owner=model, mode=cast("Any", mode), backend=backend)
         with loading(loader):
             _load_typed(model, loader)
         built = loader.constructed()
 
-    if cap.read and not declared_variants:
+    if cap.read:
         raise ConstructionFault(
             "hardware-conditional construction",
-            f"the construction read the device capability while deriving for "
-            f"{hardware_variant!r} with no declared variant set — construction that differs "
-            "per card derives PER DECLARED VARIANT, never once (cr-004)",
+            "the construction read the device capability — a code topology is a function "
+            "of the config document alone (model-code-fit D3); construction that differs "
+            "per card is unrepresentable",
         )
     _refuse_real_allocations(seen)
 
@@ -892,18 +999,15 @@ def derive(
         )
     _refuse_hidden_caches(rich)
 
-    contract = ModelConstructionContract(
-        candidate=Candidate(
-            release=release,
-            application=application,
-            model_class=f"{type(model).__module__}:{type(model).__qualname__}",
-            factory="|".join(r.factory_identity for r in loader.records()),
-            snapshot=artifact.snapshot,
-            config_digest=artifact.config.digest(),
-            hardware_variant=hardware_variant,
-        ),
-        logical_tensors=tuple(sorted(rich.logical, key=lambda t: t.key)),
-        destination_sets=_ordered_destination_sets(shallow, rich),
+    logical = tuple(sorted(rich.logical, key=lambda t: t.key))
+    destination_sets = _ordered_destination_sets(shallow, rich)
+    _check_agreement(logical, destination_sets, [d.key for c in shallow for d in c.destinations])
+    constructed = tuple(d.component for d in destination_sets)
+    return Derivation(
+        factory="|".join(r.factory_identity for r in loader.records()),
+        config_digest=artifact.config.digest(),
+        logical_tensors=logical,
+        destination_sets=destination_sets,
         derived=tuple(sorted(rich.derived, key=lambda d: d.key)),
         caches=tuple(
             sorted(
@@ -911,19 +1015,66 @@ def derive(
                 key=lambda c: c.name,
             )
         ),
+        component_use=_validate_component_use(constructed, component_use or {}),
+        observations=seen,
     )
-    check_agreement(contract, [d.key for c in shallow for d in c.destinations])
-    validated = _validate_component_use(contract, component_use or {})
-    attestation = ModelConstructionAttestation(
-        contract_digest=contract.digest,
-        substrate=SUBSTRATE,
-        torch_version=torch.__version__,
-        fences=("no_compile", "no_cuda", "no_host_egress", "no_real_allocation", "meta_parameters"),
-        double_derived=False,
-        component_use=validated,
-        timestep_plans=dict(timestep_plans or {}),
-    )
-    return Derivation(contract, attestation, seen)
+
+
+def _check_agreement(
+    logical: Sequence[LogicalTensor],
+    destination_sets: Sequence[DestinationSet],
+    destinations: Sequence[str],
+) -> None:
+    """EXACT ordered one-to-one agreement between the deep walk and the Loader census.
+
+    Membership proves topology; sequence proves the rows record the same construction
+    traversal the Loader hands to the fill plane.
+    """
+    actual = list(destinations)
+    keys = [t.key for t in logical]
+    duplicates = sorted({k for k in keys if keys.count(k) > 1})
+    if duplicates:
+        raise ConstructionFault(
+            "duplicate destination",
+            f"{len(duplicates)} logical tensor key(s) appear twice: {', '.join(duplicates[:6])} "
+            "— a destination is ONE tensor; a repeated key is a re-key by another name",
+        )
+    covered: list[str] = []
+    for dset in destination_sets:
+        covered.extend(dset.keys)
+    if sorted(covered) != sorted(keys):
+        only_set = sorted(set(covered) - set(keys))
+        only_log = sorted(set(keys) - set(covered))
+        raise ConstructionFault(
+            "incomplete destination set",
+            "the DestinationSets do not partition the logical tensors exactly "
+            f"(+{only_set[:4]} / -{only_log[:4]})",
+        )
+    missing = sorted(set(keys) - set(actual))
+    surplus = sorted(set(actual) - set(keys))
+    if missing or surplus:
+        raise ConstructionFault(
+            "census disagreement",
+            f"the harness census and the fill plane disagree: {len(missing)} deep-only "
+            f"{missing[:4]}, {len(surplus)} fill-only {surplus[:4]}",
+        )
+    if covered != actual:
+        first = next(
+            (
+                index
+                for index, (declared, filled) in enumerate(zip(covered, actual, strict=False))
+                if declared != filled
+            ),
+            min(len(covered), len(actual)),
+        )
+        declared = covered[first] if first < len(covered) else "<end>"
+        filled = actual[first] if first < len(actual) else "<end>"
+        raise ConstructionFault(
+            "census order disagreement",
+            f"the deep census and the Loader census contain the same destinations in a "
+            f"different order at index {first}: deep {declared!r}, Loader {filled!r} — "
+            "header/load order is construction identity",
+        )
 
 
 def _refuse_real_allocations(seen: Observations) -> None:
@@ -955,7 +1106,7 @@ def _refuse_hidden_caches(rich: RichCensus) -> None:
 
 
 def _validate_component_use(
-    contract: ModelConstructionContract, declared: Mapping[str, Sequence[str]]
+    constructed: Sequence[str], declared: Mapping[str, Sequence[str]]
 ) -> dict[str, tuple[str, ...]]:
     """Prove every declared component NAME exists in the derived construction.
 
@@ -963,7 +1114,7 @@ def _validate_component_use(
     could not prove existence, because the artifact was not selected yet. Nothing about
     call ORDER is derived or checked here — a declaration is a possible-set, never a phase.
     """
-    built = set(contract.components)
+    built = set(constructed)
     out: dict[str, tuple[str, ...]] = {}
     for method, names in sorted(declared.items()):
         unknown = sorted(set(names) - built)

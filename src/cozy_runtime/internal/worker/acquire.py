@@ -217,12 +217,6 @@ def preinstalled_development(
                     "development_model_components_changed",
                     name,
                 )
-            if selected_slot.get("stamps", []) != accepted_slot.get("stamps", []):
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "development_model_stamps_changed",
-                    name,
-                )
             if selected_slot != accepted_slot:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
@@ -243,6 +237,10 @@ def preinstalled_development(
         descriptor = package_descriptor.read_bytes(
             descriptor_path.read_bytes(), str(descriptor_path)
         )
+    except package_descriptor.RetiredDescriptorMember as exc:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
+        ) from exc
     except package_descriptor.StalePackageDescriptor as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
@@ -594,6 +592,10 @@ class Acquirer:
             descriptor = package_descriptor.read_bytes(
                 descriptor_path.read_bytes(), str(descriptor_path)
             )
+        except package_descriptor.RetiredDescriptorMember as exc:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
+            ) from exc
         except package_descriptor.StalePackageDescriptor as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
@@ -677,21 +679,6 @@ class Acquirer:
                     str(row["component"]): str(models[str(row["model_id"])]["manifest"]["digest"])
                     for row in slot.get("components", [])
                 }
-                stamps: dict[str, set[str]] = {}
-                for row in slot.get("stamps", []):
-                    stamps.setdefault(str(row["key"]), set()).update(
-                        str(value) for value in row["values"]
-                    )
-                descriptor_stamps = declared.get("stamps", {})
-                if not isinstance(descriptor_stamps, dict) or any(
-                    value not in stamps.get(str(key), set())
-                    for key, value in descriptor_stamps.items()
-                ):
-                    raise AcquisitionRefusal(
-                        pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        "selected_binding_mismatch",
-                        f"{path}: descriptor stamps are not selected",
-                    )
                 try:
                     store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
                     model_weight_bytes = sum(
@@ -721,9 +708,6 @@ class Acquirer:
                         reference_snapshot=reference_manifest,
                         components=components,
                         snapshots=snapshots,
-                        stamps={
-                            key: tuple(sorted(values)) for key, values in sorted(stamps.items())
-                        },
                         model_weight_bytes=model_weight_bytes,
                         sequence_parallel_degrees=degrees,
                     )
@@ -754,9 +738,7 @@ class Acquirer:
                 reference_snapshot=first.reference_snapshot,
                 components=first.components,
                 snapshots=first.snapshots,
-                stamps=first.stamps,
                 model_weight_bytes=sum(member.model_weight_bytes for member in model_set),
-                expected_logical_model_digest="",
                 development=bool(development),
             )
         selected_entrypoints = {str(row["name"]) for row in placement.entrypoints}

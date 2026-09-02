@@ -23,9 +23,9 @@ the moment the registry grew it. Transcribing the digests is the cost of making 
 impossible: a registry change that moves a digest now breaks selection loudly at launch
 (`spec_unreviewed`) instead of decoding unreviewed bytes. Alias is display, and only display.
 
-**The decode target is the CONTRACT's dtype, and the contract cannot express an encoding.**
-`ModelConstructionContract` names destinations and nothing else — no parts, no scale_of, no
-dequantize (contract.py's `_ROW_FIELDS` equality makes that an import-time proof). So the
+**The decode target is the CENSUS's dtype, and the census cannot express an encoding.**
+A derived `LogicalTensor` names a destination and nothing else — no parts, no scale_of, no
+dequantize (derive.py's `_ROW_FIELDS` equality makes that an import-time proof). So the
 decode target is the destination's own dtype, the header's logical dtype must equal it, and
 a disagreement is cr-005's `dtype_mismatch` unchanged.
 

@@ -341,7 +341,6 @@ class Executor:
         self.ready = False
         self._prepare_consumed = False
         self.poisoned = ""
-        self.logical_model_digest = ""
         self.constructed_model_digest = ""
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
@@ -817,7 +816,6 @@ class Executor:
             ),
             components=tuple(names),
             custody=str(binding.get("custody", "canonical")),
-            strict_keys=bool(binding.get("strict_keys", False)),
         )
         # CONSENT IS AN INPUT TO RESOLUTION (#549.1). It used to fire at `materialize`, with
         # the plan already chosen and the package already imported; a plan whose route the
@@ -856,7 +854,7 @@ class Executor:
                 degree=self.world,
                 devices=_sealed_entries(),
                 plan_digest=rank_invariant_digest(plan.identity()),
-                logical_model_digest=(
+                construction_digest=(
                     construction.config_digest + "/" + construction.topology_digest
                 ),
                 authorized_device_limit_bytes=authorized,
@@ -1016,15 +1014,6 @@ class Executor:
             # local bind of an un-bordered checkpoint tiers its extras (§1.1). Defaulting
             # to canonical keeps the strict reading for any record that does not say.
             custody=binding.get("custody", "canonical"),
-            strict_keys=bool(binding.get("strict_keys", False)),
-            # THE STAMPS THE CHECKPOINT ACTUALLY CARRIES (#567d). `Artifact.stamps` was
-            # never once populated by the serving path: no caller passed it, the default
-            # `{}` rode every binding, and `_admit` therefore refused every stamped model
-            # class on every artifact — a whole admission plane that could only ever say no.
-            stamps={
-                str(key): tuple(str(v) for v in values)
-                for key, values in (binding.get("stamps") or {}).items()
-            },
         )
         seen = Observations()
         registry = ModelRegistry(
@@ -1113,43 +1102,17 @@ class Executor:
         self.residency = ComponentResidency(backend=backend, torch=torch, placement="all_resident")
         object.__setattr__(model, "_cozy_residency", self.residency)
         record = registry.generations()[0].record
-        # TWO IDENTITIES, because there are two questions and one digest could only answer
-        # one of them (codex audit, adopted 2026-08-25).
-        #
-        # The LOGICAL MODEL is the reference snapshot and the topology around it.
-        # cr-006 proved on real bytes that an encoding rung changes no logical keyset and
-        # shares its `topology_digest`, which is what keeps `expect_construction_digest` a
-        # usable fence.
-        self.logical_model_digest = canonical.digest(
-            {
-                "format": "cozy.runtime.ModelConstructionContract/1",
-                "release": binding["release"],
-                "model_class": f"{model_cls.__module__}:{model_cls.__qualname__}",
-                "artifact": reference.snapshot,
-                "config_digest": record.config_digest,
-                "factory_identity": record.factory_identity,
-                "topology_digest": record.topology_digest,
-                # ModelConstructionContract destination sets are canonicalized by component.
-                # Construction traversal order is not identity and cannot change this fence.
-                "components": sorted(record.components),
-                "variant": hardware_variant,
-            }
-        )
-        # The CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is
-        # THE RESOLVED PLAN'S OWN DIGEST that says so. The old spelling hashed a delivery
-        # RUNG NAME — an artifact-wide label chosen by a chooser with no per-tensor knowledge
-        # — so two materially different fills of a mixed artifact could share a constructed
-        # digest, and the field a reader trusted most was the one nothing executed from.
-        #
-        # The plan digest binds the exact snapshot map, every tensor's implementation digest
-        # and route, the device identity, the runtime source digest and the construction
-        # contract. `logical_model_digest` stays what it was: the question "which MODEL is
-        # this" has a different answer from "which BYTES are resident", and one digest could
-        # only ever answer one of them.
+        # THE CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is
+        # THE RESOLVED PLAN'S OWN DIGEST that says so. The plan digest binds the exact
+        # snapshot map, every tensor's implementation digest and route, the device identity,
+        # the runtime source digest and the construction facts (config + topology), so two
+        # materially different fills of one artifact never share it. There is no second,
+        # "logical" identity beside it: the MCC digest and its `expect_construction_digest`
+        # fence are deleted whole (model-code-fit D12) — its only consumer was a fence the
+        # planner had already disabled.
         self.plan = plan
         constructed_preimage = canonical.write(
             {
-                "logical_model_digest": self.logical_model_digest,
                 "plan_digest": plan.digest(),
                 "topology_digest": record.topology_digest,
                 "config_digest": record.config_digest,
@@ -1164,16 +1127,6 @@ class Executor:
                 b"cozy.runtime.constructed-generation\0" + constructed_preimage
             ).hexdigest()
         )
-        expected = command.get("expect_construction_digest") or ""
-        if expected and expected != self.logical_model_digest:
-            self.poisoned = "construction digest mismatch"
-            return {
-                "ok": False,
-                "code": "construction_digest_mismatch",
-                "detail": f"the plan prices {expected} and this executor constructed "
-                f"{self.logical_model_digest}: the planner pricing variant A while the "
-                "executor serves variant B is unrepresentable",
-            }
         if self.group is not None:
             # THE FOLLOWERS FILLED THE SAME PLAN, or the group is not a group. Every reply
             # is held to rank 0's own construction identities.
@@ -1191,16 +1144,13 @@ class Executor:
                             code=code if code in _GROUP_CODES else "group_unformed",
                         )
                     )
-                # The LOGICAL model must be the same on every rank; the constructed digest
+                # The CONSTRUCTION must be the same on every rank; the constructed digest
                 # folds the card's index and is rank-local, so what is compared beside it
                 # is what the fill committed and the ceiling it committed under.
                 theirs = dict(reply.get("facts") or {})
                 agreed: list[tuple[str, object, object]] = [
-                    (
-                        "model_construction_digest",
-                        self.logical_model_digest,
-                        reply.get("model_construction_digest"),
-                    ),
+                    ("topology_digest", record.topology_digest, theirs.get("topology_digest")),
+                    ("config_digest", record.config_digest, theirs.get("config_digest")),
                     ("filled_bytes", record.filled_bytes, theirs.get("filled_bytes")),
                     (
                         "resident_budget_bytes",
@@ -1236,6 +1186,8 @@ class Executor:
             "fill_ms": backend.stats.get("fill_ms", 0),
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
+            "topology_digest": record.topology_digest,
+            "config_digest": record.config_digest,
             "device_free_bytes": memory["driver_free_bytes"],
             "device_total_bytes": memory["driver_total_bytes"],
             "allocator_bytes": memory["allocated_bytes"],
@@ -1256,7 +1208,7 @@ class Executor:
             "cuda_version": torch.version.cuda or "",
             # THE CONFESSION (§1.1). "Loudly ignored, never silently" is only true if the
             # ignoring is named where a person and a RecordOwner both see it, so the extras
-            # this bind dropped and the markers it transcribed ride the bind result.
+            # this bind dropped ride the bind result.
             "custody": binding.get("custody", "canonical"),
             # THE COMPONENT-USE CONTRACT, as a construction fact. The worker prices a
             # staged rung against it and cannot read it any other way: the declaration lives
@@ -1265,7 +1217,6 @@ class Executor:
                 method: list(names) for method, names in sorted(component_use(model_cls).items())
             },
             "ignored_extra_keys": list(record.ignored_extras),
-            "transcribed_markers": list(record.transcribed_markers),
             # THE SEAM FORM (#574b). The full document carries a row per destination and a
             # control frame is 64 KiB; on an N-ary artifact that reply could not be sent.
             "plan": plan.seam_document(),
@@ -1280,7 +1231,6 @@ class Executor:
         return {
             "ok": True,
             "ready": True,
-            "model_construction_digest": self.logical_model_digest,
             "constructed_model_digest": self.constructed_model_digest,
             "entrypoints": sorted(self.surface_names),
             "plan": plan.seam_document(),
@@ -1295,11 +1245,7 @@ class Executor:
         if (
             not isinstance(rows, list)
             or not 2 <= len(rows) <= 16
-            or any(
-                not isinstance(row, dict)
-                or set(row) != {"binding", "budgets", "expect_construction_digest"}
-                for row in rows
-            )
+            or any(not isinstance(row, dict) or set(row) != {"binding", "budgets"} for row in rows)
         ):
             return {
                 "ok": False,
@@ -1374,23 +1320,10 @@ class Executor:
         }
         self.residency = _CompositeResidency(residencies)
 
-        logical = [
-            {
-                "parameter": parameter,
-                "digest": str(reply["model_construction_digest"]),
-            }
-            for parameter, _, reply in children
-        ]
         constructed = [
             {"parameter": parameter, "digest": str(reply["constructed_model_digest"])}
             for parameter, _, reply in children
         ]
-        self.logical_model_digest = (
-            "sha256:"
-            + hashlib.sha256(
-                b"cozy.runtime.model-construction-set\0" + canonical.write(logical)
-            ).hexdigest()
-        )
         self.constructed_model_digest = (
             "sha256:"
             + hashlib.sha256(
@@ -1470,11 +1403,6 @@ class Executor:
                 for parameter, facts in facts_rows
                 for key in facts.get("ignored_extra_keys", [])
             ],
-            "transcribed_markers": [
-                f"{parameter}/{key}"
-                for parameter, facts in facts_rows
-                for key in facts.get("transcribed_markers", [])
-            ],
             "delivery": delivery,
             "models": {parameter: facts for parameter, facts in facts_rows},
             "cross_model_eviction": False,
@@ -1483,8 +1411,6 @@ class Executor:
         return {
             "ok": True,
             "ready": True,
-            "model_construction_digest": self.logical_model_digest,
-            "model_construction_digests": {row["parameter"]: row["digest"] for row in logical},
             "constructed_model_digest": self.constructed_model_digest,
             "entrypoints": sorted(self.surface_names),
             "delivery": delivery,
@@ -1542,13 +1468,11 @@ class Executor:
             "weightless": True,
             "custody": "canonical",
             "ignored_extra_keys": [],
-            "transcribed_markers": [],
         }
         return {
             "ok": True,
             "ready": True,
             "weightless": True,
-            "model_construction_digest": "",
             "constructed_model_digest": "",
             "entrypoints": sorted(self.surface_names),
             "delivery": {},

@@ -35,7 +35,8 @@ dev = [
 [project.scripts]
 cozy-runtime = "cozy_runtime.cli.main:main"
 cozy-runtime-worker = "cozy_runtime.cli.runtime_worker:main"
-cozy-model-contract-proof = "cozy_runtime.cli.model_contract_proof:main"
+# cozy-creator publish invokes this name until cl-094 moves it to `cozy-runtime derive`.
+cozy-model-contract-proof = "cozy_runtime.cli.code_topologies:main"
 cozy-native-wheel-proof = "cozy_runtime.cli.native_wheel_proof:main"
 
 [tool.pytest.ini_options]

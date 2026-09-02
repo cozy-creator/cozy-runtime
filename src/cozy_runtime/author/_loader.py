@@ -23,7 +23,7 @@ import hashlib
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Protocol, TypeVar, cast, final, runtime_checkable
 
 import msgspec
@@ -279,70 +279,23 @@ def _canonical(value: object) -> object:
 # --------------------------------------------------------------------------- artifact
 
 
-#: KNOWN MARKER RULES (§1.1). A checkpoint key whose PRESENCE states an inference-contract
-#: fact rather than supplying a weight. The table is deliberately tiny and closed: a marker
-#: earns a row by being a real dialect convention with a real consequence, and everything
-#: not listed here is an ordinary unknown extra that warns and is ignored.
-MARKER_RULES: Mapping[str, tuple[str, str]] = {
-    "v_pred": ("objective", "v_prediction"),
-    "v_pred_like": ("objective", "v_prediction"),
-    "ztsnr": ("noise_schedule", "zero_terminal_snr"),
-    "edm_vpred": ("objective", "edm_v_prediction"),
-}
-
-
-def marker_rule(key: str) -> tuple[str, str] | None:
-    """The rule a checkpoint key matches, by its LEAF name. `model.v_pred` is `v_pred`."""
-    return MARKER_RULES.get(key.rsplit(".", 1)[-1])
-
-
 @dataclass(frozen=True, slots=True)
 class Artifact:
-    """The RESOLVED binding a slot loads: one exact snapshot, its topology, its immutable
-    config, and the uploader-minted stamps a class's keywords must match.
+    """The RESOLVED binding a slot loads: one exact snapshot, its topology and its immutable
+    config.
 
     Selection produced this (package.toml default -> `--model` -> deploy binding); author
-    code never names any part of it.
+    code never names any part of it. Nothing here is a compatibility claim: whether the
+    code fits these bytes is a function of the census and the header (model-code-fit §3).
     """
 
     snapshot: str
     topology: Mapping[str, TensorSpec]
     config: Config
-    stamps: Mapping[str, str | Sequence[str]] = field(default_factory=dict)
-    """The checkpoint's OPEN uploader-minted stamp map, as its catalog lane carries it: one
-    key to a canonically ordered SET of values (tensorhub.md §lane). A class keyword joins
-    it by MEMBERSHIP and fails closed on absence — which is what makes the N-ary packaging
-    rule servable at all: the dual H3 artifact carries `task=fl2va+ref2va` because both
-    task-role transformers are in it, and a scalar equality could never admit either class.
-    Stamps are per CHECKPOINT, so every lane over one snapshot carries the same set.
-
-    A bare string is the one-element set and is accepted verbatim: `__post_init__`
-    normalizes, so `stamp_set` is the one reading and nothing downstream branches on which
-    spelling a caller used."""
     variant: str = "plain"
     custody: Custody = "canonical"
-    strict_keys: bool = False
-    """`--strict-keys`: a LOCAL bind's unknown extra keys refuse instead of confessing.
-    Meaningless on a canonical lane, where every extra already refuses."""
-
-    def __post_init__(self) -> None:
-        # ONE STAMP SPELLING INSIDE, ACCEPTED EITHER WAY AT THE DOOR. A narrow artifact's
-        # stamp is a one-element set and every caller that writes `task="fl2va"` means
-        # exactly that; normalizing here is what keeps `_admit` a single membership test
-        # instead of two readings that can disagree.
-        normalized: dict[str, str | Sequence[str]] = {
-            key: (value,) if isinstance(value, str) else tuple(value)
-            for key, value in self.stamps.items()
-        }
-        object.__setattr__(self, "stamps", normalized)
-
-    def stamp_set(self, key: str) -> tuple[str, ...]:
-        """This checkpoint's values for one stamp key. Absent is the EMPTY set, which is
-        what "unstamped means nobody looked" spells — never a value."""
-        value = self.stamps.get(key)
-        if value is None:
-            return ()
-        return (value,) if isinstance(value, str) else tuple(value)
+    """`canonical` refuses a stored key inside a constructed component that the code does
+    not consume (conversion drift); `local` lists it and ignores it (D5)."""
 
 
 # --------------------------------------------------------------------------- backend
@@ -527,11 +480,7 @@ def registered_adapters() -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class ConstructionRecord:
-    """What executing `load()` derived — the ModelConstructionContract's launch subset.
-
-    cr-004 owns the derivation HARNESS (per-candidate execution under fake tensors, the
-    published digest map); this is the record it produces and exact binding matches.
-    """
+    """What executing `load()` derived: the code topology and the fill's bookkeeping."""
 
     factory_identity: str
     config_digest: str
@@ -542,15 +491,11 @@ class ConstructionRecord:
     filled_bytes: int
     ignored_extras: tuple[str, ...] = ()
     """LOCAL-custody extras the code does not consume: warned, ignored and CONFESSED."""
-    transcribed_markers: tuple[str, ...] = ()
-    """Known marker keys and the stamp each was transcribed to (`v_pred->objective=…`)."""
 
     @property
     def topology_digest(self) -> str:
-        # The published ModelConstructionContract sorts logical destinations by key.  The
-        # serve-side projection must therefore be independent of a module's state_dict walk
-        # order too; otherwise the exact same derived contract can name a different logical
-        # model merely because two equivalent module implementations enumerate differently.
+        # Sorted by key: the projection is independent of a module's state_dict walk order,
+        # so two equivalent module implementations that enumerate differently name one model.
         rows = sorted(f"{d.key}:{list(d.spec.shape)}:{d.spec.dtype}" for d in self.destinations)
         return "blake2b:" + hashlib.blake2b("\n".join(rows).encode(), digest_size=16).hexdigest()
 
@@ -579,7 +524,6 @@ class Loader:
         "_backend",
         "_caches",
         "_device",
-        "_markers",
         "_mode",
         "_objects",
         "_open",
@@ -602,7 +546,6 @@ class Loader:
         self._device = device or Device()
         self._owner = owner
         self._open = True
-        self._markers: tuple[str, ...] = ()
         self._records: list[ConstructionRecord] = []
         self._objects: list[object] = []
         self._caches: list[DerivedCache] = []
@@ -637,7 +580,6 @@ class Loader:
             filled=filled,
             filled_bytes=filled_bytes,
             ignored_extras=extras,
-            transcribed_markers=self._markers,
         )
         self._records.append(record)
         self._objects.append(obj)
@@ -742,54 +684,9 @@ class Loader:
                 code="topology_extra_keys",
                 fields=extras[:6],
             )
-        return self._local_extras(extras)
-
-    def _local_extras(self, extras: Sequence[str]) -> tuple[str, ...]:
-        """The LOCAL/dev custody tier (§1.1): markers are never ignored, unknowns confess.
-
-        A local bind of an un-bordered checkpoint is the pull-and-run path, and its extras
-        are not all the same thing. A key matching a KNOWN MARKER RULE carries meaning the
-        inference contract depends on — the `v_pred` class — so it is transcribed to its
-        stamp or REFUSED naming the marker; ignoring it would serve the wrong objective
-        silently. Everything else warns, is ignored, and is CONFESSED: named in the bind
-        result and the attempt record, which is what "loudly ignored" has to mean if it is
-        to mean anything. `--strict-keys` opts the unknowns into refusal too.
-        """
-        if not extras:
-            return ()
-        marked: list[tuple[str, str, str]] = []
-        unknown: list[str] = []
-        for key in extras:
-            rule = marker_rule(key)
-            if rule is None:
-                unknown.append(key)
-            else:
-                marked.append((key, *rule))
-        for key, stamp, value in marked:
-            # A CONTRADICTION IS NON-MEMBERSHIP IN A NON-EMPTY SET, not inequality with a
-            # scalar: a checkpoint stamped `objective=v_prediction+epsilon` (a package
-            # carrying both regimes) is not contradicted by a `v_pred` marker key. An
-            # UNSTAMPED key is nobody having looked, and the marker is what transcribes it.
-            declared = self._artifact.stamp_set(stamp)
-            if declared and value not in declared:
-                raise ConformanceError(
-                    f"{self._artifact.snapshot} carries the marker key {key!r}, which means "
-                    f"{stamp}={value}, but the artifact is stamped "
-                    f"{stamp}={'+'.join(declared)} — a "
-                    "known marker is never ignored, so a contradiction refuses NAMING it",
-                    code="marker_conflict",
-                    fields=[key],
-                )
-        self._markers = tuple(f"{key}->{stamp}={value}" for key, stamp, value in marked)
-        if unknown and self._artifact.strict_keys:
-            raise ConformanceError(
-                f"{self._artifact.snapshot}: {len(unknown)} extra key(s) the code does not "
-                f"consume, and --strict-keys refuses rather than ignoring them: "
-                f"{', '.join(unknown[:6])}",
-                code="strict_extra_keys",
-                fields=unknown[:6],
-            )
-        return tuple(unknown)
+        # LOCAL custody (D5): an un-bordered checkpoint's extras are listed and ignored —
+        # CONFESSED in the bind result, never transcribed into a fact and never refused.
+        return tuple(extras)
 
     def _fill(self, walked: Census, obj: object) -> tuple[int, int]:
         """The SINGLE fill path. Failure rolls the whole construction back (§1.1).

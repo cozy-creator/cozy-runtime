@@ -12,9 +12,9 @@ The path, once, in order:
 Five properties are load-bearing rather than incidental:
 
 **One canonical logical tensor to one canonical destination.** The keys walked here are
-exactly the keys `contract.check_agreement` proved bijective between the harness's deep
-walk and the fill plane's own census — a destination absent from the contract has no path
-to bytes, and a contract key that never arrives refuses the whole generation.
+exactly the keys the derive harness proved bijective between its deep walk and the fill
+plane's own census — a destination absent from the census has no path to bytes, and a
+censused key that never arrives refuses the whole generation.
 
 **The freeze point.** A generation is observable as READY only after every H2D completion
 event has fired. Until then the transaction is `staging`, and any failure takes it to

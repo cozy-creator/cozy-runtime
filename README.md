@@ -108,7 +108,7 @@ header, or authentication fallback.
 
 `checks/architecture.py` keeps versioned identities in two disjoint registries.
 `DOCUMENT_KINDS` contains only stored or digested documents that cross a process/repository
-boundary: PackageDescriptor, EnvironmentReceipt, and ModelConstructionContract.
+boundary: PackageDescriptor, EnvironmentReceipt, and the code-topologies memo.
 `IMPLEMENTATION_IDS` contains the six encoding-provider names whose exact strings enter
 implementation, plan, and generation digests; those names are executable identity, not document
 formats. Command requests, planner values, worker records, proof-local state, and benchmark reports
@@ -228,9 +228,13 @@ plants a self-registering sibling module and proves describe cannot see it.
 
 `internal/descriptor.py` is the schema home for `PackageDescriptor`/`JobDescriptor`: only
 the launch and invocation facts with current readers. It carries no Runtime-global service
-inventory, diagnostics, config UI metadata, or candidate topology (cr-004's
-ModelConstructionContract owns that), and `_fixed_point` proves over the built document that
-no release digest, build timestamp, machine path or mutable binding reached it.
+inventory, diagnostics, config UI metadata, or code topology (the derive owns that), and
+`_fixed_point` proves over the built document that no release digest, build timestamp,
+machine path or mutable binding reached it. A slot is `{path, class, component_use,
+encoded_leaves}`; the deleted `stamps` and `source_profile` members refuse typed
+(`descriptor.stamps_retired`, `descriptor.source_profile_retired` — the hub's names) when
+they carry a value, and an empty `stamps` map is read as nothing declared because every
+release published before the cut ships one.
 Packages declare no GPU count, VRAM floor, accelerator class, placement, or free-form hardware
 predicate. Those facts come from the selected model lane and its concrete topology/encoding,
 RecordOwner placement, qualification measurements, and the worker's observed machine. The
@@ -238,8 +242,9 @@ descriptor reader rejects the retired `resources` key as an unknown field; forma
 current grammar and no compatibility decoder.
 An ordinary `@app.job` may opt into source-first model production without introducing another
 workflow language. A slot's entire declaration is its class annotation (cr-077): the
-publish-time slot facts (shape-only code topology + acceptable encodings) derive from the
-class's own factory, selection defaults live in `package.toml [bindings]`, and the actual
+publish-time code topology derives from the class's own factory, selection defaults live
+in `package.toml [bindings."<callable>.models.<param>"]` (the slot path is the one binding
+grammar; the class-keyed spelling refuses `binding_class_key_retired`), and the actual
 binding is dispatch. The retired `source_profiles=` decorator field refuses with the typed
 code `source_profiles_retired`. Each `WeightsOutput` may declare `topology_digest=` and a
 sorted `encodings=` tuple. Those exact requirements appear under the output's
@@ -326,13 +331,12 @@ package, semantic release, and source digest, then launches Runtime with the mat
 and facts. No project wheel, release.json, Environment, or receipt is invented.
 For a modeled entrypoint, Runtime resolves package.toml through its existing binding owner and
 joins the exact release/lane through the explicitly granted local TensorFS Repository. The
-Placement carries the ordinary exact Manifest/config/component facts but no MCC; at acquisition
+Placement carries the ordinary exact Manifest/config/component facts; at acquisition
 the launch Runtime re-reads the source descriptor and TensorFS Manifest/header/config, derives the
 same binding locally, and compares every accepted fact before STAGED. Creator owns the source-file
 digest and closes its scan race before replacing the whole worker generation after edits; Runtime
-does not invent a second source hash. TensorFS logical assets and uploader/catalog stamps refuse
-typed in this first lane because the local Repository exposes neither as a directly usable
-selection authority.
+does not invent a second source hash. TensorFS logical assets refuse typed in this first lane
+because the local Repository does not expose them as a directly usable selection authority.
 
 A writable delegated cgroup-v2 child remains the preferred executor lifecycle boundary. Ordinary
 RunPod containers instead expose their provider-owned cgroup-v2 scope read-only. Runtime uses its
@@ -396,23 +400,22 @@ materialization, convergence, fallback, or readiness code. Cold proof checks int
 warm proof checks zero downloaded package bytes and exact verified reuse, while the real
 TensorFS cache proof checks non-empty model downloaded/reused accounting.
 
-`cozy-model-contract-proof REQUEST.json OUTPUT_DIR` is the author-side slot-facts
-writer (cr-077, was cr-067's pair evidence). It runs on the publishing author's machine
-inside the project venv (`uv run --locked`), never on the hub: it compares the exact
-publishing descriptor with the project source and double-derives every requested slot
-CLASS per active hardware variant under the offline construction sandbox, then publishes
-exactly TWO facts per class — the shape-only code topology (a TensorFS CodeTopology
-document) and the acceptable encodings set. The fresh output directory appears atomically
-as the slot-facts envelope: a `cozy.package.slot-facts/1` index in `result.json` plus
-exact digest-named documents under `code-topologies/`. The construction seed (the
-checkpoint snapshot/config each factory runs against, resolved by the publisher from the
-slot's default `package.toml [bindings]` entry) is an input only — its identity never
-enters the published facts, and hub-side compatibility is graded on demand from
-`grade(code topology × checkpoint topology)` plus encoding/device qualification.
-Tensorhub stores and statically validates those bytes; it never authors, reserializes, or
-re-derives anything. The internal Candidate binds the release VERSION
-(`org/package@1.0.0`), never a release digest — the digest exists only once Tensorhub
-finalizes the upload the envelope rides in.
+`cozy-model-contract-proof REQUEST.json OUTPUT_DIR` (`cli/code_topologies.py`; the script
+name is what cozy-creator's publish invokes until cl-094 moves it to `cozy-runtime derive`)
+is the author-side writer of the publish memo `cozy.package.code-topologies/1`
+(model-code-fit §3). It runs on the publishing author's machine inside the project venv
+(`uv run --locked`), never on the hub: it compares the exact publishing descriptor with the
+project source and double-derives every requested slot CLASS under the offline construction
+sandbox — `census(factory(config_document))` on the meta device, hardware-independent (a
+construction that reads the device refuses, D3) — then publishes one row per
+(slot, config_digest) referencing the code-topology document by digest. The fresh output
+directory appears atomically: the memo index in `result.json` plus exact digest-named
+documents under `code-topologies/`. The construction seed (the config document of the
+slot's default `package.toml [bindings]` checkpoint, resolved by the publisher) is an input
+only — its identity never enters the memo. There is no ModelConstructionContract, no
+hardware variant, no verdict: Tensorhub stores the memo and never grades it. The memo binds
+the release VERSION (`org/package@1.0.0`), never a release digest — the digest exists only
+once Tensorhub finalizes the upload the envelope rides in.
 
 The request is a closed local process input, sorted unique by slot class. Config and
 descriptor input refs bind exact local bytes for proof ingestion. Their generic `digest`

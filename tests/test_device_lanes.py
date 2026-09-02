@@ -289,7 +289,6 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
                     "model_class": "",
                 },
                 "budgets": {},
-                "expect_construction_digest": "",
             }
             refused = executor.call(
                 {**weightless, "devices": worker.lanes.lanes[0].devices}, timeout=60.0

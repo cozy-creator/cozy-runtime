@@ -777,10 +777,24 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 "Slot",
             )
             _required(slot, {"slot", "reference_model_id", "config"}, "Slot")
-            if development and "model_construction_contract" in slot:
+            # THE DELETED PLANE (model-code-fit D1, D12; the proto reserves both at
+            # xs-010). `stamps` is `[]` on every wire document — the canonical writer spells
+            # closed repeated fields even when empty — and anything in it refuses typed; a
+            # `model_construction_contract` ref refuses at all.
+            if "model_construction_contract" in slot:
                 raise documents.DocumentError(
-                    "development_fields_invalid",
-                    "development derives model_construction_contract locally",
+                    "slot.model_construction_contract_retired",
+                    "Slot.model_construction_contract: the ModelConstructionContract is "
+                    "deleted (model-code-fit D12); fit is a function of the header and the census",
+                )
+            stamps = slot.get("stamps", [])
+            if not isinstance(stamps, list):
+                raise documents.DocumentError("wrong_type", "Slot.stamps")
+            if stamps:
+                raise documents.DocumentError(
+                    "slot.stamps_retired",
+                    "Slot.stamps: stamps are deleted (model-code-fit D1); a semantic twin is a "
+                    "component name or a config fact",
                 )
             slot_names.append(_identifier(slot["slot"], f"slots[{slot_index}].slot"))
             if slot["reference_model_id"] not in known_models:
@@ -813,24 +827,6 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                     raise documents.DocumentError("unknown_model", "Component.model_id")
             if len(component_names) != len(set(component_names)):
                 raise documents.DocumentError("sort_order", "Slot.components")
-            if "model_construction_contract" in slot:
-                _exact_ref(slot["model_construction_contract"], "Slot.model_construction_contract")
-            stamps = slot.get("stamps", [])
-            if not isinstance(stamps, list):
-                raise documents.DocumentError("wrong_type", "Slot.stamps")
-            stamp_ids: list[tuple[str, str]] = []
-            for value in stamps:
-                stamp = _closed_document(value, {"component", "key", "values"}, "Stamp")
-                _required(stamp, {"component", "key", "values"}, "Stamp")
-                component_name = _identifier(stamp["component"], "Stamp.component")
-                key = _identifier(stamp["key"], "Stamp.key")
-                if component_name not in component_names:
-                    raise documents.DocumentError("unknown_component", "Stamp.component")
-                if not _sorted_unique_strings(stamp["values"], "Stamp.values"):
-                    raise documents.DocumentError("missing_field", "Stamp.values")
-                stamp_ids.append((component_name, key))
-            if stamp_ids != sorted(set(stamp_ids)):
-                raise documents.DocumentError("sort_order", "Slot.stamps")
         if slot_names != sorted(set(slot_names)):
             raise documents.DocumentError("sort_order", "Entrypoint.slots")
         expected_entrypoint = (
@@ -895,14 +891,11 @@ def executor_prepare_command(
                     "release": binding.release,
                     "variant": model.variant,
                     "development": binding.development,
-                    "stamps": {key: list(value) for key, value in model.stamps.items()},
                     "custody": model.custody,
-                    "strict_keys": model.strict_keys,
                     "objective": model.objective,
                     "steps_basis": model.steps_basis,
                 },
                 "budgets": {"declared_weight_bytes": model.model_weight_bytes},
-                "expect_construction_digest": model.expected_logical_model_digest,
             }
         )
     command: dict[str, Any] = {
@@ -922,7 +915,6 @@ def executor_prepare_command(
                     "model_class": "",
                 },
                 "budgets": {},
-                "expect_construction_digest": "",
             }
         )
     elif len(models) == 1:
@@ -3596,14 +3588,6 @@ class Worker:
         ):
             executor.ready_bindings.clear()
             for binding in group:
-                if binding.expected_logical_model_digest and (
-                    binding.expected_logical_model_digest
-                    != executor.prepared_model.logical_model_digest
-                ):
-                    tenant.failed_bindings[binding.entrypoint_binding_digest] = (
-                        "logical model digest mismatch"
-                    )
-                    continue
                 executor.ready_bindings.add(binding.entrypoint_binding_digest)
                 tenant.prepared_models[binding.entrypoint_binding_digest] = executor.prepared_model
             self.note(
@@ -3800,10 +3784,8 @@ class Worker:
             except ExecutorGone as exc:
                 self.note("recovery", f"prepare refusal reclaim failed: {exc}")
             return "prepare refused: every binding", False
-        digest = reply["model_construction_digest"]
         delivery = reply.get("delivery") or {}
         resolved = PreparedModel(
-            logical_model_digest=digest,
             constructed_model_digest=str(reply["constructed_model_digest"]),
             delivery_rung=str(delivery.get("rung", "")),
             delivery_variant=str(delivery.get("variant", "")),
@@ -3813,17 +3795,6 @@ class Worker:
         executor.prepared_binding_set = binding_set
         executor.prepared_model = resolved
         for binding in group:
-            if binding.expected_logical_model_digest and (
-                binding.expected_logical_model_digest != digest
-            ):
-                self.note(
-                    "boot",
-                    f"{binding.entrypoint_binding_digest[:20]}… construction digest mismatch",
-                )
-                tenant.failed_bindings[binding.entrypoint_binding_digest] = (
-                    "logical model digest mismatch"
-                )
-                continue
             executor.ready_bindings.add(binding.entrypoint_binding_digest)
             tenant.prepared_models[binding.entrypoint_binding_digest] = resolved
         row = tenant.row()
@@ -3841,14 +3812,13 @@ class Worker:
             fill_ms=float(reply["facts"]["fill_ms"]),
             custody=str(reply["facts"].get("custody", "canonical")),
             ignored_extra_keys=", ".join(reply["facts"].get("ignored_extra_keys", ())),
-            transcribed_markers=", ".join(reply["facts"].get("transcribed_markers", ())),
         )
         self.note(
             "boot",
             f"{placement_id!r} prepared {len(group)} binding(s) in {took:.0f} ms — "
             f"{reply['facts']['filled']} destinations, "
             f"{reply['facts']['filled_bytes'] / 2**30:.3f} GiB, fill leg "
-            f"{reply['facts']['fill_ms'] / 1000:.3f} s, logical model {digest[:23]}… "
+            f"{reply['facts']['fill_ms'] / 1000:.3f} s, "
             f"generation {str(reply['constructed_model_digest'])[:23]}… "
             f"resident={sorted(reply['facts'].get('resident', {}))} "
             f"parked={reply['facts'].get('parked', [])}",

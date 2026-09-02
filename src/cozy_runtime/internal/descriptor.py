@@ -36,6 +36,18 @@ class StalePackageDescriptor(ConformanceError):
     default_code = "stale_package_descriptor"
 
 
+class RetiredDescriptorMember(StalePackageDescriptor):
+    """A slot member the grammar deleted, carrying a value: `stamps` (model-code-fit D1) or
+    `source_profile` (cr-077). Its code names the member — the hub refuses the same names."""
+
+
+#: A slot is `{path, class, component_use, encoded_leaves}` (+ optional `sequence_parallel`).
+#: These are the members it once carried and may not carry a value for. An EMPTY `stamps`
+#: map is read as nothing declared — every release published before this cut ships
+#: `"stamps": {}` and the worker reads those descriptors back; anything in it refuses typed.
+RETIRED_SLOT_KEYS = frozenset({"stamps", "source_profile"})
+
+
 # ------------------------------------------------------------------------ the document
 
 
@@ -96,13 +108,13 @@ def _callable(surface: Surface) -> dict[str, Json]:
 
 
 def _model(binding: ModelBinding) -> dict[str, Json]:
-    """One model slot. The PATH is the binding point, the CLASS carries admissibility, and
-    the per-public-method component sets are the ComponentUseContracts. Which artifact ever
-    satisfies it is a binding-clock fact and is not here."""
+    """One model slot. The PATH is the binding point, the CLASS carries `encoded_leaves`,
+    and the per-public-method component sets are the ComponentUseContracts. Which artifact
+    ever satisfies it is a binding-clock fact and is not here (model-code-fit §1)."""
     doc: dict[str, Json] = {
         "path": binding.path,
         "class": binding.class_key,
-        "stamps": dict(binding.stamps),
+        "encoded_leaves": binding.encoded_leaves,
         # Declaration order encodes no control flow and no residency choice (§1.1), so the
         # contract sorts — a reordered method body is not a surface change.
         "component_use": {
@@ -359,11 +371,14 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                 model_path = f"{path}.models[{model_index}]"
                 slot = _closed(
                     model,
-                    {"class", "component_use", "path", "stamps"},
-                    {"sequence_parallel"},
+                    {"class", "component_use", "path"},
+                    {"encoded_leaves", "sequence_parallel", *RETIRED_SLOT_KEYS},
                     source,
                     model_path,
                 )
+                _refuse_retired(slot, source, model_path)
+                if "encoded_leaves" in slot and slot["encoded_leaves"] not in ("refuse", "accept"):
+                    _invalid(source, f"{model_path}.encoded_leaves", "must be refuse or accept")
                 if "sequence_parallel" in slot:
                     _sequence_parallel(
                         slot["sequence_parallel"], source, f"{model_path}.sequence_parallel"
@@ -377,7 +392,6 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     _invalid(source, f"{model_path}.path", f"must start with {prefix!r}")
                 if not isinstance(slot["class"], str) or not slot["class"]:
                     _invalid(source, f"{model_path}.class", "must be a non-empty string")
-                _string_map(slot["stamps"], source, f"{model_path}.stamps")
                 uses = slot["component_use"]
                 if not isinstance(uses, dict):
                     _invalid(source, f"{model_path}.component_use", "must be an object")
@@ -600,11 +614,26 @@ def _closed(
     return cast(dict[str, Json], value)
 
 
-def _string_map(value: Json, source: str, path: str) -> None:
-    if not isinstance(value, dict) or not all(
-        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
-    ):
-        _invalid(source, path, "must map strings to strings")
+def _refuse_retired(slot: Mapping[str, Json], source: str, path: str) -> None:
+    """The deleted members refuse by name, at the reader, exactly as the hub does."""
+    if "stamps" in slot:
+        stamps = slot["stamps"]
+        if not isinstance(stamps, dict):
+            _invalid(source, f"{path}.stamps", "must be an object")
+        if stamps:
+            raise RetiredDescriptorMember(
+                f"{source}: {path} carries stamps {sorted(stamps)}; stamps are deleted "
+                "(model-code-fit D1): a semantic twin is a component name or a config fact",
+                code="descriptor.stamps_retired",
+                fields=[path],
+            )
+    if "source_profile" in slot:
+        raise RetiredDescriptorMember(
+            f"{source}: {path} carries source_profile; capability is the slot's class "
+            "annotation (cr-077)",
+            code="descriptor.source_profile_retired",
+            fields=[path],
+        )
 
 
 def _subset_object(value: Json, allowed: set[str], source: str, path: str) -> None:
