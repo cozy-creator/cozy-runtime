@@ -9,10 +9,10 @@ annotation. Both arms below drive the REAL walk() and _validate_result.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import msgspec
 import pytest
-
-from pathlib import Path
 
 from cozy_runtime.author import OutputError
 from cozy_runtime.author._invoke import _validate_result
