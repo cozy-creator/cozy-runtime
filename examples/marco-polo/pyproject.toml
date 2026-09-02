@@ -8,15 +8,12 @@ version = "1.0.4"
 description = "Weightless Marco/Polo example for Tensorhub publication and worker placement"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "cozy-runtime>=0.0.19,<1.0.0",
+    "cozy-runtime>=0.1,<1",
     "msgspec>=0.19",
 ]
 
 [project.entry-points."cozy.application"]
 default = "marco_polo_package:app"
-
-[tool.uv.sources]
-cozy-runtime = { path = "../..", editable = true }
 
 [tool.uv.build-backend]
 module-name = "marco_polo_package"
