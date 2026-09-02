@@ -957,20 +957,37 @@ def _selected_models(
                 ):
                     raise PreparationRefusal("package_prepare_model_manifest_mismatch", digest)
                 manifests[digest] = (length, raw, None)
+        delivered = {(digest, length) for digest, (length, _path) in object_files.items()}
+        placed: set[str] = set()
         for digest, (_length, raw, _path) in sorted(manifests.items()):
-            closure = acquire.manifest_entries(tensorfs, raw)
+            if carried_models:
+                # The walk reads the CozyTensors header out of the store, so the objects
+                # the manifest names directly (the header and its sibling files) are placed
+                # first; the parts the header reaches are only enumerated here.
+                for entry_digest, entry_length in sorted(acquire.manifest_entries(tensorfs, raw)):
+                    row = object_files.get(entry_digest)
+                    if row is None or row[0] != entry_length:
+                        raise PreparationRefusal(
+                            "package_prepare_model_object_set_mismatch",
+                            f"{digest} names {entry_digest} ({entry_length} B); not delivered",
+                        )
+                    if entry_digest not in placed:
+                        store.put_file(str(row[1]), entry_digest, entry_length)
+                        placed.add(entry_digest)
+            closure = {(str(row["id"]), int(row["length"])) for row in store.walk(digest)}
             closures[digest] = closure
             reached.update(closure)
-        if (
-            carried_models
-            and {(digest, length) for digest, (length, _path) in object_files.items()} != reached
-        ):
+        if carried_models and delivered != reached:
+            missing = sorted(digest for digest, _length in reached - delivered)
+            extra = sorted(digest for digest, _length in delivered - reached)
             raise PreparationRefusal(
                 "package_prepare_model_object_set_mismatch",
-                "downloaded model objects do not equal the selected Manifest closure",
+                f"delivered={len(delivered)} reached={len(reached)} "
+                f"missing={missing[:4]} extra={extra[:4]}",
             )
         for digest, (length, path) in sorted(object_files.items()):
-            store.put_file(str(path), digest, length)
+            if digest not in placed:
+                store.put_file(str(path), digest, length)
             verified(digest, length, path)
         for digest, (length, _raw, manifest_path) in sorted(manifests.items()):
             store.acquire_manifest(digest).release()
