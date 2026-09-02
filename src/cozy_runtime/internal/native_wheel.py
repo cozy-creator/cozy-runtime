@@ -304,7 +304,13 @@ def inspect_tree(root: Path, members: tuple[str, ...]) -> Inspection:
     """Inspect exact extracted native members before their immutable pool is published."""
 
     root = root.resolve(strict=True)
-    host_libraries = frozenset(_host_libraries())
+    # Collision is judged against the DYNAMIC LINKER's namespace only: DT_NEEDED
+    # resolution is process-global, so a wheel bundling an ldconfig name can hijack
+    # it. A Python extension in some environment's site-packages is imported by
+    # path, never resolved by name — an isolated venv carrying the same filename
+    # shadows nothing (cr-067 residual, ruled by the xs-008 self-contained-venv
+    # design). Resolution below still sees the full inventory.
+    host_libraries = frozenset(name for name, _ in _linker_library_rows())
     parsed: list[ELFMember] = []
     for member in members:
         path = (root / member).resolve(strict=True)
@@ -849,7 +855,7 @@ def _host_libraries() -> dict[str, Path]:
 
 
 @lru_cache(maxsize=1)
-def _host_library_rows() -> tuple[tuple[str, str], ...]:
+def _linker_library_rows() -> tuple[tuple[str, str], ...]:
     libraries: dict[str, Path] = {}
     tool = shutil.which("ldconfig")
     if tool is not None:
@@ -873,6 +879,12 @@ def _host_library_rows() -> tuple[tuple[str, str], ...]:
                 path = Path(right.strip())
                 if name and path.is_absolute() and path.is_file():
                     libraries.setdefault(name, path)
+    return tuple(sorted((name, str(path)) for name, path in libraries.items()))
+
+
+@lru_cache(maxsize=1)
+def _host_library_rows() -> tuple[tuple[str, str], ...]:
+    libraries: dict[str, Path] = {name: Path(path) for name, path in _linker_library_rows()}
     roots = {
         Path(value)
         for value in sysconfig.get_paths().values()
