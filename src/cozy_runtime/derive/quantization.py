@@ -54,6 +54,10 @@ _ENCODINGS: dict[str, _Encoding] = {
     ),
 }
 
+#: RNE fp32->bf16 keeps every element within amax * 2^-8 (8-bit significand, half-ulp).
+#: The normalization's own tier-1 bound — enforced on every cut, stats recorded (#695).
+BF16_ROUND_TRIP_BOUND = 2.0**-8
+
 
 class EncodingConformance(msgspec.Struct):
     """What these kinds PROVE: byte layout, decoder agreement, reproducibility (#549.6).
@@ -168,6 +172,17 @@ class Bf16Plan(msgspec.Struct):
     configs: list[str]
     order: list[tuple[str, str]]
     tensors: list[Bf16Tensor]
+    #: f32 tensors a keep-listed component holds at source precision (#695).
+    kept: list[tuple[str, str]]
+
+
+class Bf16Stats(msgspec.Struct):
+    """What one normalization cut recorded — the tier-1 round-trip stats of #695."""
+
+    converted_keys: int
+    source_bytes_read: int
+    new_bytes_written: int
+    worst_relative_frobenius: float
 
 
 _ARTIFACT_SPECS = {
@@ -249,31 +264,48 @@ def prepare_quantization(plan_bytes: bytes) -> ArtifactQuantizationPlan:
     return _artifact_plan(plan_bytes)
 
 
-def prepare_bf16(structure: SourceStructure) -> Bf16Plan:
-    """Plan a complete plain-float BF16 normalization from granted structure facts."""
+def prepare_bf16(structure: SourceStructure, *, keep: tuple[str, ...] = ()) -> Bf16Plan:
+    """Plan the fp32→bf16 ingest normalization from granted structure facts (#695).
+
+    Only plain f32 tensors convert: fp16 carries the same bytes and would lose three
+    mantissa bits for nothing, so fp16/bf16 and every already-encoded tensor inherit
+    untouched. A component named in ``keep`` is precision-sensitive by the ingest
+    config's own declaration — its f32 tensors inherit at source precision and are
+    recorded in ``kept``.
+    """
+    keep_set = set(keep)
+    if len(keep_set) != len(keep):
+        raise UnsupportedInput("keep list repeats a component")
+    available = {tensor.component for tensor in structure.tensors}
+    missing = sorted(keep_set - available)
+    if missing:
+        raise UnsupportedInput(f"keep list names absent components {missing}")
     components: list[str] = []
     tensors: list[Bf16Tensor] = []
+    kept: list[tuple[str, str]] = []
     order: list[tuple[str, str]] = []
     for tensor in structure.tensors:
         if tensor.component not in components:
             components.append(tensor.component)
         order.append((tensor.component, tensor.key))
-        if tensor.logical_dtype not in {"f16", "bf16", "f32"}:
+        if tensor.logical_dtype != "f32":
+            continue
+        if tensor.component in keep_set:
+            kept.append((tensor.component, tensor.key))
             continue
         role = _plain_source_role(tensor)
-        if tensor.logical_dtype != "bf16":
-            tensors.append(
-                Bf16Tensor(
-                    tensor.component,
-                    tensor.key,
-                    tensor.logical_dtype,
-                    tensor.shape,
-                    role,
-                )
+        tensors.append(
+            Bf16Tensor(
+                tensor.component,
+                tensor.key,
+                tensor.logical_dtype,
+                tensor.shape,
+                role,
             )
+        )
     if not components or not order:
         raise UnsupportedInput("weights source structure contains no tensors")
-    return Bf16Plan(components, list(structure.configs), order, tensors)
+    return Bf16Plan(components, list(structure.configs), order, tensors, kept)
 
 
 def prepare_source_quantization(
@@ -321,7 +353,7 @@ def bf16_targets(
     source: str,
     excluded: set[tuple[str, str]] | None = None,
 ) -> dict[str, WeightsTarget]:
-    """Declare BF16 replacements, inheriting all non-float or already-BF16 tensors."""
+    """Declare BF16 replacements for the plan's f32 cut; everything else inherits."""
     omitted = excluded or set()
     targets: dict[str, WeightsTarget] = {}
     for component in plan.components:
@@ -352,11 +384,19 @@ def write_bf16(
     plan: Bf16Plan,
     source: str,
     excluded: set[tuple[str, str]] | None = None,
-) -> int:
-    """Stream every declared non-BF16 float through one bounded conversion."""
+) -> Bf16Stats:
+    """Stream the plan's f32 cut through one bounded RNE conversion, stats recorded.
+
+    Every converted tensor's round trip is measured against the bf16 representational
+    bound (``BF16_ROUND_TRIP_BOUND`` of its amax) and logged per tensor; the worst
+    relative Frobenius rides the returned stats — the recorded derivation of #695,
+    never a silent cast.
+    """
     omitted = excluded or set()
     selected = [tensor for tensor in plan.tensors if (tensor.component, tensor.key) not in omitted]
     read = 0
+    written = 0
+    worst = 0.0
     for done, tensor in enumerate(selected, 1):
         ctx.raise_if_cancelled()
         values, length = _read_values(
@@ -368,15 +408,39 @@ def write_bf16(
             logical_dtype=tensor.source_dtype,
             shape=tensor.shape,
         )
-        transaction.add_part(
-            tensor.component,
-            tensor.key,
-            "value",
-            st.from_f32(values, "BF16"),
-        )
+        raw = st.from_f32(values, "BF16")
+        error = np.abs(values - st.to_f32(raw, "BF16", list(tensor.shape)))
+        bound = float(np.max(np.abs(values))) * BF16_ROUND_TRIP_BOUND
+        if float(np.max(error)) > bound:
+            raise UnsupportedInput(
+                f"{tensor.component}.{tensor.key}: bf16 round-trip error "
+                f"{float(np.max(error)):.4g} exceeds the representational bound {bound:.4g}",
+                code="quantization_tripwire",
+            )
+        norm = float(np.linalg.norm(values))
+        relative = float(np.linalg.norm(error)) / norm if norm else 0.0
+        worst = max(worst, relative)
+        transaction.add_part(tensor.component, tensor.key, "value", raw)
         read += length
+        written += len(raw)
+        tel.log(
+            "normalized tensor",
+            level="info",
+            component=tensor.component,
+            key=tensor.key,
+            source_dtype=tensor.source_dtype,
+            relative_frobenius=relative,
+            done=done,
+            total=len(selected),
+        )
         tel.progress(done / len(selected), stage="bf16")
-    return read
+        del values, raw, error
+    return Bf16Stats(
+        converted_keys=len(selected),
+        source_bytes_read=read,
+        new_bytes_written=written,
+        worst_relative_frobenius=worst,
+    )
 
 
 def inherited_configs(plan: Bf16Plan, *, source: str) -> dict[str, WeightsConfig]:
