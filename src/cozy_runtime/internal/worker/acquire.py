@@ -237,6 +237,10 @@ def preinstalled_development(
         descriptor = package_descriptor.read_bytes(
             descriptor_path.read_bytes(), str(descriptor_path)
         )
+    except package_descriptor.RetiredDescriptorMember as exc:
+        raise AcquisitionRefusal(
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
+        ) from exc
     except package_descriptor.StalePackageDescriptor as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
@@ -588,6 +592,10 @@ class Acquirer:
             descriptor = package_descriptor.read_bytes(
                 descriptor_path.read_bytes(), str(descriptor_path)
             )
+        except package_descriptor.RetiredDescriptorMember as exc:
+            raise AcquisitionRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
+            ) from exc
         except package_descriptor.StalePackageDescriptor as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)

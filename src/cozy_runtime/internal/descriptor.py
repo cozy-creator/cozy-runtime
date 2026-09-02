@@ -623,7 +623,7 @@ def _refuse_retired(slot: Mapping[str, Json], source: str, path: str) -> None:
         if stamps:
             raise RetiredDescriptorMember(
                 f"{source}: {path} carries stamps {sorted(stamps)}; stamps are deleted "
-                "(model-code-fit D1) — a semantic twin is a component name or a config fact",
+                "(model-code-fit D1): a semantic twin is a component name or a config fact",
                 code="descriptor.stamps_retired",
                 fields=[path],
             )

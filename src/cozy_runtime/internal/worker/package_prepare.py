@@ -199,7 +199,7 @@ def _published_descriptor(
     try:
         descriptor.read_bytes(raw, "published package descriptor")
     except descriptor.RetiredDescriptorMember as exc:
-        raise PreparationRefusal(exc.code, str(exc)) from exc
+        raise PreparationRefusal(exc.code, exc.message) from exc
     except descriptor.StalePackageDescriptor as exc:
         raise PreparationRefusal("package_prepare_published_descriptor_invalid", str(exc)) from exc
     return raw, parent
@@ -355,7 +355,7 @@ def prepare_private_placement(
     try:
         descriptor_body = descriptor.read_bytes(descriptor_raw, "prepared private descriptor")
     except descriptor.RetiredDescriptorMember as exc:
-        raise PreparationRefusal(exc.code, str(exc)) from exc
+        raise PreparationRefusal(exc.code, exc.message) from exc
     except descriptor.StalePackageDescriptor as exc:
         raise PreparationRefusal("private_placement_descriptor_invalid", str(exc)) from exc
     selected_models, entrypoints = _entrypoints(
@@ -600,7 +600,7 @@ def prepare_package(
     try:
         descriptor_body = descriptor.read_bytes(descriptor_raw, "prepared package descriptor")
     except descriptor.RetiredDescriptorMember as exc:
-        raise PreparationRefusal(exc.code, str(exc)) from exc
+        raise PreparationRefusal(exc.code, exc.message) from exc
     except descriptor.StalePackageDescriptor as exc:
         raise PreparationRefusal("package_prepare_descriptor_invalid", str(exc)) from exc
     descriptor_ref = _stage(artifact_cache, descriptor_raw)
