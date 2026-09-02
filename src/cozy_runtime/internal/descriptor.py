@@ -147,16 +147,20 @@ _FORBIDDEN_KEYS = frozenset(
 
 
 def _binding_values(bindings: Mapping[str, Mapping[str, object]]) -> frozenset[str]:
-    """Every spelling of a binding a package.toml states — the parts AND the composed ref,
-    because `model` and `release` are stored apart but named together everywhere else."""
+    """The binding SELECTION spellings a package.toml states — model, release, and the
+    composed ref, because `model` and `release` are stored apart but named together
+    everywhere else. The `lane` member is deliberately NOT scanned (cr-077): lane names
+    are format vocabulary ("bf16", "fp8") that legitimately coincides with author surface
+    names — a quantize job's weights outputs ARE the lanes it derives — and a descriptor
+    containing the word gains no pointer to the mutable selection."""
     values: set[str] = set()
     for entry in bindings.values():
-        for value in entry.values():
-            if isinstance(value, str):
-                values.add(value)
         model, release = entry.get("model"), entry.get("release")
         if isinstance(model, str):
-            values.add(f"{model}@{release}" if isinstance(release, str) else model)
+            values.add(model)
+            if isinstance(release, str):
+                values.add(release)
+                values.add(f"{model}@{release}")
     return frozenset(values)
 
 
