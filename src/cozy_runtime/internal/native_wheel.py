@@ -870,10 +870,24 @@ def _host_libraries() -> dict[str, Path]:
     return {name: Path(path) for name, path in _host_library_rows()}
 
 
+# glibc installs its loader-cache tool under /sbin, which the pod worker's fixed PATH
+# (spawn-allowlists row D: /usr/local/bin:/usr/bin:/bin) deliberately omits. The tool is
+# resolved at its own home rather than through PATH, so the sealed PATH stays narrow and no
+# PATH entry can substitute a different ldconfig.
+_LDCONFIG_HOMES = ("/sbin/ldconfig", "/usr/sbin/ldconfig")
+
+
+def _ldconfig() -> str | None:
+    for candidate in _LDCONFIG_HOMES:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("ldconfig")
+
+
 @lru_cache(maxsize=1)
 def _linker_library_rows() -> tuple[tuple[str, str], ...]:
     libraries: dict[str, Path] = {}
-    tool = shutil.which("ldconfig")
+    tool = _ldconfig()
     if tool is not None:
         try:
             result = subprocess.run(
