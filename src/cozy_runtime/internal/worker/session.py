@@ -3140,8 +3140,8 @@ class Worker:
             )
             return None
         if placement.development:
-            revision = str(placement.development.get("local_revision_digest", ""))
-            prepared = self.local_revisions.get((placement.placement_id, revision))
+            local_revision = str(placement.development.get("local_revision_digest", ""))
+            prepared = self.local_revisions.get((placement.placement_id, local_revision))
             if prepared is None:
                 self._materialization_failed(
                     placement,

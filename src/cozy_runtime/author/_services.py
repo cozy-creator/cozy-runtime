@@ -927,7 +927,7 @@ class Telemetry(_Bound):
         self._attempt._overall_fraction = overall
         return overall
 
-    def _overall_range(self, value: tuple[float, float] | None) -> tuple[float, float] | None:
+    def _overall_range(self, value: object | None) -> tuple[float, float] | None:
         if value is None:
             return None
         if not isinstance(value, tuple) or len(value) != 2:
