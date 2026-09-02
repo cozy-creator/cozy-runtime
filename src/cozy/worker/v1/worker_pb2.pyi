@@ -171,6 +171,15 @@ class CheckpointFaultCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CHECKPOINT_FAULT_CODE_STALE_SEQUENCE: _ClassVar[CheckpointFaultCode]
     CHECKPOINT_FAULT_CODE_QUOTA_EXCEEDED: _ClassVar[CheckpointFaultCode]
 
+class PrepareStage(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    PREPARE_STAGE_UNSPECIFIED: _ClassVar[PrepareStage]
+    PREPARE_STAGE_RESOLVED: _ClassVar[PrepareStage]
+    PREPARE_STAGE_DOWNLOADING: _ClassVar[PrepareStage]
+    PREPARE_STAGE_PREPARING: _ClassVar[PrepareStage]
+    PREPARE_STAGE_PREPARED: _ClassVar[PrepareStage]
+    PREPARE_STAGE_REFUSED: _ClassVar[PrepareStage]
+
 class WeightsHostStage(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     WEIGHTS_HOST_STAGE_UNSPECIFIED: _ClassVar[WeightsHostStage]
@@ -403,6 +412,12 @@ CHECKPOINT_FAULT_CODE_UNKNOWN_ATTEMPT: CheckpointFaultCode
 CHECKPOINT_FAULT_CODE_NOT_JOB_MODE: CheckpointFaultCode
 CHECKPOINT_FAULT_CODE_STALE_SEQUENCE: CheckpointFaultCode
 CHECKPOINT_FAULT_CODE_QUOTA_EXCEEDED: CheckpointFaultCode
+PREPARE_STAGE_UNSPECIFIED: PrepareStage
+PREPARE_STAGE_RESOLVED: PrepareStage
+PREPARE_STAGE_DOWNLOADING: PrepareStage
+PREPARE_STAGE_PREPARING: PrepareStage
+PREPARE_STAGE_PREPARED: PrepareStage
+PREPARE_STAGE_REFUSED: PrepareStage
 WEIGHTS_HOST_STAGE_UNSPECIFIED: WeightsHostStage
 WEIGHTS_HOST_STAGE_INTENT: WeightsHostStage
 WEIGHTS_HOST_STAGE_RECEIPT: WeightsHostStage
@@ -475,6 +490,94 @@ WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED: WeightsFinalizeDisposition
 WEIGHTS_FINALIZE_OUTCOME_UNSPECIFIED: WeightsFinalizeOutcome
 WEIGHTS_FINALIZE_OUTCOME_ADOPTED: WeightsFinalizeOutcome
 WEIGHTS_FINALIZE_OUTCOME_ABANDONED: WeightsFinalizeOutcome
+
+class WeightsHostEvent(_message.Message):
+    __slots__ = ("intent", "receipt")
+    INTENT_FIELD_NUMBER: _ClassVar[int]
+    RECEIPT_FIELD_NUMBER: _ClassVar[int]
+    intent: WeightsIntentFrame
+    receipt: WeightsReceiptFrame
+    def __init__(self, intent: _Optional[_Union[WeightsIntentFrame, _Mapping]] = ..., receipt: _Optional[_Union[WeightsReceiptFrame, _Mapping]] = ...) -> None: ...
+
+class PreparePackageSetCall(_message.Message):
+    __slots__ = ("claim", "package_set")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    package_set: DesiredPackageSet
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ...) -> None: ...
+
+class PreparePrivatePackageCall(_message.Message):
+    __slots__ = ("claim", "private_package_set")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    PRIVATE_PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    private_package_set: DesiredPrivatePackageSet
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., private_package_set: _Optional[_Union[DesiredPrivatePackageSet, _Mapping]] = ...) -> None: ...
+
+class PreparePrivatePlacementCall(_message.Message):
+    __slots__ = ("claim", "private_placement_set")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    PRIVATE_PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    private_placement_set: DesiredPrivatePlacementSet
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., private_placement_set: _Optional[_Union[DesiredPrivatePlacementSet, _Mapping]] = ...) -> None: ...
+
+class PrepareEvent(_message.Message):
+    __slots__ = ("stage", "total_bytes", "transferred_bytes", "placement_set", "safe_code", "safe_detail")
+    STAGE_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    TRANSFERRED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    stage: PrepareStage
+    total_bytes: int
+    transferred_bytes: int
+    placement_set: DesiredPlacementSet
+    safe_code: str
+    safe_detail: str
+    def __init__(self, stage: _Optional[_Union[PrepareStage, str]] = ..., total_bytes: _Optional[int] = ..., transferred_bytes: _Optional[int] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+
+class ModelSourceFileCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: ModelSourceFileRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[ModelSourceFileRequest, _Mapping]] = ...) -> None: ...
+
+class ModelSourcePrepareCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: ModelSourcePrepareRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ...) -> None: ...
+
+class PrivatePackageFetchCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: PrivatePackageFetchRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[PrivatePackageFetchRequest, _Mapping]] = ...) -> None: ...
+
+class PrivatePackageAbortCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: PrivatePackageAbort
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[PrivatePackageAbort, _Mapping]] = ...) -> None: ...
+
+class WeightsTransferCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: WeightsTransferRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[WeightsTransferRequest, _Mapping]] = ...) -> None: ...
 
 class PreparePackageSetRequest(_message.Message):
     __slots__ = ("download_delegation", "files", "environment_root")
@@ -749,7 +852,7 @@ class BootFailure(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_instance_id: _Optional[str] = ..., reason: _Optional[_Union[BootFailureReason, str]] = ..., detail: _Optional[str] = ..., resources: _Optional[_Union[WorkerResources, _Mapping]] = ..., control_runtime_digest: _Optional[str] = ..., worker_release_id: _Optional[str] = ...) -> None: ...
 
 class WorkerSnapshot(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "snapshot_id", "snapshot_digest", "snapshot_canonical_bytes", "accepted_placement_set_canonical_bytes")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "snapshot_id", "snapshot_digest", "snapshot_canonical_bytes", "accepted_placement_set_canonical_bytes", "host_snapshot_digest", "host_snapshot_canonical_bytes")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -757,6 +860,8 @@ class WorkerSnapshot(_message.Message):
     SNAPSHOT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     ACCEPTED_PLACEMENT_SET_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    HOST_SNAPSHOT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    HOST_SNAPSHOT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -764,7 +869,9 @@ class WorkerSnapshot(_message.Message):
     snapshot_digest: bytes
     snapshot_canonical_bytes: bytes
     accepted_placement_set_canonical_bytes: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ..., snapshot_canonical_bytes: _Optional[bytes] = ..., accepted_placement_set_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+    host_snapshot_digest: bytes
+    host_snapshot_canonical_bytes: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ..., snapshot_canonical_bytes: _Optional[bytes] = ..., accepted_placement_set_canonical_bytes: _Optional[bytes] = ..., host_snapshot_digest: _Optional[bytes] = ..., host_snapshot_canonical_bytes: _Optional[bytes] = ...) -> None: ...
 
 class WorkerSnapshotBody(_message.Message):
     __slots__ = ("accepted_desired_state_revision", "accepted_placement_set_digest", "journal_highwater", "worker_phase", "placements", "converged_revision", "admission_epoch", "admission_state", "available_attempt_slots", "held_attempts", "weights_transactions")
@@ -792,19 +899,29 @@ class WorkerSnapshotBody(_message.Message):
     weights_transactions: _containers.RepeatedCompositeFieldContainer[WeightsTransactionStatus]
     def __init__(self, accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., journal_highwater: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., converged_revision: _Optional[int] = ..., admission_epoch: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ...) -> None: ...
 
+class HostSnapshotBody(_message.Message):
+    __slots__ = ("held_outcomes", "weights_transactions")
+    HELD_OUTCOMES_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_TRANSACTIONS_FIELD_NUMBER: _ClassVar[int]
+    held_outcomes: _containers.RepeatedCompositeFieldContainer[HeldAttempt]
+    weights_transactions: _containers.RepeatedCompositeFieldContainer[WeightsTransactionStatus]
+    def __init__(self, held_outcomes: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ...) -> None: ...
+
 class SnapshotAck(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "snapshot_id", "snapshot_digest")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "snapshot_id", "snapshot_digest", "host_snapshot_digest")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    HOST_SNAPSHOT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
     snapshot_id: str
     snapshot_digest: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ...) -> None: ...
+    host_snapshot_digest: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ..., host_snapshot_digest: _Optional[bytes] = ...) -> None: ...
 
 class DesiredWorkerState(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "revision", "posture", "wire_minor", "drain_grace_ms", "job", "placement_set", "package_set", "private_package_set", "private_placement_set")

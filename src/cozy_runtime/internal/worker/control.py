@@ -101,6 +101,33 @@ class _Servicer:
         yield from self.plane.watch(request)
 
 
+class RuntimeWeightsHost(Protocol):
+    """The Runtime-hosted weights seam (proto-025) the loopback pod-supervisor dials. The
+    supervisor opens `Exchange` per accepted control session — intents and receipts go out on
+    it, host ACKs come back — and calls `Upload` once per granted object. The bodies are the
+    worker's `WeightsExchange`; this is only how they reach the loopback listener."""
+
+    def serve_exchange(
+        self, acks: Iterator[pb.WeightsHostAck]
+    ) -> Iterator[pb.WeightsHostEvent]: ...
+
+    def upload(self, request: pb.WeightsUploadRequest) -> pb.WorkerFrame: ...
+
+
+class _RuntimeWeightsServicer:
+    # Not a subclass for the same reason as `_Servicer`: the generated base is untyped.
+    def __init__(self, weights: RuntimeWeightsHost) -> None:
+        self.weights = weights
+
+    def Exchange(self, request_iterator: Any, context: Any) -> Any:
+        yield from self.weights.serve_exchange(request_iterator)
+
+    def Upload(self, request: pb.WeightsUploadRequest, context: Any) -> Any:
+        # `upload` answers as a WorkerFrame for the pre-21 control lane; the unary RPC wants
+        # its inner result.
+        return self.weights.upload(request).weights_upload_result
+
+
 class GrpcControlHost:
     """The production host: one gRPC server on the worker's own local binding.
 
@@ -130,6 +157,7 @@ class GrpcControlHost:
         private_placement_preparer: (
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
         ) = None,
+        weights: RuntimeWeightsHost | None = None,
     ) -> None:
         self.listen = listen
         self.addr_file = addr_file
@@ -140,6 +168,9 @@ class GrpcControlHost:
         self.model_source_preparer = model_source_preparer
         self.private_package_preparer = private_package_preparer
         self.private_placement_preparer = private_placement_preparer
+        #: The loopback weights seam (proto-025), served only when a pod supervisor is the
+        #: peer. Absent on a local run, where there is no supervisor to open `Exchange`.
+        self.weights = weights
         self.server: Any = None
         self.stopped = threading.Event()
 
@@ -152,14 +183,21 @@ class GrpcControlHost:
 
         self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
         pb_grpc.add_WorkerControlServicer_to_server(_Servicer(plane), self.server)
+        loopback_services = (
+            self.preparer is not None
+            or self.model_source_preparer is not None
+            or self.private_package_preparer is not None
+            or self.private_placement_preparer is not None
+            or self.weights is not None
+        )
+        if loopback_services and not _loopback_preparation_listener(self.listen):
+            raise RuntimeError("the loopback Runtime services can only bind a loopback listener")
         if (
             self.preparer is not None
             or self.model_source_preparer is not None
             or self.private_package_preparer is not None
             or self.private_placement_preparer is not None
         ):
-            if not _loopback_preparation_listener(self.listen):
-                raise RuntimeError("RuntimePreparation can only bind a loopback listener")
             pb_grpc.add_RuntimePreparationServicer_to_server(
                 _PreparationServicer(
                     self.preparer,
@@ -168,6 +206,12 @@ class GrpcControlHost:
                     self.private_placement_preparer,
                 ),
                 self.server,
+            )
+        if self.weights is not None:
+            # Loopback-only, exactly like RuntimePreparation: the supervisor dials it on the
+            # same 127.0.0.1 listener and it is never reachable from the external leg.
+            pb_grpc.add_RuntimeWeightsServicer_to_server(
+                _RuntimeWeightsServicer(self.weights), self.server
             )
         if self.listen.startswith("unix:"):
             self.server.add_insecure_port(self.listen)
