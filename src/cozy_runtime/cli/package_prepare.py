@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import canonical, package_environment, spawn
+from cozy_runtime.internal import canonical, package_environment, package_interface, spawn
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
@@ -25,6 +25,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         "--artifact-store",
         "--environment-python",
         "--package",
+        "--package-interface",
         "--project-wheel",
         "--release",
     }
@@ -32,15 +33,27 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     artifact_cache = Path(values["--artifact-cache"][0]).resolve()
     artifact_store = Path(values["--artifact-store"][0]).resolve()
     environment_python = _venv_python(values["--environment-python"][0])
-    wheel_paths = [
+    interface_path = Path(values["--package-interface"][0]).resolve()
+    try:
+        interface_raw = interface_path.read_bytes()
+        package_interface.read_bytes(interface_raw, str(interface_path))
+    except (OSError, package_interface.StalePackageInterface) as exc:
+        raise CliError(
+            "package_prepare_interface_unreadable",
+            str(exc),
+            "download the exact published metadata/package-interface.json again",
+            Exit.not_found,
+        ) from exc
+    artifact_paths = [
         (pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, Path(values["--project-wheel"][0]).resolve()),
         *(
             (pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, Path(value).resolve())
             for value in values.get("--dependency-wheel", [])
         ),
+        (pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE, interface_path),
     ]
     rows: list[pb.LocalDownloadFile] = []
-    for kind, path in wheel_paths:
+    for kind, path in artifact_paths:
         try:
             info = path.stat()
             digest = _hash_file(path)
@@ -54,7 +67,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         rows.append(
             pb.LocalDownloadFile(
                 digest=bytes.fromhex(digest.removeprefix("sha256:")),
-                filename=path.name,
+                filename=(package_interface.FILENAME if path == interface_path else path.name),
                 kind=kind,
                 length=info.st_size,
                 path=str(path),
@@ -64,7 +77,17 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     package = values["--package"][0]
     release = values["--release"][0]
     environment_content_digest = canonical.digest(
-        {"wheels": [documents.spell(bytes(row.digest)) for row in rows]}
+        {
+            "wheels": [
+                documents.spell(bytes(row.digest))
+                for row in rows
+                if row.kind
+                in {
+                    pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
+                    pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
+                }
+            ]
+        }
     )
     try:
         installed_environment = package_environment.open_existing_environment(
@@ -165,6 +188,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             # happens to be the local same-user command.
             native_environment=spawn.seal(config.child_base_env, {}),
             installed_environment=installed_environment,
+            published_interface=interface_raw,
             # The same job-plan root the worker session stages into: without it a
             # job-only package has no runnable callable and local install refuses.
             job_plan_root=config.cozy_home / "job-plans",
@@ -185,8 +209,8 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     placement_bytes = result.placement_set.placement_set_canonical_bytes
     placement = documents.read(placement_bytes, pb.PlacementSet)["placements"][0]
     interface_ref = placement["package_interface"]
-    interface_path = artifact_cache / str(interface_ref["digest"]).removeprefix("sha256:")
-    interface_raw = interface_path.read_bytes()
+    staged_interface = artifact_cache / str(interface_ref["digest"]).removeprefix("sha256:")
+    interface_raw = staged_interface.read_bytes()
     return Result(
         rows=(("package", package), ("release", release)),
         document={

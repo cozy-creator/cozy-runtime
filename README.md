@@ -320,10 +320,11 @@ with the venv's own Python; it receives no package `PYTHONPATH` or appended impo
 
 Local installed packages use the same ordinary venv boundary but not the rental base policy.
 Creator resolves the full lock with uv, so two local packages may carry different Python or Torch
-families. `prepare-package --environment-python <venv>/bin/python` validates that existing venv and
-recognizes exact non-protected project/dependency versions as contents of that completed package
-environment, not as worker-image distributions. A version disagreement or protected-family/root
-collision still refuses. It then authors the package interface and PlacementSet without installing
+families. `prepare-package --environment-python <venv>/bin/python --package-interface
+<download>/metadata/package-interface.json` validates that existing venv and the exact published
+interface, and recognizes exact non-protected project/dependency versions as contents of that
+completed package environment, not as worker-image distributions. A version disagreement or
+protected-family/root collision still refuses. It then authors the PlacementSet without installing
 another environment. Local `serve`
 receives the same `--environment-python`; `--environment-root` is reserved for rental
 materialization and the two flags are mutually exclusive.
