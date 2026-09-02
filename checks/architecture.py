@@ -53,6 +53,9 @@ PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
     # Public derivation surface (cr-071): job packages import it directly. It builds only
     # on the author surface — never the worker planes, the CLI, or TensorFS.
     "derive": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
+    # The activation probe (cr-075): a public mechanism surface shaped like `derive` — job
+    # code and the runtime verb both build on it; it never reaches the worker planes.
+    "probe": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
     "internal": ("cozy_runtime.cli",),
     "cli": (),
 }
