@@ -69,6 +69,9 @@ _PROTECTED_LIBRARY = re.compile(
     re.IGNORECASE,
 )
 _VIRTUAL_LIBRARIES = frozenset({"linux-vdso.so.1"})
+# NVIDIA reports the driver as MAJOR.MINOR (595.84) or MAJOR.MINOR.PATCH (570.86.15); the
+# release line varies the depth. It is recorded evidence, never a floor inferred from bytes.
+_DRIVER_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){1,2}")
 
 
 class NativeWheelRefusal(Exception):
@@ -831,7 +834,7 @@ def observe_gpu(device_index: int) -> GPUObservation:
         )
     name, driver, capability = (item.strip() for item in rows[0])
     match = re.fullmatch(r"([0-9]+)\.([0-9]+)", capability)
-    if not name or re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", driver) is None or match is None:
+    if not name or _DRIVER_VERSION.fullmatch(driver) is None or match is None:
         raise NativeWheelRefusal("package_environment_native_gpu_unavailable", output[:500])
     return {
         "device_index": device_index,
