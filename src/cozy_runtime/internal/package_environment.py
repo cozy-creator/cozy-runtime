@@ -3,8 +3,10 @@
 Runtime observes the actual interpreter's standard library and narrow protected platform families:
 Python, cozy-runtime, msgspec, TensorFS, and, when present, Torch/Triton/CUDA/NVIDIA. A placement
 creates one ordinary uv venv containing only the package project wheel and package-owned dependency
-wheels. It never resolves dependencies, copies a protected package, or re-hashes the base
-environment's RECORD tree.
+wheels. It never re-resolves the lock, copies a protected package, or re-hashes the base
+environment's RECORD tree. The one deliberate exception is cr-070's boot-install slow path: an
+image-carried distribution whose observed version falls outside the wheels' declared ranges is
+installed in range from the index, alone (`--no-deps`), logged, and re-verified on every open.
 
 The OCI image digest protects image-resident bytes. This module protects bytes that arrive
 after boot: exact wheel grants are hashed once, inspected, installed by uv into private staging,
@@ -127,6 +129,26 @@ class BlobGrant:
     length: int
     path: Path
     verified: VerifiedFile | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BootInstall:
+    """One image-carried distribution whose base version falls outside a declared range.
+
+    The pod venv installs an in-range version at prepare time — the boot-install slow path
+    (cr-070, xs-008): allowed, non-ideal, expected never, logged. The venv copy then shadows
+    the image's through ordinary venv precedence.
+    """
+
+    distribution: str
+    specifier: str
+    extras: tuple[str, ...]
+    image_version: str
+
+    @property
+    def requirement(self) -> str:
+        extras = f"[{','.join(self.extras)}]" if self.extras else ""
+        return f"{self.distribution}{extras}{self.specifier}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,7 +292,8 @@ def preflight_environment(
         ),
     )
     ordered = _verify_inventory(source, base)
-    _verify_grants(source, ordered, base)
+    inspected = _verify_grants(source, ordered, base)
+    _verify_python_requirements(inspected, base)
     return base, ordered, tuple(observed)
 
 
@@ -356,12 +379,18 @@ def materialize(
     A native dependency wheel has no bypass. Its exact installed bytes are statically inspected,
     joined to the observed interpreter/libc/loader/GPU seat, then loaded and imported in the
     bounded native operator child before the generation can be published or reused.
+
+    An image-carried distribution whose observed version falls outside the wheels' declared
+    ranges is boot-installed into the venv from the index (cr-070) rather than refused. The
+    boot plan is a pure function of the exact wheels and the re-observed base — the same
+    inputs every admission already re-derives — so it is deliberately NOT part of the content
+    identity, and every open of the generation re-verifies the installed versions in range.
     """
 
     _require_digest(source.environment_digest, "environment_digest")
     _require_digest(source.project_wheel_digest, "project_wheel_digest")
     observed = base or observe_base(python)
-    wheels = _verify_inventory(source, observed)
+    wheels = _verify_inventory(source, observed, venv_precedence=True)
     uv = _uv_binary()
     current_uv = _observed_uv_version(uv)
     if current_uv != observed.uv_version:
@@ -380,6 +409,7 @@ def materialize(
     final = contents / content_digest.removeprefix("sha256:")
     receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
     inspected = _verify_grants(source, wheels, observed)
+    boot_installs = _verify_python_requirements(inspected, observed, boot=True)
     if receipt_path.exists():
         installed = open_generation(
             root,
@@ -388,6 +418,7 @@ def materialize(
             reused=True,
             python=python,
         )
+        _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
         _qualify_native_environment(
             installed,
             inspected,
@@ -408,7 +439,7 @@ def materialize(
     if not reused:
         staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
         try:
-            _install_with_uv(uv, python, staging, inspected)
+            _install_with_uv(uv, python, staging, inspected, boot_installs)
             staged = _installed_at(
                 staging,
                 content_digest=content_digest,
@@ -417,6 +448,7 @@ def materialize(
                 reused=False,
                 base=observed,
             )
+            _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
             _qualify_native_environment(
                 staged,
                 inspected,
@@ -449,6 +481,7 @@ def materialize(
         python=python,
     )
     if reused:
+        _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
         _qualify_native_environment(
             installed,
             inspected,
@@ -460,9 +493,14 @@ def materialize(
 
 
 def verify_inventory(source: Input, base: base_observation.Observation) -> None:
-    """Refuse incompatible wheel facts before the worker downloads their bytes."""
+    """Refuse incompatible wheel facts before the worker downloads their bytes.
 
-    _verify_inventory(source, base)
+    This is the acquisition lane's pre-download mirror of `materialize`, so it applies the
+    same venv-precedence rule: a package copy of a non-protected base distribution installs
+    and shadows rather than refusing.
+    """
+
+    _verify_inventory(source, base, venv_precedence=True)
 
 
 def verify_existing_environment(
@@ -487,6 +525,7 @@ def verify_existing_environment(
         base,
         allow_base_owned=True,
     )
+    _verify_python_requirements(inspected, base)
     _qualify_native_environment(
         installed,
         inspected,
@@ -801,6 +840,7 @@ def _verify_inventory(
     *,
     allow_base_owned: bool = False,
     allow_installed_package: bool = False,
+    venv_precedence: bool = False,
 ) -> tuple[Wheel, ...]:
     if not source.wheels or len(source.wheels) > MAX_PACKAGE_WHEELS:
         raise EnvironmentRefusal("package_environment_wheel_set_invalid", str(len(source.wheels)))
@@ -835,11 +875,18 @@ def _verify_inventory(
                 "package_environment_second_protected_family",
                 f"distribution={name} is worker-image-owned and absent from this worker",
             )
-        if base_version is not None and not _allows_observed_wheel(
-            wheel,
-            base,
-            allow_base_owned=allow_base_owned,
-            allow_installed_package=allow_installed_package,
+        if (
+            base_version is not None
+            and not _allows_observed_wheel(
+                wheel,
+                base,
+                allow_base_owned=allow_base_owned,
+                allow_installed_package=allow_installed_package,
+            )
+            # A fresh `--system-site-packages` venv legitimately shadows a NON-protected
+            # base copy: the venv wins the import by ordinary precedence (cr-070). The
+            # protected worker-image families keep their fence.
+            and not (venv_precedence and not base_observation.protected_distribution(name))
         ):
             raise EnvironmentRefusal(
                 "package_environment_shadows_base_distribution",
@@ -926,7 +973,6 @@ def _verify_grants(
                     f"root={root} distributions={prior},{item.wheel.distribution}",
                 )
             root_owners[root] = item.wheel.distribution
-    _verify_python_requirements(inspected, base)
     return tuple(inspected)
 
 
@@ -1263,13 +1309,28 @@ def _marker_environment(base: base_observation.Observation) -> dict[str, str]:
 
 
 def _verify_python_requirements(
-    inspected: Sequence[_Inspected], base: base_observation.Observation
-) -> None:
+    inspected: Sequence[_Inspected],
+    base: base_observation.Observation,
+    *,
+    boot: bool = False,
+) -> tuple[BootInstall, ...]:
+    """Verify Requires-Python and every marker-true Requires-Dist against the joined venv.
+
+    With ``boot`` — the fresh-venv build lane — a requirement naming an image-carried
+    distribution the package does not itself provide, whose observed image version falls
+    outside the range, becomes one BootInstall row instead of a refusal (cr-070): the venv
+    installs an in-range version that shadows the image's copy. The row's specifier is the
+    intersection of EVERY declared range naming that distribution, so the chosen version
+    satisfies all of them or the install itself refuses.
+    """
+
     environment = _marker_environment(base)
     python = Version(environment["python_full_version"])
     base_versions = base.distribution_versions
     package_versions = {item.wheel.distribution: item.wheel.version for item in inspected}
     versions = {**base_versions, **package_versions}
+    rejected: set[str] = set()
+    merged: dict[str, tuple[SpecifierSet, frozenset[str]]] = {}
     for item in inspected:
         if item.requires_python:
             try:
@@ -1305,21 +1366,41 @@ def _verify_python_requirements(
                     "package_environment_base_invalid",
                     f"{name} has invalid version {installed!r}",
                 ) from exc
-            if not accepted:
-                if name in base_versions and name not in package_versions:
-                    detail = (
-                        f"package distribution {item.wheel.distribution} requires {requirement}, "
-                        f"but the worker image provides {name} {installed}"
-                    )
-                else:
-                    detail = (
-                        f"package distribution {item.wheel.distribution} requires {requirement}, "
-                        f"but the package environment provides {name} {installed}"
-                    )
-                raise EnvironmentRefusal(
-                    "package_environment_dependency_base_conflict",
-                    detail,
+            bootable = boot and name in base_versions and name not in package_versions
+            if bootable:
+                specifier, extras = merged.get(name, (SpecifierSet(), frozenset()))
+                merged[name] = (
+                    specifier & requirement.specifier,
+                    extras | frozenset(requirement.extras),
                 )
+            if accepted:
+                continue
+            if bootable:
+                rejected.add(name)
+                continue
+            if name in base_versions and name not in package_versions:
+                detail = (
+                    f"package distribution {item.wheel.distribution} requires {requirement}, "
+                    f"but the worker image provides {name} {installed}"
+                )
+            else:
+                detail = (
+                    f"package distribution {item.wheel.distribution} requires {requirement}, "
+                    f"but the package environment provides {name} {installed}"
+                )
+            raise EnvironmentRefusal(
+                "package_environment_dependency_base_conflict",
+                detail,
+            )
+    return tuple(
+        BootInstall(
+            distribution=name,
+            specifier=str(merged[name][0]),
+            extras=tuple(sorted(merged[name][1])),
+            image_version=base_versions[name],
+        )
+        for name in sorted(rejected)
+    )
 
 
 def _install_path(name: str) -> PurePosixPath | None:
@@ -1365,9 +1446,13 @@ def _observed_uv_version(uv: Path) -> str:
 
 
 def _install_with_uv(
-    uv: Path, python: Path, staging: Path, inspected: Sequence[_Inspected]
+    uv: Path,
+    python: Path,
+    staging: Path,
+    inspected: Sequence[_Inspected],
+    boot_installs: Sequence[BootInstall] = (),
 ) -> None:
-    commands = (
+    commands = [
         [
             str(uv),
             "venv",
@@ -1398,7 +1483,28 @@ def _install_with_uv(
             str(staging / "bin" / "python"),
             *(str(item.path) for item in sorted(inspected, key=lambda item: item.wheel.digest)),
         ],
-    )
+    ]
+    if boot_installs:
+        # The boot-install slow path (cr-070): ONE online resolve of exactly the named
+        # image-owned distributions, `--no-deps` so no digest-verified lock wheel is ever
+        # replaced by a resolver choice. `_verify_boot_installs` then proves each installed
+        # version in range, and the descriptor derivation exercises the joined venv for real.
+        commands.append(
+            [
+                str(uv),
+                "pip",
+                "install",
+                "--no-config",
+                "--no-deps",
+                "--no-build",
+                "--link-mode",
+                "clone",
+                "--compile-bytecode",
+                "--python",
+                str(staging / "bin" / "python"),
+                *(row.requirement for row in boot_installs),
+            ]
+        )
     for command in commands:
         result = subprocess.run(
             command,
@@ -1413,6 +1519,51 @@ def _install_with_uv(
                 "package_environment_uv_failed",
                 detail or f"uv exited {result.returncode}",
             )
+
+
+def _verify_boot_installs(
+    site_packages: Path, boot_installs: Sequence[BootInstall], *, reused: bool
+) -> None:
+    """Prove every boot-installed distribution present and in range, then say so.
+
+    Runs on EVERY open of a generation that needs boot rows — fresh or reused — because the
+    rows are re-derived from the wheels and the re-observed base rather than carried in the
+    content identity. A generation that predates this image's needs is named, not served.
+    """
+
+    if not boot_installs:
+        return
+    installed: dict[str, str] = {}
+    for entry in site_packages.glob("*.dist-info"):
+        name, separator, version = entry.name.removesuffix(".dist-info").rpartition("-")
+        if separator and name:
+            installed[_name(name)] = version
+    for row in boot_installs:
+        chosen = installed.get(row.distribution)
+        if chosen is None:
+            raise EnvironmentRefusal(
+                "package_environment_boot_install_missing",
+                f"distribution={row.distribution} required={row.specifier} "
+                f"image_version={row.image_version}; the generation predates this need",
+            )
+        try:
+            in_range = SpecifierSet(row.specifier).contains(Version(chosen), prereleases=True)
+        except (InvalidSpecifier, InvalidVersion) as exc:
+            raise EnvironmentRefusal(
+                "package_environment_boot_install_invalid",
+                f"distribution={row.distribution} required={row.specifier} chosen={chosen!r}",
+            ) from exc
+        if not in_range:
+            raise EnvironmentRefusal(
+                "package_environment_boot_install_out_of_range",
+                f"distribution={row.distribution} required={row.specifier} chosen={chosen}",
+            )
+        print(
+            f"[package-environment] boot-install distribution={row.distribution} "
+            f"image_version={row.image_version} required={row.specifier} "
+            f"chosen={chosen} reused={str(reused).lower()}",
+            flush=True,
+        )
 
 
 def _receipt(source: Input, wheels: Sequence[Wheel], content_digest: str) -> dict[str, Any]:

@@ -1,0 +1,106 @@
+"""The placed worker image's pinned inventory (`tensorhub.image_inventory/1`).
+
+The pinned requirements list a base worker image is built from (xs-009) is the truth about
+what the image provides. Tensorhub stages that document as `image-inventory.json` beside the
+package manifest (th-112), and pod preparation builds the package venv by NAME against it:
+an inventory-owned distribution is served by the image's site-packages copy, never by a lock
+wheel (cr-070). The live base observation is demoted to a cross-check — a disagreement
+falsifies the inventory rather than silently rewiring the pod.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any
+
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
+
+INVENTORY_FORMAT = "tensorhub.image_inventory/1"
+INVENTORY_FILENAME = "image-inventory.json"
+
+
+class ImageInventoryRefusal(Exception):
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+@dataclass(frozen=True, slots=True)
+class Inventory:
+    profile: str
+    python: str
+    distributions: tuple[tuple[str, str], ...]
+
+    @property
+    def versions(self) -> dict[str, str]:
+        return dict(self.distributions)
+
+
+def read_bytes(raw: bytes) -> Inventory:
+    """Admit one staged inventory document; the exact mirror of tensorhub's writer rule."""
+
+    try:
+        value: Any = json.loads(raw)
+    except ValueError as exc:
+        raise ImageInventoryRefusal(f"not JSON: {exc}") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "distributions",
+        "format",
+        "profile",
+        "python",
+    }:
+        raise ImageInventoryRefusal("wrong fields")
+    if value["format"] != INVENTORY_FORMAT:
+        raise ImageInventoryRefusal(f"format {value['format']!r}")
+    profile = value["profile"]
+    python = value["python"]
+    rows = value["distributions"]
+    if not isinstance(profile, str) or not profile or not isinstance(rows, list) or not rows:
+        raise ImageInventoryRefusal("profile or distributions absent")
+    try:
+        Version(str(python))
+    except InvalidVersion as exc:
+        raise ImageInventoryRefusal(f"python {python!r}") from exc
+    distributions: list[tuple[str, str]] = []
+    prior = ""
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"name", "version"}:
+            raise ImageInventoryRefusal("distribution row fields")
+        name = row["name"]
+        version = row["version"]
+        if (
+            not isinstance(name, str)
+            or not isinstance(version, str)
+            or canonicalize_name(name) != name
+            or name <= prior
+        ):
+            raise ImageInventoryRefusal(f"distribution {name!r}")
+        try:
+            Version(version)
+        except InvalidVersion as exc:
+            raise ImageInventoryRefusal(f"{name} version {version!r}") from exc
+        prior = name
+        distributions.append((name, version))
+    return Inventory(profile=profile, python=str(python), distributions=tuple(distributions))
+
+
+def disagreement(inventory: Inventory, observed_versions: dict[str, str]) -> str | None:
+    """The cross-check that demoted the observation: every inventory row must be observed.
+
+    Returns the first disagreement as `distribution=NAME inventory=X image=Y|absent`, or
+    None when the image actually provides what its inventory promises.
+    """
+
+    for name, version in inventory.distributions:
+        observed = observed_versions.get(name)
+        if observed is None:
+            return f"distribution={name} inventory={version} image=absent"
+        try:
+            agreed = Version(observed) == Version(version)
+        except InvalidVersion:
+            agreed = observed == version
+        if not agreed:
+            return f"distribution={name} inventory={version} image={observed}"
+    return None
