@@ -27,6 +27,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ import pytest
 
 from cozy_runtime.internal import base_observation, package_environment
 from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -393,6 +395,89 @@ def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None
                 (dependency_one_wheel, runtime_wheel),
                 worker_shadow,
             )
+
+
+def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> None:
+    """The live defect (2026-09-01): a flat-layout project whose build backend discovered
+    no module reached a paid pod as a dist-info-only wheel and was refused as
+    `project_wheel_invalid: wheel row has the wrong fields` — the writer had dropped the
+    empty `import_roots` and the reader read the absence as a malformed row. Preparation
+    now names the defect itself, before any document exists; and a WheelFact with no
+    roots or tags still spells both collections, as the protocol's canonical form requires.
+    """
+
+    uv = shutil.which("uv")
+    assert uv is not None
+    with tempfile.TemporaryDirectory(prefix="cozy-empty-project.") as raw:
+        root = Path(raw)
+        project = root / "hollow"
+        (project / "vendor").mkdir(parents=True)
+        (project / "pyproject.toml").write_text(
+            "[build-system]\n"
+            'requires = ["hatchling"]\n'
+            'build-backend = "hatchling.build"\n\n'
+            "[project]\n"
+            'name = "hollow"\n'
+            'version = "1.0.0"\n'
+            'requires-python = ">=3.12,<3.13"\n\n'
+            "[tool.hatch.build.targets.wheel]\n"
+            'only-include = ["vendor"]\n'
+        )
+        (project / "vendor" / "notes.txt").write_text("no module lives here\n")
+        artifact_cache = root / "artifacts"
+        wheel_set = artifact_cache / "sets" / "package"
+        wheel_set.mkdir(parents=True)
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(project))
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(ROOT))
+        project_wheel = next(wheel_set.glob("hollow-*.whl"))
+        runtime_wheel = next(wheel_set.glob("cozy_runtime-*.whl"))
+        with zipfile.ZipFile(project_wheel) as archive:
+            members = {member.filename for member in archive.infolist()}
+        assert "vendor/notes.txt" in members
+        assert not package_environment._import_roots(members)
+
+        rows = [
+            _download_row(pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, project_wheel),
+            _download_row(pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, runtime_wheel),
+        ]
+        rows.sort(key=lambda row: row.digest)
+        with pytest.raises(PreparationRefusal) as refused:
+            prepare_package(
+                package_name="local/hollow",
+                release="1.0.0",
+                release_digest="sha256:" + "27" * 32,
+                files=rows,
+                placement_seed=b"empty-project-proof",
+                artifact_cache=artifact_cache,
+                artifact_store=root / "artifact-store",
+                environment_root=root / "environment",
+                python=Path(sys.executable),
+                describe=lambda _installed, _distribution: b"",
+                verified=lambda _digest, _length, _path: None,
+                base=package_environment.observe_base(Path(sys.executable)),
+            )
+        assert refused.value.code == "package_prepare_project_wheel_no_import_roots"
+        assert refused.value.detail == f"{project_wheel.name} installs no importable module"
+
+    hollow = pb.WheelFact(
+        ref=pb.Ref(digest=b"\x27" * 32, length=1),
+        distribution="hollow",
+        version="1.0.0",
+        filename="hollow-1.0.0-py3-none-any.whl",
+    )
+    assert documents.body(hollow) == {
+        "ref": {"digest": "sha256:" + "27" * 32, "length": 1},
+        "distribution": "hollow",
+        "version": "1.0.0",
+        "filename": "hollow-1.0.0-py3-none-any.whl",
+        "import_roots": [],
+        "tags": [],
+    }
+    assert documents.body(pb.Placement(placement_id="p")) == {
+        "placement_id": "p",
+        "entrypoints": [],
+        "models": [],
+    }
 
 
 def test_worker_image_owns_pillow_and_numpy_as_peer_dependencies() -> None:
