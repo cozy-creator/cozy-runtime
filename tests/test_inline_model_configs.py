@@ -54,7 +54,7 @@ def test_placement_slot_refuses_external_config_authority() -> None:
             "release": "0.2.5",
             "source_digest": digest,
         },
-        "package_descriptor": {"digest": digest, "length": 1},
+        "package_interface": {"digest": digest, "length": 1},
         "bindings_digest": digest,
         "models": [
             {

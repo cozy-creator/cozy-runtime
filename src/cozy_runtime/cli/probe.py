@@ -41,7 +41,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.cli import payload as payload_grammar
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import descriptor as desc
+from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.probe import REPORT_FORMAT, ProbeRefusal
@@ -84,7 +84,7 @@ def run(args: list[str], opts: Options) -> Result:
     project = Path(opts.dir).expanduser().resolve()
     try:
         found = discover(project)
-        body = desc.build(found)
+        body = package_interface.build(found)
     except ConformanceError as exc:
         raise CliError(
             "validation",
@@ -129,7 +129,7 @@ def run(args: list[str], opts: Options) -> Result:
     if seed and "seed" in payload_grammar.fields(doc["request"]):
         document["seed"] = int(seed)
 
-    release = desc.package_descriptor_digest(body)
+    release = package_interface.package_interface_digest(body)
     try:
         reference_model = _construct(slot, reference_label, reference_dir, release)
         candidate_model = _construct(slot, candidate_label, candidate_dir, release)
@@ -309,7 +309,7 @@ def _entrypoint_doc(body: dict[str, Any], function: str) -> dict[str, Any]:
         assert isinstance(doc, dict)
         if doc["name"] == function:
             return doc
-    raise CliError("not_found", f"{function!r} left the descriptor", USAGE, Exit.internal)
+    raise CliError("not_found", f"{function!r} left the package interface", USAGE, Exit.internal)
 
 
 def _lane_spec(value: str, flag: str) -> tuple[str, Path]:

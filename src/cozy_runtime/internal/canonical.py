@@ -1,14 +1,14 @@
 """The ONE canonical-JSON layer for cozy-runtime documents: RFC 8785 (JCS).
 
 tensorfs-v2 owns the writer RULES (tfs-013, `crates/tensorfs-core/src/canon.rs`); this is
-the same profile in Python for the documents cozy-runtime authors — PackageDescriptor,
-EnvironmentReceipt, PackageEnvironment, and the code-topologies memo. Shared core: sorted
+the same profile in Python for the documents cozy-runtime authors — PackageInterface,
+EnvironmentReceipt, and PackageEnvironment. Shared core: sorted
 object keys
 (UTF-16 code-unit order), no insignificant whitespace, shortest round-trip numbers,
 duplicate-key refusal, lowercase `sha256:` digests, and STORED bytes are canonical bytes.
 
 Recorded divergence from tensorfs's PROFILE (not from RFC 8785): tensorfs restricts its own
-header codec to integers, printable ASCII and no `null`. A descriptor legitimately carries
+header codec to integers, printable ASCII and no `null`. A package interface legitimately carries
 float bounds (`le=20.0`), `None` defaults and non-ASCII literals, so this writer admits
 those three while retaining the I-JSON safe-number magnitude for every numeric value. The
 seam is exercised live:
@@ -118,7 +118,7 @@ def _sorted(mapping: Mapping[str, Json]) -> list[tuple[str, Json]]:
             raise CanonicalError("key_grammar", f"object key {key!r} is not a string")
         pairs.append((key, item))
     # JCS sorts by UTF-16 code unit, which differs from Python's code-point order only once
-    # a key leaves the BMP. `isascii()` is a single C-level check and every descriptor key is
+    # a key leaves the BMP. `isascii()` is a single C-level check and every package interface key is
     # an identifier, so the exact-but-costly encode runs only when a key is not ASCII.
     if all(key.isascii() for key, _ in pairs):
         pairs.sort(key=lambda kv: kv[0])
@@ -141,9 +141,9 @@ _ESCAPES = {
 }
 
 
-#: Almost every string in a descriptor is an identifier, a type name or a sentence — none
+#: Almost every string in a package interface is an identifier, a type name or a sentence — none
 #: of them need escaping. Checking once beats branching per character: this fast path plus
-#: the ASCII key sort took `canonical.write` over the real H3 descriptor from 931 us to
+#: the ASCII key sort took `canonical.write` over the real H3 package interface from 931 us to
 #: 525 us (measured, this box). Both paths produce the same canonical digest.
 _NEEDS_ESCAPE = re.compile(r'["\\\x00-\x1f]')
 

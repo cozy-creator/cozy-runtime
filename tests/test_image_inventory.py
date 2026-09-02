@@ -135,7 +135,7 @@ def _inventory(
 
 
 def _describe(selected: package_environment.InstalledEnvironment, distribution: str) -> bytes:
-    """Derive the descriptor inside the prepared venv, exactly as the worker would.
+    """Derive the package interface inside the prepared venv, exactly as the worker would.
 
     On a pod the image interpreter carries cozy-runtime and its dependencies in its real
     site-packages, so the `--system-site-packages` venv sees them. On this test host that
@@ -145,10 +145,10 @@ def _describe(selected: package_environment.InstalledEnvironment, distribution: 
     """
 
     command = (
-        "from cozy_runtime.internal import descriptor; "
+        "from cozy_runtime.internal import package_interface; "
         "from cozy_runtime.internal.discovery import discover_distribution; "
         f"found=discover_distribution({distribution!r}); "
-        "print(descriptor.canonical_bytes(descriptor.build(found)).decode())"
+        "print(package_interface.canonical_bytes(package_interface.build(found)).decode())"
     )
     result = subprocess.run(
         (str(selected.python), "-c", command),
@@ -180,7 +180,6 @@ def _prepare(
     result = prepare_package(
         package_name="paul/ranged-marco",
         release="1.0.4",
-        release_digest="sha256:" + seed.hex().ljust(64, "0"),
         files=rows,
         placement_seed=seed,
         artifact_cache=root / "artifacts",

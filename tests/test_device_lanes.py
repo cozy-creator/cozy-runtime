@@ -27,8 +27,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import accel, child_env
-from cozy_runtime.internal import descriptor as desc
+from cozy_runtime.internal import accel, child_env, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.local import (
@@ -86,22 +85,23 @@ def _slice(
     builds it, with the worker's device envelope chosen by the arm."""
     config = _config(root / "home")
     found = discover(PACKAGE)
-    body = desc.build(found)
+    body = package_interface.build(found)
     workspace = root / "run"
     workspace.mkdir(parents=True, exist_ok=True)
     revision = development_source_digest(PACKAGE)
     job_records: list[dict[str, Any]] = []
     descriptor_id = ""
     if kind == "job":
-        descriptor_id = desc.job_descriptor_id(body, "marco_job")
-        descriptor_path = workspace / "package-descriptor.json"
-        descriptor_path.write_bytes(desc.canonical_bytes(body))
+        descriptor_id = package_interface.job_descriptor_id(body, "marco_job")
+        interface_path = workspace / "metadata" / "package-interface.json"
+        interface_path.parent.mkdir()
+        interface_path.write_bytes(package_interface.canonical_bytes(body))
         job_records.append(
             {
                 "job_descriptor_id": descriptor_id,
                 "build_id": revision,
                 "application": str(body["application"]),
-                "package_descriptor": str(descriptor_path),
+                "package_interface": str(interface_path),
                 "python": sys.executable,
                 "environment_content_digest": revision,
                 "job": "marco_job",
@@ -145,8 +145,8 @@ def _slice(
             request,
             job_records=job_records,
             workspace=workspace,
-            package_revision_digest=revision,
-            package_descriptor=body if kind == "entrypoint" else None,
+            package_code_digest=revision,
+            package_interface_document=body if kind == "entrypoint" else None,
             found=found,
             development_artifact_store=config.cozy_home / "cas",
             options=WorkerOptions(root=workspace / "worker", devices=devices, no_warm=True),
@@ -274,9 +274,10 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
         assert worker.lanes.envelope.devices == "0,1"
         lane = worker.lanes.lanes[1]
         found = discover(PACKAGE)
-        body = desc.build(found)
-        descriptor = root / "package-descriptor.json"
-        descriptor.write_bytes(desc.canonical_bytes(body))
+        body = package_interface.build(found)
+        interface = root / "metadata" / "package-interface.json"
+        interface.parent.mkdir()
+        interface.write_bytes(package_interface.canonical_bytes(body))
         executor = worker.supervision.spawn(imposed=worker.imposed(lane))
         try:
             assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "1"
@@ -284,7 +285,7 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
                 "cmd": "prepare",
                 "binding": {
                     "application": str(body["application"]),
-                    "package_descriptor": str(descriptor),
+                    "package_interface": str(interface),
                     "development_project": str(PACKAGE),
                     "model_class": "",
                 },
@@ -356,7 +357,7 @@ def test_a_prepare_without_an_assigned_ceiling_is_a_worker_defect() -> None:
         model_parameter_name="",
         release="marco-polo/1.0.4",
         application="marco_polo_package:app",
-        descriptor_path="/nowhere",
+        interface_path="/nowhere",
     )
     command = executor_prepare_command(binding, devices="1", authorized_device_limit_bytes=7)
     assert command["devices"] == "1"
@@ -457,7 +458,7 @@ def test_one_lane_worker_seats_and_a_two_lane_worker_sum() -> None:
                 package={},
                 development={},
                 environment_digest=b"",
-                package_descriptor=("", 0),
+                package_interface=("", 0),
                 bindings_digest=b"",
                 models=(),
                 entrypoints=(),
@@ -514,7 +515,7 @@ def test_the_ledger_row_survives_a_switch_to_another_placement() -> None:
                 package={},
                 development={},
                 environment_digest=b"",
-                package_descriptor=("", 0),
+                package_interface=("", 0),
                 bindings_digest=b"",
                 models=(),
                 entrypoints=(),

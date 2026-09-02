@@ -46,8 +46,7 @@ from cozy_runtime.author import _codec
 from cozy_runtime.author._errors import DEVICE_OOM, OutputError
 from cozy_runtime.author._observations import EventRing, Observation
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
-from cozy_runtime.internal import canonical, fill, seam
-from cozy_runtime.internal import descriptor as package_descriptor
+from cozy_runtime.internal import canonical, fill, package_interface, seam
 from cozy_runtime.internal import weights_sink as weights_bridge
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
@@ -362,7 +361,7 @@ class AttemptRecord:
     prepared: PreparedRequest | None = None
     #: cr-009's typed publication record, once the output transaction committed one
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
-    #: Host-ACKed WeightsReceipt/1 refs, one per descriptor-declared output slot.
+    #: Host-ACKed WeightsReceipt/1 refs, one per interface-declared output slot.
     weights_receipts: dict[str, pb.WeightsReceiptRef] = dataclasses_field(default_factory=dict)
     job_models: dict[str, JobModel] = dataclasses_field(default_factory=dict)
     model_leases: list[Any] = dataclasses_field(default_factory=list)
@@ -822,21 +821,21 @@ class AttemptEngine:
             ) from exc
 
     def _job_model_declarations(self, binding: JobBinding, descriptor_id: str) -> dict[str, str]:
-        """Read the exact installed descriptor without importing package code."""
+        """Read the exact installed package interface without importing package code."""
         try:
-            descriptor_path = Path(binding.package_descriptor)
-            descriptor_stat = descriptor_path.lstat()
+            interface_path = Path(binding.package_interface)
+            interface_stat = interface_path.lstat()
             if (
-                not stat.S_ISREG(descriptor_stat.st_mode)
-                or not 0 < descriptor_stat.st_size <= canonical.DOC_MAX_BYTES
+                not stat.S_ISREG(interface_stat.st_mode)
+                or not 0 < interface_stat.st_size <= canonical.DOC_MAX_BYTES
             ):
-                raise ValueError("installed descriptor is not one bounded regular file")
-            raw = descriptor_path.read_bytes()
-            body = package_descriptor.read_bytes(raw, "installed job PackageDescriptor")
-            if package_descriptor.job_descriptor_id(body, binding.job) != descriptor_id:
+                raise ValueError("installed package interface is not one bounded regular file")
+            raw = interface_path.read_bytes()
+            body = package_interface.read_bytes(raw, "installed job package interface")
+            if package_interface.job_descriptor_id(body, binding.job) != descriptor_id:
                 raise ValueError("job_descriptor_id does not bind the installed callable")
             if str(body.get("application", "")) != binding.application:
-                raise ValueError("installed descriptor application changed")
+                raise ValueError("installed package-interface application changed")
             jobs = body.get("jobs")
             rows = (
                 [row for row in jobs if isinstance(row, Mapping) and row.get("name") == binding.job]
@@ -844,7 +843,7 @@ class AttemptEngine:
                 else []
             )
             if len(rows) != 1:
-                raise ValueError("installed descriptor has no unique selected job")
+                raise ValueError("installed package interface has no unique selected job")
             models = rows[0].get("models", [])
             if not isinstance(models, list):
                 raise ValueError("selected job models are not an array")
@@ -869,21 +868,21 @@ class AttemptEngine:
             raise
         except Exception as exc:
             raise AttemptRefusal(
-                "job_model_descriptor_invalid",
-                f"the installed job descriptor cannot bind Model parameters ({type(exc).__name__})",
+                "job_model_interface_invalid",
+                f"the installed job interface cannot bind Model parameters ({type(exc).__name__})",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             ) from exc
 
     def _hold_job_models(
         self, attempt: AttemptRecord, binding: JobBinding, descriptor_id: str
     ) -> None:
-        """Join descriptor params to grants and hold each CozyTensors closure until terminal."""
+        """Join interface params to grants and hold each CozyTensors closure until terminal."""
         declared = self._job_model_declarations(binding, descriptor_id)
         selected = grants.model_inputs(attempt.grant)
         if set(selected) != set(declared):
             raise AttemptRefusal(
                 "job_model_binding_mismatch",
-                f"job descriptor declares Model parameters {sorted(declared) or 'none'} and "
+                f"job interface declares Model parameters {sorted(declared) or 'none'} and "
                 f"InvocationSpec carries {sorted(selected) or 'none'}; the sets must match exactly",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
@@ -1087,13 +1086,6 @@ class AttemptEngine:
             raise AttemptRefusal(
                 "unknown_binding",
                 f"no entrypoint binding {plan_id[:24]}… is selected on this worker",
-                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-            )
-        package_revision_digest = declared.package_revision_digest
-        if attempt.spec.get("package_revision_digest") != package_revision_digest:
-            raise AttemptRefusal(
-                "package_revision_mismatch",
-                "InvocationSpec does not name the selected package revision digest",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
         if declared.development and attempt.spec.get("environment_digest"):
@@ -1610,7 +1602,7 @@ class AttemptEngine:
                 "cmd": "run_job",
                 "request_id": key,
                 "application": attempt.job.application,
-                "package_descriptor": attempt.job.package_descriptor,
+                "package_interface": attempt.job.package_interface,
                 "job": attempt.job.job,
                 "payload": attempt.payload,
                 "deadline_s": seconds,

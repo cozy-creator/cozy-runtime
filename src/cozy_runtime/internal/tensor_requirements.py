@@ -1,7 +1,7 @@
-"""The code side of the fit, projected into TensorFS's CodeTopology (model-code-fit §3).
+"""The code-side TensorRequirements passed to exact TensorFS fit.
 
 One projection, two producers: `cozy-runtime derive` projects the meta-device derivation
-(the memo, the PlacementSet's `Slot.components`), and the fill plane projects the serving
+(the PlacementSet's `Slot.components`), and the fill plane projects the serving
 census the moment before a byte is reserved. Both hand `tensorfs.code_topology` the same
 rows, so `tensorfs.fit` answers the same question at every clock. Nothing here matches.
 """
@@ -17,7 +17,7 @@ from cozy_runtime.internal import canonical
 #: The dtype-diet default (`internal/derive.py`): a row that names no dtype is bf16.
 DEFAULT_DTYPE = "bfloat16"
 
-MEMO_FORMAT = "cozy.runtime.code-topology/1"
+FORMAT = "cozy.runtime.tensor-requirements/1"
 
 #: One code destination: (component, key within the component, torch dtype name or None
 #: for the default, logical shape).
@@ -49,7 +49,7 @@ def accepts(encoded_leaves: str) -> list[str] | str:
 
 def tensorfs_dtype(name: str | None) -> str:
     """torch's spelling (`bfloat16`) to TensorFS's closed enum (`bf16`); a TensorFS
-    spelling passes through, and an unknown one refuses at `tensorfs.code_topology`."""
+    spelling passes through, and an unknown one refuses at the TensorFS boundary."""
     from cozy_runtime.internal.encoding import TORCH_DTYPES
 
     spelled = (name or DEFAULT_DTYPE).removeprefix("torch.")
@@ -59,22 +59,21 @@ def tensorfs_dtype(name: str | None) -> str:
     return spelled
 
 
-def memo_document(rows: Iterable[Row], constructed: Sequence[str]) -> dict[str, Any]:
-    """`component → key → {shape, dtype?}` in the runtime's own memo spelling, sorted by
-    (component, key). Its canonical bytes are the CodeTopology's `contract` digest."""
+def document(rows: Iterable[Row], constructed: Sequence[str]) -> dict[str, Any]:
+    """Canonical TensorRequirements meaning, sorted by `(component, key)`."""
     out: dict[str, dict[str, Any]] = {}
     for component, key, dtype, shape in sorted(rows, key=lambda r: (r[0], r[1])):
         row: dict[str, Any] = {"shape": list(shape)}
         if dtype is not None and dtype != DEFAULT_DTYPE:
             row["dtype"] = dtype
         out.setdefault(component, {})[key] = row
-    return {"format": MEMO_FORMAT, "components": out, "constructed": list(constructed)}
+    return {"format": FORMAT, "components": out, "constructed": list(constructed)}
 
 
-def tensorfs_bytes(
+def canonical_bytes(
     rows: Iterable[Row], constructed: Sequence[str], *, encoded_leaves: str
 ) -> bytes:
-    """Canonical TensorFS CodeTopology bytes for one construction. A row whose dtype is
+    """Canonical TensorRequirements bytes for one construction. A row whose dtype is
     not the default is PINNED: the destination fixes it (an integer buffer, an fp32
     island, a whole-fp16 construction) and the checkpoint supplies it or a lossless
     widening (D4); the fill plane admits no other dtype either."""
@@ -82,9 +81,7 @@ def tensorfs_bytes(
 
     held = sorted(rows, key=lambda r: (r[0], r[1]))
     admitted = accepts(encoded_leaves)
-    contract = (
-        "sha256:" + hashlib.sha256(canonical.write(memo_document(held, constructed))).hexdigest()
-    )
+    contract = "sha256:" + hashlib.sha256(canonical.write(document(held, constructed))).hexdigest()
     tensors = [
         tensorfs.CodeTensor(
             component=component,

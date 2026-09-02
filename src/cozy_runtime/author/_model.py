@@ -179,7 +179,7 @@ M = TypeVar("M", bound=_ScopedModel)
 
 
 class _Declared(Protocol):
-    """A declared method carries its component set as descriptor content (§1.1)."""
+    """A declared method carries its component set as interface content (§1.1)."""
 
     __uses_components__: tuple[str, ...]
 
@@ -267,7 +267,7 @@ def sequence_parallel(*, degrees: Sequence[int]) -> Callable[[type[ModelT]], typ
     The author's statement, and only the author can make it: at each degree K the class's
     attention heads divide by K, its quantization is shard-invariant (rowwise activation
     scales), and the whole pipeline is built identically on every rank. The runtime reads
-    it into the descriptor slot (`sequence_parallel.degrees`); a RecordOwner pins a
+    it into the interface slot (`sequence_parallel.degrees`); a RecordOwner pins a
     placement to K devices only at a declared K, and the worker never chooses a degree.
     "Qualified" is the measured half, recorded per device class like any other proof.
     """

@@ -1,9 +1,9 @@
-"""The `run`/`job` payload grammar and the descriptor-derived output field paths.
+"""The `run`/`job` payload grammar and the package interface-derived output field paths.
 
 Grammar (cozy-runtime-cli.md): a positional primary field, `key=value` scalars,
 `key:=<json>` raw JSON for nested values, and `--in <file>` supplying the whole payload as
 JSON with `key=value` merged on top. After that merge, `@/absolute/file` is local staging
-syntax only at descriptor-typed Asset leaves; ordinary strings are never paths.
+syntax only at package interface-typed Asset leaves; ordinary strings are never paths.
 
 Typing is the DESCRIPTOR's, not this module's: a scalar's spelling is decided by the field's
 rendered schema, so `steps=20` becomes an int because the schema says int — never because
@@ -59,7 +59,7 @@ def asset_paths(struct: Json, prefix: str = "") -> tuple[str, ...]:
 
     These ARE the output ids: the RecordOwner grants one destination per asset field path,
     and a set that does not match what the handler produced refuses the tail whole. Deriving
-    them from the descriptor is what makes `--out` a consequence of the package's declared
+    them from the package interface is what makes `--out` a consequence of the package's declared
     result rather than a convention the CLI and the package both have to remember.
     """
     assert isinstance(struct, dict)
@@ -231,7 +231,7 @@ def _replacement(
         raise CliError(
             "validation",
             f"local Asset {input_id!r} is not explicit in the request document",
-            "local files must be named on an explicit descriptor-declared Asset field",
+            "local files must be named on an explicit interface-declared Asset field",
             Exit.validation,
         ) from exc
 

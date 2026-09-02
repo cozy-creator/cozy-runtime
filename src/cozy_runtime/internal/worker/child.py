@@ -356,7 +356,7 @@ class ExecutorSupervision:
 
     def handoff(self, epoch: int) -> Path:
         """The one directory under this worker's run root the current executor may write a
-        control document into (a derived descriptor); the reader unlinks it at once. There
+        control document into (a derived interface); the reader unlinks it at once. There
         is no executor scratch tree: bytes a job stages live in the owner's `tmp/<id>/`
         through the grant, and a worker root holds nothing but `run/` and its log."""
         path = self.root / "handoff"

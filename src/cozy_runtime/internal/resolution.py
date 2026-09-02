@@ -176,7 +176,7 @@ class ConstructionFacts:
     release: str
     model_class: str
     config_digest: str
-    topology_digest: str
+    tensor_requirements_digest: str
     components: tuple[str, ...]
     custody: str = "canonical"
 
@@ -185,7 +185,7 @@ class ConstructionFacts:
             "release": self.release,
             "model_class": self.model_class,
             "config_digest": self.config_digest,
-            "topology_digest": self.topology_digest,
+            "tensor_requirements_digest": self.tensor_requirements_digest,
             "components": list(self.components),
             "custody": self.custody,
         }
@@ -818,7 +818,7 @@ def script_plan(
         release=release,
         model_class="script:" + "+".join(components),
         config_digest=canonical.digest({}),
-        topology_digest=canonical.digest(
+        tensor_requirements_digest=canonical.digest(
             {
                 row.key: [list(row.shape), dtype_name(row.dtype), row.encoded.alias]
                 for row in sorted(rows, key=lambda r: str(r.key))

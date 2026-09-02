@@ -34,8 +34,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import child_env, liveness, pull
-from cozy_runtime.internal import descriptor as desc
+from cozy_runtime.internal import child_env, liveness, package_interface, pull
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.local import (
@@ -102,7 +101,7 @@ def _run(root: Path, hook: Any) -> tuple[SliceOutcome, float]:
         ),
     )
     found = discover(PACKAGE)
-    body = desc.build(found)
+    body = package_interface.build(found)
     workspace = root / ".run"
     workspace.mkdir(parents=True)
     digest = development_source_digest(PACKAGE)
@@ -119,8 +118,8 @@ def _run(root: Path, hook: Any) -> tuple[SliceOutcome, float]:
             config,
             request,
             workspace=workspace,
-            package_revision_digest=digest,
-            package_descriptor=body,
+            package_code_digest=digest,
+            package_interface_document=body,
             found=found,
             development_artifact_store=home / "cas",
             options=WorkerOptions(root=workspace / "worker", release_id=digest, no_warm=True),

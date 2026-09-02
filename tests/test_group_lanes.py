@@ -9,7 +9,7 @@ WHAT IS REAL AND WHAT IS OWED. This box has ONE card. Proven here on the RTX 407
 fuse/split bookkeeping and every typed pin refusal; the per-device ledger rows and the MIN
 ceiling; the chooser refusing the ladder under a group; a group is ONE seat and the wire
 (`lanes[]`, `device_lane_id`, `device_pins`; proto-024) says so; the author's opt-in
-reaching the descriptor and its fixed-point scan; an executor sealed to `0,1` reading both
+reaching the PackageInterface and its fixed-point scan; an executor sealed to `0,1` reading both
 entries and NVLS-off from its own `/proc`
 environment; the seal, degree and construction refusals of a group prepare; the reclaim
 proof iterating K devices; a degree-1 prepare byte-identical to a plain one. Proven on GLOO
@@ -33,8 +33,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import accel, canonical, spawn
-from cozy_runtime.internal import descriptor as desc
+from cozy_runtime.internal import accel, canonical, package_interface, spawn
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.parallel import cp, wire
@@ -329,7 +328,7 @@ def _placement(placement_id: str, lane_id: str = "") -> Placement:
         package={},
         development={},
         environment_digest=b"",
-        package_descriptor=("", 0),
+        package_interface=("", 0),
         bindings_digest=b"",
         models=(),
         entrypoints=(),
@@ -635,10 +634,10 @@ def test_the_prepare_command_carries_the_degree_only_above_one() -> None:
 # ------------------------------------------------------------------------ the opt-in
 
 
-def test_the_authors_degrees_reach_the_descriptor_and_its_fixed_point() -> None:
+def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
     """`@sequence_parallel(degrees=...)` on the Model class -> `ModelBinding.sequence_parallel`
-    -> the descriptor slot `sequence_parallel: {degrees}` -> `DeclaredBinding` degrees.
-    The decorator refuses malformed degrees at BUILD; the descriptor's closed scan refuses
+    -> the interface slot `sequence_parallel: {degrees}` -> `DeclaredBinding` degrees.
+    The decorator refuses malformed degrees at BUILD; the interface's closed scan refuses
     a malformed slot; a class that says nothing writes no key."""
     from cozy_runtime.author import ConformanceError, Model, sequence_parallel
     from cozy_runtime.author._signature import ModelBinding as AuthorSlot
@@ -664,19 +663,19 @@ def test_the_authors_degrees_reach_the_descriptor_and_its_fixed_point() -> None:
         components={},
         sequence_parallel=Sharded.__sequence_parallel__,
     )
-    document = desc._model(slot)
+    document = package_interface._model(slot)
     assert document["sequence_parallel"] == {"degrees": [2, 4]}
-    assert "sequence_parallel" not in desc._model(
+    assert "sequence_parallel" not in package_interface._model(
         dataclasses.replace(slot, model_class=Plain, sequence_parallel=())
     )
-    # the real descriptor of the marco-polo example carries no key (nothing declared)
-    body = desc.build(discover(PACKAGE))
+    # the real PackageInterface of the marco-polo example carries no key (nothing declared)
+    body = package_interface.build(discover(PACKAGE))
     assert not any(
         "sequence_parallel" in model
         for surface in body.get("entrypoints", [])
         for model in surface.get("models", [])
     )
-    # the closed scan over REAL descriptor bytes: a well-formed slot reads back, a
+    # the closed scan over REAL interface bytes: a well-formed slot reads back, a
     # malformed one refuses by path, an unknown key inside the slot refuses
     import copy
 
@@ -694,21 +693,27 @@ def test_the_authors_degrees_reach_the_descriptor_and_its_fixed_point() -> None:
         return mutated
 
     for degrees, ok in (([2, 4], True), ([1], False), ([4, 2], False), ([], False), ("2", False)):
-        raw = desc.canonical_bytes(with_slot({"sequence_parallel": {"degrees": degrees}}))
+        raw = package_interface.canonical_bytes(
+            with_slot({"sequence_parallel": {"degrees": degrees}})
+        )
         if ok:
-            parsed = desc.read_bytes(raw)
+            parsed = package_interface.read_bytes(raw)
             assert parsed["entrypoints"][0]["models"][0]["sequence_parallel"] == {
                 "degrees": degrees
             }
             continue
-        with pytest.raises(desc.StalePackageDescriptor) as malformed:
-            desc.read_bytes(raw)
+        with pytest.raises(package_interface.StalePackageInterface) as malformed:
+            package_interface.read_bytes(raw)
         assert "sequence_parallel.degrees" in str(malformed.value), (degrees, malformed.value)
-    with pytest.raises(desc.StalePackageDescriptor):
-        desc.read_bytes(desc.canonical_bytes(with_slot({"sequence_parallel": {"x": 1}})))
-    with pytest.raises(desc.StalePackageDescriptor):
-        desc.read_bytes(
-            desc.canonical_bytes(with_slot({"sequence_parallel": {"degrees": [2], "x": 1}}))
+    with pytest.raises(package_interface.StalePackageInterface):
+        package_interface.read_bytes(
+            package_interface.canonical_bytes(with_slot({"sequence_parallel": {"x": 1}}))
+        )
+    with pytest.raises(package_interface.StalePackageInterface):
+        package_interface.read_bytes(
+            package_interface.canonical_bytes(
+                with_slot({"sequence_parallel": {"degrees": [2], "x": 1}})
+            )
         )
     # the worker-side binding: the degrees every slot declares, intersected
     two = dataclasses.replace(_binding(), models=())
@@ -723,12 +728,12 @@ def test_the_authors_degrees_reach_the_descriptor_and_its_fixed_point() -> None:
 # ------------------------------------------------------------------- the seal (real)
 
 
-def _weightless_prepare(body: dict[str, Any], descriptor: Path, **extra: Any) -> dict[str, Any]:
+def _weightless_prepare(body: dict[str, Any], interface: Path, **extra: Any) -> dict[str, Any]:
     return {
         "cmd": "prepare",
         "binding": {
             "application": str(body["application"]),
-            "package_descriptor": str(descriptor),
+            "package_interface": str(interface),
             "development_project": str(PACKAGE),
             "model_class": "",
         },
@@ -754,9 +759,10 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
             InMemoryControlHost(),
         )
         found = discover(PACKAGE)
-        body = desc.build(found)
-        descriptor = root / "package-descriptor.json"
-        descriptor.write_bytes(desc.canonical_bytes(body))
+        body = package_interface.build(found)
+        interface = root / "metadata" / "package-interface.json"
+        interface.parent.mkdir()
+        interface.write_bytes(package_interface.canonical_bytes(body))
         group = worker.lanes.fuse((0, 1))
         assert worker.imposed(group)["CUDA_VISIBLE_DEVICES"] == "0,1"
         assert worker.imposed(group)["NCCL_NVLS_ENABLE"] == "0"
@@ -775,7 +781,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
             assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1"
             assert executor.hello["rank"] == 0 and executor.hello["world"] == 1
             assert worker.supervision.devices == ("0", "1")
-            command = _weightless_prepare(body, descriptor, devices="0,1")
+            command = _weightless_prepare(body, interface, devices="0,1")
             # the seal fences the devices before the degree is even read
             other = executor.call({**command, "devices": "0"}, timeout=60.0)
             assert other["code"] == "env_seal_broken", other
@@ -796,7 +802,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
             executor = worker.supervision.spawn(imposed=worker.imposed(group))
             try:
                 reply = executor.call(
-                    _weightless_prepare(body, descriptor, devices="0,1", **extra), timeout=60.0
+                    _weightless_prepare(body, interface, devices="0,1", **extra), timeout=60.0
                 )
                 assert reply["code"] == code, reply
                 if code == "sequence_parallel_degree_mismatch":
@@ -819,15 +825,16 @@ def test_degree_one_is_a_plain_executor() -> None:
             InMemoryControlHost(),
         )
         found = discover(PACKAGE)
-        body = desc.build(found)
-        descriptor = root / "package-descriptor.json"
-        descriptor.write_bytes(desc.canonical_bytes(body))
+        body = package_interface.build(found)
+        interface = root / "metadata" / "package-interface.json"
+        interface.parent.mkdir()
+        interface.write_bytes(package_interface.canonical_bytes(body))
         replies: list[dict[str, Any]] = []
         for extra in ({}, {"sequence_parallel_degree": 1}):
             executor = worker.supervision.spawn(imposed=worker.imposed(worker.lanes.lanes[0]))
             try:
                 reply = executor.call(
-                    _weightless_prepare(body, descriptor, devices="0", **extra), timeout=120.0
+                    _weightless_prepare(body, interface, devices="0", **extra), timeout=120.0
                 )
                 assert reply["ok"], reply
                 children = subprocess.run(
@@ -912,7 +919,7 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
             "authorized_device_limit_bytes": 1,
             "binding": {
                 "application": "x:app",
-                "package_descriptor": "/nowhere",
+                "package_interface": "/nowhere",
                 "development_project": "",
                 "model_class": "",
             },

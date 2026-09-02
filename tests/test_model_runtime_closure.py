@@ -12,7 +12,7 @@ from typing import Any, TypedDict
 import pytest
 import tensorfs
 
-from cozy_runtime.internal import base_observation, canonical, descriptor
+from cozy_runtime.internal import base_observation, canonical, package_interface
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
 
@@ -138,12 +138,12 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
                 ],
             }
         ],
-        "format": descriptor.SCHEMA,
+        "format": package_interface.SCHEMA,
         "jobs": [],
     }
-    descriptor_bytes = descriptor.canonical_bytes(body)
-    descriptor_digest = "sha256:" + hashlib.sha256(descriptor_bytes).hexdigest()
-    (acquirer.cache_root / descriptor_digest.removeprefix("sha256:")).write_bytes(descriptor_bytes)
+    interface_bytes = package_interface.canonical_bytes(body)
+    interface_digest = "sha256:" + hashlib.sha256(interface_bytes).hexdigest()
+    (acquirer.cache_root / interface_digest.removeprefix("sha256:")).write_bytes(interface_bytes)
     slot = {
         "slot": "model",
         "reference_model_id": "model-0000",
@@ -154,7 +154,7 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
         + hashlib.sha256(canonical.write({"name": "generate", "slots": [slot]})).hexdigest()
     )
     placement = SimpleNamespace(
-        package_descriptor=(descriptor_digest, len(descriptor_bytes)),
+        package_interface=(interface_digest, len(interface_bytes)),
         models=(
             {
                 "id": "model-0000",
@@ -170,7 +170,7 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
         package={
             "package": "example/package",
             "release": "1",
-            "release_digest": "sha256:" + "2" * 64,
+            "project_wheel": {"ref": {"digest": "sha256:" + "2" * 64}},
         },
         development={},
         environment_digest=b"\x33" * 32,
@@ -184,4 +184,4 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
     }
     assert Path(model.config).read_bytes() == _CONFIG
     assert model.config_digest == "sha256:" + hashlib.sha256(_CONFIG).hexdigest()
-    assert documents_count == 1  # Package descriptor only; config is not a downloaded document.
+    assert documents_count == 1  # PackageInterface only; config is not a downloaded document.

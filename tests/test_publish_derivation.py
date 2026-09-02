@@ -1,16 +1,13 @@
-"""cr-067/cr-077: the author derives, the pod serves from the PUBLISHED descriptor.
+"""cr-067/cr-077: the author derives, the pod serves from the published package interface.
 
 Three planes, each driven for real:
 
 * the author surface — capability is the slot's class annotation and NOTHING else: the
-  retired `source_profiles` door refuses typed, and the descriptor slot grammar no
+  retired `source_profiles` door refuses typed, and the interface slot grammar no
   longer admits the field (hard cut, cr-077);
-* the pod preparation plane — the hub-committed manifest + descriptor staged beside the
+* the pod preparation plane — the hub-committed manifest + PackageInterface staged beside the
   set are the authoritative wiring, import-time derivation is a byte-compared cross-check,
   and NOTHING on this plane may load the derive machinery (the hard guard, proven red);
-* the code-topologies memo writer — `cozy-model-contract-proof`'s request grammar binds
-  the release VERSION, refuses the retired release-digest circularity, and reads past
-  the two request members that named the deleted MCC plane.
 """
 
 from __future__ import annotations
@@ -31,12 +28,9 @@ import pytest
 from cozy_runtime.author import App, ConformanceError, Model, WeightsOutput, WeightsSink
 from cozy_runtime.author._describe import describe
 from cozy_runtime.author._loader import Loader
-from cozy_runtime.internal import canonical, descriptor, package_environment
+from cozy_runtime.internal import canonical, package_environment, package_interface
 from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.worker.package_prepare import (
-    MANIFEST_FILENAME,
-    MANIFEST_FORMAT,
-    PUBLISHED_DESCRIPTOR_FILENAME,
     PreparationRefusal,
     prepare_package,
     prepare_package_set,
@@ -84,7 +78,7 @@ def _described(app: App) -> dict[str, object]:
         surfaces=describe(app),
         bindings={},
     )
-    return descriptor.build(found)
+    return package_interface.build(found)
 
 
 def test_source_profiles_refuse_typed_at_registration() -> None:
@@ -119,7 +113,7 @@ def test_source_profiles_refuse_typed_at_registration() -> None:
 
 def test_lane_words_are_not_selection_leaks() -> None:
     """cr-077: a weights output named after the lane it derives ("bf16") describes fine
-    beside a default binding whose lane says the same word; a descriptor string equal to
+    beside a default binding whose lane says the same word; an interface string equal to
     the binding's release remains a refused selection leak."""
 
     def build(output_id: str, release: str) -> dict[str, object]:
@@ -137,7 +131,7 @@ def test_lane_words_are_not_selection_leaks() -> None:
             surfaces=describe(app),
             bindings={"Denoiser": {"model": "acme/sd", "release": release, "lane": "bf16"}},
         )
-        return descriptor.build(found)
+        return package_interface.build(found)
 
     body = build("bf16", "1.0.0")
     assert body["jobs"][0]["weights_outputs"][0]["output_id"] == "bf16"  # type: ignore[index]
@@ -147,9 +141,9 @@ def test_lane_words_are_not_selection_leaks() -> None:
     assert leaked_release.value.code == "fixed_point"
 
 
-def test_descriptor_slot_grammar_refuses_the_retired_members() -> None:
+def test_interface_slot_grammar_refuses_the_retired_members() -> None:
     """The slot is `{path, class, component_use, encoded_leaves}` (model-code-fit §1). A
-    descriptor carrying `source_profile`, or a `stamps` VALUE, refuses typed with the hub's
+    interface carrying `source_profile`, or a `stamps` VALUE, refuses typed with the hub's
     own names; the empty `stamps` map every pre-cut release ships reads as nothing."""
     app = App()
 
@@ -157,7 +151,7 @@ def test_descriptor_slot_grammar_refuses_the_retired_members() -> None:
     def generate(payload: Request, denoiser: Denoiser) -> Reply:
         return Reply(text="ok")
 
-    body = json.loads(descriptor.canonical_bytes(_described(app)))
+    body = json.loads(package_interface.canonical_bytes(_described(app)))
     slot = body["entrypoints"][0]["models"][0]
     assert set(slot) == {"path", "class", "component_use", "encoded_leaves"}
     assert slot["encoded_leaves"] == "refuse"
@@ -167,17 +161,17 @@ def test_descriptor_slot_grammar_refuses_the_retired_members() -> None:
         mutated["entrypoints"][0]["models"][0].update(members)
         return canonical.write(mutated)
 
-    assert descriptor.read_bytes(planted(stamps={}))
-    with pytest.raises(descriptor.RetiredDescriptorMember) as stamped:
-        descriptor.read_bytes(planted(stamps={"task": "fl2va"}))
-    assert stamped.value.code == "descriptor.stamps_retired"
+    assert package_interface.read_bytes(planted(stamps={}))
+    with pytest.raises(package_interface.RetiredPackageInterfaceMember) as stamped:
+        package_interface.read_bytes(planted(stamps={"task": "fl2va"}))
+    assert stamped.value.code == "package_interface.stamps_retired"
     assert "task" in str(stamped.value)
-    with pytest.raises(descriptor.RetiredDescriptorMember) as profiled:
-        descriptor.read_bytes(planted(source_profile="acme/sd-turbo/1.0.0/bf16"))
-    assert profiled.value.code == "descriptor.source_profile_retired"
-    with pytest.raises(descriptor.StalePackageDescriptor) as unknown:
-        descriptor.read_bytes(planted(encoded_leaves="maybe"))
-    assert unknown.value.code == "malformed_package_descriptor"
+    with pytest.raises(package_interface.RetiredPackageInterfaceMember) as profiled:
+        package_interface.read_bytes(planted(source_profile="acme/sd-turbo/1.0.0/bf16"))
+    assert profiled.value.code == "package_interface.source_profile_retired"
+    with pytest.raises(package_interface.StalePackageInterface) as unknown:
+        package_interface.read_bytes(planted(encoded_leaves="maybe"))
+    assert unknown.value.code == "malformed_package_interface"
 
 
 def test_model_class_carries_exactly_one_keyword() -> None:
@@ -234,20 +228,18 @@ def test_worker_derive_fence_is_green_and_reds_on_a_planted_import(tmp_path: Pat
     assert len(problems) == 1 and "poisoned.py" in problems[0]
 
 
-def _delegation(package: str, release: str, release_digest: str) -> bytes:
+def _delegation(package: str, release: str) -> bytes:
     return canonical.write(
         {
             "format": "cozy.worker.v1.DownloadDelegation/1",
-            "packages": [
-                {"package": package, "release": release, "release_digest": release_digest}
-            ],
+            "packages": [{"package": package, "release": release}],
             "models": [],
         }
     )
 
 
-def test_pod_prep_requires_the_published_manifest_and_descriptor(tmp_path: Path) -> None:
-    """The set path refuses without the hub-committed documents staged beside the files.
+def test_pod_prep_requires_the_exact_published_interface(tmp_path: Path) -> None:
+    """The set path refuses without the hub-committed PackageInterface beside the files.
 
     Fail-on-parent: before cr-067 the same request proceeded straight to derivation.
     """
@@ -264,11 +256,28 @@ def test_pod_prep_requires_the_published_manifest_and_descriptor(tmp_path: Path)
         path=str(wheel),
     )
 
-    def prep(release_digest: str) -> pb.PreparePackageSetResult:
+    interface_bytes = package_interface.canonical_bytes(
+        {"format": package_interface.SCHEMA, "application": "a:b", "entrypoints": [], "jobs": []}
+    )
+    interface_ref: dict[str, object] = {
+        "digest": "sha256:" + hashlib.sha256(interface_bytes).hexdigest(),
+        "length": len(interface_bytes),
+    }
+
+    interface_path = view / package_interface.FILENAME
+    interface_row = pb.LocalDownloadFile(
+        digest=bytes.fromhex(str(interface_ref["digest"])[7:]),
+        filename=package_interface.FILENAME,
+        kind=pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE,
+        length=int(interface_ref["length"]),
+        path=str(interface_path),
+    )
+
+    def prep() -> pb.PreparePackageSetResult:
         return prepare_package_set(
             pb.PreparePackageSetRequest(
-                download_delegation=_delegation("paul/thing", "1.0.0", release_digest),
-                files=[row],
+                download_delegation=_delegation("paul/thing", "1.0.0"),
+                files=sorted([row, interface_row], key=lambda value: value.digest),
                 environment_root=str(tmp_path / "environment"),
             ),
             artifact_cache=artifact_cache,
@@ -279,54 +288,28 @@ def test_pod_prep_requires_the_published_manifest_and_descriptor(tmp_path: Path)
             verified=lambda _digest, _length, _path: None,
         )
 
-    release_digest = "sha256:" + "11" * 32
     with pytest.raises(PreparationRefusal) as absent:
-        prep(release_digest)
-    assert absent.value.code == "package_prepare_manifest_missing"
+        prep()
+    assert absent.value.code == "package_prepare_published_interface_invalid"
 
-    # Wrong bytes at the conventional name: the manifest must HASH to the delegated digest.
-    (view / MANIFEST_FILENAME).write_bytes(b'{"format":"nope"}')
-    with pytest.raises(PreparationRefusal) as unhashed:
-        prep(release_digest)
-    assert unhashed.value.code == "package_prepare_manifest_invalid"
-
-    # An honest manifest whose descriptor ref nothing satisfies.
-    descriptor_bytes = descriptor.canonical_bytes(
-        {"format": descriptor.SCHEMA, "application": "a:b", "entrypoints": [], "jobs": []}
-    )
-    manifest = canonical.write(
-        {
-            "format": MANIFEST_FORMAT,
-            "package": "paul/thing",
-            "release": "1.0.0",
-            "package_descriptor": {
-                "digest": "sha256:" + hashlib.sha256(descriptor_bytes).hexdigest(),
-                "length": len(descriptor_bytes),
-            },
-        }
-    )
-    (view / MANIFEST_FILENAME).write_bytes(manifest)
-    trusted = "sha256:" + hashlib.sha256(manifest).hexdigest()
-    with pytest.raises(PreparationRefusal) as undelivered:
-        prep(trusted)
-    assert undelivered.value.code == "package_prepare_published_descriptor_invalid"
-
-    (view / PUBLISHED_DESCRIPTOR_FILENAME).write_bytes(b"other bytes entirely")
+    # Wrong bytes at the conventional ordinary-file path cannot satisfy the delegated ref.
+    interface_path.parent.mkdir()
+    interface_path.write_bytes(b"other bytes entirely")
     with pytest.raises(PreparationRefusal) as mismatched:
-        prep(trusted)
-    assert mismatched.value.code == "package_prepare_published_descriptor_invalid"
+        prep()
+    assert mismatched.value.code == "package_prepare_published_interface_invalid"
 
 
-def test_pod_serves_the_published_descriptor_and_refuses_a_disagreement() -> None:
+def test_pod_serves_the_published_interface_and_refuses_a_disagreement() -> None:
     """The core authority reversal, over a real environment and real wheels.
 
-    Agree: the placement's descriptor ref is the PUBLISHED document's digest, and the
+    Agree: the placement's interface ref is the PUBLISHED document's digest, and the
     derive machinery never loads on this plane. Disagree: a typed refusal, never a serve
     (the parent served from the derived surface in both arms).
     """
     uv = shutil.which("uv")
     assert uv is not None
-    with tempfile.TemporaryDirectory(prefix="cozy-published-descriptor.") as raw:
+    with tempfile.TemporaryDirectory(prefix="cozy-published-package_interface.") as raw:
         root = Path(raw)
         artifact_cache = root / "artifacts"
         wheel_set = artifact_cache / "sets" / "package"
@@ -355,18 +338,18 @@ def test_pod_serves_the_published_descriptor_and_refuses_a_disagreement() -> Non
             check=True,
             capture_output=True,
         )
-        release_digest = "sha256:" + "17" * 32
-        installed = package_environment.open_existing_environment(python, release_digest)
+        content_digest = "sha256:" + "17" * 32
+        installed = package_environment.open_existing_environment(python, content_digest)
         (root / "store").mkdir()
 
         def describe_real(
             selected: package_environment.InstalledEnvironment, distribution: str
         ) -> bytes:
             command = (
-                "from cozy_runtime.internal import descriptor; "
+                "from cozy_runtime.internal import package_interface; "
                 "from cozy_runtime.internal.discovery import discover_distribution; "
                 f"found=discover_distribution({distribution!r}); "
-                "print(descriptor.canonical_bytes(descriptor.build(found)).decode())"
+                "print(package_interface.canonical_bytes(package_interface.build(found)).decode())"
             )
             rendered = subprocess.run(
                 [str(selected.python), "-I", "-c", command],
@@ -402,9 +385,8 @@ def test_pod_serves_the_published_descriptor_and_refuses_a_disagreement() -> Non
             return prepare_package(
                 package_name="paul/marco-polo",
                 release="1.0.4",
-                release_digest=release_digest,
                 files=rows(),
-                placement_seed=b"published-descriptor-authority",
+                placement_seed=b"published-interface-authority",
                 artifact_cache=artifact_cache,
                 artifact_store=root / "store",
                 environment_root=environment,
@@ -412,13 +394,13 @@ def test_pod_serves_the_published_descriptor_and_refuses_a_disagreement() -> Non
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,
                 installed_environment=installed,
-                published_descriptor=published,
+                published_interface=published,
             )
 
         prepared = prep(derived)
         placement_bytes = prepared.placement_set.placement_set_canonical_bytes
         placement = json.loads(placement_bytes)["placements"][0]
-        assert placement["package_descriptor"]["digest"] == (
+        assert placement["package_interface"]["digest"] == (
             "sha256:" + hashlib.sha256(derived).hexdigest()
         )
         # The hard guard, observed live: preparing a package never loads derive.
@@ -428,67 +410,5 @@ def test_pod_serves_the_published_descriptor_and_refuses_a_disagreement() -> Non
         disagreeing["application"] = "marco_polo_package:other"
         with pytest.raises(PreparationRefusal) as disagreed:
             prep(canonical.write(disagreeing))
-        assert disagreed.value.code == "package_prepare_descriptor_disagrees"
+        assert disagreed.value.code == "package_prepare_interface_disagrees"
         assert "published sha256:" in disagreed.value.detail
-
-
-def test_memo_request_binds_the_release_version(tmp_path: Path) -> None:
-    """The memo request is closed on {package, project_wheel, release}: the digest
-    circularity is structurally unrepresentable (the digest exists only after finalize).
-    The two slot members cozy-creator still sends for the deleted MCC plane
-    (`snapshot`, `hardware_variants`) are read past, not required."""
-    from cozy_runtime.cli import code_topologies as proof
-
-    descriptor_bytes = descriptor.canonical_bytes(
-        {"format": descriptor.SCHEMA, "application": "a:b", "entrypoints": [], "jobs": []}
-    )
-    descriptor_path = tmp_path / "descriptor.json"
-    descriptor_path.write_bytes(descriptor_bytes)
-
-    def request(package: dict[str, object]) -> Path:
-        body = {
-            "slots": [
-                {
-                    "class": "Denoiser",
-                    "config": {
-                        "digest": "sha256:" + "ab" * 32,
-                        "length": 2,
-                        "path": str(descriptor_path),
-                    },
-                    "hardware_variants": ["cpu"],
-                    "snapshot": "sha256:" + "cd" * 32,
-                }
-            ],
-            "package": package,
-            "package_descriptor": {
-                "digest": "sha256:" + hashlib.sha256(descriptor_bytes).hexdigest(),
-                "length": len(descriptor_bytes),
-                "path": str(descriptor_path),
-            },
-            "project": str(PACKAGE),
-        }
-        path = tmp_path / "request.json"
-        path.write_bytes(canonical.write(body))
-        return path
-
-    wheel = {
-        "distribution": "thing",
-        "version": "1.0.0",
-        "ref": {"digest": "sha256:" + "ef" * 32, "length": 5},
-    }
-    stale = request(
-        {
-            "package": "paul/thing",
-            "release": "1.0.0",
-            "release_digest": "sha256:" + "99" * 32,
-            "project_wheel": wheel,
-        }
-    )
-    assert proof.main([str(stale), str(tmp_path / "out-a")]) == 3
-
-    versioned = proof._read_request(
-        request({"package": "paul/thing", "release": "1.0.0", "project_wheel": wheel})
-    )
-    assert versioned.release_identity == "paul/thing@1.0.0"
-    assert [row.class_key for row in versioned.slots] == ["Denoiser"]
-    assert proof.INDEX_FORMAT == "cozy.package.code-topologies/1"

@@ -1,7 +1,7 @@
-"""`cozy-runtime describe` — emit the PackageDescriptor without loading weights.
+"""`cozy-runtime describe` — emit the PackageInterface without loading weights.
 
 Always read-only. Full `--json` output is the canonical publication input; there is no
-committed descriptor projection and therefore no writer or staleness-check mode.
+committed interface projection and therefore no writer or staleness-check mode.
 
 Weights are structurally unreachable here, not merely unrequested: discovery imports the app
 and freezes it, and a model parameter is a TYPE. Nothing on this path constructs a `Loader`,
@@ -15,7 +15,7 @@ from pathlib import Path
 
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import descriptor as desc
+from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
@@ -24,19 +24,19 @@ from cozy_runtime.internal.exits import Exit
 def run(function: str | None, opts: Options) -> Result:
     project = Path(opts.dir).expanduser()
     try:
-        if opts.descriptor:
-            descriptor = Path(opts.descriptor).expanduser()
+        if opts.package_interface:
+            interface = Path(opts.package_interface).expanduser()
             try:
-                raw = descriptor.read_bytes()
+                raw = interface.read_bytes()
             except OSError as exc:
                 raise ConformanceError(
-                    f"cannot read exact package descriptor {descriptor}: {exc}",
-                    code="package_descriptor_unreadable",
+                    f"cannot read exact package interface {interface}: {exc}",
+                    code="package_interface_unreadable",
                 ) from exc
-            body = desc.read_bytes(raw, str(descriptor))
+            body = package_interface.read_bytes(raw, str(interface))
         else:
             found = discover(project)
-            body = desc.build(found)
+            body = package_interface.build(found)
     except ConformanceError as exc:
         raise CliError(
             "validation",
@@ -66,17 +66,17 @@ def _list(body: Mapping[str, Json]) -> Result:
                 rows.append(
                     (
                         f"{doc['name']}.job_descriptor_id",
-                        desc.job_descriptor_id(body, str(doc["name"])),
+                        package_interface.job_descriptor_id(body, str(doc["name"])),
                     )
                 )
-    counts = desc.counts(body)
+    counts = package_interface.counts(body)
     # Empty states are definitive, and aggregates ride the listing.
     rows.append(("counts", " · ".join(_plural(n, k) for k, n in counts.items())))
-    rows.append((desc.DIGEST_KEY, desc.package_descriptor_digest(body)))
+    rows.append((package_interface.DIGEST_KEY, package_interface.package_interface_digest(body)))
     return Result(
         rows=tuple(rows),
         document=body,
-        canonical_json=desc.canonical_bytes(body),
+        canonical_json=package_interface.canonical_bytes(body),
         next=("cozy-runtime describe <function> — that function's schemas",),
     )
 
@@ -126,12 +126,12 @@ def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json], kind: str) -
     rows: list[tuple[str, str]] = [("function", f"{doc['name']} ({kind})")]
     view: dict[str, Json] = dict(doc)
     if kind == "job":
-        # DERIVED here, and only here. It may not enter the published descriptor — a
+        # DERIVED here, and only here. It may not enter the published interface — a
         # `sha256:` inside a source-stable surface leaves a reader no way to know which
         # clock it came from — but a RecordOwner dispatches by it, so a verb that would not
         # say it forces every consumer to re-derive the canonical form (cl-004 measured one
         # doing exactly that, in Go).
-        view["job_descriptor_id"] = desc.job_descriptor_id(body, str(doc["name"]))
+        view["job_descriptor_id"] = package_interface.job_descriptor_id(body, str(doc["name"]))
         rows.append(("job_descriptor_id", str(view["job_descriptor_id"])))
     lines: list[str] = ["request:"]
     lines += _fields(doc["request"])

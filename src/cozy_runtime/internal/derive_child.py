@@ -2,9 +2,8 @@
 
 `cozy-runtime derive` runs the meta-device derivation in ONE bounded child of the package's
 own interpreter — no network, no weight bytes, no writes, no subprocesses, no CUDA, a memory
-and CPU cap — exactly the harness the publish memo has always used. This module is the seam
-every caller shares: the verb, the memo writer, the local placement and the worker's package
-preparation all hand a request here and read a response back. The derive machinery itself
+and CPU cap. This module is the seam every caller shares: the verb, local placement, and worker
+package preparation all hand a request here and read a response back. The derive machinery itself
 is imported by the CHILD (`cozy_runtime.cli.derive --derive-child`), never by a caller, so
 the worker's preparation plane stays derive-free by import while `Slot.components` is still
 what the derive constructed (model-code-fit D9).
@@ -41,21 +40,13 @@ class DeriveRefusal(Exception):
 
 
 @dataclass(frozen=True, slots=True)
-class ConfigRef:
-    """The construction document a slot is derived against: exact bytes at a path."""
-
-    path: Path
-    digest: str
-    length: int
-
-    def render(self) -> dict[str, Any]:
-        return {"digest": self.digest, "length": self.length, "path": str(self.path)}
-
-
-@dataclass(frozen=True, slots=True)
 class SlotRequest:
     slot: str
-    config: ConfigRef
+    config: bytes
+
+    @property
+    def config_digest(self) -> str:
+        return "sha256:" + hashlib.sha256(self.config).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +67,9 @@ class DeriveRequest:
         return {
             "format": REQUEST_FORMAT,
             "package": package,
-            "slots": [{"slot": s.slot, "config": s.config.render()} for s in self.slots],
+            "slots": [
+                {"slot": s.slot, "config": base64.b64encode(s.config).decode()} for s in self.slots
+            ],
         }
 
     def write(self, path: Path) -> Path:
@@ -85,8 +78,8 @@ class DeriveRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class DerivedTopology:
-    """One slot's CodeTopology: canonical TensorFS bytes and their identity."""
+class TensorRequirements:
+    """One slot's canonical TensorRequirements bytes and their identity."""
 
     slot: str
     config_digest: str
@@ -98,22 +91,17 @@ class DerivedTopology:
 
 
 def constructed_components(document: bytes) -> tuple[str, ...]:
-    """The construction order a CodeTopology records (D9), read back off its bytes."""
+    """The construction order TensorRequirements records, read back off its bytes."""
     value = canonical.parse_canonical(document)
     if not isinstance(value, dict):
-        raise DeriveRefusal("derive_child_invalid", "a CodeTopology is an object")
+        raise DeriveRefusal("derive_child_invalid", "TensorRequirements is an object")
     order = value.get("constructed_components")
     if not isinstance(order, list) or not order or not all(isinstance(c, str) for c in order):
         raise DeriveRefusal(
-            "derive_child_invalid", "CodeTopology.constructed_components is a non-empty name list"
+            "derive_child_invalid",
+            "TensorRequirements.constructed_components is a non-empty name list",
         )
     return tuple(order)
-
-
-def config_ref(path: Path) -> ConfigRef:
-    """Bind a config document by its exact bytes: the identity the derive is keyed on."""
-    raw = read_exact(path, "config")
-    return ConfigRef(path, "sha256:" + hashlib.sha256(raw).hexdigest(), len(raw))
 
 
 def read_exact(path: Path, name: str) -> bytes:
@@ -164,30 +152,27 @@ def read_request(raw: bytes) -> DeriveRequest:
         if not isinstance(row, dict) or set(row) != {"slot", "config"}:
             raise DeriveRefusal("derive_request_invalid", "slot row field set")
         slot = row["slot"]
-        ref = row["config"]
-        if (
-            not isinstance(slot, str)
-            or not slot
-            or not isinstance(ref, dict)
-            or set(ref) != {"digest", "length", "path"}
-            or not isinstance(ref["digest"], str)
-            or canonical.DIGEST_RE.fullmatch(ref["digest"]) is None
-            or not isinstance(ref["length"], int)
-            or isinstance(ref["length"], bool)
-            or ref["length"] <= 0
-            or not isinstance(ref["path"], str)
-            or not Path(ref["path"]).is_absolute()
-        ):
+        encoded = row["config"]
+        if not isinstance(slot, str) or not slot or not isinstance(encoded, str):
             raise DeriveRefusal("derive_request_invalid", f"slot {slot!r}")
-        slots.append(SlotRequest(slot, ConfigRef(Path(ref["path"]), ref["digest"], ref["length"])))
+        try:
+            config = base64.b64decode(encoded, validate=True)
+            value = canonical.parse_canonical(config)
+        except (ValueError, canonical.CanonicalError) as err:
+            raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} config: {err}") from err
+        if not isinstance(value, dict):
+            raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} config is not an object")
+        slots.append(SlotRequest(slot, config))
     names = [s.slot for s in slots]
     if names != sorted(set(names)):
         raise DeriveRefusal("derive_request_invalid", "slots are sorted unique by path")
     return DeriveRequest(tuple(slots), project=project, application=application)
 
 
-def derive_in(python: Path, request: DeriveRequest, scratch: Path) -> tuple[DerivedTopology, ...]:
-    """Run the bounded child in `python`'s environment and read back one CodeTopology per
+def derive_in(
+    python: Path, request: DeriveRequest, scratch: Path
+) -> tuple[TensorRequirements, ...]:
+    """Run the bounded child in `python`'s environment and read back TensorRequirements per
     requested slot. `scratch` holds the request document the child reads."""
     scratch.mkdir(parents=True, exist_ok=True)
     request_path = request.write(scratch / f"derive-request-{os.getpid()}.json")
@@ -260,13 +245,13 @@ def derive_in(python: Path, request: DeriveRequest, scratch: Path) -> tuple[Deri
 
 def read_response(
     response: Mapping[str, Any], request: DeriveRequest
-) -> tuple[DerivedTopology, ...]:
-    if set(response) != {"topologies"}:
+) -> tuple[TensorRequirements, ...]:
+    if set(response) != {"requirements"}:
         raise DeriveRefusal("derive_child_invalid", "child result has an open field set")
-    rows = response["topologies"]
+    rows = response["requirements"]
     if not isinstance(rows, list):
-        raise DeriveRefusal("derive_child_invalid", "topologies is not an array")
-    out: list[DerivedTopology] = []
+        raise DeriveRefusal("derive_child_invalid", "requirements is not an array")
+    out: list[TensorRequirements] = []
     for row in rows:
         if not isinstance(row, dict) or set(row) != {
             "slot",
@@ -275,17 +260,17 @@ def read_response(
             "length",
             "bytes",
         }:
-            raise DeriveRefusal("derive_child_invalid", "topology row field set")
+            raise DeriveRefusal("derive_child_invalid", "requirements row field set")
         try:
             raw = base64.b64decode(str(row["bytes"]), validate=True)
         except ValueError as err:
-            raise DeriveRefusal("derive_child_invalid", "topology bytes base64") from err
-        held = DerivedTopology(str(row["slot"]), str(row["config_digest"]), raw)
+            raise DeriveRefusal("derive_child_invalid", "requirements bytes base64") from err
+        held = TensorRequirements(str(row["slot"]), str(row["config_digest"]), raw)
         if held.digest != row["digest"] or len(raw) != row["length"]:
-            raise DeriveRefusal("derive_child_invalid", "topology stored-byte identity")
+            raise DeriveRefusal("derive_child_invalid", "requirements stored-byte identity")
         out.append(held)
     if [(t.slot, t.config_digest) for t in out] != [
-        (s.slot, s.config.digest) for s in request.slots
+        (s.slot, s.config_digest) for s in request.slots
     ]:
         raise DeriveRefusal("derive_child_invalid", "rows do not answer the requested slots")
     return tuple(out)
@@ -296,9 +281,9 @@ def emit(value: Mapping[str, Any]) -> None:
     print(RESULT_PREFIX + base64.b64encode(canonical.write(dict(value))).decode())
 
 
-def render(topologies: Sequence[DerivedTopology]) -> dict[str, Any]:
+def render(requirements: Sequence[TensorRequirements]) -> dict[str, Any]:
     return {
-        "topologies": [
+        "requirements": [
             {
                 "slot": t.slot,
                 "config_digest": t.config_digest,
@@ -306,6 +291,6 @@ def render(topologies: Sequence[DerivedTopology]) -> dict[str, Any]:
                 "length": len(t.document),
                 "bytes": base64.b64encode(t.document).decode(),
             }
-            for t in topologies
+            for t in requirements
         ]
     }

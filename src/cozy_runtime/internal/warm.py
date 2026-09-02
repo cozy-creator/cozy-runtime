@@ -6,7 +6,7 @@ at neutral defaults. There is no warmup DSL and there will not be one: a knob he
 a second declaration surface, free to drift from the schema it claims to describe.
 
 The input is `internal/schema.render`'s canonical schema DOCUMENT — the same data the
-descriptor publishes — not a Python type. That is deliberate and load-bearing:
+package interface publishes — not a Python type. That is deliberate and load-bearing:
 
 * it is the same artifact a reader can inspect, so "what would the warm pass send" is
   answerable without importing anything;

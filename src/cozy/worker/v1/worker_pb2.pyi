@@ -14,6 +14,7 @@ class LocalDownloadKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL: _ClassVar[LocalDownloadKind]
     LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST: _ClassVar[LocalDownloadKind]
     LOCAL_DOWNLOAD_KIND_MODEL_OBJECT: _ClassVar[LocalDownloadKind]
+    LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE: _ClassVar[LocalDownloadKind]
 
 class Posture(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -306,6 +307,7 @@ LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL: LocalDownloadKind
 LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL: LocalDownloadKind
 LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST: LocalDownloadKind
 LOCAL_DOWNLOAD_KIND_MODEL_OBJECT: LocalDownloadKind
+LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE: LocalDownloadKind
 POSTURE_UNSPECIFIED: Posture
 POSTURE_ACCEPTING: Posture
 POSTURE_DRAINING: Posture
@@ -1000,18 +1002,18 @@ class LocalPackageFileRef(_message.Message):
     def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., kind: _Optional[_Union[LocalDownloadKind, str]] = ..., length: _Optional[int] = ...) -> None: ...
 
 class LocalPackageRevision(_message.Message):
-    __slots__ = ("package", "release", "source_digest", "package_descriptor", "files")
+    __slots__ = ("package", "release", "source_digest", "package_interface", "files")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
     SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    PACKAGE_DESCRIPTOR_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
     FILES_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
     source_digest: bytes
-    package_descriptor: Ref
+    package_interface: Ref
     files: _containers.RepeatedCompositeFieldContainer[LocalPackageFileRef]
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., package_descriptor: _Optional[_Union[Ref, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ...) -> None: ...
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., package_interface: _Optional[_Union[Ref, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ...) -> None: ...
 
 class DesiredPlacementSet(_message.Message):
     __slots__ = ("placement_set_digest", "placement_set_canonical_bytes", "device_pins")
@@ -1070,22 +1072,20 @@ class DownloadModelRef(_message.Message):
     def __init__(self, manifest: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ..., package: _Optional[str] = ..., slot: _Optional[str] = ...) -> None: ...
 
 class DownloadPackageRef(_message.Message):
-    __slots__ = ("package", "release", "release_digest")
+    __slots__ = ("package", "release")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
-    RELEASE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
-    release_digest: str
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., release_digest: _Optional[str] = ...) -> None: ...
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ...) -> None: ...
 
 class Placement(_message.Message):
-    __slots__ = ("placement_id", "package", "development", "environment_digest", "package_descriptor", "bindings_digest", "models", "entrypoints", "environment")
+    __slots__ = ("placement_id", "package", "development", "environment_digest", "package_interface", "bindings_digest", "models", "entrypoints", "environment")
     PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     DEVELOPMENT_FIELD_NUMBER: _ClassVar[int]
     ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    PACKAGE_DESCRIPTOR_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
     BINDINGS_DIGEST_FIELD_NUMBER: _ClassVar[int]
     MODELS_FIELD_NUMBER: _ClassVar[int]
     ENTRYPOINTS_FIELD_NUMBER: _ClassVar[int]
@@ -1094,12 +1094,12 @@ class Placement(_message.Message):
     package: PackageSelection
     development: DevelopmentPackage
     environment_digest: bytes
-    package_descriptor: Ref
+    package_interface: Ref
     bindings_digest: bytes
     models: _containers.RepeatedCompositeFieldContainer[Model]
     entrypoints: _containers.RepeatedCompositeFieldContainer[Entrypoint]
     environment: Environment
-    def __init__(self, placement_id: _Optional[str] = ..., package: _Optional[_Union[PackageSelection, _Mapping]] = ..., development: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., environment_digest: _Optional[bytes] = ..., package_descriptor: _Optional[_Union[Ref, _Mapping]] = ..., bindings_digest: _Optional[bytes] = ..., models: _Optional[_Iterable[_Union[Model, _Mapping]]] = ..., entrypoints: _Optional[_Iterable[_Union[Entrypoint, _Mapping]]] = ..., environment: _Optional[_Union[Environment, _Mapping]] = ...) -> None: ...
+    def __init__(self, placement_id: _Optional[str] = ..., package: _Optional[_Union[PackageSelection, _Mapping]] = ..., development: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., environment_digest: _Optional[bytes] = ..., package_interface: _Optional[_Union[Ref, _Mapping]] = ..., bindings_digest: _Optional[bytes] = ..., models: _Optional[_Iterable[_Union[Model, _Mapping]]] = ..., entrypoints: _Optional[_Iterable[_Union[Entrypoint, _Mapping]]] = ..., environment: _Optional[_Union[Environment, _Mapping]] = ...) -> None: ...
 
 class Ref(_message.Message):
     __slots__ = ("digest", "length")
@@ -1126,16 +1126,14 @@ class WheelFact(_message.Message):
     def __init__(self, ref: _Optional[_Union[Ref, _Mapping]] = ..., distribution: _Optional[str] = ..., version: _Optional[str] = ..., filename: _Optional[str] = ..., import_roots: _Optional[_Iterable[str]] = ..., tags: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class PackageSelection(_message.Message):
-    __slots__ = ("package", "release", "release_digest", "project_wheel")
+    __slots__ = ("package", "release", "project_wheel")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
-    RELEASE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PROJECT_WHEEL_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
-    release_digest: bytes
     project_wheel: WheelFact
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., release_digest: _Optional[bytes] = ..., project_wheel: _Optional[_Union[WheelFact, _Mapping]] = ...) -> None: ...
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., project_wheel: _Optional[_Union[WheelFact, _Mapping]] = ...) -> None: ...
 
 class DevelopmentPackage(_message.Message):
     __slots__ = ("package", "release", "source_digest", "project_wheel", "local_revision_digest")
@@ -1284,7 +1282,7 @@ class DeviceLane(_message.Message):
     def __init__(self, lane_id: _Optional[str] = ..., device_ordinals: _Optional[_Iterable[int]] = ..., available_attempt_slots: _Optional[int] = ..., placement_ids: _Optional[_Iterable[str]] = ..., resident_placement_ids: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class PlacementStatus(_message.Message):
-    __slots__ = ("placement_id", "executor_epoch", "dispatchable_binding_digests", "materializable_binding_digests", "faults", "accelerator", "placement_set_digest", "materialization", "serving", "retained_fallback_placement_set_digest", "acquisition", "package_revision_digest", "environment_digest", "device_lane_id")
+    __slots__ = ("placement_id", "executor_epoch", "dispatchable_binding_digests", "materializable_binding_digests", "faults", "accelerator", "placement_set_digest", "materialization", "serving", "retained_fallback_placement_set_digest", "acquisition", "environment_digest", "device_lane_id")
     PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTOR_EPOCH_FIELD_NUMBER: _ClassVar[int]
     DISPATCHABLE_BINDING_DIGESTS_FIELD_NUMBER: _ClassVar[int]
@@ -1296,7 +1294,6 @@ class PlacementStatus(_message.Message):
     SERVING_FIELD_NUMBER: _ClassVar[int]
     RETAINED_FALLBACK_PLACEMENT_SET_DIGEST_FIELD_NUMBER: _ClassVar[int]
     ACQUISITION_FIELD_NUMBER: _ClassVar[int]
-    PACKAGE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     DEVICE_LANE_ID_FIELD_NUMBER: _ClassVar[int]
     placement_id: str
@@ -1310,10 +1307,9 @@ class PlacementStatus(_message.Message):
     serving: ServingState
     retained_fallback_placement_set_digest: bytes
     acquisition: PlacementAcquisitionObservation
-    package_revision_digest: str
     environment_digest: str
     device_lane_id: str
-    def __init__(self, placement_id: _Optional[str] = ..., executor_epoch: _Optional[int] = ..., dispatchable_binding_digests: _Optional[_Iterable[bytes]] = ..., materializable_binding_digests: _Optional[_Iterable[bytes]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_set_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_placement_set_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ..., package_revision_digest: _Optional[str] = ..., environment_digest: _Optional[str] = ..., device_lane_id: _Optional[str] = ...) -> None: ...
+    def __init__(self, placement_id: _Optional[str] = ..., executor_epoch: _Optional[int] = ..., dispatchable_binding_digests: _Optional[_Iterable[bytes]] = ..., materializable_binding_digests: _Optional[_Iterable[bytes]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_set_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_placement_set_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ..., environment_digest: _Optional[str] = ..., device_lane_id: _Optional[str] = ...) -> None: ...
 
 class PlacementAcquisitionObservation(_message.Message):
     __slots__ = ("package", "model")
@@ -2304,8 +2300,7 @@ class AttemptProgress(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., seq: _Optional[int] = ..., content_type: _Optional[str] = ..., data: _Optional[bytes] = ..., placement_id: _Optional[str] = ...) -> None: ...
 
 class InvocationSpec(_message.Message):
-    __slots__ = ("package_revision_digest", "environment_digest", "payload_digest", "inputs", "outputs", "deadline_unix_ms", "serving", "job")
-    PACKAGE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("environment_digest", "payload_digest", "inputs", "outputs", "deadline_unix_ms", "serving", "job")
     ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PAYLOAD_DIGEST_FIELD_NUMBER: _ClassVar[int]
     INPUTS_FIELD_NUMBER: _ClassVar[int]
@@ -2313,7 +2308,6 @@ class InvocationSpec(_message.Message):
     DEADLINE_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
     SERVING_FIELD_NUMBER: _ClassVar[int]
     JOB_FIELD_NUMBER: _ClassVar[int]
-    package_revision_digest: str
     environment_digest: str
     payload_digest: str
     inputs: _containers.RepeatedCompositeFieldContainer[InputBinding]
@@ -2321,7 +2315,7 @@ class InvocationSpec(_message.Message):
     deadline_unix_ms: int
     serving: ServingInvocationSpec
     job: JobInvocationSpec
-    def __init__(self, package_revision_digest: _Optional[str] = ..., environment_digest: _Optional[str] = ..., payload_digest: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[OutputBinding, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., serving: _Optional[_Union[ServingInvocationSpec, _Mapping]] = ..., job: _Optional[_Union[JobInvocationSpec, _Mapping]] = ...) -> None: ...
+    def __init__(self, environment_digest: _Optional[str] = ..., payload_digest: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[OutputBinding, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., serving: _Optional[_Union[ServingInvocationSpec, _Mapping]] = ..., job: _Optional[_Union[JobInvocationSpec, _Mapping]] = ...) -> None: ...
 
 class InputBinding(_message.Message):
     __slots__ = ("input_id", "digest", "length", "kind_mime", "order")

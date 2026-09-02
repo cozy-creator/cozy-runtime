@@ -24,11 +24,9 @@ from cozy_runtime.internal import (
     fill,
     model_config,
     package_environment,
+    package_interface,
     placement_materialization,
     pull,
-)
-from cozy_runtime.internal import (
-    descriptor as package_descriptor,
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
@@ -236,11 +234,11 @@ def preinstalled_development(
     # owner may remint it while preserving the exact development closure.
     comparable_actual = {key: value for key, value in actual.items() if key != "placement_id"}
     comparable_expected = {key: value for key, value in expected.items() if key != "placement_id"}
-    if actual.get("package_descriptor") != expected.get("package_descriptor"):
+    if actual.get("package_interface") != expected.get("package_interface"):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "development_source_changed",
-            "the current checkout derives a different PackageDescriptor",
+            "the current checkout derives a different PackageInterface",
         )
     if actual.get("models", []) != expected.get("models", []):
         raise AcquisitionRefusal(
@@ -286,27 +284,25 @@ def preinstalled_development(
             "the accepted Placement does not equal the launch Runtime's local derivation",
         )
 
-    descriptor_digest, descriptor_length = placement.package_descriptor
-    descriptor_path = cache_root / descriptor_digest.removeprefix("sha256:")
-    _verify_file(descriptor_path, descriptor_digest, descriptor_length)
+    interface_digest, interface_length = placement.package_interface
+    interface_path = cache_root / interface_digest.removeprefix("sha256:")
+    _verify_file(interface_path, interface_digest, interface_length)
     try:
-        descriptor = package_descriptor.read_bytes(
-            descriptor_path.read_bytes(), str(descriptor_path)
-        )
-    except package_descriptor.RetiredDescriptorMember as exc:
+        interface = package_interface.read_bytes(interface_path.read_bytes(), str(interface_path))
+    except package_interface.RetiredPackageInterfaceMember as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
         ) from exc
-    except package_descriptor.StalePackageDescriptor as exc:
+    except package_interface.StalePackageInterface as exc:
         raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
         ) from exc
-    visible = _visible_entrypoints(descriptor)
+    visible = _visible_entrypoints(interface)
     if set(visible) != set(expected_entries):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "binding_entrypoint_set_mismatch",
-            "PlacementSet/1 does not cover every descriptor entrypoint",
+            "PlacementSet/1 does not cover every interface entrypoint",
         )
     selected_digests = {
         str(row["entrypoint_binding_digest"]): row for row in expected_entries.values()
@@ -317,7 +313,7 @@ def preinstalled_development(
             "development_binding_set_changed",
             "the locally derived bindings do not cover the exact selected entrypoints",
         )
-    verified = descriptor_length
+    verified = interface_length
     for digest, binding in bindings.items():
         selected = selected_digests[digest]
         slots = selected.get("slots", [])
@@ -641,31 +637,32 @@ class Acquirer:
             ) from exc
 
     def _bindings(self, placement: Any) -> tuple[Mapping[str, DeclaredBinding], int]:
-        descriptor_digest, descriptor_length = placement.package_descriptor
-        descriptor_path = self._stage(
-            descriptor_digest, self.fetch(descriptor_digest, descriptor_length).read_bytes()
+        interface_digest, interface_length = placement.package_interface
+        interface_path = self._stage(
+            interface_digest, self.fetch(interface_digest, interface_length).read_bytes()
         )
         try:
-            descriptor = package_descriptor.read_bytes(
-                descriptor_path.read_bytes(), str(descriptor_path)
+            interface = package_interface.read_bytes(
+                interface_path.read_bytes(), str(interface_path)
             )
-        except package_descriptor.RetiredDescriptorMember as exc:
+        except package_interface.RetiredPackageInterfaceMember as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
             ) from exc
-        except package_descriptor.StalePackageDescriptor as exc:
+        except package_interface.StalePackageInterface as exc:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
             ) from exc
-        visible = _visible_entrypoints(descriptor)
+        visible = _visible_entrypoints(interface)
         models = {str(row["id"]): row for row in placement.models}
         development = dict(getattr(placement, "development", {}))
-        release_digest = str(
-            placement.package.get("release_digest")
-            or development.get("local_revision_digest")
-            or development.get("source_digest")
-            or ""
-        )
+        selected_package = placement.package or development
+        project_wheel = selected_package.get("project_wheel", {})
+        package_code_digest = str(
+            project_wheel.get("ref", {}).get("digest", "")
+            if isinstance(project_wheel, dict)
+            else ""
+        ) or str(development.get("source_digest", ""))
         bindings: dict[str, DeclaredBinding] = {}
         count = 1
         for entrypoint in placement.entrypoints:
@@ -675,8 +672,8 @@ class Acquirer:
             if described is None:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "binding_package_descriptor_invalid",
-                    f"descriptor has no entrypoint {name!r}",
+                    "binding_package_interface_invalid",
+                    f"interface has no entrypoint {name!r}",
                 )
             slots = entrypoint.get("slots", [])
             described_models = described.get("models", [])
@@ -684,20 +681,19 @@ class Acquirer:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "binding_slot_set_mismatch", name
                 )
-            application = str(descriptor.get("application", ""))
+            application = str(interface.get("application", ""))
             if not slots:
                 bindings[binding_digest] = DeclaredBinding(
                     entrypoint_binding_digest=binding_digest,
                     entrypoint=name,
-                    package_revision_digest=release_digest,
-                    release=release_digest,
+                    release=package_code_digest,
                     environment_digest=documents.spell(placement.environment_digest),
                     config_digest=canonical.digest({}),
                     model_class="",
                     model_binding_path="",
                     model_parameter_name="",
                     application=application,
-                    descriptor_path=str(descriptor_path),
+                    interface_path=str(interface_path),
                     development=bool(development),
                 )
                 continue
@@ -707,8 +703,8 @@ class Acquirer:
             if len(described_by_path) != len(described_models):
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "binding_package_descriptor_invalid",
-                    f"{name}: duplicate or malformed descriptor model slot",
+                    "binding_package_interface_invalid",
+                    f"{name}: duplicate or malformed interface model slot",
                 )
             members: list[ModelBinding] = []
             tensorfs = fill.tensorfs_module()
@@ -719,7 +715,7 @@ class Acquirer:
                 if declared is None:
                     raise AcquisitionRefusal(
                         pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        "binding_package_descriptor_invalid",
+                        "binding_package_interface_invalid",
                         path,
                     )
                 reference = models[str(slot["reference_model_id"])]
@@ -780,8 +776,7 @@ class Acquirer:
             bindings[binding_digest] = DeclaredBinding(
                 entrypoint_binding_digest=binding_digest,
                 entrypoint=name,
-                package_revision_digest=release_digest,
-                release=release_digest,
+                release=package_code_digest,
                 models=model_set,
                 environment_digest=documents.spell(placement.environment_digest),
                 config_digest=model_binding_set_digest(model_set),
@@ -789,7 +784,7 @@ class Acquirer:
                 model_binding_path=first.model_binding_path,
                 model_parameter_name=first.model_parameter_name,
                 application=application,
-                descriptor_path=str(descriptor_path),
+                interface_path=str(interface_path),
                 store=first.store,
                 config=first.config,
                 variant=first.variant,
@@ -811,7 +806,7 @@ class Acquirer:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "binding_entrypoint_set_mismatch",
-                "PlacementSet/1 does not select the required descriptor entrypoints",
+                "PlacementSet/1 does not select the required interface entrypoints",
             )
         return bindings, count
 
@@ -919,12 +914,12 @@ def cozytensors_ref(tensorfs: Any, raw: bytes) -> tuple[str, int]:
     return ref
 
 
-def _visible_entrypoints(descriptor: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    rows = descriptor.get("entrypoints")
+def _visible_entrypoints(interface: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = interface.get("entrypoints")
     if not isinstance(rows, list):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "package_descriptor_invalid",
+            "package_interface_invalid",
             "entrypoints is not an array",
         )
     visible = {
@@ -935,7 +930,7 @@ def _visible_entrypoints(descriptor: Mapping[str, Any]) -> dict[str, dict[str, A
     if len(visible) != len(rows):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "package_descriptor_invalid",
+            "package_interface_invalid",
             "entrypoint names are not unique",
         )
     return visible

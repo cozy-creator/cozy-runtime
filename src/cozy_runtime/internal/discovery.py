@@ -3,7 +3,7 @@
 That is the COMPLETE discovery algorithm (§1.0). Importing a module never registers
 anything — registration is a method call on the app object — so there is nothing to
 harvest, no package to walk, no dependency to stub and no source to parse. Everything a
-descriptor says comes from the object package.toml named.
+package interface says comes from the object package.toml named.
 
 Execution containment is a TIER-INDEPENDENT property of the caller, not of this module:
 the trusted build runs `describe` in a disposable container of the already-built release
@@ -91,10 +91,10 @@ def discover(project: Path, *, seconds: float = IMPORT_SECONDS) -> Discovered:
 
 
 def discover_installed(application: str, *, seconds: float = IMPORT_SECONDS) -> Discovered:
-    """Freeze one descriptor-named export from the installed package environment.
+    """Freeze one package interface-named export from the installed package environment.
 
     A materialized rental has an immutable venv, not a copied source tree or package.toml.
-    The exact PackageDescriptor supplies the application identity; importing anything else
+    The exact PackageInterface supplies the application identity; importing anything else
     or adding a host path would recreate the source/PYTHONPATH authority the fixed worker rejects.
     """
 
@@ -181,8 +181,8 @@ def _import(module_name: str, application: str) -> ModuleType:
 
 
 def _bindings(project: Path) -> Mapping[str, Mapping[str, object]]:
-    """package.toml's binding table. NOT descriptor content — the fixed-point scan reads it
-    to prove no mutable binding leaked into the descriptor."""
+    """package.toml's binding table. NOT interface content — the fixed-point scan reads it
+    to prove no mutable binding leaked into the package interface."""
     from cozy_runtime.internal.bindings import read_table
 
     return read_table(project / "package.toml")

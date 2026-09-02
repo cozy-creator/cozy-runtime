@@ -228,7 +228,7 @@ def installed_cli() -> Iterator[str]:
 def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
     """describe -> exact replay -> the exit-code matrix, from `/`, no PYTHONPATH, stdin closed.
 
-    The descriptor is a PUBLICATION output, so two derivations must be byte-identical, and
+    The package interface is a PUBLICATION output, so two derivations must be byte-identical, and
     the exit codes (`internal/exits.py`) are the contract a caller actually reads. None of
     this needs a device or an executor.
     """
@@ -242,7 +242,7 @@ def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
 
     # Hardware declarations were a second, author-written placement authority. The hardcut is
     # observable from the installed public wheel: neither the value nor the decorator argument
-    # survives, and descriptor /1 has no compatibility spelling for it.
+    # survives, and package interface /1 has no compatibility spelling for it.
     _run(
         str(Path(installed_cli).with_name("python")),
         "-c",
@@ -255,14 +255,14 @@ def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
     _run(
         str(Path(installed_cli).with_name("python")),
         "-c",
-        "import json; from cozy_runtime.internal import canonical, descriptor; "
+        "import json; from cozy_runtime.internal import canonical, package_interface; "
         f"body=json.loads({first.stdout!r}); "
         "body['jobs'][0]['resources']={'gpu_count': 1}; "
         "raw=canonical.write(body); "
         "caught=False; "
-        "\ntry: descriptor.read_bytes(raw)"
-        "\nexcept descriptor.StalePackageDescriptor as exc: "
-        "caught=exc.code == 'malformed_package_descriptor'"
+        "\ntry: package_interface.read_bytes(raw)"
+        "\nexcept package_interface.StalePackageInterface as exc: "
+        "caught=exc.code == 'malformed_package_interface'"
         "\nassert caught",
         cwd="/",
     )
@@ -315,8 +315,8 @@ def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None
             str(dependency_one_wheel),
             str(project_wheel),
         )
-        release_digest = "sha256:" + "17" * 32
-        installed = package_environment.open_existing_environment(python, release_digest)
+        content_digest = "sha256:" + "17" * 32
+        installed = package_environment.open_existing_environment(python, content_digest)
         observed = package_environment.observe_base(python)
         artifact_store = root / "artifact-store"
         artifact_store.mkdir()
@@ -326,10 +326,10 @@ def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None
         ) -> bytes:
             assert selected == installed
             command = (
-                "from cozy_runtime.internal import descriptor; "
+                "from cozy_runtime.internal import package_interface; "
                 "from cozy_runtime.internal.discovery import discover_distribution; "
                 f"found=discover_distribution({distribution!r}); "
-                "print(descriptor.canonical_bytes(descriptor.build(found)).decode())"
+                "print(package_interface.canonical_bytes(package_interface.build(found)).decode())"
             )
             rendered = _run(str(selected.python), "-I", "-c", command, cwd="/")
             return rendered.stdout.encode()
@@ -346,7 +346,6 @@ def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None
             return prepare_package(
                 package_name="paul/marco-polo",
                 release="1.0.4",
-                release_digest=release_digest,
                 files=rows,
                 placement_seed=b"existing-environment-proof",
                 artifact_cache=artifact_cache,
@@ -445,7 +444,6 @@ def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> 
             prepare_package(
                 package_name="local/hollow",
                 release="1.0.0",
-                release_digest="sha256:" + "27" * 32,
                 files=rows,
                 placement_seed=b"empty-project-proof",
                 artifact_cache=artifact_cache,
@@ -739,8 +737,8 @@ def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -
             str(native_wheel_path),
             str(project_wheel),
         )
-        release_digest = "sha256:" + "23" * 32
-        installed = package_environment.open_existing_environment(python, release_digest)
+        content_digest = "sha256:" + "23" * 32
+        installed = package_environment.open_existing_environment(python, content_digest)
         observed = package_environment.observe_base(python)
         artifact_store = root / "artifact-store"
         artifact_store.mkdir()
@@ -749,10 +747,10 @@ def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -
             selected: package_environment.InstalledEnvironment, distribution: str
         ) -> bytes:
             command = (
-                "from cozy_runtime.internal import descriptor; "
+                "from cozy_runtime.internal import package_interface; "
                 "from cozy_runtime.internal.discovery import discover_distribution; "
                 f"found=discover_distribution({distribution!r}); "
-                "print(descriptor.canonical_bytes(descriptor.build(found)).decode())"
+                "print(package_interface.canonical_bytes(package_interface.build(found)).decode())"
             )
             return _run(str(selected.python), "-I", "-c", command, cwd="/").stdout.encode()
 
@@ -767,7 +765,6 @@ def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -
             return prepare_package(
                 package_name="paul/marco-polo",
                 release="1.0.4",
-                release_digest=release_digest,
                 files=rows,
                 placement_seed=b"native-dependency-admission",
                 artifact_cache=artifact_cache,

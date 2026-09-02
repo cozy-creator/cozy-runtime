@@ -20,7 +20,7 @@ ExecutionSpec a REFUSAL rather than an ignored unknown field.
 
 Profile note, checked live rather than asserted (`scripts/worker-live.py fixtures` renders
 th-024's frozen canonical fixtures through THIS writer and compares bytes + ids):
-cozy-runtime's writer admits floats, `null` and non-ASCII because a descriptor needs them;
+cozy-runtime's writer admits floats, `null` and non-ASCII because a package interface needs them;
 the protocol profile does not, so `_ascii` refuses a non-printable-ASCII field here instead
 of spelling it. Within the admissible profile the two writers are byte-identical.
 """

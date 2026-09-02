@@ -310,7 +310,7 @@ def package_environment_input(
     """Join direct executable package facts with the selected inline Environment."""
 
     fields = set(package)
-    published = {"package", "project_wheel", "release", "release_digest"}
+    published = {"package", "project_wheel", "release"}
     development = {
         "package",
         "local_revision_digest",
@@ -332,8 +332,8 @@ def package_environment_input(
         or not version
     ):
         raise LaunchRefusal("package_invalid", "package or release identity is invalid")
-    revision_field = "release_digest" if fields == published else "local_revision_digest"
-    _require_digest(package[revision_field], f"package.{revision_field}")
+    if fields == development:
+        _require_digest(package["local_revision_digest"], "package.local_revision_digest")
 
     _closed(environment, {"wheels"}, "environment")
     measured_environment = (

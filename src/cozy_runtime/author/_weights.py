@@ -23,12 +23,10 @@ MAX_WEIGHTS_COMPONENTS = 64
 MAX_WEIGHTS_ADDITIONS = 65_536
 MAX_WEIGHTS_SOURCE_READ = 64 << 20
 MAX_WEIGHTS_NEW_BYTES = (1 << 53) - 1
-MAX_WEIGHTS_ENCODINGS = 32
 MAX_WEIGHTS_SOURCE_CONFIGS = 64
 MAX_WEIGHTS_SOURCE_TENSORS = 65_536
 MAX_WEIGHTS_SOURCE_ROLES = 16
 _OUTPUT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 @runtime_checkable
@@ -41,12 +39,10 @@ WeightsBytes = bytes | bytearray | memoryview | Readable
 
 @dataclass(frozen=True, slots=True)
 class WeightsOutput:
-    """One descriptor-declared model output, byte ceiling, and optional exact contract."""
+    """One package-interface model output and its new-byte ceiling."""
 
     name: str
     max_new_bytes: int
-    topology_digest: str = ""
-    encodings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or _OUTPUT_NAME.fullmatch(self.name) is None:
@@ -63,24 +59,6 @@ class WeightsOutput:
             raise ConformanceError(
                 f"weights output {self.name} max_new_bytes must be in 0..={MAX_WEIGHTS_NEW_BYTES}",
                 code="weights_output_bound",
-                fields=[self.name],
-            )
-        contracted = bool(self.topology_digest or self.encodings)
-        if contracted and (
-            not isinstance(self.topology_digest, str)
-            or _DIGEST.fullmatch(self.topology_digest) is None
-            or not isinstance(self.encodings, tuple)
-            or not 1 <= len(self.encodings) <= MAX_WEIGHTS_ENCODINGS
-            or tuple(sorted(set(self.encodings))) != self.encodings
-            or any(
-                not isinstance(value, str) or _DIGEST.fullmatch(value) is None
-                for value in self.encodings
-            )
-        ):
-            raise ConformanceError(
-                f"weights output {self.name} contract requires one exact topology digest "
-                f"and 1..={MAX_WEIGHTS_ENCODINGS} sorted unique EncodingSpec digests",
-                code="weights_output_contract",
                 fields=[self.name],
             )
 
@@ -439,7 +417,7 @@ class WeightsTransaction:
 
 
 class WeightsSink:
-    """Attempt-bound capability for one or more descriptor-declared model outputs."""
+    """Attempt-bound capability for one or more interface-declared model outputs."""
 
     __slots__ = (
         "_attempt",
@@ -566,7 +544,7 @@ class WeightsSink:
             )
         if output not in self._outputs:
             raise CapabilityError(
-                f"weights output {output!r} is not descriptor-declared",
+                f"weights output {output!r} is not interface-declared",
                 code="weights_output_ungranted",
             )
         if output in self._spent:

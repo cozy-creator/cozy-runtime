@@ -44,13 +44,13 @@ verbs:
   run <fn> [<primary>] [k=v …]   one-shot inference: payload in, outputs to disk, exit
   job <fn> [k=v …]               run one @app.job to completion, same attempt kernel
   serve --socket <path> <mode>   speak the worker protocol for a RecordOwner
-  describe [<fn>]                the PackageDescriptor, without loading weights
+  describe [<fn>]                the PackageInterface, without loading weights
   bindings                       the RESOLVED binding records this project selects
   doctor                         this host's device/driver/credential facts
   capability [--out <path>]      the OBSERVED (encoding, device) qualification of this card
   hostfacts [<fn>] [k=v …]       this host's capacity facts (exact with a payload)
   derive --python <venv python> --slot <path> --config <document> [--out <dir>]
-                                 the CodeTopology of one slot for one construction document
+                                 TensorRequirements for one slot and construction document
   probe <fn> [k=v …]             teacher-forced activation diff of two lanes (report/1)
   new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and the two independent semvers
@@ -83,12 +83,12 @@ global flags:
   --full           widen output, lift truncation
   --fields a,b,c   pick columns
   --dir <path>     package project root (default: cwd)
-  --descriptor <path>
-                   exact PackageDescriptor input for describe/bindings (no package import)
+  --package-interface <path>
+                   exact PackageInterface input for describe/bindings (no package import)
   -h, --help       this text
 """
 
-_VALUE_FLAGS = ("--fields", "--dir", "--descriptor")
+_VALUE_FLAGS = ("--fields", "--dir", "--package-interface")
 #: Verbs that own their own flag parsing: everything after the verb belongs to them, so a
 #: payload term like `--in` is not eaten by the global pass.
 _OWNS_ARGS = (
@@ -109,7 +109,7 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
     as_json = full = want_help = False
     fields: tuple[str, ...] = ()
     directory = "."
-    descriptor = ""
+    package_interface = ""
     verb: str | None = None
     args: list[str] = []
     unknown: list[str] = []
@@ -140,7 +140,7 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
             elif flag == "--dir":
                 directory = inline
             else:
-                descriptor = inline
+                package_interface = inline
         elif item.startswith("-") and item != "-":
             unknown.append(item)
         elif verb is None:
@@ -155,15 +155,16 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
             Exit.usage,
             next=("cozy-runtime --help",),
         )
-    return verb, args, Options(as_json, full, fields, directory, descriptor), want_help
+    return verb, args, Options(as_json, full, fields, directory, package_interface), want_help
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
-    if opts.descriptor and verb not in ("describe", "bindings"):
+    if opts.package_interface and verb not in ("describe", "bindings"):
         raise CliError(
             "usage",
-            "--descriptor belongs only to describe or bindings",
-            "use --descriptor <exact-package-descriptor> with cozy-runtime describe or bindings",
+            "--package-interface belongs only to describe or bindings",
+            "use --package-interface <exact-package-interface> with "
+            "cozy-runtime describe or bindings",
             Exit.usage,
         )
     if verb == "describe":
@@ -171,7 +172,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             raise CliError(
                 "usage",
                 f"describe takes at most one function name, got {len(args)}",
-                "cozy-runtime [--json] [--dir <path>] [--descriptor <path>] describe [<function>]",
+                "cozy-runtime [--json] [--dir <path>] "
+                "[--package-interface <path>] describe [<function>]",
                 Exit.usage,
             )
         return describe_verb.run(args[0] if args else None, opts)

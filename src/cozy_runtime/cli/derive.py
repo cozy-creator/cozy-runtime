@@ -1,11 +1,11 @@
-"""`cozy-runtime derive` — the CodeTopology of (slot, construction document).
+"""`cozy-runtime derive` — the TensorRequirements of (slot, construction document).
 
     cozy-runtime [--json] derive --python <venv python> --slot <path> --config <document>
                                  [--application <module:attr> | --dir <project>] [--out <dir>]
 
 `derive(package_release, slot, config_document) = census(factory(config_document))` on the
 meta device, in the package's own interpreter, in one bounded child (model-code-fit §3).
-The answer is the canonical TensorFS CodeTopology — rows with `accepts` from the class's
+The answer is canonical TensorRequirements — rows with `accepts` from the class's
 `encoded_leaves`, plus the components the factory constructed, in order (D9). It is a pure
 function of its two inputs: no weights, no device, no candidate, and byte-identical on every
 run — the child derives twice and refuses a construction that differs from itself.
@@ -18,7 +18,6 @@ to `<dir>/<sha256-hex>.json`; `--json` prints them.
 
 from __future__ import annotations
 
-import hashlib
 import shutil
 import sys
 import tempfile
@@ -30,10 +29,10 @@ from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.internal import canonical, derive_child, sandbox
 from cozy_runtime.internal.derive import DeriveError, derive
 from cozy_runtime.internal.derive_child import (
-    DerivedTopology,
     DeriveRefusal,
     DeriveRequest,
     SlotRequest,
+    TensorRequirements,
 )
 from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.exits import Exit
@@ -65,10 +64,8 @@ def run(args: Sequence[str], opts: Options) -> Result:
         document = canonical.parse(derive_child.read_exact(config_path, "config"))
         if not isinstance(document, dict):
             raise DeriveRefusal("derive_input_invalid", f"{config_path}: config is not an object")
-        staged = scratch / "config.json"
-        staged.write_bytes(canonical.write(document))
         request = DeriveRequest(
-            (SlotRequest(slot, derive_child.config_ref(staged)),),
+            (SlotRequest(slot, canonical.write(document)),),
             project=project,
             application=application,
         )
@@ -88,7 +85,7 @@ def run(args: Sequence[str], opts: Options) -> Result:
     rows: list[tuple[str, str]] = [
         ("slot", held.slot),
         ("config_digest", held.config_digest),
-        ("code_topology", held.digest),
+        ("tensor_requirements", held.digest),
         ("length", str(len(held.document))),
         ("constructed", ", ".join(constructed)),
     ]
@@ -156,7 +153,7 @@ def child_main(argv: Sequence[str]) -> int:
             if not surface.hidden
             for binding in surface.model_bindings
         }
-        topologies: list[DerivedTopology] = []
+        requirements: list[TensorRequirements] = []
         for row in request.slots:
             binding = bindings.get(row.slot)
             if binding is None:
@@ -165,22 +162,15 @@ def child_main(argv: Sequence[str]) -> int:
                     f"{row.slot!r} is no model slot of this package (have "
                     f"{', '.join(sorted(bindings)) or 'none'})",
                 )
-            raw = derive_child.read_exact(row.config.path, f"config for {row.slot}")
-            measured = "sha256:" + hashlib.sha256(raw).hexdigest()
-            if len(raw) != row.config.length or measured != row.config.digest:
-                raise DeriveRefusal(
-                    "derive_input_identity_mismatch",
-                    f"{row.config.path} does not match {row.config.digest}/{row.config.length}",
-                )
             try:
-                document = canonical.parse_canonical(raw)
+                document = canonical.parse_canonical(row.config)
             except canonical.CanonicalError as err:
                 raise DeriveRefusal("derive_input_invalid", f"{row.slot}: {err}") from err
             if not isinstance(document, dict):
                 raise DeriveRefusal("derive_input_invalid", f"{row.slot}: config is not an object")
-            config = Config._verified(document, "config", row.config.digest)
-            topologies.append(
-                DerivedTopology(row.slot, row.config.digest, derive_twice(binding, config))
+            config = Config._verified(document, "config", row.config_digest)
+            requirements.append(
+                TensorRequirements(row.slot, row.config_digest, derive_twice(binding, config))
             )
     except DeriveRefusal as err:
         derive_child.emit({"error": err.code, "detail": err.detail})
@@ -197,7 +187,7 @@ def child_main(argv: Sequence[str]) -> int:
     except Exception as err:
         derive_child.emit({"error": "derive_internal", "detail": f"{type(err).__name__}: {err}"})
         return int(Exit.internal)
-    derive_child.emit(derive_child.render(topologies))
+    derive_child.emit(derive_child.render(requirements))
     return int(Exit.ok)
 
 
@@ -215,7 +205,7 @@ def derive_twice(binding: ModelBinding, config: Config) -> bytes:
                 "derive_config_digest_mismatch",
                 f"{binding.path} did not retain the exact config document identity",
             )
-        return result.tensorfs_bytes(encoded_leaves=binding.encoded_leaves)
+        return result.tensor_requirements_bytes(encoded_leaves=binding.encoded_leaves)
 
     first = once()
     if once() != first:
