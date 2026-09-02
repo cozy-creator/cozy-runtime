@@ -123,7 +123,6 @@ class _DevelopmentModel:
     config_digest: str
     config_bytes: bytes
     components: tuple[str, ...]
-    assets: Mapping[str, Mapping[str, Any]]
     store: Path
     variant: str
     custody: str
@@ -808,7 +807,6 @@ class LocalRecordOwner:
                 if self.placement is not None
                 else ""
             ),
-            config_digest="",
             payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
             inputs=self._input_bindings(body),
             outputs=self._output_bindings(),
@@ -818,7 +816,7 @@ class LocalRecordOwner:
                 int(time.time() * 1000) + self.request.timeout_ms if self.request.timeout_ms else 0
             ),
         )
-        # `config_digest` stays EMPTY. Model configuration is bound and verified separately.
+        # `config_digest` stays EMPTY. Checkpoint configuration comes only from CozyTensors.
         if self.request.kind == "job":
             spec.job.CopyFrom(
                 pb.JobInvocationSpec(
@@ -1118,28 +1116,10 @@ def development_placement_documents(
         for selected_path in selected_paths:
             selected = resolved_models[selected_path]
             model_id = model_ids[selected.slot.path]
-            assets = [
-                pb.Asset(
-                    name=asset_name,
-                    model_id=model_id,
-                    ref=pb.Ref(
-                        digest=documents.raw(str(asset["digest"])),
-                        length=int(asset["length"]),
-                    ),
-                )
-                for asset_name, asset in sorted(selected.assets.items())
-            ]
             slots.append(
                 pb.Slot(
                     slot=selected.slot.param,
                     reference_model_id=model_id,
-                    config=pb.Config(
-                        document=pb.Ref(
-                            digest=documents.raw(selected.config_digest),
-                            length=len(selected.config_bytes),
-                        ),
-                        assets=assets,
-                    ),
                     components=[
                         pb.Component(component=component, model_id=model_id)
                         for component in selected.components
@@ -1148,7 +1128,9 @@ def development_placement_documents(
             )
             config_path = ""
             if artifact_cache is not None:
-                _, staged_config = _stage_exact(artifact_cache, selected.config_bytes)
+                _, staged_config = _stage_exact(
+                    artifact_cache / "selections", selected.config_bytes
+                )
                 config_path = str(staged_config)
             members.append(
                 ModelBinding(
@@ -1315,9 +1297,7 @@ def _resolve_development_models(
             )
         manifest_length = len(manifest_bytes)
         try:
-            config_digest, config_bytes = model_config.construction_document(
-                store, header.get("configs")
-            )
+            config_digest, config_bytes = model_config.construction_document(header.get("configs"))
         except model_config.ModelConfigRefusal as exc:
             raise RuntimeError(
                 f"development_model_config_invalid: {binding.ref}: {type(exc).__name__}: {exc}"
@@ -1325,7 +1305,7 @@ def _resolve_development_models(
         if not header.get("components"):
             raise RuntimeError(f"development_model_components_absent: {binding.ref}")
         components = _derive_components(found.project, slot.path, config_bytes, config_digest)
-        selected_assets = _development_assets(binding.ref, header.get("assets", {}))
+        _development_assets(binding.ref, header.get("assets", {}))
         try:
             model_weight_bytes = sum(
                 int(row["length"]) for row in store.walk_cozytensors(manifest_digest)
@@ -1345,7 +1325,6 @@ def _resolve_development_models(
             config_digest=config_digest,
             config_bytes=config_bytes,
             components=components,
-            assets=selected_assets,
             store=store_root,
             # Repository lane and accelerator hardware are independent facts. Development
             # carries no caller-authored hardware variant; the executor derives smNN from
@@ -1388,7 +1367,7 @@ def _derive_components(
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def _development_assets(binding_ref: str, value: object) -> Mapping[str, Mapping[str, Any]]:
+def _development_assets(binding_ref: str, value: object) -> None:
     if not isinstance(value, Mapping):
         raise RuntimeError(f"development_model_assets_invalid: {binding_ref}")
     if value:
@@ -1396,7 +1375,6 @@ def _development_assets(binding_ref: str, value: object) -> Mapping[str, Mapping
             "development_model_assets_unsupported: local modeled development does not "
             f"yet stream TensorFS logical assets for {binding_ref}"
         )
-    return {}
 
 
 def _exact_model_ref(value: str) -> tuple[str, str, str]:

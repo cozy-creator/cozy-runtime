@@ -206,7 +206,6 @@ class WeightsReceipt:
     weights_transaction_id: str
     tensorfs_receipt_digest: str
     tensorfs_receipt: bytes
-    checkpoint_evidence_canonical_bytes: bytes
     replayed: bool = False
 
 

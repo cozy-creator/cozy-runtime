@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +22,7 @@ from cozy_runtime.internal import (
     base_observation,
     canonical,
     fill,
+    model_config,
     package_environment,
     placement_materialization,
     pull,
@@ -224,7 +225,7 @@ def preinstalled_development(
     """Admit one independently re-derived source-checkout selection.
 
     The launch Runtime has re-read package.toml and the exact local TensorFS Repository,
-    Manifest, header and config. This function compares that derivation with every accepted
+    Manifest, and inline header config. This function compares that derivation with every accepted
     Placement fact before handing the normal attempt kernel its local resolution paths. No
     PackageRelease or Environment is invented for this same-user lane.
     """
@@ -266,12 +267,6 @@ def preinstalled_development(
                 name,
             )
         for selected_slot, accepted_slot in zip(selected_slots, accepted_slots, strict=True):
-            if selected_slot.get("config") != accepted_slot.get("config"):
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                    "development_model_config_changed",
-                    name,
-                )
             if selected_slot.get("components", []) != accepted_slot.get("components", []):
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
@@ -323,33 +318,26 @@ def preinstalled_development(
             "the locally derived bindings do not cover the exact selected entrypoints",
         )
     verified = descriptor_length
-    documents_count = 1
     for digest, binding in bindings.items():
         selected = selected_digests[digest]
         slots = selected.get("slots", [])
         if not slots:
             continue
-        selected_configs = {
-            f"{selected['name']}.models.{slot['slot']}": slot["config"]["document"]
-            for slot in slots
-        }
+        selected_paths = {f"{selected['name']}.models.{slot['slot']}" for slot in slots}
         members = binding.model_bindings()
-        if set(selected_configs) != {member.model_binding_path for member in members}:
+        if selected_paths != {member.model_binding_path for member in members}:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "development_model_slot_changed",
                 str(selected["name"]),
             )
         for member in members:
-            config = selected_configs[member.model_binding_path]
-            _verify_file(Path(member.config), str(config["digest"]), int(config["length"]))
-            verified += int(config["length"])
-            documents_count += 1
+            _verify_file(Path(member.config), member.config_digest, None)
     return AcquiredPlacement(
         None,
         bindings,
         len(placement.models),
-        documents_count,
+        1,
         0,
         0,
         verified,
@@ -476,8 +464,8 @@ class Acquirer:
 
     def acquire(self, placement: Any) -> AcquiredPlacement:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cozy-acquire") as pool:
-            package_future = pool.submit(self._run_package, placement)
             model_future = pool.submit(self._run_model, placement)
+            package_future = pool.submit(self._run_package, placement, model_future)
             installed, bindings, documents_count = package_future.result()
             model_objects = model_future.result()
         self._verify_model_refs(bindings)
@@ -493,12 +481,15 @@ class Acquirer:
         )
 
     def _run_package(
-        self, placement: Any
+        self, placement: Any, models: Future[int]
     ) -> tuple[package_environment.InstalledEnvironment, Mapping[str, DeclaredBinding], int]:
         self._thread.leg = "package"
         self.observation.start("package")
         try:
             installed = self.installed_environment or self._environment(placement)
+            # The header is the sole config authority. Environment installation overlaps the
+            # model transfer, then binding resolution waits for the verified header closure.
+            models.result()
             bindings, count = self._bindings(placement)
             return installed, bindings, count
         finally:
@@ -720,6 +711,8 @@ class Acquirer:
                     f"{name}: duplicate or malformed descriptor model slot",
                 )
             members: list[ModelBinding] = []
+            tensorfs = fill.tensorfs_module()
+            store = pull.open_store(tensorfs, self.artifact_store)
             for slot in slots:
                 path = f"{name}.models.{slot['slot']}"
                 declared = described_by_path.get(path)
@@ -729,9 +722,6 @@ class Acquirer:
                         "binding_package_descriptor_invalid",
                         path,
                     )
-                config_ref = _ref(slot["config"]["document"], "slot.config.document")
-                config_path = self._stage(config_ref[0], self.fetch(*config_ref).read_bytes())
-                count += 1
                 reference = models[str(slot["reference_model_id"])]
                 reference_manifest = str(reference["manifest"]["digest"])
                 components = tuple(str(row["component"]) for row in slot.get("components", []))
@@ -746,7 +736,12 @@ class Acquirer:
                     for row in slot.get("components", [])
                 }
                 try:
-                    store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
+                    held = store.manifest(reference_manifest)
+                    header = tensorfs.parse_header(bytes(held["header"]))
+                    config_digest, config_bytes = model_config.construction_document(
+                        header.get("configs")
+                    )
+                    config_path = self._stage(config_digest, config_bytes)
                     model_weight_bytes = sum(
                         int(row["length"]) for row in store.walk_cozytensors(reference_manifest)
                     )
@@ -767,7 +762,7 @@ class Acquirer:
                         model_class=str(declared.get("class", "")),
                         model_binding_path=path,
                         model_parameter_name=str(slot["slot"]),
-                        config_digest=config_ref[0],
+                        config_digest=config_digest,
                         store=str(self.artifact_store),
                         config=str(config_path),
                         variant="",
@@ -779,10 +774,6 @@ class Acquirer:
                         model=f"{reference['repo']}@{reference['version']}/{reference['lane']}",
                     )
                 )
-                for asset in slot["config"].get("assets", []):
-                    ref = _ref(asset["ref"], "slot.config.asset")
-                    self._stage(ref[0], self.fetch(*ref).read_bytes())
-                    count += 1
             members.sort(key=lambda member: member.model_binding_path)
             model_set = tuple(members)
             first = model_set[0]

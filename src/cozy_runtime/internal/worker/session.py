@@ -334,28 +334,6 @@ class Placement:
             or ""
         )
 
-    @property
-    def config_digest(self) -> str:
-        selected = sorted(
-            (
-                f"{entrypoint['name']}.models.{slot['slot']}",
-                str(slot["config"]["document"]["digest"]),
-            )
-            for entrypoint in self.entrypoints
-            for slot in entrypoint.get("slots", [])
-        )
-        if not selected:
-            return canonical.digest({})
-        if len(selected) == 1:
-            return selected[0][1]
-        return canonical.digest(
-            {
-                "model_bindings": [
-                    {"path": path, "config_digest": digest} for path, digest in selected
-                ]
-            }
-        )
-
 
 @dataclass(slots=True)
 class HostedPlacement:
@@ -782,14 +760,13 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 {
                     "slot",
                     "reference_model_id",
-                    "config",
                     "components",
                     "model_construction_contract",
                     "stamps",
                 },
                 "Slot",
             )
-            _required(slot, {"slot", "reference_model_id", "config"}, "Slot")
+            _required(slot, {"slot", "reference_model_id"}, "Slot")
             # THE DELETED PLANE (model-code-fit D1, D12; the proto reserves both at
             # xs-010). `stamps` is `[]` on every wire document — the canonical writer spells
             # closed repeated fields even when empty — and anything in it refuses typed; a
@@ -807,27 +784,11 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 raise documents.DocumentError(
                     "slot.stamps_retired",
                     "Slot.stamps: stamps are deleted (model-code-fit D1); a semantic twin is a "
-                    "component name or a config fact",
+                    "component name or an inline CozyTensors config fact",
                 )
             slot_names.append(_identifier(slot["slot"], f"slots[{slot_index}].slot"))
             if slot["reference_model_id"] not in known_models:
                 raise documents.DocumentError("unknown_model", "Slot.reference_model_id")
-            config = _closed_document(slot["config"], {"document", "assets"}, "Config")
-            _required(config, {"document"}, "Config")
-            _exact_ref(config["document"], "Config.document")
-            assets = config.get("assets", [])
-            if not isinstance(assets, list):
-                raise documents.DocumentError("wrong_type", "Config.assets")
-            asset_names: list[str] = []
-            for asset_index, value in enumerate(assets):
-                asset = _closed_document(value, {"name", "model_id", "ref"}, "Asset")
-                _required(asset, {"name", "model_id", "ref"}, "Asset")
-                asset_names.append(_identifier(asset["name"], f"assets[{asset_index}].name"))
-                if asset["model_id"] not in known_models:
-                    raise documents.DocumentError("unknown_model", "Asset.model_id")
-                _exact_ref(asset["ref"], "Asset.ref")
-            if asset_names != sorted(set(asset_names)):
-                raise documents.DocumentError("sort_order", "Config.assets")
             components = slot.get("components", [])
             if not isinstance(components, list):
                 raise documents.DocumentError("wrong_type", "Slot.components")
@@ -4963,13 +4924,11 @@ class Worker:
                 if placement.environment_digest
                 else canonical.digest({})
             )
-            status.config_digest = placement.config_digest
             if not all(
                 re.fullmatch(r"sha256:[0-9a-f]{64}", value)
                 for value in (
                     status.package_revision_digest,
                     status.environment_digest,
-                    status.config_digest,
                 )
             ):
                 raise RuntimeError("dispatchable placement has incomplete invocation identity")

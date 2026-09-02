@@ -133,25 +133,14 @@ def write_tenant_store(root: Path, *, blocks: int, scale: int = 1) -> TenantStor
         "text_norm": int(components["text_encoder"]["final_norm.weight"][2][0]),
         "vae": int(components["vae"]["decoder.conv_in.weight"][2][0]),
     }
-    config_path = work / "config.json"
     config_bytes = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
-    config_path.write_bytes(config_bytes)
-    config_hex = hashlib.sha256(config_bytes).hexdigest()
-    tfs("put", str(store), str(config_path))
     header["assets"] = []
-    header["configs"] = [["unet", f"sha256:{config_hex}", len(config_bytes), "application/json"]]
+    header["configs"] = [["unet", config_bytes.decode("utf-8")]]
     (work / "header.json").write_text(json.dumps(header))
     (work / "order.json").write_text(
         json.dumps([[name, row[0]] for name, rows in header["components"] for row in rows])
     )
-    (work / "entries.json").write_text(
-        json.dumps(
-            [
-                ["model.cozytensors", "cozytensors"],
-                ["unet/config.json", "file", {"sha256": config_hex, "length": len(config_bytes)}],
-            ]
-        )
-    )
+    (work / "entries.json").write_text(json.dumps([["model.cozytensors", "cozytensors"]]))
     reproduced = tfs(
         "checkpoint",
         "reproduce",
@@ -165,15 +154,10 @@ def write_tenant_store(root: Path, *, blocks: int, scale: int = 1) -> TenantStor
         r"manifest\s+(sha256:[0-9a-f]{64}) length=(\d+)", reproduced
     ).groups()
     opened = tensorfs.Store.open(str(store))
-    manifest = opened.manifest(manifest_id)
-    topology = tensorfs.topology_digest(bytes(manifest["header"]))
-    evidence = json.dumps(
-        {"classification_digest": topology}, separators=(",", ":"), sort_keys=True
-    ).encode()
     operation = opened.begin_operation("op-tenant", "cozytest", "tenant")
     operation.hold_manifest(manifest_id, int(manifest_length))
-    operation.commit_release(None, "1", "bf16", manifest_id, int(manifest_length), evidence)
-    weight_bytes = sum(int(row["length"]) for row in opened.walk(manifest_id))
+    operation.commit_release(None, "1", "bf16", manifest_id, int(manifest_length))
+    weight_bytes = sum(int(row["length"]) for row in opened.walk_cozytensors(manifest_id))
     return TenantStore(root=store, weight_bytes=weight_bytes, config=config)
 
 
@@ -391,7 +375,6 @@ class TwoTenantOwner(LocalRecordOwner):
         spec = pb.InvocationSpec(
             package_revision_digest=self.package_revision_digest,
             environment_digest="",
-            config_digest="",
             payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
             inputs=self._input_bindings(body),
             outputs=self._output_bindings(),

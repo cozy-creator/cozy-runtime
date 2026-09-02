@@ -58,7 +58,6 @@ _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
 # Closed collection fields have one spelling even when empty (worker-protocol
 # scripts/canonical.py EXPLICIT_REPEATED; the same table in Creator's canonical writer).
 EXPLICIT_REPEATED: dict[str, tuple[str, ...]] = {
-    "cozy.worker.v1.Config": ("assets",),
     "cozy.worker.v1.DownloadDelegation": ("models", "packages"),
     "cozy.worker.v1.Entrypoint": ("slots",),
     "cozy.worker.v1.Environment": ("wheels",),

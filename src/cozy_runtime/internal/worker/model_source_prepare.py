@@ -179,7 +179,6 @@ def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareM
         profile = row.get("profile")
         manifest = row.get("manifest_digest")
         length = row.get("manifest_length")
-        evidence = row.get("checkpoint_evidence_canonical_bytes")
         if (
             not isinstance(slot, str)
             or slot <= prior
@@ -189,8 +188,6 @@ def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareM
             or not isinstance(length, int)
             or isinstance(length, bool)
             or length <= 0
-            or not isinstance(evidence, bytes)
-            or not 0 < len(evidence) <= weights_limits.MAX_CHECKPOINT_EVIDENCE_BYTES
         ):
             raise ModelSourceRefusal(
                 "model_source_tensorfs_result_invalid", "TensorFS returned an invalid row"
@@ -201,7 +198,6 @@ def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareM
                 slot=slot,
                 profile=profile,
                 manifest=pb.Ref(digest=documents.raw(manifest), length=length),
-                checkpoint_evidence_canonical_bytes=evidence,
             )
         )
     return pb.PrepareModelSourceResult(

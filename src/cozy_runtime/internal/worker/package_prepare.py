@@ -371,7 +371,6 @@ def prepare_private_placement(
         package_name=str(development.get("package", "")),
         selections=models,
         files=model_files,
-        artifact_cache=artifact_cache,
         artifact_store=artifact_store,
         verified=verified,
         derive=_deriver(installed, str(descriptor_body.get("application", ""))),
@@ -628,7 +627,6 @@ def prepare_package(
             package_name=package_name,
             selections=models,
             files=model_files,
-            artifact_cache=artifact_cache,
             artifact_store=artifact_store,
             verified=verified,
             derive=_deriver(installed, str(descriptor_body.get("application", ""))),
@@ -643,7 +641,6 @@ def prepare_package(
             package_name=package_name,
             selections=(),
             files={},
-            artifact_cache=artifact_cache,
             artifact_store=None,
             verified=verified,
             derive=None,
@@ -783,7 +780,6 @@ def _entrypoints(
     package_name: str,
     selections: Sequence[Any],
     files: Mapping[str, tuple[int, int, Path]],
-    artifact_cache: Path,
     artifact_store: Path | None,
     verified: Callable[[str, int, Path], None],
     derive: Deriver | None,
@@ -791,9 +787,7 @@ def _entrypoints(
     rows = body.get("entrypoints")
     if not isinstance(rows, list):
         raise PreparationRefusal("package_prepare_descriptor_invalid", "entrypoints")
-    selected = _selected_models(
-        package_name, selections, files, artifact_cache, artifact_store, verified
-    )
+    selected = _selected_models(package_name, selections, files, artifact_store, verified)
     if selected and derive is None:
         raise PreparationRefusal(
             "package_prepare_derive_refused", "a modeled selection needs the package environment"
@@ -849,13 +843,6 @@ def _entrypoints(
                 pb.Slot(
                     slot=path.removeprefix(prefix),
                     reference_model_id=model_id,
-                    config=pb.Config(
-                        document=pb.Ref(
-                            digest=documents.raw(str(model["config_digest"])),
-                            length=len(model["config_bytes"]),
-                        ),
-                        assets=[],
-                    ),
                     # WHAT THE DERIVE CONSTRUCTED, in construction order (D9) — never the
                     # header's component set. Whether those components exist in the
                     # checkpoint is the fit's question, answered at construction.
@@ -934,7 +921,6 @@ def _selected_models(
     package_name: str,
     selections: Sequence[Any],
     files: Mapping[str, tuple[int, int, Path]],
-    artifact_cache: Path,
     artifact_store: Path | None,
     verified: Callable[[str, int, Path], None],
 ) -> dict[str, dict[str, Any]]:
@@ -1062,12 +1048,11 @@ def _selected_models(
                     f"{digest}: expected configs, components, and no runtime-consumed assets",
                 )
             try:
-                config_digest, config_bytes = model_config.construction_document(store, configs)
+                config_digest, config_bytes = model_config.construction_document(configs)
             except model_config.ModelConfigRefusal as exc:
                 raise PreparationRefusal(
                     "package_prepare_model_config_mismatch", f"{digest}: {exc}"
                 ) from exc
-            _stage(artifact_cache, config_bytes)
             for value in selected.values():
                 if value["selection"]["manifest"] == digest:
                     value.update(

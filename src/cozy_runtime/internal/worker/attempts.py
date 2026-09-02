@@ -1110,12 +1110,6 @@ class AttemptEngine:
                 "InvocationSpec does not name the selected Environment",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
-        if not declared.development and attempt.spec.get("config_digest") != declared.config_digest:
-            raise AttemptRefusal(
-                "config_mismatch",
-                "InvocationSpec does not name the selected package/model configuration",
-                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-            )
         attempt.declared = declared
         attempt.prepared_model = prepared_model
         attempt.state = "preparing"
