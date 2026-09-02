@@ -230,10 +230,18 @@ def derive_in(python: Path, request: DeriveRequest, scratch: Path) -> tuple[Deri
         "",
     )
     if not encoded:
-        detail = (
-            result.stderr.strip()[-1200:] or f"child exited {result.returncode} without a result"
+        stderr = result.stderr.strip()
+        if "No module named cozy_runtime" in stderr or "No module named 'cozy_runtime'" in stderr:
+            raise DeriveRefusal(
+                "derive_runtime_absent",
+                f"{python}: its cozy-runtime carries no `derive` verb (the package's lock "
+                "selects an older runtime than the one preparing it); relock the package to "
+                "a runtime that carries it",
+            )
+        raise DeriveRefusal(
+            "derive_child_failed",
+            stderr[-1200:] or f"child exited {result.returncode} without a result",
         )
-        raise DeriveRefusal("derive_child_failed", detail)
     try:
         response = canonical.parse_canonical(base64.b64decode(encoded, validate=True))
     except (ValueError, canonical.CanonicalError) as err:
