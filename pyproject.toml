@@ -25,6 +25,8 @@ dev = [
     "mypy>=1.13",
     "pytest>=8.4",
     "ruff>=0.16",
+    # Model-bound Runtime tests exercise the real compiled storage boundary.
+    "tensorfs>=0.1.2,<1",
     "types-protobuf>=6.30",
     "av>=18.1,<19",
     # `cozy_runtime.derive` is numpy code; the checking venv installs numpy so mypy checks
@@ -98,9 +100,8 @@ module = ["av", "av.*"]
 ignore_missing_imports = true
 
 # `tensorfs` is tfs-007's compiled facade. It SHIPS type information (`py.typed` plus a
-# hand-written `_ext.pyi`), so this is not a case of an untyped dependency: it is simply not
-# installed in the checking venv, exactly like torch, because it is a native extension the
-# base package does not require. The GPU venvs install the wheel; see README.
+# hand-written `_ext.pyi`), so this is not a case of an untyped dependency. The development
+# environment installs it for model-bound Runtime tests; the base package still does not.
 [[tool.mypy.overrides]]
 module = ["tensorfs", "tensorfs.*"]
 ignore_missing_imports = true

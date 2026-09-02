@@ -10,13 +10,11 @@ from types import SimpleNamespace
 from typing import Any, TypedDict
 
 import pytest
+import tensorfs
 
 from cozy_runtime.internal import base_observation
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
-
-tensorfs = pytest.importorskip("tensorfs")
-
 
 # Canonical CozyTensors header produced by TensorFS itself. It contains one inline f32 tensor and
 # one six-byte tokenizer asset. Keeping the bytes fixed makes this a border test: Runtime does not
