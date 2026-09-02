@@ -1236,14 +1236,28 @@ def _resolve_development_models(
     artifact_store: Path,
     binding_overrides: Mapping[str, str] | None = None,
 ) -> Mapping[str, _DevelopmentModel]:
+    # The strict resolve runs over the WHOLE declared slot set — jobs' included, so a
+    # package.toml default for a job source (`<job>.models.<param>`) is a declared slot,
+    # not `unknown_binding`. Only entrypoint slots stage models here: a serving closure
+    # holds serving models, and a job's source binds per invocation (JobDirective).
     slots = [
         slot
         for surface in found.surfaces
         if surface.kind == "entrypoint" and not surface.hidden
         for slot in surface.model_bindings
     ]
+    job_slots = [
+        slot
+        for surface in found.surfaces
+        if surface.kind == "job" and not surface.hidden
+        for slot in surface.model_bindings
+    ]
+    job_paths = frozenset(slot.path for slot in job_slots)
+    declared = slots + job_slots
     try:
-        chosen = binding_table.resolve(slots, found.bindings, overrides=binding_overrides)
+        chosen = binding_table.resolve(
+            declared, found.bindings, overrides=binding_overrides, optional=job_paths
+        )
     except Exception as exc:
         raise RuntimeError(f"development_model_binding_invalid: {exc}") from exc
     try:
