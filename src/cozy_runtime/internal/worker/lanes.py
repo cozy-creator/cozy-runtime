@@ -18,15 +18,26 @@ Residence ceilings are ASSIGNED here, not derived in the executor (cr-025's
 subtracts what other executors on the lane were authorized but have not yet settled, so
 two executors preparing on one device cannot both be handed the same headroom. Every
 input is a measurement; nothing here is configured.
+
+Two model-bearing placements on ONE lane share it by RESIDENCY ARBITRATION, never by
+concurrency (cr-022, the owner's "one gets to use it first, then the next gets to use it
+for a different request"). Both executors exist, sealed to the lane; at most one holds
+its weights on the device at a time unless the measured card holds both. The trigger is
+an attempt (or a prepare) for a tenant whose demand does not fit what the driver reports
+free: the other tenants VACATE, LRU-first, until it does — eviction FREES (weights are
+immutable, nothing is copied out) and the vacated tenant re-stages on its own next
+attempt through the ordinary demand-pull admission. No timer and no idleness clock
+decides anything here; a tenant that fits beside its neighbours is never moved.
 """
 
 from __future__ import annotations
 
 import queue
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 
+from cozy_runtime.internal.accel import DeviceMemory
 from cozy_runtime.internal.worker import child
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.ledger import Ledger
@@ -71,6 +82,22 @@ class LaneRow:
     #: TRUE for a slot whose executor holds device memory (a model-bearing placement); a
     #: weightless executor never reaches the device and prices nothing on it
     model_bearing: bool = False
+    #: the executor slot this row's generation lives in, so the lane can ask it to vacate
+    supervision: child.ExecutorSupervision | None = None
+    #: the lane clock at this tenant's latest admission or prepare: LRU victim order
+    last_used: int = 0
+
+    def resident_bytes(self) -> int:
+        return sum(self.ledger.resident.values())
+
+    def executor(self) -> child.Executor | None:
+        """The live, unpoisoned executor holding this row's bytes, or None. A poisoned or
+        dead one is not a vacate candidate: its own rebuild reclaims it, by process death,
+        which frees more surely than any eviction."""
+        current = self.supervision.current if self.supervision is not None else None
+        if current is None or current.poisoned or not current.alive():
+            return None
+        return current
 
 
 class DeviceLane:
@@ -94,6 +121,14 @@ class DeviceLane:
         self.work: queue.Queue[AttemptRecord | ExecutorDeath | None] = queue.Queue()
         #: this lane's gate: has it STOPPED moving? A rebuild on another lane leaves it set.
         self.settled = threading.Event()
+        #: THE DEVICE, as a lock: held by the lane thread from an attempt's admission to its
+        #: terminal, and by any model-bearing prepare on this lane. Residency arbitration
+        #: vacates co-tenants under it, so a tenant is never evicted while its own attempt
+        #: is on the card. Re-entrant because the lane thread rebuilds (prepares) inside
+        #: its own hold.
+        self.device = threading.RLock()
+        #: the LRU clock: advanced by `touch`, never by time
+        self.clock = 0
 
     def __repr__(self) -> str:
         return f"DeviceLane({self.lane_id!r}, devices={self.devices!r})"
@@ -112,6 +147,26 @@ class DeviceLane:
 
     def model_bearing_slots(self) -> list[str]:
         return sorted(slot for slot, row in self.rows.items() if row.model_bearing)
+
+    def touch(self, slot: str) -> None:
+        """`slot`'s tenant used the device (an admission or a prepare): it is now MRU."""
+        self.clock += 1
+        self.row(slot).last_used = self.clock
+
+    def victims(self, slot: str) -> list[tuple[str, LaneRow]]:
+        """The co-tenants of `slot` that hold device bytes, LRU first (the arbitration's
+        eviction order, design §4.6): model-bearing rows with resident components and a
+        live, unpoisoned executor to ask. A row mid-prepare (outstanding authorization,
+        no construction facts yet) holds nothing the driver has settled and is skipped."""
+        held = [
+            (key, row)
+            for key, row in self.rows.items()
+            if key != slot
+            and row.model_bearing
+            and row.resident_bytes() > 0
+            and row.executor() is not None
+        ]
+        return sorted(held, key=lambda item: item[1].last_used)
 
     # ------------------------------------------------------------- assigned ceilings
 
@@ -199,22 +254,30 @@ class LaneSet:
         *,
         model_bearing: bool,
         declared_bytes: int,
-        measured_free: dict[str, int],
+        measured: Mapping[str, DeviceMemory],
     ) -> DeviceLane:
         """Choose the lane for a placement by MEASURED fit, or refuse typed.
 
         The worker never orders attempts (#475); it does own GPU allocation (#659), and this
-        is the whole of it. A model-bearing placement takes the first lane (envelope order)
-        that holds no other model-bearing placement and whose measured free bytes, less the
-        ceilings the lane has outstanding, cover the placement's declared weight bytes. One
-        model-bearing placement per lane is the shape this issue builds; same-lane co-fit
-        over these rows is cr-022's arithmetic and is refused here, not guessed at. A
-        weightless placement holds no device memory and goes to the lane with the fewest
-        placements, so its attempts do not all queue behind one seat.
+        is the whole of it. A model-bearing placement is placed in this order, envelope
+        order within each step, and every number is the driver's:
 
-        `measured_free` maps lane id to the lane's measured free bytes, and a lane absent
-        from it is UNREADABLE: it cannot be shown to fit, so it is never chosen for a
-        model-bearing placement.
+        1. a lane holding no other model-bearing placement whose measured free bytes, less
+           the ceilings the lane has outstanding, cover the declared weight bytes — the
+           placement has the device to itself (cr-066);
+        2. a lane whose measured headroom still covers the declared bytes BESIDE its
+           tenants — co-residency, no swap will ever be needed unless the measurements
+           move (cr-022's co-fit arm);
+        3. a lane whose measured TOTAL covers the declared bytes — time-sliced sharing
+           (cr-022's swap arm): the placement fits the card alone, and the lane's residency
+           arbitration gives it the card when its attempts need it. Fewest model-bearing
+           tenants first, so sharing spreads before it stacks.
+
+        Nothing fitting anywhere is `device_lane_infeasible`, and moves no other
+        placement. A lane absent from `measured` is UNREADABLE and can be shown to fit
+        nothing, so it is never chosen for a model-bearing placement. A weightless
+        placement holds no device memory and goes to the lane with the fewest placements,
+        so its attempts do not all queue behind one seat.
         """
         current = self.lane_of(placement_id)
         if current is not None:
@@ -224,24 +287,37 @@ class LaneSet:
             chosen.placements.add(placement_id)
             return chosen
         shortfalls: list[str] = []
+        readable: list[tuple[DeviceLane, DeviceMemory]] = []
         for lane in self.lanes:
-            occupied = lane.model_bearing_slots()
-            if occupied:
-                shortfalls.append(f"{lane.lane_id} holds model-bearing {occupied}")
-                continue
-            free = measured_free.get(lane.lane_id)
-            if free is None:
+            memory = measured.get(lane.lane_id)
+            if memory is None or memory.state != "measured":
                 shortfalls.append(f"{lane.lane_id} free bytes unreadable")
                 continue
-            headroom = free - lane.outstanding_bytes()
-            if headroom < declared_bytes:
-                shortfalls.append(
-                    f"{lane.lane_id} has {headroom} B measured headroom for {declared_bytes} B "
-                    "of declared weights"
-                )
-                continue
-            lane.placements.add(placement_id)
-            return lane
+            readable.append((lane, memory))
+
+        def headroom(lane: DeviceLane, memory: DeviceMemory) -> int:
+            return memory.free_bytes - lane.outstanding_bytes()
+
+        alone = [
+            lane
+            for lane, memory in readable
+            if not lane.model_bearing_slots() and headroom(lane, memory) >= declared_bytes
+        ]
+        beside = [lane for lane, memory in readable if headroom(lane, memory) >= declared_bytes]
+        shared = sorted(
+            (lane for lane, memory in readable if memory.total_bytes >= declared_bytes),
+            key=lambda lane: (len(lane.model_bearing_slots()), lane.ordinals),
+        )
+        for candidates in (alone, beside, shared):
+            if candidates:
+                chosen = candidates[0]
+                chosen.placements.add(placement_id)
+                return chosen
+        for lane, memory in readable:
+            shortfalls.append(
+                f"{lane.lane_id} has {headroom(lane, memory)} B measured headroom and "
+                f"{memory.total_bytes} B total for {declared_bytes} B of declared weights"
+            )
         raise LaneRefusal(
             "device_lane_infeasible",
             f"no lane fits placement {placement_id!r}: " + "; ".join(shortfalls),

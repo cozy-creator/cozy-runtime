@@ -572,6 +572,9 @@ class PlanChooser:
         was established. It read a generation-wide activation maximum before and ignored
         the request entirely, which is the same number for every shape a deployment serves
         (codex audit, adopted 2026-08-25)."""
+        return self._demand(declared, prepared.cell())
+
+    def _demand(self, declared: DeclaredBinding, cell: str) -> list[Coefficient]:
         resident = self.ledger.resident or {}
         absent = self.ledger.evicted or {}
         # The GENERATION's weights, resident or parked. A component a rung evicted is still
@@ -590,7 +593,7 @@ class PlanChooser:
                 else "",
             )
         ]
-        activations, source = self.ledger.activations_for(prepared.cell())
+        activations, source = self.ledger.activations_for(cell)
         if activations > 0:
             terms.append(Coefficient("activations", activations, "measured", source))
         else:
@@ -611,36 +614,14 @@ class PlanChooser:
 
     # ------------------------------------------------------------------ the walk
 
-    def choose(
-        self,
-        declared: DeclaredBinding,
-        prepared_model: PreparedModel,
-        prepared: PreparedRequest,
-    ) -> AttemptPlan:
-        self.choices += 1
-        if self.ledger.unreconciled:
-            # A CHOOSER MAY NOT PRICE AGAINST A LEDGER THAT IS KNOWN TO BE WRONG. This is the
-            # loud half of cl-003's defect: the drift existed, this repository's own
-            # reconciliation had already NAMED it, and the next request was priced against it
-            # anyway — so a capacity fact arrived as an OOM in the middle of a VAE decode and
-            # was reported as the package's exception. An unreconciled ledger reconciles
-            # (a fresh generation re-establishes it) or it refuses; it never guesses.
-            raise PlanRefusal(
-                "ledger_unreconciled",
-                f"this worker's ledger is not a truth right now and no rung may be priced "
-                f"against it: {self.ledger.unreconciled}. The generation is invalidated and "
-                "rebuilt, which re-establishes every number from a real construction; until "
-                "then a plan chosen here would be arithmetic over a residency the worker "
-                "already knows it cannot vouch for",
-                {
-                    "resource": "vram",
-                    "scope": "ledger",
-                    "needed_bytes": 0,
-                    "available_bytes": max(self.ledger.allocatable, 0),
-                    "evidence_class": "measured",
-                },
-            )
-        terms = {c.name: c for c in self.demand(declared, prepared)}
+    def _walk(
+        self, declared: DeclaredBinding, cell: str
+    ) -> tuple[dict[str, Coefficient], list[dict[str, Any]], str, dict[str, Any]]:
+        """The ladder walk over the LIVE ledger: demand terms, one row per rung, the first
+        rung that fits (or ""), and the walk document (the rows ride it as `rungs`).
+        `choose` turns the result into a plan; `fits` asks only whether a rung exists
+        (cr-022's lane arbitration)."""
+        terms = {c.name: c for c in self._demand(declared, cell)}
         resident = self.ledger.resident or {}
         # THE COMPONENTS THIS GENERATION DECLARES BUT IS NOT HOLDING. They are not free: a
         # rung that wants them resident has to bring every one of them BACK, and the walk
@@ -650,7 +631,6 @@ class PlanChooser:
         absent = self.ledger.evicted or {}
         absent_bytes = sum(absent.values())
         declared_bytes = sum(resident.values()) + absent_bytes
-        weights = declared_bytes or declared.model_weight_bytes
         # `device_allocatable` is what a NEW reservation can actually get. It already
         # accounts for whatever this generation holds, so the ladder's arithmetic is over
         # HEADROOM: what the attempt needs ON TOP of the weights that are already there.
@@ -668,7 +648,6 @@ class PlanChooser:
         ]
         largest = max([max(sizes.values(), default=declared.model_weight_bytes), *scoped])
         activations = terms["activations"]
-        cell = prepared.cell()
         measured_scopes = self.ledger.activation_scopes_for(cell)
         scope_headrooms = {
             method: measured_scopes.get(method, activations.value)
@@ -753,8 +732,58 @@ class PlanChooser:
             "rungs": rows,
             "shape_cell": cell,
         }
+        return terms, rows, chosen, walk
+
+    def fits(self, declared: DeclaredBinding, cell: str = "") -> str:
+        """The first proven rung that fits this generation on the ledger AS IT STANDS, or
+        "" when none does. No I/O and no side effect: the lane reads it before pricing an
+        attempt and again after re-measuring the device, to decide whether a co-tenant must
+        give the card up (cr-022). An unreconciled ledger fits nothing — `choose` refuses it
+        typed and no arbitration should move bytes on its account."""
+        if self.ledger.unreconciled:
+            return ""
+        _terms, _rows, chosen, _walk = self._walk(declared, cell)
+        return chosen
+
+    def choose(
+        self,
+        declared: DeclaredBinding,
+        prepared_model: PreparedModel,
+        prepared: PreparedRequest,
+    ) -> AttemptPlan:
+        self.choices += 1
+        if self.ledger.unreconciled:
+            # A CHOOSER MAY NOT PRICE AGAINST A LEDGER THAT IS KNOWN TO BE WRONG. This is the
+            # loud half of cl-003's defect: the drift existed, this repository's own
+            # reconciliation had already NAMED it, and the next request was priced against it
+            # anyway — so a capacity fact arrived as an OOM in the middle of a VAE decode and
+            # was reported as the package's exception. An unreconciled ledger reconciles
+            # (a fresh generation re-establishes it) or it refuses; it never guesses.
+            raise PlanRefusal(
+                "ledger_unreconciled",
+                f"this worker's ledger is not a truth right now and no rung may be priced "
+                f"against it: {self.ledger.unreconciled}. The generation is invalidated and "
+                "rebuilt, which re-establishes every number from a real construction; until "
+                "then a plan chosen here would be arithmetic over a residency the worker "
+                "already knows it cannot vouch for",
+                {
+                    "resource": "vram",
+                    "scope": "ledger",
+                    "needed_bytes": 0,
+                    "available_bytes": max(self.ledger.allocatable, 0),
+                    "evidence_class": "measured",
+                },
+            )
+        terms, _rows, chosen, walk = self._walk(declared, prepared.cell())
         self.walks.append(walk)
         del self.walks[:-16]
+        activations = terms["activations"]
+        allocatable = self.ledger.allocatable
+        resident = walk["resident"]
+        absent = walk["absent"]
+        absent_bytes = sum(absent.values())
+        weights = walk["declared_bytes"] or declared.model_weight_bytes
+        scope_headrooms = walk["scope_headroom_bytes"]
         if not chosen:
             proven = tuple(placement for placement, _why, status in RUNGS if status == "proven")
             if proven and all(self.ledger.placement_refusal(placement) for placement in proven):

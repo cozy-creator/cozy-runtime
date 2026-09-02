@@ -97,6 +97,7 @@ from cozy_runtime.internal.worker.lanes import (
     DeviceLane,
     ExecutorDeath,
     LaneRefusal,
+    LaneRow,
     LaneSet,
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
@@ -332,11 +333,14 @@ class Placement:
 
 @dataclass(slots=True)
 class HostedPlacement:
-    """One additional weightless placement and the process that imports only its package.
+    """One additional placement and the process that imports only its package.
 
     The original single-placement fields remain the primary slot.  Keeping this value small
     makes the co-fitting cut equally small: package-local bindings, failures and supervision
-    never become a second scheduler or a shared environment.
+    never become a second scheduler or a shared environment. A hosted placement may bear a
+    model (cr-022): its executor is sealed to the lane the worker assigned it, prepared
+    through the same generation prepare as the primary, and shares that lane's device by
+    residency arbitration when it does not co-fit.
     """
 
     placement: Placement
@@ -345,6 +349,29 @@ class HostedPlacement:
     prepared_models: dict[str, PreparedModel] = field(default_factory=dict)
     failed_bindings: dict[str, str] = field(default_factory=dict)
     latched: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Tenant:
+    """ONE placement's executor slot on its lane, as a prepare reads it.
+
+    The primary slot and a hosted one keep their state in different places; the generation
+    prepare (`_prepare_generation`) reads neither directly. It reads this, so the two
+    cannot drift apart again — the hosted prepare used to be a second, thinner path with no
+    assigned ceiling, no construction facts and no per-binding faults, which is why it could
+    host weightless packages only.
+    """
+
+    placement: Placement
+    supervision: ExecutorSupervision
+    bindings: dict[str, DeclaredBinding]
+    prepared_models: dict[str, PreparedModel]
+    failed_bindings: dict[str, str]
+    lane: DeviceLane
+    slot: str
+
+    def row(self) -> LaneRow:
+        return self.lane.row(self.slot)
 
 
 @dataclass(slots=True)
@@ -961,9 +988,9 @@ class Worker:
         #: a separate field precisely because one field cannot hold both, which is the same
         #: reason the observed state has two axes.
         self.pending: Placement | None = None
-        #: Additional pure-Python packages hosted beside the primary placement.  Each gets
-        #: its own immutable uv environment and executor, sealed to the lane the worker
-        #: assigned it; an attempt takes its own placement's lane seat and no other.
+        #: Additional placements hosted beside the primary one, weightless or model-bearing.
+        #: Each gets its own immutable uv environment and executor, sealed to the lane the
+        #: worker assigned it; an attempt takes its own placement's lane seat and no other.
         self.hosted: dict[str, HostedPlacement] = {}
         self.pending_hosted: list[dict[str, Any]] = []
         #: Job mode has no placement, so it carries its own dispatchability edge (cr-009).
@@ -1131,29 +1158,34 @@ class Worker:
             raise RuntimeError(f"placement {placement_id!r} has no device lane")
         return lane
 
-    def _assign_lane(self, placement: Placement, bindings: Mapping[str, DeclaredBinding]) -> bool:
+    def _assign_lane(
+        self,
+        placement: Placement,
+        bindings: Mapping[str, DeclaredBinding],
+        supervision: ExecutorSupervision,
+    ) -> bool:
         """Assign one placement to a lane by MEASURED fit (cr-066 R2), or latch it typed.
 
         The declared bytes are the placement's model weight bytes from its bindings' MCC
-        census; the measured side is each lane's driver-reported free bytes, read now. A
-        placement that fits nowhere refuses `device_lane_infeasible` and leaves every other
-        placement where it is — never a silent over-commit onto some lane.
+        census; the measured side is each lane's driver-reported free and total bytes, read
+        now. A placement that fits nowhere refuses `device_lane_infeasible` and leaves every
+        other placement where it is — never a silent over-commit onto some lane. The row
+        the lane keeps for it remembers `supervision`, the slot the lane asks to vacate
+        when a co-tenant needs the card (cr-022).
         """
         model_bearing = any(not binding.weightless for binding in bindings.values())
         declared = sum(binding.model_weight_bytes for binding in bindings.values())
-        measured: dict[str, int] = {}
+        measured: dict[str, accel.DeviceMemory] = {}
         if model_bearing:
             kind = accel.host_backend_family()
             for lane in self.lanes.lanes:
-                memory = accel.device_memory(lane.devices, kind)
-                if memory.state == "measured":
-                    measured[lane.lane_id] = memory.free_bytes
+                measured[lane.lane_id] = accel.device_memory(lane.devices, kind)
         try:
             lane = self.lanes.assign(
                 placement.placement_id,
                 model_bearing=model_bearing,
                 declared_bytes=declared,
-                measured_free=measured,
+                measured=measured,
             )
         except LaneRefusal as exc:
             placement.lane_id = ""
@@ -1168,12 +1200,16 @@ class Worker:
             self.note("materialization", f"{placement.placement_id!r} refused: {exc}"[:256])
             return False
         placement.lane_id = lane.lane_id
-        lane.row(placement.placement_id).model_bearing = model_bearing
+        row = lane.row(placement.placement_id)
+        row.model_bearing = model_bearing
+        row.supervision = supervision
+        tenants = [slot for slot in lane.model_bearing_slots() if slot != placement.placement_id]
         self.note(
             "materialization",
             f"{placement.placement_id!r} assigned to {lane.lane_id} "
             f"(CUDA_VISIBLE_DEVICES={lane.devices!r}; "
             + ("model-bearing" if model_bearing else "weightless")
+            + (f"; shares the device with {tenants} by residency arbitration" if tenants else "")
             + ")",
         )
         return True
@@ -2710,7 +2746,7 @@ class Worker:
                 self._release_lane(outgoing.placement_id)
         # THE LANE, before the executor exists to be sealed to it (cr-066): the same
         # placement id keeps its lane across a replacement; a new one is placed by fit.
-        if not self._assign_lane(candidate, bindings):
+        if not self._assign_lane(candidate, bindings, self.supervision):
             candidate.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
             self.placement = candidate
             self.pending = None
@@ -2772,7 +2808,7 @@ class Worker:
             self.bump_admission(f"placement {placement_id!r} removed")
 
     def _reconcile_hosted(self, revision: int) -> None:
-        """Converge additional weightless packages without disturbing the primary one."""
+        """Converge the additional placements without disturbing the primary one."""
 
         if revision != self.accepted.accepted_desired_state_revision:
             return
@@ -2815,7 +2851,7 @@ class Worker:
         self._settle()
 
     def _activate_hosted(self, hosted: HostedPlacement, revision: int) -> None:
-        """Acquire and start one pure-Python package in its own existing uv environment."""
+        """Acquire, place and activate one hosted placement in its own uv environment."""
 
         placement = hosted.placement
         placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_MATERIALIZING
@@ -2823,21 +2859,19 @@ class Worker:
         if acquired is None or revision != self.accepted.accepted_desired_state_revision:
             return
         bindings = dict(acquired.bindings)
-        if (
-            placement.models
-            or not bindings
-            or any(not binding.weightless for binding in self.bindings.values())
-            or any(not binding.weightless for binding in bindings.values())
-        ):
+        if not bindings:
+            # A placement with nothing to serve. Model-bearing hosted placements are admitted
+            # (cr-022): the lane assignment below places them by measured fit — another lane
+            # of their own, co-resident beside a tenant that leaves room, or time-sliced on
+            # a shared lane — and the generation prepare is the primary's own.
             placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
-            hosted.latched = "multi_placement_requires_weightless"
+            hosted.latched = "placement_without_bindings"
             self.engine.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                     subject=placement.placement_id,
                     reason=hosted.latched,
-                    detail="simultaneous package placement currently admits pure-Python, "
-                    "model-free bindings only",
+                    detail="the placement resolved no entrypoint binding to serve",
                 )
             )
             self.note(
@@ -2853,7 +2887,7 @@ class Worker:
         hosted.bindings = bindings
         hosted.prepared_models = {}
         hosted.failed_bindings = {}
-        if not self._assign_lane(placement, bindings):
+        if not self._assign_lane(placement, bindings, hosted.supervision):
             placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
             hosted.latched = "device_lane_infeasible"
             self._settle()
@@ -2862,62 +2896,32 @@ class Worker:
         self._prepare_hosted_executor(hosted)
 
     def _prepare_hosted_executor(self, hosted: HostedPlacement) -> None:
+        """ACTIVATE one hosted placement through the generation prepare the primary uses.
+
+        The serving edge is the hosted placement's own; the worker-level latch is not
+        touched — a hosted placement that cannot prepare latches itself and the others keep
+        serving. No boot warm pass runs for a hosted placement: package execution begins
+        with its first attempt, as it does for every dynamic placement.
+        """
         placement = hosted.placement
         self._hosted_set_serving(
             placement.placement_id,
             pb.ServingState.SERVING_STATE_ACTIVATING,
             f"activating placement {placement.placement_id!r}",
         )
-        executor = hosted.supervision.current
-        lane = self._lane_of(placement.placement_id)
-        try:
-            if executor is None:
-                executor = hosted.supervision.spawn(imposed=self.imposed(lane))
-            elif not executor.alive() or executor.poisoned:
-                executor = hosted.supervision.replace(
-                    executor, imposed=self.imposed(lane), why="placement executor changed"
-                )
-            group = list(hosted.bindings.values())
-            first = group[0]
-            reply = executor.call(
-                executor_prepare_command(first, devices=lane.devices), timeout=None
-            )
-            if not reply.get("ok"):
-                raise ExecutorGone(f"{reply.get('code')}: {reply.get('detail', '')}")
-            facts = reply.get("facts") or {}
-            prepared = PreparedModel(
-                logical_model_digest=str(reply.get("model_construction_digest", "")),
-                constructed_model_digest=str(reply.get("constructed_model_digest", "")),
-                delivery_rung="",
-                delivery_variant="",
-                weight_bytes=int(facts.get("filled_bytes", 0)),
-            )
-            executor.construction_key = first.construction_key()
-            executor.prepared_binding_set = frozenset(hosted.bindings)
-            executor.prepared_model = prepared
-            for binding in group:
-                executor.ready_bindings.add(binding.entrypoint_binding_digest)
-                hosted.prepared_models[binding.entrypoint_binding_digest] = prepared
-            self.note(
-                "boot",
-                f"{placement.placement_id!r} executor epoch {executor.epoch} "
-                f"pid {executor.pid} prepared {len(group)} binding(s)",
-            )
-        except Exception as exc:
-            placement.serving = pb.ServingState.SERVING_STATE_OFFLINE
-            hosted.latched = f"activation_failed: {safe(str(exc))}"[:200]
-            self.engine.fault(
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                    subject=placement.placement_id,
-                    reason="activation_failed",
-                    detail=safe(str(exc)),
-                )
+        hosted.failed_bindings.clear()
+        latch, _reused = self._prepare_generation(self._tenant(placement.placement_id))
+        if latch:
+            hosted.latched = latch
+            self._hosted_set_serving(
+                placement.placement_id,
+                pb.ServingState.SERVING_STATE_OFFLINE,
+                f"placement {placement.placement_id!r} latched: {latch}"[:200],
             )
             self.note(
                 "boot",
                 f"{placement.placement_id!r} activation failed; other placements stay live: "
-                f"{safe(str(exc))}",
+                f"{latch}",
             )
             self._settle()
             return
@@ -3388,20 +3392,93 @@ class Worker:
                     self._settle()
             self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "no bindings")
             return
+        assert self.placement is not None
         # A fresh activation re-earns every verdict; a stale fault must not outlive the
         # prepare that produced it.
         self.failed_bindings.clear()
         self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING)
+        latch, reused = self._prepare_generation(self._tenant(self.placement.placement_id))
+        if latch:
+            self.latched = latch
+            if (
+                latch == "prepare refused: every binding"
+                and self.options.development_project is not None
+            ):
+                # A source-checkout generation has one placement and no retained published
+                # fallback. Creator's readiness owner treats FAILED materialization as the
+                # terminal answer and replaces this generation; leaving it STAGED/OFFLINE
+                # made a permanent prepare refusal look like an endlessly activating model.
+                self.placement.materialization = (
+                    pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+                )
+            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, latch[:200])
+            self._settle()
+            return
+        if reused:
+            # The high-water mark moves BEFORE the edge is published. `set_serving`
+            # reports immediately — dispatchability is an edge — and `converged_revision`
+            # CLAMPS itself back until serving actually says DISPATCHABLE, so writing it
+            # first cannot publish an early claim, while writing it second published one
+            # frame that said DISPATCHABLE and not-converged in the same breath.
+            self.accepted.converged_revision = self.accepted.accepted_desired_state_revision
+            self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
+            return
+        if self.failed_bindings:
+            self.note(
+                "boot",
+                f"{len(self.bindings) - len(self.failed_bindings)} of {len(self.bindings)} "
+                f"binding(s) prepared; faulted: " + ", ".join(sorted(self.failed_bindings)),
+            )
+        self._finish_activation()
+
+    def _tenant(self, placement_id: str) -> Tenant:
+        """The prepare's view of one placement's slot: the primary's or a hosted one's."""
+        hosted = self.hosted.get(placement_id)
+        if hosted is None:
+            assert self.placement is not None and self.placement.placement_id == placement_id
+            return Tenant(
+                placement=self.placement,
+                supervision=self.supervision,
+                bindings=self.bindings,
+                prepared_models=self.prepared_models,
+                failed_bindings=self.failed_bindings,
+                lane=self._primary_lane(),
+                slot=self._primary_slot(),
+            )
+        return Tenant(
+            placement=hosted.placement,
+            supervision=hosted.supervision,
+            bindings=hosted.bindings,
+            prepared_models=hosted.prepared_models,
+            failed_bindings=hosted.failed_bindings,
+            lane=self._lane_of(placement_id),
+            slot=placement_id,
+        )
+
+    def _prepare_generation(self, tenant: Tenant) -> tuple[str, bool]:
+        """ONE placement's generation: spawn or reuse its executor, prepare its ONE
+        construction under the lane's assigned ceiling, bank the construction facts on its
+        row. The same code for the primary slot and for every hosted placement (cr-022).
+
+        Returns `(latch, reused)`: an empty latch means at least one binding is ready;
+        `reused` means the live generation already held this construction and nothing was
+        prepared. A model-bearing prepare holds the lane's DEVICE lock: an attempt on a
+        co-tenant cannot be on the card while this prepare vacates it or fills beside it.
+        """
         by_construction: dict[str, list[DeclaredBinding]] = {}
-        for binding in self.bindings.values():
+        for binding in tenant.bindings.values():
             by_construction.setdefault(binding.construction_key(), []).append(binding)
+        placement_id = tenant.placement.placement_id
         if len(by_construction) != 1:
+            # ONE construction per executor. Two model-bearing placements share a lane as
+            # two executors (residency arbitration between them); two constructions in one
+            # placement would be one executor with two generations, which nothing prices.
             detail = (
-                f"the launch worker received {len(by_construction)} distinct model "
+                f"placement {placement_id!r} received {len(by_construction)} distinct model "
                 "constructions, but one executor can own exactly one prepared generation"
             )
-            for binding in self.bindings.values():
-                self.failed_bindings[binding.entrypoint_binding_digest] = detail
+            for binding in tenant.bindings.values():
+                tenant.failed_bindings[binding.entrypoint_binding_digest] = detail
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
@@ -3410,20 +3487,17 @@ class Worker:
                         detail=detail,
                     )
                 )
-            executor = self.supervision.current
+            executor = tenant.supervision.current
             if executor is not None:
                 try:
-                    self.supervision.retire_current(executor, detail)
+                    tenant.supervision.retire_current(executor, detail)
                 except ExecutorGone as exc:
                     self.note("recovery", f"multi-construction reclaim failed: {exc}")
-            self.latched = "multiple_constructions_unsupported"
-            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
-            self._settle()
-            return
+            return "multiple_constructions_unsupported", False
 
         construction_key, group = next(iter(by_construction.items()))
         binding_set = frozenset(binding.entrypoint_binding_digest for binding in group)
-        executor = self.supervision.current
+        executor = tenant.supervision.current
         if (
             executor is not None
             and executor.alive()
@@ -3438,39 +3512,44 @@ class Worker:
                     binding.expected_logical_model_digest
                     != executor.prepared_model.logical_model_digest
                 ):
-                    self.failed_bindings[binding.entrypoint_binding_digest] = (
+                    tenant.failed_bindings[binding.entrypoint_binding_digest] = (
                         "logical model digest mismatch"
                     )
                     continue
                 executor.ready_bindings.add(binding.entrypoint_binding_digest)
-                self.prepared_models[binding.entrypoint_binding_digest] = executor.prepared_model
+                tenant.prepared_models[binding.entrypoint_binding_digest] = executor.prepared_model
             self.note(
                 "boot",
-                f"reused epoch {executor.epoch} pid {executor.pid} for the same "
-                f"construction ({len(executor.ready_bindings)} binding(s))",
+                f"{placement_id!r} reused epoch {executor.epoch} pid {executor.pid} for the "
+                f"same construction ({len(executor.ready_bindings)} binding(s))",
             )
             if executor.ready_bindings:
-                # The high-water mark moves BEFORE the edge is published. `set_serving`
-                # reports immediately — dispatchability is an edge — and `converged_revision`
-                # CLAMPS itself back until serving actually says DISPATCHABLE, so writing it
-                # first cannot publish an early claim, while writing it second published one
-                # frame that said DISPATCHABLE and not-converged in the same breath.
-                self.accepted.converged_revision = self.accepted.accepted_desired_state_revision
-                self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
-            else:
-                self.latched = "logical model digest mismatch"
-                self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
-            return
+                return "", True
+            return "logical model digest mismatch", False
 
-        lane = self._primary_lane()
-        slot = self._primary_slot()
+        first = group[0]
+        with tenant.lane.device if not first.weightless else contextlib.nullcontext():
+            return self._prepare_construction(tenant, group, construction_key, binding_set)
+
+    def _prepare_construction(
+        self,
+        tenant: Tenant,
+        group: list[DeclaredBinding],
+        construction_key: str,
+        binding_set: frozenset[str],
+    ) -> tuple[str, bool]:
+        """The device half of `_prepare_generation`, under the lane's device lock."""
+        lane, slot = tenant.lane, tenant.slot
+        placement_id = tenant.placement.placement_id
+        executor = tenant.supervision.current
         try:
             if executor is None:
                 self.note(
                     "boot",
-                    f"spawning the device executor (exec-first trampoline) on {lane.lane_id}",
+                    f"{placement_id!r}: spawning the device executor (exec-first trampoline) "
+                    f"on {lane.lane_id}",
                 )
-                executor = self.supervision.spawn(imposed=self.imposed(lane))
+                executor = tenant.supervision.spawn(imposed=self.imposed(lane))
             elif (
                 executor.alive()
                 and not executor.poisoned
@@ -3480,226 +3559,214 @@ class Worker:
             ):
                 self.note(
                     "boot",
-                    f"preparing fresh epoch {executor.epoch} pid {executor.pid}",
+                    f"{placement_id!r}: preparing fresh epoch {executor.epoch} pid {executor.pid}",
                 )
             else:
-                self.note("boot", "replacing the device executor for a new construction")
-                executor = self.supervision.replace(
+                self.note(
+                    "boot",
+                    f"{placement_id!r}: replacing the device executor for a new construction",
+                )
+                executor = tenant.supervision.replace(
                     executor,
                     imposed=self.imposed(lane),
                     why="desired construction changed",
                 )
             self.note(
                 "boot",
-                f"epoch {executor.epoch} pid {executor.pid} dialled back in "
+                f"{placement_id!r} epoch {executor.epoch} pid {executor.pid} dialled back in "
                 f"{(executor.ready_at - executor.spawned_at) * 1000:.0f} ms "
                 f"(no_new_privs={executor.hello.get('no_new_privs')}, "
                 f"oom_score_adj={executor.hello.get('oom_score_adj')}, "
                 f"torch_loaded={executor.hello.get('torch_loaded')})",
             )
         except ExecutorGone as exc:
-            self.latched = f"executor_activation_failed: {exc}"[:200]
-            self.note("boot", self.latched)
-            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "executor absent")
-            self._settle()
-            return
+            self.note("boot", f"{placement_id!r}: executor_activation_failed: {exc}"[:256])
+            return f"executor_activation_failed: {exc}"[:200], False
 
-        for group in by_construction.values():
-            first = group[0]
-            started = time.perf_counter()
-            subject = f"prepare:{first.components[0] if first.components else first.entrypoint}"
-            try:
-                authorized = self._authorize_prepare(lane, slot, first)
-            except LaneRefusal as exc:
-                # No byte moved and the executor is untouched: the BINDINGS fault, typed,
-                # and the placement reports what the driver would not say.
-                for member in group:
-                    self.failed_bindings[member.entrypoint_binding_digest] = str(exc)
-                    self.engine.fault(
-                        pb.Fault(
-                            kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                            subject=member.entrypoint_binding_digest,
-                            reason=exc.code,
-                            detail=safe(exc.detail),
-                        )
-                    )
-                self.note("boot", f"prepare REFUSED before the executor: {exc}"[:256])
-                continue
-            self.monitor.start(subject, "load")
-            try:
-                reply = executor.call(
-                    executor_prepare_command(
-                        first, devices=lane.devices, authorized_device_limit_bytes=authorized
-                    ),
-                    timeout=None,
-                    on_progress=lambda frame: self.monitor.advance(
-                        f"prepare:{frame.get('name', '')}", int(frame.get("position", 0) or 0)
-                    ),
-                )
-            except ExecutorGone as exc:
-                lane.settle(slot)
-                self.monitor.end(subject, "executor_gone")
-                detail = f"executor disappeared during prepare: {exc}"[:1024]
-                for member in group:
-                    self.failed_bindings[member.entrypoint_binding_digest] = detail
-                    self.engine.fault(
-                        pb.Fault(
-                            kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                            subject=member.entrypoint_binding_digest,
-                            reason="executor_gone_during_prepare",
-                            detail=safe(detail),
-                        )
-                    )
-                try:
-                    self.supervision.retire_current(executor, detail)
-                except ExecutorGone as reclaim:
-                    self.note("recovery", f"prepare-loss reclaim failed: {reclaim}")
-                continue
-            took = (time.perf_counter() - started) * 1000
-            # The authorization SETTLED with this reply, refused or filled: whatever the
-            # process holds is the driver's to see now, and a refused one is replaced.
-            lane.settle(slot)
-            if not reply.get("ok"):
-                self.monitor.end(subject, str(reply.get("code")))
-                self.boot.step(
-                    "load",
-                    "refused",
-                    took,
-                    component=first.components[0] if first.components else "",
-                    code=str(reply.get("code")),
-                )
-                detail = str(reply.get("detail"))[:1024]
-                shortfall = reply.get("shortfall") or {}
-                if shortfall:
-                    detail = (
-                        f"{shortfall['resource']} shortfall at {shortfall['scope']}: "
-                        f"needed {shortfall['needed_bytes']} B, "
-                        f"{shortfall['available_bytes']} B free (measured) - {detail}"
-                    )[:1024]
+        first = group[0]
+        started = time.perf_counter()
+        subject = f"prepare:{first.components[0] if first.components else first.entrypoint}"
+        if not first.weightless:
+            # THE LANE IS SHARED BY RESIDENCY (cr-022): before this generation is handed a
+            # ceiling, co-tenants that leave it no room for its declared weights give the
+            # card up. What is measured is the driver's free bytes less the lane's other
+            # outstanding ceilings; what is declared is the binding's own MCC census.
+            declared = sum(binding.model_weight_bytes for binding in group)
+            lane.touch(slot)
+            self._make_room(
+                lane,
+                slot,
+                lambda memory: memory.free_bytes - lane.outstanding_bytes() >= declared,
+                f"prepare of {placement_id!r} declaring {declared} B",
+            )
+        try:
+            authorized = self._authorize_prepare(lane, slot, first)
+        except LaneRefusal as exc:
+            # No byte moved and the executor is untouched: the BINDINGS fault, typed,
+            # and the placement reports what the driver would not say.
+            for member in group:
+                tenant.failed_bindings[member.entrypoint_binding_digest] = str(exc)
                 self.engine.fault(
                     pb.Fault(
                         kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
-                        subject=first.entrypoint_binding_digest,
-                        reason=str(reply.get("code")),
-                        # SANITIZED, like every other detail that crosses this wire (#574b).
-                        # The document profile is printable ASCII; refusal prose in this
-                        # codebase is written with em dashes, and one of them in a Fault
-                        # made EVERY later claim ack raise `non_ascii_field` — the worker
-                        # became unclaimable over a refusal it could not spell.
+                        subject=member.entrypoint_binding_digest,
+                        reason=exc.code,
+                        detail=safe(exc.detail),
+                    )
+                )
+            self.note("boot", f"{placement_id!r} prepare REFUSED before the executor: {exc}"[:256])
+            return "prepare refused: every binding", False
+        self.monitor.start(subject, "load")
+        try:
+            reply = executor.call(
+                executor_prepare_command(
+                    first, devices=lane.devices, authorized_device_limit_bytes=authorized
+                ),
+                timeout=None,
+                on_progress=lambda frame: self.monitor.advance(
+                    f"prepare:{frame.get('name', '')}", int(frame.get("position", 0) or 0)
+                ),
+            )
+        except ExecutorGone as exc:
+            lane.settle(slot)
+            self.monitor.end(subject, "executor_gone")
+            detail = f"executor disappeared during prepare: {exc}"[:1024]
+            for member in group:
+                tenant.failed_bindings[member.entrypoint_binding_digest] = detail
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                        subject=member.entrypoint_binding_digest,
+                        reason="executor_gone_during_prepare",
                         detail=safe(detail),
                     )
                 )
-                # AN ACTIVATION FAILURE LATCHES for this desired revision (§8): the worker
-                # does not evict-and-retry forever, `converged_revision` stays behind, and
-                # the fault is typed on the placement.
-                # PREPARE IS PER-BINDING (#572d). This used to latch the whole placement
-                # and `return`, so ONE binding's failure denied every sibling the card —
-                # on H3 a hidden, unbuildable ref2va binding took the working T2VA one
-                # down with it, and the working one never got its turn to try.
-                #
-                # It is #548d's refusal-vs-fault split applied to bindings: a placement can
-                # hold a FAULTED binding and still serve the others. The fault is typed on
-                # the binding that earned it, its entrypoints refuse naming it, and the
-                # loop goes on to the next group.
-                for member in group:
-                    self.failed_bindings[member.entrypoint_binding_digest] = (
-                        f"{reply.get('code')}: {detail}"
-                    )
-                # #567c's SECOND HALF: a refusal reduced to its class name is a refusal
-                # that does not exist. This line carried the code and four memory numbers
-                # and DROPPED the executor's own message — so an operator watching a boot
-                # fail read "unhandled_exception" beside "the allocator holds -1 B", which
-                # names neither what broke nor where. The detail leads; the memory state
-                # follows it, because on a genuine shortfall those numbers are the answer
-                # and on everything else they are context.
-                self.note(
-                    "boot",
-                    f"prepare REFUSED for {first.entrypoint_binding_digest[:20]}: "
-                    f"{reply.get('code')} - {detail} "
-                    f"[peak allocator {reply.get('peak_allocator_bytes', 0)} B was LIVE when "
-                    f"it failed; the allocator holds {reply.get('allocator_bytes', -1)} B and "
-                    f"the device has {reply.get('device_free_bytes', -1)} B free. The executor "
-                    "is poisoned and replaced; the card returns with the process (#613)]" + "]",
-                )
-                # A failed construction owns no retry policy. Retire its possibly retained
-                # allocations and remain offline; convergence decides whether to try again.
-                try:
-                    self.supervision.retire_current(
-                        executor, f"prepare refused: {reply.get('code')}"
-                    )
-                except ExecutorGone as exc:
-                    self.note("recovery", f"prepare refusal reclaim failed: {exc}")
-                continue
-            digest = reply["model_construction_digest"]
-            delivery = reply.get("delivery") or {}
-            resolved = PreparedModel(
-                logical_model_digest=digest,
-                constructed_model_digest=str(reply["constructed_model_digest"]),
-                delivery_rung=str(delivery.get("rung", "")),
-                delivery_variant=str(delivery.get("variant", "")),
-                weight_bytes=int(reply["facts"]["filled_bytes"]),
-            )
-            executor.construction_key = construction_key
-            executor.prepared_binding_set = binding_set
-            executor.prepared_model = resolved
-            for binding in group:
-                if binding.expected_logical_model_digest and (
-                    binding.expected_logical_model_digest != digest
-                ):
-                    self.note(
-                        "boot",
-                        f"{binding.entrypoint_binding_digest[:20]}… construction digest mismatch",
-                    )
-                    continue
-                executor.ready_bindings.add(binding.entrypoint_binding_digest)
-                self.prepared_models[binding.entrypoint_binding_digest] = resolved
-            self._primary_row().observe_construction(reply["facts"])
-            self.monitor.end(subject, "filled")
+            try:
+                tenant.supervision.retire_current(executor, detail)
+            except ExecutorGone as reclaim:
+                self.note("recovery", f"prepare-loss reclaim failed: {reclaim}")
+            return "prepare refused: every binding", False
+        took = (time.perf_counter() - started) * 1000
+        # The authorization SETTLED with this reply, refused or filled: whatever the
+        # process holds is the driver's to see now, and a refused one is replaced.
+        lane.settle(slot)
+        if not reply.get("ok"):
+            self.monitor.end(subject, str(reply.get("code")))
             self.boot.step(
                 "load",
-                "filled",
+                "refused",
                 took,
-                component=first.entrypoint,
-                destinations=int(reply["facts"]["filled"]),
-                bytes=int(reply["facts"]["filled_bytes"]),
-                fill_ms=float(reply["facts"]["fill_ms"]),
-                custody=str(reply["facts"].get("custody", "canonical")),
-                ignored_extra_keys=", ".join(reply["facts"].get("ignored_extra_keys", ())),
-                transcribed_markers=", ".join(reply["facts"].get("transcribed_markers", ())),
+                component=first.components[0] if first.components else "",
+                code=str(reply.get("code")),
             )
-            self.note(
-                "boot",
-                f"prepared {len(group)} binding(s) in {took:.0f} ms — "
-                f"{reply['facts']['filled']} destinations, "
-                f"{reply['facts']['filled_bytes'] / 2**30:.3f} GiB, fill leg "
-                f"{reply['facts']['fill_ms'] / 1000:.3f} s, logical model {digest[:23]}… "
-                f"generation {str(reply['constructed_model_digest'])[:23]}… "
-                f"resident={sorted(reply['facts'].get('resident', {}))} "
-                f"parked={reply['facts'].get('parked', [])}",
-            )
-            if delivery:
-                self.note("delivery", _delivery_observation(delivery))
-        # A placement with NO working binding has nothing to serve and says so; one with
-        # any working binding becomes dispatchable and refuses only what actually failed.
-        if len(self.failed_bindings) >= len(self.bindings):
-            self.latched = "prepare refused: every binding"
-            if self.options.development_project is not None and self.placement is not None:
-                # A source-checkout generation has one placement and no retained published
-                # fallback. Creator's readiness owner treats FAILED materialization as the
-                # terminal answer and replaces this generation; leaving it STAGED/OFFLINE
-                # made a permanent prepare refusal look like an endlessly activating model.
-                self.placement.materialization = (
-                    pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+            detail = str(reply.get("detail"))[:1024]
+            shortfall = reply.get("shortfall") or {}
+            if shortfall:
+                detail = (
+                    f"{shortfall['resource']} shortfall at {shortfall['scope']}: "
+                    f"needed {shortfall['needed_bytes']} B, "
+                    f"{shortfall['available_bytes']} B free (measured) - {detail}"
+                )[:1024]
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
+                    subject=first.entrypoint_binding_digest,
+                    reason=str(reply.get("code")),
+                    # SANITIZED, like every other detail that crosses this wire (#574b).
+                    # The document profile is printable ASCII; refusal prose in this
+                    # codebase is written with em dashes, and one of them in a Fault
+                    # made EVERY later claim ack raise `non_ascii_field` — the worker
+                    # became unclaimable over a refusal it could not spell.
+                    detail=safe(detail),
                 )
-            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, "prepare REFUSED")
-            return
-        if self.failed_bindings:
+            )
+            # AN ACTIVATION FAILURE LATCHES for this desired revision (§8): the worker
+            # does not evict-and-retry forever, `converged_revision` stays behind, and
+            # the fault is typed on the placement. PREPARE IS PER-BINDING (#572d): the
+            # fault is typed on the bindings that earned it and its entrypoints refuse
+            # naming it (#548d's refusal-vs-fault split applied to bindings).
+            for member in group:
+                tenant.failed_bindings[member.entrypoint_binding_digest] = (
+                    f"{reply.get('code')}: {detail}"
+                )
+            # #567c's SECOND HALF: a refusal reduced to its class name is a refusal
+            # that does not exist. The detail leads; the memory state follows it, because
+            # on a genuine shortfall those numbers are the answer and on everything else
+            # they are context.
             self.note(
                 "boot",
-                f"{len(self.bindings) - len(self.failed_bindings)} of {len(self.bindings)} "
-                f"binding(s) prepared; faulted: " + ", ".join(sorted(self.failed_bindings)),
+                f"{placement_id!r} prepare REFUSED for {first.entrypoint_binding_digest[:20]}: "
+                f"{reply.get('code')} - {detail} "
+                f"[peak allocator {reply.get('peak_allocator_bytes', 0)} B was LIVE when "
+                f"it failed; the allocator holds {reply.get('allocator_bytes', -1)} B and "
+                f"the device has {reply.get('device_free_bytes', -1)} B free. The executor "
+                "is poisoned and replaced; the card returns with the process (#613)]",
             )
-        self._finish_activation()
+            # A failed construction owns no retry policy. Retire its possibly retained
+            # allocations and remain offline; convergence decides whether to try again.
+            try:
+                tenant.supervision.retire_current(executor, f"prepare refused: {reply.get('code')}")
+            except ExecutorGone as exc:
+                self.note("recovery", f"prepare refusal reclaim failed: {exc}")
+            return "prepare refused: every binding", False
+        digest = reply["model_construction_digest"]
+        delivery = reply.get("delivery") or {}
+        resolved = PreparedModel(
+            logical_model_digest=digest,
+            constructed_model_digest=str(reply["constructed_model_digest"]),
+            delivery_rung=str(delivery.get("rung", "")),
+            delivery_variant=str(delivery.get("variant", "")),
+            weight_bytes=int(reply["facts"]["filled_bytes"]),
+        )
+        executor.construction_key = construction_key
+        executor.prepared_binding_set = binding_set
+        executor.prepared_model = resolved
+        for binding in group:
+            if binding.expected_logical_model_digest and (
+                binding.expected_logical_model_digest != digest
+            ):
+                self.note(
+                    "boot",
+                    f"{binding.entrypoint_binding_digest[:20]}… construction digest mismatch",
+                )
+                tenant.failed_bindings[binding.entrypoint_binding_digest] = (
+                    "logical model digest mismatch"
+                )
+                continue
+            executor.ready_bindings.add(binding.entrypoint_binding_digest)
+            tenant.prepared_models[binding.entrypoint_binding_digest] = resolved
+        row = tenant.row()
+        if row.ledger.executor_pid != executor.pid:
+            row.ledger.begin_generation(executor.pid)
+        row.ledger.observe_construction(reply["facts"])
+        self.monitor.end(subject, "filled")
+        self.boot.step(
+            "load",
+            "filled",
+            took,
+            component=first.entrypoint,
+            destinations=int(reply["facts"]["filled"]),
+            bytes=int(reply["facts"]["filled_bytes"]),
+            fill_ms=float(reply["facts"]["fill_ms"]),
+            custody=str(reply["facts"].get("custody", "canonical")),
+            ignored_extra_keys=", ".join(reply["facts"].get("ignored_extra_keys", ())),
+            transcribed_markers=", ".join(reply["facts"].get("transcribed_markers", ())),
+        )
+        self.note(
+            "boot",
+            f"{placement_id!r} prepared {len(group)} binding(s) in {took:.0f} ms — "
+            f"{reply['facts']['filled']} destinations, "
+            f"{reply['facts']['filled_bytes'] / 2**30:.3f} GiB, fill leg "
+            f"{reply['facts']['fill_ms'] / 1000:.3f} s, logical model {digest[:23]}… "
+            f"generation {str(reply['constructed_model_digest'])[:23]}… "
+            f"resident={sorted(reply['facts'].get('resident', {}))} "
+            f"parked={reply['facts'].get('parked', [])}",
+        )
+        if delivery:
+            self.note("delivery", _delivery_observation(delivery))
+        if not executor.ready_bindings:
+            return "prepare refused: every binding", False
+        return "", False
 
     def _finish_activation(self) -> None:
         """Run optional warm work, then publish the activation edge or its typed failure."""
@@ -3946,6 +4013,109 @@ class Worker:
         )
         return granted
 
+    # ------------------------------------------------------ residency arbitration
+
+    def _arbitrate_residency(self, attempt: AttemptRecord, slot: AttemptSlot) -> None:
+        """Give THIS attempt's tenant the device its plan needs, before the plan is priced.
+
+        cr-022's swap arm, the owner's "one gets to use it first, then the next gets to use
+        it for a different request". The tenant's row is refreshed with the driver's free
+        bytes as they stand now — the ledger's own number is the executor's last probe,
+        and co-tenants move gigabytes between probes — and the chooser is asked whether any
+        proven rung fits. If none does, co-tenants vacate LRU-first until one does (or
+        nobody holds anything, in which case the chooser refuses or deepens exactly as it
+        would alone). The lane seat is held by this attempt throughout, so no co-tenant
+        is mid-attempt; the device lock is held by this lane thread, so no co-tenant's
+        prepare is either. Both fitting means nothing moves, ever.
+        """
+        serving = attempt.spec.get("serving")
+        if serving is None or self.accepted.mode != "serving":
+            return
+        declared = slot.bindings.get(str(serving.get("entrypoint_binding_digest", "")))
+        if declared is None or declared.weightless:
+            return
+        lane = self.lanes.by_id[slot.lane_id]
+        tenant = attempt.placement_id
+        lane.touch(tenant)
+        row = lane.row(tenant)
+
+        def fits(memory: accel.DeviceMemory) -> bool:
+            row.ledger.observe_device_free(memory.free_bytes, memory.total_bytes)
+            return bool(row.chooser.fits(declared))
+
+        self._make_room(lane, tenant, fits, f"attempt {attempt.request_id}#{attempt.attempt}")
+
+    def _make_room(
+        self,
+        lane: DeviceLane,
+        slot: str,
+        fits: Callable[[accel.DeviceMemory], bool],
+        why: str,
+    ) -> None:
+        """RESIDENCY ARBITRATION on one lane: vacate co-tenants, LRU-first, until `fits`.
+
+        `fits` reads the lane as the driver measures it NOW (cr-066's NVML reading, the
+        same meter ceilings are assigned from) and says whether `slot`'s demand holds. It is
+        asked before anything moves and again after each vacate. A lane the driver cannot
+        read is left alone: the prepare or the plan refuses typed on the same fact. A
+        victim's process stays — only its residency changes, so its executor epoch and its
+        placement's serving state do not move; its next attempt re-stages on demand.
+        """
+        kind = accel.host_backend_family()
+        memory = accel.device_memory(lane.devices, kind)
+        if memory.state != "measured" or fits(memory):
+            return
+        for victim, row in lane.victims(slot):
+            executor = row.executor()
+            if executor is None:
+                continue
+            before = memory.free_bytes
+            freed = self._vacate(victim, row, executor, why)
+            memory = accel.device_memory(lane.devices, kind)
+            self.note(
+                "residency",
+                f"{lane.lane_id}: {victim!r} (epoch {executor.epoch} pid {executor.pid}) "
+                f"vacated {freed} B for {slot!r} on {why}; the driver reports "
+                f"{before} -> {memory.free_bytes} B free",
+            )
+            if memory.state != "measured" or fits(memory):
+                return
+        self.note(
+            "residency",
+            f"{lane.lane_id}: no co-tenant of {slot!r} holds bytes the driver could give "
+            f"back for {why}; the plan decides on {memory.free_bytes} B free",
+        )
+
+    def _vacate(self, victim: str, row: LaneRow, executor: child.Executor, why: str) -> int:
+        """Ask one co-tenant's executor to free every component it holds; bank the
+        after-state on its row. Returns the bytes it reports freed (0 on refusal or death:
+        a dead executor freed everything, and the re-measurement says so)."""
+        try:
+            with executor.watched("vacate"):
+                reply = executor.call({"cmd": "vacate"}, timeout=None)
+        except ExecutorGone as exc:
+            row.ledger.device_unreadable(f"the executor died while vacating: {exc}")
+            self.note("residency", f"{victim!r} died while vacating: {exc}"[:256])
+            return 0
+        if not reply.get("ok"):
+            self.note(
+                "residency",
+                f"{victim!r} refused to vacate: {reply.get('code')}: {reply.get('detail', '')}"[
+                    :256
+                ],
+            )
+            return 0
+        freed = row.ledger.observe_vacate(reply, why)
+        row.ledger.device_process = self.read_device_process(executor.pid)
+        held = (reply.get("vacated") or {}).get("held") or {}
+        if held:
+            self.note(
+                "residency",
+                f"{victim!r} kept {sorted(held)}: "
+                + "; ".join(f"{name}: {reason}" for name, reason in sorted(held.items()))[:300],
+            )
+        return freed
+
     # ------------------------------------------------------------------ dispatch
 
     def on_offer(self, offered: pb.AttemptOffer) -> None:
@@ -4178,8 +4348,13 @@ class Worker:
                 self.rebuild_exited(item.executor, item.placement_id)
                 continue
             attempt = item
-            if self.admit(attempt):
-                self.execute(attempt)
+            self.await_settled(attempt)
+            # THE DEVICE IS HELD from admission to the terminal (cr-022): a co-tenant's
+            # prepare on this lane waits here rather than vacating an executor whose
+            # attempt is on the card.
+            with lane.device:
+                if self.admit(attempt):
+                    self.execute(attempt)
             # Rebuild on REFUSALS too (#458): a poisoned generation refuses every attempt,
             # so a rebuild gated on admission could never run again.
             self.rebuild_if_needed(attempt.placement_id)
@@ -4187,7 +4362,6 @@ class Worker:
     def admit(self, attempt: AttemptRecord) -> bool:
         """FETCH -> HYDRATE -> CHOOSE -> ACCEPT, or a typed terminal. Never a silence."""
         key = f"{attempt.request_id}#{attempt.attempt}"
-        self.await_settled(attempt)
         # Desired-state convergence and executor rebuilds take this same lock. Recheck the
         # offer's immutable routing facts under it, then hold it through the acceptance
         # A queued offer cannot be accepted on the far side of a placement or
@@ -4271,7 +4445,8 @@ class Worker:
                 )
                 return False
             try:
-                self._bind_attempt_slot(attempt)
+                slot = self._bind_attempt_slot(attempt)
+                self._arbitrate_residency(attempt, slot)
                 accepted = self.engine.prepare_and_accept(attempt)
             except AttemptRefusal as exc:
                 self.note("attempt", f"{key} refused: {exc.code}")

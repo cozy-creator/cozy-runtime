@@ -196,6 +196,32 @@ class _CompositeResidency:
         for row in self.rows.values():
             row.open_attempt(placement, headroom_bytes, scope_headroom_bytes)
 
+    def vacate(self) -> dict[str, Any]:
+        """Every slot frees its own components; the reports merge under the slot prefix."""
+        reports = {name: row.vacate() for name, row in sorted(self.rows.items())}
+        prefix = len(reports) > 1
+
+        def keyed(name: str, component: str) -> str:
+            return f"{name}/{component}" if prefix else str(component)
+
+        return {
+            "freed": {
+                keyed(name, component): int(size)
+                for name, report in reports.items()
+                for component, size in report["freed"].items()
+            },
+            "held": {
+                keyed(name, component): str(why)
+                for name, report in reports.items()
+                for component, why in report["held"].items()
+            },
+            "freed_bytes": sum(int(report["freed_bytes"]) for report in reports.values()),
+            "allocator_delta_bytes": sum(
+                int(report["allocator_delta_bytes"]) for report in reports.values()
+            ),
+            "vacate_ms": round(sum(float(report["vacate_ms"]) for report in reports.values()), 2),
+        }
+
     def document(self) -> dict[str, Any]:
         documents = {name: row.document() for name, row in sorted(self.rows.items())}
         prefix = len(documents) > 1
@@ -881,6 +907,10 @@ class Executor:
             "reserved_bytes": memory["reserved_bytes"],
             "resident": dict(backend.vram_charge),
             "parked": sorted(backend.parked),
+            # WITH THEIR SIZES, like the residency document's `evicted`: a parked component
+            # is a component the next attempt may have to bring back, and a chooser that
+            # sees its name and not its bytes prices that stage-in at nothing.
+            "evicted": {name: backend.component_bytes.get(name, 0) for name in backend.parked},
             "resident_budget_bytes": resident_budget,
             "authorized_device_limit_bytes": authorized,
             "rss_bytes": _rss(),
@@ -1045,6 +1075,11 @@ class Executor:
             for parameter, facts in facts_rows
             for component in facts.get("parked", [])
         ]
+        evicted = {
+            f"{parameter}/{component}": int(size)
+            for parameter, facts in facts_rows
+            for component, size in (facts.get("evicted") or {}).items()
+        }
         scopes = {
             f"{parameter}.{method}": [f"{parameter}/{component}" for component in components]
             for parameter, facts in facts_rows
@@ -1084,6 +1119,7 @@ class Executor:
             "reserved_bytes": int(last.get("reserved_bytes", -1)),
             "resident": resident,
             "parked": parked,
+            "evicted": evicted,
             "declared_scopes": scopes,
             "rss_bytes": max(int(facts.get("rss_bytes", 0)) for _, facts in facts_rows),
             "pinned": {
@@ -1906,6 +1942,29 @@ class Executor:
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
+    def vacate(self) -> dict[str, Any]:
+        """FREE this generation's device bytes for another tenant of the lane (cr-022).
+
+        The worker calls this BETWEEN attempts — the lane seat guarantees none is in
+        flight here — when a co-tenant's attempt or prepare does not fit beside what this
+        process holds. The process stays (its epoch does not move; only residency does);
+        the weights come back through the ordinary demand-pull admission of the next
+        attempt. The reply is the probe's after-state plus what moved, so the worker's row
+        for this generation describes the device rather than the generation's history.
+        """
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if self.torch is None or self.residency is None:
+            return {**self.probe(), "vacated": {"freed": {}, "held": {}, "freed_bytes": 0}}
+        from cozy_runtime.internal.residency import ResidencyRefusal
+
+        try:
+            vacated = self.residency.vacate()
+        except ResidencyRefusal as exc:
+            return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
+        accel.synchronize(self.torch, self.device_kind)
+        return {**self.probe(), "vacated": vacated}
+
     def probe(self) -> dict[str, Any]:
         if self.torch is None:
             return {"ok": True, "torch": False, "rss_bytes": _rss()}
@@ -2173,6 +2232,8 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.warm(command)
             elif name == "probe":
                 reply = executor.probe()
+            elif name == "vacate":
+                reply = executor.vacate()
             elif name == "shutdown":
                 channel.send({"reply": name, "ok": True})
                 return int(Exit.ok)

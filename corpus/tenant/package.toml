@@ -1,0 +1,11 @@
+# cr-022's shared-lane fixture: one synthetic model whose ONLY job is to hold real device
+# bytes. Two placements of this package on one card are the "one gets the GPU, then the
+# next" case; the binding below is the in-repo default the tests override per store.
+
+[application]
+object = "tiny_tenant:app"
+
+[bindings."TenantModel"]
+model = "cozytest/tenant"
+release = "1"
+lane = "bf16"

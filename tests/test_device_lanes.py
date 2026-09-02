@@ -304,31 +304,44 @@ def test_a_prepare_without_an_assigned_ceiling_is_a_worker_defect() -> None:
 
 
 def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
-    """Fit is arithmetic over MEASURED free bytes: a model-bearing placement takes the first
-    lane with room and no other model-bearing tenant; a lane the driver cannot read is never
-    chosen; nothing fitting is a typed refusal that moves no other placement."""
+    """Fit is arithmetic over MEASURED bytes, in three steps (cr-066, then cr-022): a
+    model-bearing placement takes a lane with room and no other model-bearing tenant; else
+    a lane with measured headroom BESIDE its tenants (co-residency); else a lane whose
+    measured TOTAL holds it alone (time-sliced sharing). A lane the driver cannot read is
+    never chosen; nothing fitting anywhere is a typed refusal that moves no other
+    placement."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
     assert len(lanes_) == 3 and lanes_.envelope.ordinals == (0, 1, 2)
-    measured = {"lane-0": 4 << 30, "lane-1": 16 << 30}  # lane-2 unreadable
-    big = lanes_.assign("big", model_bearing=True, declared_bytes=8 << 30, measured_free=measured)
+    measured = {
+        "lane-0": accel.DeviceMemory("measured", 4 << 30, 8 << 30),
+        "lane-1": accel.DeviceMemory("measured", 16 << 30, 24 << 30),
+        "lane-2": accel.DeviceMemory("unreadable"),
+    }
+    big = lanes_.assign("big", model_bearing=True, declared_bytes=8 << 30, measured=measured)
     assert big.lane_id == "lane-1"
     lanes_.lanes[1].row("big").model_bearing = True
-    small = lanes_.assign(
-        "small", model_bearing=True, declared_bytes=2 << 30, measured_free=measured
-    )
+    small = lanes_.assign("small", model_bearing=True, declared_bytes=2 << 30, measured=measured)
     assert small.lane_id == "lane-0"
     lanes_.lanes[0].row("small").model_bearing = True
+    # step 2: every lane has a tenant; lane-0's measured headroom still covers 1 GiB
+    beside = lanes_.assign("beside", model_bearing=True, declared_bytes=1 << 30, measured=measured)
+    assert beside.lane_id == "lane-0"
+    lanes_.lanes[0].row("beside").model_bearing = True
+    # step 3: nothing has 6 GiB of headroom; lane-1 (one tenant, 24 GiB total) is chosen
+    # over lane-0 (two tenants) — sharing spreads before it stacks
+    shared = lanes_.assign("shared", model_bearing=True, declared_bytes=6 << 30, measured=measured)
+    assert shared.lane_id == "lane-1"
+    lanes_.lanes[1].row("shared").model_bearing = True
     with pytest.raises(lanes.LaneRefusal) as refused:
-        lanes_.assign("third", model_bearing=True, declared_bytes=1 << 30, measured_free=measured)
+        lanes_.assign("huge", model_bearing=True, declared_bytes=32 << 30, measured=measured)
     assert refused.value.code == "device_lane_infeasible"
     assert "lane-2 free bytes unreadable" in refused.value.detail
-    assert lanes_.lane_of("third") is None
+    assert "B total for 34359738368 B" in refused.value.detail
+    assert lanes_.lane_of("huge") is None
     assert lanes_.lane_of("big") is lanes_.lanes[1] and lanes_.lane_of("small") is lanes_.lanes[0]
     # weightless placements spread over the lanes with the fewest tenants
-    assert (
-        lanes_.assign("w1", model_bearing=False, declared_bytes=0, measured_free={})
-        is (lanes_.lanes[2])
-    )
+    weightless = lanes_.assign("w1", model_bearing=False, declared_bytes=0, measured={})
+    assert weightless is lanes_.lanes[2]
     lanes_.release("big")
     assert lanes_.lane_of("big") is None and "big" not in lanes_.lanes[1].rows
 
