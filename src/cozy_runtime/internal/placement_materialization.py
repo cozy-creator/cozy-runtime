@@ -80,9 +80,12 @@ def prepare_boot(
     del config  # the handoff carries nothing this step decides on
     # Package executors read verified TensorFS objects but never publish them. Root owns
     # the store; execute/read bits admit the fixed executor uid without making any object
-    # or directory writable to it.
+    # or directory writable to it. The artifact cache is the supervisor's landing area
+    # (it takes ownership of it after this boot) and also carries the worker's staged
+    # selection documents, which the executor reads by path: the execute bit alone lets
+    # the fixed executor uid traverse to `selections/`; `sets/` stays the supervisor's 0700.
     _directory(artifact_store_root, mode=0o755)
-    _directory(artifact_cache_root)
+    _directory(artifact_cache_root, mode=0o711)
     _directory(boot_root)
     return PreparedBoot(
         artifact_store=artifact_store_root,
