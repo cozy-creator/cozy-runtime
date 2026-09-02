@@ -1311,7 +1311,9 @@ def _resolve_development_models(
         components = tuple(sorted(str(component) for component in components_value))
         selected_assets = _development_assets(binding.ref, header.get("assets", {}))
         try:
-            model_weight_bytes = sum(int(row["length"]) for row in store.walk(manifest_digest))
+            model_weight_bytes = sum(
+                int(row["length"]) for row in store.walk_cozytensors(manifest_digest)
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"development_model_inventory_invalid: {binding.ref}: {exc}"

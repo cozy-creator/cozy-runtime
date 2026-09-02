@@ -959,20 +959,23 @@ def _selected_models(
         placed: set[str] = set()
         for digest, (_length, raw, _path) in sorted(manifests.items()):
             if carried_models:
-                # The walk reads the CozyTensors header out of the store, so the objects
-                # the manifest names directly (the header and its sibling files) are placed
-                # first; the parts the header reaches are only enumerated here.
-                for entry_digest, entry_length in sorted(acquire.manifest_entries(tensorfs, raw)):
-                    row = object_files.get(entry_digest)
-                    if row is None or row[0] != entry_length:
-                        raise PreparationRefusal(
-                            "package_prepare_model_object_set_mismatch",
-                            f"{digest} names {entry_digest} ({entry_length} B); not delivered",
-                        )
-                    if entry_digest not in placed:
-                        store.put_file(str(row[1]), entry_digest, entry_length)
-                        placed.add(entry_digest)
-            closure = {(str(row["id"]), int(row["length"])) for row in store.walk(digest)}
+                # The header is the sole direct snapshot entry needed to discover the runtime
+                # closure. README, sample, license, and other ordinary siblings stay outside
+                # model preparation even when the snapshot retains them.
+                header_digest, header_length = acquire.cozytensors_ref(tensorfs, raw)
+                row = object_files.get(header_digest)
+                if row is None or row[0] != header_length:
+                    raise PreparationRefusal(
+                        "package_prepare_model_object_set_mismatch",
+                        f"{digest} names CozyTensors header {header_digest} "
+                        f"({header_length} B); not delivered",
+                    )
+                if header_digest not in placed:
+                    store.put_file(str(row[1]), header_digest, header_length)
+                    placed.add(header_digest)
+            closure = {
+                (str(row["id"]), int(row["length"])) for row in store.walk_cozytensors(digest)
+            }
             closures[digest] = closure
             reached.update(closure)
         if carried_models and delivered != reached:
@@ -988,7 +991,7 @@ def _selected_models(
                 store.put_file(str(path), digest, length)
             verified(digest, length, path)
         for digest, (length, _raw, manifest_path) in sorted(manifests.items()):
-            store.acquire_manifest(digest).release()
+            store.acquire_cozytensors(digest).release()
             held = store.manifest(digest)
             header = tensorfs.parse_header(bytes(held["header"]))
             configs = header.get("configs")
@@ -1000,7 +1003,7 @@ def _selected_models(
             ):
                 raise PreparationRefusal(
                     "package_prepare_model_header_unsupported",
-                    f"{digest}: expected configs, components, and no assets",
+                    f"{digest}: expected configs, components, and no runtime-consumed assets",
                 )
             try:
                 config_digest, config_bytes = model_config.construction_document(store, configs)

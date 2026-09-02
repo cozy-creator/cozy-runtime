@@ -525,11 +525,12 @@ class Acquirer:
                     manifest_path = self.fetch(manifest_digest, manifest_length)
                     manifest_raw = manifest_path.read_bytes()
                     store.put_manifest(manifest_raw, manifest_digest, manifest_length)
-                    for digest, length in manifest_entries(tensorfs, manifest_raw):
-                        path = self.fetch(digest, length)
-                        store.put_file(str(path), digest, length)
+                    header_digest, header_length = cozytensors_ref(tensorfs, manifest_raw)
+                    header_path = self.fetch(header_digest, header_length)
+                    store.put_file(str(header_path), header_digest, header_length)
                 reached = {
-                    (str(row["id"]), int(row["length"])) for row in store.walk(manifest_digest)
+                    (str(row["id"]), int(row["length"]))
+                    for row in store.walk_cozytensors(manifest_digest)
                 }
                 closure = {(manifest_digest, manifest_length), *reached}
                 if self.plan.authorized():
@@ -550,7 +551,7 @@ class Acquirer:
                     # its own ledger ends a stalled stream; an expired presign is refused
                     # by the origin, reported as a fetch fault, and the next plan carries
                     # fresh access for exactly the objects still missing.
-                    outcome = pull.pull_granted_manifest(
+                    outcome = pull.pull_granted_cozytensors(
                         tensorfs,
                         store,
                         manifest_digest,
@@ -565,7 +566,7 @@ class Acquirer:
                         reused=max(0, outcome.bytes_total - outcome.bytes_moved),
                     )
                 else:
-                    store.acquire_manifest(manifest_digest).release()
+                    store.acquire_cozytensors(manifest_digest).release()
                 count += len(closure)
             return count
         except AcquisitionRefusal:
@@ -682,7 +683,7 @@ class Acquirer:
                 try:
                     store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
                     model_weight_bytes = sum(
-                        int(row["length"]) for row in store.walk(reference_manifest)
+                        int(row["length"]) for row in store.walk_cozytensors(reference_manifest)
                     )
                 except Exception as exc:
                     raise AcquisitionRefusal(
@@ -760,7 +761,7 @@ class Acquirer:
             for binding in bindings.values():
                 for model in binding.model_bindings():
                     for digest in {model.reference_snapshot, *model.snapshots.values()}:
-                        store.acquire_manifest(digest).release()
+                        store.acquire_cozytensors(digest).release()
         except Exception as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
@@ -830,28 +831,30 @@ def _ref(value: object, name: str) -> tuple[str, int]:
     return str(value["digest"]), int(value["length"])
 
 
-def manifest_entries(tensorfs: Any, raw: bytes) -> set[tuple[str, int]]:
-    """Read exact blob refs through TensorFS's canonical Manifest parser."""
+def cozytensors_ref(tensorfs: Any, raw: bytes) -> tuple[str, int]:
+    """Select the sole typed CozyTensors header through TensorFS's Manifest parser."""
 
     try:
         manifest = tensorfs.parse_manifest(raw)
         rows = manifest["entries"]
-        refs = {
-            ("sha256:" + str(row["blob"]["sha256"]), int(row["blob"]["length"])) for row in rows
-        }
+        selected = [row for row in rows if row.get("kind") == "cozytensors"]
+        if len(selected) != 1:
+            raise ValueError("expected exactly one cozytensors entry")
+        blob = selected[0]["blob"]
+        ref = "sha256:" + str(blob["sha256"]), int(blob["length"])
     except Exception as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "model_manifest_invalid",
             f"TensorFS refused Manifest bytes: {type(exc).__name__}: {exc}",
         ) from exc
-    if not rows or len(refs) != len(rows) or any(length <= 0 for _digest, length in refs):
+    if not rows or not ref[0].startswith("sha256:") or len(ref[0]) != 71 or ref[1] <= 0:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "model_manifest_invalid",
-            "TensorFS Manifest refs are not unique and positive",
+            "TensorFS Manifest has no positive CozyTensors header reference",
         )
-    return refs
+    return ref
 
 
 def _visible_entrypoints(descriptor: Mapping[str, Any]) -> dict[str, dict[str, Any]]:

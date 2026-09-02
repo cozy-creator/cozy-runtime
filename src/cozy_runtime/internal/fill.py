@@ -533,9 +533,9 @@ class Checkpoint:
             )
 
     def acquire(self) -> Any:
-        """A verified read lease over the whole manifest. The GC-safe hold registers FIRST."""
+        """A verified read lease over this snapshot's CozyTensors runtime closure."""
         with store_refusals(f"acquiring a lease on {self.manifest_id[:23]}"):
-            return self.store.acquire_manifest(self.manifest_id)
+            return self.store.acquire_cozytensors(self.manifest_id)
 
 
 @dataclass(frozen=True, slots=True)

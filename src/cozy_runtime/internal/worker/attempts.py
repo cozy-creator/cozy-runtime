@@ -875,7 +875,7 @@ class AttemptEngine:
     def _hold_job_models(
         self, attempt: AttemptRecord, binding: JobBinding, descriptor_id: str
     ) -> None:
-        """Join descriptor params to exact grant rows and hold every Manifest until terminal."""
+        """Join descriptor params to grants and hold each CozyTensors closure until terminal."""
         declared = self._job_model_declarations(binding, descriptor_id)
         selected = grants.model_inputs(attempt.grant)
         if set(selected) != set(declared):
@@ -909,7 +909,7 @@ class AttemptEngine:
                         f"local Manifest is {len(manifest_bytes)} B"
                     )
                 if manifest not in leases:
-                    leases[manifest] = store.acquire_manifest(manifest)
+                    leases[manifest] = store.acquire_cozytensors(manifest)
                 models[parameter] = JobModel(
                     parameter=parameter,
                     class_name=declared[parameter],

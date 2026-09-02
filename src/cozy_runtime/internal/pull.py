@@ -778,11 +778,12 @@ def pull(
         allow_local=local_hub(base),
         streams=streams,
         on_object=on_object,
+        complete=tensorfs.fetch_complete,
     )
     return result
 
 
-def pull_granted_manifest(
+def pull_granted_cozytensors(
     tensorfs: Any,
     store: Any,
     manifest_id: str,
@@ -796,7 +797,7 @@ def pull_granted_manifest(
     cache_store: Any | None = None,
     allow_local: bool = False,
 ) -> PullResult:
-    """Admit one exact Manifest closure from closed direct HTTPS grants.
+    """Admit one exact CozyTensors runtime closure from closed direct HTTPS grants.
 
     Rental provisioning already carries delivery authority, so resolving a mutable hub ref
     would add a second meaning clock.  This door instead takes one already-selected root and
@@ -804,9 +805,11 @@ def pull_granted_manifest(
     release-wide ObjectSet by Manifest reachability; this function deliberately does
     not guess that a union of several roots is one root's closure.
 
-    Every object, including the root manifest, travels through ``fetch_admit``.  No local
-    provision copy or human-ref artifact index is written, and HTTPS grants never use an
-    inherited proxy or the loopback development carve-out.
+    Every object, including the root manifest, travels through ``fetch_admit``. TensorFS proves
+    that the plan is exactly the selected CozyTensors runtime closure; ordinary files beside it
+    in the snapshot are deliberately outside the pull. No local provision copy or human-ref
+    artifact index is written, and HTTPS grants never use an inherited proxy or the loopback
+    development carve-out.
     """
 
     root = manifest_id.removeprefix("sha256:")
@@ -896,6 +899,7 @@ def pull_granted_manifest(
         on_object=on_object,
         no_proxy=True,
         cache_store=cache_store,
+        complete=tensorfs.fetch_complete_cozytensors,
     )
     return result
 
@@ -912,6 +916,7 @@ def _execute_plan(
     allow_local: bool,
     streams: int,
     on_object: Callable[[str, int, bool], None] | None,
+    complete: Callable[[Any, bytes], Any],
     no_proxy: bool = False,
     cache_store: Any | None = None,
 ) -> None:
@@ -980,7 +985,7 @@ def _execute_plan(
             assert first is not None
             raise first
     try:
-        tensorfs.fetch_complete(store, plan["document"])
+        complete(store, plan["document"])
     except Exception as exc:
         raise _border(exc, "weights_incomplete") from exc
 
