@@ -360,3 +360,583 @@ class RuntimePreparation(object):
             timeout,
             metadata,
             _registered_method=True)
+
+
+class RuntimeWeightsStub(object):
+    """Loopback-only Runtime-hosted weights seam. pod-supervisor is its only client and dials it on
+    the same loopback listener as WorkerControl and RuntimePreparation; it is never registered
+    on the external listener. It carries the supervisor<->Runtime privates that were
+    direction-annotated WorkerControl frames before minor 21.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Exchange = channel.stream_stream(
+                '/cozy.worker.v1.RuntimeWeights/Exchange',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostEvent.FromString,
+                _registered_method=True)
+        self.Upload = channel.unary_unary(
+                '/cozy.worker.v1.RuntimeWeights/Upload',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsUploadRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsUploadResult.FromString,
+                _registered_method=True)
+
+
+class RuntimeWeightsServicer(object):
+    """Loopback-only Runtime-hosted weights seam. pod-supervisor is its only client and dials it on
+    the same loopback listener as WorkerControl and RuntimePreparation; it is never registered
+    on the external listener. It carries the supervisor<->Runtime privates that were
+    direction-annotated WorkerControl frames before minor 21.
+    """
+
+    def Exchange(self, request_iterator, context):
+        """Runtime -> host intents and receipts, host -> Runtime acks, on ONE stream the supervisor
+        opens per accepted control session. The host commits its ledger before each ack, and
+        forwards a recorded receipt to the RecordOwner on WorkerControl BEFORE acking it, so the
+        owner sees the receipt ahead of the attempt outcome the Runtime can only send after.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Upload(self, request, context):
+        """One validated upload grant in, one terminal answer out. Runtime streams the bytes it holds.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_RuntimeWeightsServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Exchange': grpc.stream_stream_rpc_method_handler(
+                    servicer.Exchange,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostEvent.SerializeToString,
+            ),
+            'Upload': grpc.unary_unary_rpc_method_handler(
+                    servicer.Upload,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsUploadRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsUploadResult.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'cozy.worker.v1.RuntimeWeights', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('cozy.worker.v1.RuntimeWeights', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class RuntimeWeights(object):
+    """Loopback-only Runtime-hosted weights seam. pod-supervisor is its only client and dials it on
+    the same loopback listener as WorkerControl and RuntimePreparation; it is never registered
+    on the external listener. It carries the supervisor<->Runtime privates that were
+    direction-annotated WorkerControl frames before minor 21.
+    """
+
+    @staticmethod
+    def Exchange(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/cozy.worker.v1.RuntimeWeights/Exchange',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Upload(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimeWeights/Upload',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsUploadRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsUploadResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class PodHostStub(object):
+    """---------------------------------------------------------------------------
+    PodHost -- the RecordOwner <-> pod HOST lane. A second service on the pod's external
+    listener, served by pod-supervisor beside WorkerControl. It carries what the host does on the
+    owner's behalf and nothing that is control: the owner asks the host to PREPARE (download,
+    verify, obtain the PlacementSet bytes from the Runtime's loopback preparation), then sends
+    those exact bytes ITSELF as DesiredWorkerState{placement_set} on WorkerControl. Remote and
+    local are the same three steps -- prepare, placement_set bytes, desired_state -- and a
+    multi-GiB materialization never sits on the control stream's read loop, where before 21 it
+    head-of-line blocked every offer, ack, and cancel behind it.
+
+    AUTHORITY: every call opens with the owner's Claim -- the same message and the same Ed25519
+    proof over ClaimProof/1 the owner presents on WorkerControl -- which the host verifies against
+    the same control key the Runtime verifies it against. A call whose record_owner_epoch is
+    older than the highest Claim the host has forwarded is refused. A host call is scoped to the
+    worker lifetime the proof names, never to one control stream: control_stream_epoch is 0 on
+    the Claim and on every request carried here, and nonzero refuses. The request's
+    record_owner_epoch and worker_boot_id MUST equal the Claim's.
+
+    REPLAY: each lane is durable in the host ledger and idempotent on its identity fields. A
+    reconnecting owner re-issues the exact call and receives the ledger's answer (the same
+    terminal status, or REPLAYED) or attaches to the operation still in flight. Progress is the
+    owner's observed signal; no lane needs a wall-clock guess.
+
+    Locally PodHost is not a service: the daemon calls the same host functions in-process.
+    ---------------------------------------------------------------------------
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.PreparePackageSet = channel.unary_stream(
+                '/cozy.worker.v1.PodHost/PreparePackageSet',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
+                _registered_method=True)
+        self.PreparePrivatePackage = channel.unary_stream(
+                '/cozy.worker.v1.PodHost/PreparePrivatePackage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
+                _registered_method=True)
+        self.PreparePrivatePlacement = channel.unary_stream(
+                '/cozy.worker.v1.PodHost/PreparePrivatePlacement',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePlacementCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
+                _registered_method=True)
+        self.ModelSourceFile = channel.unary_stream(
+                '/cozy.worker.v1.PodHost/ModelSourceFile',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceFileCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceFileStatus.FromString,
+                _registered_method=True)
+        self.ModelSourcePrepare = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ModelSourcePrepare',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
+                _registered_method=True)
+        self.PrivatePackageFetch = channel.unary_stream(
+                '/cozy.worker.v1.PodHost/PrivatePackageFetch',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFetchCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFileStatus.FromString,
+                _registered_method=True)
+        self.PrivatePackageAbort = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/PrivatePackageAbort',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortStatus.FromString,
+                _registered_method=True)
+        self.WeightsTransfer = channel.unary_stream(
+                '/cozy.worker.v1.PodHost/WeightsTransfer',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferStatus.FromString,
+                _registered_method=True)
+
+
+class PodHostServicer(object):
+    """---------------------------------------------------------------------------
+    PodHost -- the RecordOwner <-> pod HOST lane. A second service on the pod's external
+    listener, served by pod-supervisor beside WorkerControl. It carries what the host does on the
+    owner's behalf and nothing that is control: the owner asks the host to PREPARE (download,
+    verify, obtain the PlacementSet bytes from the Runtime's loopback preparation), then sends
+    those exact bytes ITSELF as DesiredWorkerState{placement_set} on WorkerControl. Remote and
+    local are the same three steps -- prepare, placement_set bytes, desired_state -- and a
+    multi-GiB materialization never sits on the control stream's read loop, where before 21 it
+    head-of-line blocked every offer, ack, and cancel behind it.
+
+    AUTHORITY: every call opens with the owner's Claim -- the same message and the same Ed25519
+    proof over ClaimProof/1 the owner presents on WorkerControl -- which the host verifies against
+    the same control key the Runtime verifies it against. A call whose record_owner_epoch is
+    older than the highest Claim the host has forwarded is refused. A host call is scoped to the
+    worker lifetime the proof names, never to one control stream: control_stream_epoch is 0 on
+    the Claim and on every request carried here, and nonzero refuses. The request's
+    record_owner_epoch and worker_boot_id MUST equal the Claim's.
+
+    REPLAY: each lane is durable in the host ledger and idempotent on its identity fields. A
+    reconnecting owner re-issues the exact call and receives the ledger's answer (the same
+    terminal status, or REPLAYED) or attaches to the operation still in flight. Progress is the
+    owner's observed signal; no lane needs a wall-clock guess.
+
+    Locally PodHost is not a service: the daemon calls the same host functions in-process.
+    ---------------------------------------------------------------------------
+    """
+
+    def PreparePackageSet(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PreparePrivatePackage(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PreparePrivatePlacement(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ModelSourceFile(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ModelSourcePrepare(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PrivatePackageFetch(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PrivatePackageAbort(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def WeightsTransfer(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_PodHostServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'PreparePackageSet': grpc.unary_stream_rpc_method_handler(
+                    servicer.PreparePackageSet,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.SerializeToString,
+            ),
+            'PreparePrivatePackage': grpc.unary_stream_rpc_method_handler(
+                    servicer.PreparePrivatePackage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.SerializeToString,
+            ),
+            'PreparePrivatePlacement': grpc.unary_stream_rpc_method_handler(
+                    servicer.PreparePrivatePlacement,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePlacementCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.SerializeToString,
+            ),
+            'ModelSourceFile': grpc.unary_stream_rpc_method_handler(
+                    servicer.ModelSourceFile,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceFileCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceFileStatus.SerializeToString,
+            ),
+            'ModelSourcePrepare': grpc.unary_unary_rpc_method_handler(
+                    servicer.ModelSourcePrepare,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.SerializeToString,
+            ),
+            'PrivatePackageFetch': grpc.unary_stream_rpc_method_handler(
+                    servicer.PrivatePackageFetch,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFetchCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFileStatus.SerializeToString,
+            ),
+            'PrivatePackageAbort': grpc.unary_unary_rpc_method_handler(
+                    servicer.PrivatePackageAbort,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortStatus.SerializeToString,
+            ),
+            'WeightsTransfer': grpc.unary_stream_rpc_method_handler(
+                    servicer.WeightsTransfer,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferStatus.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'cozy.worker.v1.PodHost', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('cozy.worker.v1.PodHost', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class PodHost(object):
+    """---------------------------------------------------------------------------
+    PodHost -- the RecordOwner <-> pod HOST lane. A second service on the pod's external
+    listener, served by pod-supervisor beside WorkerControl. It carries what the host does on the
+    owner's behalf and nothing that is control: the owner asks the host to PREPARE (download,
+    verify, obtain the PlacementSet bytes from the Runtime's loopback preparation), then sends
+    those exact bytes ITSELF as DesiredWorkerState{placement_set} on WorkerControl. Remote and
+    local are the same three steps -- prepare, placement_set bytes, desired_state -- and a
+    multi-GiB materialization never sits on the control stream's read loop, where before 21 it
+    head-of-line blocked every offer, ack, and cancel behind it.
+
+    AUTHORITY: every call opens with the owner's Claim -- the same message and the same Ed25519
+    proof over ClaimProof/1 the owner presents on WorkerControl -- which the host verifies against
+    the same control key the Runtime verifies it against. A call whose record_owner_epoch is
+    older than the highest Claim the host has forwarded is refused. A host call is scoped to the
+    worker lifetime the proof names, never to one control stream: control_stream_epoch is 0 on
+    the Claim and on every request carried here, and nonzero refuses. The request's
+    record_owner_epoch and worker_boot_id MUST equal the Claim's.
+
+    REPLAY: each lane is durable in the host ledger and idempotent on its identity fields. A
+    reconnecting owner re-issues the exact call and receives the ledger's answer (the same
+    terminal status, or REPLAYED) or attaches to the operation still in flight. Progress is the
+    owner's observed signal; no lane needs a wall-clock guess.
+
+    Locally PodHost is not a service: the daemon calls the same host functions in-process.
+    ---------------------------------------------------------------------------
+    """
+
+    @staticmethod
+    def PreparePackageSet(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/PreparePackageSet',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PreparePrivatePackage(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/PreparePrivatePackage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePackageCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PreparePrivatePlacement(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/PreparePrivatePlacement',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePrivatePlacementCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ModelSourceFile(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ModelSourceFile',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceFileCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceFileStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ModelSourcePrepare(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ModelSourcePrepare',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PrivatePackageFetch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/PrivatePackageFetch',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFetchCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageFileStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PrivatePackageAbort(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/PrivatePackageAbort',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PrivatePackageAbortStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WeightsTransfer(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/WeightsTransfer',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)

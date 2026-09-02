@@ -16,6 +16,19 @@ trips for an 8 GiB object and bought no authority the grant did not already carr
 
 `read` stays: it is the authenticated owner read-back lane, a bounded range of one object the
 owner explicitly asked for, which is a different thing from moving a whole object.
+
+TWO LANES TO THE HOST, ONE PREFERRED (proto-025, minor 21). The host's own seam is
+`RuntimeWeights`, a loopback service this Runtime serves: the supervisor opens `Exchange`
+per control session, intents and receipts go out on it as server events, acks come back as
+client messages, and `Upload` is unary. The pre-21 form -- the same messages as
+direction-annotated `WorkerControl` frames -- stays wired until the retirement minor. Which
+lane an exchange takes is an OBSERVED FACT, not a flag: a live `Exchange` stream selects
+itself; with none open the frame goes on `WorkerControl`. Every pending exchange remembers
+the lane and the exact envelope it last went out under, and is re-issued only when that
+lane is gone (the control stream superseded at the snapshot barrier, or a newer `Exchange`
+opened). An ack settles the exchange it answers exactly once, by echoing that envelope: an
+ack to a send this Runtime has since re-issued cannot bind a writer epoch the host has
+already fenced past.
 """
 
 from __future__ import annotations
@@ -25,8 +38,9 @@ import binascii
 import hashlib
 import io
 import json
+import queue
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -82,11 +96,50 @@ class WeightsExchangeError(Exception):
         self.detail = detail
 
 
+#: Where a pending exchange last went out: `("control", control_stream_epoch)` or
+#: `("exchange", stream id)`. The lane is live while that stream is; a send on a lane that
+#: is gone is what a replay re-issues.
+Lane = tuple[str, int]
+#: The three-field envelope a send was stamped with; the ack echoes it exactly.
+Envelope = tuple[int, int, str]
+
+_EVENT_FIELD = {"weights_intent": "intent", "weights_receipt": "receipt"}
+
+
+def _envelope(message: Any) -> Envelope:
+    return message.record_owner_epoch, message.control_stream_epoch, message.worker_boot_id
+
+
 @dataclass(slots=True)
 class _Pending:
     frame: pb.WorkerFrame
     event: threading.Event
     ack: pb.WeightsHostAck | None = None
+    lane: Lane = ("", 0)
+    envelope: Envelope = (0, 0, "")
+
+
+class _ExchangeStream:
+    """ONE open `RuntimeWeights.Exchange` call: the events this Runtime pushes to the
+    supervisor, and the fact of whether the call is still open."""
+
+    __slots__ = ("ended", "id", "out", "superseded")
+
+    def __init__(self, stream_id: int) -> None:
+        self.id = stream_id
+        self.out: queue.Queue[pb.WeightsHostEvent | None] = queue.Queue()
+        self.ended = threading.Event()
+        self.superseded = False
+
+    def live(self) -> bool:
+        return not self.ended.is_set()
+
+    def end(self, *, superseded: bool = False) -> None:
+        if superseded:
+            self.superseded = True
+        if not self.ended.is_set():
+            self.ended.set()
+            self.out.put(None)
 
 
 @dataclass(slots=True)
@@ -127,11 +180,20 @@ class WeightsExchange:
         send: Callable[[pb.WorkerFrame], None],
         stop: threading.Event,
         owner_scope: Callable[[], str],
+        stamp: Callable[[Any], Any] | None = None,
+        note: Callable[[str, str], None] | None = None,
         allow_private_egress: bool = False,
     ) -> None:
+        #: The `WorkerControl` lane: stamps the frame's envelope and queues it on the live
+        #: control stream. Used only while no `Exchange` is open.
         self.send = send
+        #: The worker's envelope stamp, for events that leave on `Exchange` instead. The
+        #: identity default is for a test that exercises only the upload path, which never
+        #: stamps; the worker always passes its own fence stamp.
+        self.stamp = stamp or (lambda message: message)
         self.stop = stop
         self.owner_scope = owner_scope
+        self.note = note or (lambda _kind, _step: None)
         self.store_root = store_root
         # Local proof only; production leaves this false, exactly as the supervisor's own
         # `allowPrivateWeightsUploads` does. It widens nothing but the address classes an
@@ -142,6 +204,136 @@ class WeightsExchange:
         self._pending: dict[tuple[str, int, str, int], _Pending] = {}
         self._bindings: dict[str, tuple[int, bytes]] = {}
         self._held: dict[str, _Held] = {}
+        #: The live `RuntimeWeights.Exchange` call, if a supervisor has one open. Its
+        #: presence IS the lane choice; nothing else configures it.
+        self._stream: _ExchangeStream | None = None
+        self._streams_opened = 0
+
+    # ------------------------------------------------------------- the host's lanes
+
+    def exchange_open(self) -> bool:
+        """The observed fact that selects the lane: a supervisor holds `Exchange` open."""
+        with self._lock:
+            return self._stream is not None and self._stream.live()
+
+    def open_exchange_id(self) -> int:
+        """The generation of the live `Exchange`, or 0 if none is open. Observability only:
+        each accepted supervisor stream is one higher than the last."""
+        with self._lock:
+            if self._stream is not None and self._stream.live():
+                return self._stream.id
+            return 0
+
+    def serve_exchange(self, acks: Iterator[pb.WeightsHostAck]) -> Iterator[pb.WeightsHostEvent]:
+        """The server side of `RuntimeWeights.Exchange`, for one supervisor session.
+
+        A newer `Exchange` supersedes this one exactly as a newer control stream supersedes
+        its predecessor; the superseded call ends and its late acks are refused, so one
+        exchange can never bind two writer epochs. A pending exchange stranded when this call
+        ends is re-issued at the next snapshot barrier (`replay_pending`) under the fence that
+        is current then, never restamped here where the fence may be mid-transition.
+        """
+        stream = self._open(acks)
+        try:
+            while True:
+                event = stream.out.get()
+                if event is None:
+                    break
+                yield event
+        finally:
+            self._close(stream)
+        if stream.superseded:
+            raise WeightsExchangeError(
+                "weights_exchange_superseded", "a newer RuntimeWeights.Exchange replaced this one"
+            )
+
+    def _open(self, acks: Iterator[pb.WeightsHostAck]) -> _ExchangeStream:
+        with self._lock:
+            self._streams_opened += 1
+            stream = _ExchangeStream(self._streams_opened)
+            previous, self._stream = self._stream, stream
+            if previous is not None:
+                previous.end(superseded=True)
+            if self.stop.is_set():
+                stream.end()
+                return stream
+        # The stream's own thread reads acks; the server thread yields events. Both end with
+        # the call, and the call ends when either side says so.
+        self.note("artifact", f"RuntimeWeights.Exchange {stream.id} open")
+        threading.Thread(
+            target=self._read_acks,
+            args=(stream, acks),
+            daemon=True,
+            name=f"weights-exchange-{stream.id}",
+        ).start()
+        return stream
+
+    def _close(self, stream: _ExchangeStream) -> None:
+        stream.end()
+        with self._lock:
+            if self._stream is stream:
+                self._stream = None
+        self.note("artifact", f"RuntimeWeights.Exchange {stream.id} ended")
+
+    def _read_acks(self, stream: _ExchangeStream, acks: Iterator[pb.WeightsHostAck]) -> None:
+        """The stream's client half: every ack the supervisor sends, until it half-closes,
+        cancels, or this Runtime supersedes the call. Ending the read ends the call."""
+        try:
+            for ack in acks:
+                if not stream.live():
+                    return
+                try:
+                    self.absorb_ack(ack, lane=("exchange", stream.id))
+                except WeightsExchangeError as exc:
+                    self.note("artifact", f"dropped host ACK on Exchange: {exc.code}: {exc.detail}")
+        except Exception as exc:
+            # The supervisor cancelled or its connection went: the call is over either way,
+            # and what it carried stays pending for the next lane.
+            self.note("artifact", f"Exchange {stream.id} ack reader ended: {type(exc).__name__}")
+        finally:
+            stream.end()
+
+    def _dispatch(self, pending: _Pending) -> None:
+        """Send (or re-send) one exchange on the lane that is open right now. `_lock` held."""
+        stream = self._stream
+        if stream is not None and stream.live():
+            self._send_on_exchange(pending, stream)
+        else:
+            self._send_on_control(pending)
+
+    def _send_on_exchange(self, pending: _Pending, stream: _ExchangeStream) -> None:
+        # A fresh copy per send: `pending.frame` stays the unstamped template so a re-issue
+        # under a later fence starts from the same bytes.
+        frame = pb.WorkerFrame()
+        frame.CopyFrom(pending.frame)
+        kind = frame.WhichOneof("msg")
+        assert kind is not None
+        inner = self.stamp(getattr(frame, kind))
+        event = pb.WeightsHostEvent()
+        getattr(event, _EVENT_FIELD[kind]).CopyFrom(inner)
+        pending.lane = ("exchange", stream.id)
+        pending.envelope = _envelope(inner)
+        stream.out.put(event)
+
+    def _send_on_control(self, pending: _Pending) -> None:
+        # A fresh copy per send: the control sender serializes what it was handed, and a
+        # later re-issue must not restamp bytes a superseded sender may still be reading.
+        frame = pb.WorkerFrame()
+        frame.CopyFrom(pending.frame)
+        self.send(frame)  # worker.send stamps the live fence under the claim lock
+        kind = frame.WhichOneof("msg")
+        assert kind is not None
+        inner = getattr(frame, kind)
+        pending.lane = ("control", inner.control_stream_epoch)
+        pending.envelope = _envelope(inner)
+
+    def _lane_live(self, lane: Lane, control_stream_epoch: int) -> bool:
+        if lane[0] == "control":
+            return lane[1] == control_stream_epoch
+        stream = self._stream
+        return (
+            lane[0] == "exchange" and stream is not None and stream.live() and stream.id == lane[1]
+        )
 
     @staticmethod
     def _key(
@@ -325,7 +517,14 @@ class WeightsExchange:
             "weights_receipt_digest": documents.spell(receipt_digest),
         }
 
-    def absorb_ack(self, ack: pb.WeightsHostAck) -> None:
+    def absorb_ack(self, ack: pb.WeightsHostAck, *, lane: Lane) -> None:
+        """One ack settles the one exchange it answers, ONCE.
+
+        `lane` is where the ack arrived. It must be where the exchange last went out, and
+        the ack must echo the envelope of that send: after a re-issue the host may have
+        fenced a new writer epoch for the same transaction, and an ack to the earlier send
+        would bind this Runtime to an epoch the host has already moved past.
+        """
         key = self._key(ack.request_id, ack.attempt_ordinal, ack.output_slot, ack.stage)
         with self._lock:
             pending = self._pending.get(key)
@@ -333,19 +532,38 @@ class WeightsExchange:
                 raise WeightsExchangeError(
                     "weights_host_ack_unexpected", "no exact host exchange awaits this ACK"
                 )
+            if pending.lane != lane or pending.envelope != _envelope(ack):
+                raise WeightsExchangeError(
+                    "weights_host_ack_superseded",
+                    "the ACK answers a send this exchange has since re-issued",
+                )
             pending.ack = ack
             pending.event.set()
 
-    def replay_pending(self) -> None:
+    def replay_pending(self, control_stream_epoch: int) -> None:
+        """The snapshot barrier: re-issue what the SUPERSEDED lanes still owe.
+
+        A pending exchange whose lane is live keeps waiting there -- an open `Exchange`
+        survives an owner reconnect, and its ack, when it comes, still names the send it
+        answers. Only a send on a control stream that is not this one, or on an `Exchange`
+        that has ended, is re-issued, on whichever lane is open now.
+        """
         with self._lock:
-            frames = [pending.frame for pending in self._pending.values() if pending.ack is None]
-        for frame in frames:
-            self.send(frame)
+            stranded = [
+                pending
+                for pending in self._pending.values()
+                if pending.ack is None and not self._lane_live(pending.lane, control_stream_epoch)
+            ]
+            for pending in stranded:
+                self._dispatch(pending)
 
     def close(self) -> None:
         """Release every live TensorFS read lease; durable facts remain with the host."""
         with self._lock:
             held, self._held = list(self._held.values()), {}
+            stream, self._stream = self._stream, None
+        if stream is not None:
+            stream.end()
         for transaction in held:
             transaction.lease.release()
 
@@ -424,7 +642,12 @@ class WeightsExchange:
         return pb.WorkerFrame(weights_read_result=result)
 
     def upload(self, request: pb.WeightsUploadRequest) -> pb.WorkerFrame:
-        """Stream ONE held object to the exact presigned URL the supervisor granted."""
+        """Stream ONE held object to the exact presigned URL the supervisor granted.
+
+        Returns the answer as a `WorkerFrame`; `RuntimeWeights.Upload` unwraps its inner
+        `WeightsUploadResult`, and the pre-21 `WorkerControl` lane sends the frame as-is
+        (the session restamps the envelope). The bytes never enter the host process.
+        """
         result = pb.WeightsUploadResult(
             weights_transaction_id=request.weights_transaction_id,
             writer_epoch=request.writer_epoch,
@@ -516,8 +739,10 @@ class WeightsExchange:
                     "weights_host_exchange_conflict", "another exchange holds this output stage"
                 )
             self._pending[key] = pending
+            # Send on whichever lane is open right now, stamped with the current fence, and
+            # remember both so the one ack that answers this send is the one that settles it.
+            self._dispatch(pending)
         try:
-            self.send(frame)
             while not pending.event.wait(0.1):
                 if canceled() or self.stop.is_set():
                     raise WeightsExchangeError(

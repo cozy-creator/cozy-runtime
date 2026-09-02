@@ -109,6 +109,9 @@ def _run(config: WorkerHostConfig) -> int:
     host.model_source_preparer = worker.prepare_model_source
     host.private_package_preparer = worker.prepare_private_package
     host.private_placement_preparer = worker.prepare_private_placement
+    # The loopback weights seam (proto-025). The supervisor opens Exchange per control
+    # session and calls Upload; both are the worker's own WeightsExchange.
+    host.weights = worker.weights
 
     def ready(_address: str) -> None:
         if worker.stop.is_set():
