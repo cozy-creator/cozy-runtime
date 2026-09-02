@@ -36,6 +36,7 @@ import json
 import math
 import os
 import resource
+import socket
 import sys
 import time
 from collections.abc import Mapping
@@ -58,6 +59,15 @@ from cozy_runtime.internal import accel, canonical, child_env, descriptor, sandb
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.parallel import cp, wire
+from cozy_runtime.internal.parallel.group import RankGroup, RankSpec, join_rank
+from cozy_runtime.internal.parallel.mirror import FollowerMirror, LeaderMirror
+from cozy_runtime.internal.parallel.plan import (
+    GroupPlan,
+    GroupRefusal,
+    RankDivergence,
+    rank_invariant_digest,
+)
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError, connect
 from cozy_runtime.protocol import documents
 
@@ -90,6 +100,15 @@ def _env_changes() -> tuple[str, ...]:
     """
     current = seal_snapshot()
     return tuple(name for name in sorted(_SEALED) if current.get(name, "") != _SEALED[name])
+
+
+def _sealed_entries() -> tuple[str, ...]:
+    """The seal's `CUDA_VISIBLE_DEVICES` entries: one per device this process may use."""
+    return tuple(
+        entry.strip()
+        for entry in _SEALED.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if entry.strip()
+    )
 
 
 def _env_document() -> dict[str, Any]:
@@ -283,9 +302,27 @@ class _CompositeResidency:
 class Executor:
     """One epoch's mutable state. Everything here dies with the process."""
 
-    def __init__(self, channel: Channel, root: Path, fill_forensics_dir: str = "") -> None:
+    def __init__(
+        self,
+        channel: Channel,
+        root: Path,
+        fill_forensics_dir: str = "",
+        *,
+        rank: int = 0,
+        world: int = 1,
+    ) -> None:
         self.channel = channel
         self.root = root
+        #: THIS process's rank in its generation's group and the group's size (cr-068). A
+        #: plain executor is rank 0 of a world of 1 and forms nothing; rank 0 of a wider
+        #: world spawns and drives the followers; a follower's channel is rank 0's seam.
+        self.rank = int(rank)
+        self.world = int(world)
+        self.group: RankGroup | None = None
+        self.pg: Any = None
+        self._device_ready = False
+        #: the attempt spool while an attempt runs: where a mirrored call's payloads go
+        self._attempt_spool: Path | None = None
         #: cr-038: the fill plane's capture directory, taken from the sealed environment
         #: snapshot at process entry and passed down — never read ambiently.
         self.fill_forensics_dir = fill_forensics_dir
@@ -340,6 +377,145 @@ class Executor:
             "length": len(raw),
         }
 
+    # ------------------------------------------------------------- the group (cr-068)
+
+    def _initialize_device(self, torch: Any) -> dict[str, Any] | None:
+        """Runtime's ONE explicit accelerator init boundary, idempotent per process.
+
+        Under a group every rank pins its own card: rank r of a seal naming K entries is
+        card r of that seal, made current before any allocation. A CUDA context that
+        already exists when this runs is a refusal (`cuda_initialized_before_runtime`) -
+        something else picked a device first.
+        """
+        if self._device_ready:
+            return None
+        if accel.initialized(torch, self.device_kind):
+            return {
+                "ok": False,
+                "code": "cuda_initialized_before_runtime",
+                "detail": "Torch CUDA was already initialized before Runtime's explicit "
+                "allocator boundary; package execution is refused",
+            }
+        accel.initialize(torch, self.device_kind)
+        if self.world > 1 and self.device_kind == "cuda":
+            torch.cuda.set_device(self.rank)
+        accel.reset_peak(torch, self.device_kind)
+        self._device_ready = True
+        return None
+
+    def _rank_device(self, torch: Any) -> Any:
+        if self.device_kind == "cuda" and accel.present(torch, self.device_kind):
+            return torch.device("cuda", self.rank if self.world > 1 else 0)
+        return torch.device("cpu")
+
+    def join(self, command: dict[str, Any]) -> dict[str, Any]:
+        """A FOLLOWER joins rank 0's store and forms its half of the process group."""
+        if self.rank == 0:
+            return {"ok": False, "code": "not_a_follower", "detail": "rank 0 forms the group"}
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        changed = _env_changes()
+        if changed:
+            return {"ok": False, "code": "env_seal_broken", "detail": ", ".join(changed)}
+        import torch
+
+        self.torch = torch
+        spec = RankSpec(
+            rank=self.rank,
+            world=self.world,
+            port=int(command["port"]),
+            backend=str(command.get("backend") or "nccl"),
+        )
+        if spec.backend == "nccl":
+            # This rank's card becomes current HERE, through the one init boundary: the
+            # NCCL communicator binds to the current device. A gloo group (the CPU stand-in
+            # the suite proves rendezvous on) touches no device.
+            refused = self._initialize_device(torch)
+            if refused is not None:
+                self.poisoned = f"join refused: {refused['code']}"
+                return refused
+        try:
+            self.pg = join_rank(torch, spec, _SEALED)
+        except Exception as exc:
+            self.poisoned = f"join failed: {type(exc).__name__}"
+            return {
+                "ok": False,
+                "code": "group_unformed",
+                "detail": f"rank {self.rank} could not join: {type(exc).__name__}: {exc}"[:900],
+            }
+        return {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
+
+    def run(self, command: dict[str, Any]) -> dict[str, Any]:
+        """A FOLLOWER's half of one mirrored component-use call (cr-068)."""
+        if self.rank == 0:
+            return {
+                "ok": False,
+                "code": "not_a_follower",
+                "detail": "rank 0 mirrors, it is not mirrored",
+            }
+        if not self.ready or self.torch is None:
+            return {"ok": False, "code": "executor_not_ready", "detail": "no generation is Ready"}
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        model = self.models.get(str(command.get("model", "")))
+        method = str(command.get("method", ""))
+        if model is None or not method or method.startswith("_"):
+            self.poisoned = "mirrored call names no model method"
+            return {
+                "ok": False,
+                "code": "rank_divergence",
+                "detail": f"rank {self.rank} holds no {command.get('model')!r}.{method}",
+                "rank": self.rank,
+            }
+        payloads = wire.TensorSpool(Path(str(command.get("spool", self.root))) / "ranks")
+        try:
+            args, kwargs = wire.run_call(command, payloads, device=self._rank_device(self.torch))
+            with cp.gated_call():
+                getattr(model, method)(*args, **kwargs)
+            accel.synchronize(self.torch, self.device_kind)
+        except Exception as exc:
+            outcome = classify(exc)
+            self.poisoned = f"mirrored {method} failed: {outcome.code}"
+            return {
+                "ok": False,
+                "code": outcome.code,
+                "detail": f"{type(exc).__name__}: {exc}"[:900],
+                "rank": self.rank,
+            }
+        return {"ok": True, "rank": self.rank, "method": method}
+
+    def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
+        """A group that could not form or hold is THIS process's poison: the worker
+        rebuilds the whole cgroup, never a partial group."""
+        self.poisoned = f"group: {exc.code}"
+        if closing and self.group is not None:
+            self.group.close()
+        return {"ok": False, "code": exc.code, "detail": exc.message[:900]}
+
+    def _install_group(self, torch: Any, model: Any, parameter: str) -> dict[str, Any] | None:
+        """Every rank shards its replica and takes its side of the mirror."""
+        if self.world <= 1:
+            return None
+        comms = cp.CpComms(self.pg, self.rank, self._rank_device(torch))
+        try:
+            installed = cp.install_context_parallel(model, degree=self.world, comms=comms)
+        except GroupRefusal as exc:
+            return self._group_refusal(exc)
+        mirror: LeaderMirror | FollowerMirror
+        if self.rank == 0:
+            assert self.group is not None
+            mirror = LeaderMirror(self.group, parameter, lambda: self._attempt_spool)
+        else:
+            mirror = FollowerMirror()
+        object.__setattr__(model, "_cozy_group", mirror)
+        self.facts["sequence_parallel"] = {
+            "degree": self.world,
+            "rank": self.rank,
+            "components": list(installed),
+            "followers": list(self.group.pids()) if self.group is not None else [],
+        }
+        return None
+
     def prepare(self, command: dict[str, Any]) -> dict[str, Any]:
         """Consume this epoch's one construction attempt.
 
@@ -388,6 +564,72 @@ class Executor:
                 f"{sealed_devices!r} and the prepare names {command.get('devices')!r}: "
                 "an executor serves exactly its lane's devices",
             }
+        # THE DEGREE (cr-068): the ONLY new fact a group's executor receives. K must equal
+        # the number of devices the seal names on rank 0, and the world it was spawned into
+        # on a follower; a mismatch refuses before any weight moves. Degree 1 (or absent)
+        # is a plain executor, whatever the seal's width - a job's envelope lane.
+        degree = int(command.get("sequence_parallel_degree") or 1)
+        expected_degree = self.world if self.rank > 0 else max(degree, 1)
+        if degree != expected_degree or (degree > 1 and degree != len(_sealed_entries())):
+            self.poisoned = "sequence-parallel degree mismatch"
+            return {
+                "ok": False,
+                "code": "sequence_parallel_degree_mismatch",
+                "detail": f"the prepare names degree {degree}; this process is rank "
+                f"{self.rank} of a world of {self.world} sealed to "
+                f"{len(_sealed_entries())} device(s) ({sealed_devices!r})",
+            }
+        if self.rank > 0:
+            # THE BROADCAST PLAN'S HARDWARE HALF, checked before torch is imported: the
+            # degree and the devices are this rank's own facts already, and a rank 0 that
+            # planned for other cards is divergence, not something to fill under.
+            try:
+                broadcast = GroupPlan.read(dict((command.get("group") or {}).get("plan") or {}))
+            except (KeyError, TypeError, ValueError) as exc:
+                self.poisoned = "rank divergence"
+                return {
+                    "ok": False,
+                    "code": "rank_divergence",
+                    "detail": f"rank {self.rank} received no readable group plan: {exc}"[:400],
+                    "rank": self.rank,
+                }
+            if (broadcast.degree, broadcast.devices) != (self.world, _sealed_entries()):
+                self.poisoned = "rank divergence"
+                return {
+                    "ok": False,
+                    "code": "rank_divergence",
+                    "detail": f"rank {self.rank} is sealed to {list(_sealed_entries())} in a "
+                    f"world of {self.world}; rank 0 broadcast degree {broadcast.degree} over "
+                    f"{list(broadcast.devices)}",
+                    "rank": self.rank,
+                }
+        if degree > 1 and (
+            "models" in command or not command.get("binding", {}).get("model_class")
+        ):
+            self.poisoned = "sequence-parallel construction unsupported"
+            return {
+                "ok": False,
+                "code": "sequence_parallel_unsupported",
+                "detail": "a group shards ONE model-bearing construction; a weightless or "
+                "multi-model placement serves at degree 1",
+            }
+        if degree > 1 and self.rank == 0 and self.group is None:
+            # RANKS 1..K-1 EXIST FROM HERE, before torch is imported: they dial back over
+            # their own seam and answer `hello` under exactly this seal while this process
+            # goes on to import torch and resolve the plan.
+            self.world = degree
+            self.group = RankGroup(
+                degree=degree,
+                backend="nccl" if self.device_kind == "cuda" else "gloo",
+                python=sys.executable,
+                root=str(self.root),
+                forward=self.channel.send,
+            )
+            try:
+                self.group.spawn()
+                self.group.dial_back(_SEALED)
+            except GroupRefusal as exc:
+                return self._group_refusal(exc)
         if "models" in command:
             return self._prepare_many(command)
         binding = command["binding"]
@@ -447,15 +689,9 @@ class Executor:
             resolve,
         )
 
-        if accel.initialized(torch, self.device_kind):
-            return {
-                "ok": False,
-                "code": "cuda_initialized_before_runtime",
-                "detail": "Torch CUDA was already initialized before Runtime's explicit "
-                "allocator boundary; package execution is refused",
-            }
-        accel.initialize(torch, self.device_kind)
-        accel.reset_peak(torch, self.device_kind)
+        refused = self._initialize_device(torch)
+        if refused is not None:
+            return refused
         cuda_ms = (time.perf_counter() - started) * 1000
         changed = _env_changes()
         if changed:
@@ -466,6 +702,21 @@ class Executor:
                 "the allocator read its environment once and a late imposition is a silent "
                 f"no-op, so this is a refusal rather than a warning ({', '.join(changed)})",
             }
+        if self.group is not None and not self.group.formed:
+            # THE GROUP FORMS BEFORE THE FILL (cr-068): a group that cannot rendezvous costs
+            # no weight movement, and a follower that fails here is a prepare refusal, never
+            # a partial group.
+            try:
+                self.pg = self.group.form(torch, _SEALED)
+            except GroupRefusal as exc:
+                return self._group_refusal(exc)
+            except Exception as exc:
+                return self._group_refusal(
+                    GroupRefusal(
+                        f"rank 0 could not form the group: {type(exc).__name__}: {exc}",
+                        code="group_unformed",
+                    )
+                )
 
         if self.discovered is None:
             self._discover_provisioned(binding)
@@ -502,7 +753,7 @@ class Executor:
         # the executor's device; a repository lane is never a hardware claim. THE DEVICE IS
         # ORDINAL 0 BY CONSTRUCTION (cr-066): the worker sealed this process to exactly its
         # lane's devices, so there is nothing to select here and no index to carry.
-        device_index = 0
+        device_index = self.rank if self.world > 1 else 0
         device_facts = measure_device(torch, device_index)
         hardware_variant = str(binding.get("variant") or "")
         if not hardware_variant:
@@ -597,6 +848,39 @@ class Executor:
                 "detail": str(exc).splitlines()[0][:900],
                 "plan": {"walk": exc.walk, "objective": binding.get("objective")},
             }
+        if self.world > 1:
+            # RANK 0 DECIDES, EVERY RANK OBEYS (cr-068). Rank 0 hands its followers the same
+            # prepare with the plan it resolved; a follower resolves the same inputs on its
+            # own card and refuses `rank_divergence` on the first field that differs.
+            mine = GroupPlan(
+                degree=self.world,
+                devices=_sealed_entries(),
+                plan_digest=rank_invariant_digest(plan.identity()),
+                logical_model_digest=(
+                    construction.config_digest + "/" + construction.topology_digest
+                ),
+                authorized_device_limit_bytes=authorized,
+            )
+            if self.rank == 0:
+                assert self.group is not None
+                try:
+                    self.group.broadcast({**command, "group": {"plan": mine.document()}})
+                except GroupRefusal as exc:
+                    return self._group_refusal(exc)
+            else:
+                try:
+                    mine.assert_agrees(
+                        GroupPlan.read(dict((command.get("group") or {}).get("plan") or {})),
+                        rank=self.rank,
+                    )
+                except (RankDivergence, KeyError, TypeError, ValueError) as exc:
+                    self.poisoned = "rank divergence"
+                    return {
+                        "ok": False,
+                        "code": "rank_divergence",
+                        "detail": str(exc)[:900],
+                        "rank": self.rank,
+                    }
 
         # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
         # worker can report measured progress for a multi-GB load without inventing a timeout.
@@ -890,9 +1174,60 @@ class Executor:
                 f"{self.logical_model_digest}: the planner pricing variant A while the "
                 "executor serves variant B is unrepresentable",
             }
+        if self.group is not None:
+            # THE FOLLOWERS FILLED THE SAME PLAN, or the group is not a group. Every reply
+            # is held to rank 0's own construction identities.
+            try:
+                replies = self.group.collect("prepare")
+            except GroupRefusal as exc:
+                return self._group_refusal(exc)
+            for follower, reply in zip(self.group.followers, replies, strict=True):
+                if not reply.get("ok"):
+                    code = str(reply.get("code") or "group_unformed")
+                    return self._group_refusal(
+                        GroupRefusal(
+                            f"rank {follower.rank} refused the prepare: {code}: "
+                            f"{reply.get('detail', '')}"[:800],
+                            code=code if code in _GROUP_CODES else "group_unformed",
+                        )
+                    )
+                # The LOGICAL model must be the same on every rank; the constructed digest
+                # folds the card's index and is rank-local, so what is compared beside it
+                # is what the fill committed and the ceiling it committed under.
+                theirs = dict(reply.get("facts") or {})
+                agreed: list[tuple[str, object, object]] = [
+                    (
+                        "model_construction_digest",
+                        self.logical_model_digest,
+                        reply.get("model_construction_digest"),
+                    ),
+                    ("filled_bytes", record.filled_bytes, theirs.get("filled_bytes")),
+                    (
+                        "resident_budget_bytes",
+                        resident_budget,
+                        theirs.get("resident_budget_bytes"),
+                    ),
+                ]
+                for key, ours, other in agreed:
+                    if other != ours:
+                        return self._group_refusal(
+                            RankDivergence(
+                                follower.rank,
+                                key,
+                                f"rank 0 built {ours!r}, rank {follower.rank} built {other!r}",
+                            )
+                        )
+        self.facts = {}
+        refused = self._install_group(torch, model, binding["model_parameter_name"])
+        if refused is not None:
+            return refused
+        group_facts = dict(self.facts)
         memory = accel.allocation(torch, self.device_kind)
         self.ready = True
         self.facts = {
+            # `sequence_parallel` rides here under a group ONLY: a plain executor's facts
+            # are exactly what they were.
+            **group_facts,
             "cuda_init_ms": round(cuda_ms, 2),
             "prepare_ms": round((time.perf_counter() - started) * 1000, 2),
             # An all-inline checkpoint commits without opening the object stream. No stream
@@ -1307,6 +1642,7 @@ class Executor:
         spool = Path(command["spool"])
         deadline = _deadline(command["deadline_s"])
         torch = self.torch
+        self._attempt_spool = spool
 
         # The lossy lane, carrying BOTH kinds of live record. A progress frame is not
         # retained anywhere: its `position` is the monotone unit count the worker's
@@ -1356,6 +1692,11 @@ class Executor:
             ),
         )
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
+        self._attempt_spool = None
+        if self.group is not None and self.group.broken and not self.poisoned:
+            # A FOLLOWER DIED OR DIVERGED UNDER THIS ATTEMPT (cr-068): the group is one
+            # executor, so this process is poisoned with it and the worker rebuilds all K.
+            self.poisoned = f"group: {self.group.broken}"[:200]
 
         # §3.4 step 2: the exact D2H wait BEFORE the device lease releases. Everything the
         # tail touches must already be immutable and independent of package GPU state. A
@@ -1430,7 +1771,7 @@ class Executor:
                 "allocated_at_start_bytes": allocated_at_start,
                 "rss_at_end_bytes": _rss(),
                 "started_unix": started_wall,
-                "gpu_count": 1 if torch is not None else 0,
+                "gpu_count": self.world if torch is not None else 0,
             },
         }
 
@@ -1958,11 +2299,29 @@ class Executor:
             return {**self.probe(), "vacated": {"freed": {}, "held": {}, "freed_bytes": 0}}
         from cozy_runtime.internal.residency import ResidencyRefusal
 
+        if self.group is not None:
+            # EVERY RANK VACATES (cr-068): each replica frees its own card. The reply is
+            # rank 0's; the worker reads the K devices itself, through NVML.
+            try:
+                self.group.broadcast({"cmd": "vacate"})
+            except GroupRefusal as exc:
+                return self._group_refusal(exc, closing=False)
         try:
             vacated = self.residency.vacate()
         except ResidencyRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
         accel.synchronize(self.torch, self.device_kind)
+        if self.group is not None:
+            try:
+                for reply in self.group.collect("vacate"):
+                    if not reply.get("ok"):
+                        raise GroupRefusal(
+                            f"a follower refused to vacate: {reply.get('code')}: "
+                            f"{reply.get('detail', '')}"[:600],
+                            code="group_broken",
+                        )
+            except GroupRefusal as exc:
+                return self._group_refusal(exc, closing=False)
         return {**self.probe(), "vacated": vacated}
 
     def probe(self) -> dict[str, Any]:
@@ -2171,12 +2530,34 @@ def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:
 
 # --------------------------------------------------------------------------- main
 
+#: What a follower rank answers. It has no worker: rank 0 is its whole control plane.
+_FOLLOWER_COMMANDS = frozenset({"hello", "join", "prepare", "run", "vacate", "probe", "shutdown"})
+
+#: A follower's refusal codes rank 0 relays as-is; any other refusal is the group not
+#: forming, named with the follower's own detail.
+_GROUP_CODES = frozenset({"rank_divergence", "context_parallel_unavailable", "group_broken"})
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="cozy-runtime device executor")
-    parser.add_argument("--socket", required=True)
+    parser.add_argument("--socket", default="")
     parser.add_argument("--root", required=True)
+    # A FOLLOWER RANK (cr-068): the same program, told its rank, its world, the inherited
+    # seam fd to rank 0 and rank 0's pid. It never has a worker socket of its own.
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--world", type=int, default=1)
+    parser.add_argument("--rank-fd", type=int, default=-1)
+    parser.add_argument("--leader", type=int, default=0)
     args = parser.parse_args(argv)
+    if args.rank > 0:
+        if args.rank_fd < 0 or args.world <= args.rank or not args.leader:
+            parser.error("a follower rank needs --rank-fd, --world > rank and --leader")
+        if os.getppid() != args.leader:
+            # pdeathsig was armed before exec and covers FUTURE deaths only; an already
+            # orphaned follower never becomes a rank.
+            return int(Exit.structural)
+    elif not args.socket:
+        parser.error("--socket is required for rank 0")
 
     _capture_seal()
     # cr-042: the executor's ONE network fence, installed BEFORE the seam dials so the
@@ -2188,11 +2569,17 @@ def main(argv: list[str] | None = None) -> int:
         "(cr-012). Package code that dials is a bug, and this is where the bug stops",
         allow_unix_seam=True,
     )
-    channel = connect(args.socket)
+    channel = (
+        connect(args.socket)
+        if args.rank == 0
+        else Channel(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=args.rank_fd))
+    )
     executor = Executor(
         channel,
         Path(args.root),
         fill_forensics_dir=_SEALED.get(child_env.FILL_FORENSICS_DIR, "").strip(),
+        rank=args.rank,
+        world=args.world,
     )
 
     while True:
@@ -2203,6 +2590,11 @@ def main(argv: list[str] | None = None) -> int:
         if command is None:
             return int(Exit.ok)
         name = command.get("cmd", "")
+        if executor.group is not None and executor.group.broken and not executor.poisoned:
+            # A FOLLOWER DIED BETWEEN COMMANDS (cr-068): the group is one executor, so this
+            # process is poisoned before it answers anything, and the worker's next
+            # command reads `poisoned_generation` and rebuilds the whole cgroup.
+            executor.poisoned = f"group: {executor.group.broken}"[:200]
         try:
             if name == "hello":
                 reply = {
@@ -2217,7 +2609,20 @@ def main(argv: list[str] | None = None) -> int:
                     "sealed": dict(_SEALED),
                     "torch_loaded": "torch" in sys.modules,
                     "rss_bytes": _rss(),
+                    "rank": executor.rank,
+                    "world": executor.world,
                 }
+            elif executor.rank > 0 and name not in _FOLLOWER_COMMANDS:
+                reply = {
+                    "ok": False,
+                    "code": "follower_command_unsupported",
+                    "detail": f"rank {executor.rank} answers {sorted(_FOLLOWER_COMMANDS)}, "
+                    f"not {name!r}",
+                }
+            elif name == "join":
+                reply = executor.join(command)
+            elif name == "run":
+                reply = executor.run(command)
             elif name == "describe_installed":
                 reply = executor.describe_installed(command)
             elif name == "prepare":
@@ -2235,6 +2640,8 @@ def main(argv: list[str] | None = None) -> int:
             elif name == "vacate":
                 reply = executor.vacate()
             elif name == "shutdown":
+                if executor.group is not None:
+                    executor.group.close()
                 channel.send({"reply": name, "ok": True})
                 return int(Exit.ok)
             else:

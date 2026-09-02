@@ -874,7 +874,7 @@ class WorkerSnapshot(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ..., snapshot_canonical_bytes: _Optional[bytes] = ..., accepted_placement_set_canonical_bytes: _Optional[bytes] = ..., host_snapshot_digest: _Optional[bytes] = ..., host_snapshot_canonical_bytes: _Optional[bytes] = ...) -> None: ...
 
 class WorkerSnapshotBody(_message.Message):
-    __slots__ = ("accepted_desired_state_revision", "accepted_placement_set_digest", "journal_highwater", "worker_phase", "placements", "converged_revision", "admission_epoch", "admission_state", "available_attempt_slots", "held_attempts", "weights_transactions")
+    __slots__ = ("accepted_desired_state_revision", "accepted_placement_set_digest", "journal_highwater", "worker_phase", "placements", "converged_revision", "admission_epoch", "admission_state", "available_attempt_slots", "held_attempts", "weights_transactions", "lanes")
     ACCEPTED_DESIRED_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
     ACCEPTED_PLACEMENT_SET_DIGEST_FIELD_NUMBER: _ClassVar[int]
     JOURNAL_HIGHWATER_FIELD_NUMBER: _ClassVar[int]
@@ -886,6 +886,7 @@ class WorkerSnapshotBody(_message.Message):
     AVAILABLE_ATTEMPT_SLOTS_FIELD_NUMBER: _ClassVar[int]
     HELD_ATTEMPTS_FIELD_NUMBER: _ClassVar[int]
     WEIGHTS_TRANSACTIONS_FIELD_NUMBER: _ClassVar[int]
+    LANES_FIELD_NUMBER: _ClassVar[int]
     accepted_desired_state_revision: int
     accepted_placement_set_digest: bytes
     journal_highwater: int
@@ -897,7 +898,8 @@ class WorkerSnapshotBody(_message.Message):
     available_attempt_slots: int
     held_attempts: _containers.RepeatedCompositeFieldContainer[HeldAttempt]
     weights_transactions: _containers.RepeatedCompositeFieldContainer[WeightsTransactionStatus]
-    def __init__(self, accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., journal_highwater: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., converged_revision: _Optional[int] = ..., admission_epoch: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ...) -> None: ...
+    lanes: _containers.RepeatedCompositeFieldContainer[DeviceLane]
+    def __init__(self, accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., journal_highwater: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., converged_revision: _Optional[int] = ..., admission_epoch: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ..., lanes: _Optional[_Iterable[_Union[DeviceLane, _Mapping]]] = ...) -> None: ...
 
 class HostSnapshotBody(_message.Message):
     __slots__ = ("held_outcomes", "weights_transactions")
@@ -1008,12 +1010,22 @@ class PrivatePackageRevision(_message.Message):
     def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., package_descriptor: _Optional[_Union[Ref, _Mapping]] = ..., files: _Optional[_Iterable[_Union[PrivatePackageFileRef, _Mapping]]] = ...) -> None: ...
 
 class DesiredPlacementSet(_message.Message):
-    __slots__ = ("placement_set_digest", "placement_set_canonical_bytes")
+    __slots__ = ("placement_set_digest", "placement_set_canonical_bytes", "device_pins")
     PLACEMENT_SET_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PLACEMENT_SET_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    DEVICE_PINS_FIELD_NUMBER: _ClassVar[int]
     placement_set_digest: bytes
     placement_set_canonical_bytes: bytes
-    def __init__(self, placement_set_digest: _Optional[bytes] = ..., placement_set_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+    device_pins: _containers.RepeatedCompositeFieldContainer[PlacementDevicePin]
+    def __init__(self, placement_set_digest: _Optional[bytes] = ..., placement_set_canonical_bytes: _Optional[bytes] = ..., device_pins: _Optional[_Iterable[_Union[PlacementDevicePin, _Mapping]]] = ...) -> None: ...
+
+class PlacementDevicePin(_message.Message):
+    __slots__ = ("placement_id", "device_ordinals")
+    PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
+    DEVICE_ORDINALS_FIELD_NUMBER: _ClassVar[int]
+    placement_id: str
+    device_ordinals: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, placement_id: _Optional[str] = ..., device_ordinals: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class PlacementSet(_message.Message):
     __slots__ = ("placements",)
@@ -1234,7 +1246,7 @@ class JobDirective(_message.Message):
     def __init__(self, build_id: _Optional[str] = ..., job_descriptor_id: _Optional[str] = ..., resource_caps: _Optional[_Union[ResourceCaps, _Mapping]] = ..., publication_contract: _Optional[_Union[PublicationContract, _Mapping]] = ..., reclaim_on_terminal: bool = ..., device_count: _Optional[int] = ...) -> None: ...
 
 class ObservedWorkerState(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "applied_wire_minor", "held_attempts", "faults", "activity", "job_capacity", "placements", "admission_epoch", "admission_state", "available_attempt_slots", "accepted_desired_state_revision", "accepted_placement_set_digest", "converged_revision", "worker_phase")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "applied_wire_minor", "held_attempts", "faults", "activity", "job_capacity", "placements", "admission_epoch", "admission_state", "available_attempt_slots", "accepted_desired_state_revision", "accepted_placement_set_digest", "converged_revision", "worker_phase", "lanes")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1251,6 +1263,7 @@ class ObservedWorkerState(_message.Message):
     ACCEPTED_PLACEMENT_SET_DIGEST_FIELD_NUMBER: _ClassVar[int]
     CONVERGED_REVISION_FIELD_NUMBER: _ClassVar[int]
     WORKER_PHASE_FIELD_NUMBER: _ClassVar[int]
+    LANES_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -1267,10 +1280,23 @@ class ObservedWorkerState(_message.Message):
     accepted_placement_set_digest: bytes
     converged_revision: int
     worker_phase: WorkerPhase
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., applied_wire_minor: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., activity: _Optional[_Iterable[_Union[ActivityEvent, _Mapping]]] = ..., job_capacity: _Optional[_Union[JobCapacity, _Mapping]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., admission_epoch: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., converged_revision: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ...) -> None: ...
+    lanes: _containers.RepeatedCompositeFieldContainer[DeviceLane]
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., applied_wire_minor: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., activity: _Optional[_Iterable[_Union[ActivityEvent, _Mapping]]] = ..., job_capacity: _Optional[_Union[JobCapacity, _Mapping]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., admission_epoch: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., converged_revision: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ..., lanes: _Optional[_Iterable[_Union[DeviceLane, _Mapping]]] = ...) -> None: ...
+
+class DeviceLane(_message.Message):
+    __slots__ = ("lane_id", "device_ordinals", "available_attempt_slots", "placement_ids")
+    LANE_ID_FIELD_NUMBER: _ClassVar[int]
+    DEVICE_ORDINALS_FIELD_NUMBER: _ClassVar[int]
+    AVAILABLE_ATTEMPT_SLOTS_FIELD_NUMBER: _ClassVar[int]
+    PLACEMENT_IDS_FIELD_NUMBER: _ClassVar[int]
+    lane_id: str
+    device_ordinals: _containers.RepeatedScalarFieldContainer[int]
+    available_attempt_slots: int
+    placement_ids: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, lane_id: _Optional[str] = ..., device_ordinals: _Optional[_Iterable[int]] = ..., available_attempt_slots: _Optional[int] = ..., placement_ids: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class PlacementStatus(_message.Message):
-    __slots__ = ("placement_id", "executor_epoch", "dispatchable_binding_digests", "materializable_binding_digests", "faults", "accelerator", "placement_set_digest", "materialization", "serving", "retained_fallback_placement_set_digest", "acquisition", "package_revision_digest", "environment_digest", "config_digest")
+    __slots__ = ("placement_id", "executor_epoch", "dispatchable_binding_digests", "materializable_binding_digests", "faults", "accelerator", "placement_set_digest", "materialization", "serving", "retained_fallback_placement_set_digest", "acquisition", "package_revision_digest", "environment_digest", "config_digest", "device_lane_id")
     PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTOR_EPOCH_FIELD_NUMBER: _ClassVar[int]
     DISPATCHABLE_BINDING_DIGESTS_FIELD_NUMBER: _ClassVar[int]
@@ -1285,6 +1311,7 @@ class PlacementStatus(_message.Message):
     PACKAGE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     CONFIG_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    DEVICE_LANE_ID_FIELD_NUMBER: _ClassVar[int]
     placement_id: str
     executor_epoch: int
     dispatchable_binding_digests: _containers.RepeatedScalarFieldContainer[bytes]
@@ -1299,7 +1326,8 @@ class PlacementStatus(_message.Message):
     package_revision_digest: str
     environment_digest: str
     config_digest: str
-    def __init__(self, placement_id: _Optional[str] = ..., executor_epoch: _Optional[int] = ..., dispatchable_binding_digests: _Optional[_Iterable[bytes]] = ..., materializable_binding_digests: _Optional[_Iterable[bytes]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_set_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_placement_set_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ..., package_revision_digest: _Optional[str] = ..., environment_digest: _Optional[str] = ..., config_digest: _Optional[str] = ...) -> None: ...
+    device_lane_id: str
+    def __init__(self, placement_id: _Optional[str] = ..., executor_epoch: _Optional[int] = ..., dispatchable_binding_digests: _Optional[_Iterable[bytes]] = ..., materializable_binding_digests: _Optional[_Iterable[bytes]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_set_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_placement_set_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ..., package_revision_digest: _Optional[str] = ..., environment_digest: _Optional[str] = ..., config_digest: _Optional[str] = ..., device_lane_id: _Optional[str] = ...) -> None: ...
 
 class PlacementAcquisitionObservation(_message.Message):
     __slots__ = ("package", "model")

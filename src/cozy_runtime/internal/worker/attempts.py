@@ -149,6 +149,20 @@ STATUS = pb.OutcomeStatus
 
 #: The author-surface outcome vocabulary, mapped onto the wire's NEUTRAL one. The mapping is
 #: total and closed: a new author terminal without a wire meaning is a compile-time hole.
+#: The executor's own faults under a group lane (cr-068): a follower died, diverged or
+#: could not cross an argument. RUNTIME origin already; the cause is the executor's, not the
+#: author's, and the executor poisons itself so the worker rebuilds the whole group.
+GROUP_FAULT_CODES = frozenset(
+    {
+        "group_broken",
+        "group_unformed",
+        "rank_divergence",
+        "uncrossable_argument",
+        "ungated_sharded_forward",
+        "context_parallel_unavailable",
+    }
+)
+
 _TERMINAL = {
     "succeeded": (STATUS.OUTCOME_STATUS_SUCCEEDED, CAUSE.CAUSE_CODE_UNSPECIFIED),
     "refused": (STATUS.OUTCOME_STATUS_REFUSED, CAUSE.CAUSE_CODE_INVALID_REQUEST),
@@ -1749,6 +1763,8 @@ class AttemptEngine:
             # post-accept OOM as one makes a planner or envelope defect read as a legitimate
             # capacity result, and nobody goes to look at the planner. The runtime priced
             # this attempt and admitted it, so the fault is the runtime's.
+            cause = CAUSE.CAUSE_CODE_EXECUTOR_FAULT
+        if outcome["terminal"] == "failed" and outcome["code"] in GROUP_FAULT_CODES:
             cause = CAUSE.CAUSE_CODE_EXECUTOR_FAULT
         if outcome["terminal"] == "refused" and outcome["code"] in (
             "unsupported_input",

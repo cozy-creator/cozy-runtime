@@ -703,6 +703,12 @@ class Acquirer:
                         "selected_model_manifest_unavailable",
                         f"{type(exc).__name__}: {exc}",
                     ) from exc
+                sequence_parallel = declared.get("sequence_parallel")
+                degrees = (
+                    tuple(int(d) for d in sequence_parallel.get("degrees", []))
+                    if isinstance(sequence_parallel, dict)
+                    else ()
+                )
                 members.append(
                     ModelBinding(
                         model_class=str(declared.get("class", "")),
@@ -719,6 +725,7 @@ class Acquirer:
                             key: tuple(sorted(values)) for key, values in sorted(stamps.items())
                         },
                         model_weight_bytes=model_weight_bytes,
+                        sequence_parallel_degrees=degrees,
                     )
                 )
                 for asset in slot["config"].get("assets", []):

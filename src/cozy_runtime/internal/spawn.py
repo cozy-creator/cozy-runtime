@@ -116,3 +116,77 @@ def spawn_executor(
     )
     del cwd  # the executor's cwd is the worker's; the spool is passed as a path
     return Spawned(pid, env, seal_digest(env), tuple(argv))
+
+
+@dataclass(slots=True)
+class Child:
+    """One spawned follower as its rank-0 parent holds it: the pid and its exit status,
+    read through `waitpid` exactly once (the same shape `subprocess.Popen` gives)."""
+
+    pid: int
+    returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self.returncode is None:
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                return self.returncode
+            if pid == self.pid:
+                self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def wait(self) -> int:
+        if self.returncode is None:
+            try:
+                _pid, status = os.waitpid(self.pid, 0)
+                self.returncode = os.waitstatus_to_exitcode(status)
+            except ChildProcessError:
+                self.returncode = -1
+        return self.returncode
+
+    def send_signal(self, number: int) -> None:
+        os.kill(self.pid, number)
+
+
+def spawn_follower(
+    *, python: str, module_argv: list[str], env: Mapping[str, str], inherit_fd: int
+) -> Child:
+    """EXEC-FIRST launch of ONE follower rank by rank 0 (cr-068).
+
+    The same trampoline the worker execs, under its `inherit` backend: the parent check,
+    pdeathsig, no_new_privs and the executor's OOM score are set in a fresh process, and
+    the follower keeps rank 0's cgroup and PGID exactly as inherited. `posix_spawn` with
+    FILE ACTIONS ONLY, like the worker's own launch: rank 0 is threaded by now (its
+    follower readers) and runs no Python between fork and exec. The environment is rank
+    0's own sealed one, verbatim; `inherit_fd` is the follower's seam and the only
+    descriptor made inheritable.
+    """
+    argv = [
+        python,
+        "-c",
+        "import sys; from cozy_runtime.internal.trampoline import main; main(sys.argv[1:])",
+        "--expect-parent",
+        str(os.getpid()),
+        "--oom-adj",
+        str(EXECUTOR_OOM_SCORE_ADJ),
+        "--uid",
+        "-1",
+        "--gid",
+        "-1",
+        "--scope-backend",
+        "inherit",
+        "--",
+        python,
+        *module_argv,
+    ]
+    os.set_inheritable(inherit_fd, True)
+    pid = os.posix_spawn(
+        python,
+        argv,
+        dict(env),
+        file_actions=[(os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0o600)],
+        setsigdef=[],
+        setsigmask=[],
+    )
+    return Child(pid)

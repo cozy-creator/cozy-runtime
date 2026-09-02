@@ -38,7 +38,7 @@ from cozy_runtime.internal.local import (
     development_source_digest,
     run_slice,
 )
-from cozy_runtime.internal.worker import lanes
+from cozy_runtime.internal.worker import lane_wire, lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import (
@@ -80,7 +80,7 @@ def _workspace() -> Iterator[Path]:
 
 
 def _slice(
-    root: Path, *, devices: str, kind: str, hook: Any = None
+    root: Path, *, devices: str, kind: str, hook: Any = None, owner_hook: Any = None
 ) -> tuple[SliceOutcome, list[str]]:
     """One marco-polo request through `run_slice`, exactly as `cozy-runtime run`/`job`
     builds it, with the worker's device envelope chosen by the arm."""
@@ -122,9 +122,11 @@ def _slice(
     )
     seals: list[str] = []
 
-    def capture(_owner: LocalRecordOwner, worker: Worker) -> None:
+    def capture(owner: LocalRecordOwner, worker: Worker) -> None:
         # The harness reads the child's OWN report of its sealed environment at the moment
         # the supervision publishes it — the same `hello` the worker digest-checks.
+        if owner_hook is not None:
+            owner_hook(owner)
         publish = worker.supervision.on_change
 
         def on_change(executor: Any) -> None:
@@ -165,24 +167,86 @@ def test_one_lane_serves_sealed_to_its_device() -> None:
     assert seals == ["0"], seals
 
 
+def _owner_below_lanes(owner: LocalRecordOwner) -> None:
+    """Re-author the local owner as one that negotiates the minor BEFORE device lanes
+    (proto-024, 22): the queued claim and every desired state it will send say 21. This
+    is the older peer's exact bytes, not a switch inside the runtime."""
+    older = lane_wire.LANES_WIRE_MINOR - 1
+    queued = owner.host.inbound.get_nowait()
+    assert queued is not None and queued.WhichOneof("msg") == "claim"
+    claim = queued.claim
+    owner.host.deliver(
+        pb.RecordOwnerFrame(
+            claim=pb.Claim(
+                record_owner_epoch=claim.record_owner_epoch,
+                record_owner_id=claim.record_owner_id,
+                wire_minor=older,
+            )
+        )
+    )
+    desired_state = owner._desired_state
+
+    def _desired_state() -> pb.DesiredWorkerState:
+        directive = desired_state()
+        directive.wire_minor = older
+        return directive
+
+    owner._desired_state = _desired_state  # type: ignore[method-assign]
+
+
 @needs_executor
-def test_a_two_device_serving_envelope_refuses_typed_and_stays_online() -> None:
-    """THE FENCE. A serving set on a two-lane worker refuses `device_lanes_unsupported`,
-    the fault names proto-024 as what lifts it, no executor is ever spawned, and the
-    worker stays ONLINE (it answered; it did not fail)."""
+def test_a_two_device_serving_envelope_refuses_an_owner_below_minor_22() -> None:
+    """THE FENCE. A serving set from a RecordOwner that negotiated minor 21 on a two-lane
+    worker refuses `device_lanes_unsupported` (that owner reads one count over two lanes),
+    the fault names the minor that carries `lanes[]`, no executor is ever spawned, and
+    the worker stays ONLINE (it answered; it did not fail)."""
     workers: list[Worker] = []
     with _workspace() as root:
-        outcome, seals = _slice(root, devices="0,1", kind="entrypoint", hook=workers.append)
+        outcome, seals = _slice(
+            root,
+            devices="0,1",
+            kind="entrypoint",
+            hook=workers.append,
+            owner_hook=_owner_below_lanes,
+        )
     assert outcome.result is None
     assert "device_lanes_unsupported" in outcome.error, outcome.error
-    assert "proto-024" in outcome.error, outcome.error
+    assert "negotiated wire minor 21" in outcome.error, outcome.error
     reasons = [fault["reason"] for fault in outcome.faults]
     assert "device_lanes_unsupported" in reasons, reasons
     assert seals == [], f"an executor was spawned behind the fence: {seals}"
     (worker,) = workers
     assert worker.phase == pb.WorkerPhase.WORKER_PHASE_ONLINE
     assert worker.latched == "device_lanes_unsupported"
+    assert worker.fence.wire_minor == lane_wire.LANES_WIRE_MINOR - 1
     assert worker.supervision.spawns == 0
+
+
+@needs_executor
+def test_a_two_device_serving_envelope_serves_an_owner_at_minor_22_per_lane() -> None:
+    """The fence LIFTED. The same set from an owner at 22 is served: the weightless
+    placement lands on lane-0 (fewest placements), sealed to device 0 alone, and every
+    observed state the owner read carries both lanes, the placement's `device_lane_id`,
+    and a worker-level count that is the SUM over lanes."""
+    owners: list[LocalRecordOwner] = []
+    with _workspace() as root:
+        outcome, seals = _slice(root, devices="0,1", kind="entrypoint", owner_hook=owners.append)
+    assert outcome.result == {"message": "polo"}, (outcome.error, outcome.faults)
+    assert seals == ["0"], seals
+    (owner,) = owners
+    served = [r for r in owner.reports if r.lanes and r.placements]
+    assert served, "no observed state carried lanes and a placement"
+    for report in served:
+        assert [lane.lane_id for lane in report.lanes] == ["lane-0", "lane-1"]
+        assert [list(lane.device_ordinals) for lane in report.lanes] == [[0], [1]]
+        assert report.available_attempt_slots == sum(
+            lane.available_attempt_slots for lane in report.lanes
+        )
+        (status,) = report.placements
+        assert status.device_lane_id == "lane-0"
+        assert list(report.lanes[0].placement_ids) == [status.placement_id]
+        assert list(report.lanes[1].placement_ids) == []
+    assert report.applied_wire_minor == lane_wire.LANES_WIRE_MINOR
 
 
 @needs_executor
@@ -308,42 +372,69 @@ def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
     model-bearing placement takes a lane with room and no other model-bearing tenant; else
     a lane with measured headroom BESIDE its tenants (co-residency); else a lane whose
     measured TOTAL holds it alone (time-sliced sharing). A lane the driver cannot read is
-    never chosen; nothing fitting anywhere is a typed refusal that moves no other
-    placement."""
+    never chosen; nothing fitting is a typed refusal that moves no other placement. On a
+    WIDE envelope the candidate lane is the placement's PIN (cr-068): the worker validates,
+    it never chooses which paid card to idle."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
-    assert len(lanes_) == 3 and lanes_.envelope.ordinals == (0, 1, 2)
+    assert len(lanes_) == 3 and lanes_.envelope.ordinals == (0, 1, 2) and lanes_.wide
     measured = {
-        "lane-0": accel.DeviceMemory("measured", 4 << 30, 8 << 30),
-        "lane-1": accel.DeviceMemory("measured", 16 << 30, 24 << 30),
-        "lane-2": accel.DeviceMemory("unreadable"),
+        0: accel.DeviceMemory("measured", 4 << 30, 8 << 30),
+        1: accel.DeviceMemory("measured", 16 << 30, 24 << 30),
+        2: accel.DeviceMemory("unreadable"),
     }
-    big = lanes_.assign("big", model_bearing=True, declared_bytes=8 << 30, measured=measured)
+    big = lanes_.assign(
+        "big", model_bearing=True, declared_bytes=8 << 30, measured=measured, pin=(1,)
+    )
     assert big.lane_id == "lane-1"
     lanes_.lanes[1].row("big").model_bearing = True
-    small = lanes_.assign("small", model_bearing=True, declared_bytes=2 << 30, measured=measured)
+    small = lanes_.assign(
+        "small", model_bearing=True, declared_bytes=2 << 30, measured=measured, pin=(0,)
+    )
     assert small.lane_id == "lane-0"
     lanes_.lanes[0].row("small").model_bearing = True
-    # step 2: every lane has a tenant; lane-0's measured headroom still covers 1 GiB
-    beside = lanes_.assign("beside", model_bearing=True, declared_bytes=1 << 30, measured=measured)
+    # step 2: lane-0 has a tenant; its measured headroom still covers 1 GiB beside it
+    beside = lanes_.assign(
+        "beside", model_bearing=True, declared_bytes=1 << 30, measured=measured, pin=(0,)
+    )
     assert beside.lane_id == "lane-0"
     lanes_.lanes[0].row("beside").model_bearing = True
-    # step 3: nothing has 6 GiB of headroom; lane-1 (one tenant, 24 GiB total) is chosen
-    # over lane-0 (two tenants) — sharing spreads before it stacks
-    shared = lanes_.assign("shared", model_bearing=True, declared_bytes=6 << 30, measured=measured)
-    assert shared.lane_id == "lane-1"
-    lanes_.lanes[1].row("shared").model_bearing = True
+    # step 3: lane-0 has no 6 GiB of headroom; its 8 GiB total holds it alone (time-sliced)
+    shared = lanes_.assign(
+        "shared", model_bearing=True, declared_bytes=6 << 30, measured=measured, pin=(0,)
+    )
+    assert shared.lane_id == "lane-0"
+    lanes_.lanes[0].row("shared").model_bearing = True
     with pytest.raises(lanes.LaneRefusal) as refused:
-        lanes_.assign("huge", model_bearing=True, declared_bytes=32 << 30, measured=measured)
-    assert refused.value.code == "device_lane_infeasible"
-    assert "lane-2 free bytes unreadable" in refused.value.detail
+        lanes_.assign(
+            "huge", model_bearing=True, declared_bytes=32 << 30, measured=measured, pin=(1,)
+        )
+    assert refused.value.code == "device_pin_infeasible"
     assert "B total for 34359738368 B" in refused.value.detail
-    assert lanes_.lane_of("huge") is None
+    with pytest.raises(lanes.LaneRefusal) as refused:
+        lanes_.assign(
+            "blind", model_bearing=True, declared_bytes=1 << 20, measured=measured, pin=(2,)
+        )
+    assert refused.value.code == "device_pin_infeasible"
+    assert "lane-2 free bytes unreadable" in refused.value.detail
+    # NO PIN on a wide envelope: refused typed (ruling 3), nothing moved
+    with pytest.raises(lanes.LaneRefusal) as refused:
+        lanes_.assign("unpinned", model_bearing=True, declared_bytes=1 << 20, measured=measured)
+    assert refused.value.code == "device_group_unsupported"
+    assert "carries no device pin on a 3-device envelope" in refused.value.detail
+    assert lanes_.lane_of("huge") is None and lanes_.lane_of("unpinned") is None
     assert lanes_.lane_of("big") is lanes_.lanes[1] and lanes_.lane_of("small") is lanes_.lanes[0]
     # weightless placements spread over the lanes with the fewest tenants
     weightless = lanes_.assign("w1", model_bearing=False, declared_bytes=0, measured={})
     assert weightless is lanes_.lanes[2]
     lanes_.release("big")
     assert lanes_.lane_of("big") is None and "big" not in lanes_.lanes[1].rows
+    # a ONE-device envelope needs no pin: the worker's one lane is the candidate
+    one = lanes.LaneSet.from_envelope("0", worker_pid=os.getpid())
+    assert not one.wide
+    alone = one.assign(
+        "solo", model_bearing=True, declared_bytes=1 << 30, measured={0: measured[0]}
+    )
+    assert alone is one.lanes[0]
 
 
 def test_one_lane_worker_seats_and_a_two_lane_worker_sum() -> None:

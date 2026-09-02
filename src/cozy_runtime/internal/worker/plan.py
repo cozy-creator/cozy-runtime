@@ -280,6 +280,9 @@ class ModelBinding:
     custody: str = "canonical"
     strict_keys: bool = False
     expected_logical_model_digest: str = ""
+    sequence_parallel_degrees: tuple[int, ...] = ()
+    """The descriptor slot's `sequence_parallel.degrees` (cr-068): what the author said the
+    class shards at. A placement pinned to K devices needs K here."""
 
     def snapshot_for(self, component: str) -> str:
         return self.snapshots.get(component, self.reference_snapshot)
@@ -436,6 +439,15 @@ class DeclaredBinding:
             ),
         )
 
+    def sequence_parallel_degrees(self) -> tuple[int, ...]:
+        """The degrees EVERY model slot of this binding declares: a group shards the whole
+        construction, so a slot that declares nothing makes the binding unshardable."""
+        degrees: set[int] | None = None
+        for model in self.model_bindings():
+            declared = set(model.sequence_parallel_degrees)
+            degrees = declared if degrees is None else degrees & declared
+        return tuple(sorted(degrees or ()))
+
     def snapshot_for(self, component: str) -> str:
         """This component's snapshot, or the binding's own when the map omits it."""
         return self.snapshots.get(component, self.reference_snapshot)
@@ -559,8 +571,13 @@ class PlanChooser:
     PRECOMPUTED ordered set.
     """
 
-    def __init__(self, ledger: Ledger) -> None:
+    def __init__(self, ledger: Ledger, *, degree: int = 1) -> None:
         self.ledger = ledger
+        #: the lane's sequence-parallel degree (cr-068). Above 1 the ladder is REFUSED, not
+        #: deepened: K ranks run ONE plan priced against the tightest card (the ledger's
+        #: `device_free` is the MIN over the lane's devices), and a rung one rank would
+        #: need to deepen is a rung the group cannot run.
+        self.degree = int(degree)
         self.choices = 0
         #: every choice's ladder walk, for the envelope and the triage bundle
         self.walks: list[dict[str, Any]] = []
@@ -918,7 +935,28 @@ class PlanChooser:
 
         SHARED cloud: a shortfall is a RESCHEDULE-shaped fact for the RecordOwner, never a
         structural-incompatibility claim — a different worker may fit it exactly.
+
+        A GROUP (cr-068, cr-018): never deepened. Every rank runs the same plan, so a
+        per-rank downgrade is unrepresentable; the refusal is `CONSTRAINT_INFEASIBLE`,
+        priced against the MIN over the K devices' headroom, and the RecordOwner reads it
+        as a placement that does not fit this group.
         """
+        if self.degree > 1:
+            walk["refused_under_group"] = self.degree
+            raise PlanRefusal(
+                "group_constraint_infeasible",
+                f"no proven placement rung fits this {self.degree}-device group: needed "
+                f"{activations.value} B of headroom ({activations.provenance}) against "
+                f"{max(allocatable, 0)} B allocatable on the tightest device; the ladder is "
+                "not deepened under a group because every rank runs one plan",
+                {
+                    "resource": "vram",
+                    "scope": "group",
+                    "needed_bytes": activations.value,
+                    "available_bytes": max(allocatable, 0),
+                    "evidence_class": "measured" if activations.enforceable else "bound",
+                },
+            )
         if not activations.enforceable:
             # An UNCALIBRATED coefficient MAY NOT REFUSE. It may deepen the ladder, because
             # a placement rung changes weight placement only — never the kernel, never the

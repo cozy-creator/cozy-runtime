@@ -27,7 +27,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.0.33"
+version = "0.1.0"
 source = { editable = "../../" }
 dependencies = [
     { name = "cryptography" },
@@ -60,6 +60,7 @@ provides-extras = ["derive", "corpus", "media", "model-execution", "cuda-kernels
 dev = [
     { name = "av", specifier = ">=18.1,<19" },
     { name = "mypy", specifier = ">=1.13" },
+    { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=8.4" },
     { name = "ruff", specifier = ">=0.16" },
     { name = "types-protobuf", specifier = ">=6.30" },

@@ -27,6 +27,7 @@ check, and here it does not have to — the parent can read the child's kernel-o
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -153,6 +154,32 @@ class Counter:
         return row
 
 
+@dataclass(frozen=True, slots=True)
+class DeviceFacts:
+    """ONE device of the lane, as the DRIVER reports it to the worker (cr-068).
+
+    A group lane holds K of these under one ledger: every rank holds the full weights on
+    its own card, so residency is per device while the generation is one. `free`/`total`
+    are NVML's numbers read from outside every CUDA context; `process` is the executor's
+    per-process bytes on THIS device, -1 when unreadable.
+    """
+
+    ordinal: int
+    entry: str
+    free: int
+    total: int
+    process: int = -1
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "ordinal": self.ordinal,
+            "entry": self.entry,
+            "free": self.free,
+            "total": self.total,
+            "process": self.process,
+        }
+
+
 @dataclass(slots=True)
 class Ledger:
     """The worker's one ledger. Worker-owned, torch-free, atomic over host classes."""
@@ -195,6 +222,10 @@ class Ledger:
     #: bytes). -1 until assigned. It is a policy fact the executor is handed, never one it
     #: derives: the executor fits its prepare under the smaller of this and what it measures.
     authorized_device_limit_bytes: int = -1
+    #: ordinal -> that device's driver-reported row (cr-068). One entry on a device lane;
+    #: K on a group lane. `device_free`/`device_total` above are the MIN over these, which
+    #: is what a plan priced once for every rank is priced against.
+    devices: dict[int, DeviceFacts] = field(default_factory=dict)
     #: classes this worker could not read, by name. Never silently zero.
     unreadable: list[str] = field(default_factory=list)
     #: per-component RESIDENT device bytes, by component name. The staging plane's own
@@ -286,6 +317,7 @@ class Ledger:
         self.closed_since_baseline = 0
         self.executor_pid = executor_pid
         self.authorized_device_limit_bytes = -1
+        self.devices.clear()
         self.unreadable.clear()
         self.resident.clear()
         self.evicted.clear()
@@ -443,6 +475,19 @@ class Ledger:
         self.device_free = int(free)
         self.device_total = int(total)
 
+    def observe_devices(self, rows: Mapping[int, DeviceFacts]) -> None:
+        """Every device of the lane, per ordinal, and the MIN as the generation's number.
+
+        A group lane's plan is priced ONCE for all ranks (cr-018: the degrade ladder is
+        refused, never adapted per rank), so the free bytes the chooser reads are the
+        tightest card's. The per-device rows stay readable beside it.
+        """
+        self.devices = dict(rows)
+        if rows:
+            self.observe_device_free(
+                min(row.free for row in rows.values()), min(row.total for row in rows.values())
+            )
+
     def refuse_placement(self, placement: str, reason: str) -> None:
         """Bank one measured generation/rung capacity falsification."""
 
@@ -551,6 +596,9 @@ class Ledger:
                     for cell, scopes in sorted(self.activation_scopes_by_cell.items())
                 },
                 "free": self.device_free,
+            },
+            "devices": {
+                str(ordinal): facts.document() for ordinal, facts in sorted(self.devices.items())
             },
             "components": {"resident": dict(self.resident), "evicted": dict(self.evicted)},
             "unreconciled": self.unreconciled,
