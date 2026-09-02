@@ -27,7 +27,7 @@ from pathlib import Path
 import msgspec
 import pytest
 
-from cozy_runtime.author import App, ConformanceError, Model
+from cozy_runtime.author import App, ConformanceError, Model, WeightsOutput, WeightsSink
 from cozy_runtime.author._describe import describe
 from cozy_runtime.author._loader import Loader
 from cozy_runtime.internal import canonical, descriptor, package_environment
@@ -114,6 +114,36 @@ def test_source_profiles_refuse_typed_at_registration() -> None:
         return Reply(text="ok")
 
     assert describe(app)
+
+
+def test_lane_words_are_not_selection_leaks() -> None:
+    """cr-077: a weights output named after the lane it derives ("bf16") describes fine
+    beside a default binding whose lane says the same word; a descriptor string equal to
+    the binding's release remains a refused selection leak."""
+
+    def build(output_id: str, release: str) -> dict[str, object]:
+        app = App()
+
+        @app.job(weights=(WeightsOutput(output_id, max_new_bytes=1 << 20),))
+        def produce(payload: Request, denoiser: Denoiser, weights: WeightsSink) -> Reply:
+            return Reply(text="ok")
+
+        found = Discovered(
+            app=app,
+            application="profiled_package:app",
+            project=PACKAGE,
+            module=sys.modules[__name__],
+            surfaces=describe(app),
+            bindings={"Denoiser": {"model": "acme/sd", "release": release, "lane": "bf16"}},
+        )
+        return descriptor.build(found)
+
+    body = build("bf16", "1.0.0")
+    assert body["jobs"][0]["weights_outputs"][0]["output_id"] == "bf16"  # type: ignore[index]
+
+    with pytest.raises(ConformanceError) as leaked_release:
+        build("ev-003", "ev-003")
+    assert leaked_release.value.code == "fixed_point"
 
 
 def test_descriptor_slot_grammar_refuses_the_retired_field() -> None:
