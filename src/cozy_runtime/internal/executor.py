@@ -2124,9 +2124,12 @@ class Executor:
                             "event": "progress",
                             "request_id": request_id,
                             "kind": "progress",
-                            "name": str(frame.name)[:120],
-                            "value": frame.fraction,
+                            "stage": frame.stage,
+                            "stage_fraction": frame.stage_fraction,
+                            "overall_fraction": frame.overall_fraction,
                             "position": frame.position,
+                            "total": frame.total,
+                            "advance": frame.advance,
                             "step_ms": frame.step_ms,
                         }
                     )

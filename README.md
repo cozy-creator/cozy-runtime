@@ -136,6 +136,14 @@ spellings — are redacted at the emit boundary and counted. Nothing is refused:
 may not fail the thing it observes, and field NAMES are not inspected at all, because the
 name regex that used to be here false-positived on `output_tokens` and `eos_token`.
 
+Progress names the package's execution stage. `tel.progress(stage_fraction, stage=...,
+overall_fraction=...)` keeps resettable within-stage progress distinct from optional monotonic
+whole-invocation progress. `tel.step_callback(total, stage=..., overall_range=(start, end))`
+adds exact work-unit coordinates and maps counted steps into a package-owned overall range;
+`tel.stage(name, overall_range=...)` reports only entry/success boundaries, never an invented
+within-stage percentage. Invalid progress is omitted and diagnosed on the same bounded lossy
+lane; it cannot route, settle, bill, or otherwise control an attempt.
+
 **Every terminal attempt commits one bounded triage record** — identity, applied posture,
 ledger reconciliation, attribution, confessions, faults, and the capped observation tail —
 written and fsynced BEFORE its write receipt is recorded and before the terminal that names

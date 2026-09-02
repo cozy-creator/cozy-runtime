@@ -166,19 +166,19 @@ REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
     """Preserve the measured progress coordinates the executor already supplied.
 
-    The old worker serialized only ``value`` and silently discarded stage, position, and
-    step time. That left clients with a percentage but no honest way to name a denoising
-    stage, count its steps, or estimate its remaining wall time.
+    Stage-local and overall fractions stay separate. Optional coordinates are omitted when
+    the package does not know them; no layer fabricates whole-invocation completion.
     """
     kind = frame.get("kind", "progress")
     payload: Any = frame.get("value")
     if kind == "progress":
         payload = {
-            "name": str(frame.get("name", ""))[:120],
-            "fraction": frame.get("value"),
-            "position": frame.get("position"),
+            "stage": str(frame.get("stage", ""))[:120],
             "step_ms": frame.get("step_ms", 0.0),
         }
+        for field in ("stage_fraction", "position", "total", "overall_fraction"):
+            if frame.get(field) is not None:
+                payload[field] = frame[field]
     return {"type": kind, "payload": payload}
 
 
@@ -1982,7 +1982,9 @@ class Worker:
     def emit_progress(self, request_id: str, attempt: int, frame: dict[str, Any]) -> None:
         """The LOSSY lane. Bounded per watch, oldest-first shed, worker-owned sequence."""
         key = (request_id, attempt)
-        position = frame.get("position")
+        position = (
+            frame.get("advance") if frame.get("kind") == "progress" else frame.get("position")
+        )
         if isinstance(position, int):
             self.monitor.advance(f"{request_id}#{attempt}", position)
         if frame.get("kind") != "progress":

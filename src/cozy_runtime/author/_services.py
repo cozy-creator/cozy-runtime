@@ -13,6 +13,7 @@ what makes "escaped handle" a typed failure instead of a review rule.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -68,12 +69,14 @@ class AdjustmentRow:
 
 @dataclass(frozen=True, slots=True)
 class ProgressFrame:
-    """One frame on the LOSSY live lane. Never retained: its durable form is `Attribution`
-    plus the monotone `position` the worker's silence detector reads."""
+    """One bounded frame on the LOSSY live lane; never durable lifecycle state."""
 
-    name: str
-    fraction: float
-    position: int
+    stage: str
+    stage_fraction: float | None
+    advance: int
+    position: int | None = None
+    total: int | None = None
+    overall_fraction: float | None = None
     step_ms: float = 0.0
 
 
@@ -156,6 +159,8 @@ class Attempt:
     metrics_dropped: int = 0
     _counter: int = 0
     _step_mark: float = 0.0
+    _overall_fraction: float | None = None
+    _progress_diagnostics: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not self.ring.subject:
@@ -170,7 +175,7 @@ class Attempt:
 
     def signal(self, frame: ProgressFrame) -> None:
         """One LOSSY frame. Not retained, so a flood cannot evict the retained tail."""
-        self.position = frame.position
+        self.position = frame.advance
         if self.sink is not None:
             self.sink(frame)
 
@@ -726,15 +731,35 @@ class Telemetry(_Bound):
         super().__init__(attempt)
         self._ctx = ctx
 
-    def progress(self, fraction: float, *, stage: str | None = None) -> None:
+    def progress(
+        self,
+        stage_fraction: float,
+        *,
+        stage: str | None = None,
+        overall_fraction: float | None = None,
+    ) -> None:
         attempt = self._attempt
         attempt.check_open("Telemetry.progress")
-        attempt.signal(
-            ProgressFrame(stage or "", round(min(max(fraction, 0.0), 1.0), 6), attempt.position + 1)
-        )
+        name = self._stage_name(stage)
+        if name is None:
+            return
+        fraction = self._fraction(stage_fraction, "stage_fraction")
+        overall = self._overall(overall_fraction)
+        if fraction is not None or overall is not None:
+            self._progress_frame(
+                name,
+                stage_fraction=fraction,
+                overall_fraction=overall,
+            )
 
-    def step_callback(self, total: int, *, stage: str | None = None) -> Any:
-        """One hook doing progress + cancellation — every v1 package hand-rolled this.
+    def step_callback(
+        self,
+        total: int,
+        *,
+        stage: str | None = None,
+        overall_range: tuple[float, float] | None = None,
+    ) -> Any:
+        """Return one counted-work hook carrying stage and optional overall coordinates.
 
         It is also the STEP-TIME instrument: the interval between consecutive calls is
         accumulated in place (five floats per stage), so inference step time is attributable
@@ -743,7 +768,13 @@ class Telemetry(_Bound):
         """
         attempt = self._attempt
         attempt.check_open("Telemetry.step_callback")
-        name = stage or "step"
+        name = self._stage_name(stage or "step")
+        bounds = self._overall_range(overall_range)
+        valid_total = (
+            isinstance(total, int) and not isinstance(total, bool) and 0 < total <= 1_000_000_000
+        )
+        if not valid_total:
+            self._diagnose("total must be an integer in 1..1000000000")
         # The mark starts HERE, at callback construction, so the FIRST step has an interval
         # too. Starting it at the first call would silently drop step 0 from the count — and
         # on a one-step request that is the whole measurement.
@@ -754,11 +785,33 @@ class Telemetry(_Bound):
             now = time.perf_counter()
             mark = attempt._step_mark
             if mark:
-                attempt.attribution.step(name, (now - mark) * 1000)
+                attempt.attribution.step(name or "step", (now - mark) * 1000)
             attempt._step_mark = now
             step_ms = (now - mark) * 1000 if mark else 0.0
-            attempt.signal(
-                ProgressFrame(name, (step + 1) / total if total else 1.0, step + 1, step_ms)
+            if (
+                name is None
+                or not valid_total
+                or not isinstance(step, int)
+                or isinstance(step, bool)
+                or not 0 <= step < total
+            ):
+                if valid_total and (not isinstance(step, int) or isinstance(step, bool)):
+                    self._diagnose("step must be an integer")
+                elif valid_total and isinstance(step, int) and not 0 <= step < total:
+                    self._diagnose("step must be within the declared total")
+                return
+            raw_fraction = (step + 1) / total
+            fraction = round(raw_fraction, 6)
+            overall = None
+            if bounds is not None:
+                overall = self._overall(bounds[0] + raw_fraction * (bounds[1] - bounds[0]))
+            self._progress_frame(
+                name,
+                stage_fraction=fraction,
+                position=step + 1,
+                total=total,
+                overall_fraction=overall,
+                step_ms=step_ms,
             )
 
         return on_step
@@ -768,7 +821,9 @@ class Telemetry(_Bound):
         self._attempt.emit("log", message, level, **fields)
 
     @contextmanager
-    def stage(self, name: str) -> Iterator[None]:
+    def stage(
+        self, name: str, *, overall_range: tuple[float, float] | None = None
+    ) -> Iterator[None]:
         """Per-stage timing bracket; `stage_ms` feeds the duration model and benchmarks.
 
         Structurally separate from a component-use scope: this records a NUMBER and touches
@@ -776,13 +831,25 @@ class Telemetry(_Bound):
         `timing-decides-nothing` fence proves the module cannot reach them.
         """
         self._attempt.check_open("Telemetry.stage")
+        stage = self._stage_name(name)
+        bounds = self._overall_range(overall_range)
+        if stage is not None:
+            self._progress_frame(
+                stage,
+                overall_fraction=self._overall(bounds[0]) if bounds is not None else None,
+            )
         start = time.perf_counter()
+        succeeded = False
         try:
             yield
+            succeeded = True
         finally:
             elapsed = (time.perf_counter() - start) * 1000
-            self._attempt.attribution.stage(name, elapsed)
-            self._attempt.emit("stage", name, round(elapsed, 3))
+            if stage is not None:
+                self._attempt.attribution.stage(stage, elapsed)
+                self._attempt.emit("stage", stage, round(elapsed, 3))
+                if succeeded and bounds is not None:
+                    self._progress_frame(stage, overall_fraction=self._overall(bounds[1]))
 
     def metric(self, name: str, value: float, *, unit: str | None = None) -> None:
         self._attempt.check_open("Telemetry.metric")
@@ -803,6 +870,84 @@ class Telemetry(_Bound):
             return False
         attempt.metrics_emitted += 1
         return True
+
+    def _progress_frame(
+        self,
+        stage: str | None,
+        *,
+        stage_fraction: float | None = None,
+        position: int | None = None,
+        total: int | None = None,
+        overall_fraction: float | None = None,
+        step_ms: float = 0.0,
+    ) -> None:
+        name = self._stage_name(stage)
+        if name is None:
+            return
+        attempt = self._attempt
+        attempt.signal(
+            ProgressFrame(
+                stage=name,
+                stage_fraction=stage_fraction,
+                advance=attempt.position + 1,
+                position=position,
+                total=total,
+                overall_fraction=overall_fraction,
+                step_ms=step_ms,
+            )
+        )
+
+    def _stage_name(self, value: object) -> str | None:
+        if not isinstance(value, str) or not value or len(value) > 120 or not value.isprintable():
+            self._diagnose("stage must be 1..120 printable characters")
+            return None
+        return value
+
+    def _fraction(self, value: object, field: str) -> float | None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0.0 <= value <= 1.0
+        ):
+            self._diagnose(f"{field} must be a finite number in 0..1")
+            return None
+        return round(float(value), 6)
+
+    def _overall(self, value: object | None) -> float | None:
+        if value is None:
+            return None
+        overall = self._fraction(value, "overall_fraction")
+        if overall is None:
+            return None
+        previous = self._attempt._overall_fraction
+        if previous is not None and overall < previous:
+            self._diagnose("overall_fraction must not move backward")
+            return None
+        self._attempt._overall_fraction = overall
+        return overall
+
+    def _overall_range(self, value: tuple[float, float] | None) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        if not isinstance(value, tuple) or len(value) != 2:
+            self._diagnose("overall_range must be a (start, end) pair")
+            return None
+        start = self._fraction(value[0], "overall_range start")
+        end = self._fraction(value[1], "overall_range end")
+        if start is None or end is None:
+            return None
+        if end < start:
+            self._diagnose("overall_range end must not precede its start")
+            return None
+        return start, end
+
+    def _diagnose(self, reason: str) -> None:
+        attempt = self._attempt
+        if reason in attempt._progress_diagnostics:
+            return
+        attempt._progress_diagnostics.add(reason)
+        attempt.emit("log", "progress omitted", "warn", reason=reason)
 
 
 class Adjustments(_Bound):
