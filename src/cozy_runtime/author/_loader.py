@@ -7,10 +7,12 @@ service at load time, is a type error rather than a footnote (§1.3).
 
 `construct(T, factory=)` is the ONE construction primitive and does exactly four things
 (§1.1): (1) hands the factory a typed READ-ONLY config capability — never a path; (2) runs
-the SAME factory under derive and under serve; (3) walks and matches the returned object
-against the checkpoint topology BEFORE allocating anything; (4) fills every destination
-through the single backend path. `load(T)` is sugar over a REGISTERED exact adapter and
-never duck-types `from_pretrained`.
+the SAME factory under derive and under serve; (3) censuses the returned object and asks
+the backend for the ONE fit verdict (`tensorfs.fit` over the census and the checkpoint
+header, model-code-fit §3) BEFORE allocating anything; (4) fills every destination through
+the single backend path. `load(T)` is sugar over a REGISTERED exact adapter and never
+duck-types `from_pretrained`. The runtime keeps no matcher of its own: a verdict that is
+not `ok` is the typed refusal `model_fit_refused`, carrying the Fit document verbatim.
 
 Deliberately absent, and not to be added here: any checkpoint path, source carrier, catalog
 ref, device/dtype override, offload/pin/eviction knob, compile hook or selection surface.
@@ -286,7 +288,8 @@ class Artifact:
 
     Selection produced this (package.toml default -> `--model` -> deploy binding); author
     code never names any part of it. Nothing here is a compatibility claim: whether the
-    code fits these bytes is a function of the census and the header (model-code-fit §3).
+    code fits these bytes is a function of the census and the header (model-code-fit §3),
+    and the backend answers it from the header it holds.
     """
 
     snapshot: str
@@ -298,6 +301,23 @@ class Artifact:
     not consume (conversion drift); `local` lists it and ignores it (D5)."""
 
 
+#: The `Fit` document `tensorfs.fit` returns, verbatim: `code` (one of the eight),
+#: `detail` (the §3 text), `component`, `key`, `encoding`, `device`, `custody`, `ignored`,
+#: `routes` and `ok`. The runtime never authors one and never rephrases one.
+Fit = Mapping[str, object]
+
+
+class ModelFitRefused(ConformanceError):
+    """The construction does not fit its checkpoint. Raised before a byte is reserved; the
+    Fit document rides whole so the prepare refusal can carry it verbatim (§3)."""
+
+    default_code = "model_fit_refused"
+
+    def __init__(self, fit: Fit) -> None:
+        super().__init__(f"{fit.get('code')} — {fit.get('detail')}")
+        self.fit = dict(fit)
+
+
 # --------------------------------------------------------------------------- backend
 
 
@@ -305,17 +325,23 @@ class Backend(Protocol):
     """The ONE fill path (§1.1). cr-005 supplies the TensorFS stream behind it; the
     package cannot observe which backend served it — that is the backend-blindness fence.
 
-    Three calls, one transaction: `materialize` reserves the destinations the census just
-    agreed on, `fill` validates and claims each one, and `commit` moves the bytes and
-    fences the copies. `fill` is deliberately NOT the thing that moves bytes — a plane
-    that copies inside the walk cannot refuse a late destination without a partial
-    generation to undo.
+    Four calls, one transaction: `fit` judges the census against the checkpoint header
+    (`tensorfs.fit`, model-code-fit §3) with nothing reserved, `materialize` reserves the
+    destinations the census just agreed on, `fill` validates and claims each one, and
+    `commit` moves the bytes and fences the copies. `fill` is deliberately NOT the thing
+    that moves bytes — a plane that copies inside the walk cannot refuse a late
+    destination without a partial generation to undo.
 
     `encoded_leaves` is the model class's own `ENCODED_LEAVES` declaration, carried in
-    rather than reached for. It rides `materialize` because that is the first call of the
-    transaction and the last moment before a destination is reserved: a package that did
+    rather than reached for. It rides `fit` (it is the `accepts` of every code row) and
+    `materialize` (the last moment before a destination is reserved): a package that did
     not consent must refuse with nothing to undo, not after its bytes are on the card.
     """
+
+    def fit(self, walked: Census, *, encoded_leaves: str) -> Fit | None:
+        """The one verdict, or None when this backend holds no checkpoint header to judge
+        against (derive mode; a local lane tree). The runtime keeps no other matcher."""
+        ...
 
     def materialize(
         self, obj: object, walked: Census, *, encoded_leaves: str
@@ -334,7 +360,10 @@ class Backend(Protocol):
 
 @dataclass(slots=True)
 class _NullBackend:
-    """Derive mode's backend: walk and match run, nothing is allocated or filled."""
+    """Derive mode's backend: the walk runs, nothing is judged, allocated or filled."""
+
+    def fit(self, walked: Census, *, encoded_leaves: str) -> Fit | None:
+        return None
 
     def materialize(
         self, obj: object, walked: Census, *, encoded_leaves: str
@@ -491,6 +520,9 @@ class ConstructionRecord:
     filled_bytes: int
     ignored_extras: tuple[str, ...] = ()
     """LOCAL-custody extras the code does not consume: warned, ignored and CONFESSED."""
+    fit: dict[str, object] | None = None
+    """The `ok` Fit document this construction was judged by, verbatim; None where no
+    header was there to judge against (derive mode)."""
 
     @property
     def topology_digest(self) -> str:
@@ -568,18 +600,23 @@ class Loader:
                 code="factory_result",
             )
         walked = census(obj)
-        destinations = walked.destinations
-        extras = self._match(destinations, identity)
+        # THE ONE VERDICT, before a byte is reserved (model-code-fit §3). The backend holds
+        # the checkpoint header and asks `tensorfs.fit`; this plane matches nothing itself.
+        fit = self._backend.fit(walked, encoded_leaves=self._consent())
+        if fit is not None and not fit.get("ok"):
+            raise ModelFitRefused(fit)
+        ignored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("ignored", ())))
         filled, filled_bytes = self._fill(walked, obj)
         record = ConstructionRecord(
             factory_identity=identity,
             config_digest=self._artifact.config.digest(),
-            destinations=destinations,
+            destinations=walked.destinations,
             components=walked.components,
             schedulers=walked.schedulers,
             filled=filled,
             filled_bytes=filled_bytes,
-            ignored_extras=extras,
+            ignored_extras=ignored,
+            fit=dict(fit) if fit is not None else None,
         )
         self._records.append(record)
         self._objects.append(obj)
@@ -630,6 +667,14 @@ class Loader:
         """load/unload returned: the loader is dead. Holding one is not holding a capability."""
         self._open = False
 
+    def _consent(self) -> str:
+        """The consent the MODEL CLASS declared, read off the generation that owns this
+        loader. `__encoded_leaves__` is a class attribute with a conservative default on
+        `Model` itself, so a host that never declared one says "refuse" rather than raising
+        here — the refusal belongs to the plane that would replace a leaf, with the
+        artifact's own encoding named in it."""
+        return str(getattr(type(self._owner), "__encoded_leaves__", "refuse"))
+
     def _require_open(self, what: str) -> None:
         if not self._open:
             raise CapabilityError(
@@ -637,56 +682,6 @@ class Loader:
                 "code cannot reach it — `ctx` always means the request Context (§1.3)",
                 code="loader_closed",
             )
-
-    def _match(self, destinations: Sequence[Destination], identity: str) -> tuple[str, ...]:
-        """Match the code topology against the checkpoint topology BEFORE allocating."""
-        table = self._artifact.topology
-        if self._mode == "derive" and not table:
-            # Derivation and matching are two steps on one clock, not one step. A release
-            # can be derived before any binding exists (§1.0), and an open/BYOM slot binds
-            # checkpoints that did not exist at build — so an artifact with no header table
-            # yields the CODE topology alone, and the match runs when a candidate arrives.
-            # Serve mode has no such case: an empty table there is a checkpoint supplying
-            # nothing, and the missing-key refusal below is the correct answer.
-            return ()
-        missing = [d.key for d in destinations if d.key not in table]
-        if missing:
-            raise ConformanceError(
-                f"{identity} vs {self._artifact.snapshot}: the code constructs "
-                f"{len(missing)} destination(s) the checkpoint does not supply: "
-                f"{', '.join(missing[:6])}{'…' if len(missing) > 6 else ''}",
-                code="topology_missing_keys",
-                fields=missing[:6],
-            )
-        wrong = [
-            f"{d.key} code{list(d.spec.shape)} vs bytes{list(table[d.key].shape)}"
-            for d in destinations
-            if tuple(table[d.key].shape) != tuple(d.spec.shape)
-        ]
-        if wrong:
-            raise ConformanceError(
-                f"{identity} vs {self._artifact.snapshot}: logical shapes differ: "
-                f"{'; '.join(wrong[:4])}",
-                code="topology_shape",
-            )
-        # A key belonging to a component this class does not construct is an UNBOUND
-        # SIBLING — the dual artifact's other transformer — simply outside this
-        # construction, never an "extra key" (§1.1). Surplus is judged per constructed
-        # component: bytes the code DOES bind a component for but does not consume.
-        built = {d.component for d in destinations}
-        consumed = {d.key for d in destinations}
-        extras = sorted(k for k in table if k not in consumed and k.split(".")[0] in built)
-        if extras and self._artifact.custody == "canonical":
-            raise ConformanceError(
-                f"{self._artifact.snapshot}: {len(extras)} key(s) the code does not consume on a "
-                f"CANONICAL lane — the border already classified every key, so a surplus is "
-                f"conversion drift: {', '.join(extras[:6])}",
-                code="topology_extra_keys",
-                fields=extras[:6],
-            )
-        # LOCAL custody (D5): an un-bordered checkpoint's extras are listed and ignored —
-        # CONFESSED in the bind result, never transcribed into a fact and never refused.
-        return tuple(extras)
 
     def _fill(self, walked: Census, obj: object) -> tuple[int, int]:
         """The SINGLE fill path. Failure rolls the whole construction back (§1.1).
@@ -701,16 +696,7 @@ class Loader:
         done: list[str] = []
         total = 0
         try:
-            # The consent the MODEL CLASS declared, read off the generation that owns this
-            # loader. `__encoded_leaves__` is a class attribute with a conservative default
-            # on `Model` itself, so a host that never declared one says "refuse" rather
-            # than raising here — the refusal belongs to the plane that would replace a
-            # leaf, with the artifact's own encoding named in it.
-            live = self._backend.materialize(
-                obj,
-                walked,
-                encoded_leaves=str(getattr(type(self._owner), "__encoded_leaves__", "refuse")),
-            )
+            live = self._backend.materialize(obj, walked, encoded_leaves=self._consent())
             for d in walked.destinations:
                 self._backend.fill(d.key, self._artifact.topology[d.key], live[d.key])
                 done.append(d.key)

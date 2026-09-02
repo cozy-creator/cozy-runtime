@@ -7,7 +7,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
+import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -16,6 +18,7 @@ from typing import Any
 from cozy_runtime.internal import (
     base_observation,
     canonical,
+    derive_child,
     descriptor,
     fill,
     image_inventory,
@@ -280,12 +283,19 @@ def prepare_private_placement(
     request: pb.PreparePrivatePlacementRequest,
     *,
     prepared: Mapping[str, Any],
+    installed: package_environment.InstalledEnvironment | None,
     artifact_cache: Path,
     artifact_store: Path | None,
     verified: Callable[[str, int, Path], None],
 ) -> pb.PreparePackageSetResult:
     """Bind verified models to one exact already-prepared local revision core."""
 
+    if installed is None:
+        raise PreparationRefusal(
+            "private_placement_environment_absent",
+            f"{request.operation_id}: the local revision's environment is not held, so its "
+            "slots cannot be derived",
+        )
     development = prepared.get("development")
     descriptor_ref = prepared.get("package_descriptor")
     if (
@@ -364,6 +374,7 @@ def prepare_private_placement(
         artifact_cache=artifact_cache,
         artifact_store=artifact_store,
         verified=verified,
+        derive=_deriver(installed, str(descriptor_body.get("application", ""))),
     )
     entrypoint_bodies = [documents.body(row) for row in entrypoints]
     model_bodies = [documents.body(row) for row in selected_models]
@@ -620,6 +631,7 @@ def prepare_package(
             artifact_cache=artifact_cache,
             artifact_store=artifact_store,
             verified=verified,
+            derive=_deriver(installed, str(descriptor_body.get("application", ""))),
         )
     else:
         # Local package transport freezes code, descriptor and Environment only. A later ordinary
@@ -634,6 +646,7 @@ def prepare_package(
             artifact_cache=artifact_cache,
             artifact_store=None,
             verified=verified,
+            derive=None,
         )
     if development is None and not entrypoints and not jobs:
         raise PreparationRefusal(
@@ -726,6 +739,44 @@ def _verify_local_revision(
         )
 
 
+#: `(slot path, config bytes, config digest) -> the components the derive constructed`.
+Deriver = Callable[[str, bytes, str], tuple[str, ...]]
+
+
+def _deriver(installed: package_environment.InstalledEnvironment, application: str) -> Deriver:
+    """`cozy-runtime derive` in the package's own environment, one bounded child per slot:
+    `Slot.components` is what the factory constructs for this config document (D9), and
+    this plane never reads it off the header. The child imports the derive machinery; this
+    plane imports only the request/response seam (cr-067's guard, kept by construction)."""
+
+    def derive(slot: str, config_bytes: bytes, config_digest: str) -> tuple[str, ...]:
+        if not application:
+            raise PreparationRefusal("package_prepare_descriptor_invalid", "application")
+        scratch = Path(tempfile.mkdtemp(prefix="cozy-prepare-derive-"))
+        try:
+            config_path = scratch / "config.json"
+            config_path.write_bytes(config_bytes)
+            request = derive_child.DeriveRequest(
+                (
+                    derive_child.SlotRequest(
+                        slot,
+                        derive_child.ConfigRef(config_path, config_digest, len(config_bytes)),
+                    ),
+                ),
+                application=application,
+            )
+            (held,) = derive_child.derive_in(installed.python, request, scratch)
+            return derive_child.constructed_components(held.document)
+        except derive_child.DeriveRefusal as exc:
+            raise PreparationRefusal(
+                "package_prepare_derive_refused", f"{slot}: {exc.code}: {exc.detail}"
+            ) from exc
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    return derive
+
+
 def _entrypoints(
     body: Mapping[str, Any],
     *,
@@ -735,6 +786,7 @@ def _entrypoints(
     artifact_cache: Path,
     artifact_store: Path | None,
     verified: Callable[[str, int, Path], None],
+    derive: Deriver | None,
 ) -> tuple[list[pb.Model], list[pb.Entrypoint]]:
     rows = body.get("entrypoints")
     if not isinstance(rows, list):
@@ -742,6 +794,10 @@ def _entrypoints(
     selected = _selected_models(
         package_name, selections, files, artifact_cache, artifact_store, verified
     )
+    if selected and derive is None:
+        raise PreparationRefusal(
+            "package_prepare_derive_refused", "a modeled selection needs the package environment"
+        )
     model_ids = {slot: f"model-{index:04d}" for index, slot in enumerate(sorted(selected))}
     models = [
         pb.Model(
@@ -787,6 +843,8 @@ def _entrypoints(
             described_slots.add(path)
             model = selected[path]
             model_id = model_ids[path]
+            assert derive is not None
+            constructed = derive(path, model["config_bytes"], str(model["config_digest"]))
             slots.append(
                 pb.Slot(
                     slot=path.removeprefix(prefix),
@@ -798,9 +856,12 @@ def _entrypoints(
                         ),
                         assets=[],
                     ),
+                    # WHAT THE DERIVE CONSTRUCTED, in construction order (D9) — never the
+                    # header's component set. Whether those components exist in the
+                    # checkpoint is the fit's question, answered at construction.
                     components=[
                         pb.Component(component=component, model_id=model_id)
-                        for component in model["components"]
+                        for component in constructed
                     ],
                 )
             )
@@ -995,12 +1056,7 @@ def _selected_models(
             held = store.manifest(digest)
             header = tensorfs.parse_header(bytes(held["header"]))
             configs = header.get("configs")
-            components = header.get("components")
-            if (
-                not isinstance(components, dict)
-                or not components
-                or header.get("assets") not in ({}, None)
-            ):
+            if not header.get("components") or header.get("assets") not in ({}, None):
                 raise PreparationRefusal(
                     "package_prepare_model_header_unsupported",
                     f"{digest}: expected configs, components, and no runtime-consumed assets",
@@ -1018,7 +1074,6 @@ def _selected_models(
                         manifest_length=length,
                         config_digest=config_digest,
                         config_bytes=config_bytes,
-                        components=tuple(sorted(str(component) for component in components)),
                     )
             if manifest_path is not None:
                 verified(digest, length, manifest_path)

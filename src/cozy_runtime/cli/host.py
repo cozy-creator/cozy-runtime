@@ -61,7 +61,7 @@ def doctor(config: RuntimeConfig, opts: Options) -> Result:
     return Result(
         rows=rows,
         document=document if opts.json else None,
-        next=("cozy-runtime fit <function> — this host's verdicts for a function",),
+        next=("cozy-runtime hostfacts <function> — this host's capacity facts for a function",),
     )
 
 

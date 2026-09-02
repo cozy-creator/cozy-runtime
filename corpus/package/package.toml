@@ -7,6 +7,14 @@
 [application]
 object = "sdxl_gpu:app"
 
-[bindings."SdxlUnetModel"]
+[bindings."denoise.models.model"]
+model = "cozy/sdxl-unet"
+release = "cr-005"
+
+[bindings."stubborn.models.model"]
+model = "cozy/sdxl-unet"
+release = "cr-005"
+
+[bindings."pair.models.model"]
 model = "cozy/sdxl-unet"
 release = "cr-005"

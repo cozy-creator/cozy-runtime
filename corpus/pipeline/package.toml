@@ -4,6 +4,10 @@
 [application]
 object = "sdxl_txt2img:app"
 
-[bindings."SdxlPipelineModel"]
+[bindings."generate.models.model"]
+model = "cozy/sdxl-pipeline"
+release = "cr-008b"
+
+[bindings."condition.models.model"]
 model = "cozy/sdxl-pipeline"
 release = "cr-008b"

@@ -907,6 +907,8 @@ def executor_prepare_command(
                     "custody": model.custody,
                     "objective": model.objective,
                     "steps_basis": model.steps_basis,
+                    "package": binding.package,
+                    "model": model.model,
                 },
                 "budgets": {"declared_weight_bytes": model.model_weight_bytes},
             }
@@ -1463,6 +1465,7 @@ class Worker:
             result = package_prepare.prepare_private_placement(
                 request,
                 prepared=prepared.document,
+                installed=prepared.installed,
                 artifact_cache=Path(self.options.artifact_cache or ""),
                 artifact_store=(
                     Path(self.options.artifact_store)
@@ -3890,7 +3893,8 @@ class Worker:
             f"{reply['facts']['fill_ms'] / 1000:.3f} s, "
             f"generation {str(reply['constructed_model_digest'])[:23]}… "
             f"resident={sorted(reply['facts'].get('resident', {}))} "
-            f"parked={reply['facts'].get('parked', [])}",
+            f"parked={reply['facts'].get('parked', [])}; "
+            f"fit: {(reply['facts'].get('fit') or {}).get('detail', 'unjudged')}",
         )
         if delivery:
             self.note("delivery", _delivery_observation(delivery))

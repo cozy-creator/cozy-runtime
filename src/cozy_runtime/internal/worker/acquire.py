@@ -776,6 +776,7 @@ class Acquirer:
                         snapshots=snapshots,
                         model_weight_bytes=model_weight_bytes,
                         sequence_parallel_degrees=degrees,
+                        model=f"{reference['repo']}@{reference['version']}/{reference['lane']}",
                     )
                 )
                 for asset in slot["config"].get("assets", []):
@@ -806,6 +807,11 @@ class Acquirer:
                 snapshots=first.snapshots,
                 model_weight_bytes=sum(member.model_weight_bytes for member in model_set),
                 development=bool(development),
+                package=(
+                    f"{development['package']}@{development['release']}"
+                    if development
+                    else f"{placement.package['package']}@{placement.package['release']}"
+                ),
             )
         selected_entrypoints = {str(row["name"]) for row in placement.entrypoints}
         if (development and not selected_entrypoints) or (

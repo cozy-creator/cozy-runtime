@@ -61,7 +61,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, census
 from cozy_runtime.internal import accel
@@ -415,6 +415,11 @@ class Checkpoint:
         from cozy_runtime.internal.encoding import aliases
 
         self._aliases = aliases()
+
+    def has(self, component: str) -> bool:
+        """Does the header carry this component? A constructed component it does not carry
+        is the fit's `component_missing`, so nothing here refuses it first."""
+        return component in self.header["components"]
 
     def rows(self, component: str) -> list[PlanRow]:
         """The header's lookup rows for one component.
@@ -862,6 +867,7 @@ class StreamingFillBackend:
         release: str = "cozy-runtime/0.0.2",
         qualified: tuple[Capabilities, dict[str, Any]] | None = None,
         forensics_dir: str = "",
+        custody: str = "canonical",
     ) -> None:
         from cozy_runtime.internal.derive import torch_module
 
@@ -882,6 +888,10 @@ class StreamingFillBackend:
         # hardcut requires the ordered tensor rows to agree with the construction traversal.
         # In both cases `_stream` receives the exact order from `fill`'s enqueue transaction.
         self.plan = {row.key: row for row in rows}
+        #: How this machine came to hold the bytes (model-code-fit D5): `canonical` refuses
+        #: a stored key the code does not consume, `local` lists and ignores it. The fit
+        #: reads it; nothing else here does.
+        self.custody = custody
         self.device = self.torch.device(device)
         self.device_str = str(self.torch.empty(0, device=self.device).device)
         #: The BACKEND this generation is filled on. Memory metering and reclaim go through
@@ -1206,6 +1216,70 @@ class StreamingFillBackend:
                 )
             lease = self.leases[component] = checkpoint.acquire()
         return lease
+
+    def fit(self, walked: Census, *, encoded_leaves: str) -> Mapping[str, object] | None:
+        """THE ONE VERDICT (model-code-fit §3): `tensorfs.fit` over the serving census and
+        the checkpoint header, with this executor's device class and its own qualification
+        records, before a destination is reserved. One fit per checkpoint the census reads:
+        a component-per-snapshot binding (cr-008b) is judged against each header it fills
+        from. The document comes back verbatim; on `ok` the keys `local` custody ignored
+        leave the fill's completeness set so the commit does not miss them.
+        """
+        from cozy_runtime.internal import canonical, code_topology
+        from cozy_runtime.internal.probe import observed_capability_records
+
+        tensorfs = tensorfs_module()
+        by_checkpoint: dict[str, tuple[Checkpoint, list[str]]] = {}
+        for component in walked.components:
+            checkpoint = self.checkpoints.get(component)
+            if checkpoint is None:
+                raise _refuse(
+                    "destination_absent",
+                    f"the construction built component {component!r} and the binding names "
+                    f"no checkpoint for it (bound: {', '.join(sorted(self.checkpoints)) or 'none'})"
+                    " — the derive's constructed components and the serving census disagree",
+                    [component],
+                )
+            by_checkpoint.setdefault(checkpoint.manifest_id, (checkpoint, []))[1].append(component)
+        observations = canonical.write(observed_capability_records(self.probe))
+        verdict: dict[str, object] | None = None
+        ignored: list[str] = []
+        routes = {"verbatim": 0, "decoded_float": 0, "encoded_gemm": 0}
+        for checkpoint, constructed in by_checkpoint.values():
+            members = set(constructed)
+            rows = [
+                (d.component, d.key[len(d.component) + 1 :], d.spec.dtype, d.spec.shape)
+                for d in walked.destinations
+                if d.component in members
+            ]
+            code = code_topology.tensorfs_bytes(rows, constructed, encoded_leaves=encoded_leaves)
+            with store_refusals(f"fitting {checkpoint.manifest_id[:23]}"):
+                fit = dict(
+                    tensorfs.fit(
+                        code,
+                        checkpoint.header_bytes,
+                        custody=self.custody,
+                        device=self.device_facts.predicate,
+                        observations=observations,
+                    )
+                )
+            if not fit.get("ok"):
+                return fit
+            verdict = fit
+            ignored.extend(str(k) for k in cast("Sequence[object]", fit.get("ignored", ())))
+            counted = cast("Mapping[str, int]", fit.get("routes", {}))
+            for route in routes:
+                routes[route] += int(counted.get(route, 0))
+        if verdict is None:
+            return None
+        for full in ignored:
+            component, _, key = full.partition("/")
+            expected = self.expected.get(component)
+            if expected is not None:
+                self.expected[component] = expected - {f"{component}.{key}"}
+        if len(by_checkpoint) > 1:
+            verdict = {**verdict, "ignored": ignored, "routes": routes}
+        return verdict
 
     def materialize(
         self, obj: object, walked: Census, *, encoded_leaves: str = "refuse"

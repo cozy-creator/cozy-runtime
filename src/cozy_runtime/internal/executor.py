@@ -662,7 +662,7 @@ class Executor:
 
         self.torch = torch
         from cozy_runtime.author import ModelRegistry
-        from cozy_runtime.author._loader import Artifact, Config
+        from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
         from cozy_runtime.author._model import component_use
         from cozy_runtime.internal.anima_optimization import (
             AnimaOptimizationRefusal,
@@ -776,7 +776,12 @@ class Executor:
         checkpoints = {
             name: Checkpoint(reference.store, vmap.get(name, reference.snapshot)) for name in names
         }
-        rows = [r for name in names for r in checkpoints[name].rows(name)]
+        # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
+        # carries: a constructed component the checkpoint lacks is the fit's own
+        # `component_missing`, judged at construction with the §3 text, so the plan is
+        # resolved over the rows the header does supply and nothing here refuses first.
+        present = [name for name in names if checkpoints[name].has(name)]
+        rows = [r for name in present for r in checkpoints[name].rows(name)]
         # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
         # lane's card, so a multi-GPU pod's records name the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding["release"])
@@ -912,6 +917,7 @@ class Executor:
             # here would re-measure a device fact that has not changed.
             qualified=qualified,
             forensics_dir=self.fill_forensics_dir,
+            custody=str(binding.get("custody", "canonical")),
         )
         # THE ARITHMETIC, BEFORE THE FIRST BYTE (#574b). The provisioned binding derives its
         # destination residency from the MCC's complete logical+derived tensor census. The
@@ -1027,7 +1033,7 @@ class Executor:
             # destination is reserved, and that refusal is a typed fill refusal like any
             # other rather than an exception escaping the prepare path.
             backend.expect(
-                {name: tuple(r.key for r in checkpoints[name].rows(name)) for name in names}
+                {name: tuple(r.key for r in checkpoints[name].rows(name)) for name in present}
             )
             model = registry.acquire(binding["model_binding_path"], model_cls, artifact)
             optimization = apply_anima_execution_plan(
@@ -1035,6 +1041,25 @@ class Executor:
                 application=str(binding["application"]),
                 model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
             )
+        except ModelFitRefused as exc:
+            # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
+            # loader asked before `materialize`, so the only thing to undo is the read
+            # lease, and the executor is replaced like every other prepare refusal.
+            backend.poison(())
+            self.poisoned = f"fit refused: {exc.fit.get('code')}"
+            return {
+                "ok": False,
+                "code": exc.code,
+                "detail": (
+                    f"{binding.get('package') or binding['application']} "
+                    f"{binding['model_binding_path']} does not fit "
+                    f"{binding.get('model') or reference.snapshot}: "
+                    f"{exc.fit.get('code')} — {exc.fit.get('detail')}"
+                )[:900],
+                "fit": exc.fit,
+                "state": backend.state,
+                "envelope": envelope,
+            }
         except AnimaOptimizationRefusal as exc:
             backend.poison(())
             self.poisoned = f"execution plan refused: {exc.code}"
@@ -1217,6 +1242,9 @@ class Executor:
                 method: list(names) for method, names in sorted(component_use(model_cls).items())
             },
             "ignored_extra_keys": list(record.ignored_extras),
+            # THE FIT this generation was judged by (§3), verbatim: the eight-code document
+            # `tensorfs.fit` returned, `ok` here by construction.
+            "fit": record.fit,
             # THE SEAM FORM (#574b). The full document carries a row per destination and a
             # control frame is 64 KiB; on an N-ary artifact that reply could not be sent.
             "plan": plan.seam_document(),

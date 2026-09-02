@@ -792,9 +792,11 @@ def fence_supervised_worker_lanes() -> list[str]:
     return bad
 
 
-#: cr-067 hard guard: topology derivation must NEVER run on pod prep. The worker's
-#: preparation plane may not import the derive machinery or TensorFS's author facade —
-#: cold boot pays for staging and venv materialization, never for a meta-device load.
+#: cr-067 hard guard, kept under model-code-fit D9: the worker's preparation plane may not
+#: IMPORT the derive machinery or TensorFS's author facade. `Slot.components` is what the
+#: derive constructed, so preparation runs `cozy-runtime derive`'s bounded child in the
+#: package's own environment through the `internal/derive_child.py` seam — a request/response
+#: document plane — and never loads a meta-device construction into the worker process.
 WORKER_DERIVE_FORBIDDEN = ("cozy_runtime.internal.derive", "cozy_runtime.derive", "tensorfs")
 
 

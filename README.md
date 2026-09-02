@@ -402,19 +402,33 @@ materialization, convergence, fallback, or readiness code. Cold proof checks int
 warm proof checks zero downloaded package bytes and exact verified reuse, while the real
 TensorFS cache proof checks non-empty model downloaded/reused accounting.
 
+**The fit (model-code-fit §3).** `cozy-runtime derive --python <venv python> --slot <path>
+--config <document> [--application <module:attr> | --dir <project>] [--out <dir>]`
+(`cli/derive.py`) is the code side: `census(factory(config_document))` on the meta device,
+in one bounded child of the package's own interpreter (`internal/derive_child.py` — no
+network, no weight bytes, no writes, no CUDA), emitted as the canonical TensorFS
+CodeTopology: rows with `accepts` from the class's `encoded_leaves`, plus the components the
+factory constructed in order (D9). Hardware-independent (a construction that reads the
+device refuses, D3) and deterministic — the child derives twice and refuses a construction
+that differs from itself. The checkpoint side is the cozytensors header, and the ONE answer
+is `tensorfs.fit`: the worker's `Loader.construct` censuses the real construction and asks
+it — with the executor's device class and its own `probe.qualify` records — before a byte is
+reserved; a verdict that is not `ok` is the typed prepare refusal `model_fit_refused`
+carrying the Fit document verbatim. The runtime keeps no matcher of its own. Every
+PlacementSet writer (`worker/package_prepare.py`, `internal/local.py`) fills
+`Slot.components` from the derive, never from the header.
+
 `cozy-model-contract-proof REQUEST.json OUTPUT_DIR` (`cli/code_topologies.py`; the script
 name is what cozy-creator's publish invokes until cl-094 moves it to `cozy-runtime derive`)
-is the author-side writer of the publish memo `cozy.package.code-topologies/1`
-(model-code-fit §3). It runs on the publishing author's machine inside the project venv
-(`uv run --locked`), never on the hub: it compares the exact publishing descriptor with the
-project source and double-derives every requested slot CLASS under the offline construction
-sandbox — `census(factory(config_document))` on the meta device, hardware-independent (a
-construction that reads the device refuses, D3) — then publishes one row per
+is the author-side writer of the publish memo `cozy.package.code-topologies/1`. It runs on
+the publishing author's machine inside the project venv (`uv run --locked`), never on the
+hub: it compares the exact publishing descriptor with the project source and derives every
+requested slot CLASS through the same child, then publishes one row per
 (slot, config_digest) referencing the code-topology document by digest. The fresh output
 directory appears atomically: the memo index in `result.json` plus exact digest-named
-documents under `code-topologies/`. The construction seed (the config document of the
-slot's default `package.toml [bindings]` checkpoint, resolved by the publisher) is an input
-only — its identity never enters the memo. There is no ModelConstructionContract, no
+CodeTopology documents under `code-topologies/`. The construction seed (the config document
+of the slot's default `package.toml [bindings]` checkpoint, resolved by the publisher) is an
+input only — its identity never enters the memo. There is no ModelConstructionContract, no
 hardware variant, no verdict: Tensorhub stores the memo and never grades it. The memo binds
 the release VERSION (`org/package@1.0.0`), never a release digest — the digest exists only
 once Tensorhub finalizes the upload the envelope rides in.
@@ -488,7 +502,7 @@ fill without the reader is a typed `reader_unavailable` refusal naming the insta
 `examples/marco-polo` is the weightless reference package — one entrypoint, one job, no model
 — and it is what the end-to-end suite builds, installs and runs.
 
-`run` · `serve` · `job` · `ingest` · `doctor` · `fit` land in
+`run` · `serve` · `job` · `ingest` · `doctor` · `hostfacts` land in
 cr-016 over the real attempt kernel.
 
 **Jobs (cr-009).** A job is an attempt class on the same machinery, not a second runtime:

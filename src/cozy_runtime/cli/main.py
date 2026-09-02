@@ -8,9 +8,10 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 
+from cozy_runtime.cli import derive as derive_verb
 from cozy_runtime.cli import describe as describe_verb
-from cozy_runtime.cli import fit as fit_verb
 from cozy_runtime.cli import host as host_verbs
+from cozy_runtime.cli import hostfacts as hostfacts_verb
 from cozy_runtime.cli import new as new_verb
 from cozy_runtime.cli import package_prepare as package_prepare_verbs
 from cozy_runtime.cli import probe as probe_verb
@@ -28,7 +29,8 @@ BUILT = (
     "bindings",
     "doctor",
     "capability",
-    "fit",
+    "hostfacts",
+    "derive",
     "probe",
     "new",
     "version",
@@ -46,7 +48,9 @@ verbs:
   bindings                       the RESOLVED binding records this project selects
   doctor                         this host's device/driver/credential facts
   capability [--out <path>]      the OBSERVED (encoding, device) qualification of this card
-  fit [<fn>] [k=v …]             this host's fit verdicts (exact with a payload)
+  hostfacts [<fn>] [k=v …]       this host's capacity facts (exact with a payload)
+  derive --python <venv python> --slot <path> --config <document> [--out <dir>]
+                                 the CodeTopology of one slot for one construction document
   probe <fn> [k=v …]             teacher-forced activation diff of two lanes (report/1)
   new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and the two independent semvers
@@ -90,7 +94,8 @@ _VALUE_FLAGS = ("--fields", "--dir", "--descriptor")
 _OWNS_ARGS = (
     "run",
     "job",
-    "fit",
+    "hostfacts",
+    "derive",
     "probe",
     "capability",
     "serve",
@@ -197,8 +202,10 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return host_verbs.development_placement(config, args, opts)
     if verb == "prepare-package":
         return package_prepare_verbs.prepare_local_package(config, args, opts)
-    if verb == "fit":
-        return fit_verb.run(args, opts, config)
+    if verb == "hostfacts":
+        return hostfacts_verb.run(args, opts, config)
+    if verb == "derive":
+        return derive_verb.run(args, opts)
     if verb == "probe":
         return probe_verb.run(args, opts)
     if verb == "capability":
@@ -208,8 +215,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             raise CliError(
                 "usage",
                 f"doctor takes no arguments, got {len(args)}",
-                "cozy-runtime doctor [--json] — it derives no fit verdict, so it takes no "
-                "payload; `cozy-runtime fit` is the verdict verb",
+                "cozy-runtime doctor [--json] — it takes no payload; `cozy-runtime hostfacts` "
+                "is the capacity verb",
                 Exit.usage,
             )
         return host_verbs.doctor(config, opts)
