@@ -9,6 +9,8 @@ imported by path and shadows nothing; only ldconfig names are process-global.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from cozy_runtime.internal.native_wheel import (
     NativeWheelRefusal,
     _linker_library_rows,
@@ -19,8 +21,8 @@ from cozy_runtime.internal.native_wheel import (
 def _refusal(library: str) -> NativeWheelRefusal | None:
     try:
         _require_safe_libraries(
-            root=None,  # unused by the arms below
-            path=type("P", (), {"name": library})(),
+            root=Path("."),
+            path=Path(library),
             soname="",
             needed=(),
             runpaths=(),
