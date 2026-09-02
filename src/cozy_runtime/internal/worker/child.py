@@ -26,7 +26,6 @@ import os
 import queue
 import re
 import secrets
-import shutil
 import signal
 import socket
 import threading
@@ -276,7 +275,6 @@ class ExecutorSupervision:
         executor_uid: int = -1,
         executor_gid: int = -1,
         jit_pod_scope: str = "",
-        scratch_root: Path | None = None,
         device_process: Callable[[int], accel.ProcessMemory] | None = None,
     ) -> None:
         self.root = root
@@ -289,7 +287,6 @@ class ExecutorSupervision:
         self.executor_uid = executor_uid
         self.executor_gid = executor_gid
         self.jit_pod_scope = jit_pod_scope or f"local-{secrets.token_hex(16)}"
-        self.scratch_root = scratch_root
         self.root.mkdir(parents=True, exist_ok=True)
         if self.isolated:
             # Group execute admits the fixed executor to the named socket/cancel paths but
@@ -357,31 +354,15 @@ class ExecutorSupervision:
         os.chown(path, self.executor_uid, self.executor_gid)
         path.chmod(0o700)
 
-    def epoch_scratch(self, epoch: int) -> Path:
-        if self.scratch_root is None:
-            raise ExecutorGone("executor scratch root is absent")
-        if not self.isolated:
-            return self.scratch_root
-        return self.scratch_root / f"epoch-{epoch}"
-
-    def _prepare_epoch_scratch(self) -> None:
-        if not self.isolated:
-            return
-        if self.scratch_root is None:
-            raise ExecutorGone("isolated executor scratch root is absent")
-        self.scratch_root.mkdir(parents=True, exist_ok=True)
-        os.chown(self.scratch_root, 0, 0)
-        self.scratch_root.chmod(0o711)
-        # No old executor exists while _spawn_locked holds the lifecycle lock. Remove every
-        # retired epoch before making the successor reachable; a fixed uid therefore
-        # cannot read a previous epoch's scratch even though the numeric uid is reused.
-        for entry in self.scratch_root.iterdir():
-            if entry.is_symlink() or not entry.is_dir():
-                raise ExecutorGone(f"unexpected entry in executor scratch root: {entry}")
-            shutil.rmtree(entry)
-        scratch = self.epoch_scratch(self.epoch)
-        scratch.mkdir(mode=0o700)
-        os.chown(scratch, self.executor_uid, self.executor_gid)
+    def handoff(self, epoch: int) -> Path:
+        """The one directory under this worker's run root the current executor may write a
+        control document into (a derived descriptor); the reader unlinks it at once. There
+        is no executor scratch tree: bytes a job stages live in the owner's `tmp/<id>/`
+        through the grant, and a worker root holds nothing but `run/` and its log."""
+        path = self.root / "handoff"
+        path.mkdir(exist_ok=True)
+        self.grant_directory(path, epoch)
+        return path
 
     @property
     def _owner_path(self) -> Path:
@@ -729,7 +710,6 @@ class ExecutorSupervision:
             # A RESPAWN bumps the transport fence, and with it the readiness fence: a fresh
             # executor has no state, so no epoch bump can leave readiness unmoved.
             self.epoch += 1
-        self._prepare_epoch_scratch()
         self.spawns += 1
         started = time.perf_counter()
         spawned: spawn.Spawned | None = None
