@@ -307,8 +307,10 @@ class AttemptRecord:
     Fetched, length- and digest-checked, sniffed and spooled BEFORE acceptance, so the
     executor is handed verified files and never an address."""
     scratch: Path | None = None
-    """The RUN's scratch tree. Keyed on the run and NOT on the attempt, which is the whole
-    of resumability: a retried attempt of the same run reads what the killed one left."""
+    """The RUN's scratch tree, when the grant names one (`tmp/<request-id>/` on the owner's
+    side; owner ruling 2026-09-02). Keyed on the run and NOT on the attempt, which is the
+    whole of resumability: a retried attempt of the same run reads what the killed one
+    left. None until the grant carries it — the Scratch service then refuses typed."""
     state: str = "validating"
     spool: Path | None = None
     outcome_id: str = ""
@@ -448,7 +450,6 @@ class AttemptEngine:
         authorizer: grants.Authorizer,
         jobs: Mapping[str, JobBinding],
         spool_root: Path,
-        scratch_root: Path,
         instance_id: str,
         send: Callable[[pb.WorkerFrame], None],
         progress: Callable[[str, int, dict[str, Any]], None],
@@ -465,9 +466,6 @@ class AttemptEngine:
         self.jobs = dict(jobs)
         self.job_device_count = 0
         self.spool_root = spool_root
-        #: Where a run's scratch lives. Deliberately outside the disposable worker directory
-        #: so an acknowledged run can clean worker state without deleting resumable scratch.
-        self.scratch_root = scratch_root
         self.instance_id = instance_id
         self.send = send
         self.progress = progress
@@ -1010,19 +1008,11 @@ class AttemptEngine:
             device_count=self.job_device_count,
         )
         attempt.plan = plan
-        # The RUN's scratch, not the attempt's: `Scratch.checkpoint_dir(key=)` must hand a
-        # retried attempt the SAME tree, which is the whole of resume. It is created here,
-        # before acceptance, so a job never discovers at step 40,000 that it has nowhere
-        # durable to write.
-        scratch_root = (
-            supervision.epoch_scratch(attempt.executor_epoch)
-            if supervision.isolated
-            else self.scratch_root
-        )
-        attempt.scratch = scratch_root / opaque_key("job-scratch", attempt.request_id)
-        attempt.scratch.mkdir(parents=True, exist_ok=True)
-        if supervision.isolated:
-            supervision.grant_directory(attempt.scratch, attempt.executor_epoch)
+        # A job's scratch is the RUN's, granted by the owner as `tmp/<request-id>/` and
+        # removed by the owner when the request settles; the worker owns no scratch tree of
+        # its own. Until a grant names one, `attempt.scratch` stays None and the Scratch
+        # service refuses typed (`scratch_unavailable`).
+        attempt.scratch = None
 
         opened = slot.ledger.snapshot()
         self._hold_job_models(attempt, binding, descriptor_id)
@@ -1593,9 +1583,8 @@ class AttemptEngine:
                 # record CANCELED ahead of it.
                 attempt.reclaim_done.wait()
                 return self.finish_cancel(attempt, attempt.canceling)
-            # A job's scratch tree deliberately SURVIVES — it is the run's, not the
-            # attempt's — but the attempt SPOOL is aborted on both lanes, so nothing
-            # half-written can reach a granted destination.
+            # The attempt SPOOL is aborted on both lanes, so nothing half-written can
+            # reach a granted destination.
             grants.abort_outputs(spool)
             return self.abandon(attempt, str(exc))
         return self.release(attempt, reply, spool, key)

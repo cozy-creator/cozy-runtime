@@ -302,8 +302,10 @@ is selectable.
 The rented-pod worker stays root and non-dumpable; the exec-first trampoline sets `no_new_privs`
 and drops package execution to uid/gid 65533. Runtime keeps control state in memory because its
 pod-supervisor owns the durable replay ledger. Receipts, acquisition cache, and worker credentials
-remain root-only. Content is root-owned/read-only, and executor scratch/probe state is private to
-one epoch and deleted before the fixed uid is reused. A worker that cannot perform the
+remain root-only. Content is root-owned/read-only. The worker keeps no scratch tree: an attempt's
+spool and a derived descriptor's handoff live under its `run/` root for exactly one attempt or
+call, and bytes a job stages are the owner's `tmp/<request-id>/`, granted per run and removed by
+the owner when the request settles. A worker that cannot perform the
 identity split refuses before binding. Native/local development keeps its explicit same-user lane.
 Base bytecode is baked in the image and uv compiles package bytecode during installation. Any later
 bytecode is directed to the worker-boot/content cache outside the read-only venv. The executor starts

@@ -75,9 +75,7 @@ def _supervision() -> Iterator[child.ExecutorSupervision]:
         python=sys.executable,
         base_env=_base_env(),
         cozy_home=scratch / "home",
-        scratch_root=scratch / "executor",
     )
-    (scratch / "executor").mkdir(parents=True)
     supervision.use_environment(sys.executable, "sha256:" + "0" * 64)
     try:
         yield supervision

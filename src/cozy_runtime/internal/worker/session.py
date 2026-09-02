@@ -975,7 +975,6 @@ class Worker:
             executor_uid=options.executor_uid,
             executor_gid=options.executor_gid,
             jit_pod_scope=self.fence.worker_boot_id,
-            scratch_root=self.root.parent / "scratch",
         )
         self.supervision.on_change = self.executor_changed
         # One accepted stream at a time may mutate control state. Claims take this through
@@ -1039,7 +1038,6 @@ class Worker:
             authorizer=self.authorizer,
             jobs={},
             spool_root=self.root / "spool",
-            scratch_root=self.root.parent / "scratch",
             instance_id=options.instance_id,
             send=self.send,
             progress=self.emit_progress,
@@ -1101,7 +1099,6 @@ class Worker:
             executor_uid=self.options.executor_uid,
             executor_gid=self.options.executor_gid,
             jit_pod_scope=f"{self.fence.worker_boot_id}-{key}",
-            scratch_root=self.root.parent / "scratch" / key,
         )
         supervision.on_invalidate = lambda why: self._hosted_capacity_dropped(placement_id, why)
         supervision.on_exit = lambda executor: self._hosted_executor_exited(placement_id, executor)
@@ -1479,8 +1476,8 @@ class Worker:
                         executor = self.supervision.replace(
                             executor, imposed=self.imposed(lane), why="prepared package changed"
                         )
-                    scratch = self.supervision.epoch_scratch(executor.epoch)
-                    output = scratch / f"package-descriptor-{uuid.uuid4().hex}.json"
+                    handoff = self.supervision.handoff(executor.epoch)
+                    output = handoff / f"package-descriptor-{uuid.uuid4().hex}.json"
                     # A cold import, torch included: bound by the executor's own measured
                     # work and its death, never by a number of seconds (xs-007 row 8).
                     with executor.watched("describe_installed"):

@@ -116,14 +116,12 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         python=str(environment_python),
         base_env=config.child_base_env,
         cozy_home=config.cozy_home,
-        scratch_root=scratch / "executor",
     )
-    (scratch / "executor").mkdir(parents=True)
 
     def describe(installed: package_environment.InstalledEnvironment, distribution: str) -> bytes:
         supervisor.use_environment(str(installed.python), installed.content_digest)
         executor = supervisor.spawn(imposed={})
-        output = scratch / "executor" / "descriptor.json"
+        output = supervisor.handoff(executor.epoch) / "descriptor.json"
         with executor.watched("describe_installed"):
             reply = executor.call(
                 {"cmd": "describe_installed", "distribution": distribution, "output": str(output)},
