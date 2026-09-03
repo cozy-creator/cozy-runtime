@@ -4,10 +4,9 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "cozy-runtime-cuda-kernels"
-version = "0.1.0+torch2.13cu130"
-description = "Cozy's purpose-built CUDA kernels for its Torch 2.13/CUDA 13 worker profile"
+version = "0.1.0"
+description = "Cozy's purpose-built CUDA kernels: nanobind + DLPack over the CUDA runtime, abi3"
 requires-python = ">=3.12"
-dependencies = ["torch==2.13.0"]
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 
