@@ -6,10 +6,12 @@ import json
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STAMP = "a" * 40
+PROJECT_VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
 
 
 def test_installed_wheel_version_is_independent_of_caller_repository(tmp_path: Path) -> None:
@@ -33,7 +35,7 @@ def test_installed_wheel_version_is_independent_of_caller_repository(tmp_path: P
         check=True,
         capture_output=True,
     )
-    wheel = next(wheelhouse.glob("cozy_runtime-0.2.10-*.whl"))
+    wheel = next(wheelhouse.glob(f"cozy_runtime-{PROJECT_VERSION}-*.whl"))
     environment = tmp_path / "environment"
     subprocess.run(
         [uv, "venv", "--python", "3.12", str(environment)],
@@ -82,7 +84,7 @@ def test_installed_wheel_version_is_independent_of_caller_repository(tmp_path: P
         text=True,
     )
     reported = json.loads(result.stdout)
-    assert reported["distribution"] == "0.2.10"
-    assert reported["tag"] == "v0.2.10"
+    assert reported["distribution"] == PROJECT_VERSION
+    assert reported["tag"] == f"v{PROJECT_VERSION}"
     assert reported["commit"] == STAMP[:12]
     assert reported["commit"] != caller_commit

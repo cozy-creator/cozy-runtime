@@ -1,4 +1,4 @@
-"""Derived configs cross the real Runtime -> published TensorFS 0.2.1 boundary."""
+"""Derived configs cross the real Runtime -> published TensorFS 0.3.0 boundary."""
 
 from __future__ import annotations
 
@@ -81,6 +81,10 @@ def test_add_and_derive_configs_land_as_inline_jcs(tmp_path: Path) -> None:
         allowed_sources={manifest: manifest_length},
         output_bounds={"result": 1 << 20},
     )
+    structure = host.structure(manifest)
+    assert [(tensor.key, tensor.logical_dtype) for tensor in structure.tensors] == [
+        ("weight", "f32")
+    ]
     transaction = WeightsTransaction(
         attempt=Attempt("request-1", tmp_path / "spool"),
         cancel=lambda: False,

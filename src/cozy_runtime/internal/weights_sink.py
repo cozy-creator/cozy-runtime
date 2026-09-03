@@ -283,7 +283,7 @@ class WeightsTransactionHost:
                         WeightsSourceTensor(
                             component=str(component),
                             key=str(key),
-                            logical_dtype=str(logical["dtype"]),
+                            logical_dtype=str(logical["logical_dtype"]),
                             shape=tuple(int(value) for value in logical["shape"]),
                             parts=tuple(
                                 WeightsSourcePart(
@@ -393,7 +393,7 @@ class WeightsTransactionHost:
                 key: {
                     "encoding": tensor.encoding,
                     "logical": {
-                        "dtype": tensor.logical_dtype,
+                        "logical_dtype": tensor.logical_dtype,
                         "shape": list(tensor.shape),
                     },
                     "parts": {

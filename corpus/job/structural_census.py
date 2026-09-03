@@ -90,7 +90,7 @@ def _component_rows(store_root: str, snapshot: str, component: str) -> list[dict
     for key, entry in table.items():
         logical = entry["logical"]
         shape = [int(n) for n in logical["shape"]]
-        dtype = str(logical["dtype"])
+        dtype = str(logical["logical_dtype"])
         width = int(tensorfs.DTYPES[dtype])
         nbytes = width
         for extent in shape:

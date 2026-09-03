@@ -150,6 +150,14 @@ def test_loader_consumes_verified_header_assets(tmp_path: Path) -> None:
         capability.read("tokenizer/vocab.txt")
 
 
+def test_worker_prepare_reads_tensorfs_03_logical_dtype(tmp_path: Path) -> None:
+    """Exercise the exact Checkpoint.rows path the executor's worker prepare calls."""
+
+    store_root, manifest_id, _manifest_length, _store = _snapshot(tmp_path, include_asset=True)
+    rows = fill.Checkpoint(store_root, manifest_id).rows("unet")
+    assert [(row.key, row.dtype, row.shape) for row in rows] == [("unet.weight", "f32", (1,))]
+
+
 def test_cold_fit_accepts_only_manifest_header_and_model_assets(tmp_path: Path) -> None:
     _store_root, manifest_id, _manifest_length, store = _snapshot(tmp_path, include_asset=True)
     set_root = tmp_path / "partial"
