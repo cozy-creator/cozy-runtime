@@ -673,7 +673,7 @@ def _spec_vectors(
         }
     for case in document.get("cases", ()):
         logical = case.get("logical") or {}
-        if TORCH_DTYPES.get(str(logical.get("dtype"))) != dtype_name:
+        if TORCH_DTYPES.get(str(logical.get("logical_dtype"))) != dtype_name:
             continue
         roles = {role: vector_tensor(torch, blob, device) for role, blob in case["roles"].items()}
         missing = sorted(provider.required - set(roles))

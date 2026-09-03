@@ -439,7 +439,7 @@ class Checkpoint:
         for key, entry in table.items():
             logical = entry["logical"]
             shape = tuple(int(n) for n in logical["shape"])
-            dtype = str(logical["dtype"])
+            dtype = str(logical["logical_dtype"])
             width = self.tensorfs.DTYPES.get(dtype)
             if width is None:
                 raise _refuse(
