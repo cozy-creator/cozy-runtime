@@ -1829,7 +1829,7 @@ class Executor:
         if surface.model_bindings:
             from cozy_runtime.internal import fill
 
-            store_value = str(command.get("artifact_store", ""))
+            store_value = str(command.get("tensorfs_root", ""))
             if not store_value or not Path(store_value).is_dir():
                 return {
                     "ok": False,
@@ -1847,17 +1847,17 @@ class Executor:
         elif surface.weights_outputs:
             from cozy_runtime.internal import fill, pull
 
-            store_value = str(command.get("artifact_store", ""))
+            store_value = str(command.get("tensorfs_root", ""))
             if not store_value:
                 return {
                     "ok": False,
-                    "code": "artifact_store_unavailable",
+                    "code": "tensorfs_store_unavailable",
                     "detail": "this weights-producing job has no verified TensorFS store",
                 }
             try:
                 store = pull.open_store(fill.tensorfs_module(), Path(store_value))
             except pull.PullRefusal as exc:
-                return {"ok": False, "code": "artifact_store_unavailable", "detail": exc.message}
+                return {"ok": False, "code": "tensorfs_store_unavailable", "detail": exc.message}
         try:
             job_models = self._job_models(surface, command, store)
         except CapabilityError as exc:
@@ -1871,7 +1871,7 @@ class Executor:
             if store is None:
                 return {
                     "ok": False,
-                    "code": "artifact_store_unavailable",
+                    "code": "tensorfs_store_unavailable",
                     "detail": "this weights-producing job has no verified TensorFS store",
                 }
             allowed_sources = {

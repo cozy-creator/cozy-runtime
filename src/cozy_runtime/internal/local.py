@@ -87,7 +87,7 @@ class StagedDevelopmentPlacement:
 
     bindings: Mapping[str, str]
     placement: pb.Placement
-    artifact_store: Path
+    tensorfs_root: Path
     artifact_cache: Path
     declared_bindings: Mapping[str, DeclaredBinding] = field(default_factory=dict)
 
@@ -993,7 +993,7 @@ def stage_development_placement(
     release: str,
     source_digest: str,
     artifact_cache: Path,
-    artifact_store: Path,
+    tensorfs_root: Path,
     found: Any = None,
     binding_overrides: Mapping[str, str] | None = None,
 ) -> StagedDevelopmentPlacement:
@@ -1003,12 +1003,12 @@ def stage_development_placement(
     launcher's install-owned, content-addressed document store (cozy-creator's
     `installs/<id>/artifact-cache/`, a run's workspace), never under `cozy_home`: the home
     root holds what has a reason to be there, and a launch's derived documents are the
-    launcher's to place and reclaim. `artifact_store` is named, never created here.
+    launcher's to place and reclaim. `tensorfs_root` is named, never created here.
     """
 
     home = cozy_home.resolve()
     cache = artifact_cache.resolve()
-    selected_store = artifact_store.resolve()
+    selected_store = tensorfs_root.resolve()
     documents_ = development_placement_documents(
         interface,
         package=package,
@@ -1016,7 +1016,7 @@ def stage_development_placement(
         source_digest=source_digest,
         found=found,
         cozy_home=home,
-        artifact_store=selected_store,
+        tensorfs_root=selected_store,
         artifact_cache=cache,
         binding_overrides=binding_overrides,
     )
@@ -1041,7 +1041,7 @@ def development_placement_documents(
     source_digest: str,
     found: Any = None,
     cozy_home: Path | None = None,
-    artifact_store: Path | None = None,
+    tensorfs_root: Path | None = None,
     artifact_cache: Path | None = None,
     binding_overrides: Mapping[str, str] | None = None,
 ) -> DevelopmentPlacementDocuments:
@@ -1074,12 +1074,12 @@ def development_placement_documents(
     )
     resolved_models: Mapping[str, _DevelopmentModel] = {}
     if modeled_paths:
-        if found is None or cozy_home is None or artifact_store is None:
+        if found is None or cozy_home is None or tensorfs_root is None:
             raise RuntimeError(
                 "development_model_resolution_absent: modeled development requires the "
                 "discovered package, COZY_HOME, and local TensorFS store"
             )
-        resolved_models = _resolve_development_models(found, artifact_store, binding_overrides)
+        resolved_models = _resolve_development_models(found, tensorfs_root, binding_overrides)
         if sorted(resolved_models) != modeled_paths:
             raise RuntimeError("development_model_mismatch: resolved binding paths changed")
 
@@ -1199,7 +1199,7 @@ def development_placement_documents(
 
 def _resolve_development_models(
     found: Any,
-    artifact_store: Path,
+    tensorfs_root: Path,
     binding_overrides: Mapping[str, str] | None = None,
 ) -> Mapping[str, _DevelopmentModel]:
     # The strict resolve runs over the WHOLE declared slot set — jobs' included, so a
@@ -1232,7 +1232,7 @@ def _resolve_development_models(
         raise RuntimeError(f"development_tensorfs_unavailable: {exc}") from exc
 
     resolved: dict[str, _DevelopmentModel] = {}
-    store_root = artifact_store.resolve()
+    store_root = tensorfs_root.resolve()
     try:
         if not store_root.is_dir():
             raise FileNotFoundError(store_root)
@@ -1439,7 +1439,7 @@ def run_slice(
     package_code_digest: str,
     package_interface_document: Mapping[str, Any] | None = None,
     found: Any = None,
-    development_artifact_store: Path | None = None,
+    development_tensorfs_root: Path | None = None,
     development_binding_overrides: Mapping[str, str] | None = None,
     job_records: list[dict[str, Any]] | None = None,
     options: WorkerOptions | None = None,
@@ -1471,7 +1471,7 @@ def run_slice(
             release="0.0.0",
             source_digest=source_digest,
             artifact_cache=workspace / "artifact-cache",
-            artifact_store=development_artifact_store or workspace / "store",
+            tensorfs_root=development_tensorfs_root or workspace / "tensorfs",
             found=found,
             binding_overrides=development_binding_overrides,
         )
@@ -1491,11 +1491,11 @@ def run_slice(
     )
     options = options or WorkerOptions(root=workspace / "worker")
     if staged is not None:
-        if options.artifact_store not in (None, staged.artifact_store):
-            raise RuntimeError("local closure and worker name different artifact stores")
+        if options.tensorfs_root not in (None, staged.tensorfs_root):
+            raise RuntimeError("local closure and worker name different TensorFS roots")
         options = dataclasses.replace(
             options,
-            artifact_store=staged.artifact_store,
+            tensorfs_root=staged.tensorfs_root,
             artifact_cache=staged.artifact_cache,
             development_project=Path.cwd().resolve(),
             development_package=staged.placement.development.package,

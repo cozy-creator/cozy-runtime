@@ -25,7 +25,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options) -> Result:
     required = {
         "--artifact-cache",
-        "--artifact-store",
+        "--tensorfs-root",
         "--environment-python",
         "--locked-requirements",
         "--package",
@@ -33,7 +33,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     }
     values = _values(args, required, {"--model"})
     artifact_cache = Path(values["--artifact-cache"][0]).resolve()
-    artifact_store = Path(values["--artifact-store"][0]).resolve()
+    tensorfs_root = Path(values["--tensorfs-root"][0]).resolve()
     environment_python = _venv_python(values["--environment-python"][0])
     lock_path = Path(values["--locked-requirements"][0]).resolve()
     try:
@@ -137,7 +137,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             models=models,
             placement_seed=seed,
             artifact_cache=artifact_cache,
-            artifact_store=artifact_store,
+            tensorfs_root=tensorfs_root,
             environment_root=installed_environment.generation,
             python=environment_python,
             describe=describe,

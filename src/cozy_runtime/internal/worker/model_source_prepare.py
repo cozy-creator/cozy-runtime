@@ -32,18 +32,18 @@ class ModelSourceRefusal(Exception):
 
 
 def prepare_model_source(
-    request: pb.PrepareModelSourceRequest, *, artifact_store: Path
+    request: pb.PrepareModelSourceRequest, *, tensorfs_root: Path
 ) -> pb.PrepareModelSourceResult:
     """Prepare one exact sorted profile set, returning only typed refs or a safe refusal."""
 
     try:
-        if not artifact_store.is_absolute():
+        if not tensorfs_root.is_absolute():
             raise ModelSourceRefusal(
                 "model_source_store_invalid", "TensorFS store path is not absolute"
             )
         profiles, files = _request(request)
         tensorfs = fill.tensorfs_module()
-        store = _open_or_init(tensorfs, artifact_store)
+        store = _open_or_init(tensorfs, tensorfs_root)
         prepared = store.prepare_model_source(
             request.operation_id,
             documents.spell(bytes(request.source_selection_digest)),
@@ -68,7 +68,7 @@ def prepare_model_source(
 def _open_or_init(tensorfs: Any, root: Path) -> Any:
     """pull.py's store discipline, verbatim: open a real store, refuse foreign
     bytes with TensorFS's own typed STORE_ERA, and initialize only a truly
-    empty directory. A fresh pod's baked-empty /var/lib/cozy/tensorfs refused
+    empty directory. A fresh pod's baked-empty TensorFS root refused
     every source preparation without this (live: run 82, 2026-09-02)."""
     root.mkdir(parents=True, exist_ok=True)
     if all((root / name).is_dir() for name in ("repos", "manifests", "blobs")):
@@ -78,15 +78,15 @@ def _open_or_init(tensorfs: Any, root: Path) -> Any:
     return tensorfs.Store.init(str(root))
 
 
-def release_model_source(*, artifact_store: Path, operation_id: str) -> None:
+def release_model_source(*, tensorfs_root: Path, operation_id: str) -> None:
     """Explicit local lifecycle cleanup; remote pod absence remains the correctness boundary."""
 
     if _IDENTIFIER.fullmatch(operation_id) is None:
         raise ModelSourceRefusal("model_source_operation_invalid", "operation id is invalid")
-    if not artifact_store.is_absolute():
+    if not tensorfs_root.is_absolute():
         raise ModelSourceRefusal("model_source_store_invalid", "TensorFS store path is invalid")
     tensorfs = fill.tensorfs_module()
-    tensorfs.Store.open(str(artifact_store)).release_model_source(operation_id)
+    tensorfs.Store.open(str(tensorfs_root)).release_model_source(operation_id)
 
 
 def _request(

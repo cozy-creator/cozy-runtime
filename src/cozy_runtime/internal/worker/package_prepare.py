@@ -47,7 +47,7 @@ def prepare_package_set(
     request: pb.PreparePackageSetRequest,
     *,
     artifact_cache: Path,
-    artifact_store: Path,
+    tensorfs_root: Path,
     environment_root: Path,
     python: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
@@ -69,7 +69,7 @@ def prepare_package_set(
     if (
         Path(request.environment_root) != environment_root
         or not environment_root.is_absolute()
-        or not artifact_store.is_absolute()
+        or not tensorfs_root.is_absolute()
         or (job_plan_root is not None and not job_plan_root.is_absolute())
     ):
         raise PreparationRefusal(
@@ -104,7 +104,7 @@ def prepare_package_set(
             package_name, release, str(selected.get("release_digest", "")), models
         ),
         artifact_cache=artifact_cache,
-        artifact_store=artifact_store,
+        tensorfs_root=tensorfs_root,
         environment_root=environment_root,
         python=python,
         describe=describe,
@@ -124,7 +124,7 @@ def prepare_published_local(
     models: Sequence[Any],
     placement_seed: bytes,
     artifact_cache: Path,
-    artifact_store: Path,
+    tensorfs_root: Path,
     environment_root: Path,
     python: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
@@ -147,7 +147,7 @@ def prepare_published_local(
         models=models,
         placement_seed=placement_seed,
         artifact_cache=artifact_cache,
-        artifact_store=artifact_store,
+        tensorfs_root=tensorfs_root,
         environment_root=environment_root,
         python=python,
         describe=describe,
@@ -238,7 +238,7 @@ def _prepare_published(
     models: Sequence[Any],
     placement_seed: bytes,
     artifact_cache: Path,
-    artifact_store: Path | None,
+    tensorfs_root: Path | None,
     environment_root: Path,
     python: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
@@ -328,7 +328,7 @@ def _prepare_published(
         interface_body,
         package_name=package_name,
         selections=models,
-        artifact_store=artifact_store,
+        tensorfs_root=tensorfs_root,
         verified=verified,
         derive=_deriver(installed, application),
     )
@@ -370,7 +370,7 @@ def _prepare_published(
 def check_package_set_compatibility(
     request: pb.PreparePackageSetRequest,
     *,
-    artifact_store: Path,
+    tensorfs_root: Path,
     environment_root: Path,
     python: Path,
     base: base_observation.Observation | None = None,
@@ -418,7 +418,7 @@ def check_package_set_compatibility(
         native_environment=native_environment,
         native_device_index=native_device_index,
     )
-    candidates = _compatibility_models(models, artifact_store=artifact_store)
+    candidates = _compatibility_models(models, tensorfs_root=tensorfs_root)
     if set(candidates) != set(slot_paths):
         raise PreparationRefusal(
             "package_prepare_model_selection_mismatch",
@@ -519,7 +519,7 @@ def _compatibility_environment(
 def _compatibility_models(
     models: Sequence[Any],
     *,
-    artifact_store: Path,
+    tensorfs_root: Path,
 ) -> dict[str, dict[str, Any]]:
     """Read each selected manifest, its CozyTensors header, and the header-declared assets
     from the local TensorFS Store through one explicit object-set lease — the manifests and
@@ -556,7 +556,7 @@ def _compatibility_models(
         }
     by_manifest: dict[str, dict[str, Any]] = {}
     try:
-        store = pull.open_store(tensorfs, artifact_store)
+        store = pull.open_store(tensorfs, tensorfs_root)
     except pull.PullRefusal as exc:
         raise PreparationRefusal("package_prepare_model_store_absent", str(exc)) from exc
     for digest in sorted(wanted_manifests):
@@ -698,7 +698,7 @@ def prepare_private_placement(
     prepared: Mapping[str, Any],
     installed: package_environment.InstalledEnvironment | None,
     artifact_cache: Path,
-    artifact_store: Path | None,
+    tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
 ) -> pb.PreparePackageSetResult:
     """Bind verified models to one exact already-prepared local revision core."""
@@ -755,7 +755,7 @@ def prepare_private_placement(
         interface_body,
         package_name=str(development.get("package", "")),
         selections=models,
-        artifact_store=artifact_store,
+        tensorfs_root=tensorfs_root,
         verified=verified,
         derive=_deriver(installed, str(interface_body.get("application", ""))),
     )
@@ -944,7 +944,7 @@ def prepare_package(
         interface_body,
         package_name=package_name,
         selections=(),
-        artifact_store=None,
+        tensorfs_root=None,
         verified=verified,
         derive=None,
     )
@@ -1059,14 +1059,14 @@ def _entrypoints(
     *,
     package_name: str,
     selections: Sequence[Any],
-    artifact_store: Path | None,
+    tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
     derive: Deriver | None,
 ) -> tuple[list[pb.Model], list[pb.Entrypoint]]:
     rows = body.get("entrypoints")
     if not isinstance(rows, list):
         raise PreparationRefusal("package_prepare_interface_invalid", "entrypoints")
-    selected = _selected_models(package_name, selections, artifact_store, verified)
+    selected = _selected_models(package_name, selections, tensorfs_root, verified)
     if selected and derive is None:
         raise PreparationRefusal(
             "package_prepare_derive_refused", "a modeled selection needs the package environment"
@@ -1199,7 +1199,7 @@ def _stage_job_plans(
 def _selected_models(
     package_name: str,
     selections: Sequence[Any],
-    artifact_store: Path | None,
+    tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
 ) -> dict[str, dict[str, Any]]:
     """Resolve each selected model from the local TensorFS Store (wire 30).
@@ -1221,14 +1221,14 @@ def _selected_models(
     if not selected:
         return selected
 
-    if artifact_store is None:
+    if tensorfs_root is None:
         raise PreparationRefusal(
             "package_prepare_model_store_absent", "modeled package requires a TensorFS store"
         )
 
     try:
         tensorfs = fill.tensorfs_module()
-        store = pull.open_store(tensorfs, artifact_store)
+        store = pull.open_store(tensorfs, tensorfs_root)
         manifests: dict[str, tuple[int, bytes]] = {}
         for value in selected.values():
             selection = value["selection"]
@@ -1270,7 +1270,7 @@ def _selected_models(
                 )
             try:
                 config_bytes = model_config.construction_config(configs)
-                assets = fill.Checkpoint(artifact_store, digest).model_assets()
+                assets = fill.Checkpoint(tensorfs_root, digest).model_assets()
             except model_config.ModelConfigRefusal as exc:
                 raise PreparationRefusal(
                     "package_prepare_model_config_mismatch", f"{digest}: {exc}"

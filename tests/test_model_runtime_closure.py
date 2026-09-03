@@ -87,7 +87,7 @@ def _acquirer(tmp_path: Path, store_root: Path) -> Acquirer:
         cache_root=roots["cache"],
         environment_root=roots["environment"],
         selection_root=roots["selection"],
-        artifact_store=store_root,
+        tensorfs_root=store_root,
         python=Path("/usr/bin/python3"),
         base=base_observation.current(),
     )
@@ -176,7 +176,7 @@ def test_cold_fit_reads_manifest_header_and_model_assets_from_the_store(tmp_path
             "lane": "main",
         }
     ]
-    candidate = _compatibility_models(selected, artifact_store=store_root)["generate.models.model"]
+    candidate = _compatibility_models(selected, tensorfs_root=store_root)["generate.models.model"]
     assert candidate["config"] == _CONFIG
     assert candidate["assets"] == {"tokenizer/vocab.txt": _ASSET}
 
@@ -194,7 +194,7 @@ def test_cold_fit_reads_manifest_header_and_model_assets_from_the_store(tmp_path
     )
     cold = [dict(selected[0], manifest=cold_manifest)]
     with pytest.raises(PreparationRefusal, match="model_asset_unavailable"):
-        _compatibility_models(cold, artifact_store=cold_root)
+        _compatibility_models(cold, tensorfs_root=cold_root)
 
 
 def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -> None:

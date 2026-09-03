@@ -244,8 +244,8 @@ class WorkerOptions:
     """
     environment_python: Path | None = None
     """An already-complete local package venv; mutually exclusive with materialization root."""
-    artifact_store: Path | None = None
-    """The verified TensorFS store populated from the canonical model-root closure."""
+    tensorfs_root: Path | None = None
+    """The one host-local executable TensorFS Store."""
     artifact_cache: Path | None = None
     """Where the dynamic acquisition lane writes the exact bytes it fetches (cr-049).
 
@@ -1028,7 +1028,7 @@ class Worker:
         )
         self.stop = threading.Event()
         self.weights = weights.WeightsExchange(
-            store_root=options.artifact_store,
+            store_root=options.tensorfs_root,
             send=self.send,
             stamp=self.stamp,
             stop=self.stop,
@@ -1049,7 +1049,7 @@ class Worker:
             device_process=self.read_device_process,
             weights=self.weights,
             owner_scope=lambda: self.fence.record_owner_id,
-            artifact_store=options.artifact_store,
+            tensorfs_root=options.tensorfs_root,
         )
         self.engine.boot_id = self.fence.worker_boot_id
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
@@ -1432,7 +1432,7 @@ class Worker:
             try:
                 return package_prepare.check_package_set_compatibility(
                     request,
-                    artifact_store=Path(self.options.artifact_store or ""),
+                    tensorfs_root=Path(self.options.tensorfs_root or ""),
                     environment_root=Path(self.options.environment_root or ""),
                     python=Path(self.options.python or sys.executable),
                     base=self.base,
@@ -1476,9 +1476,9 @@ class Worker:
                 prepared=prepared.document,
                 installed=prepared.installed,
                 artifact_cache=Path(self.options.artifact_cache or ""),
-                artifact_store=(
-                    Path(self.options.artifact_store)
-                    if self.options.artifact_store is not None
+                tensorfs_root=(
+                    Path(self.options.tensorfs_root)
+                    if self.options.tensorfs_root is not None
                     else None
                 ),
                 verified=mark_verified,
@@ -1665,7 +1665,7 @@ class Worker:
         return package_prepare.prepare_package_set(
             request,
             artifact_cache=Path(self.options.artifact_cache or ""),
-            artifact_store=Path(self.options.artifact_store or ""),
+            tensorfs_root=Path(self.options.tensorfs_root or ""),
             environment_root=Path(self.options.environment_root or ""),
             python=Path(self.options.python or sys.executable),
             describe=describe,
@@ -1683,7 +1683,7 @@ class Worker:
 
         with self.preparation_lock:
             result = model_source_prepare.prepare_model_source(
-                request, artifact_store=Path(self.options.artifact_store or "")
+                request, tensorfs_root=Path(self.options.tensorfs_root or "")
             )
             if result.outcome in {
                 pb.MODEL_SOURCE_PREPARE_OUTCOME_PREPARED,
@@ -1697,7 +1697,7 @@ class Worker:
 
         with self.preparation_lock:
             model_source_prepare.release_model_source(
-                artifact_store=Path(self.options.artifact_store or ""),
+                tensorfs_root=Path(self.options.tensorfs_root or ""),
                 operation_id=operation_id,
             )
             self.model_source_operations.discard(operation_id)
@@ -1774,7 +1774,7 @@ class Worker:
     def _rebuild_held_manifests(self) -> None:
         """Boot: `held_manifests` from the store's own verified walk, no network. A worker
         without a store or without the TensorFS reader holds nothing and says so."""
-        root = self.options.artifact_store
+        root = self.options.tensorfs_root
         if root is None or not Path(root).is_dir():
             return
         started = time.perf_counter()
@@ -3168,7 +3168,7 @@ class Worker:
                     terminal=True,
                 )
                 return None
-            if self.options.artifact_cache is None or self.options.artifact_store is None:
+            if self.options.artifact_cache is None or self.options.tensorfs_root is None:
                 self._materialization_failed(
                     placement,
                     pb.Fault(
@@ -3176,7 +3176,7 @@ class Worker:
                         subject=placement.placement_id,
                         reason="artifact_cache_absent",
                         detail="source-checkout selection bytes require --artifact-cache and "
-                        "--artifact-store",
+                        "--tensorfs-root",
                     ),
                     terminal=False,
                 )
@@ -3194,7 +3194,7 @@ class Worker:
                     release=self.options.development_release,
                     source_digest=self.options.development_source_digest,
                     artifact_cache=self.options.artifact_cache,
-                    artifact_store=self.options.artifact_store,
+                    tensorfs_root=self.options.tensorfs_root,
                     found=found,
                     binding_overrides=self.options.development_binding_overrides,
                 )
@@ -3291,7 +3291,7 @@ class Worker:
             prepared_environment = None
         if (
             self.options.environment_root is None and self.options.environment_python is None
-        ) or self.options.artifact_store is None:
+        ) or self.options.tensorfs_root is None:
             self._materialization_failed(
                 placement,
                 pb.Fault(
@@ -3299,7 +3299,7 @@ class Worker:
                     subject=placement.placement_id,
                     reason="environment_materialization_input_missing",
                     detail="this worker was launched without --environment-root or "
-                    "--environment-python and --artifact-store; the worker will not "
+                    "--environment-python and --tensorfs-root; the worker will not "
                     "guess where the worker put package environments or TensorFS objects",
                 ),
                 terminal=False,
@@ -3362,7 +3362,7 @@ class Worker:
                 cache_root=self.options.artifact_cache,
                 environment_root=environment_root,
                 selection_root=self.options.artifact_cache / "selections",
-                artifact_store=self.options.artifact_store,
+                tensorfs_root=self.options.tensorfs_root,
                 python=self.options.environment_python or Path(sys.executable),
                 base=self.base,
                 installed_environment=installed_environment,
@@ -5265,7 +5265,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         "(cr-049); content-addressed, so a replay re-fetches only what is missing",
     )
     parser.add_argument(
-        "--artifact-store",
+        "--tensorfs-root",
         required=True,
         help="verified TensorFS store populated from selected model Manifests",
     )
@@ -5347,7 +5347,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
             if args.environment_python
             else None
         ),
-        artifact_store=Path(args.artifact_store).resolve(),
+        tensorfs_root=Path(args.tensorfs_root).resolve(),
         artifact_cache=Path(args.artifact_cache).resolve() if args.artifact_cache else None,
         development_project=(
             Path(args.development_project).resolve() if args.development_project else None

@@ -352,7 +352,7 @@ class WeightsExchange:
     ) -> dict[str, Any]:
         if self.store_root is None:
             raise WeightsExchangeError(
-                "artifact_store_unavailable", "this worker has no verified TensorFS store"
+                "tensorfs_store_unavailable", "this worker has no verified TensorFS Store"
             )
         if (
             len(declaration_digest) != 32
@@ -923,7 +923,7 @@ class WeightsExchange:
         if self.store is None:
             if self.store_root is None:
                 raise WeightsExchangeError(
-                    "artifact_store_unavailable", "this worker has no verified TensorFS store"
+                    "tensorfs_store_unavailable", "this worker has no verified TensorFS Store"
                 )
             self.store = pull.open_store(fill.tensorfs_module(), self.store_root)
         return self.store

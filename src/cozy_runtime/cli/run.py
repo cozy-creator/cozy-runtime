@@ -49,6 +49,7 @@ VALUE_FLAGS = (
     "--in",
     "--input",
     "--org",
+    "--tensorfs-root",
 )
 BOOL_FLAGS = ("--offline", "--stream", "--strict-keys")
 
@@ -197,6 +198,17 @@ def run(
             Exit.structural,
         )
     overrides = _overrides(flags.get("--model") or [], slots)
+    tensorfs_root: Path | None = None
+    if slots:
+        values = flags.get("--tensorfs-root") or []
+        if len(values) != 1:
+            raise CliError(
+                "usage",
+                "model-bound local execution requires one --tensorfs-root",
+                "pass the explicit local TensorFS Store root",
+                Exit.usage,
+            )
+        tensorfs_root = Path(values[0]).expanduser().resolve()
 
     doc = _doc_for(body, function, kind)
     request_schema = doc["request"]
@@ -271,7 +283,7 @@ def run(
             package_code_digest=package_code_digest,
             package_interface_document=body if kind == "entrypoint" else None,
             found=found,
-            development_artifact_store=config.cozy_home / "cas",
+            development_tensorfs_root=tensorfs_root,
             development_binding_overrides=overrides,
             options=WorkerOptions(
                 root=workspace / "worker",
