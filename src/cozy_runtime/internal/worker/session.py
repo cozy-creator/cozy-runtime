@@ -570,15 +570,12 @@ def _wheel_fact(value: object, name: str) -> dict[str, Any]:
 
 
 def _package_selection(value: object) -> dict[str, Any]:
-    row = _closed_document(value, {"package", "release", "project_wheel"}, "PackageSelection")
-    _required(row, {"package", "release", "project_wheel"}, "PackageSelection")
+    row = _closed_document(value, {"package", "release"}, "PackageSelection")
+    _required(row, {"package", "release"}, "PackageSelection")
     package = _identifier(row["package"], "PackageSelection.package")
     release = _identifier(row["release"], "PackageSelection.release")
     if package.count("/") != 1 or not all(package.split("/")) or SEMVER.fullmatch(release) is None:
         raise documents.DocumentError("package_invalid", "package identity or release is invalid")
-    project = _wheel_fact(row["project_wheel"], "PackageSelection.project_wheel")
-    if project["distribution"] != package.split("/", 1)[1] or project["version"] != release:
-        raise documents.DocumentError("project_wheel_mismatch", package)
     return row
 
 
@@ -671,20 +668,36 @@ def _placement_profile(entry: dict[str, Any]) -> None:
             or HASH_ENTRY.fullmatch(entry["environment_digest"]) is None
         ):
             raise documents.DocumentError("malformed_digest", "Placement.environment_digest")
-        environment = _closed_document(entry["environment"], {"wheels"}, "Environment")
-        wheels = environment.get("wheels", [])
+        environment = _closed_document(
+            entry["environment"], {"local_wheels", "locked_requirements"}, "Environment"
+        )
+        wheels = environment.get("local_wheels", [])
         if not isinstance(wheels, list):
-            raise documents.DocumentError("wrong_type", "Environment.wheels")
+            raise documents.DocumentError("wrong_type", "Environment.local_wheels")
         wheel_rows = [
-            _wheel_fact(row, f"Environment.wheels[{index}]") for index, row in enumerate(wheels)
+            _wheel_fact(row, f"Environment.local_wheels[{index}]")
+            for index, row in enumerate(wheels)
         ]
         names = [str(row["distribution"]) for row in wheel_rows]
         if names != sorted(set(names)):
-            raise documents.DocumentError("sort_order", "Environment.wheels")
-        if package["project_wheel"]["distribution"] in names:
-            raise documents.DocumentError(
-                "project_wheel_mismatch", "project wheel is in dependency wheels"
-            )
+            raise documents.DocumentError("sort_order", "Environment.local_wheels")
+        if published:
+            # A published install is identified by the exact export it materialized from;
+            # supplied wheels belong to editable revisions only.
+            if wheels:
+                raise documents.DocumentError(
+                    "environment_invalid", "published Environment carries local_wheels"
+                )
+            _exact_ref(environment.get("locked_requirements"), "Environment.locked_requirements")
+        else:
+            if "locked_requirements" in environment:
+                raise documents.DocumentError(
+                    "environment_invalid", "development Environment carries a lock ref"
+                )
+            if package["project_wheel"]["distribution"] in names:
+                raise documents.DocumentError(
+                    "project_wheel_mismatch", "project wheel is in dependency wheels"
+                )
         measured_environment = documents.spell(
             documents.embedded_document_digest(environment, "cozy.worker.v1.Environment")
         )
@@ -1419,7 +1432,7 @@ class Worker:
             try:
                 return package_prepare.check_package_set_compatibility(
                     request,
-                    artifact_cache=Path(self.options.artifact_cache or ""),
+                    artifact_store=Path(self.options.artifact_store or ""),
                     environment_root=Path(self.options.environment_root or ""),
                     python=Path(self.options.python or sys.executable),
                     base=self.base,
@@ -3313,14 +3326,19 @@ class Worker:
                 project_ref = (
                     project_wheel.get("ref", {}) if isinstance(project_wheel, dict) else {}
                 )
-                package_code_digest = str(project_ref.get("digest", "")) or str(
-                    placement.development.get("source_digest", "")
+                # Published placements carry no wheel fact at wire 30: the derived
+                # package interface is the exact code surface, so it is the code digest.
+                package_code_digest = (
+                    placement.package_interface[0]
+                    if placement.package
+                    else str(project_ref.get("digest", ""))
+                    or str(placement.development.get("source_digest", ""))
                 )
                 if not re.fullmatch(r"sha256:[0-9a-f]{64}", package_code_digest):
                     raise package_environment.EnvironmentRefusal(
                         "package_environment_code_digest_absent",
-                        "preinstalled package selection has no exact project-wheel "
-                        "or source digest",
+                        "preinstalled package selection has no exact interface, "
+                        "project-wheel, or source digest",
                     )
                 content_digest = canonical.digest(
                     {

@@ -491,61 +491,71 @@ class Acquirer:
             self.observation.finish("model")
 
     def _environment(self, placement: Any) -> package_environment.InstalledEnvironment:
+        """Reopen the generation this placement's prepare published; move no wheel bytes.
+
+        Wire 30 deletes wheel members and grants from the download path outright: a
+        published install's exact content is its locked-requirements ref, an editable one's
+        is its supplied wheel facts, and either way the receipt digest is a pure function of
+        those placement facts plus the re-observed base. A generation this boot never
+        published is a typed resumable refusal — the owner re-prepares; nothing here can
+        re-acquire package bytes.
+        """
+
         environment_digest = documents.spell(placement.environment_digest)
-        package = placement.package or placement.development
-        wheel_rows = [package["project_wheel"], *placement.environment.get("wheels", [])]
-        expected_paths: dict[str, Path] = {}
-        for row in wheel_rows:
-            digest, _length = _ref(row["ref"], "wheel.ref")
-            expected_paths[digest] = self.cache_root / digest.removeprefix("sha256:")
         try:
-            package_environment.verify_inventory(
-                placement_materialization.package_environment_input(
-                    package=package,
-                    environment=placement.environment,
+            if placement.package:
+                lock = placement.environment.get("locked_requirements")
+                if not isinstance(lock, dict):
+                    raise AcquisitionRefusal(
+                        pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                        "environment_lock_absent",
+                        "published placement names no locked_requirements",
+                    )
+                _content, receipt_digest = package_environment.locked_identity(
+                    self.base,
+                    locked_digest=str(lock.get("digest", "")),
+                    locked_length=int(lock.get("length", 0)),
                     environment_digest=environment_digest,
-                    wheel_paths=expected_paths,
-                ),
-                self.base,
-            )
-        except (LaunchRefusal, package_environment.EnvironmentRefusal) as exc:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.detail
-            ) from exc
-        wheel_paths: dict[str, Path] = {}
-        verified: dict[str, package_environment.VerifiedFile] = {}
-        for row in wheel_rows:
-            digest, length = _ref(row["ref"], "wheel.ref")
-            path = self.fetch(digest, length)
-            wheel_paths[digest] = path
-            receipt = self.verified_cache.trusted(digest, length, path)
-            if receipt is None:
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                    "wheel_verification_receipt_absent",
-                    digest,
                 )
-            verified[digest] = receipt
-        self.wheels = len(wheel_paths)
-        try:
-            source = placement_materialization.package_environment_input(
-                package=package,
-                environment=placement.environment,
-                environment_digest=environment_digest,
-                wheel_paths=wheel_paths,
-                verified_wheels=verified,
-            )
-            return package_environment.materialize(
-                source,
+            else:
+                package = placement.development
+                wheel_rows = [
+                    package["project_wheel"],
+                    *placement.environment.get("local_wheels", []),
+                ]
+                wheels = []
+                for row in wheel_rows:
+                    digest, _length = _ref(row["ref"], "wheel.ref")
+                    wheels.append(
+                        package_environment.Wheel(
+                            distribution=str(row.get("distribution", "")),
+                            version=str(row.get("version", "")),
+                            filename=str(row.get("filename", "")),
+                            digest=digest,
+                            length=int(row["ref"]["length"]),
+                            tags=tuple(row.get("tags", [])),
+                            owner="project" if row is wheel_rows[0] else "custom",
+                            import_roots=tuple(row.get("import_roots", [])),
+                        )
+                    )
+                receipt_digest = package_environment.wheel_receipt_digest(
+                    self.base,
+                    wheels=wheels,
+                    environment_digest=environment_digest,
+                )
+            return package_environment.open_generation(
                 self.environment_root,
+                receipt_digest=receipt_digest,
+                environment_digest=environment_digest,
                 python=self.python,
-                base=self.base,
-                native_environment=self.native_environment,
-                native_device_index=self.native_device_index,
             )
+        except AcquisitionRefusal:
+            raise
         except (LaunchRefusal, package_environment.EnvironmentRefusal) as exc:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.detail
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                getattr(exc, "code", "environment_generation_absent"),
+                getattr(exc, "detail", str(exc)),
             ) from exc
 
     def _models(self, placement: Any) -> int:
@@ -643,13 +653,19 @@ class Acquirer:
         visible = _visible_entrypoints(interface)
         models = {str(row["id"]): row for row in placement.models}
         development = dict(getattr(placement, "development", {}))
-        selected_package = placement.package or development
-        project_wheel = selected_package.get("project_wheel", {})
-        package_code_digest = str(
-            project_wheel.get("ref", {}).get("digest", "")
-            if isinstance(project_wheel, dict)
-            else ""
-        ) or str(development.get("source_digest", ""))
+        project_wheel = development.get("project_wheel", {})
+        # Published placements carry no wheel fact at wire 30; the exact derived package
+        # interface is the code surface, so its digest is the binding's code identity.
+        package_code_digest = (
+            interface_digest
+            if placement.package
+            else str(
+                project_wheel.get("ref", {}).get("digest", "")
+                if isinstance(project_wheel, dict)
+                else ""
+            )
+            or str(development.get("source_digest", ""))
+        )
         bindings: dict[str, DeclaredBinding] = {}
         count = 1
         for entrypoint in placement.entrypoints:

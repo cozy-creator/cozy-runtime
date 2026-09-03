@@ -45,6 +45,8 @@ from packaging.version import InvalidVersion, Version
 from cozy_runtime.internal import base_observation, canonical, native_wheel
 
 RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
+LOCKED_RECEIPT_FORMAT = "cozy.runtime.LockedEnvironmentReceipt/1"
+LOCKED_CONTENT_FORMAT = "cozy.runtime.LockedPackageEnvironment/1"
 CONTENT_IDENTITY_NAME = "package-environment-content.json"
 MAX_WHEEL_BYTES = 2 << 30
 MAX_WHEEL_MEMBERS = 100_000
@@ -224,6 +226,16 @@ class _Inspected:
     requires_python: str | None
     requirements: tuple[Requirement, ...]
     native_members: tuple[str, ...]
+
+
+def wheel_name_version(filename: str) -> tuple[str, str] | None:
+    """(normalized distribution, version) a wheel filename declares, or None."""
+
+    try:
+        name, version, _build, _tags = parse_wheel_filename(filename)
+    except (InvalidWheelFilename, InvalidVersion):
+        return None
+    return str(name), str(version)
 
 
 def measure_wheel(
@@ -495,47 +507,474 @@ def materialize(
     return installed
 
 
-def verify_inventory(source: Input, base: base_observation.Observation) -> None:
-    """Refuse incompatible wheel facts before the worker downloads their bytes.
+@dataclass(frozen=True, slots=True)
+class LockedRow:
+    """One exact hash-pinned requirement row of a locked-requirements export."""
 
-    This is the acquisition lane's pre-download mirror of `materialize`, so it applies the
-    same venv-precedence rule: a package copy of a non-protected base distribution installs
-    and shadows rather than refusing.
+    text: str
+    name: str
+    version: str
+
+
+@dataclass(frozen=True, slots=True)
+class LockedRequirements:
+    """The release's exact requirements export (wire 30): identity over the raw bytes."""
+
+    digest: str
+    length: int
+    indexes: tuple[str, ...]
+    rows: tuple[LockedRow, ...]
+
+
+_INDEX_DIRECTIVES = ("--index-url", "--extra-index-url")
+
+
+def read_locked_requirements(raw: bytes) -> LockedRequirements:
+    """Admit one locked-requirements export.
+
+    The only admitted rows are blank/comment lines, https index directives, and exact
+    `name==version` requirements carrying at least one `--hash=sha256:`. Anything a resolver
+    would have freedom over — a range, a bare name, a path or URL row, an editable — refuses.
     """
 
-    _verify_inventory(source, base, venv_precedence=True)
+    from cozy_runtime.protocol import weights_limits
+
+    ceiling = int(weights_limits.MAX_LOCKED_REQUIREMENTS_BYTES)
+    if not 0 < len(raw) <= ceiling:
+        raise EnvironmentRefusal(
+            "package_environment_lock_invalid", f"{len(raw)} B is empty or over {ceiling} B"
+        )
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise EnvironmentRefusal("package_environment_lock_invalid", str(exc)) from exc
+    logical: list[str] = []
+    pending = ""
+    for line in text.splitlines():
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        logical.append(pending + line)
+        pending = ""
+    if pending:
+        logical.append(pending)
+    indexes: list[str] = []
+    rows: list[LockedRow] = []
+    prior = ""
+    for number, row in enumerate((entry.strip() for entry in logical), start=1):
+
+        def refuse(detail: str, number: int = number) -> EnvironmentRefusal:
+            return EnvironmentRefusal(
+                "package_environment_lock_invalid", f"line {number}: {detail}"
+            )
+
+        if not row or row.startswith("#"):
+            continue
+        directive, _, address = row.partition(" ")
+        if directive in _INDEX_DIRECTIVES:
+            address = address.strip()
+            if not address.startswith("https://") and not address.startswith(
+                ("http://127.0.0.1:", "http://127.0.0.1/", "http://[::1]:", "http://[::1]/")
+            ):
+                raise refuse(f"index {address!r} is not an https or loopback URL")
+            indexes.append(address)
+            continue
+        if row.startswith("-"):
+            raise refuse(f"option {row.split()[0]!r} is outside the locked vocabulary")
+        requirement_text, *options = row.split(" --")
+        options = ["--" + option.strip() for option in options]
+        if not options or any(not option.startswith("--hash=sha256:") for option in options):
+            raise refuse("every requirement row carries only --hash=sha256: options")
+        if any(len(option) != len("--hash=sha256:") + 64 for option in options):
+            raise refuse("a --hash value is not 64 hex")
+        try:
+            requirement = Requirement(requirement_text.strip())
+        except InvalidRequirement as exc:
+            raise refuse(str(exc)) from exc
+        clauses = list(requirement.specifier)
+        if (
+            requirement.url is not None
+            or requirement.extras
+            or len(clauses) != 1
+            or clauses[0].operator != "=="
+        ):
+            raise refuse(f"{requirement_text.strip()!r} is not one exact == pin")
+        name = _NORMALIZE.sub("-", requirement.name).lower()
+        if name <= prior:
+            raise refuse(f"{name!r} is out of order or repeats a name")
+        prior = name
+        rows.append(LockedRow(text=row, name=name, version=clauses[0].version))
+    if not rows:
+        raise EnvironmentRefusal("package_environment_lock_invalid", "the export pins nothing")
+    return LockedRequirements(
+        digest=_sha(raw),
+        length=len(raw),
+        indexes=tuple(indexes),
+        rows=tuple(rows),
+    )
 
 
-def verify_existing_environment(
-    source: Input,
-    *,
+def wheel_receipt_digest(
     base: base_observation.Observation,
-    installed: InstalledEnvironment,
+    *,
+    wheels: Sequence[Wheel],
+    environment_digest: str,
+) -> str:
+    """The receipt digest a wheel-sourced materialize published, from placement facts alone.
+
+    The row order is Input order — the project wheel first, then the supplied local wheels in
+    their document's sorted-by-distribution order — exactly what `_receipt` recorded."""
+
+    _require_digest(environment_digest, "environment_digest")
+    project = next((wheel for wheel in wheels if wheel.owner == "project"), None)
+    if project is None:
+        raise EnvironmentRefusal(
+            "package_environment_project_wheel_absent", "no project wheel fact"
+        )
+    content_bytes = canonical.write(
+        _content_identity(wheels, base.interpreter_identity, base.uv_version)
+    )
+    receipt = {
+        "content_digest": _sha(content_bytes),
+        "environment_digest": environment_digest,
+        "format": RECEIPT_FORMAT,
+        "package_wheels": [
+            {
+                "digest": wheel.digest,
+                "distribution": wheel.distribution,
+                "owner": wheel.owner,
+                "version": wheel.version,
+            }
+            for wheel in wheels
+        ],
+        "project_wheel_digest": project.digest,
+    }
+    return _sha(canonical.write(receipt))
+
+
+def locked_identity(
+    base: base_observation.Observation,
+    *,
+    locked_digest: str,
+    locked_length: int,
+    environment_digest: str,
+) -> tuple[str, str]:
+    """(content_digest, receipt_digest) for a locked generation, from placement facts alone.
+
+    Deterministic in the placement's Environment.locked_requirements ref plus the observed
+    base, so a serving worker reopens the generation its prepare published without holding
+    the export bytes (proto-030 deletes them after venv creation)."""
+
+    content_bytes = canonical.write(
+        _locked_content_identity(locked_digest, base.interpreter_identity, base.uv_version)
+    )
+    content_digest = _sha(content_bytes)
+    receipt_bytes = canonical.write(
+        _locked_receipt(environment_digest, content_digest, locked_digest, locked_length)
+    )
+    return content_digest, _sha(receipt_bytes)
+
+
+def materialize_locked(
+    locked: LockedRequirements,
+    install_rows: Sequence[LockedRow],
+    root: Path,
+    *,
+    environment_digest: str,
+    python: Path = Path(sys.executable),
+    base: base_observation.Observation | None = None,
     native_environment: Mapping[str, str] | None = None,
     native_device_index: int = 0,
-) -> None:
-    """Verify exact wheel facts against an already-complete local uv environment."""
+) -> InstalledEnvironment:
+    """Materialize one venv from the release's exact hash-pinned export (xs-017).
 
-    wheels = _verify_inventory(
-        source,
-        base,
-        allow_base_owned=True,
-        allow_installed_package=True,
+    `install_rows` is the caller's image-inventory-filtered subset; identity is over the FULL
+    export bytes, so the filter — a pure function of the export and the re-observed base —
+    is deliberately not part of the content identity, exactly like the old boot plan.
+    Every artifact must match a hash the export names (`--require-hashes`); the indexes have
+    no authority over bytes. The uv cache is operation-scoped derived work: it lives beside
+    the staging tree and is deleted after install without invalidating hardlinked venv files.
+    The joined venv (image site-packages included) is proven by the derivation that follows —
+    a real import of the installed application in the venv's own interpreter — so an
+    image-owned distribution outside a declared range is a typed refusal there, never a
+    boot-install.
+    """
+
+    _require_digest(environment_digest, "environment_digest")
+    if not locked.indexes:
+        raise EnvironmentRefusal(
+            "package_environment_lock_index_absent",
+            "the export names no --index-url/--extra-index-url",
+        )
+    observed = base or observe_base(python)
+    uv = _uv_binary()
+    current_uv = _observed_uv_version(uv)
+    if current_uv != observed.uv_version:
+        raise EnvironmentRefusal(
+            "package_environment_uv_changed",
+            f"observed={observed.uv_version} current={current_uv}",
+        )
+    content_bytes = canonical.write(
+        _locked_content_identity(locked.digest, observed.interpreter_identity, observed.uv_version)
     )
-    inspected = _verify_grants(
-        source,
-        wheels,
-        base,
-        allow_base_owned=True,
+    content_digest = _sha(content_bytes)
+    receipt_bytes = canonical.write(
+        _locked_receipt(environment_digest, content_digest, locked.digest, locked.length)
     )
-    _verify_python_requirements(inspected, base)
-    _qualify_native_environment(
-        installed,
-        inspected,
-        base,
-        native_environment,
-        native_device_index,
+    receipt_digest = _sha(receipt_bytes)
+    contents = root / "contents"
+    receipts = root / "receipts"
+    final = contents / content_digest.removeprefix("sha256:")
+    receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
+    if receipt_path.exists():
+        installed = open_generation(
+            root,
+            receipt_digest=receipt_digest,
+            environment_digest=environment_digest,
+            reused=True,
+            python=python,
+        )
+        _qualify_native_environment(
+            installed,
+            _locked_inspected(installed.site_packages, install_rows),
+            observed,
+            native_environment,
+            native_device_index,
+            static_host_check=False,
+        )
+        return installed
+    reused = final.exists()
+    _require_owned_root(root)
+    _remove_dead_staging(root)
+    contents.mkdir(parents=True, exist_ok=True, mode=0o700)
+    receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
+    contents.chmod(0o711)
+    receipts.chmod(0o700)
+    if not reused:
+        staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
+        cache = root / f".uv-cache-{os.getpid()}-{uuid.uuid4().hex}"
+        try:
+            _install_locked(uv, python, staging, cache, locked.indexes, install_rows)
+            staged = _installed_at(
+                staging,
+                content_digest=content_digest,
+                receipt_bytes=receipt_bytes,
+                receipt_digest=receipt_digest,
+                reused=False,
+                base=observed,
+            )
+            _qualify_native_environment(
+                staged,
+                _locked_inspected(staged.site_packages, install_rows),
+                observed,
+                native_environment,
+                native_device_index,
+                static_host_check=False,
+            )
+            _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
+            _make_read_only(staging)
+            _fsync_dir(staging)
+            try:
+                os.rename(staging, final)
+                final.chmod(0o555)
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                _remove_tree(staging)
+                reused = True
+            _fsync_dir(contents)
+        except Exception:
+            if staging.exists():
+                _remove_tree(staging)
+            raise
+        finally:
+            if cache.exists():
+                _remove_tree(cache)
+    _publish_receipt(receipt_path, receipt_bytes, receipts)
+    installed = open_generation(
+        root,
+        receipt_digest=receipt_digest,
+        environment_digest=environment_digest,
+        reused=reused,
+        python=python,
     )
+    if reused:
+        _qualify_native_environment(
+            installed,
+            _locked_inspected(installed.site_packages, install_rows),
+            observed,
+            native_environment,
+            native_device_index,
+            static_host_check=False,
+        )
+    return installed
+
+
+def _locked_inspected(
+    site_packages: Path, install_rows: Sequence[LockedRow]
+) -> tuple[_Inspected, ...]:
+    """The locked arm's native-proof inputs, observed from the installed tree.
+
+    The wheel arm inspects archives before install; a locked install never holds archives, so
+    each installed row's RECORD names its members instead. The proof that follows — static
+    ELF inspection, the seat join, the dlopen/import probe in the sealed operator child — is
+    the same one.
+    """
+
+    by_name: dict[str, Path] = {}
+    for entry in site_packages.glob("*.dist-info"):
+        name, separator, _version = entry.name.removesuffix(".dist-info").rpartition("-")
+        if separator and name:
+            by_name[_NORMALIZE.sub("-", name).lower()] = entry
+    inspected: list[_Inspected] = []
+    for row in install_rows:
+        info = by_name.get(row.name)
+        if info is None:
+            raise EnvironmentRefusal(
+                "package_environment_locked_row_missing",
+                f"{row.name}=={row.version} was named by the export and is not installed",
+            )
+        try:
+            record = (info / "RECORD").read_text()
+        except OSError as exc:
+            raise EnvironmentRefusal(
+                "package_environment_locked_record_unreadable", f"{row.name}: {exc}"
+            ) from exc
+        native: list[str] = []
+        roots: set[str] = set()
+        for line in csv.reader(record.splitlines()):
+            if not line or not line[0]:
+                continue
+            member = line[0]
+            pure = PurePosixPath(member)
+            if member.startswith("/") or ".." in pure.parts:
+                continue
+            head = pure.parts[0]
+            if head.endswith((".dist-info", ".data")):
+                continue
+            if pure.suffix.lower() in _NATIVE_SUFFIXES:
+                native.append(member)
+            # An import root is a real top-level module surface: a dot-free package
+            # directory, a top-level module file, or a top-level extension module. An
+            # auditwheel `.libs` support directory is neither.
+            if len(pure.parts) > 1:
+                root = head
+            elif pure.suffix == ".py":
+                root = pure.stem
+            elif pure.suffix.lower() in _NATIVE_SUFFIXES:
+                root = head.split(".", 1)[0]
+            else:
+                continue
+            if _IMPORT_ROOT.fullmatch(root):
+                roots.add(root)
+        inspected.append(
+            _Inspected(
+                wheel=Wheel(
+                    distribution=row.name,
+                    version=row.version,
+                    filename=f"{row.name}-{row.version} (locked)",
+                    digest="sha256:" + "0" * 64,
+                    length=1,
+                    tags=(),
+                    owner="custom",
+                    import_roots=tuple(sorted(roots)),
+                ),
+                path=info,
+                members=(),
+                import_roots=frozenset(roots),
+                requires_python=None,
+                requirements=(),
+                native_members=tuple(sorted(native)),
+            )
+        )
+    return tuple(inspected)
+
+
+def _install_locked(
+    uv: Path,
+    python: Path,
+    staging: Path,
+    cache: Path,
+    indexes: Sequence[str],
+    install_rows: Sequence[LockedRow],
+) -> None:
+    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    requirements = cache / "locked-requirements.txt"
+    requirements.write_text("".join(row.text + "\n" for row in install_rows))
+    scoped = ["--cache-dir", str(cache)]
+    commands = [
+        [
+            str(uv),
+            "venv",
+            "--no-project",
+            "--no-config",
+            "--offline",
+            "--no-python-downloads",
+            "--link-mode",
+            "hardlink",
+            "--python",
+            str(python),
+            "--system-site-packages",
+            *scoped,
+            str(staging),
+        ],
+        [
+            str(uv),
+            "pip",
+            "install",
+            "--no-config",
+            *scoped,
+            "--require-hashes",
+            "--no-deps",
+            "--no-build",
+            "--link-mode",
+            "hardlink",
+            "--compile-bytecode",
+            "--python",
+            str(staging / "bin" / "python"),
+            "--index-url",
+            indexes[0],
+            *(part for index in indexes[1:] for part in ("--extra-index-url", index)),
+            "--requirements",
+            str(requirements),
+        ],
+    ]
+    for command in commands:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip()[-2000:] or result.stdout.strip()[-2000:]
+            raise EnvironmentRefusal(
+                "package_environment_uv_failed",
+                detail or f"uv exited {result.returncode}",
+            )
+
+
+def _locked_content_identity(
+    locked_digest: str, interpreter: Mapping[str, str], uv_version: str
+) -> dict[str, Any]:
+    return {
+        "format": LOCKED_CONTENT_FORMAT,
+        "interpreter": dict(interpreter),
+        "locked_requirements_digest": locked_digest,
+        "uv_version": uv_version,
+    }
+
+
+def _locked_receipt(
+    environment_digest: str, content_digest: str, locked_digest: str, locked_length: int
+) -> dict[str, Any]:
+    return {
+        "content_digest": content_digest,
+        "environment_digest": environment_digest,
+        "format": LOCKED_RECEIPT_FORMAT,
+        "locked_requirements": {"digest": locked_digest, "length": locked_length},
+    }
 
 
 def _installed_at(
@@ -570,6 +1009,8 @@ def _qualify_native_environment(
     environment: Mapping[str, str] | None,
     device_index: int,
     boot_versions: Mapping[str, str] | None = None,
+    *,
+    static_host_check: bool = True,
 ) -> None:
     native = tuple(item for item in inspected if item.native_members)
     if not native:
@@ -595,10 +1036,11 @@ def _qualify_native_environment(
             **(boot_versions or {}),
         }
         native_wheel.verify_seat(base, seat, gpu=gpu, venv_versions=venv_versions)
-        native_wheel.qualify_host(
-            inspection,
-            gpu_sm=gpu["sm"] if gpu is not None else None,
-        )
+        if static_host_check:
+            native_wheel.qualify_host(
+                inspection,
+                gpu_sm=gpu["sm"] if gpu is not None else None,
+            )
         request = json.dumps(
             {
                 "members": list(members),
@@ -771,6 +1213,30 @@ def parse_environment_receipt(raw: bytes) -> dict[str, Any]:
         value = canonical.parse_canonical(raw)
     except canonical.CanonicalError as exc:
         raise EnvironmentRefusal("package_environment_receipt_invalid", str(exc)) from exc
+    if isinstance(value, dict) and value.get("format") == LOCKED_RECEIPT_FORMAT:
+        if set(value) != {"content_digest", "environment_digest", "format", "locked_requirements"}:
+            raise EnvironmentRefusal("package_environment_receipt_invalid", "wrong fields")
+        for field in ("content_digest", "environment_digest"):
+            item = value.get(field)
+            if not isinstance(item, str):
+                raise EnvironmentRefusal(
+                    "package_environment_receipt_invalid", f"{field} is not a digest"
+                )
+            _require_digest(item, field)
+        ref = value.get("locked_requirements")
+        if (
+            not isinstance(ref, dict)
+            or set(ref) != {"digest", "length"}
+            or not isinstance(ref.get("digest"), str)
+            or not isinstance(ref.get("length"), int)
+            or isinstance(ref.get("length"), bool)
+            or ref["length"] <= 0
+        ):
+            raise EnvironmentRefusal(
+                "package_environment_receipt_invalid", "locked_requirements is not an exact ref"
+            )
+        _require_digest(str(ref["digest"]), "locked_requirements.digest")
+        return value
     fields = {
         "content_digest",
         "environment_digest",
@@ -1607,6 +2073,21 @@ def _content_identity(
 
 
 def _content_matches_receipt(identity: object, receipt: Mapping[str, Any]) -> bool:
+    if receipt.get("format") == LOCKED_RECEIPT_FORMAT:
+        ref = receipt.get("locked_requirements")
+        return (
+            isinstance(identity, dict)
+            and set(identity)
+            == {"format", "interpreter", "locked_requirements_digest", "uv_version"}
+            and identity.get("format") == LOCKED_CONTENT_FORMAT
+            and isinstance(identity.get("interpreter"), dict)
+            and set(identity["interpreter"]) == {"libc", "os_arch", "python_abi"}
+            and all(isinstance(v, str) and v for v in identity["interpreter"].values())
+            and isinstance(identity.get("uv_version"), str)
+            and bool(identity["uv_version"])
+            and isinstance(ref, dict)
+            and identity.get("locked_requirements_digest") == ref.get("digest")
+        )
     rows = receipt.get("package_wheels")
     if not isinstance(rows, list) or not rows:
         raise EnvironmentRefusal("package_environment_receipt_invalid", "package_wheels is empty")

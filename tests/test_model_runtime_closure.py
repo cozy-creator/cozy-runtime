@@ -22,7 +22,6 @@ from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     _compatibility_models,
 )
-from cozy_runtime.protocol import worker_pb2 as pb
 
 # Canonical CozyTensors header produced by TensorFS itself. It contains one inline JCS config, one
 # inline f32 tensor, and one six-byte tokenizer asset. Keeping the bytes fixed makes this a border
@@ -161,29 +160,13 @@ def test_worker_prepare_reads_tensorfs_03_logical_dtype(tmp_path: Path) -> None:
     assert SPEC_PLAIN in launch_providers()
 
 
-def test_cold_fit_accepts_only_manifest_header_and_model_assets(tmp_path: Path) -> None:
-    _store_root, manifest_id, _manifest_length, store = _snapshot(tmp_path, include_asset=True)
-    set_root = tmp_path / "partial"
-    set_root.mkdir()
-    manifest = bytes(store.manifest(manifest_id)["manifest"])
+def test_cold_fit_reads_manifest_header_and_model_assets_from_the_store(tmp_path: Path) -> None:
+    """Wire 30: the cold check receives no files. The host admits the manifest, the
+    CozyTensors header and the header-declared assets to the local Store; the check reads
+    them through an explicit partial object-set lease while tensor bodies are still in
+    flight, and an absent small object is a resumable refusal, not a verdict."""
 
-    def row(raw: bytes, kind: pb.LocalDownloadKind) -> pb.LocalDownloadFile:
-        digest = hashlib.sha256(raw).digest()
-        path = (set_root / digest.hex()).resolve()
-        path.write_bytes(raw)
-        return pb.LocalDownloadFile(
-            digest=digest,
-            filename=path.name,
-            kind=kind,
-            length=len(raw),
-            path=str(path),
-        )
-
-    files = [
-        row(manifest, pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST),
-        row(_HEADER, pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT),
-        row(_ASSET, pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT),
-    ]
+    store_root, manifest_id, _manifest_length, _store = _snapshot(tmp_path, include_asset=True)
     selected = [
         {
             "slot": "generate.models.model",
@@ -193,7 +176,7 @@ def test_cold_fit_accepts_only_manifest_header_and_model_assets(tmp_path: Path) 
             "lane": "main",
         }
     ]
-    candidate = _compatibility_models(files, selected, set_root=set_root)["generate.models.model"]
+    candidate = _compatibility_models(selected, artifact_store=store_root)["generate.models.model"]
     assert candidate["config"] == _CONFIG
     assert candidate["assets"] == {"tokenizer/vocab.txt": _ASSET}
 
@@ -205,12 +188,13 @@ def test_cold_fit_accepts_only_manifest_header_and_model_assets(tmp_path: Path) 
     )
     assert not mismatch["ok"] and mismatch["code"] == "shape_mismatch"
 
-    with pytest.raises(PreparationRefusal, match="object_set_mismatch"):
-        _compatibility_models(
-            [*files, row(b"tensor part", pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT)],
-            selected,
-            set_root=set_root,
-        )
+    # The asset object was never admitted: the partial lease refuses resumably.
+    cold_root, cold_manifest, _cold_length, _cold_store = _snapshot(
+        tmp_path / "cold", include_asset=False
+    )
+    cold = [dict(selected[0], manifest=cold_manifest)]
+    with pytest.raises(PreparationRefusal, match="model_asset_unavailable"):
+        _compatibility_models(cold, artifact_store=cold_root)
 
 
 def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -> None:
@@ -261,11 +245,7 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
         entrypoints=(
             {"name": "generate", "entrypoint_binding_digest": binding_digest, "slots": [slot]},
         ),
-        package={
-            "package": "example/package",
-            "release": "1",
-            "project_wheel": {"ref": {"digest": "sha256:" + "2" * 64}},
-        },
+        package={"package": "example/package", "release": "1"},
         development={},
         environment_digest=b"\x33" * 32,
     )

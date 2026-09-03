@@ -17,7 +17,6 @@ UNAVAILABLE, because that is the condition under test, and it asserts the proces
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import hashlib
 import json
 import os
@@ -34,6 +33,7 @@ from typing import Any
 
 import pytest
 
+from conftest import image_python, sealed_child_environment
 from cozy_runtime.internal import base_observation, package_environment
 from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package
 from cozy_runtime.protocol import documents
@@ -194,15 +194,41 @@ def _write_pure_project(
     (package / "__init__.py").write_text(f"VALUE = {version!r}\n")
 
 
-def _download_row(kind: pb.LocalDownloadKind, path: Path) -> pb.LocalDownloadFile:
-    raw = path.read_bytes()
-    return pb.LocalDownloadFile(
-        digest=hashlib.sha256(raw).digest(),
-        filename=path.name,
-        kind=kind,
-        length=len(raw),
-        path=str(path),
+def _wheel_rows(paths: list[Path]) -> list[pb.LocalPackageWheel]:
+    rows = [
+        pb.LocalPackageWheel(
+            digest=hashlib.sha256(path.read_bytes()).digest(),
+            filename=path.name,
+            length=path.stat().st_size,
+            path=str(path),
+        )
+        for path in paths
+    ]
+    rows.sort(key=lambda row: row.digest)
+    return rows
+
+
+def _development(
+    package: str, release: str, revision_digest: bytes | None = None
+) -> pb.DevelopmentPackage:
+    return pb.DevelopmentPackage(
+        package=package,
+        release=release,
+        source_digest=hashlib.sha256(b"editable-source").digest(),
+        local_revision_digest=revision_digest or hashlib.sha256(b"unknown-revision").digest(),
     )
+
+
+def _measured_revision(refusal: PreparationRefusal) -> bytes:
+    """The revision digest a first prepare measured, from its own typed refusal.
+
+    Creator computes the exact LocalPackageRevision digest from its editable install; the
+    test recovers the same value from the preparation's measurement instead of
+    reimplementing the derivation beside it."""
+
+    assert refusal.code == "local_package_revision_mismatch", refusal.code
+    spelled = refusal.detail.split("measured ", 1)[1].split(",", 1)[0]
+    return bytes.fromhex(spelled.removeprefix("sha256:"))
 
 
 @pytest.fixture(scope="session")
@@ -273,58 +299,40 @@ def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
     _run(*cli, "run", "marco", "bogus=1", "--out", "/tmp", cwd="/", expect=3)
 
 
-def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None:
-    """A complete local venv owns its project/dependencies; a worker image does not.
-
-    This is the exact SDXL regression shape: preparation receives the immutable wheels used
-    to create an already-complete local uv environment, observes those installed versions,
-    and must not reinterpret an identical package dependency as a worker-image shadow.
-    """
+def test_editable_revision_materializes_from_supplied_wheels() -> None:
+    """The one preparation that still receives files (wire 30): an editable revision's
+    wheels, installed into a fresh venv over a REAL base that owns the runtime closure —
+    exactly a pod's image python. The project wheel is the row that MEASURES as the
+    package's own distribution/release; the placement carries the supplied dependency as
+    Environment.local_wheels and the project fact on DevelopmentPackage. A wheel shadowing
+    a protected image family at another version refuses typed."""
 
     uv = shutil.which("uv")
     assert uv is not None
-    with tempfile.TemporaryDirectory(prefix="cozy-existing-environment.") as raw:
-        root = Path(raw)
-        dependency_one = root / "annotated-doc-0.0.5"
-        dependency_two = root / "annotated-doc-0.0.6"
-        _write_annotated_doc(dependency_one, "0.0.5")
-        _write_annotated_doc(dependency_two, "0.0.6")
+    python = image_python()
+    observed = package_environment.observe_base(python)
+    assert "cozy-runtime" in observed.distribution_versions
 
+    with tempfile.TemporaryDirectory(prefix="cozy-editable-revision.") as raw:
+        root = Path(raw)
+        dependency = root / "annotated-doc-0.0.5"
+        _write_annotated_doc(dependency, "0.0.5")
+        impostor = root / "impostor"
+        _write_pure_project(impostor, "cozy-runtime", "9.9.9", "cozy_runtime_impostor")
         artifact_cache = root / "artifacts"
         wheel_set = artifact_cache / "sets" / "package"
         wheel_set.mkdir(parents=True)
-        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(ROOT))
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(PACKAGE))
-        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency_one))
-        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency_two))
-        runtime_wheel = next(wheel_set.glob("cozy_runtime-*.whl"))
-        dependency_one_wheel = next(wheel_set.glob("annotated_doc-0.0.5-*.whl"))
-        dependency_two_wheel = next(wheel_set.glob("annotated_doc-0.0.6-*.whl"))
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency))
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(impostor))
         project_wheel = next(wheel_set.glob("marco_polo-*.whl"))
-
-        environment = root / "environment"
-        python = environment / "bin" / "python"
-        _run(uv, "venv", "--python", sys.executable, str(environment))
-        _run(
-            uv,
-            "pip",
-            "install",
-            "--python",
-            str(python),
-            str(runtime_wheel),
-            str(dependency_one_wheel),
-            str(project_wheel),
-        )
-        content_digest = "sha256:" + "17" * 32
-        installed = package_environment.open_existing_environment(python, content_digest)
-        observed = package_environment.observe_base(python)
-        artifact_store = root / "artifact-store"
-        artifact_store.mkdir()
+        dependency_wheel = next(wheel_set.glob("annotated_doc-0.0.5-*.whl"))
+        impostor_wheel = next(wheel_set.glob("cozy_runtime-9.9.9-*.whl"))
+        environment = root / "environments"
 
         def describe_real(
             selected: package_environment.InstalledEnvironment, distribution: str
         ) -> bytes:
-            assert selected == installed
             command = (
                 "from cozy_runtime.internal import package_interface; "
                 "from cozy_runtime.internal.discovery import discover_distribution; "
@@ -335,65 +343,47 @@ def test_existing_package_environment_owns_its_exact_dependency_wheels() -> None
             return rendered.stdout.encode()
 
         def prepare(
-            dependency: Path, base: base_observation.Observation = observed
+            wheels: list[Path], revision_digest: bytes | None
         ) -> pb.PreparePackageSetResult:
-            rows = [
-                _download_row(pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, project_wheel),
-                _download_row(pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, dependency),
-                _download_row(pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, runtime_wheel),
-            ]
-            rows.sort(key=lambda row: row.digest)
             return prepare_package(
                 package_name="paul/marco-polo",
                 release="1.0.4",
-                files=rows,
-                placement_seed=b"existing-environment-proof",
+                wheels=_wheel_rows(wheels),
+                placement_seed=b"editable-revision-proof",
                 artifact_cache=artifact_cache,
-                artifact_store=artifact_store,
                 environment_root=environment,
                 python=python,
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,
-                base=base,
-                installed_environment=installed,
+                base=observed,
+                development=_development("paul/marco-polo", "1.0.4", revision_digest),
             )
 
-        prepared = prepare(dependency_one_wheel)
-        assert prepared.placement_set.placement_set_canonical_bytes
+        # Creator's revision digest is exact; the first measurement supplies it here.
+        with pytest.raises(PreparationRefusal) as unknown:
+            prepare([project_wheel, dependency_wheel], None)
+        revision = _measured_revision(unknown.value)
 
-        with pytest.raises(PreparationRefusal) as mismatch:
-            prepare(dependency_two_wheel)
-        assert mismatch.value.code == "package_environment_shadows_base_distribution"
-        assert "package_version=0.0.6 image_version=0.0.5" in mismatch.value.detail
+        prepared = prepare([project_wheel, dependency_wheel], revision)
+        placement = json.loads(prepared.placement_set.placement_set_canonical_bytes)["placements"][
+            0
+        ]
+        assert placement["development"]["local_revision_digest"] == ("sha256:" + revision.hex())
+        assert placement["development"]["project_wheel"]["distribution"] == "marco-polo"
+        local_wheels = placement["environment"]["local_wheels"]
+        assert [row["distribution"] for row in local_wheels] == ["annotated-doc"]
+        assert "locked_requirements" not in placement["environment"]
+        generation = environment / "contents"
+        (venv_python,) = generation.glob("*/bin/python")
+        _run(str(venv_python), "-I", "-c", "import marco_polo_package, annotated_doc", cwd="/")
 
-        package_names = {"marco-polo", "annotated-doc"}
-        rental_distributions = tuple(
-            (name, "0.1.0" if name == "cozy-runtime" else version)
-            for name, version in observed.distributions
-            if name not in package_names
-        )
-        rental_base = dataclasses.replace(observed, distributions=rental_distributions)
-        _base, package_wheels, supplied = package_environment.preflight_environment(
-            project_wheel,
-            (dependency_one_wheel, runtime_wheel),
-            rental_base,
-        )
-        assert "cozy-runtime" not in {wheel.distribution for wheel in package_wheels}
-        assert "cozy-runtime" in {wheel.distribution for wheel in supplied}
-
-        worker_shadow = dataclasses.replace(
-            rental_base,
-            distributions=(*rental_base.distributions, ("annotated-doc", "0.0.5")),
-        )
-        with pytest.raises(
-            package_environment.EnvironmentRefusal,
-            match="package_environment_shadows_base_distribution",
-        ):
-            package_environment.preflight_environment(
-                project_wheel,
-                (dependency_one_wheel, runtime_wheel),
-                worker_shadow,
-            )
+        # A protected image family cannot be replaced by a supplied wheel: the measure
+        # itself convicts the impostor before any install.
+        with pytest.raises(PreparationRefusal) as shadowed:
+            prepare([project_wheel, impostor_wheel], revision)
+        assert shadowed.value.code == "package_environment_base_distribution_import_roots_conflict"
+        assert "cozy-runtime 9.9.9" in shadowed.value.detail
+        assert "cannot be replaced" in shadowed.value.detail
 
 
 def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> None:
@@ -435,24 +425,19 @@ def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> 
         assert "vendor/notes.txt" in members
         assert not package_environment._import_roots(members)
 
-        rows = [
-            _download_row(pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, project_wheel),
-            _download_row(pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, runtime_wheel),
-        ]
-        rows.sort(key=lambda row: row.digest)
         with pytest.raises(PreparationRefusal) as refused:
             prepare_package(
                 package_name="local/hollow",
                 release="1.0.0",
-                files=rows,
+                wheels=_wheel_rows([project_wheel, runtime_wheel]),
                 placement_seed=b"empty-project-proof",
                 artifact_cache=artifact_cache,
-                artifact_store=root / "artifact-store",
                 environment_root=root / "environment",
                 python=Path(sys.executable),
                 describe=lambda _installed, _distribution: b"",
                 verified=lambda _digest, _length, _path: None,
                 base=package_environment.observe_base(Path(sys.executable)),
+                development=_development("local/hollow", "1.0.0"),
             )
         assert refused.value.code == "package_prepare_project_wheel_no_import_roots"
         assert refused.value.detail == f"{project_wheel.name} installs no importable module"
@@ -714,34 +699,17 @@ def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -
         artifact_cache = root / "artifacts"
         wheel_set = artifact_cache / "sets" / "package"
         wheel_set.mkdir(parents=True)
-        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(ROOT))
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(PACKAGE))
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency))
-        runtime_wheel = next(wheel_set.glob("cozy_runtime-*.whl"))
         project_wheel = next(wheel_set.glob("marco_polo-*.whl"))
         native_wheel_path = next(wheel_set.glob("native_leaf-*.whl"))
         # A pure-Python build would defeat the test silently, so the concrete ABI tag the
         # admission path requires is asserted, not assumed.
         assert "-py3-none-any.whl" not in native_wheel_path.name, native_wheel_path.name
 
-        environment = root / "environment"
-        python = environment / "bin" / "python"
-        _run(uv, "venv", "--python", sys.executable, str(environment))
-        _run(
-            uv,
-            "pip",
-            "install",
-            "--python",
-            str(python),
-            str(runtime_wheel),
-            str(native_wheel_path),
-            str(project_wheel),
-        )
-        content_digest = "sha256:" + "23" * 32
-        installed = package_environment.open_existing_environment(python, content_digest)
+        python = image_python()
         observed = package_environment.observe_base(python)
-        artifact_store = root / "artifact-store"
-        artifact_store.mkdir()
+        environment = root / "environments"
 
         def describe_real(
             selected: package_environment.InstalledEnvironment, distribution: str
@@ -754,51 +722,40 @@ def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -
             )
             return _run(str(selected.python), "-I", "-c", command, cwd="/").stdout.encode()
 
-        rows = [
-            _download_row(pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, project_wheel),
-            _download_row(pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, native_wheel_path),
-            _download_row(pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, runtime_wheel),
-        ]
-        rows.sort(key=lambda row: row.digest)
-
-        def prepare(native_environment: dict[str, str] | None) -> pb.PreparePackageSetResult:
+        def prepare(
+            native_environment: dict[str, str] | None, revision_digest: bytes | None
+        ) -> pb.PreparePackageSetResult:
             return prepare_package(
                 package_name="paul/marco-polo",
                 release="1.0.4",
-                files=rows,
+                wheels=_wheel_rows([project_wheel, native_wheel_path]),
                 placement_seed=b"native-dependency-admission",
                 artifact_cache=artifact_cache,
-                artifact_store=artifact_store,
                 environment_root=environment,
                 python=python,
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,
                 base=observed,
                 native_environment=native_environment,
-                installed_environment=installed,
+                development=_development("paul/marco-polo", "1.0.4", revision_digest),
             )
 
         # RED ARM: no sealed execution environment means no qualification host. There is no
         # caller identity that substitutes for one.
         with pytest.raises(PreparationRefusal) as absent:
-            prepare(None)
+            prepare(None, None)
         assert absent.value.code == "package_environment_native_proof_environment_absent"
 
         # GREEN ARM: the same bytes, admitted, because the operator child opened the ELF with
         # the dynamic loader and imported the module out of this exact environment.
-        prepared = prepare(_sealed_child_environment())
+        with pytest.raises(PreparationRefusal) as unknown:
+            prepare(sealed_child_environment(), None)
+        prepared = prepare(sealed_child_environment(), _measured_revision(unknown.value))
         assert prepared.placement_set.placement_set_canonical_bytes
+        (venv_python,) = (environment / "contents").glob("*/bin/python")
         assert (
             _run(
-                str(python), "-I", "-c", "import native_leaf; print(native_leaf.answer())"
+                str(venv_python), "-I", "-c", "import native_leaf; print(native_leaf.answer())"
             ).stdout.strip()
             == "42"
         )
-
-
-def _sealed_child_environment() -> dict[str, str]:
-    """The seal a worker would hand the operator child, built through the one env authority."""
-
-    from cozy_runtime.internal import config, spawn
-
-    return spawn.seal(config.read_config().child_base_env, {})
