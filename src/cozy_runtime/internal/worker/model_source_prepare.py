@@ -68,7 +68,7 @@ def prepare_model_source(
 def _open_or_init(tensorfs: Any, root: Path) -> Any:
     """pull.py's store discipline, verbatim: open a real store, refuse foreign
     bytes with TensorFS's own typed STORE_ERA, and initialize only a truly
-    empty directory. A fresh pod's baked-empty /var/lib/cozy/store refused
+    empty directory. A fresh pod's baked-empty /var/lib/cozy/tensorfs refused
     every source preparation without this (live: run 82, 2026-09-02)."""
     root.mkdir(parents=True, exist_ok=True)
     if all((root / name).is_dir() for name in ("repos", "manifests", "blobs")):
