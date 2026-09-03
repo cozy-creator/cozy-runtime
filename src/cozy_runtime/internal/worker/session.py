@@ -3539,20 +3539,36 @@ class Worker:
             self._settle()
             return
         binding = JobBinding.read(json.loads(record.read_text()))
-        if (
-            binding.job_descriptor_id != job.job_descriptor_id
-            or binding.build_id != job.build_id
-            or not job.reclaim_on_terminal
-        ):
+        # NAME THE FIELD AND BOTH VALUES. One sentence covered three different
+        # disagreements, so the only fact an operator can act on — which field, and what
+        # each side said — was recoverable solely by reading this function (run 202 spent
+        # a paid pod discovering that `build_id` was the one).
+        disagreement = ""
+        if binding.job_descriptor_id != job.job_descriptor_id:
+            disagreement = (
+                f"job_descriptor_id: the directive names {job.job_descriptor_id}, the "
+                f"prepared job plan {binding.job_descriptor_id}"
+            )
+        elif binding.build_id != job.build_id:
+            disagreement = (
+                f"build_id: the directive names {job.build_id}, the prepared job plan was "
+                f"staged under {binding.build_id}"
+            )
+        elif not job.reclaim_on_terminal:
+            disagreement = (
+                "reclaim_on_terminal: the directive says false; a job is one bounded "
+                "attempt and is always reclaimed at its terminal"
+            )
+        if disagreement:
             self.engine.fault(
                 pb.Fault(
                     kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                     subject=job.job_descriptor_id,
                     reason="job_plan_mismatch",
-                    detail="JobDirective does not equal the prepared package job plan",
+                    detail=disagreement,
                 )
             )
-            self.latched = "job_plan_mismatch"
+            self.latched = f"job_plan_mismatch: {disagreement}"[:200]
             self._settle()
             return
         self.supervision.use_environment(binding.python, binding.environment_content_digest)

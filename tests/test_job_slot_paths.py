@@ -199,7 +199,16 @@ def test_a_job_shaped_selection_prepares(
     assert placement["entrypoints"] == []
     assert [row["repo"] for row in placement["models"]] == [PACKAGE]
     # The job plan the JobDirective will resolve against exists.
-    assert len(list((tmp_path / "job-plans").glob("*.json"))) == 1
+    staged = sorted((tmp_path / "job-plans").glob("*.json"))
+    assert len(staged) == 1
+    # AND IT IS STAGED UNDER THIS PLACEMENT'S OWN IDENTITY. The RecordOwner reads the
+    # same field back off these prepared bytes to name the build in its JobDirective;
+    # `session.py::apply_job_directive` refuses `job_plan_mismatch` when the two
+    # disagree, before any attempt is offered. Run 202 died here, on a directive that
+    # named the RecordOwner's united PlacementSet digest -- a value this preparation
+    # cannot see, because the union does not exist yet.
+    record = json.loads(staged[0].read_text())
+    assert record["build_id"] == placement["environment_digest"]
 
 
 def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(

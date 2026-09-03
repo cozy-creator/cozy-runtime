@@ -1190,6 +1190,11 @@ def _stage_job_plans(
     if root.is_symlink() or not root.is_dir():
         raise PreparationRefusal("package_prepare_job_plan_root_invalid", str(root))
     application = str(body.get("application", ""))
+    # `build_id` IS THIS PREPARATION'S OWN PLACEMENT IDENTITY, and it must stay one: the
+    # RecordOwner reads the same field back off the prepared PlacementSet to name the
+    # build in its JobDirective. It is NOT the PlacementSet digest — the RecordOwner
+    # unites the sets several packages prepared into one document, so that digest does
+    # not exist yet here and this preparation could never predict it.
     staged: set[str] = set()
     for row in selected:
         name = str(row.get("name", ""))
