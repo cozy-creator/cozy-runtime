@@ -1,6 +1,6 @@
 """Source preparation initializes a truly empty store root (pull.py's rule).
 
-Live incident (run 82, 2026-09-02): worker images bake /var/lib/cozy/store
+Live incident (run 82, 2026-09-02): worker images bake /var/lib/cozy/tensorfs
 as an EMPTY directory, and bare Store.open refused every fresh pod's first
 source preparation with STORE_ERA. Three arms over the real tensorfs module:
 empty → init; real store → open; foreign bytes → tensorfs's own typed

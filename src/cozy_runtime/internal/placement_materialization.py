@@ -38,8 +38,8 @@ ENVIRONMENT_FORMAT = "cozy.worker.v1.Environment/1"
 MAX_PACKAGE_ENVIRONMENT_BYTES = 4 << 30
 BOOT_ROOT = host_paths.BOOT_DATA
 ENVIRONMENT_ROOT = host_paths.ENVIRONMENT_ROOT
-LOCAL_WEIGHTS_STORE_ROOT = host_paths.WEIGHTS_STORE
-WEIGHTS_CACHE_ROOT = host_paths.WEIGHTS_CACHE
+LOCAL_TENSORFS_ROOT = host_paths.TENSORFS_ROOT
+TRANSFER_STAGING_ROOT = host_paths.TRANSFER_STAGING
 MAX_ARTIFACT_BYTES = 8 << 30
 CHUNK_BYTES = 1 << 20
 
@@ -48,18 +48,18 @@ CHUNK_BYTES = 1 << 20
 class PreparedBoot:
     """What a pod knows about itself once it is ready and still empty."""
 
-    artifact_store: Path
-    artifact_cache: Path
+    tensorfs_root: Path
+    transfer_staging: Path
 
 
 def prepare_boot(
     config: WorkerHostConfig,
     *,
     boot_root: Path = BOOT_ROOT,
-    artifact_store_root: Path = LOCAL_WEIGHTS_STORE_ROOT,
-    artifact_cache_root: Path = WEIGHTS_CACHE_ROOT,
+    tensorfs_root: Path = LOCAL_TENSORFS_ROOT,
+    transfer_staging_root: Path = TRANSFER_STAGING_ROOT,
 ) -> PreparedBoot:
-    """Bring the pod to READY-BUT-EMPTY: lay its two CAS roots.
+    """Bring the pod to READY-BUT-EMPTY: open TensorFS and local transfer staging.
 
     No lease check (xs-007 row 18). This used to refuse `worker_lease_elapsed` against
     `COZY_WORKER_LEASE_EXPIRY_UNIX`, the rental cap tensorhub has since deleted; the
@@ -80,17 +80,17 @@ def prepare_boot(
     del config  # the handoff carries nothing this step decides on
     # Package executors read verified TensorFS objects but never publish them. Root owns
     # the store; execute/read bits admit the fixed executor uid without making any object
-    # or directory writable to it. The artifact cache is the supervisor's landing area
-    # (it takes ownership of it after this boot) and also carries the worker's staged
+    # or directory writable to it. Transfer staging is the supervisor's container-local
+    # landing area (it takes ownership after this boot) and also carries the worker's staged
     # selection documents, which the executor reads by path: the execute bit alone lets
     # the fixed executor uid traverse to `selections/`; `sets/` stays the supervisor's 0700.
-    _directory(artifact_store_root, mode=0o755)
-    _grant_executor_holds(artifact_store_root)
-    _directory(artifact_cache_root, mode=0o711)
+    _directory(tensorfs_root, mode=0o755, allow_symlink=True)
+    _grant_executor_holds(tensorfs_root)
+    _directory(transfer_staging_root, mode=0o711)
     _directory(boot_root)
     return PreparedBoot(
-        artifact_store=artifact_store_root,
-        artifact_cache=artifact_cache_root,
+        tensorfs_root=tensorfs_root,
+        transfer_staging=transfer_staging_root,
     )
 
 
@@ -283,12 +283,18 @@ def _grant_executor_holds(store_root: Path) -> None:
     lock.chmod(0o666)
 
 
-def _directory(path: Path, *, mode: int = 0o700) -> None:
+def _directory(path: Path, *, mode: int = 0o700, allow_symlink: bool = False) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    info = path.lstat()
+    # Only TensorFS may be redirected by the fixed root supervisor into a
+    # provider-mounted volume. Transfer staging and boot state remain ordinary
+    # container-local directories and retain the lstat symlink refusal.
+    info = path.stat() if allow_symlink else path.lstat()
     if not path.is_absolute() or not stat.S_ISDIR(info.st_mode):
         raise LaunchRefusal("provision_store_invalid", str(path))
-    path.chmod(mode)
+    # A root-squashed mount can deny chmod to container root even when the
+    # supervisor's fixed-uid helper already installed the exact mode.
+    if stat.S_IMODE(info.st_mode) != mode:
+        path.chmod(mode)
 
 
 def _fsync(path: Path) -> None:
