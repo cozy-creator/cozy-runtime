@@ -1,38 +1,18 @@
-"""`cozy-runtime version` — tag + commit + the two independent semvers."""
+"""`cozy-runtime version` — installed distribution and embedded build provenance."""
 
 from __future__ import annotations
 
-import subprocess
-from pathlib import Path
-
 from cozy_runtime import PYTHON_CONTRACT_VERSION, WIRE_PROTOCOL_VERSION, __version__
+from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime.cli.io import Result
 from cozy_runtime.internal.config import RuntimeConfig
 
-_SOURCE_ROOT = Path(__file__).resolve().parents[3]
-
-
-def _git(*args: str) -> str | None:
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(_SOURCE_ROOT), *args],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return out.stdout.strip() or None if out.returncode == 0 else None
-
 
 def run(config: RuntimeConfig, full: bool = False) -> Result:
-    tag = _git("describe", "--tags", "--abbrev=0") or "untagged"
-    commit = _git("rev-parse", "--short=12", "HEAD") or "unknown"
     rows: tuple[tuple[str, str], ...] = (
         ("distribution", __version__),
-        ("tag", tag),
-        ("commit", commit),
+        ("tag", f"v{__version__}"),
+        ("commit", COMMIT[:12] if COMMIT != "unknown" else COMMIT),
         ("wire_protocol", WIRE_PROTOCOL_VERSION),
         ("python_contract", PYTHON_CONTRACT_VERSION),
     )
