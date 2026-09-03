@@ -1,4 +1,4 @@
-"""Cozy's purpose-built CUDA kernels for the Torch 2.13/CUDA 13 worker profile."""
+"""Cozy's purpose-built CUDA kernels: nanobind + DLPack over the CUDA runtime, abi3."""
 
 # SPDX-License-Identifier: Apache-2.0
 

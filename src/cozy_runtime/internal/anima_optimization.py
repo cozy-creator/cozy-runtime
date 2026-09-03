@@ -25,7 +25,7 @@ from packaging.version import InvalidVersion, Version
 DIFFUSERS_VERSION = "0.40.0"
 FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION = "cozy-runtime-cuda-kernels"
 FUSED_ANIMA_CUDA_KERNEL_MODULE = "cozy_runtime_cuda_kernels"
-FUSED_ANIMA_CUDA_KERNEL_VERSION = "0.1.0+torch2.13cu130"
+FUSED_ANIMA_CUDA_KERNEL_VERSION = "0.1.0"
 FUSED_ANIMA_TORCH_RELEASE = "2.13.0"
 FUSED_ANIMA_CUDA_RELEASE = "13.0"
 

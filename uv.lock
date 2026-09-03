@@ -238,14 +238,8 @@ dev = [
 
 [[package]]
 name = "cozy-runtime-cuda-kernels"
-version = "0.1.0+torch2.13cu130"
+version = "0.1.0"
 source = { editable = "packages/cozy-runtime-cuda-kernels" }
-dependencies = [
-    { name = "torch" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "torch", specifier = "==2.13.0" }]
 
 [[package]]
 name = "cryptography"

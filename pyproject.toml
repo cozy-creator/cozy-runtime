@@ -146,10 +146,10 @@ media = [
 # Runtime owns the model byte plane. Local package environments select this complete
 # capability; base worker images provide TensorFS from the same PyPI range.
 model-execution = ["tensorfs>=0.3.1,<1"]
-# Optional fused Anima CUDA kernels. Base worker images opt into this only on their exact
-# supported NVIDIA CUDA profile; every other Runtime profile keeps ordinary eager execution.
+# Optional fused Anima CUDA kernels. nanobind + DLPack over the CUDA runtime, abi3: one
+# build serves every NVIDIA image profile (cr-091); non-CUDA profiles keep eager execution.
 cuda-kernels = [
-    "cozy-runtime-cuda-kernels==0.1.0+torch2.13cu130; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cozy-runtime-cuda-kernels==0.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [[tool.mypy.overrides]]
