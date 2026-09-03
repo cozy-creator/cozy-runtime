@@ -20,7 +20,7 @@ ExecutionSpec a REFUSAL rather than an ignored unknown field.
 
 Profile note, checked live rather than asserted (`scripts/worker-live.py fixtures` renders
 th-024's frozen canonical fixtures through THIS writer and compares bytes + ids):
-cozy-runtime's writer admits floats, `null` and non-ASCII because a descriptor needs them;
+cozy-runtime's writer admits floats, `null` and non-ASCII because a package interface needs them;
 the protocol profile does not, so `_ascii` refuses a non-printable-ASCII field here instead
 of spelling it. Within the admissible profile the two writers are byte-identical.
 """
@@ -58,7 +58,6 @@ _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
 # Closed collection fields have one spelling even when empty (worker-protocol
 # scripts/canonical.py EXPLICIT_REPEATED; the same table in Creator's canonical writer).
 EXPLICIT_REPEATED: dict[str, tuple[str, ...]] = {
-    "cozy.worker.v1.Config": ("assets",),
     "cozy.worker.v1.DownloadDelegation": ("models", "packages"),
     "cozy.worker.v1.Entrypoint": ("slots",),
     "cozy.worker.v1.Environment": ("wheels",),

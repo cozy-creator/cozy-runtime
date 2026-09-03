@@ -201,11 +201,11 @@ class JobBinding:
     job_descriptor_id: str
     build_id: str
     application: str
-    package_descriptor: str
+    package_interface: str
     python: str
     environment_content_digest: str
     job: str
-    """The registered `@app.job` name this descriptor id resolves to."""
+    """The registered `@app.job` name this job descriptor id resolves to."""
     publishes: bool = False
     emits_media: bool = False
     gpu_rate_micro_usd_per_hour: int = 0
@@ -270,7 +270,7 @@ class ModelBinding:
     model_weight_bytes: int = 0
     custody: str = "canonical"
     sequence_parallel_degrees: tuple[int, ...] = ()
-    """The descriptor slot's `sequence_parallel.degrees` (cr-068): what the author said the
+    """The interface slot's `sequence_parallel.degrees` (cr-068): what the author said the
     class shards at. A placement pinned to K devices needs K here."""
     model: str = ""
     """`org/name@release/lane` — the checkpoint's catalog name, for the one line a person
@@ -335,9 +335,9 @@ class DeclaredBinding:
     config_digest: str = ""
     """The exact selected model config, or sha256(canonical {}) when weightless."""
     application: str = ""
-    """The exact PackageDescriptor application imported from the installed venv."""
-    descriptor_path: str = ""
-    """Local path to the exact granted descriptor bytes; resolution, never identity."""
+    """The exact PackageInterface application imported from the installed venv."""
+    interface_path: str = ""
+    """Local path to the exact granted package-interface bytes; resolution, never identity."""
     development_project: str = ""
     """Launch-local source path for DevelopmentPackage discovery; never protocol identity."""
     store: str = ""
@@ -353,8 +353,6 @@ class DeclaredBinding:
     component cannot be read out of a whole-pipeline snapshot without reading the pipeline;
     per-component snapshots make a partial fill the store's ordinary complete read, and the
     objects dedup so it costs nothing."""
-    package_revision_digest: str = ""
-    """Published release.json provenance or explicit development source identity."""
     development: bool = False
     """True only for explicit same-user source-checkout execution with no Environment."""
     objective: str = "latency"
@@ -454,7 +452,6 @@ class DeclaredBinding:
                 {
                     "weightless": True,
                     "release": self.release,
-                    "package_revision_digest": self.package_revision_digest or self.release,
                 }
             )
         return canonical.digest(

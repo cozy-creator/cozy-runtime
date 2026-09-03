@@ -207,7 +207,6 @@ class _Transaction:
             weights_transaction_id="wtx-" + digest[:16],
             tensorfs_receipt_digest="sha256:" + digest,
             tensorfs_receipt=canonical,
-            checkpoint_evidence_canonical_bytes=b"{}",
         )
         self.store.committed[self.declared.output_slot] = _Committed(
             declaration, dict(self.parts), receipt

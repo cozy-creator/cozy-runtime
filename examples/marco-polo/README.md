@@ -35,15 +35,15 @@ local-development override: it is not embedded in the project wheel. The base wo
 one exact Cozy Runtime wheel, while the package declares the oldest compatible Runtime API it needs.
 Arbitrary local or editable dependencies are not bundled by publication.
 
-`pyproject.toml`, `uv.lock`, the Runtime-derived canonical descriptor, and the project wheel are
+`pyproject.toml`, `uv.lock`, the Runtime-derived canonical package interface, and the project wheel are
 the exact publication inputs. The
-descriptor is sent directly to Tensorhub and is not committed here. There is no release manifest
+package interface is sent directly to Tensorhub and is not committed here. There is no release manifest
 and no author-selected worker profile. Publication is independent of worker images; the selected
 worker validates the wheel against its actual Python and base-package inventory at install time. The current remote contract
 admits one placement per worker, so publishing this fixture under two package repositories can prove
 sequential same-pod replacement with `cozy rent revise`; it does not prove simultaneous stacking.
 
-Cozy derives the publication descriptor through this locked, read-only project command:
+Cozy derives the publication package interface through this locked, read-only project command:
 
 ```sh
 uv run --locked --project examples/marco-polo \

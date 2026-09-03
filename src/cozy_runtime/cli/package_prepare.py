@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import canonical, package_environment, spawn
+from cozy_runtime.internal import canonical, package_environment, package_interface, spawn
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
@@ -25,23 +25,35 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         "--artifact-store",
         "--environment-python",
         "--package",
+        "--package-interface",
         "--project-wheel",
         "--release",
-        "--release-digest",
     }
     values = _values(args, required, {"--dependency-wheel", "--model"})
     artifact_cache = Path(values["--artifact-cache"][0]).resolve()
     artifact_store = Path(values["--artifact-store"][0]).resolve()
     environment_python = _venv_python(values["--environment-python"][0])
-    wheel_paths = [
+    interface_path = Path(values["--package-interface"][0]).resolve()
+    try:
+        interface_raw = interface_path.read_bytes()
+        package_interface.read_bytes(interface_raw, str(interface_path))
+    except (OSError, package_interface.StalePackageInterface) as exc:
+        raise CliError(
+            "package_prepare_interface_unreadable",
+            str(exc),
+            "download the exact published metadata/package-interface.json again",
+            Exit.not_found,
+        ) from exc
+    artifact_paths = [
         (pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, Path(values["--project-wheel"][0]).resolve()),
         *(
             (pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, Path(value).resolve())
             for value in values.get("--dependency-wheel", [])
         ),
+        (pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE, interface_path),
     ]
     rows: list[pb.LocalDownloadFile] = []
-    for kind, path in wheel_paths:
+    for kind, path in artifact_paths:
         try:
             info = path.stat()
             digest = _hash_file(path)
@@ -55,7 +67,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         rows.append(
             pb.LocalDownloadFile(
                 digest=bytes.fromhex(digest.removeprefix("sha256:")),
-                filename=path.name,
+                filename=(package_interface.FILENAME if path == interface_path else path.name),
                 kind=kind,
                 length=info.st_size,
                 path=str(path),
@@ -64,10 +76,22 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     rows.sort(key=lambda row: row.digest)
     package = values["--package"][0]
     release = values["--release"][0]
-    release_digest = values["--release-digest"][0]
+    environment_content_digest = canonical.digest(
+        {
+            "wheels": [
+                documents.spell(bytes(row.digest))
+                for row in rows
+                if row.kind
+                in {
+                    pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
+                    pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
+                }
+            ]
+        }
+    )
     try:
         installed_environment = package_environment.open_existing_environment(
-            environment_python, release_digest
+            environment_python, environment_content_digest
         )
     except package_environment.EnvironmentRefusal as exc:
         raise CliError(
@@ -105,7 +129,11 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             )
         models.append(row)
     seed = canonical.write(
-        {"package": package, "release": release, "release_digest": release_digest}
+        {
+            "package": package,
+            "release": release,
+            "environment_content_digest": environment_content_digest,
+        }
     )
     # Linux caps Unix socket paths at 108 bytes. The generation/cache path is
     # user-selectable and may be much longer, so disposable executor control
@@ -121,7 +149,8 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     def describe(installed: package_environment.InstalledEnvironment, distribution: str) -> bytes:
         supervisor.use_environment(str(installed.python), installed.content_digest)
         executor = supervisor.spawn(imposed={})
-        output = supervisor.handoff(executor.epoch) / "descriptor.json"
+        output = supervisor.handoff(executor.epoch) / "metadata" / "package-interface.json"
+        output.parent.mkdir()
         with executor.watched("describe_installed"):
             reply = executor.call(
                 {"cmd": "describe_installed", "distribution": distribution, "output": str(output)},
@@ -129,23 +158,22 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             )
         if not reply.get("ok"):
             raise PreparationRefusal(
-                "package_prepare_descriptor_failed", str(reply.get("code", "invalid reply"))
+                "package_prepare_interface_failed", str(reply.get("code", "invalid reply"))
             )
         try:
             raw = output.read_bytes()
         except OSError as exc:
             raise PreparationRefusal(
-                "package_prepare_descriptor_failed", "descriptor output is absent"
+                "package_prepare_interface_failed", "package-interface output is absent"
             ) from exc
         if reply.get("digest") != _digest(raw) or reply.get("length") != len(raw):
-            raise PreparationRefusal("package_prepare_descriptor_failed", "invalid reply")
+            raise PreparationRefusal("package_prepare_interface_failed", "invalid reply")
         return raw
 
     try:
         result = prepare_package(
             package_name=package,
             release=release,
-            release_digest=release_digest,
             files=rows,
             placement_seed=seed,
             artifact_cache=artifact_cache,
@@ -155,11 +183,12 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             verified=lambda _digest, _length, _path: None,
             artifact_store=artifact_store,
             models=models,
-            # The same seal the descriptor executor above runs under: a native dependency
+            # The same seal the interface executor above runs under: a native dependency
             # wheel is qualified against THIS seat, not waved through because the caller
             # happens to be the local same-user command.
             native_environment=spawn.seal(config.child_base_env, {}),
             installed_environment=installed_environment,
+            published_interface=interface_raw,
             # The same job-plan root the worker session stages into: without it a
             # job-only package has no runnable callable and local install refuses.
             job_plan_root=config.cozy_home / "job-plans",
@@ -179,15 +208,15 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
 
     placement_bytes = result.placement_set.placement_set_canonical_bytes
     placement = documents.read(placement_bytes, pb.PlacementSet)["placements"][0]
-    descriptor_ref = placement["package_descriptor"]
-    descriptor_path = artifact_cache / str(descriptor_ref["digest"]).removeprefix("sha256:")
-    descriptor_raw = descriptor_path.read_bytes()
+    interface_ref = placement["package_interface"]
+    staged_interface = artifact_cache / str(interface_ref["digest"]).removeprefix("sha256:")
+    interface_raw = staged_interface.read_bytes()
     return Result(
         rows=(("package", package), ("release", release)),
         document={
             "package": package,
             "release": release,
-            "package_descriptor": _exact(descriptor_raw),
+            "package_interface": _exact(interface_raw),
             "placement_set": _exact(placement_bytes),
         },
     )

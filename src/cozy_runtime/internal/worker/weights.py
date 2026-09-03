@@ -847,11 +847,6 @@ class WeightsExchange:
             if hashlib.sha256(inner).hexdigest() != str(value["tensorfs_receipt_digest"])[7:]:
                 raise ValueError("nested digest mismatch")
             facts = json.loads(inner)
-            checkpoint_evidence = base64.b64decode(
-                str(value["checkpoint_evidence_canonical_bytes"]), validate=True
-            )
-            if facts["checkpoint_evidence_canonical_bytes"].encode("utf-8") != checkpoint_evidence:
-                raise ValueError("CheckpointEvidence handoff mismatch")
             manifest = facts["manifest"]
             manifest_id = "sha256:" + str(manifest["sha256"])
             manifest_length = int(manifest["length"])

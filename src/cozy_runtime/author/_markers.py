@@ -138,7 +138,7 @@ class AssetBound:
       cannot set it.
 
     COUNT bounds are not here on purpose: `Annotated[list[ImageAsset], Meta(max_length=9)]`
-    is msgspec's own, it is already in the descriptor's constraint vocabulary, and a second
+    is msgspec's own, it is already in the package interface's constraint vocabulary, and a second
     spelling of a limit that already validates would be a second contract.
     """
 

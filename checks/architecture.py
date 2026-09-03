@@ -808,7 +808,7 @@ def worker_derive_free_violations(worker_dir: pathlib.Path) -> list[str]:
                 if name == banned or name.startswith(banned + "."):
                     problems.append(
                         f"{path.relative_to(worker_dir.parent.parent.parent)}: imports {name} — "
-                        "worker prep modules may not reach derive/code-topology (cr-067)"
+                        "worker prep modules may not reach derive/TensorRequirements (cr-067)"
                     )
     return problems
 
@@ -877,7 +877,7 @@ def fence_residency_sets_only() -> list[str]:
     attribute, a keyword or a document key, so a planted `"resident_bytes"` row key is
     refused as surely as a planted constructor argument. (2) Every `pb.DeviceLane(...)`,
     `pb.ObservedWorkerState(...)` and `pb.WorkerSnapshotBody(...)` call under `src/` passes
-    keywords from the vendored descriptor only, none of them a pricing word. (3) The
+    keywords from the vendored package interface only, none of them a pricing word. (3) The
     positional proof: the vendored `DeviceLane` carries exactly the five proto-026 fields
     at their numbers, so a field added to the wire message is refused here before any
     emitter could fill it.

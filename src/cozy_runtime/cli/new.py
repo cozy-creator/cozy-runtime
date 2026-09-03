@@ -8,7 +8,7 @@ from pathlib import Path
 from cozy_runtime import __version__
 from cozy_runtime.cli import describe as describe_verb
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import descriptor
+from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.exits import Exit
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -159,8 +159,8 @@ def _readme(name: str, pkg: str) -> str:
     uv run cozy-runtime --json describe
 
 `cozy package publish` invokes Runtime's read-only describe command and sends the canonical
-descriptor bytes with the source release. Tensorhub independently derives and compares the
-same descriptor from the installed project wheel. Nothing generated is committed here.
+PackageInterface bytes with the source release. Tensorhub independently derives and compares the
+same interface from the installed project wheel. Nothing generated is committed here.
 """
 
 
@@ -207,8 +207,8 @@ def run(name: str, target_dir: str) -> Result:
             ("entry", f"{pkg}:app"),
             ("files", str(len(files))),
             (
-                descriptor.DIGEST_KEY,
-                descriptor.package_descriptor_digest(described.document),
+                package_interface.DIGEST_KEY,
+                package_interface.package_interface_digest(described.document),
             ),
         ),
         commands=(

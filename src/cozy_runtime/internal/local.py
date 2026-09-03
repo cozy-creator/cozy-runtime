@@ -25,7 +25,7 @@ The only two things that are LOCAL are stated out loud here rather than hidden:
    and recovery across child processes; Runtime keeps only this process's attempt state.
 
 What this module is NOT: it is not the `run` verb. cr-016 owns the CLI surface, the
-descriptor-derived output ids and the exit-code mapping, and it will WRAP this — never the
+package-interface-derived output ids and the exit-code mapping, and it will WRAP this — never the
 reverse, and never by growing a second execution path beside it.
 """
 
@@ -49,10 +49,10 @@ from cozy_runtime.internal import bindings as binding_table
 from cozy_runtime.internal import (
     canonical,
     derive_child,
-    descriptor,
     fill,
     liveness,
     model_config,
+    package_interface,
     proctree,
     pull,
 )
@@ -97,7 +97,7 @@ class StagedDevelopmentPlacement:
 class DevelopmentPlacementDocuments:
     """Exact bytes and Placement behind local source-checkout execution."""
 
-    descriptor: bytes
+    package_interface: bytes
     placement: pb.Placement
     bindings: Mapping[str, DeclaredBinding] = field(default_factory=dict)
 
@@ -123,7 +123,6 @@ class _DevelopmentModel:
     config_digest: str
     config_bytes: bytes
     components: tuple[str, ...]
-    assets: Mapping[str, Mapping[str, Any]]
     store: Path
     variant: str
     custody: str
@@ -145,7 +144,7 @@ class LocalRequest:
     entrypoint: str
     payload: dict[str, Any]
     #: the result FIELD PATHS the caller grants a destination for (`image`, `detail.thumb`).
-    #: cr-016 derives these from the package descriptor; here the driver names them, and a
+    #: cr-016 derives these from the package interface; here the driver names them, and a
     #: set that does not match what the handler produced refuses the tail whole (#248).
     outputs: tuple[str, ...] = ("image",)
     request_id: str = "run-1"
@@ -292,7 +291,7 @@ class LocalRecordOwner:
         bindings: dict[str, str],
         workspace: Path,
         *,
-        package_revision_digest: str,
+        package_code_digest: str,
         placement: pb.Placement | None = None,
         auto_ack: bool = True,
         on_progress: Any = None,
@@ -302,7 +301,7 @@ class LocalRecordOwner:
         #: JOB mode: the durable checkpoint requests this owner answered, in order.
         self.checkpoints: list[dict[str, Any]] = []
         self.workspace = workspace
-        self.package_revision_digest = package_revision_digest
+        self.package_code_digest = package_code_digest
         self.placement = placement
         self.auto_ack = auto_ack
         self.ended = "unstarted"
@@ -689,7 +688,7 @@ class LocalRecordOwner:
             # is no binding plan to prepare, no warm pool to fill and no serving pointer.
             directive.job.CopyFrom(
                 pb.JobDirective(
-                    build_id=self.package_revision_digest,
+                    build_id=self.package_code_digest,
                     job_descriptor_id=self.request.job_descriptor_id,
                     resource_caps=pb.ResourceCaps(
                         device_required=False, max_rss_bytes=0, max_disk_bytes=0
@@ -799,7 +798,6 @@ class LocalRecordOwner:
         # local RecordOwner must not mint a whitespace-dependent dialect beside Tensorhub.
         body = canonical.write(self.request.payload)
         spec = pb.InvocationSpec(
-            package_revision_digest=self.package_revision_digest,
             environment_digest=(
                 ""
                 if self.placement is not None
@@ -808,7 +806,6 @@ class LocalRecordOwner:
                 if self.placement is not None
                 else ""
             ),
-            config_digest="",
             payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
             inputs=self._input_bindings(body),
             outputs=self._output_bindings(),
@@ -818,11 +815,10 @@ class LocalRecordOwner:
                 int(time.time() * 1000) + self.request.timeout_ms if self.request.timeout_ms else 0
             ),
         )
-        # `config_digest` stays EMPTY. Model configuration is bound and verified separately.
         if self.request.kind == "job":
             spec.job.CopyFrom(
                 pb.JobInvocationSpec(
-                    build_id=self.package_revision_digest,
+                    build_id=self.package_code_digest,
                     job_descriptor_id=self.request.job_descriptor_id,
                     publication_contract=self._publication(),
                 )
@@ -994,7 +990,7 @@ class LocalRecordOwner:
 
 def stage_development_placement(
     cozy_home: Path,
-    package_descriptor: Mapping[str, Any],
+    interface: Mapping[str, Any],
     *,
     package: str,
     release: str,
@@ -1004,9 +1000,9 @@ def stage_development_placement(
     found: Any = None,
     binding_overrides: Mapping[str, str] | None = None,
 ) -> StagedDevelopmentPlacement:
-    """Stage one exact PlacementSet/1 plus its launch-local descriptor/config bytes.
+    """Stage one exact PlacementSet/1 plus its launch-local interface/config bytes.
 
-    The descriptor and config bytes the executor reads land in `artifact_cache` — the
+    The package interface and config bytes the executor reads land in `artifact_cache` — the
     launcher's install-owned, content-addressed document store (cozy-creator's
     `installs/<id>/artifact-cache/`, a run's workspace), never under `cozy_home`: the home
     root holds what has a reason to be there, and a launch's derived documents are the
@@ -1017,7 +1013,7 @@ def stage_development_placement(
     cache = artifact_cache.resolve()
     selected_store = artifact_store.resolve()
     documents_ = development_placement_documents(
-        package_descriptor,
+        interface,
         package=package,
         release=release,
         source_digest=source_digest,
@@ -1041,7 +1037,7 @@ def stage_development_placement(
 
 
 def development_placement_documents(
-    package_descriptor: Mapping[str, Any],
+    interface: Mapping[str, Any],
     *,
     package: str,
     release: str,
@@ -1054,9 +1050,9 @@ def development_placement_documents(
 ) -> DevelopmentPlacementDocuments:
     """Construct exact source and local-TensorFS selection facts through existing owners."""
 
-    entries = package_descriptor.get("entrypoints")
+    entries = interface.get("entrypoints")
     if not isinstance(entries, list):
-        raise RuntimeError("a local serving closure requires an PackageDescriptor entrypoint set")
+        raise RuntimeError("a local serving closure requires an PackageInterface entrypoint set")
     visible: list[Mapping[str, Any]] = [entry for entry in entries if isinstance(entry, Mapping)]
     if not visible:
         raise RuntimeError("a local serving closure requires at least one visible entrypoint")
@@ -1067,12 +1063,12 @@ def development_placement_documents(
     except documents.DocumentError as exc:
         raise RuntimeError("development source digest is invalid") from exc
 
-    descriptor_bytes = descriptor.canonical_bytes(package_descriptor)
-    descriptor_ref = _exact_ref(descriptor_bytes)
-    descriptor_path = ""
+    interface_bytes = package_interface.canonical_bytes(interface)
+    interface_ref = _exact_ref(interface_bytes)
+    interface_path = ""
     if artifact_cache is not None:
-        _, staged_descriptor = _stage_exact(artifact_cache, descriptor_bytes)
-        descriptor_path = str(staged_descriptor)
+        _, staged_interface = _stage_exact(artifact_cache, interface_bytes)
+        interface_path = str(staged_interface)
     modeled_paths = sorted(
         str(model.get("path", ""))
         for entry in visible
@@ -1118,28 +1114,10 @@ def development_placement_documents(
         for selected_path in selected_paths:
             selected = resolved_models[selected_path]
             model_id = model_ids[selected.slot.path]
-            assets = [
-                pb.Asset(
-                    name=asset_name,
-                    model_id=model_id,
-                    ref=pb.Ref(
-                        digest=documents.raw(str(asset["digest"])),
-                        length=int(asset["length"]),
-                    ),
-                )
-                for asset_name, asset in sorted(selected.assets.items())
-            ]
             slots.append(
                 pb.Slot(
                     slot=selected.slot.param,
                     reference_model_id=model_id,
-                    config=pb.Config(
-                        document=pb.Ref(
-                            digest=documents.raw(selected.config_digest),
-                            length=len(selected.config_bytes),
-                        ),
-                        assets=assets,
-                    ),
                     components=[
                         pb.Component(component=component, model_id=model_id)
                         for component in selected.components
@@ -1148,7 +1126,9 @@ def development_placement_documents(
             )
             config_path = ""
             if artifact_cache is not None:
-                _, staged_config = _stage_exact(artifact_cache, selected.config_bytes)
+                _, staged_config = _stage_exact(
+                    artifact_cache / "selections", selected.config_bytes
+                )
                 config_path = str(staged_config)
             members.append(
                 ModelBinding(
@@ -1189,8 +1169,8 @@ def development_placement_documents(
             model_parameter_name=first.model_parameter_name if first is not None else "",
             release=source_digest,
             models=model_set,
-            application=str(package_descriptor.get("application", "")),
-            descriptor_path=descriptor_path,
+            application=str(interface.get("application", "")),
+            interface_path=interface_path,
             development_project=str(found.project) if found is not None else "",
             store=first.store if first is not None else "",
             config=first.config if first is not None else "",
@@ -1198,7 +1178,6 @@ def development_placement_documents(
             reference_snapshot=first.reference_snapshot if first is not None else "",
             components=first.components if first is not None else (),
             snapshots=first.snapshots if first is not None else {},
-            package_revision_digest=source_digest,
             config_digest=model_binding_set_digest(model_set),
             development=True,
             model_weight_bytes=sum(model.model_weight_bytes for model in model_set),
@@ -1221,14 +1200,14 @@ def development_placement_documents(
             release=release,
             source_digest=source_raw,
         ),
-        package_descriptor=pb.Ref(
-            digest=documents.raw(str(descriptor_ref["digest"])), length=len(descriptor_bytes)
+        package_interface=pb.Ref(
+            digest=documents.raw(str(interface_ref["digest"])), length=len(interface_bytes)
         ),
         bindings_digest=bindings_digest,
         models=models,
         entrypoints=entrypoints,
     )
-    return DevelopmentPlacementDocuments(descriptor_bytes, placement, declared_bindings)
+    return DevelopmentPlacementDocuments(interface_bytes, placement, declared_bindings)
 
 
 def _resolve_development_models(
@@ -1315,17 +1294,15 @@ def _resolve_development_models(
             )
         manifest_length = len(manifest_bytes)
         try:
-            config_digest, config_bytes = model_config.construction_document(
-                store, header.get("configs")
-            )
+            config_digest, config_bytes = model_config.construction_document(header.get("configs"))
         except model_config.ModelConfigRefusal as exc:
             raise RuntimeError(
                 f"development_model_config_invalid: {binding.ref}: {type(exc).__name__}: {exc}"
             ) from exc
         if not header.get("components"):
             raise RuntimeError(f"development_model_components_absent: {binding.ref}")
-        components = _derive_components(found.project, slot.path, config_bytes, config_digest)
-        selected_assets = _development_assets(binding.ref, header.get("assets", {}))
+        components = _derive_components(found.project, slot.path, config_bytes)
+        _development_assets(binding.ref, header.get("assets", {}))
         try:
             model_weight_bytes = sum(
                 int(row["length"]) for row in store.walk_cozytensors(manifest_digest)
@@ -1345,7 +1322,6 @@ def _resolve_development_models(
             config_digest=config_digest,
             config_bytes=config_bytes,
             components=components,
-            assets=selected_assets,
             store=store_root,
             # Repository lane and accelerator hardware are independent facts. Development
             # carries no caller-authored hardware variant; the executor derives smNN from
@@ -1357,9 +1333,7 @@ def _resolve_development_models(
     return resolved
 
 
-def _derive_components(
-    project: Path, slot: str, config_bytes: bytes, config_digest: str
-) -> tuple[str, ...]:
+def _derive_components(project: Path, slot: str, config_bytes: bytes) -> tuple[str, ...]:
     """`Slot.components` = what the derive constructs for this config document (D9), from
     `cozy-runtime derive`'s bounded child in THIS venv — this process is the package venv's
     own runtime, and `sys.executable` is its interpreter."""
@@ -1368,14 +1342,8 @@ def _derive_components(
 
     scratch = Path(tempfile.mkdtemp(prefix="cozy-local-derive-"))
     try:
-        config_path = scratch / "config.json"
-        config_path.write_bytes(config_bytes)
         request = derive_child.DeriveRequest(
-            (
-                derive_child.SlotRequest(
-                    slot, derive_child.ConfigRef(config_path, config_digest, len(config_bytes))
-                ),
-            ),
+            (derive_child.SlotRequest(slot, config_bytes),),
             project=Path(project).resolve(),
         )
         (held,) = derive_child.derive_in(Path(sys.executable), request, scratch)
@@ -1388,7 +1356,7 @@ def _derive_components(
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def _development_assets(binding_ref: str, value: object) -> Mapping[str, Mapping[str, Any]]:
+def _development_assets(binding_ref: str, value: object) -> None:
     if not isinstance(value, Mapping):
         raise RuntimeError(f"development_model_assets_invalid: {binding_ref}")
     if value:
@@ -1396,7 +1364,6 @@ def _development_assets(binding_ref: str, value: object) -> Mapping[str, Mapping
             "development_model_assets_unsupported: local modeled development does not "
             f"yet stream TensorFS logical assets for {binding_ref}"
         )
-    return {}
 
 
 def _exact_model_ref(value: str) -> tuple[str, str, str]:
@@ -1498,8 +1465,8 @@ def run_slice(
     binding_records: list[dict[str, Any]] | None = None,
     *,
     workspace: Path,
-    package_revision_digest: str,
-    package_descriptor: Mapping[str, Any] | None = None,
+    package_code_digest: str,
+    package_interface_document: Mapping[str, Any] | None = None,
     found: Any = None,
     development_artifact_store: Path | None = None,
     development_binding_overrides: Mapping[str, str] | None = None,
@@ -1522,13 +1489,13 @@ def run_slice(
         )
     bindings: dict[str, str] = {}
     staged: StagedDevelopmentPlacement | None = None
-    if package_descriptor is not None:
+    if package_interface_document is not None:
         if request.kind != "entrypoint":
             raise RuntimeError("only a serving run accepts a package binding closure")
         source_digest = development_source_digest(Path.cwd().resolve())
         staged = stage_development_placement(
             config.cozy_home,
-            package_descriptor,
+            package_interface_document,
             package="local/development-package",
             release="0.0.0",
             source_digest=source_digest,
@@ -1543,10 +1510,10 @@ def run_slice(
         request,
         bindings,
         workspace,
-        package_revision_digest=(
+        package_code_digest=(
             documents.spell(staged.placement.development.source_digest)
             if staged is not None
-            else package_revision_digest
+            else package_code_digest
         ),
         placement=staged.placement if staged is not None else None,
         auto_ack=auto_ack,

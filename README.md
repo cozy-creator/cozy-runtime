@@ -28,7 +28,7 @@ worker-control compatibility contract.
 
 **One end-to-end test suite, no mocks.** `uv run pytest` runs against
 `examples/marco-polo` through the public CLI installed from a freshly built wheel into a venv
-that has nothing else: describe, an exact byte-identical descriptor replay, the exit-code
+that has nothing else: describe, an exact byte-identical package interface replay, the exit-code
 matrix, one served request, and one job through the real two-process worker. Nothing is
 stubbed, patched or doubled — a test that passes because a fake agreed with it is worse than
 no test. The two legs that SPAWN AN EXECUTOR skip where the host cannot contain one (a
@@ -108,7 +108,7 @@ header, or authentication fallback.
 
 `checks/architecture.py` keeps versioned identities in two disjoint registries.
 `DOCUMENT_KINDS` contains only stored or digested documents that cross a process/repository
-boundary: PackageDescriptor, EnvironmentReceipt, and the code-topologies memo.
+boundary: PackageInterface, EnvironmentReceipt, and PackageEnvironment.
 `IMPLEMENTATION_IDS` contains the six encoding-provider names whose exact strings enter
 implementation, plan, and generation digests; those names are executable identity, not document
 formats. Command requests, planner values, worker records, proof-local state, and benchmark reports
@@ -135,6 +135,14 @@ the silence detector reads. Credential-shaped VALUES — signed URLs, bearer and
 spellings — are redacted at the emit boundary and counted. Nothing is refused: observability
 may not fail the thing it observes, and field NAMES are not inspected at all, because the
 name regex that used to be here false-positived on `output_tokens` and `eos_token`.
+
+Progress names the package's execution stage. `tel.progress(stage_fraction, stage=...,
+overall_fraction=...)` keeps resettable within-stage progress distinct from optional monotonic
+whole-invocation progress. `tel.step_callback(total, stage=..., overall_range=(start, end))`
+adds exact work-unit coordinates and maps counted steps into a package-owned overall range;
+`tel.stage(name, overall_range=...)` reports only entry/success boundaries, never an invented
+within-stage percentage. Invalid progress is omitted and diagnosed on the same bounded lossy
+lane; it cannot route, settle, bill, or otherwise control an attempt.
 
 **Every terminal attempt commits one bounded triage record** — identity, applied posture,
 ledger reconciliation, attribution, confessions, faults, and the capped observation tail —
@@ -219,36 +227,34 @@ worker's own bookkeeping, `measured` for a named device or kernel interface,
 one) and the METHOD that produced it. Every attempt closes by reconciling every class
 against the line taken before its envelope was granted, and the record is recorded.
 
-## The descriptor
+## The package interface
 
 `internal/discovery.py` is the isolation boundary: it imports exactly the ONE `App` export
 package.toml names, freezes it, and stops. Importing a module never registers anything, so
 there is no recursive discovery, no dependency stubbing and no source parser — a red arm
 plants a self-registering sibling module and proves describe cannot see it.
 
-`internal/descriptor.py` is the schema home for `PackageDescriptor`/`JobDescriptor`: only
+`internal/package_interface.py` is the schema home for `PackageInterface`/`JobDescriptor`: only
 the launch and invocation facts with current readers. It carries no Runtime-global service
-inventory, diagnostics, config UI metadata, or code topology (the derive owns that), and
+inventory, diagnostics, config UI metadata, or tensor requirements (the derive owns that), and
 `_fixed_point` proves over the built document that no release digest, build timestamp,
 machine path or mutable binding reached it. A slot is `{path, class, component_use,
 encoded_leaves}`; the deleted `stamps` and `source_profile` members refuse typed
-(`descriptor.stamps_retired`, `descriptor.source_profile_retired` — the hub's names) when
+(`package_interface.stamps_retired`, `package_interface.source_profile_retired`) when
 they carry a value, and an empty `stamps` map is read as nothing declared because every
 release published before the cut ships one.
 Packages declare no GPU count, VRAM floor, accelerator class, placement, or free-form hardware
 predicate. Those facts come from the selected model lane and its concrete topology/encoding,
 RecordOwner placement, qualification measurements, and the worker's observed machine. The
-descriptor reader rejects the retired `resources` key as an unknown field; format `/1` has one
+interface reader rejects the retired `resources` key as an unknown field; format `/1` has one
 current grammar and no compatibility decoder.
 An ordinary `@app.job` may opt into source-first model production without introducing another
-workflow language. A slot's entire declaration is its class annotation (cr-077): the
-publish-time code topology derives from the class's own factory, selection defaults live
+workflow language. A slot's entire declaration is its class annotation (cr-077); selection defaults live
 in `package.toml [bindings."<callable>.models.<param>"]` (the slot path is the one binding
 grammar; the class-keyed spelling refuses `binding_class_key_retired`), and the actual
 binding is dispatch. The retired `source_profiles=` decorator field refuses with the typed
-code `source_profiles_retired`. Each `WeightsOutput` may declare `topology_digest=` and a
-sorted `encodings=` tuple. Those exact requirements appear under the output's
-`required_contract`; Tensorhub derives both from the produced header before retention. The
+code `source_profiles_retired`. Each `WeightsOutput` declares only its name and new-byte ceiling;
+the produced CozyTensors header is the sole tensor-schema and encoding authority. The
 executor still receives only verified model capabilities, never the foreign source credential or
 destination authority. Multiple transformations are ordinary code inside one bounded job—there is
 no `model_productions` graph, compatibility reader, or second scheduler.
@@ -256,10 +262,11 @@ no `model_productions` graph, compatibility reader, or second scheduler.
 `checks/architecture.py`'s `canonical-numbers` fence replays it over the frozen ES6 vector
 corpus in `vectors/es6-numbers.txt`.
 
-The descriptor is derived, not committed. `cozy-runtime --json --dir PROJECT describe` writes
-the canonical descriptor bytes to stdout without modifying the project. Creator sends those
-bytes with the source release; Tensorhub independently derives the descriptor from the installed
-project wheel and compares it. `package_descriptor_digest` is SHA-256 over those canonical bytes.
+The package interface is derived, not committed to the source tree. `cozy-runtime --json --dir
+PROJECT describe` writes canonical bytes to stdout. Creator places those exact bytes at
+`metadata/package-interface.json` in the ordinary uploaded package file tree; Tensorhub derives
+the same interface from the installed project wheel and compares it. `package_interface_digest`
+is SHA-256 over those canonical bytes.
 
 ## Commands
 
@@ -283,7 +290,7 @@ installed a second time inside a rental.
 Runtime observes the interpreter it will actually execute once per worker boot: CPython ABI,
 Linux architecture/glibc, uv, standard-library roots, every installed distribution version for
 dependency resolution, and import-root ownership for the protected Python/Torch/Triton/CUDA/
-NVIDIA/cozy-runtime/TensorFS families plus msgspec, Runtime's public descriptor ABI. Packages may
+NVIDIA/cozy-runtime/TensorFS families plus msgspec, Runtime's public interface ABI. Packages may
 still carry their own incompatible ordinary dependencies when the selected base does not own that
 distribution.
 Runtime measures each arriving wheel's real ZIP roots and rejects protected distribution/root
@@ -303,7 +310,7 @@ The rented-pod worker stays root and non-dumpable; the exec-first trampoline set
 and drops package execution to uid/gid 65533. Runtime keeps control state in memory because its
 pod-supervisor owns the durable replay ledger. Receipts, acquisition cache, and worker credentials
 remain root-only. Content is root-owned/read-only. The worker keeps no scratch tree: an attempt's
-spool and a derived descriptor's handoff live under its `run/` root for exactly one attempt or
+spool and a derived interface's handoff live under its `run/` root for exactly one attempt or
 call, and bytes a job stages are the owner's `tmp/<request-id>/`, granted per run and removed by
 the owner when the request settles. A worker that cannot perform the
 identity split refuses before binding. Native/local development keeps its explicit same-user lane.
@@ -313,10 +320,11 @@ with the venv's own Python; it receives no package `PYTHONPATH` or appended impo
 
 Local installed packages use the same ordinary venv boundary but not the rental base policy.
 Creator resolves the full lock with uv, so two local packages may carry different Python or Torch
-families. `prepare-package --environment-python <venv>/bin/python` validates that existing venv and
-recognizes exact non-protected project/dependency versions as contents of that completed package
-environment, not as worker-image distributions. A version disagreement or protected-family/root
-collision still refuses. It then authors the descriptor and PlacementSet without installing
+families. `prepare-package --environment-python <venv>/bin/python --package-interface
+<download>/metadata/package-interface.json` validates that existing venv and the exact published
+interface, and recognizes exact non-protected project/dependency versions as contents of that
+completed package environment, not as worker-image distributions. A version disagreement or
+protected-family/root collision still refuses. It then authors the PlacementSet without installing
 another environment. Local `serve`
 receives the same `--environment-python`; `--environment-root` is reserved for rental
 materialization and the two flags are mutually exclusive.
@@ -334,7 +342,7 @@ and facts. No project wheel, release.json, Environment, or receipt is invented.
 For a modeled entrypoint, Runtime resolves package.toml through its existing binding owner and
 joins the exact release/lane through the explicitly granted local TensorFS Repository. The
 Placement carries the ordinary exact Manifest/config/component facts; at acquisition
-the launch Runtime re-reads the source descriptor and TensorFS Manifest/header/config, derives the
+the launch Runtime re-reads the source interface and TensorFS Manifest/header/config, derives the
 same binding locally, and compares every accepted fact before STAGED. Creator owns the source-file
 digest and closes its scan race before replacing the whole worker generation after edits; Runtime
 does not invent a second source hash. TensorFS logical assets refuse typed in this first lane
@@ -406,8 +414,8 @@ TensorFS cache proof checks non-empty model downloaded/reused accounting.
 --config <document> [--application <module:attr> | --dir <project>] [--out <dir>]`
 (`cli/derive.py`) is the code side: `census(factory(config_document))` on the meta device,
 in one bounded child of the package's own interpreter (`internal/derive_child.py` — no
-network, no weight bytes, no writes, no CUDA), emitted as the canonical TensorFS
-CodeTopology: rows with `accepts` from the class's `encoded_leaves`, plus the components the
+network, no weight bytes, no writes, no CUDA), emitted as canonical TensorRequirements: rows
+with `accepts` from the class's `encoded_leaves`, plus the components the
 factory constructed in order (D9). Hardware-independent (a construction that reads the
 device refuses, D3) and deterministic — the child derives twice and refuses a construction
 that differs from itself. The checkpoint side is the cozytensors header, and the ONE answer
@@ -418,53 +426,12 @@ carrying the Fit document verbatim. The runtime keeps no matcher of its own. Eve
 PlacementSet writer (`worker/package_prepare.py`, `internal/local.py`) fills
 `Slot.components` from the derive, never from the header.
 
-`cozy-model-contract-proof REQUEST.json OUTPUT_DIR` (`cli/code_topologies.py`; the script
-name is what cozy-creator's publish invokes until cl-094 moves it to `cozy-runtime derive`)
-is the author-side writer of the publish memo `cozy.package.code-topologies/1`. It runs on
-the publishing author's machine inside the project venv (`uv run --locked`), never on the
-hub: it compares the exact publishing descriptor with the project source and derives every
-requested slot CLASS through the same child, then publishes one row per
-(slot, config_digest) referencing the code-topology document by digest. The fresh output
-directory appears atomically: the memo index in `result.json` plus exact digest-named
-CodeTopology documents under `code-topologies/`. The construction seed (the config document
-of the slot's default `package.toml [bindings]` checkpoint, resolved by the publisher) is an
-input only — its identity never enters the memo. There is no ModelConstructionContract, no
-hardware variant, no verdict: Tensorhub stores the memo and never grades it. The memo binds
-the release VERSION (`org/package@1.0.0`), never a release digest — the digest exists only
-once Tensorhub finalizes the upload the envelope rides in.
-
-The request is a closed local process input, sorted unique by slot class. Config and
-descriptor input refs bind exact local bytes for proof ingestion. Their generic `digest`
-is byte integrity and is never compared with semantic `package_descriptor_digest`:
-
-```json
-{
-  "project": "/home/author/package",
-  "package": {"package": "org/package", "release": "1.0.0", "project_wheel": {"ref": {"digest": "sha256:<64 lowercase hex>", "length": 1234}, "distribution": "package", "filename": "package-1.0.0-py3-none-any.whl", "import_roots": ["package"], "tags": ["py3-none-any"], "version": "1.0.0"}},
-  "package_descriptor": {
-    "path": "/proof/package.descriptor.json",
-    "digest": "sha256:<64 lowercase hex>",
-    "length": 5678
-  },
-  "slots": [{
-    "class": "SdxlModel",
-    "snapshot": "sha256:<64 lowercase hex>",
-    "config": {
-      "path": "/proof/model-config.json",
-      "digest": "sha256:<64 lowercase hex>",
-      "length": 9012
-    },
-    "hardware_variants": ["sm89", "sm90"]
-  }]
-}
-```
-
 A package whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
-`describe` refuses the release if PyAV is absent. The descriptor publishes the hard per-field
+`describe` refuses the release if PyAV is absent. The package interface publishes the hard per-field
 codec ceilings and the attempt-wide retained decoded-value ceiling.
 
 A package that prepares, binds, or fills a model selects `cozy-runtime[model-execution]`.
-That Runtime capability owns `tensorfs>=0.1,<1` from PyPI; package code does not declare
+That Runtime capability owns `tensorfs>=0.2,<1` from PyPI; package code does not declare
 TensorFS directly. Every approved base worker image already owns the same distribution, so
 rental overlay export prunes it and Runtime observes the image-provided facade before
 execution.
@@ -481,21 +448,14 @@ flat binding record or pretends the local selection carries Tensorhub's hardware
 On a private rental, an editable checkout is not mounted or watched. Creator builds one exact
 ephemeral project wheel and closed dependency-wheel set, and pod-supervisor verifies their bounded
 WorkerControl chunks into local files. The loopback-only
-`RuntimePreparation.PrepareLocalPackage` method then calls the same wheel/base/venv/descriptor/
+`RuntimePreparation.PrepareLocalPackage` method then calls the same wheel/base/venv/interface/
 job-plan implementation as a published package. Its resulting Placement uses
 `DevelopmentPackage` source identity plus the measured project wheel and Environment, so it cannot
 masquerade as a Tensorhub release. Runtime receives no source path, URL, credential, or catalog
 authority.
 
-**TensorFS.** The fill plane reads through tfs-007's `tensorfs` facade — a compiled
-extension that is not on an index yet, so the GPU venvs install a locally built wheel:
-
-    cd ../tensorfs && uvx maturin build --release \
-        --manifest-path crates/tensorfs-py/Cargo.toml --out /tmp/cozy-wheels
-    uv pip install --python corpus/.venv/bin/python /tmp/cozy-wheels/tensorfs-*.whl
-
-When TensorFS publishes, this becomes an ordinary pinned dependency and the step goes away.
-The base package installs and type-checks without it, exactly as it does without torch; a
+**TensorFS.** The fill plane reads through tfs-007's published `tensorfs` facade. The base
+package installs and type-checks without model execution, exactly as it does without torch; a
 fill without the reader is a typed `reader_unavailable` refusal naming the install, never an
 `ImportError` escaping a request.
 

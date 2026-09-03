@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,12 +22,11 @@ from cozy_runtime.internal import (
     base_observation,
     canonical,
     fill,
+    model_config,
     package_environment,
+    package_interface,
     placement_materialization,
     pull,
-)
-from cozy_runtime.internal import (
-    descriptor as package_descriptor,
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
@@ -224,7 +223,7 @@ def preinstalled_development(
     """Admit one independently re-derived source-checkout selection.
 
     The launch Runtime has re-read package.toml and the exact local TensorFS Repository,
-    Manifest, header and config. This function compares that derivation with every accepted
+    Manifest, and inline header config. This function compares that derivation with every accepted
     Placement fact before handing the normal attempt kernel its local resolution paths. No
     PackageRelease or Environment is invented for this same-user lane.
     """
@@ -235,11 +234,11 @@ def preinstalled_development(
     # owner may remint it while preserving the exact development closure.
     comparable_actual = {key: value for key, value in actual.items() if key != "placement_id"}
     comparable_expected = {key: value for key, value in expected.items() if key != "placement_id"}
-    if actual.get("package_descriptor") != expected.get("package_descriptor"):
+    if actual.get("package_interface") != expected.get("package_interface"):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "development_source_changed",
-            "the current checkout derives a different PackageDescriptor",
+            "the current checkout derives a different PackageInterface",
         )
     if actual.get("models", []) != expected.get("models", []):
         raise AcquisitionRefusal(
@@ -266,12 +265,6 @@ def preinstalled_development(
                 name,
             )
         for selected_slot, accepted_slot in zip(selected_slots, accepted_slots, strict=True):
-            if selected_slot.get("config") != accepted_slot.get("config"):
-                raise AcquisitionRefusal(
-                    pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                    "development_model_config_changed",
-                    name,
-                )
             if selected_slot.get("components", []) != accepted_slot.get("components", []):
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
@@ -291,27 +284,25 @@ def preinstalled_development(
             "the accepted Placement does not equal the launch Runtime's local derivation",
         )
 
-    descriptor_digest, descriptor_length = placement.package_descriptor
-    descriptor_path = cache_root / descriptor_digest.removeprefix("sha256:")
-    _verify_file(descriptor_path, descriptor_digest, descriptor_length)
+    interface_digest, interface_length = placement.package_interface
+    interface_path = cache_root / interface_digest.removeprefix("sha256:")
+    _verify_file(interface_path, interface_digest, interface_length)
     try:
-        descriptor = package_descriptor.read_bytes(
-            descriptor_path.read_bytes(), str(descriptor_path)
-        )
-    except package_descriptor.RetiredDescriptorMember as exc:
+        interface = package_interface.read_bytes(interface_path.read_bytes(), str(interface_path))
+    except package_interface.RetiredPackageInterfaceMember as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
         ) from exc
-    except package_descriptor.StalePackageDescriptor as exc:
+    except package_interface.StalePackageInterface as exc:
         raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
+            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
         ) from exc
-    visible = _visible_entrypoints(descriptor)
+    visible = _visible_entrypoints(interface)
     if set(visible) != set(expected_entries):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "binding_entrypoint_set_mismatch",
-            "PlacementSet/1 does not cover every descriptor entrypoint",
+            "PlacementSet/1 does not cover every interface entrypoint",
         )
     selected_digests = {
         str(row["entrypoint_binding_digest"]): row for row in expected_entries.values()
@@ -322,34 +313,27 @@ def preinstalled_development(
             "development_binding_set_changed",
             "the locally derived bindings do not cover the exact selected entrypoints",
         )
-    verified = descriptor_length
-    documents_count = 1
+    verified = interface_length
     for digest, binding in bindings.items():
         selected = selected_digests[digest]
         slots = selected.get("slots", [])
         if not slots:
             continue
-        selected_configs = {
-            f"{selected['name']}.models.{slot['slot']}": slot["config"]["document"]
-            for slot in slots
-        }
+        selected_paths = {f"{selected['name']}.models.{slot['slot']}" for slot in slots}
         members = binding.model_bindings()
-        if set(selected_configs) != {member.model_binding_path for member in members}:
+        if selected_paths != {member.model_binding_path for member in members}:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "development_model_slot_changed",
                 str(selected["name"]),
             )
         for member in members:
-            config = selected_configs[member.model_binding_path]
-            _verify_file(Path(member.config), str(config["digest"]), int(config["length"]))
-            verified += int(config["length"])
-            documents_count += 1
+            _verify_file(Path(member.config), member.config_digest, None)
     return AcquiredPlacement(
         None,
         bindings,
         len(placement.models),
-        documents_count,
+        1,
         0,
         0,
         verified,
@@ -476,8 +460,8 @@ class Acquirer:
 
     def acquire(self, placement: Any) -> AcquiredPlacement:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cozy-acquire") as pool:
-            package_future = pool.submit(self._run_package, placement)
             model_future = pool.submit(self._run_model, placement)
+            package_future = pool.submit(self._run_package, placement, model_future)
             installed, bindings, documents_count = package_future.result()
             model_objects = model_future.result()
         self._verify_model_refs(bindings)
@@ -493,12 +477,15 @@ class Acquirer:
         )
 
     def _run_package(
-        self, placement: Any
+        self, placement: Any, models: Future[int]
     ) -> tuple[package_environment.InstalledEnvironment, Mapping[str, DeclaredBinding], int]:
         self._thread.leg = "package"
         self.observation.start("package")
         try:
             installed = self.installed_environment or self._environment(placement)
+            # The header is the sole config authority. Environment installation overlaps the
+            # model transfer, then binding resolution waits for the verified header closure.
+            models.result()
             bindings, count = self._bindings(placement)
             return installed, bindings, count
         finally:
@@ -650,31 +637,32 @@ class Acquirer:
             ) from exc
 
     def _bindings(self, placement: Any) -> tuple[Mapping[str, DeclaredBinding], int]:
-        descriptor_digest, descriptor_length = placement.package_descriptor
-        descriptor_path = self._stage(
-            descriptor_digest, self.fetch(descriptor_digest, descriptor_length).read_bytes()
+        interface_digest, interface_length = placement.package_interface
+        interface_path = self._stage(
+            interface_digest, self.fetch(interface_digest, interface_length).read_bytes()
         )
         try:
-            descriptor = package_descriptor.read_bytes(
-                descriptor_path.read_bytes(), str(descriptor_path)
+            interface = package_interface.read_bytes(
+                interface_path.read_bytes(), str(interface_path)
             )
-        except package_descriptor.RetiredDescriptorMember as exc:
+        except package_interface.RetiredPackageInterfaceMember as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
             ) from exc
-        except package_descriptor.StalePackageDescriptor as exc:
+        except package_interface.StalePackageInterface as exc:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_descriptor_invalid", str(exc)
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
             ) from exc
-        visible = _visible_entrypoints(descriptor)
+        visible = _visible_entrypoints(interface)
         models = {str(row["id"]): row for row in placement.models}
         development = dict(getattr(placement, "development", {}))
-        release_digest = str(
-            placement.package.get("release_digest")
-            or development.get("local_revision_digest")
-            or development.get("source_digest")
-            or ""
-        )
+        selected_package = placement.package or development
+        project_wheel = selected_package.get("project_wheel", {})
+        package_code_digest = str(
+            project_wheel.get("ref", {}).get("digest", "")
+            if isinstance(project_wheel, dict)
+            else ""
+        ) or str(development.get("source_digest", ""))
         bindings: dict[str, DeclaredBinding] = {}
         count = 1
         for entrypoint in placement.entrypoints:
@@ -684,8 +672,8 @@ class Acquirer:
             if described is None:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "binding_package_descriptor_invalid",
-                    f"descriptor has no entrypoint {name!r}",
+                    "binding_package_interface_invalid",
+                    f"interface has no entrypoint {name!r}",
                 )
             slots = entrypoint.get("slots", [])
             described_models = described.get("models", [])
@@ -693,20 +681,19 @@ class Acquirer:
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "binding_slot_set_mismatch", name
                 )
-            application = str(descriptor.get("application", ""))
+            application = str(interface.get("application", ""))
             if not slots:
                 bindings[binding_digest] = DeclaredBinding(
                     entrypoint_binding_digest=binding_digest,
                     entrypoint=name,
-                    package_revision_digest=release_digest,
-                    release=release_digest,
+                    release=package_code_digest,
                     environment_digest=documents.spell(placement.environment_digest),
                     config_digest=canonical.digest({}),
                     model_class="",
                     model_binding_path="",
                     model_parameter_name="",
                     application=application,
-                    descriptor_path=str(descriptor_path),
+                    interface_path=str(interface_path),
                     development=bool(development),
                 )
                 continue
@@ -716,22 +703,21 @@ class Acquirer:
             if len(described_by_path) != len(described_models):
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    "binding_package_descriptor_invalid",
-                    f"{name}: duplicate or malformed descriptor model slot",
+                    "binding_package_interface_invalid",
+                    f"{name}: duplicate or malformed interface model slot",
                 )
             members: list[ModelBinding] = []
+            tensorfs = fill.tensorfs_module()
+            store = pull.open_store(tensorfs, self.artifact_store)
             for slot in slots:
                 path = f"{name}.models.{slot['slot']}"
                 declared = described_by_path.get(path)
                 if declared is None:
                     raise AcquisitionRefusal(
                         pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        "binding_package_descriptor_invalid",
+                        "binding_package_interface_invalid",
                         path,
                     )
-                config_ref = _ref(slot["config"]["document"], "slot.config.document")
-                config_path = self._stage(config_ref[0], self.fetch(*config_ref).read_bytes())
-                count += 1
                 reference = models[str(slot["reference_model_id"])]
                 reference_manifest = str(reference["manifest"]["digest"])
                 components = tuple(str(row["component"]) for row in slot.get("components", []))
@@ -746,7 +732,12 @@ class Acquirer:
                     for row in slot.get("components", [])
                 }
                 try:
-                    store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
+                    held = store.manifest(reference_manifest)
+                    header = tensorfs.parse_header(bytes(held["header"]))
+                    config_digest, config_bytes = model_config.construction_document(
+                        header.get("configs")
+                    )
+                    config_path = self._stage(config_digest, config_bytes)
                     model_weight_bytes = sum(
                         int(row["length"]) for row in store.walk_cozytensors(reference_manifest)
                     )
@@ -767,7 +758,7 @@ class Acquirer:
                         model_class=str(declared.get("class", "")),
                         model_binding_path=path,
                         model_parameter_name=str(slot["slot"]),
-                        config_digest=config_ref[0],
+                        config_digest=config_digest,
                         store=str(self.artifact_store),
                         config=str(config_path),
                         variant="",
@@ -779,18 +770,13 @@ class Acquirer:
                         model=f"{reference['repo']}@{reference['version']}/{reference['lane']}",
                     )
                 )
-                for asset in slot["config"].get("assets", []):
-                    ref = _ref(asset["ref"], "slot.config.asset")
-                    self._stage(ref[0], self.fetch(*ref).read_bytes())
-                    count += 1
             members.sort(key=lambda member: member.model_binding_path)
             model_set = tuple(members)
             first = model_set[0]
             bindings[binding_digest] = DeclaredBinding(
                 entrypoint_binding_digest=binding_digest,
                 entrypoint=name,
-                package_revision_digest=release_digest,
-                release=release_digest,
+                release=package_code_digest,
                 models=model_set,
                 environment_digest=documents.spell(placement.environment_digest),
                 config_digest=model_binding_set_digest(model_set),
@@ -798,7 +784,7 @@ class Acquirer:
                 model_binding_path=first.model_binding_path,
                 model_parameter_name=first.model_parameter_name,
                 application=application,
-                descriptor_path=str(descriptor_path),
+                interface_path=str(interface_path),
                 store=first.store,
                 config=first.config,
                 variant=first.variant,
@@ -820,7 +806,7 @@ class Acquirer:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "binding_entrypoint_set_mismatch",
-                "PlacementSet/1 does not select the required descriptor entrypoints",
+                "PlacementSet/1 does not select the required interface entrypoints",
             )
         return bindings, count
 
@@ -928,12 +914,12 @@ def cozytensors_ref(tensorfs: Any, raw: bytes) -> tuple[str, int]:
     return ref
 
 
-def _visible_entrypoints(descriptor: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    rows = descriptor.get("entrypoints")
+def _visible_entrypoints(interface: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = interface.get("entrypoints")
     if not isinstance(rows, list):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "package_descriptor_invalid",
+            "package_interface_invalid",
             "entrypoints is not an array",
         )
     visible = {
@@ -944,7 +930,7 @@ def _visible_entrypoints(descriptor: Mapping[str, Any]) -> dict[str, dict[str, A
     if len(visible) != len(rows):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-            "package_descriptor_invalid",
+            "package_interface_invalid",
             "entrypoint names are not unique",
         )
     return visible

@@ -12,22 +12,24 @@ from typing import Any, TypedDict
 import pytest
 import tensorfs
 
-from cozy_runtime.internal import base_observation
+from cozy_runtime.internal import base_observation, canonical, package_interface
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
 
-# Canonical CozyTensors header produced by TensorFS itself. It contains one inline f32 tensor and
-# one six-byte tokenizer asset. Keeping the bytes fixed makes this a border test: Runtime does not
-# author or reinterpret the header format.
+# Canonical CozyTensors header produced by TensorFS itself. It contains one inline JCS config, one
+# inline f32 tensor, and one six-byte tokenizer asset. Keeping the bytes fixed makes this a border
+# test: Runtime does not author or reinterpret the header format.
 _HEADER = base64.b64decode(
-    "hW1jb3p5dGVuc29ycy8xgIGFc3Rva2VuaXplci92b2NhYi50eHRYIJ5ekBAsaZRV6QOf+QMoTgaJ"
-    "OU3TRbsRRWcG8IeYTS63Bmp0ZXh0L3BsYWlugYJYIJ5ekBAsaZRV6QOf+QMoTgaJOU3TRbsRRWcG"
-    "8IeYTS63BoGFjAMLAgEABAUIBwYJCoCBg2V2YWx1ZYEAgQCBeJNQbGFpbiBsaXR0bGUtZW5kaWFu"
-    "IHJvdy1tYWpvciBzdG9yYWdlOiBvbmUgYHZhbHVlYCByb2xlIGNhcnJ5aW5nIHRoZSBsb2dpY2Fs"
-    "IGJ5dGVzIHZlcmJhdGltLiBFbnRyeSB6ZXJvIG9mIHRoZSByZWdpc3RyeTsgbm90IGEgc3BlY2lh"
-    "bCBhYnNlbnQgZm9ybS6BglggR2b5Mbu3DtQx40s05Pn8XdqBdOlvQ6is152Hme/NQ9IZAgSBgmR1"
-    "bmV0gYVmd2VpZ2h0AYEBAIGEZXZhbHVlAYEBRAAAAAA="
+    "hW1jb3p5dGVuc29ycy8xgYJkdW5ldFgceyJoaWRkZW5fc2l6ZSI6NCwibGF5ZXJzIjoxfYGFc3Rv"
+    "a2VuaXplci92b2NhYi50eHRYIJ5ekBAsaZRV6QOf+QMoTgaJOU3TRbsRRWcG8IeYTS63Bmp0ZXh0"
+    "L3BsYWlugYJYIJ5ekBAsaZRV6QOf+QMoTgaJOU3TRbsRRWcG8IeYTS63BoGFjAMLAgEABAUIBwYJC"
+    "oCBg2V2YWx1ZYEAgQCBeJNQbGFpbiBsaXR0bGUtZW5kaWFuIHJvdy1tYWpvciBzdG9yYWdlOiBv"
+    "bmUgYHZhbHVlYCByb2xlIGNhcnJ5aW5nIHRoZSBsb2dpY2FsIGJ5dGVzIHZlcmJhdGltLiBFbnRy"
+    "eSB6ZXJvIG9mIHRoZSByZWdpc3RyeTsgbm90IGEgc3BlY2lhbCBhYnNlbnQgZm9ybS6BglggR2b5"
+    "Mbu3DtQx40s05Pn8XdqBdOlvQ6is152Hme/NQ9IZAgSBgmR1bmV0gYVmd2VpZ2h0AYEBAIGEZXZh"
+    "bHVlAYEBRAAAAAA="
 )
+_CONFIG = b'{"hidden_size":4,"layers":1}'
 _ASSET = b"vocab\n"
 
 
@@ -115,3 +117,71 @@ def test_model_prep_still_requires_header_assets(tmp_path: Path) -> None:
 
     assert refused.value.code == "tensorfs_refused"
     assert hashlib.sha256(_ASSET).hexdigest() in refused.value.detail
+
+
+def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -> None:
+    store_root, manifest_id, manifest_length, store = _snapshot(tmp_path, include_asset=True)
+    acquirer = _acquirer(tmp_path, store_root)
+    body = {
+        "application": "test:app",
+        "entrypoints": [
+            {
+                "name": "generate",
+                "request": {"fields": []},
+                "result": {"fields": []},
+                "models": [
+                    {
+                        "path": "generate.models.model",
+                        "class": "test.Model",
+                        "component_use": {"generate": ["unet"]},
+                    }
+                ],
+            }
+        ],
+        "format": package_interface.SCHEMA,
+        "jobs": [],
+    }
+    interface_bytes = package_interface.canonical_bytes(body)
+    interface_digest = "sha256:" + hashlib.sha256(interface_bytes).hexdigest()
+    (acquirer.cache_root / interface_digest.removeprefix("sha256:")).write_bytes(interface_bytes)
+    slot = {
+        "slot": "model",
+        "reference_model_id": "model-0000",
+        "components": [{"component": "unet", "model_id": "model-0000"}],
+    }
+    binding_digest = (
+        "sha256:"
+        + hashlib.sha256(canonical.write({"name": "generate", "slots": [slot]})).hexdigest()
+    )
+    placement = SimpleNamespace(
+        package_interface=(interface_digest, len(interface_bytes)),
+        models=(
+            {
+                "id": "model-0000",
+                "repo": "example/model",
+                "version": "1",
+                "lane": "main",
+                "manifest": {"digest": manifest_id, "length": manifest_length},
+            },
+        ),
+        entrypoints=(
+            {"name": "generate", "entrypoint_binding_digest": binding_digest, "slots": [slot]},
+        ),
+        package={
+            "package": "example/package",
+            "release": "1",
+            "project_wheel": {"ref": {"digest": "sha256:" + "2" * 64}},
+        },
+        development={},
+        environment_digest=b"\x33" * 32,
+    )
+
+    bindings, documents_count = acquirer._bindings(placement)
+
+    (model,) = bindings[binding_digest].model_bindings()
+    assert tensorfs.parse_header(bytes(store.manifest(manifest_id)["header"]))["configs"] == {
+        "unet": _CONFIG
+    }
+    assert Path(model.config).read_bytes() == _CONFIG
+    assert model.config_digest == "sha256:" + hashlib.sha256(_CONFIG).hexdigest()
+    assert documents_count == 1  # PackageInterface only; config is not a downloaded document.

@@ -187,7 +187,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         )
     if all(development.values()):
         from cozy_runtime.author import ConformanceError
-        from cozy_runtime.internal import descriptor, local
+        from cozy_runtime.internal import local, package_interface
         from cozy_runtime.internal.discovery import discover
 
         project = Path(development["--development-project"]).expanduser().resolve()
@@ -195,7 +195,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             found = discover(project)
             staged = local.stage_development_placement(
                 config.cozy_home,
-                descriptor.build(found),
+                package_interface.build(found),
                 package=development["--development-package"],
                 release=development["--development-release"],
                 source_digest=development["--development-source-digest"],
@@ -262,7 +262,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
     """Internal Creator plumbing for one honest source-checkout PlacementSet."""
 
     from cozy_runtime.author import ConformanceError
-    from cozy_runtime.internal import descriptor, local
+    from cozy_runtime.internal import local, package_interface
     from cozy_runtime.internal.discovery import discover
     from cozy_runtime.internal.worker.session import SEMVER
     from cozy_runtime.protocol import documents
@@ -312,7 +312,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
     try:
         found = discover(project)
         development = local.development_placement_documents(
-            descriptor.build(found),
+            package_interface.build(found),
             package=package,
             release=release,
             source_digest=source_digest,
@@ -338,7 +338,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
         ) from exc
     placement_bytes = documents.canonical_bytes(pb.PlacementSet(placements=[development.placement]))
     placement_digest = "sha256:" + hashlib.sha256(placement_bytes).hexdigest()
-    descriptor_digest = "sha256:" + hashlib.sha256(development.descriptor).hexdigest()
+    interface_digest = "sha256:" + hashlib.sha256(development.package_interface).hexdigest()
     document = {
         "package": package,
         "release": release,
@@ -348,10 +348,10 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
             "digest": placement_digest,
             "length": len(placement_bytes),
         },
-        "package_descriptor": {
-            "canonical_bytes_base64": base64.b64encode(development.descriptor).decode(),
-            "digest": descriptor_digest,
-            "length": len(development.descriptor),
+        "package_interface": {
+            "canonical_bytes_base64": base64.b64encode(development.package_interface).decode(),
+            "digest": interface_digest,
+            "length": len(development.package_interface),
         },
     }
     return Result(

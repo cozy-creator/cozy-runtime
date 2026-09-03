@@ -8,7 +8,7 @@ Nothing durable lives here — no records, no credential, no monotone wire count
 Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
 
     hello     process facts: pid, parent, no_new_privs, oom_score_adj, the SEALED env
-    describe_installed  derive one installed package descriptor into brokered scratch
+    describe_installed  derive one installed PackageInterface into brokered scratch
     prepare   construct + fill one binding; report the construction digest and ready facts
     prepare_request  resolve ONE request (decode, normalize, preflight) and retain it, so
               the worker prices a plan against the record the handler will actually run
@@ -55,7 +55,7 @@ from cozy_runtime.author._invoke import (
 )
 from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._services import ProgressFrame
-from cozy_runtime.internal import accel, canonical, child_env, descriptor, sandbox
+from cozy_runtime.internal import accel, canonical, child_env, package_interface, sandbox
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
 from cozy_runtime.internal.exits import Exit
@@ -353,15 +353,15 @@ class Executor:
     # ------------------------------------------------------------------ prepare
 
     def describe_installed(self, command: dict[str, Any]) -> dict[str, Any]:
-        """Import one installed package and write its descriptor to brokered scratch."""
+        """Import one installed package and write its interface to brokered scratch."""
 
         distribution = str(command.get("distribution", ""))
         output = Path(str(command.get("output", "")))
         if not distribution or not output.is_absolute():
             return {"ok": False, "code": "package_prepare_path_invalid", "detail": "paths"}
         discovered = discover_distribution(distribution)
-        body = descriptor.build(discovered)
-        raw = descriptor.canonical_bytes(body)
+        body = package_interface.build(discovered)
+        raw = package_interface.canonical_bytes(body)
         with output.open("xb") as stream:
             stream.write(raw)
             stream.flush()
@@ -813,7 +813,7 @@ class Executor:
             release=str(binding["release"]),
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
             config_digest=canonical.digest(config_document),
-            topology_digest=canonical.digest(
+            tensor_requirements_digest=canonical.digest(
                 {
                     key: [list(spec.shape), spec.dtype, spec.encoding]
                     for key, spec in sorted(topology_of(rows).items())
@@ -860,7 +860,7 @@ class Executor:
                 devices=_sealed_entries(),
                 plan_digest=rank_invariant_digest(plan.identity()),
                 construction_digest=(
-                    construction.config_digest + "/" + construction.topology_digest
+                    construction.config_digest + "/" + construction.tensor_requirements_digest
                 ),
                 authorized_device_limit_bytes=authorized,
             )
@@ -1139,7 +1139,7 @@ class Executor:
         constructed_preimage = canonical.write(
             {
                 "plan_digest": plan.digest(),
-                "topology_digest": record.topology_digest,
+                "tensor_requirements_digest": record.tensor_requirements_digest,
                 "config_digest": record.config_digest,
                 # THE APPLIED CEILING, derived from the card (cl-027).
                 "resident_budget_bytes": resident_budget,
@@ -1174,7 +1174,11 @@ class Executor:
                 # is what the fill committed and the ceiling it committed under.
                 theirs = dict(reply.get("facts") or {})
                 agreed: list[tuple[str, object, object]] = [
-                    ("topology_digest", record.topology_digest, theirs.get("topology_digest")),
+                    (
+                        "tensor_requirements_digest",
+                        record.tensor_requirements_digest,
+                        theirs.get("tensor_requirements_digest"),
+                    ),
                     ("config_digest", record.config_digest, theirs.get("config_digest")),
                     ("filled_bytes", record.filled_bytes, theirs.get("filled_bytes")),
                     (
@@ -1211,7 +1215,7 @@ class Executor:
             "fill_ms": backend.stats.get("fill_ms", 0),
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
-            "topology_digest": record.topology_digest,
+            "tensor_requirements_digest": record.tensor_requirements_digest,
             "config_digest": record.config_digest,
             "device_free_bytes": memory["driver_free_bytes"],
             "device_total_bytes": memory["driver_total_bytes"],
@@ -1446,11 +1450,11 @@ class Executor:
         }
 
     def _discover_provisioned(self, binding: Mapping[str, Any]) -> None:
-        """Import the installed release or explicit development source and bind its descriptor."""
+        """Import the installed release or development source and bind its PackageInterface."""
 
         application = str(binding.get("application") or "")
-        descriptor_path = str(binding.get("package_descriptor") or "")
-        if not application or not descriptor_path:
+        interface_path = str(binding.get("package_interface") or "")
+        if not application or not interface_path:
             raise RuntimeError("executor requires the canonical installed release identity")
         development_project = str(binding.get("development_project") or "")
         discovered = (
@@ -1458,11 +1462,11 @@ class Executor:
             if development_project
             else discover_installed(application)
         )
-        published = descriptor.read_bytes(Path(descriptor_path).read_bytes(), descriptor_path)
-        descriptor.compare(
+        published = package_interface.read_bytes(Path(interface_path).read_bytes(), interface_path)
+        package_interface.compare(
             published,
-            descriptor.build(discovered),
-            ("provisioned PackageDescriptor", "installed package"),
+            package_interface.build(discovered),
+            ("provisioned PackageInterface", "installed package"),
         )
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
@@ -1755,7 +1759,7 @@ class Executor:
             binding = declared[parameter]
             if not isinstance(row, Mapping) or row.get("class") != binding.class_key:
                 raise CapabilityError(
-                    f"job Model parameter {parameter!r} changed its descriptor class",
+                    f"job Model parameter {parameter!r} changed its interface class",
                     code="job_model_class_mismatch",
                 )
             manifest = str(row.get("manifest", ""))
@@ -1813,7 +1817,7 @@ class Executor:
                 self._discover_provisioned(
                     {
                         "application": command["application"],
-                        "package_descriptor": command["package_descriptor"],
+                        "package_interface": command["package_interface"],
                     }
                 )
             except Exception as exc:
@@ -2120,9 +2124,12 @@ class Executor:
                             "event": "progress",
                             "request_id": request_id,
                             "kind": "progress",
-                            "name": str(frame.name)[:120],
-                            "value": frame.fraction,
+                            "stage": frame.stage,
+                            "stage_fraction": frame.stage_fraction,
+                            "overall_fraction": frame.overall_fraction,
                             "position": frame.position,
+                            "total": frame.total,
+                            "advance": frame.advance,
                             "step_ms": frame.step_ms,
                         }
                     )

@@ -1496,7 +1496,7 @@ def _install_with_uv(
         # The boot-install slow path (cr-070): ONE online resolve of exactly the named
         # image-owned distributions, `--no-deps` so no digest-verified lock wheel is ever
         # replaced by a resolver choice. `_verify_boot_installs` then proves each installed
-        # version in range, and the descriptor derivation exercises the joined venv for real.
+        # version in range, and the package interface derivation exercises the joined venv for real.
         commands.append(
             [
                 str(uv),

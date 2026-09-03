@@ -522,7 +522,7 @@ class Checkpoint:
         """The store's own read plan over the traversal THIS PLANE asks for.
 
         cr-005's rule survives the swap and is now the store's to keep: read order is the
-        STORE's, write order is the CONTRACT's. The runtime hands over the code-topology
+        STORE's, write order is the CONTRACT's. The runtime hands over TensorRequirements
         traversal and TensorFS decides how to touch the disk for it.
 
         `components` DECLARES what this plan is for (#570b), and the fill plane always knows
@@ -654,7 +654,7 @@ def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
 
     The spec's `encoding` carries the tensor's real ALIAS rather than a constant `plain`:
     the match itself is over logical shape (an encoding rung changes no topology — every
-    rung of one model shares its `topology_digest`), but a table that lied about the
+    rung of one model shares its `tensor_requirements_digest`), but a table that lied about the
     encoding would be the only place in the runtime that did.
     """
     return {
@@ -1225,7 +1225,7 @@ class StreamingFillBackend:
         from. The document comes back verbatim; on `ok` the keys `local` custody ignored
         leave the fill's completeness set so the commit does not miss them.
         """
-        from cozy_runtime.internal import canonical, code_topology
+        from cozy_runtime.internal import canonical, tensor_requirements
         from cozy_runtime.internal.probe import observed_capability_records
 
         tensorfs = tensorfs_module()
@@ -1252,11 +1252,13 @@ class StreamingFillBackend:
                 for d in walked.destinations
                 if d.component in members
             ]
-            code = code_topology.tensorfs_bytes(rows, constructed, encoded_leaves=encoded_leaves)
+            requirements = tensor_requirements.canonical_bytes(
+                rows, constructed, encoded_leaves=encoded_leaves
+            )
             with store_refusals(f"fitting {checkpoint.manifest_id[:23]}"):
                 fit = dict(
                     tensorfs.fit(
-                        code,
+                        requirements,
                         checkpoint.header_bytes,
                         custody=self.custody,
                         device=self.device_facts.predicate,
@@ -1526,7 +1528,7 @@ class StreamingFillBackend:
         if spec.nbytes and spec.nbytes != row.nbytes:
             raise _refuse(
                 "length_mismatch",
-                f"{key}: the code topology says {spec.nbytes} B, the checkpoint header "
+                f"{key}: the tensor requirements says {spec.nbytes} B, the checkpoint header "
                 f"{row.nbytes} B",
                 [key],
             )

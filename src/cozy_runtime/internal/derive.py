@@ -35,7 +35,7 @@ from types import ModuleType
 from typing import Any, Literal, cast
 
 from cozy_runtime.author._loader import Artifact, Census, Loader, census, loading
-from cozy_runtime.internal import code_topology
+from cozy_runtime.internal import tensor_requirements
 
 SUBSTRATE = "meta-device"
 
@@ -131,7 +131,7 @@ def _refuse_compile() -> Iterator[None]:
     """`torch.compile` during construction REFUSES, naming itself.
 
     It wraps the module in an `OptimizedModule` whose every `state_dict` key gains an
-    `_orig_mod.` prefix, so the derived code topology would demand `blk._orig_mod.weight`
+    `_orig_mod.` prefix, so the derived tensor requirements would demand `blk._orig_mod.weight`
     from checkpoints that carry `blk.weight` — a construction that no artifact on earth
     satisfies. v1 could not refuse (its h3 package compiled the VAE decoder for a real
     1.68x serve win) so it neutered compile to eager for the drive (pgw#1659, after a
@@ -148,7 +148,7 @@ def _refuse_compile() -> Iterator[None]:
         raise ConstructionFault(
             "torch.compile",
             "compiling during construction renames every destination with an `_orig_mod.` "
-            "prefix, so the derived code topology matches no checkpoint. Compilation is a "
+            "prefix, so the derived tensor requirements matches no checkpoint. Compilation is a "
             "runtime plan decision, never a construction fact — delete the call from load()",
             site=_author_site(),
         )
@@ -711,7 +711,7 @@ _KNOWN: tuple[tuple[str, str, str], ...] = (
     (
         "uninitialized parameter",
         "torch.nn.LazyModuleMixin",
-        "a lazy module has NO shape until its first forward, so there is no code topology "
+        "a lazy module has NO shape until its first forward, so there is no tensor requirements "
         "to derive and no checkpoint key to match. Declare the shapes in `__init__`",
     ),
     (
@@ -756,7 +756,7 @@ def _classify(exc: Exception) -> DeriveError:
 def component_members(built: Sequence[object]) -> list[tuple[str, object]]:
     """The component roots, by the SAME rule the fill plane used (`_loader.census`).
 
-    Two component tables that can disagree are two topologies, and only one of them gets
+    Two component tables that can disagree are two schemas, and only one of them gets
     filled — so this reuses the loader's own member walk rather than restating it.
     """
     from cozy_runtime.author._loader import ModuleLike, Scheduler, _members
@@ -903,7 +903,7 @@ def _refuse_wrapper(name: str, member: Any) -> None:
         raise ConstructionFault(
             "torch.nn.LazyModuleMixin",
             f"component {name!r} holds an UninitializedParameter: a lazy module has NO "
-            "shape until its first forward, so there is no code topology to derive and no "
+            "shape until its first forward, so there are no TensorRequirements to derive and no "
             "checkpoint key to match. Declare the shapes in `__init__`",
         )
 
@@ -913,7 +913,7 @@ def _refuse_wrapper(name: str, member: Any) -> None:
 
 @dataclass(frozen=True, slots=True)
 class Derivation:
-    """The CODE TOPOLOGY one `load()` derives, plus the load's own bookkeeping.
+    """The TensorRequirements one `load()` derives, plus its bookkeeping.
 
     It is a pure function of (factory, config document): no candidate, no snapshot, no
     hardware variant and no verdict (model-code-fit §3, D3). The `factory` and
@@ -934,21 +934,17 @@ class Derivation:
     def components(self) -> tuple[str, ...]:
         return tuple(d.component for d in self.destination_sets)
 
-    def rows(self) -> list[code_topology.Row]:
+    def rows(self) -> list[tensor_requirements.Row]:
         """The code destinations as `(component, key, dtype?, shape)` — the one projection
-        `tensorfs.code_topology` reads, shared with the serving census."""
+        TensorFS reads, shared with the serving census."""
         return [
             (t.component, t.key[len(t.component) + 1 :], t.dtype, t.shape)
             for t in self.logical_tensors
         ]
 
-    def code_topology(self) -> dict[str, Any]:
-        """`component → key → {shape, dtype?}` in the runtime's memo spelling."""
-        return code_topology.memo_document(self.rows(), self.components)
-
-    def tensorfs_bytes(self, *, encoded_leaves: str) -> bytes:
-        """The canonical TensorFS CodeTopology `tensorfs.fit` and the memo consume."""
-        return code_topology.tensorfs_bytes(
+    def tensor_requirements_bytes(self, *, encoded_leaves: str) -> bytes:
+        """Canonical TensorRequirements consumed by exact TensorFS fit."""
+        return tensor_requirements.canonical_bytes(
             self.rows(), self.components, encoded_leaves=encoded_leaves
         )
 
@@ -962,7 +958,7 @@ def derive(
     backend: Any = None,
     substrate_device: str = "meta",
 ) -> Derivation:
-    """Execute `model.load(loader)` on the meta substrate and derive its code topology.
+    """Execute `model.load(loader)` on the meta substrate and derive TensorRequirements.
 
     `mode="serve"` runs the IDENTICAL substrate and the identical walk, and differs only in
     that the fill path runs. That is the derive/serve fence made mechanical rather than
@@ -970,7 +966,7 @@ def derive(
     substrate and one census, and the only branch between them is whether bytes are moved
     into destinations the census has already agreed on.
 
-    A construction that reads the device is refused (D3): a code topology is
+    A construction that reads the device is refused (D3): TensorRequirements is
     hardware-independent, and a factory that branches on the card has no single one.
     """
     torch = torch_module()
@@ -990,7 +986,7 @@ def derive(
     if cap.read:
         raise ConstructionFault(
             "hardware-conditional construction",
-            "the construction read the device capability — a code topology is a function "
+            "the construction read the device capability — TensorRequirements is a function "
             "of the config document alone (model-code-fit D3); construction that differs "
             "per card is unrepresentable",
         )

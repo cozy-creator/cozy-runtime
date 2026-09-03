@@ -35,7 +35,7 @@ from cozy_runtime.author._weights import (
     WeightsSourceTensor,
     WeightsTarget,
 )
-from cozy_runtime.protocol import documents, weights_limits
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 _OUTPUT_SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")
@@ -409,15 +409,6 @@ class WeightsTransactionHost:
                 "TensorFS receipt declaration differs from the locked weights request",
                 code="weights_receipt_mismatch",
             )
-        evidence = value.get("checkpoint_evidence_canonical_bytes")
-        if (
-            not isinstance(evidence, bytes)
-            or not 0 < len(evidence) <= weights_limits.MAX_CHECKPOINT_EVIDENCE_BYTES
-        ):
-            raise CapabilityError(
-                "TensorFS receipt carries no bounded CheckpointEvidence",
-                code="weights_receipt_mismatch",
-            )
         return value
 
     @staticmethod
@@ -428,23 +419,12 @@ class WeightsTransactionHost:
         *,
         replayed: bool,
     ) -> WeightsReceipt:
-        evidence = facts["checkpoint_evidence_canonical_bytes"]
-        assert isinstance(evidence, bytes)
-        serializable = dict(facts)
-        try:
-            serializable["checkpoint_evidence_canonical_bytes"] = evidence.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise CapabilityError(
-                "TensorFS CheckpointEvidence is not canonical UTF-8",
-                code="weights_receipt_mismatch",
-            ) from exc
-        raw = canonical_json.encode(serializable)
+        raw = canonical_json.encode(facts)
         return WeightsReceipt(
             output_slot=output_slot,
             weights_transaction_id=transaction_id,
             tensorfs_receipt_digest="sha256:" + hashlib.sha256(raw).hexdigest(),
             tensorfs_receipt=raw,
-            checkpoint_evidence_canonical_bytes=evidence,
             replayed=replayed,
         )
 
@@ -567,7 +547,6 @@ def protocol_receipt(
         weights_transaction_id=receipt.weights_transaction_id,
         tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
         tensorfs_receipt_canonical_bytes=receipt.tensorfs_receipt,
-        checkpoint_evidence_canonical_bytes=receipt.checkpoint_evidence_canonical_bytes,
     )
     canonical_bytes, digest = documents.identity(body)
     return (

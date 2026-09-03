@@ -1,4 +1,4 @@
-"""The descriptor's request/result projection over the author's own type system.
+"""The package interface's request/result projection over the author's own type system.
 
 `internal/schema.render` is the real production renderer — the one `describe` runs and the
 one whose output is a PUBLICATION fact. The arms below are the types msgspec codes and
@@ -42,7 +42,7 @@ def test_msgspec_native_containers_project() -> None:
 
 
 def test_types_with_no_interoperable_spelling_are_opaque_not_refusals() -> None:
-    """`bytes` and `datetime` are msgspec-native. The descriptor names them and moves on."""
+    """`bytes` and `datetime` are msgspec-native. The package interface names them and moves on."""
     assert render(bytes) == {"opaque": "bytes"}
     assert render(datetime.datetime) == {"opaque": "datetime"}
 
@@ -59,7 +59,7 @@ def test_an_enumeration_the_wire_cannot_name_degrades_instead_of_refusing() -> N
 
 
 def test_unknown_meta_constraints_pass_through_verbatim() -> None:
-    """A constraint msgspec APPLIES must reach the descriptor, learned by Creator or not."""
+    """A constraint msgspec APPLIES must reach the package interface, learned by Creator or not."""
 
     class Request(msgspec.Struct):
         count: Annotated[int, msgspec.Meta(lt=64, ge=1)]

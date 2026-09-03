@@ -19,11 +19,11 @@ from cozy_runtime.internal import (
     base_observation,
     canonical,
     derive_child,
-    descriptor,
     fill,
     image_inventory,
     model_config,
     package_environment,
+    package_interface,
     placement_materialization,
     pull,
 )
@@ -34,10 +34,6 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 MAX_FILES = 4096
 MAX_FILE_BYTES = 8 << 30
-MAX_MANIFEST_BYTES = 64 << 20
-MANIFEST_FORMAT = "cozy.package.manifest/1"
-MANIFEST_FILENAME = "package-manifest.json"
-PUBLISHED_DESCRIPTOR_FILENAME = "package-descriptor.json"
 _DISTRIBUTION = re.compile(r"[-_.]+")
 _OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
 
@@ -90,17 +86,9 @@ def prepare_package_set(
         raise PreparationRefusal("package_prepare_delegation_invalid", "package row")
     package_name = str(selected.get("package", ""))
     release = str(selected.get("release", ""))
-    release_digest = str(selected.get("release_digest", ""))
-    try:
-        documents.raw(release_digest)
-    except (documents.DocumentError, ValueError) as exc:
-        raise PreparationRefusal("package_prepare_release_digest_invalid", release_digest) from exc
-    published_descriptor, set_directory = _published_descriptor(
+    published_interface, set_directory = _published_interface(
         request.files,
         artifact_cache=artifact_cache,
-        package_name=package_name,
-        release=release,
-        release_digest=release_digest,
     )
     inventory_raw = _read_beside(
         set_directory / image_inventory.INVENTORY_FILENAME,
@@ -114,8 +102,7 @@ def prepare_package_set(
     return prepare_package(
         package_name=package_name,
         release=release,
-        release_digest=release_digest,
-        published_descriptor=published_descriptor,
+        published_interface=published_interface,
         files=request.files,
         placement_seed=request.download_delegation,
         artifact_cache=artifact_cache,
@@ -133,85 +120,48 @@ def prepare_package_set(
     )
 
 
-def _published_descriptor(
+def _published_interface(
     files: Sequence[pb.LocalDownloadFile],
     *,
     artifact_cache: Path,
-    package_name: str,
-    release: str,
-    release_digest: str,
 ) -> tuple[bytes, Path]:
-    """Read and prove the hub-committed manifest + descriptor staged beside the set.
-
-    The published descriptor is the pod's authoritative wiring (cr-067). The manifest's
-    identity IS the delegation's wire-trusted `release_digest` (the sha256 of the
-    committed `cozy.package.manifest/1` bytes), and the descriptor ref is taken only
-    from inside the proven manifest -- the same trust pattern the local package lane uses.
-    `LocalDownloadKind` is a closed wire enum, so both documents ride at conventional
-    filenames in the set directory rather than as `files` rows.
-    """
-
-    parents = {Path(row.path).parent for row in files}
-    if len(parents) != 1:
-        raise PreparationRefusal("package_prepare_file_path_invalid", "files span package sets")
-    parent = parents.pop()
-    if not parent.is_absolute() or not parent.is_relative_to(artifact_cache / "sets"):
-        raise PreparationRefusal("package_prepare_file_path_invalid", str(parent))
-    manifest_raw = _read_beside(parent / MANIFEST_FILENAME, "package_prepare_manifest_missing")
-    if documents.spell(hashlib.sha256(manifest_raw).digest()) != release_digest:
-        raise PreparationRefusal(
-            "package_prepare_manifest_invalid",
-            "staged manifest bytes do not hash to the delegated release digest",
-        )
-    try:
-        manifest = json.loads(manifest_raw)
-    except ValueError as exc:
-        raise PreparationRefusal("package_prepare_manifest_invalid", str(exc)) from exc
-    descriptor_ref = manifest.get("package_descriptor") if isinstance(manifest, dict) else None
+    """Read the exact PackageInterface staged beside ordinary verified package files."""
+    rows = [row for row in files if row.kind == pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE]
+    if len(rows) != 1:
+        raise PreparationRefusal("package_prepare_interface_count", str(len(rows)))
+    row = rows[0]
+    path = Path(row.path)
+    parent = path.parent.parent
     if (
-        not isinstance(manifest, dict)
-        or manifest.get("format") != MANIFEST_FORMAT
-        or manifest.get("package") != package_name
-        or manifest.get("release") != release
-        or not isinstance(descriptor_ref, dict)
+        len(row.digest) != 32
+        or not 0 < row.length <= canonical.DOC_MAX_BYTES
+        or not path.is_absolute()
+        or row.filename != package_interface.FILENAME
+        or path != parent / package_interface.FILENAME
+        or not parent.is_relative_to(artifact_cache / "sets")
+        or path.resolve() != path
     ):
+        raise PreparationRefusal("package_prepare_interface_ref_invalid", row.filename)
+    raw = _read_beside(path, "package_prepare_published_interface_invalid")
+    digest = documents.spell(bytes(row.digest))
+    if len(raw) != row.length or documents.spell(hashlib.sha256(raw).digest()) != digest:
         raise PreparationRefusal(
-            "package_prepare_manifest_invalid", "manifest identity or descriptor ref"
-        )
-    digest = descriptor_ref.get("digest")
-    length = descriptor_ref.get("length")
-    if (
-        not isinstance(digest, str)
-        or not isinstance(length, int)
-        or isinstance(length, bool)
-        or length <= 0
-    ):
-        raise PreparationRefusal("package_prepare_manifest_invalid", "descriptor ref shape")
-    try:
-        documents.raw(digest)
-    except (documents.DocumentError, ValueError) as exc:
-        raise PreparationRefusal("package_prepare_manifest_invalid", digest) from exc
-    raw = _read_beside(
-        parent / PUBLISHED_DESCRIPTOR_FILENAME, "package_prepare_published_descriptor_invalid"
-    )
-    if len(raw) != length or documents.spell(hashlib.sha256(raw).digest()) != digest:
-        raise PreparationRefusal(
-            "package_prepare_published_descriptor_invalid",
-            "staged descriptor bytes do not match the manifest ref",
+            "package_prepare_published_interface_invalid",
+            "staged package-interface bytes do not match its exact file row",
         )
     try:
-        descriptor.read_bytes(raw, "published package descriptor")
-    except descriptor.RetiredDescriptorMember as exc:
+        package_interface.read_bytes(raw, "published package interface")
+    except package_interface.RetiredPackageInterfaceMember as exc:
         raise PreparationRefusal(exc.code, exc.message) from exc
-    except descriptor.StalePackageDescriptor as exc:
-        raise PreparationRefusal("package_prepare_published_descriptor_invalid", str(exc)) from exc
+    except package_interface.StalePackageInterface as exc:
+        raise PreparationRefusal("package_prepare_published_interface_invalid", str(exc)) from exc
     return raw, parent
 
 
 def _read_beside(path: Path, refusal: str) -> bytes:
     try:
         info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_MANIFEST_BYTES:
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= canonical.DOC_MAX_BYTES:
             raise PreparationRefusal(refusal, str(path))
         return path.read_bytes()
     except OSError as exc:
@@ -262,7 +212,6 @@ def prepare_local_package(
     return prepare_package(
         package_name=package.package,
         release=package.release,
-        release_digest=documents.spell(package.local_revision_digest),
         files=request.files,
         placement_seed=(request.operation_id.encode("ascii") + package.local_revision_digest),
         artifact_cache=artifact_cache,
@@ -297,16 +246,16 @@ def prepare_private_placement(
             "slots cannot be derived",
         )
     development = prepared.get("development")
-    descriptor_ref = prepared.get("package_descriptor")
+    interface_ref = prepared.get("package_interface")
     if (
         _OPERATION_ID.fullmatch(request.operation_id) is None
         or len(request.local_revision_digest) != 32
         or not isinstance(development, dict)
         or development.get("local_revision_digest")
         != documents.spell(request.local_revision_digest)
-        or not isinstance(descriptor_ref, dict)
-        or not isinstance(descriptor_ref.get("digest"), str)
-        or not isinstance(descriptor_ref.get("length"), int)
+        or not isinstance(interface_ref, dict)
+        or not isinstance(interface_ref.get("digest"), str)
+        or not isinstance(interface_ref.get("length"), int)
     ):
         raise PreparationRefusal("private_placement_identity_invalid", request.operation_id)
     try:
@@ -348,33 +297,34 @@ def prepare_private_placement(
     if rows and len(parents) != 1:
         raise PreparationRefusal("private_placement_file_invalid", "files span package sets")
 
-    digest = str(descriptor_ref["digest"])
-    length = int(descriptor_ref["length"])
+    digest = str(interface_ref["digest"])
+    length = int(interface_ref["length"])
     try:
         documents.raw(digest)
     except (documents.DocumentError, ValueError) as exc:
-        raise PreparationRefusal("private_placement_descriptor_invalid", digest) from exc
-    descriptor_raw = _read_file(artifact_cache / digest.removeprefix("sha256:"), length)
+        raise PreparationRefusal("private_placement_interface_invalid", digest) from exc
+    interface_raw = _read_file(artifact_cache / digest.removeprefix("sha256:"), length)
     if (
-        len(descriptor_raw) != length
-        or "sha256:" + hashlib.sha256(descriptor_raw).hexdigest() != digest
+        len(interface_raw) != length
+        or "sha256:" + hashlib.sha256(interface_raw).hexdigest() != digest
     ):
-        raise PreparationRefusal("private_placement_descriptor_invalid", digest)
+        raise PreparationRefusal("private_placement_interface_invalid", digest)
     try:
-        descriptor_body = descriptor.read_bytes(descriptor_raw, "prepared local package descriptor")
-    except descriptor.RetiredDescriptorMember as exc:
+        interface_body = package_interface.read_bytes(
+            interface_raw, "prepared local package interface"
+        )
+    except package_interface.RetiredPackageInterfaceMember as exc:
         raise PreparationRefusal(exc.code, exc.message) from exc
-    except descriptor.StalePackageDescriptor as exc:
-        raise PreparationRefusal("private_placement_descriptor_invalid", str(exc)) from exc
+    except package_interface.StalePackageInterface as exc:
+        raise PreparationRefusal("private_placement_interface_invalid", str(exc)) from exc
     selected_models, entrypoints = _entrypoints(
-        descriptor_body,
+        interface_body,
         package_name=str(development.get("package", "")),
         selections=models,
         files=model_files,
-        artifact_cache=artifact_cache,
         artifact_store=artifact_store,
         verified=verified,
-        derive=_deriver(installed, str(descriptor_body.get("application", ""))),
+        derive=_deriver(installed, str(interface_body.get("application", ""))),
     )
     entrypoint_bodies = [documents.body(row) for row in entrypoints]
     model_bodies = [documents.body(row) for row in selected_models]
@@ -401,7 +351,6 @@ def prepare_package(
     *,
     package_name: str,
     release: str,
-    release_digest: str,
     files: Sequence[pb.LocalDownloadFile],
     placement_seed: bytes,
     artifact_cache: Path,
@@ -417,7 +366,7 @@ def prepare_package(
     native_device_index: int = 0,
     installed_environment: package_environment.InstalledEnvironment | None = None,
     development: pb.DevelopmentPackage | None = None,
-    published_descriptor: bytes | None = None,
+    published_interface: bytes | None = None,
     inventory: image_inventory.Inventory | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
@@ -434,11 +383,6 @@ def prepare_package(
     the caller's own sealed execution environment. Without one there is no qualification host,
     so the wheel refuses rather than installs.
     """
-
-    try:
-        documents.raw(release_digest)
-    except (documents.DocumentError, ValueError) as exc:
-        raise PreparationRefusal("package_prepare_release_digest_invalid", release_digest) from exc
 
     expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     try:
@@ -469,20 +413,39 @@ def prepare_package(
         if row.kind not in {
             pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
             pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
+            pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE,
             pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
             pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
         }:
             raise PreparationRefusal("package_prepare_file_invalid", row.filename)
         path = Path(row.path)
+        interface_file = row.kind == pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE
+        set_root = path.parent.parent if interface_file else path.parent
         if (
             not path.is_absolute()
-            or path.name != row.filename
+            or (
+                row.filename != package_interface.FILENAME
+                if interface_file
+                else path.name != row.filename
+            )
+            or path != set_root / row.filename
             or not path.is_relative_to(artifact_cache / "sets")
             or path.resolve(strict=True) != path
         ):
             raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
-        parents.add(path.parent)
+        parents.add(set_root)
         digest = documents.spell(bytes(row.digest))
+        if interface_file:
+            if (
+                published_interface is None
+                or row.length != len(published_interface)
+                or digest != "sha256:" + hashlib.sha256(published_interface).hexdigest()
+            ):
+                raise PreparationRefusal(
+                    "package_prepare_published_interface_invalid", row.filename
+                )
+            verified(digest, row.length, path)
+            continue
         if row.kind in {
             pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
             pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
@@ -549,7 +512,6 @@ def prepare_package(
     package = pb.PackageSelection(
         package=package_name,
         release=release,
-        release_digest=documents.raw(release_digest),
         project_wheel=_wheel_fact(project),
     )
     wheel_paths = {wheel.digest: path for wheel, path, _receipt in facts}
@@ -589,61 +551,60 @@ def prepare_package(
     if materialized is not None:
         materialized(installed)
 
-    if published_descriptor is None:
-        descriptor_raw = describe(installed, project.distribution)
+    if published_interface is None:
+        interface_raw = describe(installed, project.distribution)
     else:
-        # The PUBLISHED descriptor is the authoritative wiring (cr-067). Import-time
+        # The PUBLISHED interface is the authoritative wiring (cr-067). Import-time
         # enumeration still runs -- it is a free cross-check -- but a disagreement
         # falsifies the release rather than silently rewiring the pod: refuse, and the
         # record owner relays the defect (th-106).
-        descriptor_raw = published_descriptor
+        interface_raw = published_interface
         derived_raw = describe(installed, project.distribution)
-        if derived_raw != published_descriptor:
+        if derived_raw != published_interface:
             raise PreparationRefusal(
-                "package_prepare_descriptor_disagrees",
+                "package_prepare_interface_disagrees",
                 "published "
-                + documents.spell(hashlib.sha256(published_descriptor).digest())
+                + documents.spell(hashlib.sha256(published_interface).digest())
                 + " != derived "
                 + documents.spell(hashlib.sha256(derived_raw).digest()),
             )
     try:
-        descriptor_body = descriptor.read_bytes(descriptor_raw, "prepared package descriptor")
-    except descriptor.RetiredDescriptorMember as exc:
+        interface_body = package_interface.read_bytes(interface_raw, "prepared package interface")
+    except package_interface.RetiredPackageInterfaceMember as exc:
         raise PreparationRefusal(exc.code, exc.message) from exc
-    except descriptor.StalePackageDescriptor as exc:
-        raise PreparationRefusal("package_prepare_descriptor_invalid", str(exc)) from exc
-    descriptor_ref = _stage(artifact_cache, descriptor_raw)
+    except package_interface.StalePackageInterface as exc:
+        raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
+    interface_ref = _stage(artifact_cache, interface_raw)
     if development is not None:
-        _verify_local_revision(development, descriptor_ref, rows)
+        _verify_local_revision(development, interface_ref, rows)
     jobs = _stage_job_plans(
-        descriptor_body,
+        interface_body,
         root=job_plan_root,
-        build_id=release_digest,
-        descriptor_path=artifact_cache / descriptor_ref[0].removeprefix("sha256:"),
+        build_id=project.digest,
+        interface_path=artifact_cache / interface_ref[0].removeprefix("sha256:"),
         installed=installed,
     )
     if development is None:
         selected_models, entrypoints = _entrypoints(
-            descriptor_body,
+            interface_body,
             package_name=package_name,
             selections=models,
             files=model_files,
-            artifact_cache=artifact_cache,
             artifact_store=artifact_store,
             verified=verified,
-            derive=_deriver(installed, str(descriptor_body.get("application", ""))),
+            derive=_deriver(installed, str(interface_body.get("application", ""))),
         )
     else:
-        # Local package transport freezes code, descriptor and Environment only. A later ordinary
-        # PlacementSet supplies exact modeled serving bindings; JobDirective + InvocationSpec
+        # Local package transport freezes code, PackageInterface, and Environment only. A
+        # later ordinary PlacementSet supplies exact modeled serving bindings; JobDirective
+        # + InvocationSpec
         # supplies a job's exact model inputs. Weightless serving bindings need no later model
-        # authority and are already exact consequences of this retained descriptor.
+        # authority and are already exact consequences of this retained package interface.
         selected_models, entrypoints = _entrypoints(
-            descriptor_body,
+            interface_body,
             package_name=package_name,
             selections=(),
             files={},
-            artifact_cache=artifact_cache,
             artifact_store=None,
             verified=verified,
             derive=None,
@@ -665,9 +626,7 @@ def prepare_package(
     placement = pb.Placement(
         placement_id="package-" + hashlib.sha256(placement_seed).hexdigest()[:24],
         environment_digest=documents.raw(environment_digest),
-        package_descriptor=pb.Ref(
-            digest=documents.raw(descriptor_ref[0]), length=descriptor_ref[1]
-        ),
+        package_interface=pb.Ref(digest=documents.raw(interface_ref[0]), length=interface_ref[1]),
         bindings_digest=bindings_digest,
         models=selected_models,
         entrypoints=entrypoints,
@@ -710,16 +669,14 @@ def _wheel_fact(wheel: package_environment.Wheel) -> pb.WheelFact:
 
 def _verify_local_revision(
     development: pb.DevelopmentPackage,
-    descriptor_ref: tuple[str, int],
+    interface_ref: tuple[str, int],
     files: Sequence[pb.LocalDownloadFile],
 ) -> None:
     revision = pb.LocalPackageRevision(
         package=development.package,
         release=development.release,
         source_digest=development.source_digest,
-        package_descriptor=pb.Ref(
-            digest=documents.raw(descriptor_ref[0]), length=descriptor_ref[1]
-        ),
+        package_interface=pb.Ref(digest=documents.raw(interface_ref[0]), length=interface_ref[1]),
         files=[
             pb.LocalPackageFileRef(
                 digest=row.digest,
@@ -739,8 +696,8 @@ def _verify_local_revision(
         )
 
 
-#: `(slot path, config bytes, config digest) -> the components the derive constructed`.
-Deriver = Callable[[str, bytes, str], tuple[str, ...]]
+#: `(slot path, config bytes) -> the components the derive constructed`.
+Deriver = Callable[[str, bytes], tuple[str, ...]]
 
 
 def _deriver(installed: package_environment.InstalledEnvironment, application: str) -> Deriver:
@@ -749,20 +706,13 @@ def _deriver(installed: package_environment.InstalledEnvironment, application: s
     this plane never reads it off the header. The child imports the derive machinery; this
     plane imports only the request/response seam (cr-067's guard, kept by construction)."""
 
-    def derive(slot: str, config_bytes: bytes, config_digest: str) -> tuple[str, ...]:
+    def derive(slot: str, config_bytes: bytes) -> tuple[str, ...]:
         if not application:
-            raise PreparationRefusal("package_prepare_descriptor_invalid", "application")
+            raise PreparationRefusal("package_prepare_interface_invalid", "application")
         scratch = Path(tempfile.mkdtemp(prefix="cozy-prepare-derive-"))
         try:
-            config_path = scratch / "config.json"
-            config_path.write_bytes(config_bytes)
             request = derive_child.DeriveRequest(
-                (
-                    derive_child.SlotRequest(
-                        slot,
-                        derive_child.ConfigRef(config_path, config_digest, len(config_bytes)),
-                    ),
-                ),
+                (derive_child.SlotRequest(slot, config_bytes),),
                 application=application,
             )
             (held,) = derive_child.derive_in(installed.python, request, scratch)
@@ -783,17 +733,14 @@ def _entrypoints(
     package_name: str,
     selections: Sequence[Any],
     files: Mapping[str, tuple[int, int, Path]],
-    artifact_cache: Path,
     artifact_store: Path | None,
     verified: Callable[[str, int, Path], None],
     derive: Deriver | None,
 ) -> tuple[list[pb.Model], list[pb.Entrypoint]]:
     rows = body.get("entrypoints")
     if not isinstance(rows, list):
-        raise PreparationRefusal("package_prepare_descriptor_invalid", "entrypoints")
-    selected = _selected_models(
-        package_name, selections, files, artifact_cache, artifact_store, verified
-    )
+        raise PreparationRefusal("package_prepare_interface_invalid", "entrypoints")
+    selected = _selected_models(package_name, selections, files, artifact_store, verified)
     if selected and derive is None:
         raise PreparationRefusal(
             "package_prepare_derive_refused", "a modeled selection needs the package environment"
@@ -816,14 +763,14 @@ def _entrypoints(
     described_slots: set[str] = set()
     for value in rows:
         if not isinstance(value, dict) or not isinstance(value.get("name"), str):
-            raise PreparationRefusal("package_prepare_descriptor_invalid", "entrypoint")
+            raise PreparationRefusal("package_prepare_interface_invalid", "entrypoint")
         described = value.get("models", [])
         if not isinstance(described, list):
-            raise PreparationRefusal("package_prepare_descriptor_invalid", "model slots")
+            raise PreparationRefusal("package_prepare_interface_invalid", "model slots")
         described_paths: set[str] = set()
         for row in described:
             if not isinstance(row, dict) or not isinstance(row.get("path"), str):
-                raise PreparationRefusal("package_prepare_descriptor_invalid", "model slot")
+                raise PreparationRefusal("package_prepare_interface_invalid", "model slot")
             described_paths.add(str(row["path"]))
         if len(described_paths) != len(described):
             raise PreparationRefusal(
@@ -844,18 +791,11 @@ def _entrypoints(
             model = selected[path]
             model_id = model_ids[path]
             assert derive is not None
-            constructed = derive(path, model["config_bytes"], str(model["config_digest"]))
+            constructed = derive(path, model["config_bytes"])
             slots.append(
                 pb.Slot(
                     slot=path.removeprefix(prefix),
                     reference_model_id=model_id,
-                    config=pb.Config(
-                        document=pb.Ref(
-                            digest=documents.raw(str(model["config_digest"])),
-                            length=len(model["config_bytes"]),
-                        ),
-                        assets=[],
-                    ),
                     # WHAT THE DERIVE CONSTRUCTED, in construction order (D9) — never the
                     # header's component set. Whether those components exist in the
                     # checkpoint is the fit's question, answered at construction.
@@ -875,7 +815,7 @@ def _entrypoints(
         out.append(entrypoint)
     out.sort(key=lambda row: row.name)
     if len({row.name for row in out}) != len(out):
-        raise PreparationRefusal("package_prepare_descriptor_invalid", "duplicate entrypoint")
+        raise PreparationRefusal("package_prepare_interface_invalid", "duplicate entrypoint")
     if described_slots != set(selected):
         raise PreparationRefusal(
             "package_prepare_model_selection_mismatch",
@@ -890,12 +830,12 @@ def _stage_job_plans(
     *,
     root: Path | None,
     build_id: str,
-    descriptor_path: Path,
+    interface_path: Path,
     installed: package_environment.InstalledEnvironment,
 ) -> set[str]:
     rows = body.get("jobs")
     if not isinstance(rows, list):
-        raise PreparationRefusal("package_prepare_descriptor_invalid", "jobs")
+        raise PreparationRefusal("package_prepare_interface_invalid", "jobs")
     selected = [row for row in rows if isinstance(row, dict)]
     if not selected or root is None:
         return set()
@@ -906,12 +846,12 @@ def _stage_job_plans(
     staged: set[str] = set()
     for row in selected:
         name = str(row.get("name", ""))
-        descriptor_id = descriptor.job_descriptor_id(body, name)
+        descriptor_id = package_interface.job_descriptor_id(body, name)
         record = {
             "job_descriptor_id": descriptor_id,
             "build_id": build_id,
             "application": application,
-            "package_descriptor": str(descriptor_path),
+            "package_interface": str(interface_path),
             "python": str(installed.python),
             "environment_content_digest": installed.content_digest,
             "job": name,
@@ -934,7 +874,6 @@ def _selected_models(
     package_name: str,
     selections: Sequence[Any],
     files: Mapping[str, tuple[int, int, Path]],
-    artifact_cache: Path,
     artifact_store: Path | None,
     verified: Callable[[str, int, Path], None],
 ) -> dict[str, dict[str, Any]]:
@@ -1062,12 +1001,11 @@ def _selected_models(
                     f"{digest}: expected configs, components, and no runtime-consumed assets",
                 )
             try:
-                config_digest, config_bytes = model_config.construction_document(store, configs)
+                config_digest, config_bytes = model_config.construction_document(configs)
             except model_config.ModelConfigRefusal as exc:
                 raise PreparationRefusal(
                     "package_prepare_model_config_mismatch", f"{digest}: {exc}"
                 ) from exc
-            _stage(artifact_cache, config_bytes)
             for value in selected.values():
                 if value["selection"]["manifest"] == digest:
                     value.update(

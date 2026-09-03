@@ -41,7 +41,7 @@ def _refuse_source_profiles(source_profiles: Mapping[str, str] | None) -> None:
     `source_profiles=` gets one typed refusal, never a silent ignore or a shim.
 
     Capability is the slot's class annotation — the publish-time slot facts (shape-only
-    code topology + acceptable encodings) derive from the class's own factory. Selection
+    tensor requirements + acceptable encodings) derive from the class's own factory. Selection
     defaults live in `package.toml [bindings]`; the actual binding is dispatch."""
     if source_profiles:
         raise ConformanceError(
@@ -67,7 +67,7 @@ class Registration:
     preflight: Callable[..., object] | None = None
     hidden: bool = False
     """This surface is DECLARED but NOT PUBLISHED (#572d). A hidden entrypoint stays in the
-    local registry but is absent from the descriptor, so no deployment stages a binding and
+    local registry but is absent from the package interface, so no deployment stages a binding and
     no request reaches it.
 
     It is an AUTHOR fact, not a deployment one: what makes H3's `reference_to_video` hidden
@@ -133,7 +133,7 @@ class App:
         """Register a request-serving callable. BARE is the common case (§1.2).
 
         `hidden=True` declares a surface that is real but NOT READY: it is omitted from the
-        published descriptor and gets no binding staged and no traffic (§1.2, #572d).
+        published interface and gets no binding staged and no traffic (§1.2, #572d).
 
         ``source_profiles`` is RETIRED (cr-077): capability is the slot's class annotation,
         and the publish-time slot facts are derived from the class itself. Passing it

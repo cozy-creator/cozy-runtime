@@ -166,19 +166,19 @@ REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
     """Preserve the measured progress coordinates the executor already supplied.
 
-    The old worker serialized only ``value`` and silently discarded stage, position, and
-    step time. That left clients with a percentage but no honest way to name a denoising
-    stage, count its steps, or estimate its remaining wall time.
+    Stage-local and overall fractions stay separate. Optional coordinates are omitted when
+    the package does not know them; no layer fabricates whole-invocation completion.
     """
     kind = frame.get("kind", "progress")
     payload: Any = frame.get("value")
     if kind == "progress":
         payload = {
-            "name": str(frame.get("name", ""))[:120],
-            "fraction": frame.get("value"),
-            "position": frame.get("position"),
+            "stage": str(frame.get("stage", ""))[:120],
             "step_ms": frame.get("step_ms", 0.0),
         }
+        for field in ("stage_fraction", "position", "total", "overall_fraction"):
+            if frame.get(field) is not None:
+                payload[field] = frame[field]
     return {"type": kind, "payload": payload}
 
 
@@ -297,7 +297,7 @@ class Placement:
     package: dict[str, Any]
     development: dict[str, Any]
     environment_digest: bytes
-    package_descriptor: tuple[str, int]
+    package_interface: tuple[str, int]
     bindings_digest: bytes
     models: tuple[dict[str, Any], ...]
     entrypoints: tuple[dict[str, Any], ...]
@@ -322,39 +322,6 @@ class Placement:
     #: so the placement over that revision serves from this environment instead of
     #: re-acquiring bytes nothing on the pod still holds.
     installed: package_environment.InstalledEnvironment | None = None
-
-    @property
-    def execution_digest(self) -> str:
-        """Published release.json provenance or explicit development source identity."""
-
-        return str(
-            self.package.get("release_digest")
-            or self.development.get("local_revision_digest")
-            or self.development.get("source_digest")
-            or ""
-        )
-
-    @property
-    def config_digest(self) -> str:
-        selected = sorted(
-            (
-                f"{entrypoint['name']}.models.{slot['slot']}",
-                str(slot["config"]["document"]["digest"]),
-            )
-            for entrypoint in self.entrypoints
-            for slot in entrypoint.get("slots", [])
-        )
-        if not selected:
-            return canonical.digest({})
-        if len(selected) == 1:
-            return selected[0][1]
-        return canonical.digest(
-            {
-                "model_bindings": [
-                    {"path": path, "config_digest": digest} for path, digest in selected
-                ]
-            }
-        )
 
 
 @dataclass(slots=True)
@@ -603,19 +570,12 @@ def _wheel_fact(value: object, name: str) -> dict[str, Any]:
 
 
 def _package_selection(value: object) -> dict[str, Any]:
-    row = _closed_document(
-        value, {"package", "release", "release_digest", "project_wheel"}, "PackageSelection"
-    )
-    _required(row, {"package", "release", "release_digest", "project_wheel"}, "PackageSelection")
+    row = _closed_document(value, {"package", "release", "project_wheel"}, "PackageSelection")
+    _required(row, {"package", "release", "project_wheel"}, "PackageSelection")
     package = _identifier(row["package"], "PackageSelection.package")
     release = _identifier(row["release"], "PackageSelection.release")
     if package.count("/") != 1 or not all(package.split("/")) or SEMVER.fullmatch(release) is None:
         raise documents.DocumentError("package_invalid", "package identity or release is invalid")
-    if (
-        not isinstance(row["release_digest"], str)
-        or HASH_ENTRY.fullmatch(row["release_digest"]) is None
-    ):
-        raise documents.DocumentError("package_invalid", "release_digest is malformed")
     project = _wheel_fact(row["project_wheel"], "PackageSelection.project_wheel")
     if project["distribution"] != package.split("/", 1)[1] or project["version"] != release:
         raise documents.DocumentError("project_wheel_mismatch", package)
@@ -671,7 +631,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         "package",
         "development",
         "environment_digest",
-        "package_descriptor",
+        "package_interface",
         "bindings_digest",
         "models",
         "entrypoints",
@@ -680,11 +640,11 @@ def _placement_profile(entry: dict[str, Any]) -> None:
     _closed_document(entry, fields, "Placement")
     _required(
         entry,
-        {"placement_id", "package_descriptor", "bindings_digest", "entrypoints"},
+        {"placement_id", "package_interface", "bindings_digest", "entrypoints"},
         "Placement",
     )
     _identifier(entry["placement_id"], "Placement.placement_id")
-    _exact_ref(entry["package_descriptor"], "Placement.package_descriptor")
+    _exact_ref(entry["package_interface"], "Placement.package_interface")
     if (
         not isinstance(entry["bindings_digest"], str)
         or HASH_ENTRY.fullmatch(entry["bindings_digest"]) is None
@@ -782,14 +742,13 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 {
                     "slot",
                     "reference_model_id",
-                    "config",
                     "components",
                     "model_construction_contract",
                     "stamps",
                 },
                 "Slot",
             )
-            _required(slot, {"slot", "reference_model_id", "config"}, "Slot")
+            _required(slot, {"slot", "reference_model_id"}, "Slot")
             # THE DELETED PLANE (model-code-fit D1, D12; the proto reserves both at
             # xs-010). `stamps` is `[]` on every wire document — the canonical writer spells
             # closed repeated fields even when empty — and anything in it refuses typed; a
@@ -807,27 +766,11 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 raise documents.DocumentError(
                     "slot.stamps_retired",
                     "Slot.stamps: stamps are deleted (model-code-fit D1); a semantic twin is a "
-                    "component name or a config fact",
+                    "component name or an inline CozyTensors config fact",
                 )
             slot_names.append(_identifier(slot["slot"], f"slots[{slot_index}].slot"))
             if slot["reference_model_id"] not in known_models:
                 raise documents.DocumentError("unknown_model", "Slot.reference_model_id")
-            config = _closed_document(slot["config"], {"document", "assets"}, "Config")
-            _required(config, {"document"}, "Config")
-            _exact_ref(config["document"], "Config.document")
-            assets = config.get("assets", [])
-            if not isinstance(assets, list):
-                raise documents.DocumentError("wrong_type", "Config.assets")
-            asset_names: list[str] = []
-            for asset_index, value in enumerate(assets):
-                asset = _closed_document(value, {"name", "model_id", "ref"}, "Asset")
-                _required(asset, {"name", "model_id", "ref"}, "Asset")
-                asset_names.append(_identifier(asset["name"], f"assets[{asset_index}].name"))
-                if asset["model_id"] not in known_models:
-                    raise documents.DocumentError("unknown_model", "Asset.model_id")
-                _exact_ref(asset["ref"], "Asset.ref")
-            if asset_names != sorted(set(asset_names)):
-                raise documents.DocumentError("sort_order", "Config.assets")
             components = slot.get("components", [])
             if not isinstance(components, list):
                 raise documents.DocumentError("wrong_type", "Slot.components")
@@ -890,7 +833,7 @@ def executor_prepare_command(
             {
                 "binding": {
                     "application": binding.application,
-                    "package_descriptor": binding.descriptor_path,
+                    "package_interface": binding.interface_path,
                     "development_project": binding.development_project,
                     "model_class": model.model_class,
                     "model_binding_path": model.model_binding_path,
@@ -925,7 +868,7 @@ def executor_prepare_command(
             {
                 "binding": {
                     "application": binding.application,
-                    "package_descriptor": binding.descriptor_path,
+                    "package_interface": binding.interface_path,
                     "development_project": binding.development_project,
                     "model_class": "",
                 },
@@ -1019,7 +962,7 @@ class Worker:
         self.control_lock = threading.RLock()
         self.preparation_lock = threading.Lock()
         self.model_source_operations: set[str] = set()
-        # Exact code/descriptor/Environment revisions prepared over the loopback seam.
+        # Exact code/PackageInterface/Environment revisions prepared over the loopback seam.
         # This is same-process admission state, not a Runtime journal. After worker restart the
         # RecordOwner replays preparation before a model-bound PlacementSet can join it.
         self.local_revisions: dict[tuple[str, str], Placement] = {}
@@ -1522,7 +1465,8 @@ class Worker:
                             executor, imposed=self.imposed(lane), why="prepared package changed"
                         )
                     handoff = self.supervision.handoff(executor.epoch)
-                    output = handoff / f"package-descriptor-{uuid.uuid4().hex}.json"
+                    output = handoff / "metadata" / "package-interface.json"
+                    output.parent.mkdir()
                     # A cold import, torch included: bound by the executor's own measured
                     # work and its death, never by a number of seconds (xs-007 row 8).
                     with executor.watched("describe_installed"):
@@ -1540,21 +1484,21 @@ class Worker:
                     ) from exc
                 if not reply.get("ok"):
                     raise package_prepare.PreparationRefusal(
-                        "package_prepare_descriptor_failed",
+                        "package_prepare_interface_failed",
                         f"{reply.get('code', 'invalid reply')}: {reply.get('detail', '')}",
                     )
                 try:
                     raw = output.read_bytes()
                 except OSError as exc:
                     raise package_prepare.PreparationRefusal(
-                        "package_prepare_descriptor_failed", "descriptor output is absent"
+                        "package_prepare_interface_failed", "package-interface output is absent"
                     ) from exc
                 finally:
                     output.unlink(missing_ok=True)
                 digest = "sha256:" + hashlib.sha256(raw).hexdigest()
                 if reply.get("digest") != digest or reply.get("length") != len(raw):
                     raise package_prepare.PreparationRefusal(
-                        "package_prepare_descriptor_failed", str(reply.get("code", "invalid reply"))
+                        "package_prepare_interface_failed", str(reply.get("code", "invalid reply"))
                     )
                 return raw
 
@@ -1584,16 +1528,16 @@ class Worker:
                         "local preparation did not return one development Placement",
                     )
                 entry = prepared[0]
-                package_descriptor = dict(entry.get("package_descriptor", {}))
+                package_interface = dict(entry.get("package_interface", {}))
                 stored = Placement(
                     placement_id=str(entry.get("placement_id", "")),
                     placement_set_digest=result.placement_set.placement_set_digest,
                     package=dict(entry.get("package", {})),
                     development=dict(entry.get("development", {})),
                     environment_digest=_digest_field(entry.get("environment_digest")),
-                    package_descriptor=(
-                        str(package_descriptor.get("digest", "")),
-                        int(package_descriptor.get("length", 0)),
+                    package_interface=(
+                        str(package_interface.get("digest", "")),
+                        int(package_interface.get("length", 0)),
                     ),
                     bindings_digest=_digest_field(entry.get("bindings_digest")),
                     models=tuple(dict(row) for row in entry.get("models", [])),
@@ -1602,7 +1546,7 @@ class Worker:
                     document=dict(entry),
                     installed=materialized[0] if materialized else None,
                 )
-                revision = stored.execution_digest
+                revision = str(stored.development.get("local_revision_digest", ""))
                 if revision != documents.spell(request.package.local_revision_digest):
                     raise package_prepare.PreparationRefusal(
                         "local_package_revision_mismatch",
@@ -2038,7 +1982,9 @@ class Worker:
     def emit_progress(self, request_id: str, attempt: int, frame: dict[str, Any]) -> None:
         """The LOSSY lane. Bounded per watch, oldest-first shed, worker-owned sequence."""
         key = (request_id, attempt)
-        position = frame.get("position")
+        position = (
+            frame.get("advance") if frame.get("kind") == "progress" else frame.get("position")
+        )
         if isinstance(position, int):
             self.monitor.advance(f"{request_id}#{attempt}", position)
         if frame.get("kind") != "progress":
@@ -2524,16 +2470,16 @@ class Worker:
 
     @staticmethod
     def _placement_from_entry(entry: Mapping[str, Any], placement_set_digest: bytes) -> Placement:
-        package_descriptor = dict(entry.get("package_descriptor", {}))
+        package_interface = dict(entry.get("package_interface", {}))
         return Placement(
             placement_id=str(entry.get("placement_id", "")),
             placement_set_digest=placement_set_digest,
             package=dict(entry.get("package", {})),
             development=dict(entry.get("development", {})),
             environment_digest=_digest_field(entry.get("environment_digest")),
-            package_descriptor=(
-                str(package_descriptor.get("digest", "")),
-                int(package_descriptor.get("length", 0)),
+            package_interface=(
+                str(package_interface.get("digest", "")),
+                int(package_interface.get("length", 0)),
             ),
             bindings_digest=_digest_field(entry.get("bindings_digest")),
             models=tuple(dict(row) for row in entry.get("models", [])),
@@ -3130,14 +3076,14 @@ class Worker:
                 )
                 return None
             try:
-                from cozy_runtime.internal import descriptor as development_descriptor
                 from cozy_runtime.internal import local as development_local
+                from cozy_runtime.internal import package_interface
                 from cozy_runtime.internal.discovery import discover
 
                 found = discover(self.options.development_project)
                 staged = development_local.stage_development_placement(
                     self.config.cozy_home,
-                    development_descriptor.build(found),
+                    package_interface.build(found),
                     package=self.options.development_package,
                     release=self.options.development_release,
                     source_digest=self.options.development_source_digest,
@@ -3194,9 +3140,8 @@ class Worker:
             )
             return None
         if placement.development:
-            prepared = self.local_revisions.get(
-                (placement.placement_id, placement.execution_digest)
-            )
+            local_revision = str(placement.development.get("local_revision_digest", ""))
+            prepared = self.local_revisions.get((placement.placement_id, local_revision))
             if prepared is None:
                 self._materialization_failed(
                     placement,
@@ -3213,7 +3158,7 @@ class Worker:
                 "development",
                 "environment_digest",
                 "environment",
-                "package_descriptor",
+                "package_interface",
             )
             changed = next(
                 (
@@ -3271,16 +3216,31 @@ class Worker:
             installed_environment = prepared_environment
             if self.options.environment_python is not None:
                 package = placement.package or placement.development
-                release_digest = package.get("release_digest") or package.get(
-                    "local_revision_digest"
+                project_wheel = package.get("project_wheel", {})
+                project_ref = (
+                    project_wheel.get("ref", {}) if isinstance(project_wheel, dict) else {}
                 )
-                if not isinstance(release_digest, str):
+                package_code_digest = str(project_ref.get("digest", "")) or str(
+                    placement.development.get("source_digest", "")
+                )
+                if not re.fullmatch(r"sha256:[0-9a-f]{64}", package_code_digest):
                     raise package_environment.EnvironmentRefusal(
-                        "package_environment_release_digest_absent",
-                        "preinstalled package selection has no immutable release digest",
+                        "package_environment_code_digest_absent",
+                        "preinstalled package selection has no exact project-wheel "
+                        "or source digest",
                     )
+                content_digest = canonical.digest(
+                    {
+                        "package_code_digest": package_code_digest,
+                        "package_interface": {
+                            "digest": placement.package_interface[0],
+                            "length": placement.package_interface[1],
+                        },
+                        "environment_digest": documents.spell(placement.environment_digest),
+                    }
+                )
                 installed_environment = package_environment.open_existing_environment(
-                    self.options.environment_python, release_digest
+                    self.options.environment_python, content_digest
                 )
             environment_root = self.options.environment_root or (
                 installed_environment.generation if installed_environment is not None else None
@@ -4957,21 +4917,12 @@ class Worker:
             placement.materialization == pb.MaterializationState.MATERIALIZATION_STATE_STAGED
             and placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
         ):
-            status.package_revision_digest = placement.execution_digest
             status.environment_digest = (
                 documents.spell(placement.environment_digest)
                 if placement.environment_digest
                 else canonical.digest({})
             )
-            status.config_digest = placement.config_digest
-            if not all(
-                re.fullmatch(r"sha256:[0-9a-f]{64}", value)
-                for value in (
-                    status.package_revision_digest,
-                    status.environment_digest,
-                    status.config_digest,
-                )
-            ):
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", status.environment_digest) is None:
                 raise RuntimeError("dispatchable placement has incomplete invocation identity")
         if placement.acquisition.ListFields():
             status.acquisition.CopyFrom(placement.acquisition)

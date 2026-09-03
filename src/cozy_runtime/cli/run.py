@@ -25,7 +25,7 @@ from cozy_runtime.author import ConformanceError
 from cozy_runtime.cli import payload as payload_grammar
 from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.internal import bindings as binding_table
-from cozy_runtime.internal import descriptor as desc
+from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.discovery import discover
@@ -165,7 +165,7 @@ def run(
 
     try:
         found = discover(project)
-        body = desc.build(found)
+        body = package_interface.build(found)
     except ConformanceError as exc:
         raise CliError(
             "validation",
@@ -212,7 +212,7 @@ def run(
     trees: dict[str, str] = {}
     descriptor_id = ""
     if kind == "job":
-        descriptor_id = desc.job_descriptor_id(body, function)
+        descriptor_id = package_interface.job_descriptor_id(body, function)
         trees = _input_trees(flags.get("--input") or [])
 
     out_dir = Path((flags.get("--out") or ["outputs"])[0]).expanduser().resolve()
@@ -220,18 +220,19 @@ def run(
     if workspace.exists():
         shutil.rmtree(workspace, ignore_errors=True)
     workspace.mkdir(parents=True, exist_ok=True)
-    package_revision_digest = development_source_digest(project)
+    package_code_digest = development_source_digest(project)
     if kind == "job":
-        descriptor_path = workspace / "package-descriptor.json"
-        descriptor_path.write_bytes(desc.canonical_bytes(body))
+        interface_path = workspace / "metadata" / "package-interface.json"
+        interface_path.parent.mkdir()
+        interface_path.write_bytes(package_interface.canonical_bytes(body))
         job_records.append(
             {
                 "job_descriptor_id": descriptor_id,
-                "build_id": package_revision_digest,
+                "build_id": package_code_digest,
                 "application": str(body["application"]),
-                "package_descriptor": str(descriptor_path),
+                "package_interface": str(interface_path),
                 "python": sys.executable,
-                "environment_content_digest": package_revision_digest,
+                "environment_content_digest": package_code_digest,
                 "job": function,
                 "publishes": bool(surface.publishes),
                 "emits_media": bool(surface.emits_media),
@@ -258,7 +259,7 @@ def run(
     # narration is not suppressed — it is a real progress channel — it just goes where
     # progress goes, so `--json` emits exactly the document and nothing else.
     # A local source checkout is the installed release for this one process. The device
-    # executor is exec-first and imports the descriptor's application in a fresh interpreter,
+    # executor is exec-first and imports the interface's application in a fresh interpreter,
     # so it must inherit the same explicit project root that discovery used above. Remote
     # serving imports its wheel from the provisioned environment and never enters this path.
     with contextlib.chdir(project), contextlib.redirect_stdout(sys.stderr):
@@ -267,14 +268,14 @@ def run(
             request,
             job_records=job_records,
             workspace=workspace,
-            package_revision_digest=package_revision_digest,
-            package_descriptor=body if kind == "entrypoint" else None,
+            package_code_digest=package_code_digest,
+            package_interface_document=body if kind == "entrypoint" else None,
             found=found,
             development_artifact_store=config.cozy_home / "cas",
             development_binding_overrides=overrides,
             options=WorkerOptions(
                 root=workspace / "worker",
-                release_id=package_revision_digest,
+                release_id=package_code_digest,
                 no_warm=True,
             ),
         )
@@ -318,7 +319,7 @@ def _doc_for(body: Mapping[str, Json], function: str, kind: str) -> Mapping[str,
         assert isinstance(entry, dict)
         if entry["name"] == function:
             return entry
-    raise AssertionError(f"{function} was discovered but is not in the descriptor")
+    raise AssertionError(f"{function} was discovered but is not in the package interface")
 
 
 def _timeout(spelled: str) -> int:
@@ -349,21 +350,21 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
     """
     project = Path(opts.dir).expanduser().resolve()
     slots: Sequence[binding_table.BindingSlot]
-    if opts.descriptor:
+    if opts.package_interface:
         try:
-            body = desc.read_bytes(
-                Path(opts.descriptor).expanduser().resolve().read_bytes(),
-                "package bindings descriptor",
+            body = package_interface.read_bytes(
+                Path(opts.package_interface).expanduser().resolve().read_bytes(),
+                "package bindings interface",
             )
             table = binding_table.read_table(project / "package.toml")
-            descriptor_slots = _descriptor_slots(body)
-            slots = descriptor_slots
-            optional = frozenset(slot.path for slot in descriptor_slots if slot.job)
+            interface_slots = _interface_slots(body)
+            slots = interface_slots
+            optional = frozenset(slot.path for slot in interface_slots if slot.job)
         except (OSError, ConformanceError) as exc:
             raise CliError(
                 "validation",
                 str(exc),
-                "supply the exact release descriptor and its package.toml",
+                "supply the exact release package interface and itstoon package.toml",
                 Exit.validation,
             ) from exc
         visible = list(body.get("entrypoints", []))
@@ -394,13 +395,13 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
         plans = (
             list(
                 development_placement_documents(
-                    desc.build(found),
+                    package_interface.build(found),
                     package="local/development-package",
                     release="0.0.0",
                     source_digest=development_source_digest(project),
                 ).subjects()
             )
-            if visible and not opts.descriptor
+            if visible and not opts.package_interface
             else []
         )
         return [], plans
@@ -437,49 +438,59 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
 
 
 @dataclass(frozen=True, slots=True)
-class _DescriptorSlot:
+class _InterfaceSlot:
     path: str
     param: str
     class_key: str
     job: bool
 
 
-def _descriptor_slots(body: Mapping[str, Any]) -> list[_DescriptorSlot]:
-    """Recover the binding vocabulary already frozen into PackageDescriptor/1.
+def _interface_slots(body: Mapping[str, Any]) -> list[_InterfaceSlot]:
+    """Recover the binding vocabulary already frozen into PackageInterface/1.
 
     Jobs' model slots are declared exactly like entrypoints' — the jobs array is read
     wherever the entrypoints array is — a job's slot just binds per invocation.
     """
-    out: dict[str, _DescriptorSlot] = {}
+    out: dict[str, _InterfaceSlot] = {}
     for collection, job in (("entrypoints", False), ("jobs", True)):
         rows = body.get(collection, [])
         if not isinstance(rows, list):
-            raise ConformanceError(f"descriptor {collection} are malformed", code="descriptor")
+            raise ConformanceError(
+                f"package interface {collection} are malformed", code="package_interface"
+            )
         for callable_ in rows:
             if not isinstance(callable_, dict):
                 raise ConformanceError(
-                    f"descriptor {collection} entry is malformed", code="descriptor"
+                    f"package interface {collection} entry is malformed",
+                    code="package_interface",
                 )
             models = callable_.get("models", [])
             if not isinstance(models, list):
-                raise ConformanceError("descriptor model slots are malformed", code="descriptor")
+                raise ConformanceError(
+                    "package interface model slots are malformed", code="package_interface"
+                )
             for model in models:
                 if not isinstance(model, dict):
-                    raise ConformanceError("descriptor model slot is malformed", code="descriptor")
+                    raise ConformanceError(
+                        "package interface model slot is malformed", code="package_interface"
+                    )
                 path, class_key = model.get("path"), model.get("class")
                 if not isinstance(path, str) or not isinstance(class_key, str) or not class_key:
                     raise ConformanceError(
-                        "descriptor model slot identity is malformed", code="descriptor"
+                        "package interface model slot identity is malformed",
+                        code="package_interface",
                     )
                 prefix = f"{callable_.get('name', '')}.models."
                 if not path.startswith(prefix) or not path.removeprefix(prefix):
                     raise ConformanceError(
-                        f"descriptor model slot {path!r} is malformed", code="descriptor"
+                        f"package interface model slot {path!r} is malformed",
+                        code="package_interface",
                     )
-                slot = _DescriptorSlot(path, path.removeprefix(prefix), class_key, job)
+                slot = _InterfaceSlot(path, path.removeprefix(prefix), class_key, job)
                 if path in out and out[path] != slot:
                     raise ConformanceError(
-                        f"descriptor model slot {path!r} conflicts", code="descriptor"
+                        f"package interface model slot {path!r} conflicts",
+                        code="package_interface",
                     )
                 out[path] = slot
     return [out[path] for path in sorted(out)]
@@ -653,7 +664,7 @@ def _cause_name(code: Any) -> str:
 
 
 def _save(outcome: SliceOutcome, out_dir: Path) -> dict[str, str]:
-    """Move the granted outputs into `--out`, named by their descriptor FIELD PATH.
+    """Move the granted outputs into `--out`, named by their package-interface FIELD PATH.
 
     The EXTENSION comes from the asset's own declared media type, not from the granted
     destination's filename: a RecordOwner grants an opaque location and the worker writes

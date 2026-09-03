@@ -509,7 +509,7 @@ def registered_adapters() -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class ConstructionRecord:
-    """What executing `load()` derived: the code topology and the fill's bookkeeping."""
+    """What executing `load()` derived: the tensor requirements and the fill's bookkeeping."""
 
     factory_identity: str
     config_digest: str
@@ -525,7 +525,7 @@ class ConstructionRecord:
     header was there to judge against (derive mode)."""
 
     @property
-    def topology_digest(self) -> str:
+    def tensor_requirements_digest(self) -> str:
         # Sorted by key: the projection is independent of a module's state_dict walk order,
         # so two equivalent module implementations that enumerate differently name one model.
         rows = sorted(f"{d.key}:{list(d.spec.shape)}:{d.spec.dtype}" for d in self.destinations)
@@ -537,7 +537,7 @@ class ConstructionRecord:
         return (
             "blake2b:"
             + hashlib.blake2b(
-                f"{self.factory_identity}|{self.config_digest}|{self.topology_digest}".encode(),
+                f"{self.factory_identity}|{self.config_digest}|{self.tensor_requirements_digest}".encode(),
                 digest_size=16,
             ).hexdigest()
         )

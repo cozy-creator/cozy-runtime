@@ -16,8 +16,7 @@ from cozy_runtime.author import ConformanceError
 from cozy_runtime.cli import payload as payload_grammar
 from cozy_runtime.cli import run as run_verb
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import descriptor as desc
-from cozy_runtime.internal import hostfacts
+from cozy_runtime.internal import hostfacts, package_interface
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
@@ -30,7 +29,7 @@ def run(args: list[str], opts: Options, config: RuntimeConfig) -> Result:
     project = Path(opts.dir).expanduser().resolve()
     try:
         found = discover(project)
-        body = desc.build(found)
+        body = package_interface.build(found)
     except ConformanceError as exc:
         raise CliError(
             "validation",

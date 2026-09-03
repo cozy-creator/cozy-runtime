@@ -1,6 +1,6 @@
 """Signature analysis: the ONE source with two readers (mypy statically, describe at build).
 
-The signature is the capability declaration. Everything the descriptor needs — the payload
+The signature is the capability declaration. Everything the package interface needs — the payload
 and result schemas, model binding paths, and AuthorCapabilitySet — is a PURE FUNCTION of the
 parameter types, so there is no second document to drift (§1.0/§1.3/§1.7).
 """
@@ -41,7 +41,7 @@ class Param:
 
 @dataclass(frozen=True, slots=True)
 class PreflightSpec:
-    """Hook identity + result schema — the descriptor's "schedule-builder identity"."""
+    """Hook identity + result schema — the package interface's "schedule-builder identity"."""
 
     fn: Callable[..., object]
     identity: str
@@ -52,11 +52,11 @@ class PreflightSpec:
 
 @dataclass(frozen=True, slots=True)
 class ModelBinding:
-    """One model slot as the descriptor sees it. The derived canonical PATH is the binding
+    """One model slot as the package interface sees it. The derived canonical PATH is the binding
     point; the CLASS carries `encoded_leaves` and the component-use contract."""
 
     path: str
-    """`<callable>.models.<param>` — renaming a parameter is a breaking descriptor change."""
+    """`<callable>.models.<param>` — renaming a parameter is a breaking package interface change."""
     param: str
     model_class: type[Model[Any]]
     components: Mapping[str, tuple[str, ...]]
@@ -76,7 +76,7 @@ class ModelBinding:
 
 @dataclass(frozen=True, slots=True)
 class Surface:
-    """One registered callable's derived surface. cr-003's descriptor consumes this."""
+    """One registered callable's derived surface. cr-003's package interface consumes this."""
 
     name: str
     kind: Kind
@@ -95,7 +95,7 @@ class Surface:
     preflight: PreflightSpec | None = None
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d). Hidden callables stay in the local registry but
-    are absent from the descriptor, so no binding is staged and no request reaches them."""
+    are absent from the package interface, so no binding is staged and no request reaches them."""
 
     @property
     def model_params(self) -> tuple[str, ...]:

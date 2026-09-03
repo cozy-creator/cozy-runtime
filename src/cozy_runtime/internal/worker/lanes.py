@@ -447,7 +447,7 @@ class LaneSet:
         is the whole of it. `measured` is the driver's reading of every envelope device,
         keyed by ordinal. `pin` is the RecordOwner's placement of this placement on THIS
         worker (proto-024 `device_pins`); `degrees` is what the package declares it can
-        shard at (descriptor `sequence_parallel.degrees`).
+        shard at (package interface `sequence_parallel.degrees`).
 
         A model-bearing placement is placed in this order, envelope order within each
         step, over its CANDIDATE lanes — the pinned lane, or every device lane of a

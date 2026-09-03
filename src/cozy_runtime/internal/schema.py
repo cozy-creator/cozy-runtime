@@ -1,4 +1,4 @@
-"""Type tree -> canonical schema document. The descriptor's request/result half.
+"""Type tree -> canonical schema document. The package interface's request/result half.
 
 SOURCE-STABLE by construction: everything below is read from the author's own declared
 types, so nothing a candidate artifact, a binding, a machine or a clock knows can reach it.
@@ -103,7 +103,7 @@ def _render_bare(tp: object, seen: frozenset[type], *, union_owns_tag_field: boo
                 union_owns_tag_field=union_owns_tag_field,
             )
     # ANYTHING ELSE IS OPAQUE, NOT A BUILD FAILURE. `bytes`, `datetime`, a third-party
-    # value type — msgspec still codes it and JSON still carries it. The descriptor says
+    # value type — msgspec still codes it and JSON still carries it. The package interface says
     # "this field exists and Creator cannot introspect it" instead of refusing the package.
     return _opaque(tp)
 
@@ -137,7 +137,7 @@ def _enumeration(tp: object, values: Sequence[object]) -> Json:
     """A closed value set, or `opaque` when one member has no interoperable spelling.
 
     msgspec codes a tuple-valued enum and a `Literal[b"..."]` perfectly well, so refusing
-    the BUILD over one made the descriptor narrower than the runtime it describes. The node
+    the BUILD over one made the package interface narrower than the runtime it describes. The node
     degrades instead: the field exists, and Creator cannot enumerate it.
     """
     try:
@@ -252,7 +252,7 @@ def _field(field: msgspec.structs.FieldInfo, seen: frozenset[type]) -> Json:
 
 #: Every `msgspec.Meta` constraint, passed through VERBATIM. A consumer that does not
 #: understand one ignores it; refusing the build over a constraint Creator has not learned
-#: to read yet made the descriptor the narrower of the two surfaces for no reason.
+#: to read yet made the package interface the narrower of the two surfaces for no reason.
 _CONSTRAINTS = (
     "gt",
     "ge",

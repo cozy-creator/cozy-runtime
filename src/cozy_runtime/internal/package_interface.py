@@ -1,4 +1,4 @@
-"""The package descriptor generated from one frozen application.
+"""The package interface generated from one frozen application.
 
 Its one identity is SHA-256 over canonical JSON. Creator obtains those exact bytes from
 `cozy-runtime --json describe`; nothing is written into the package repository.
@@ -16,8 +16,9 @@ from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
 
-SCHEMA = "cozy.package.descriptor/1"
-DIGEST_KEY = "package_descriptor_digest"
+SCHEMA = "cozy.package.interface/1"
+DIGEST_KEY = "package_interface_digest"
+FILENAME = "metadata/package-interface.json"
 
 #: The complete top-level field set. A reader admits EXACTLY these — never a superset.
 TOP_LEVEL_KEYS = frozenset(
@@ -30,13 +31,13 @@ TOP_LEVEL_KEYS = frozenset(
 )
 
 
-class StalePackageDescriptor(ConformanceError):
-    """Supplied descriptor bytes are malformed or differ from the installed release."""
+class StalePackageInterface(ConformanceError):
+    """Supplied package-interface bytes are malformed or differ from the installed release."""
 
-    default_code = "stale_package_descriptor"
+    default_code = "stale_package_interface"
 
 
-class RetiredDescriptorMember(StalePackageDescriptor):
+class RetiredPackageInterfaceMember(StalePackageInterface):
     """A slot member the grammar deleted, carrying a value: `stamps` (model-code-fit D1) or
     `source_profile` (cr-077). Its code names the member — the hub refuses the same names."""
 
@@ -44,7 +45,7 @@ class RetiredDescriptorMember(StalePackageDescriptor):
 #: A slot is `{path, class, component_use, encoded_leaves}` (+ optional `sequence_parallel`).
 #: These are the members it once carried and may not carry a value for. An EMPTY `stamps`
 #: map is read as nothing declared — every release published before this cut ships
-#: `"stamps": {}` and the worker reads those descriptors back; anything in it refuses typed.
+#: `"stamps": {}` and the worker reads those interfaces back; anything in it refuses typed.
 RETIRED_SLOT_KEYS = frozenset({"stamps", "source_profile"})
 
 
@@ -52,7 +53,7 @@ RETIRED_SLOT_KEYS = frozenset({"stamps", "source_profile"})
 
 
 def build(found: Discovered) -> dict[str, Json]:
-    """Derive one descriptor from the frozen application."""
+    """Derive one package interface from the frozen application."""
     entrypoints: list[Json] = []
     jobs: list[Json] = []
     for surface in found.surfaces:
@@ -97,11 +98,6 @@ def _callable(surface: Surface) -> dict[str, Json]:
                     "mime_type": "application/vnd.cozy.model-manifest",
                     "max_bytes": output.max_new_bytes,
                 }
-                if output.topology_digest:
-                    declared["required_contract"] = {
-                        "topology_digest": output.topology_digest,
-                        "encodings": list(output.encodings),
-                    }
                 outputs.append(declared)
             doc["weights_outputs"] = outputs
     return doc
@@ -139,7 +135,6 @@ _SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 _FORBIDDEN_KEYS = frozenset(
     {
         "release",
-        "release_digest",
         "built_at",
         "build_id",
         "timestamp",
@@ -163,7 +158,7 @@ def _binding_values(bindings: Mapping[str, Mapping[str, object]]) -> frozenset[s
     composed ref, because `model` and `release` are stored apart but named together
     everywhere else. The `lane` member is deliberately NOT scanned (cr-077): lane names
     are format vocabulary ("bf16", "fp8") that legitimately coincides with author surface
-    names — a quantize job's weights outputs ARE the lanes it derives — and a descriptor
+    names — a quantize job's weights outputs ARE the lanes it derives — and an interface
     containing the word gains no pointer to the mutable selection."""
     values: set[str] = set()
     for entry in bindings.values():
@@ -177,12 +172,12 @@ def _binding_values(bindings: Mapping[str, Mapping[str, object]]) -> frozenset[s
 
 
 def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
-    """The descriptor's fixed point, proven over the built document (§1.0)."""
+    """The package interface's fixed point, proven over the built document (§1.0)."""
     if isinstance(value, Mapping):
         for key, item in value.items():
             if key in _FORBIDDEN_KEYS:
                 raise ConformanceError(
-                    f"{path}.{key}: the descriptor is the SOURCE-STABLE surface — release "
+                    f"{path}.{key}: the package interface is the SOURCE-STABLE surface — release "
                     "digests, timestamps, machine paths, mutable bindings and "
                     "candidate-selected facts live on other clocks (cr-004)",
                     code="fixed_point",
@@ -193,14 +188,6 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
         for index, item in enumerate(value):
             _fixed_point(item, bindings, f"{path}[{index}]")
     elif isinstance(value, str):
-        # An artifact output declares the exact byte-level result the package promises to
-        # derive. Those two digest-shaped values are SOURCE facts, unlike a selected release,
-        # model, build, or candidate. The contract's closed parser below is the only place
-        # this exception exists and validates both values as exact sha256 identities.
-        if path.endswith(".required_contract.topology_digest") or re.search(
-            r"\.required_contract\.encodings\[\d+\]$", path
-        ):
-            return
         if value in bindings:
             raise ConformanceError(
                 f"{path}: {value!r} is a package.toml binding value — bindings are MUTABLE "
@@ -215,7 +202,7 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
         ):
             if pattern.search(value):
                 raise ConformanceError(
-                    f"{path}: {value!r} is {why}; the descriptor must reproduce byte-identically "
+                    f"{path}: {value!r} is {why}; the interface must reproduce byte-identically "
                     "in every environment of one release",
                     code="fixed_point",
                     fields=[path],
@@ -226,12 +213,12 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
 
 
 def canonical_bytes(doc: Mapping[str, Json]) -> bytes:
-    """The semantic descriptor bytes used for identity and control-plane transport."""
+    """The semantic interface bytes used for identity and control-plane transport."""
     return canonical.write(dict(doc))
 
 
-def package_descriptor_digest(doc: Mapping[str, Json]) -> str:
-    """The descriptor's formatting-invariant semantic identity."""
+def package_interface_digest(doc: Mapping[str, Json]) -> str:
+    """The package interface's formatting-invariant semantic identity."""
     return canonical.digest(dict(doc))
 
 
@@ -262,13 +249,13 @@ def job_descriptor_id(body: Mapping[str, Json], name: str) -> str:
 
 
 def compare(left: Mapping[str, Json], right: Mapping[str, Json], names: tuple[str, str]) -> None:
-    """Refuse unless two descriptors have the same content."""
+    """Refuse unless two package interfaces have the same content."""
     if canonical_bytes(left) == canonical_bytes(right):
         return
     detail = "; ".join(_differences(left, right)) or "the documents differ"
-    raise StalePackageDescriptor(
+    raise StalePackageInterface(
         f"{names[0]} and {names[1]} are different documents: {detail}",
-        code="stale_package_descriptor",
+        code="stale_package_interface",
     )
 
 
@@ -305,17 +292,15 @@ def _differences(left: Json, right: Json, path: str = "") -> list[str]:
     return []
 
 
-def read_bytes(raw: bytes, source: str = "package descriptor") -> dict[str, Json]:
-    """Read one descriptor projection without making its formatting part of identity."""
+def read_bytes(raw: bytes, source: str = "package interface") -> dict[str, Json]:
+    """Read one interface projection without making its formatting part of identity."""
     try:
         parsed = canonical.parse(raw)
     except canonical.CanonicalError as exc:
-        raise StalePackageDescriptor(
-            f"{source}: {exc}", code="malformed_package_descriptor"
-        ) from exc
+        raise StalePackageInterface(f"{source}: {exc}", code="malformed_package_interface") from exc
     if not isinstance(parsed, dict):
-        raise StalePackageDescriptor(
-            f"{source} is not a JSON object", code="malformed_package_descriptor"
+        raise StalePackageInterface(
+            f"{source} is not a JSON object", code="malformed_package_interface"
         )
     fields = set(parsed)
     if fields != TOP_LEVEL_KEYS:
@@ -326,13 +311,13 @@ def read_bytes(raw: bytes, source: str = "package descriptor") -> dict[str, Json
             problems.append(f"missing {', '.join(missing)}")
         if unknown:
             problems.append(f"unknown {', '.join(unknown)}")
-        raise StalePackageDescriptor(
-            f"{source} has {'; '.join(problems)}: the descriptor fields are exactly "
+        raise StalePackageInterface(
+            f"{source} has {'; '.join(problems)}: the interface fields are exactly "
             f"{', '.join(sorted(TOP_LEVEL_KEYS))}",
             code="unknown_field",
         )
     if parsed["format"] != SCHEMA:
-        raise StalePackageDescriptor(
+        raise StalePackageInterface(
             f"{source}: format {parsed['format']!r} is not {SCHEMA!r}",
             code="unknown_format",
         )
@@ -423,7 +408,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                         output = _closed(
                             output_raw,
                             {"output_id", "mime_type", "max_bytes"},
-                            {"required_contract"},
+                            set(),
                             source,
                             output_path,
                         )
@@ -446,12 +431,6 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                                 f"{output_path}.max_bytes",
                                 "must be an integer in 0..=2^53-1",
                             )
-                        if "required_contract" in output:
-                            _artifact_contract(
-                                output["required_contract"],
-                                source,
-                                f"{output_path}.required_contract",
-                            )
 
 
 _PORTABLE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -461,23 +440,6 @@ def _portable_name(value: Json, source: str, path: str) -> str:
     if not isinstance(value, str) or _PORTABLE_NAME.fullmatch(value) is None:
         _invalid(source, path, "must be a portable lowercase name")
     return value
-
-
-def _artifact_contract(value: Json, source: str, path: str) -> None:
-    contract = _closed(value, {"topology_digest", "encodings"}, set(), source, path)
-    topology = contract["topology_digest"]
-    encodings = contract["encodings"]
-    if not isinstance(topology, str) or _SHA256.fullmatch(topology) is None:
-        _invalid(source, f"{path}.topology_digest", "must be an exact sha256 digest")
-    if (
-        not isinstance(encodings, list)
-        or not 1 <= len(encodings) <= 32
-        or encodings != sorted(set(encodings))
-        or any(
-            not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in encodings
-        )
-    ):
-        _invalid(source, f"{path}.encodings", "must be sorted unique exact sha256 digests")
 
 
 def _schema(value: Json, source: str, path: str, union_tag_field: str | None = None) -> None:
@@ -621,17 +583,17 @@ def _refuse_retired(slot: Mapping[str, Json], source: str, path: str) -> None:
         if not isinstance(stamps, dict):
             _invalid(source, f"{path}.stamps", "must be an object")
         if stamps:
-            raise RetiredDescriptorMember(
+            raise RetiredPackageInterfaceMember(
                 f"{source}: {path} carries stamps {sorted(stamps)}; stamps are deleted "
                 "(model-code-fit D1): a semantic twin is a component name or a config fact",
-                code="descriptor.stamps_retired",
+                code="package_interface.stamps_retired",
                 fields=[path],
             )
     if "source_profile" in slot:
-        raise RetiredDescriptorMember(
+        raise RetiredPackageInterfaceMember(
             f"{source}: {path} carries source_profile; capability is the slot's class "
             "annotation (cr-077)",
-            code="descriptor.source_profile_retired",
+            code="package_interface.source_profile_retired",
             fields=[path],
         )
 
@@ -642,7 +604,7 @@ def _subset_object(value: Json, allowed: set[str], source: str, path: str) -> No
 
 
 def _invalid(source: str, path: str, detail: str) -> NoReturn:
-    raise StalePackageDescriptor(f"{source}: {path} {detail}", code="malformed_package_descriptor")
+    raise StalePackageInterface(f"{source}: {path} {detail}", code="malformed_package_interface")
 
 
 _SCALARS = frozenset({"bool", "float", "int", "null", "str"})

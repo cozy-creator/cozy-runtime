@@ -133,7 +133,7 @@ def _trace(exc: BaseException) -> str:
     return text[-TRACEBACK_CAP:] if len(text) > TRACEBACK_CAP else text
 
 
-#: The frozen vocabulary the descriptor publishes and the refusal layer maps.
+#: The frozen vocabulary the package interface publishes and the refusal layer maps.
 NEUTRAL_ERROR_SET: Mapping[str, object] = {
     "author_raises": ["InvalidRequest", "UnsupportedInput", "Cancelled", "exception"],
     "terminals": ["succeeded", "refused", "failed", "canceled"],

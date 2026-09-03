@@ -1,4 +1,4 @@
-"""Package-descriptor admission at the worker's real acquisition boundary."""
+"""PackageInterface admission at the worker's real acquisition boundary."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import base_observation, canonical, descriptor
+from cozy_runtime.internal import base_observation, canonical, package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
@@ -26,11 +26,11 @@ def _job(name: str) -> dict[str, Json]:
     return {**_entrypoint(name), "publishes": False}
 
 
-def _descriptor(entrypoints: list[Json]) -> dict[str, Json]:
+def _interface(entrypoints: list[Json]) -> dict[str, Json]:
     return {
         "application": "job_only:app",
         "entrypoints": entrypoints,
-        "format": descriptor.SCHEMA,
+        "format": package_interface.SCHEMA,
         "jobs": [_job("produce")],
     }
 
@@ -55,10 +55,10 @@ def _bindings(tmp_path: Path, body: dict[str, Json]) -> tuple[object, int]:
     placement = Placement(
         placement_id="package-job-only",
         placement_set_digest=b"\x11" * 32,
-        package={"release_digest": "sha256:" + "22" * 32},
+        package={"project_wheel": {"ref": {"digest": "sha256:" + "22" * 32}}},
         development={},
         environment_digest=b"\x33" * 32,
-        package_descriptor=(digest, len(raw)),
+        package_interface=(digest, len(raw)),
         bindings_digest=documents.digest_of(canonical.write({"entrypoints": [], "models": []})),
         models=(),
         entrypoints=(),
@@ -69,7 +69,7 @@ def _bindings(tmp_path: Path, body: dict[str, Json]) -> tuple[object, int]:
 
 
 def test_job_only_package_set_has_no_serving_bindings(tmp_path: Path) -> None:
-    bindings, documents = _bindings(tmp_path, _descriptor([]))
+    bindings, documents = _bindings(tmp_path, _interface([]))
 
     assert bindings == {}
     assert documents == 1
@@ -83,10 +83,10 @@ def test_job_only_package_set_has_no_serving_bindings(tmp_path: Path) -> None:
     ],
     ids=["duplicate", "malformed"],
 )
-def test_package_set_refuses_invalid_descriptor_entrypoints(
+def test_package_set_refuses_invalid_interface_entrypoints(
     tmp_path: Path, entrypoints: list[Json]
 ) -> None:
     with pytest.raises(AcquisitionRefusal) as refused:
-        _bindings(tmp_path, _descriptor(entrypoints))
+        _bindings(tmp_path, _interface(entrypoints))
 
-    assert refused.value.code == "package_descriptor_invalid"
+    assert refused.value.code == "package_interface_invalid"

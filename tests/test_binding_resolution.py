@@ -15,7 +15,7 @@ import pytest
 
 from cozy_runtime.cli.io import CliError, Options
 from cozy_runtime.cli.run import resolved_bindings
-from cozy_runtime.internal import descriptor as desc
+from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover
 
 TENANT = Path(__file__).resolve().parent.parent / "corpus" / "tenant"
@@ -84,12 +84,15 @@ def test_a_genuinely_unknown_path_still_refuses(tmp_path: Path) -> None:
     assert "declares no slot" in str(refused.value)
 
 
-def test_the_descriptor_arm_reads_the_jobs_array(tmp_path: Path) -> None:
-    """`bindings --descriptor` recovers jobs' slots from the frozen PackageDescriptor/1."""
-    project = _package(tmp_path, "tenant_descriptor", job_binding=True)
-    descriptor = tmp_path / "package.descriptor.json"
-    descriptor.write_bytes(desc.canonical_bytes(desc.build(discover(project))))
-    records, _ = resolved_bindings(Options(dir=str(project), descriptor=str(descriptor)))
+def test_the_interface_arm_reads_the_jobs_array(tmp_path: Path) -> None:
+    """`bindings --package-interface` recovers jobs' slots from the frozen PackageInterface/1."""
+    project = _package(tmp_path, "tenant_interface", job_binding=True)
+    interface = tmp_path / "metadata" / "package-interface.json"
+    interface.parent.mkdir()
+    interface.write_bytes(
+        package_interface.canonical_bytes(package_interface.build(discover(project)))
+    )
+    records, _ = resolved_bindings(Options(dir=str(project), package_interface=str(interface)))
     assert [(r["model_binding_path"], r["ref"]) for r in records] == [
         ("prune.models.source", "cozytest/tenant@1"),
         ("touch.models.model", "cozytest/tenant@1"),
