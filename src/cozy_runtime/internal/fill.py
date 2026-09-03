@@ -400,6 +400,9 @@ class Checkpoint:
 
     def __init__(self, root: str | Path, manifest_id: str) -> None:
         tensorfs = tensorfs_module()
+        # Keep the facade's PEP 561 return type; the optional-module helper is deliberately Any.
+        from tensorfs import parse_header
+
         self.tensorfs = tensorfs
         self.root = str(root)
         self.manifest_id = manifest_id
@@ -410,7 +413,7 @@ class Checkpoint:
             # Encoding definitions are nested directly in cozytensors/1. TensorFS parses
             # and validates the header once and exposes each definition with the digest
             # that tensor rows cite; there is no second closure-object lookup.
-            self.header: dict[str, Any] = tensorfs.parse_header(self.header_bytes)
+            self.header = parse_header(self.header_bytes)
             self.specs = tuple(str(row["id"]) for row in self.header["encodings"])
         from cozy_runtime.internal.encoding import aliases
 
