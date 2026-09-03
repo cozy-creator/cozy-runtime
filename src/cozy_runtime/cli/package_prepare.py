@@ -13,7 +13,11 @@ from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.internal import canonical, package_environment
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
+from cozy_runtime.internal.worker.child import (
+    INTERFACE_DOCUMENT,
+    ExecutorGone,
+    ExecutorSupervision,
+)
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     prepare_published_local,
@@ -108,8 +112,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     def describe(installed: package_environment.InstalledEnvironment, distribution: str) -> bytes:
         supervisor.use_environment(str(installed.python), installed.content_digest)
         executor = supervisor.spawn(imposed={})
-        output = supervisor.handoff(executor.epoch) / "metadata" / "package-interface.json"
-        output.parent.mkdir()
+        output = supervisor.handoff(executor.epoch, INTERFACE_DOCUMENT)
         with executor.watched("describe_installed"):
             reply = executor.call(
                 {"cmd": "describe_installed", "distribution": distribution, "output": str(output)},

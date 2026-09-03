@@ -87,6 +87,7 @@ from cozy_runtime.internal.worker.attempts import (
 )
 from cozy_runtime.internal.worker.child import (
     GRACE_SECONDS,
+    INTERFACE_DOCUMENT,
     ExecutorGone,
     ExecutorSupervision,
     socket_path_refusal,
@@ -1588,9 +1589,7 @@ class Worker:
                     executor = supervision.replace(
                         executor, imposed=self.imposed(lane), why="prepared package changed"
                     )
-                handoff = supervision.handoff(executor.epoch)
-                output = handoff / "metadata" / "package-interface.json"
-                output.parent.mkdir()
+                output = supervision.handoff(executor.epoch, INTERFACE_DOCUMENT)
                 # A cold import, torch included: bound by the executor's own measured
                 # work and its death, never by a number of seconds (xs-007 row 8).
                 with executor.watched("describe_installed"):

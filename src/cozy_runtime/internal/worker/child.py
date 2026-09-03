@@ -262,6 +262,11 @@ class OwnerRecord:
     """Frozen pre-kill census, durable so reclaim proof survives worker death."""
 
 
+#: The control document an executor derives into its handoff: one installed package's
+#: PackageInterface, written by `describe_installed` and unlinked by the reader at once.
+INTERFACE_DOCUMENT = "package-interface.json"
+
+
 class ExecutorSupervision:
     """Owns the worker's one disposable executor process and epoch fence."""
 
@@ -354,15 +359,32 @@ class ExecutorSupervision:
         os.chown(path, self.executor_uid, self.executor_gid)
         path.chmod(0o700)
 
-    def handoff(self, epoch: int) -> Path:
-        """The one directory under this worker's run root the current executor may write a
-        control document into (a derived interface); the reader unlinks it at once. There
+    def handoff(self, epoch: int, document: str) -> Path:
+        """The one path under this worker's run root the current executor may write a
+        control document to (a derived interface); the reader unlinks it at once. There
         is no executor scratch tree: bytes a job stages live in the owner's `tmp/<id>/`
-        through the grant, and a worker root holds nothing but `run/` and its log."""
+        through the grant, and a worker root holds nothing but `run/` and its log.
+
+        THE GRANTED DIRECTORY IS THE WHOLE SURFACE, which is why this returns the document
+        and not the directory holding it. Callers used to append their own subdirectory and
+        mkdir it -- as this ROOT worker, inside a directory just handed to an unprivileged
+        executor -- so the executor's own `open(..., "xb")` was refused on a tree it
+        nominally owned. Run 187 died there, on a rented GPU, after a 92 GiB fetch had
+        already succeeded: `PermissionError: [Errno 13] Permission denied:
+        '/run/cozy/worker/handoff/metadata/package-interface.json'`. A path this method
+        returns is granted; one a caller builds beneath it is not.
+
+        A stale document is cleared rather than inherited. `describe_installed` creates it
+        exclusively, so one left behind by an interrupted preparation would refuse the next
+        attempt -- and preparation is re-issued after exactly that kind of interruption."""
+        if document != Path(document).name or document in ("", ".", ".."):
+            raise ExecutorGone(f"handoff document {document!r} is not one file name")
         path = self.root / "handoff"
         path.mkdir(exist_ok=True)
         self.grant_directory(path, epoch)
-        return path
+        document_path = path / document
+        document_path.unlink(missing_ok=True)
+        return document_path
 
     @property
     def _owner_path(self) -> Path:
