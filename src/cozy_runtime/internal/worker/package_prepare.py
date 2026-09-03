@@ -104,7 +104,9 @@ def prepare_package_set(
         release=release,
         published_interface=published_interface,
         files=request.files,
-        placement_seed=request.download_delegation,
+        placement_seed=placement_identity(
+            package_name, release, str(selected.get("release_digest", "")), models
+        ),
         artifact_cache=artifact_cache,
         artifact_store=artifact_store,
         models=models,
@@ -117,6 +119,33 @@ def prepare_package_set(
         native_environment=native_environment,
         native_device_index=native_device_index,
         inventory=inventory,
+    )
+
+
+def placement_identity(
+    package_name: str, release: str, release_digest: str, models: Sequence[canonical.Json]
+) -> bytes:
+    """The placement's identity is WHAT is prepared, never the credential that
+    authorized it. The delegation carries a per-signing expiry and worker pins
+    (other clocks — cr-004), so seeding identity with its raw bytes made every
+    re-signed converge a brand-new placement and defeated ledger reuse
+    (xs-014 finding 1). Model rows are re-sorted here so identity cannot
+    depend on the author's ordering."""
+
+    def model_key(row: canonical.Json) -> str:
+        body = row if isinstance(row, Mapping) else {}
+        return "\x00".join(
+            str(body.get(field, ""))
+            for field in ("package", "slot", "model", "release", "manifest")
+        )
+
+    return canonical.write(
+        {
+            "models": sorted((row for row in models), key=model_key),
+            "package": package_name,
+            "release": release,
+            "release_digest": release_digest,
+        }
     )
 
 
