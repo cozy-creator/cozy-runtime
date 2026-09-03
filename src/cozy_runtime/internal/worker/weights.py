@@ -1,9 +1,16 @@
-"""Stateless Runtime side of the WeightsSink host exchange.
+"""Runtime side of the WeightsSink host exchange, and the record of what it holds open.
 
-The supervisor is the durable authority. Runtime keeps only waiters and live TensorFS read
-leases and sends intent before the executor opens a writer; the worker and executor share only
-fixed files in the already-brokered attempt spool for declaration/receipt bytes too large for
-their control seam.
+Runtime keeps the waiters and the live TensorFS read leases and sends intent before the
+executor opens a writer; the worker and executor share only fixed files in the already-brokered
+attempt spool for declaration/receipt bytes too large for their control seam.
+
+THE TRANSACTION ROWS ARE THIS WORKER'S (th-142 child 2). The supervisor used to inject them
+into a second snapshot document because it kept the pod's durable record. It does not any
+more: every field of a `WeightsTransactionStatus` is something this Runtime authored or was
+ACKed back — the transaction id and writer epoch come from the host ack it validated, the
+declaration and receipt digests are its own bytes — so it records them beside its attempts and
+reports them in the one snapshot document it already authors. Custody of the produced BYTES
+does not move here; only the record of which transactions are open.
 
 Runtime holds the produced bytes, so Runtime is what streams them. When the supervisor has
 bound a transfer to its durable receipt it hands over the presigned PUT it was given, and
@@ -47,6 +54,7 @@ from typing import Any, BinaryIO, cast
 from urllib.parse import urlparse
 
 from cozy_runtime.internal import egress, fill
+from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -183,6 +191,7 @@ class WeightsExchange:
         stamp: Callable[[Any], Any] | None = None,
         note: Callable[[str, str], None] | None = None,
         allow_private_egress: bool = False,
+        records: WorkerRecords | None = None,
     ) -> None:
         #: The `WorkerControl` lane: stamps the frame's envelope and queues it on the live
         #: control stream. Used only while no `Exchange` is open.
@@ -200,6 +209,12 @@ class WeightsExchange:
         # upload may reach, and only for a caller that constructed this object saying so.
         self.allow_private_egress = allow_private_egress
         self.store: Any = None
+        #: The durable record this worker keeps its open transactions in (th-142 child 2).
+        #: Absent for a local run, which has no restart to recover from.
+        self.records = records
+        #: transaction id -> the `WeightsTransactionStatus` fields, as recorded. Seeded at boot
+        #: from the durable record and kept in step with every settled exchange.
+        self._transactions: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._pending: dict[tuple[str, int, str, int], _Pending] = {}
         self._bindings: dict[str, tuple[int, bytes]] = {}
@@ -398,6 +413,14 @@ class WeightsExchange:
             raise WeightsExchangeError(
                 "weights_host_ack_mismatch", "transaction binding changed within one Runtime"
             )
+        self._record_transaction(
+            attempt,
+            transaction_id=ack.weights_transaction_id,
+            output_slot=output_slot,
+            writer_epoch=ack.writer_epoch,
+            declaration_digest=declaration_digest,
+            receipt_digest=b"",
+        )
         receipt_digest = b""
         if ack.HasField("weights_receipt"):
             receipt_digest = self._receipt_ref(ack.weights_receipt)
@@ -425,6 +448,14 @@ class WeightsExchange:
                 raise WeightsExchangeError(
                     "weights_manifest_mismatch", "host replayed another produced Manifest"
                 )
+            self._record_transaction(
+                attempt,
+                transaction_id=ack.weights_transaction_id,
+                output_slot=output_slot,
+                writer_epoch=ack.writer_epoch,
+                declaration_digest=declaration_digest,
+                receipt_digest=receipt_digest,
+            )
             attempt.weights_receipts[output_slot] = held.receipt
         return {
             "ok": True,
@@ -511,6 +542,14 @@ class WeightsExchange:
             raise WeightsExchangeError(
                 "weights_manifest_mismatch", "receipt ACK did not echo produced Manifest"
             )
+        self._record_transaction(
+            attempt,
+            transaction_id=transaction_id,
+            output_slot=output_slot,
+            writer_epoch=held.writer_epoch,
+            declaration_digest=self._declaration_digest(transaction_id),
+            receipt_digest=receipt_digest,
+        )
         attempt.weights_receipts[output_slot] = reference
         return {
             "ok": True,
@@ -916,8 +955,83 @@ class WeightsExchange:
     def _drop(self, transaction_id: str) -> None:
         with self._lock:
             held = self._held.pop(transaction_id, None)
+            recorded = self._transactions.pop(transaction_id, None)
+        if recorded is not None and self.records is not None:
+            self.records.append(
+                "weights", {"weights_transaction_id": transaction_id, "removed": True}
+            )
         if held is not None:
             held.lease.release()
+
+    # ------------------------------------------------------- the durable transaction rows
+
+    def _record_transaction(
+        self,
+        attempt: Any,
+        *,
+        transaction_id: str,
+        output_slot: str,
+        writer_epoch: int,
+        declaration_digest: bytes,
+        receipt_digest: bytes,
+    ) -> None:
+        """One settled exchange, recorded in the shape the snapshot reports it.
+
+        Written only after the host ACK validated, because a transaction the host has not
+        acknowledged is not one this worker holds — announcing it would be a claim about the
+        other side of an exchange that never completed.
+        """
+        row = {
+            "weights_transaction_id": transaction_id,
+            "request_id": attempt.request_id,
+            "attempt_ordinal": attempt.attempt,
+            "invocation_spec_digest": documents.spell(attempt.digest),
+            "output_slot": output_slot,
+            "writer_epoch": writer_epoch,
+            "state": "receipt" if receipt_digest else "intent",
+            "tensorfs_declaration_digest": documents.spell(declaration_digest),
+            "weights_receipt_digest": documents.spell(receipt_digest) if receipt_digest else "",
+        }
+        with self._lock:
+            if self._transactions.get(transaction_id) == row:
+                return
+            self._transactions[transaction_id] = row
+        if self.records is not None:
+            self.records.append("weights", row)
+
+    def adopt(self, rows: list[dict[str, Any]]) -> None:
+        """Take the previous process's open transactions as this one's own."""
+        with self._lock:
+            for row in rows:
+                transaction = str(row.get("weights_transaction_id", ""))
+                if transaction:
+                    self._transactions[transaction] = row
+
+    def transaction_rows(self) -> list[pb.WeightsTransactionStatus]:
+        """`WorkerSnapshotBody.weights_transactions`, sorted by transaction id."""
+        with self._lock:
+            rows = list(self._transactions.values())
+        out = []
+        for row in sorted(rows, key=lambda item: str(item["weights_transaction_id"])):
+            receipt = str(row.get("weights_receipt_digest", ""))
+            out.append(
+                pb.WeightsTransactionStatus(
+                    weights_transaction_id=str(row["weights_transaction_id"]),
+                    request_id=str(row["request_id"]),
+                    attempt_ordinal=int(row["attempt_ordinal"]),
+                    invocation_spec_digest=str(row["invocation_spec_digest"]),
+                    output_slot=str(row["output_slot"]),
+                    writer_epoch=int(row["writer_epoch"]),
+                    state=pb.WEIGHTS_TRANSACTION_STATE_RECEIPT
+                    if row.get("state") == "receipt"
+                    else pb.WEIGHTS_TRANSACTION_STATE_INTENT,
+                    tensorfs_declaration_digest=documents.raw(
+                        str(row["tensorfs_declaration_digest"])
+                    ),
+                    weights_receipt_digest=documents.raw(receipt) if receipt else b"",
+                )
+            )
+        return out
 
     def _store(self) -> Any:
         if self.store is None:

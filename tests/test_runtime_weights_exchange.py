@@ -16,7 +16,9 @@ What they hold the Runtime to:
   the Runtime's side), and it TOLERATES the ACK arriving after a snapshot barrier;
 * it settles ONCE, by the exact send the ACK answers: after a reconnect re-issues the
   intent under a new envelope, an ACK echoing the stale one is refused and only the ACK on
-  the live lane settles it — the writer epoch a superseded send would have bound never binds.
+  the live lane settles it — the writer epoch a superseded send would have bound never binds;
+* and the settled transaction is a row in THIS worker's own durable record and its own
+  snapshot document (th-142 child 2), where a host-authored second document used to carry it.
 """
 
 from __future__ import annotations
@@ -33,8 +35,9 @@ from typing import Any
 import grpc
 import pytest
 
-from cozy_runtime.internal.worker import weights
+from cozy_runtime.internal.worker import durable, weights
 from cozy_runtime.internal.worker.control import _RuntimeWeightsServicer
+from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
@@ -315,3 +318,70 @@ def test_without_an_exchange_the_intent_rides_worker_control(rig: Rig) -> None:
     pending["thread"].join(WAIT)
     assert not pending["thread"].is_alive(), "the control-lane ACK did not settle the intent"
     assert pending["result"]["value"]["writer_epoch"] == 2
+
+
+def test_the_settled_transaction_is_this_worker_s_own_durable_row(tmp_path: Path) -> None:
+    """th-142 child 2: the supervisor used to inject `weights_transactions` into a second
+    snapshot document because it kept the pod's durable record. Every field of one is
+    something this Runtime authored or was ACKed back, so it records the row itself, reports
+    it in its own document, and still has it after the process is replaced."""
+    fence = Fence()
+    control = ControlLane(fence)
+    records = WorkerRecords(journal=durable.Journal.under(tmp_path))
+    exchange = weights.WeightsExchange(
+        store_root=tmp_path,
+        send=control.send,
+        stamp=fence.stamp,
+        stop=threading.Event(),
+        owner_scope=lambda: "owner-scope",
+        records=records,
+    )
+    assert exchange.transaction_rows() == []
+
+    result: dict[str, Any] = {}
+
+    def call() -> None:
+        result["value"] = exchange.intent(
+            _attempt(),
+            output_slot=OUTPUT_SLOT,
+            declaration_digest=DECLARATION_DIGEST,
+            declaration=DECLARATION,
+            requested_writer_epoch=0,
+        )
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    assert control.signal.wait(WAIT), "no WorkerControl frame carried the intent"
+    intent = control.frames[0].weights_intent
+    exchange.absorb_ack(
+        _recorded_ack(intent, writer_epoch=4, envelope=fence),
+        lane=("control", fence.control_stream_epoch),
+    )
+    thread.join(WAIT)
+    assert not thread.is_alive(), "the ACK did not settle the intent"
+
+    (row,) = exchange.transaction_rows()
+    assert row.weights_transaction_id == TRANSACTION
+    assert row.request_id == "req-1" and row.attempt_ordinal == 3
+    assert row.writer_epoch == 4
+    assert row.state == pb.WEIGHTS_TRANSACTION_STATE_INTENT
+    assert row.tensorfs_declaration_digest == DECLARATION_DIGEST
+    assert not row.weights_receipt_digest  # absent until a receipt binds one
+    exchange.close()
+
+    # THE PROCESS IS REPLACED. A fresh exchange, told nothing but where the record is, holds
+    # the same transaction — which is the whole point of moving the record here.
+    recovery = durable.recover(
+        durable.Journal.under(tmp_path), boot_id="boot-2", instance_id="inst-2"
+    )
+    successor = weights.WeightsExchange(
+        store_root=tmp_path,
+        send=ControlLane(Fence()).send,
+        stamp=Fence().stamp,
+        stop=threading.Event(),
+        owner_scope=lambda: "owner-scope",
+        records=WorkerRecords(journal=durable.Journal.under(tmp_path)),
+    )
+    successor.adopt(recovery.weights)
+    assert successor.transaction_rows() == [row]
+    successor.close()

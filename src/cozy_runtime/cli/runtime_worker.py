@@ -197,6 +197,9 @@ def _worker_options(
         # it cannot reach.
         triage_root=host_paths.MEDIA_ROOT / "triage",
         triage_owner=(POD_SUPERVISOR_UID, POD_SUPERVISOR_GID),
+        # THE DURABLE ATTEMPT RECORD (th-142 child 2). The supervisor creates the root before
+        # it execs this worker; this process is the only one that reads or writes inside it.
+        record_root=host_paths.WORKER_RECORD_ROOT,
     )
 
 

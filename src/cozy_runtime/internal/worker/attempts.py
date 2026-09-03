@@ -36,7 +36,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclasses_field
 from pathlib import Path
@@ -2740,6 +2740,38 @@ class AttemptEngine:
             held.outcome_id = attempt.outcome_id
             held.outcome_digest = attempt.outcome_digest
         return held
+
+    def adopt(self, recovered: Sequence[Mapping[str, Any]]) -> list[tuple[str, int]]:
+        """Take the previous process's unacked terminals as this one's own (th-142 child 2).
+
+        A recovered attempt is a terminal and an identity, and nothing else: no spec, no plan,
+        no executor, no spool. That is exactly the shape `compact()` already leaves a closed
+        attempt in, and exactly what the two questions still owed — does the snapshot name it,
+        and does the ack close it — are answered from. It enters `history` in state `outcome`,
+        so `snapshot_entries` reports it OUTCOME_PENDING_ACK and `pending_outcomes` replays it
+        after the barrier, on the same path as a terminal this process authored.
+        """
+        adopted: list[tuple[str, int]] = []
+        for row in recovered:
+            key = (str(row.get("request_id", "")), int(row.get("attempt", 0)))
+            if not key[0] or key[1] <= 0 or key in self.history:
+                continue
+            attempt = AttemptRecord(
+                request_id=key[0],
+                attempt=key[1],
+                digest=documents.raw(str(row["invocation_spec_digest"])),
+                spec={},
+                state="outcome",
+                kind="job" if row.get("attempt_kind") == "job" else "serving",
+                placement_id=str(row.get("placement_id", "")),
+                executor_epoch=int(row.get("executor_epoch", 0) or 0),
+                outcome_id=str(row["outcome_id"]),
+                outcome_digest=documents.raw(str(row["outcome_digest"])),
+                outcome_bytes=base64.b64decode(str(row["outcome_canonical_b64"])),
+            )
+            self.history[key] = attempt
+            adopted.append(key)
+        return adopted
 
     def pending_outcomes(self) -> list[AttemptRecord]:
         return [a for a in self.history.values() if a.state == "outcome"]

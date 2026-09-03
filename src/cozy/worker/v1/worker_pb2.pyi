@@ -881,7 +881,7 @@ class BootFailure(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_instance_id: _Optional[str] = ..., reason: _Optional[_Union[BootFailureReason, str]] = ..., detail: _Optional[str] = ..., resources: _Optional[_Union[WorkerResources, _Mapping]] = ..., control_runtime_digest: _Optional[str] = ..., worker_release_id: _Optional[str] = ...) -> None: ...
 
 class WorkerSnapshot(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "snapshot_id", "snapshot_digest", "snapshot_canonical_bytes", "accepted_placement_set_canonical_bytes", "host_snapshot_digest", "host_snapshot_canonical_bytes")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "snapshot_id", "snapshot_digest", "snapshot_canonical_bytes", "accepted_placement_set_canonical_bytes")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -889,8 +889,6 @@ class WorkerSnapshot(_message.Message):
     SNAPSHOT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     ACCEPTED_PLACEMENT_SET_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
-    HOST_SNAPSHOT_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    HOST_SNAPSHOT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -898,9 +896,7 @@ class WorkerSnapshot(_message.Message):
     snapshot_digest: bytes
     snapshot_canonical_bytes: bytes
     accepted_placement_set_canonical_bytes: bytes
-    host_snapshot_digest: bytes
-    host_snapshot_canonical_bytes: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ..., snapshot_canonical_bytes: _Optional[bytes] = ..., accepted_placement_set_canonical_bytes: _Optional[bytes] = ..., host_snapshot_digest: _Optional[bytes] = ..., host_snapshot_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ..., snapshot_canonical_bytes: _Optional[bytes] = ..., accepted_placement_set_canonical_bytes: _Optional[bytes] = ...) -> None: ...
 
 class WorkerSnapshotBody(_message.Message):
     __slots__ = ("accepted_desired_state_revision", "accepted_placement_set_digest", "journal_highwater", "worker_phase", "placements", "converged_revision", "admission_epoch", "admission_state", "available_attempt_slots", "held_attempts", "weights_transactions", "lanes", "held_manifests")
@@ -932,29 +928,19 @@ class WorkerSnapshotBody(_message.Message):
     held_manifests: _containers.RepeatedScalarFieldContainer[str]
     def __init__(self, accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., journal_highwater: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., converged_revision: _Optional[int] = ..., admission_epoch: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ..., lanes: _Optional[_Iterable[_Union[DeviceLane, _Mapping]]] = ..., held_manifests: _Optional[_Iterable[str]] = ...) -> None: ...
 
-class HostSnapshotBody(_message.Message):
-    __slots__ = ("held_outcomes", "weights_transactions")
-    HELD_OUTCOMES_FIELD_NUMBER: _ClassVar[int]
-    WEIGHTS_TRANSACTIONS_FIELD_NUMBER: _ClassVar[int]
-    held_outcomes: _containers.RepeatedCompositeFieldContainer[HeldAttempt]
-    weights_transactions: _containers.RepeatedCompositeFieldContainer[WeightsTransactionStatus]
-    def __init__(self, held_outcomes: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ...) -> None: ...
-
 class SnapshotAck(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "snapshot_id", "snapshot_digest", "host_snapshot_digest")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "snapshot_id", "snapshot_digest")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    HOST_SNAPSHOT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
     snapshot_id: str
     snapshot_digest: bytes
-    host_snapshot_digest: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ..., host_snapshot_digest: _Optional[bytes] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ...) -> None: ...
 
 class DesiredWorkerState(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "revision", "posture", "wire_minor", "drain_grace_ms", "job", "placement_set", "package_set", "local_package_set", "private_placement_set")

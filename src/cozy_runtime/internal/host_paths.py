@@ -16,3 +16,7 @@ TLS_CERTIFICATE: Final = Path("/run/cozy/bootstrap/tls.crt")
 TLS_PRIVATE_KEY: Final = Path("/run/cozy/bootstrap/tls.key")
 WORKER_CONTROL_ADDRESS: Final = Path("/run/cozy/worker/control.addr")
 WORKER_STATE: Final = Path("/run/cozy/worker")
+#: The Runtime's DURABLE attempt record (th-142 child 2). Under /var/lib and not /run: an
+#: obligation that a restart erases is not a record. The supervisor creates the root and hands
+#: it over; nothing but the Runtime reads or writes inside it.
+WORKER_RECORD_ROOT: Final = Path("/var/lib/cozy/worker")

@@ -66,6 +66,7 @@ from cozy_runtime.internal.worker import (
     acquire,
     child,
     downloads,
+    durable,
     grants,
     lane_wire,
     model_source_prepare,
@@ -279,6 +280,12 @@ class WorkerOptions:
     """The uid/gid each committed bundle is handed to — the pod media plane's, so a plane
     that runs as its own uid can open a file the root worker wrote. Absent keeps the
     writer's identity."""
+    record_root: Path | None = None
+    """Where this worker keeps its DURABLE ATTEMPT RECORD (th-142 child 2).
+
+    A pod's supervisor creates the directory and hands it over; the worker owns everything in
+    it. Absent means this worker keeps no record and recovers nothing, which is right for the
+    local door — a run whose RecordOwner is in this process has no restart to survive."""
 
 
 @dataclass(slots=True)
@@ -956,7 +963,20 @@ class Worker:
         self.admission_epoch = 1
         self.seq = itertools.count(1)  # WORKER-owned monotone counter
         self.progress_seq: dict[tuple[str, int], itertools.count[int]] = {}
-        self.records = WorkerRecords()
+        #: THE DURABLE HALF (th-142 child 2). Accepted attempts, their terminals, their
+        #: closes and the open weights transactions go to disk under the root the supervisor
+        #: created, so a worker that dies holding an obligation still owes it when it comes
+        #: back. Everything else here is narration and ends with the process.
+        self.records = WorkerRecords(journal=durable.Journal.under(options.record_root))
+        #: What the previous process left. Its interrupted attempts are given a terminal HERE,
+        #: durably, before anything can report them — an ordinal cannot be re-authored later
+        #: under a second outcome id.
+        self.recovery = durable.recover(
+            self.records.journal,
+            boot_id=self.fence.worker_boot_id,
+            instance_id=options.instance_id,
+        )
+        self.records.restore(self.recovery.rows)
         #: THE LANES (cr-066): one serialized device lane per envelope entry, in envelope
         #: order, plus the whole-envelope lane a job's executor is sealed under. Each lane
         #: owns its attempt thread, its work queue, its `settled` gate and one ledger row per
@@ -1032,7 +1052,9 @@ class Worker:
             stop=self.stop,
             owner_scope=lambda: self.fence.record_owner_id,
             note=self.note,
+            records=self.records,
         )
+        self.weights.adopt(self.recovery.weights)
         self.engine = AttemptEngine(
             records=self.records,
             authorizer=self.authorizer,
@@ -1050,6 +1072,15 @@ class Worker:
             tensorfs_root=options.tensorfs_root,
         )
         self.engine.boot_id = self.fence.worker_boot_id
+        adopted = self.engine.adopt(self.recovery.attempts)
+        if adopted:
+            self.note(
+                "outcome",
+                f"recovered {len(adopted)} unacknowledged attempt(s) from this worker's own "
+                f"durable record ({len(self.recovery.interrupted)} interrupted by the previous "
+                "process and given a terminal at this boot); the snapshot names them and they "
+                "replay after the barrier",
+            )
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
         #: claim installs a FRESH queue under `claim_lock`, so the superseded stream's sender
         #: keeps draining its own (now unread) queue and can never consume a frame authored
@@ -2336,6 +2367,9 @@ class Worker:
         if self.placement is not None:
             body.placements.append(self.placement_status())
         body.held_attempts.extend(self.engine.snapshot_entries())
+        # th-142 child 2: the rows a second, host-authored document used to carry. Every field
+        # of one is this worker's own — what it declared, and what the host ACKed back.
+        body.weights_transactions.extend(self.weights.transaction_rows())
         if self.accepted.mode == "serving":
             lane_wire.emit_lanes(body, self.lane_documents())
         lane_wire.emit_held_manifests(body, self.held_manifests.digests())
