@@ -1281,9 +1281,7 @@ class StreamingFillBackend:
                     component=component,
                     key=key,
                     shape=list(shape),
-                    logical_dtype=(
-                        None if dtype_name(dtype) in ("bf16", "f16") else dtype_name(dtype)
-                    ),
+                    logical_dtype=tensorfs_requirement_dtype(dtype),
                 )
                 for component, key, dtype, shape in rows
             ]
@@ -2369,6 +2367,24 @@ def dtype_name(dtype: object) -> str:
     own (`torch.float16`), and a fill that guesses which is which is a silent wrong copy."""
     name = str(getattr(dtype, "name", dtype)).removeprefix("torch.")
     return TORCH_DTYPES.get(name, name)
+
+
+def tensorfs_dtype_name(dtype: object) -> str:
+    """Normalize a Torch or TensorFS spelling into TensorFS's closed dtype namespace."""
+
+    name = str(getattr(dtype, "name", dtype)).removeprefix("torch.")
+    if name in TORCH_DTYPES:
+        return name
+    return next((stored for stored, torch in TORCH_DTYPES.items() if torch == name), name)
+
+
+def tensorfs_requirement_dtype(dtype: object | None) -> str | None:
+    """Constraint spelling for TensorFS fit; ordinary bf16/f16 remain convertible."""
+
+    if dtype is None:
+        return None
+    name = tensorfs_dtype_name(dtype)
+    return None if name in ("bf16", "f16") else name
 
 
 def _data_ptr(tensor: Any) -> int:
