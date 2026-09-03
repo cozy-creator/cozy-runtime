@@ -541,7 +541,6 @@ class ExecutorSupervision:
         """Clear only the exact durable owner whose OS and driver absence was proved."""
         recorded = self._read_owner()
         if recorded is None:
-            proctree.release_process_scope(expected.scope)
             return
         if recorded != expected:
             raise ExecutorGone(
@@ -549,7 +548,6 @@ class ExecutorSupervision:
             )
         self._owner_path.unlink()
         self._fsync_root()
-        proctree.release_process_scope(expected.scope)
 
     def _fsync_root(self) -> None:
         descriptor = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -749,7 +747,6 @@ class ExecutorSupervision:
             if isinstance(owner.scope, proctree.ProcessTreeScope):
                 imposed[EXECUTOR_SCOPE_ENV] = owner.scope.token
             self._write_owner(owner)
-            proctree.adopt_process_scope(owner.scope)
             spawned = self._launch(
                 python=self.python,
                 module_argv=[
@@ -1018,7 +1015,12 @@ class ExecutorSupervision:
             # for that state, which is not uncertainty about live memory. Preserve the birth
             # until `_reap_and_prove_absent`, but treat the released device side as absent.
             for member in known:
-                if states[member.pid] == "Z":
+                if states[member.pid] in {None, "Z"}:
+                    # A vanished birth has completed exit even further than a zombie: the
+                    # kernel has already torn down its mm and device contexts, and on a
+                    # host with no driver (a CPU pod) the driver API answers unreadable
+                    # for every pid, which is not uncertainty about a process that no
+                    # longer exists.
                     observations[member.pid] = accel.ProcessMemory("absent", 0)
             try:
                 token_leftovers = (
@@ -1061,6 +1063,7 @@ class ExecutorSupervision:
                     f"process_states={states}, device_states="
                     f"{ {pid: item.state for pid, item in observations.items()} }; "
                     f"token_leftovers={sorted(p.pid for p in token_leftovers)}; "
+                    f"census={proctree.describe_scope_census(owner.scope)}; "
                     f"{pace.verdict(liveness.noise_floor())}; "
                     "ownership retained and successor spawn refused"
                 )

@@ -912,6 +912,13 @@ class Worker:
         self.options = options
         self.host = host
         self.root = Path(options.root)
+        #: Per-slot executor uids (pod co-hosting). Each additional executor slot owns a
+        #: DISJOINT uid domain: the pod census cannot attribute processes by token — a
+        #: setuid child is non-dumpable and docker-default pods carry no SYS_PTRACE, so
+        #: /proc/<pid>/environ is unreadable even to the worker — so one uid per slot is
+        #: what keeps one slot's reclaim from freezing a sibling's serving executor.
+        #: The primary keeps the seat's own uid.
+        self._slot_uids: dict[str, int] = {}
         self.root.mkdir(parents=True, exist_ok=True)
         _claim_descriptor_headroom()
         self.base = package_environment.observe_base(
@@ -1074,6 +1081,27 @@ class Worker:
         #: serializes claim acceptance: one fence, whichever host thread observes the claim
         self.claim_lock = threading.Lock()
 
+    def _slot_executor_uid(self, slot: str) -> int:
+        """The slot's own executor uid: deterministic by slot key, probed past in-boot
+        collisions, in a range (64000..64511) disjoint from the pod seat uids (65533
+        executor, 65532 media) and system users; setuid and chown need no passwd row."""
+
+        base = self.options.executor_uid
+        if base < 0:
+            return base
+        held = self._slot_uids.get(slot)
+        if held is not None:
+            return held
+        span = 512
+        start = int(hashlib.sha256(slot.encode()).hexdigest()[:8], 16) % span
+        used = set(self._slot_uids.values())
+        for probe in range(span):
+            uid = 64000 + (start + probe) % span
+            if uid not in used:
+                self._slot_uids[slot] = uid
+                return uid
+        raise RuntimeError("executor slot uid range exhausted")
+
     def _new_placement_supervision(self, placement_id: str) -> ExecutorSupervision:
         """Create the one executor slot owned by an additional package placement."""
 
@@ -1083,7 +1111,7 @@ class Worker:
             python=self.options.python or sys.executable,
             base_env=self.config.child_base_env,
             cozy_home=self.config.cozy_home,
-            executor_uid=self.options.executor_uid,
+            executor_uid=self._slot_executor_uid(placement_id),
             executor_gid=self.options.executor_gid,
             jit_pod_scope=f"{self.fence.worker_boot_id}-{key}",
         )
@@ -1472,7 +1500,7 @@ class Worker:
             python=self.options.python or sys.executable,
             base_env=self.config.child_base_env,
             cozy_home=self.config.cozy_home,
-            executor_uid=self.options.executor_uid,
+            executor_uid=self._slot_executor_uid("prepare"),
             executor_gid=self.options.executor_gid,
             jit_pod_scope=f"{self.fence.worker_boot_id}-prepare",
         )
