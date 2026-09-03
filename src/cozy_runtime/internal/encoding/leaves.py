@@ -40,6 +40,65 @@ from cozy_runtime.internal.encoding.formats import (
 ACT_SCALE_FLOOR = 1e-12
 
 
+def _triton_rowwise_kernel() -> Any:
+    """The FUSED spelling of `quantize_activation_rowwise`, compiled once, lazily.
+
+    cr-086 measured #515f's warning coming true on sm89 at the real Anima DiT shapes: the
+    unfused six-pass quantize costs 1.2-5.1 ms around a GEMM that costs 1.0-6.6 ms, so the
+    whole w8a8 leaf ran at 0.60-1.14x the bf16 linear it replaced while the fp8 GEMM alone
+    ran at 1.6-2.0x. One Triton kernel — a per-row amax reduction and the scaled cast in a
+    single launch — does the same arithmetic (same divide, same clamp, same RTNE cast) in
+    0.03-0.54 ms and turns the leaf into the speedup the tensor cores promise.
+
+    Same divide (`div_rn`, IEEE round-nearest — triton's bare `/` is an approximate
+    reciprocal and measurably drifts), same clamp, same floor. The one honest difference:
+    triton's f32->e4m3 downcast double-rounds through f16, so values landing exactly on a
+    representational tie pick the other neighbour (~0.25% of elements, one fp8 code) —
+    inside the probe's deviation bound, and the probe measures whichever path actually runs.
+
+    Returns the compiled kernel, or None where triton is absent or refuses this device;
+    the eager spelling below stays the executable floor.
+    """
+    cached = getattr(_triton_rowwise_kernel, "_cached", "unset")
+    if cached != "unset":
+        return cached
+    try:
+        import triton
+        import triton.language as tl
+
+        @triton.jit  # type: ignore[untyped-decorator]
+        def _kernel(  # type: ignore[no-untyped-def]
+            x_ptr, out_ptr, scale_ptr, columns, stride_x, stride_out, BLOCK: tl.constexpr
+        ):
+            row = tl.program_id(0)
+            offsets = tl.arange(0, BLOCK)
+            amax = tl.zeros((BLOCK,), dtype=tl.float32)
+            for start in range(0, columns, BLOCK):
+                index = start + offsets
+                value = tl.load(x_ptr + row * stride_x + index, mask=index < columns, other=0.0).to(
+                    tl.float32
+                )
+                amax = tl.maximum(amax, tl.abs(value))
+            scale = tl.maximum(tl.max(amax, axis=0) / 448.0, 1e-12)
+            tl.store(scale_ptr + row, scale)
+            for start in range(0, columns, BLOCK):
+                index = start + offsets
+                value = tl.load(x_ptr + row * stride_x + index, mask=index < columns, other=0.0).to(
+                    tl.float32
+                )
+                quantized = tl.clamp(tl.div_rn(value, scale), -448.0, 448.0)
+                tl.store(
+                    out_ptr + row * stride_out + index,
+                    quantized.to(tl.float8e4nv, fp_downcast_rounding="rtne"),
+                    mask=index < columns,
+                )
+
+    except Exception:
+        _kernel = None
+    _triton_rowwise_kernel._cached = _kernel  # type: ignore[attr-defined]
+    return _kernel
+
+
 def quantize_activation_rowwise(torch: Any, x: Any) -> tuple[Any, Any]:
     """`[..., K]` float -> `[M, K]` E4M3 payload + `[M, 1]` f32 per-TOKEN scale.
 
@@ -50,14 +109,31 @@ def quantize_activation_rowwise(torch: Any, x: Any) -> tuple[Any, Any]:
     pairs with a per-output-row weight scale: the two scale vectors are the two OUTER
     dimensions of the product and neither is the reduction axis.
 
-    #515f is banked against this spelling and not hidden by it: unfused, this is six
-    elementwise passes over `[M, K]` around a GEMM that costs `M*K*N`, so the overhead
-    fraction falls as 1/N and only disappears when the quantize is fused into one kernel.
+    #515f named the unfused cost honestly — six elementwise passes over `[M, K]` around a
+    GEMM costing `M*K*N`, disappearing only "when the quantize is fused into one kernel" —
+    and `_triton_rowwise_kernel` is that fusion (cr-086): one launch, deviation noted on
+    its docstring. A CUDA operand takes it when triton built; everything else (CPU probes,
+    a venv without triton, a launch failure) runs the eager passes below and stays correct.
 
     NOT a probe-only helper, despite the family resemblance to `instruments.py`'s two: this
     one runs inside every forward pass of a rowwise encoded leaf.
     """
     flat = x.reshape(-1, x.shape[-1])
+    if flat.is_cuda and flat.numel() and flat.stride(-1) == 1:
+        kernel = _triton_rowwise_kernel()
+        if kernel is not None:
+            rows, columns = int(flat.shape[0]), int(flat.shape[1])
+            out = torch.empty(rows, columns, dtype=torch.float8_e4m3fn, device=flat.device)
+            scale = torch.empty(rows, 1, dtype=torch.float32, device=flat.device)
+            try:
+                kernel[(rows,)](
+                    flat, out, scale, columns, flat.stride(0), columns, BLOCK=1024, num_warps=8
+                )
+                return out, scale
+            except Exception:
+                # One honest disable: a device triton cannot serve falls to eager for the
+                # life of the process rather than re-raising per forward.
+                _triton_rowwise_kernel._cached = None  # type: ignore[attr-defined]
     amax = flat.abs().amax(dim=-1, keepdim=True).float()
     scale = (amax / E4M3_MAX).clamp(min=ACT_SCALE_FLOOR)
     return (flat.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn), scale
