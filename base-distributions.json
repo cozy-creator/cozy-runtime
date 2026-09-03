@@ -1,7 +1,6 @@
 {
   "distributions": [
     "cozy-runtime",
-    "cozy-runtime-cuda-kernels",
     "msgspec",
     "numpy",
     "pillow",

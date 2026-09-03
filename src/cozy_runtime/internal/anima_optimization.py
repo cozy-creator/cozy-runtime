@@ -6,7 +6,7 @@ storage addresses are invariants.  This is intentionally one closed plan, not a 
 monkey-patching framework.
 
 ``torch.compile`` is a qualification-time discovery oracle, never an invocation-time path.
-Reusable fusion belongs in Runtime's maintained CUDA-kernel companion; eager stays available.
+Reusable fusion belongs in Runtime's own in-package CUDA kernels; eager stays available.
 """
 
 from __future__ import annotations
@@ -23,9 +23,11 @@ from typing import Any
 from packaging.version import InvalidVersion, Version
 
 DIFFUSERS_VERSION = "0.40.0"
-FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION = "cozy-runtime-cuda-kernels"
-FUSED_ANIMA_CUDA_KERNEL_MODULE = "cozy_runtime_cuda_kernels"
-FUSED_ANIMA_CUDA_KERNEL_VERSION = "0.1.0"
+# The kernels ride cozy-runtime's own cp312-abi3 wheel (cr-094): the module is probed,
+# never version-pinned. The revision names the native sources' review state and is bumped
+# whenever `native/` changes, so optimization identity tracks the kernels, not releases.
+FUSED_ANIMA_CUDA_KERNEL_MODULE = "cozy_runtime._kernels"
+FUSED_ANIMA_CUDA_KERNEL_REVISION = "0.1.0"
 FUSED_ANIMA_TORCH_RELEASE = "2.13.0"
 FUSED_ANIMA_CUDA_RELEASE = "13.0"
 
@@ -45,13 +47,13 @@ _SOURCE_DIGESTS = {
     "AnimaPrepareLatentsStep.__call__": (
         "5f758c69ad2f82a37d707e3ca736b88011b41f04a958dbc657ec397b88c2bef5"
     ),
-    "cozy_runtime_cuda_kernels.rms_rope_split_half": (
-        "5c3aa37b7166a2465d099a42749a26d70712054cf5b2cc4e871a66e8cb3cf74f"
+    "cozy_runtime._kernels.rms_rope_split_half": (
+        "084c60d95676ae003e285fb57ec6b9c3416ffba6e0a0f62d2097f26b8c8aa999"
     ),
 }
 _IDENTITY_DOCUMENT = {
     "diffusers": DIFFUSERS_VERSION,
-    FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION: FUSED_ANIMA_CUDA_KERNEL_VERSION,
+    FUSED_ANIMA_CUDA_KERNEL_MODULE: FUSED_ANIMA_CUDA_KERNEL_REVISION,
     "plan": "direct-split-half-rope-matrix",
     "sources": _SOURCE_DIGESTS,
 }
@@ -484,10 +486,8 @@ def _fused_anima_cuda_capability() -> tuple[Any, Any] | None:
             return None
     except (AttributeError, RuntimeError):
         return None
-    native_version = _installed_version(FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION)
-    if native_version != FUSED_ANIMA_CUDA_KERNEL_VERSION:
-        return None
     try:
+        import_module(FUSED_ANIMA_CUDA_KERNEL_MODULE + "._C")
         anima_kernels = import_module(FUSED_ANIMA_CUDA_KERNEL_MODULE)
     except ImportError:
         return None
@@ -514,7 +514,7 @@ def _apply_fused_anima_cuda_plan(
         "CosmosRotaryPosEmbed.forward": CosmosRotaryPosEmbed.forward,
         "CosmosTransformerBlock.forward": CosmosTransformerBlock.forward,
         "AnimaPrepareLatentsStep.__call__": AnimaPrepareLatentsStep.__call__,
-        "cozy_runtime_cuda_kernels.rms_rope_split_half": anima_kernels.rms_rope_split_half,
+        "cozy_runtime._kernels.rms_rope_split_half": anima_kernels.rms_rope_split_half,
     }
     for name, source in sources.items():
         _require_source(name, source)
@@ -562,7 +562,7 @@ def _apply_fused_anima_cuda_plan(
     return AppliedAnimaOptimization(
         OPTIMIZATION_ID,
         f"diffusers=={DIFFUSERS_VERSION};"
-        f"{FUSED_ANIMA_CUDA_KERNEL_DISTRIBUTION}=={FUSED_ANIMA_CUDA_KERNEL_VERSION}",
+        f"{FUSED_ANIMA_CUDA_KERNEL_MODULE}=={FUSED_ANIMA_CUDA_KERNEL_REVISION}",
         (
             "fused_rmsnorm_split_half_rope",
             "addcmul_residuals",

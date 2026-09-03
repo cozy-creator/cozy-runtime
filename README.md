@@ -197,21 +197,21 @@ compares the state-dict tensor schema and every parameter/buffer storage address
 its source/dependency digest enters constructed-generation identity. Any source, class or
 config drift refuses typed.
 
-The NVIDIA CUDA base worker image may install `cozy-runtime[cuda-kernels]`. That extra selects
-the small, CUDA-only `cozy-runtime-cuda-kernels` companion built from this same Runtime
-commit. It carries only the fused operations Runtime actually uses; CPU profiles carry no
-native companion, and adding future Cozy-owned kernels extends this one reviewed boundary.
-Runtime uses these fused Anima CUDA kernels only for Torch 2.13.0 built with CUDA 13.0
-when CUDA is available. CPU, missing-CUDA, other Torch/CUDA pairs, and profiles without
-the exact native library keep the ordinary eager implementation. CPU, MPS and Windows
-profiles do not install that extra. A candidate CUDA image runs
-a hand-run comparison of eager and optimized real
-CUDA blocks at Anima's native token width, checks determinism and storage identity, and
-measures the block speedup.
+Runtime is ONE PyPI package with two wheel files per release: the pure `py3-none-any`
+wheel, and a `cp312-abi3` linux/x86 wheel carrying the same code plus the compiled CUDA
+kernels at `cozy_runtime._kernels` (`COZY_RUNTIME_BUILD_KERNELS=1` selects that build;
+the default `uv build` stays toolchain-free). The `native/` sources ship only the fused
+operations Runtime actually uses, and adding future Cozy-owned kernels extends this one
+reviewed boundary. Runtime uses these fused Anima CUDA kernels only for Torch 2.13.0
+built with CUDA 13.0 when CUDA is available. CPU, missing-CUDA, other Torch/CUDA pairs,
+and wheels without the native extension keep the ordinary eager implementation. A
+candidate CUDA image runs a hand-run comparison of eager and optimized real CUDA blocks
+at Anima's native token width, checks determinism and storage identity, and measures the
+block speedup.
 
 Every model-specific optimization first benchmarks `torch.compile`/Inductor as a discovery
 oracle and records profile identity, graph breaks, generated kernels, compile cost, warm
-latency, peak VRAM and output equivalence. Reusable fusion becomes a maintained companion
+latency, peak VRAM and output equivalence. Reusable fusion becomes a maintained in-package
 kernel; otherwise qualification may produce one exact AOT artifact. Runtime never compiles
 on each invocation, and eager execution remains the fallback.
 

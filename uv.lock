@@ -2,12 +2,6 @@ version = 1
 revision = 3
 requires-python = "==3.12.*"
 
-[manifest]
-members = [
-    "cozy-runtime",
-    "cozy-runtime-cuda-kernels",
-]
-
 [[package]]
 name = "anyio"
 version = "4.14.2"
@@ -166,7 +160,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.2.17"
+version = "0.2.18"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -182,9 +176,6 @@ corpus = [
     { name = "diffusers" },
     { name = "torch" },
     { name = "transformers" },
-]
-cuda-kernels = [
-    { name = "cozy-runtime-cuda-kernels", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 derive = [
     { name = "torch" },
@@ -210,7 +201,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "av", marker = "extra == 'media'", specifier = ">=18.1,<19" },
-    { name = "cozy-runtime-cuda-kernels", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda-kernels'", editable = "packages/cozy-runtime-cuda-kernels" },
     { name = "cryptography", specifier = ">=45" },
     { name = "diffusers", marker = "extra == 'corpus'", specifier = ">=0.36" },
     { name = "grpcio", specifier = ">=1.76" },
@@ -223,7 +213,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
 ]
-provides-extras = ["derive", "corpus", "media", "model-execution", "cuda-kernels"]
+provides-extras = ["derive", "corpus", "media", "model-execution"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -235,11 +225,6 @@ dev = [
     { name = "tensorfs", specifier = ">=0.3.1,<1" },
     { name = "types-protobuf", specifier = ">=6.30" },
 ]
-
-[[package]]
-name = "cozy-runtime-cuda-kernels"
-version = "0.1.0"
-source = { editable = "packages/cozy-runtime-cuda-kernels" }
 
 [[package]]
 name = "cryptography"
