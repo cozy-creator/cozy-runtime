@@ -343,8 +343,6 @@ class Acquirer:
         verified_cache: VerifiedArtifactCache | None = None,
         held_manifests: HeldManifests | None = None,
         on_observation: Any = None,
-        native_environment: Mapping[str, str] | None = None,
-        native_device_index: int = 0,
     ) -> None:
         self.plan = plan
         self.cache_root = cache_root
@@ -356,8 +354,6 @@ class Acquirer:
         self.installed_environment = installed_environment
         self.verified_cache = verified_cache or VerifiedArtifactCache()
         self.held_manifests = held_manifests or HeldManifests()
-        self.native_environment = native_environment
-        self.native_device_index = native_device_index
         self.fetched_bytes = self.verified_bytes = self.trusted_reuse_bytes = self.wheels = 0
         self._fetch_lock = Lock()
         self._new_digests: set[str] = set()

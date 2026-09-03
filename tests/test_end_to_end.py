@@ -33,7 +33,7 @@ from typing import Any
 
 import pytest
 
-from conftest import image_python, sealed_child_environment
+from conftest import image_python
 from cozy_runtime.internal import base_observation, package_environment
 from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package
 from cozy_runtime.protocol import documents
@@ -680,13 +680,12 @@ def _write_native_dependency(root: Path, version: str) -> None:
     )
 
 
-def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -> None:
-    """A native dependency wheel installs only where it is proved to load, import and run.
+def test_native_dependency_wheel_installs_like_any_other_wheel() -> None:
+    """A native dependency wheel installs with no prepare-time qualification (cr-093).
 
-    The retired `allow_native_custom` flag admitted native wheels on WHO was asking. This
-    asserts the replacement: the same wheel refuses with no qualification host to prove it
-    against, and is admitted once the sealed execution environment is supplied — because the
-    loader actually opened the ELF and the interpreter actually imported the module.
+    The kernels link no framework (cr-091), so there is no torch-ABI fact for a prepare-time
+    inspection to prove. Whether the extension loads is the executor's import to answer; the
+    proof here is exactly that — the venv's own interpreter imports the module and runs it.
     """
 
     uv = shutil.which("uv")
@@ -726,9 +725,7 @@ def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -
             )
             return _run(str(selected.python), "-I", "-c", command, cwd="/").stdout.encode()
 
-        def prepare(
-            native_environment: dict[str, str] | None, revision_digest: bytes | None
-        ) -> pb.PreparePackageSetResult:
+        def prepare(revision_digest: bytes | None) -> pb.PreparePackageSetResult:
             return prepare_package(
                 package_name="paul/marco-polo",
                 release="1.0.4",
@@ -741,21 +738,12 @@ def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,
                 base=observed,
-                native_environment=native_environment,
                 development=_development("paul/marco-polo", "1.0.4", revision_digest),
             )
 
-        # RED ARM: no sealed execution environment means no qualification host. There is no
-        # caller identity that substitutes for one.
-        with pytest.raises(PreparationRefusal) as absent:
-            prepare(None, None)
-        assert absent.value.code == "package_environment_native_proof_environment_absent"
-
-        # GREEN ARM: the same bytes, admitted, because the operator child opened the ELF with
-        # the dynamic loader and imported the module out of this exact environment.
         with pytest.raises(PreparationRefusal) as unknown:
-            prepare(sealed_child_environment(), None)
-        prepared = prepare(sealed_child_environment(), _measured_revision(unknown.value))
+            prepare(None)
+        prepared = prepare(_measured_revision(unknown.value))
         assert prepared.placement_set.placement_set_canonical_bytes
         (venv_python,) = (environment / "contents").glob("*/bin/python")
         assert (

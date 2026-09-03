@@ -1,23 +1,9 @@
-"""Shared test plumbing.
-
-A process has exactly one config authority (`read_config()` refuses a second call), and two
-test files both need the sealed child environment a worker would hand its operator child, so
-the ONE read lives here.
-"""
+"""Shared test plumbing."""
 
 from __future__ import annotations
 
 import functools
 from pathlib import Path
-
-
-@functools.cache
-def sealed_child_environment() -> dict[str, str]:
-    """The seal a worker would hand the operator child, built through the one env authority."""
-
-    from cozy_runtime.internal import config, spawn
-
-    return spawn.seal(config.read_config().child_base_env, {})
 
 
 @functools.cache
