@@ -197,6 +197,11 @@ def _worker_options(
         # it cannot reach.
         triage_root=host_paths.MEDIA_ROOT / "triage",
         triage_owner=(POD_SUPERVISOR_UID, POD_SUPERVISOR_GID),
+        # The supervisor's one window into whether this pod is being used (th-142). It is
+        # the pod's release decision: nobody attached, nothing in flight, and nothing
+        # moving is a rental nobody is holding.
+        activity_path=host_paths.WORKER_ACTIVITY,
+        activity_owner=(POD_SUPERVISOR_UID, POD_SUPERVISOR_GID),
     )
 
 
