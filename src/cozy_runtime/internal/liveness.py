@@ -2,11 +2,11 @@
 
 Nothing in this runtime is killed because a number of seconds passed. What ends a process
 early is process death, a typed result, a cancel, a caller's own deadline — or a PROVEN
-wedge, and this module is where "proven" is defined. `pull._Streams` already judged a
-stream this way: silent for far longer than the longest gap the same pull had actually
-shown, and never for less than the sampling noise floor. That rule is lifted here so a
-PROCESS is judged the same way — an executor answering a seam command, a native-operator
-fixture, the whole boot of a local run:
+wedge, and this module is where "proven" is defined. The transport's stream ledger (now
+tensorfs's, cr-090) already judged a stream this way: silent for far longer than the longest
+gap the same pull had actually shown, and never for less than the sampling noise floor.
+That rule is lifted here so a PROCESS is judged the same way — an executor answering a
+seam command, a native-operator fixture, the whole boot of a local run:
 
     wedged  =  the meter has not changed for longer than STILL_FACTOR times the longest pause
                this same subject has already shown, AND for longer than the floor the caller

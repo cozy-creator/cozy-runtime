@@ -926,7 +926,55 @@ def fence_residency_sets_only() -> list[str]:
     return bad
 
 
+#: The one module that may open an HTTP connection, and only for the worker's
+#: control-plane-minted output grant (`egress.put_from`) — until th-132 moves the upload
+#: half into tensorfs too, when this allowlist shrinks to nothing.
+HTTP_CLIENT_ALLOWED = frozenset({"internal/egress.py"})
+HTTP_CLIENT_MODULES = frozenset({"urllib.request", "http.client"})
+
+
+def fence_one_address_predicate() -> list[str]:
+    """No second downloader beside the one egress door (cr-012, retargeted by cr-090).
+
+    The failure mode this fence exists against is not "the SSRF check was wrong", it is
+    "there were two downloaders and only one had the check". The download transport and its
+    address predicate live in tensorfs (`tensorfs-core/src/transport/policy.rs`); what this
+    runtime still holds is the upload half in `internal/egress.py`, whose `blocked()` is the
+    ONE address predicate here. A urllib.request/http.client import anywhere else is a new
+    byte-mover chain that the predicate does not cover — the exemption is never granted; a
+    new mover belongs in tensorfs.
+    """
+    bad = []
+    for path in py_files():
+        where = path.relative_to(SRC).as_posix()
+        if where in HTTP_CLIENT_ALLOWED:
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            names = (
+                [a.name for a in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+            )
+            hit = sorted(
+                n
+                for n in names
+                if n in HTTP_CLIENT_MODULES
+                or any(n.startswith(m + ".") for m in HTTP_CLIENT_MODULES)
+            )
+            if hit:
+                bad.append(
+                    f"{module_of(path)}:{node.lineno} imports {', '.join(hit)} — a second "
+                    "network byte mover beside internal/egress.py; downloads belong to "
+                    "tensorfs's transport, and the exemption is never granted"
+                )
+    return bad
+
+
 FENCES = {
+    "one-address-predicate": fence_one_address_predicate,
     "forbidden-dependency": fence_forbidden_dependency,
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,

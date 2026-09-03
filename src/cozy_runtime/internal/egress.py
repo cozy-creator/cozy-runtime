@@ -1,20 +1,15 @@
 """cr-012 — the ONE bounded stream reader, and the fail-closed egress boundary.
 
-Everything that pulls bytes into this runtime from an address someone else minted comes
-through here. That is the point: the failure mode this module exists against is not "the
-SSRF check was wrong", it is "there were two downloaders and only one had the check".
-
-`blocked()` is that one check, and it is the WHOLE address decision for every downloader:
-`pull.guard` calls it, `EgressPolicy.check_addresses` calls it, and the
-`one-address-predicate` fence (`checks/architecture.py`, red-armed in `scripts/redarm.py`)
-reddens if a third chain appears. The two used to be separate hand-written class lists that
-differed by `is_reserved`/`is_unspecified` and coincided only because CPython folds those
-into `is_private` for v4 — an agreement by accident is the drift this module is for.
-
-`fetch_into` has NO production caller today (cr-042 deleted the worker's `https://` input
-grant row, whose allowlist never had a writer). `put_from` has exactly one: the worker's
-control-plane-minted output grant. Both use the same URL/address validation below. A second
-network byte mover beside this module is the defect above, restated.
+The hazard this module exists against is not "the SSRF check was wrong", it is "there were
+two downloaders and only one had the check". cr-090 resolved it by subtraction: this
+runtime DOWNLOADS nothing any more — the transport and its address predicate live in
+tensorfs (`tensorfs-core/src/transport/policy.rs`, the port of `blocked()` below: same six
+classes, IPv6 fail-closed, every redirect hop re-checked, connects to the checked
+addresses). What remains here is the UPLOAD half and its check: `put_from` has exactly one
+caller, the worker's control-plane-minted output grant, and it moves to tensorfs under
+th-132, taking `blocked()` with it. The `one-address-predicate` fence in
+`checks/architecture.py` reddens if any other urllib/http.client chain appears beside this
+module — a second network byte mover in this runtime is the defect above, restated.
 
 **A stream may not exceed its declared size.** `copy_bounded` stops at the declared length
 and refuses before writing the over-bound chunk; it never buffers the body in memory. A body that
@@ -27,11 +22,10 @@ link-local, multicast or reserved address refuses — every address it resolves 
 first, because a name with one public and one 169.254.169.254 answer is the metadata-service
 bypass with an extra step.
 
-**Every redirect hop is a NEW request and gets the whole check again.** Hop-0-only
-validation IS the metadata-service bypass: `https://allowed.example/x` answering `302
-http://169.254.169.254/latest/meta-data/` passes a hop-0 check and fetches the credential.
-So redirects are never followed by the HTTP library — `_NoRedirect` turns them back into
-responses, and this module re-enters its own front door with the new URL.
+**A redirect never replaces the exact granted URL.** `put_from` refuses one outright —
+after validating the target, so a metadata/private-address redirect is a precise security
+refusal rather than a generic one. Following a redirect inside an HTTP library would put
+the second request outside this module's front door, which is the whole bug.
 
 **The DNS-rebinding limit is stated, not papered over.** Validation happens at resolve time
 and the connection is made by hostname, so a name that answers publicly during the check and
@@ -63,32 +57,29 @@ CHUNK = 1 << 20
 #: The silence bound on ONE socket operation — a read or a write that moves nothing — and
 #: never on a transfer: a 99 GB PUT keeps its socket busy for as long as the bytes take.
 #: DERIVED, not chosen: it is the runtime's one noise floor (`liveness.noise_floor`), the
-#: smallest silence the pull ledger itself ever acts on, so an egress socket is given exactly
-#: the patience a pull stream is given before either is called stalled.
+#: smallest silence any transport ledger acts on (tensorfs's included), so an egress socket
+#: is given exactly the patience a pull stream is given before either is called stalled.
 SILENCE_SECONDS = liveness.noise_floor()
 
 #: How many times one object is re-sent. The PUT is idempotent by construction — one
 #: immutable key, `If-None-Match: *` — so a retry costs one object's bytes and never its
 #: identity: a 412 on a re-send of a body the first send completed is the first send landing.
-#: The same shape as `pull.FETCH_ATTEMPTS`, for the same reason.
+#: The same shape as the transport's per-object re-ask budget, for the same reason.
 PUT_ATTEMPTS = 4
 
 #: The store answers a re-send is worth attempting for. Everything else is a fact about the
 #: request or the grant, and asking again about those is a lie about time.
 RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
-#: The redirect budget. A chain longer than this is a loop or an evasion, either way no.
-MAX_REDIRECTS = 4
-
 #: An `If-None-Match: *` write that lands on an existing immutable key answers with this.
 HTTP_PRECONDITION_FAILED = 412
 
 
-#: The address classes no downloader in this runtime connects to. ONE list: `pull.guard`
-#: and `EgressPolicy.check_addresses` were two hand-written chains that differed by
-#: `is_reserved`/`is_unspecified` and agreed only by CPython accident, which is exactly the
-#: "two downloaders, one check" defect this module exists against (cr-042). The
-#: `one-address-predicate` fence in `checks/architecture.py` reddens if a third appears.
+#: The address classes nothing in this runtime connects to. ONE list, one remaining caller
+#: (`EgressPolicy.check_addresses`, the upload lane): the download half of this predicate
+#: moved to tensorfs `transport/policy.rs` with the transport (cr-090), and the
+#: `one-address-predicate` fence in `checks/architecture.py` reddens if a second chain
+#: appears here.
 _CLASSES: tuple[tuple[str, str], ...] = (
     ("private", "is_private"),
     ("loopback", "is_loopback"),
@@ -181,7 +172,6 @@ class EgressPolicy:
     """The deployment's declared egress bound. Empty allowlist means NO egress at all."""
 
     allowed_hosts: tuple[str, ...] = ()
-    max_redirects: int = MAX_REDIRECTS
     allow_private: bool = False
     """Loopback and private ranges, admitted ONLY for a local deployment that declares it.
     It is a separate switch from the allowlist because "I trust this host" and "I accept a
@@ -313,7 +303,7 @@ def put_from(
     bytes, which is a successful end state for a content-addressed write, not a failure.
 
     The object is RE-SENT when the socket goes silent or the store answers a retryable
-    status, `PUT_ATTEMPTS` times, exactly as `pull._fetch` re-asks for one object: the
+    status, `PUT_ATTEMPTS` times, exactly as the transport re-asks for one object: the
     socket's silence bound is observed per operation and a re-send costs this object's bytes,
     never the attempt. A source that cannot be rewound gets one send.
     """
@@ -401,78 +391,3 @@ def put_from(
             http_status=status, etag=etag, exact=status != HTTP_PRECONDITION_FAILED
         )
     raise AssertionError("unreachable: the send loop returns or raises on its last attempt")
-
-
-def fetch_into(
-    url: str,
-    policy: EgressPolicy,
-    sink: BinaryIO,
-    *,
-    expected_length: int | None,
-    cap: int,
-    prefix_bytes: int,
-    what: str = "input",
-) -> StreamReceipt:
-    """Fetch one object into a sink, re-validating at every redirect hop."""
-    import http.client
-    import urllib.error
-    import urllib.parse
-    import urllib.request
-
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        """Redirects are RETURNED, not followed. Following one inside the library would put
-        the second request outside this module's front door, which is the whole bug."""
-
-        def redirect_request(self, *args: object, **kwargs: object) -> None:
-            return None
-
-    opener = urllib.request.build_opener(_NoRedirect)
-    hops: list[str] = []
-    current = url
-    for hop in range(policy.max_redirects + 1):
-        host, addresses = _validate(current, policy)
-        hops.append(f"{host} {addresses}")
-        try:
-            request = urllib.request.Request(
-                current, method="GET", headers={"Accept-Encoding": "identity"}
-            )
-            response = opener.open(request, timeout=SILENCE_SECONDS)
-        except urllib.error.HTTPError as error:
-            location = error.headers.get("Location") if error.headers else None
-            if error.code in (301, 302, 303, 307, 308) and location:
-                if hop == policy.max_redirects:
-                    raise EgressRefusal(
-                        "egress_redirect_budget",
-                        f"{what}: more than {policy.max_redirects} redirects "
-                        f"({' -> '.join(hops)}); a longer chain is a loop or an evasion",
-                    ) from error
-                try:
-                    current = urllib.parse.urljoin(current, location)
-                except ValueError as exc:
-                    raise EgressRefusal(
-                        "egress_url", f"{what}: a redirect names a malformed URL ({exc})"
-                    ) from exc
-                continue
-            raise EgressRefusal("egress_http_error", f"{what}: {error.code} from {host}") from error
-        except ValueError as exc:
-            raise EgressRefusal("egress_url", f"{what}: the URL is malformed ({exc})") from exc
-        except (http.client.HTTPException, OSError) as exc:
-            raise EgressRefusal("egress_unreachable", f"{what}: {exc}") from exc
-        try:
-            with response as body:
-                return copy_bounded(
-                    iter(lambda body=body: body.read(CHUNK), b""),  # type: ignore[misc]
-                    sink,
-                    expected_length=expected_length,
-                    cap=cap,
-                    prefix_bytes=prefix_bytes,
-                    what=what,
-                )
-        except EgressRefusal:
-            raise
-        except (http.client.HTTPException, OSError) as exc:
-            raise EgressRefusal(
-                "egress_body_error",
-                f"{what}: the response body could not be read completely ({type(exc).__name__})",
-            ) from exc
-    raise EgressRefusal("egress_redirect_budget", f"{what}: redirect budget exhausted")

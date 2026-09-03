@@ -23,11 +23,8 @@ from cozy_runtime.internal import (
     fill,
     package_environment,
     package_interface,
-    placement_materialization,
-    pull,
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
-from cozy_runtime.internal.worker.downloads import DownloadPlan
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     ModelBinding,
@@ -331,7 +328,6 @@ class Acquirer:
 
     def __init__(
         self,
-        plan: DownloadPlan,
         *,
         cache_root: Path,
         install_root: Path,
@@ -344,7 +340,6 @@ class Acquirer:
         held_manifests: HeldManifests | None = None,
         on_observation: Any = None,
     ) -> None:
-        self.plan = plan
         self.cache_root = cache_root
         self.install_root = install_root
         self.selection_root = selection_root
@@ -363,16 +358,10 @@ class Acquirer:
         self.observation = AcquisitionObservation(on_observation)
 
     def fetch(self, digest: str, length: int, *, observe: bool = True) -> Path:
-        """Read one reached exact ref locally, or fetch it through the current Hub plan."""
+        """Read one reached exact ref from the local artifact cache; this worker downloads
+        nothing (cr-090) — bytes reach the pod through TensorFS's one transport."""
 
         target = self.cache_root / digest.removeprefix("sha256:")
-        planned = self.plan.subjects.get(digest)
-        if planned is not None and planned != length:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                "weights_length_conflict",
-                f"{digest} is named at {length} B and planned at {planned} B",
-            )
         already = target.exists()
         trusted = self.verified_cache.trusted(digest, length, target)
         trusted_before = trusted is not None
@@ -384,24 +373,12 @@ class Acquirer:
                 path = target
                 trusted = self.verified_cache.record(digest, length, target)
             else:
-                location = self.plan.locations.get(digest)
-                if planned is None or not location:
-                    raise AcquisitionRefusal(
-                        pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                        "download_plan_missing",
-                        f"{digest} is reached by PlacementSet/1 and absent locally and "
-                        "from the plan",
-                    )
-                # The presign's expiry is the ORIGIN's to enforce, and it does (403). It is
-                # not a deadline on the bytes: a fetch that is landing bytes when the URL
-                # lapses is refused by the store, reported as a fetch fault, and re-planned
-                # with fresh access — never cut here by a clock read off the URL.
-                path = placement_materialization.fetch_exact(
-                    {"digest": digest, "length": length, "url": location},
-                    self.cache_root,
-                    allow_local=self.plan.allow_local,
+                raise AcquisitionRefusal(
+                    pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                    "artifact_absent",
+                    f"{digest} is reached by PlacementSet/1 and absent from the local "
+                    "artifact cache; this runtime holds no downloader",
                 )
-                trusted = self.verified_cache.record(digest, length, path)
         except AcquisitionRefusal:
             raise
         except LaunchRefusal as exc:
@@ -409,8 +386,6 @@ class Acquirer:
                 pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH
                 if exc.code
                 in {
-                    "grant_identity_mismatch",
-                    "grant_length_mismatch",
                     "local_artifact_digest_mismatch",
                     "local_artifact_identity_mismatch",
                     "local_artifact_invalid",
@@ -553,7 +528,7 @@ class Acquirer:
             return 0
         try:
             tensorfs = fill.tensorfs_module()
-            store = pull.open_store(tensorfs, self.tensorfs_root)
+            store = fill.open_store(tensorfs, self.tensorfs_root)
             count = 0
             for model in placement.models:
                 manifest_digest, manifest_length = _ref(model["manifest"], "model.manifest")
@@ -574,51 +549,19 @@ class Acquirer:
                     for row in store.walk_cozytensors(manifest_digest)
                 }
                 closure = {(manifest_digest, manifest_length), *reached}
-                if self.plan.authorized():
-                    reads: list[pull.Read] = []
-                    for digest, length in sorted(closure):
-                        planned = self.plan.subjects.get(digest)
-                        location = self.plan.locations.get(digest)
-                        if planned != length or not location:
-                            raise AcquisitionRefusal(
-                                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                                "model_manifest_plan_incomplete",
-                                f"{digest} is reached at {length} B and not exactly planned",
-                            )
-                        reads.append(pull.Read(digest, length, location))
-                    # NO DEADLINE (xs-007 row 16). The presigns' expiry used to be the pull's
-                    # deadline, which cut a 100 GB materialization at the URL lifetime and
-                    # called it a credential error. The pull is per-object resumable and
-                    # its own ledger ends a stalled stream; an expired presign is refused
-                    # by the origin, reported as a fetch fault, and the next plan carries
-                    # fresh access for exactly the objects still missing.
-                    outcome = pull.pull_granted_cozytensors(
-                        tensorfs,
-                        store,
-                        manifest_digest,
-                        manifest_length,
-                        reads,
-                        session="placement-" + manifest_digest[7:19],
-                        allow_local=self.plan.allow_local,
-                    )
-                    self.observation.add(
-                        "model",
-                        downloaded=outcome.bytes_moved,
-                        reused=max(0, outcome.bytes_total - outcome.bytes_moved),
-                    )
-                # The leg ends on TensorFS's verified walk over the manifest's runtime
-                # closure; the same walk is the residency fact `held_manifests` reports.
+                # This worker moves no model bytes (cr-090): the store is filled by
+                # TensorFS's one transport before the placement is acquired. The leg ends
+                # on TensorFS's verified walk over the manifest's runtime closure; the
+                # same walk is the residency fact `held_manifests` reports.
                 if not self.held_manifests.observe(store, manifest_digest):
                     store.acquire_cozytensors(manifest_digest).release()
                 count += len(closure)
             return count
         except AcquisitionRefusal:
             raise
-        except (pull.PullRefusal, fill.FillRefusal) as exc:
-            code = exc.code if isinstance(exc, pull.PullRefusal) else "tensorfs_refused"
-            detail = exc.message if isinstance(exc, pull.PullRefusal) else str(exc)
+        except fill.FillRefusal as exc:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED, code, detail
+                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED, "tensorfs_refused", str(exc)
             ) from exc
         except Exception as exc:
             raise AcquisitionRefusal(
@@ -700,7 +643,7 @@ class Acquirer:
                 )
             members: list[ModelBinding] = []
             tensorfs = fill.tensorfs_module()
-            store = pull.open_store(tensorfs, self.tensorfs_root)
+            store = fill.open_store(tensorfs, self.tensorfs_root)
             for slot in slots:
                 path = f"{name}.models.{slot['slot']}"
                 declared = described_by_path.get(path)
@@ -799,7 +742,7 @@ class Acquirer:
         if not any(not binding.weightless for binding in bindings.values()):
             return
         try:
-            store = pull.open_store(fill.tensorfs_module(), self.tensorfs_root)
+            store = fill.open_store(fill.tensorfs_module(), self.tensorfs_root)
             for binding in bindings.values():
                 for model in binding.model_bindings():
                     for digest in {model.reference_snapshot, *model.snapshots.values()}:

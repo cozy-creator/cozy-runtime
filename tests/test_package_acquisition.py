@@ -9,7 +9,6 @@ import pytest
 from cozy_runtime.internal import base_observation, canonical, package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
-from cozy_runtime.internal.worker.downloads import DownloadPlan
 from cozy_runtime.internal.worker.session import Placement
 from cozy_runtime.protocol import documents
 
@@ -44,7 +43,6 @@ def _bindings(tmp_path: Path, body: dict[str, Json]) -> tuple[object, int]:
     for name in ("environment", "selection", "store"):
         (tmp_path / name).mkdir()
     acquirer = Acquirer(
-        DownloadPlan(),
         cache_root=cache,
         install_root=tmp_path / "environment",
         selection_root=tmp_path / "selection",

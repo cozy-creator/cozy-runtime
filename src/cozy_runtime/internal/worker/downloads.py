@@ -1,15 +1,13 @@
-"""Worker identity verification and transitional local download facts.
+"""Worker identity verification: the canonical private-rental Claim transcript.
 
-Tensorhub/R2 networking is owned by pod-supervisor. Runtime receives only
-verified local paths; there is no HTTP client, origin, TLS key use, or URL
-redemption in this module.
+Runtime downloads nothing (cr-090): model bytes reach the local TensorFS Store
+through TensorFS's one transport, and operation wheels through pod-supervisor.
+There is no HTTP client, origin, TLS key use, URL, or download plan here.
 """
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
-from dataclasses import dataclass, field
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -19,7 +17,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 
 class DownloadRefusal(Exception):
-    """A typed Claim or supervisor-supplied local-file refusal."""
+    """A typed Claim refusal."""
 
     def __init__(self, kind: pb.FaultKind, code: str, detail: str, *, server_time: int = 0) -> None:
         super().__init__(f"{code}: {detail}")
@@ -27,54 +25,6 @@ class DownloadRefusal(Exception):
         self.code = code
         self.detail = detail
         self.server_time = server_time
-
-
-@dataclass(frozen=True, slots=True)
-class DownloadFile:
-    digest: str
-    length: int
-    kind: str
-    url: str
-    expires_at_unix: int
-
-
-@dataclass(frozen=True, slots=True)
-class DownloadPlan:
-    """Transitional in-memory input for the existing placement acquirer.
-
-    Pod workers no longer construct this from URLs. It remains while local
-    Creator and the PreparedPackageSet handoff converge on verified paths.
-    """
-
-    server_time_unix: int = 0
-    expires_at_unix: int = 0
-    files: Mapping[str, DownloadFile] = field(default_factory=dict)
-    allow_local: bool = False
-
-    @property
-    def subjects(self) -> dict[str, int]:
-        return {digest: row.length for digest, row in self.files.items()}
-
-    @property
-    def locations(self) -> dict[str, str]:
-        return {digest: row.url for digest, row in self.files.items()}
-
-    def authorized(self) -> bool:
-        return bool(self.files)
-
-    def merged(self, newer: DownloadPlan) -> DownloadPlan:
-        rows = dict(self.files)
-        rows.update(newer.files)
-        return DownloadPlan(
-            server_time_unix=max(self.server_time_unix, newer.server_time_unix),
-            expires_at_unix=max(self.expires_at_unix, newer.expires_at_unix),
-            files=dict(sorted(rows.items())),
-            allow_local=self.allow_local or newer.allow_local,
-        )
-
-    def deadline(self, digest: str) -> int:
-        row = self.files.get(digest)
-        return row.expires_at_unix if row is not None else 0
 
 
 def verify_claim_proof(
