@@ -634,6 +634,7 @@ def resolve(
     walk: list[dict[str, Any]] = []
     candidates: list[tuple[ResolvedModelPlan, float, str]] = []
     floors: dict[str, ResolvedModelPlan] = {}
+    leaved: dict[str, ResolvedModelPlan] = {}
 
     for variant in variants:
         rows = list(rows_for.get(variant.name, ()))
@@ -711,6 +712,8 @@ def resolve(
             plan = _with_facts(plan, facts)
             if policy == "decode_floor" or not plan.route_census().get("encoded_gemm"):
                 floors.setdefault(variant.name, plan)
+            elif policy == "encoded_gemm":
+                leaved.setdefault(variant.name, plan)
             value, provenance = score(plan, objective)
             row: dict[str, Any] = {
                 "variant": variant.name,
@@ -755,6 +758,32 @@ def resolve(
     # it is the ordinary state of a rig that has never run this plan: the deployment still
     # has to serve, and the one plan that needs no comparison to justify is the reference
     # variant's decode floor — the plan every deviation is measured against.
+    #
+    # ONE exception, and it is the encoded lane's reason to exist (cr-086): when the
+    # deployment's REFERENCE variant itself stores encoded bytes, the package consents to
+    # leaf replacement, and this device QUALIFIED the native leaves, the floor would decode
+    # the lane back to float — undoing the exact selection the binding made, forever,
+    # because a plan that never runs never banks the measurement that would let it win.
+    # Same artifact, same bytes; only the route differs, and the confession names it.
+    if encoded_leaves == "accept":
+        preferred = leaved.get(reference[0].name)
+        if preferred is not None:
+            for row in walk:
+                if row.get("plan") == preferred.digest():
+                    row["verdict"] = "chosen_uncalibrated"
+            return _replace(
+                preferred,
+                confession=(
+                    f"UNCALIBRATED: no offered plan has a banked {objective} measurement on "
+                    f"{device.tuple_key()}. The {reference[0].name!r} REFERENCE variant "
+                    "stores encoded bytes, the package declares encoded_leaves='accept' and "
+                    f"this device qualified the native leaves, so resolution serves the lane "
+                    f"through its ENCODED-GEMM plan ({preferred.label()}) rather than "
+                    "decoding it back to the float it was derived from. This prepare banks "
+                    "the facts a later resolution can rank"
+                ),
+                walk=tuple(walk),
+            )
     floor = floors.get(reference[0].name)
     if floor is not None:
         for row in walk:
