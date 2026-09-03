@@ -1165,6 +1165,36 @@ def _stage_job_plans(
     return staged
 
 
+def _resolved_manifest_length(
+    resolved: Mapping[str, Any], digest: str, declared: int, where: str
+) -> int:
+    """The length of the manifest a selection resolves to, cross-checked against it.
+
+    THE SELECTION DECLARES A DIGEST; THE STORE DECLARES THE LENGTH. `cli/package_prepare`
+    requires `manifest_length` on every selection row it accepts, but the pod's rows come
+    from a signed DownloadDelegation whose model entries are lane/manifest/model/package/
+    release/slot -- there is no length in them. Reading one and comparing it to the store's
+    real length compared 0 against a real number, which no store can satisfy: every modeled
+    preparation on a pod refused `package_prepare_model_selection_mismatch` while naming the
+    digest that had in fact matched. `local.py` already gets this right -- the length comes
+    from the resolved row, and a caller-supplied one is cross-checked only when it exists --
+    and this is that rule, given a name so the two halves cannot drift apart again.
+    """
+
+    resolved_digest = str(resolved["manifest_digest"])
+    length = int(resolved["manifest_length"])
+    if resolved_digest != digest or (declared and declared != length):
+        # Name BOTH sides. The old message quoted only the digest the caller expected, so a
+        # length disagreement and a digest disagreement read identically -- which sent a
+        # reader hunting for a lane mix-up that was never there.
+        raise PreparationRefusal(
+            "package_prepare_model_selection_mismatch",
+            f"{where} resolves to {resolved_digest}/{length}, "
+            f"not the selected {digest}" + (f"/{declared}" if declared else ""),
+        )
+    return length
+
+
 def _selected_models(
     package_name: str,
     selections: Sequence[Any],
@@ -1202,22 +1232,29 @@ def _selected_models(
         for value in selected.values():
             selection = value["selection"]
             digest = str(selection["manifest"])
-            length = int(selection.get("manifest_length", 0))
+            # A DELEGATION NAMES A DIGEST AND NO LENGTH. `cli/package_prepare` requires
+            # `manifest_length` in every selection row it accepts, but the pod's rows come
+            # from a signed DownloadDelegation whose model entries are
+            # lane/manifest/model/package/release/slot -- there is no length to read. So
+            # this defaulted to 0 and compared 0 against the store's real length, which no
+            # store can ever satisfy: every modeled preparation on a pod refused
+            # `package_prepare_model_selection_mismatch` naming the digest that had in fact
+            # matched. `local.py` already resolves this correctly -- the length comes from
+            # the resolved row and a caller-supplied one is only cross-checked when it
+            # exists -- and this is that, for the same reason.
+            declared = int(selection.get("manifest_length", 0))
             model = str(selection.get("model", ""))
             release = str(selection.get("release", ""))
             lane = str(selection.get("lane", ""))
             parts = model.split("/")
             if len(parts) != 2 or not all(parts) or not release or not lane:
                 raise PreparationRefusal("package_prepare_model_selection_mismatch", model)
-            resolved = store.resolve_release(parts[0], parts[1], release, lane)
-            if (
-                str(resolved["manifest_digest"]) != digest
-                or int(resolved["manifest_length"]) != length
-            ):
-                raise PreparationRefusal(
-                    "package_prepare_model_selection_mismatch",
-                    f"{model}@{release}/{lane} does not resolve to {digest}",
-                )
+            length = _resolved_manifest_length(
+                store.resolve_release(parts[0], parts[1], release, lane),
+                digest,
+                declared,
+                f"{model}@{release}/{lane}",
+            )
             held = store.manifest(digest)
             raw = bytes(held["manifest"])
             if (
