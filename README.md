@@ -209,6 +209,22 @@ candidate CUDA image runs a hand-run comparison of eager and optimized real CUDA
 at Anima's native token width, checks determinism and storage identity, and measures the
 block speedup.
 
+`scripts/build-kernel-wheel.sh` is that second wheel's ONE recipe, run by `publish.yaml`
+and by hand alike. It builds inside `manylinux_2_28_x86_64` with CUDA 13.0 and lets
+auditwheel certify the platform tag, so nvcc never has to exist on the host and the
+release cannot ship a tag the binary does not honour. A wheel's glibc floor is the floor
+of the machine that compiled it, which is why the build is manylinux rather than the GPU
+worker image's Ubuntu 24.04 base (that toolchain yields an unpublishable
+`manylinux_2_39`); the parts that must match the worker image -- nvcc 13.0.88, cp312,
+static cudart -- do. A developer box wanting the fused kernels installs that exact file,
+never a side channel:
+
+```
+scripts/build-kernel-wheel.sh --out dist
+uv tool install --force --python 3.12 \
+  "cozy-runtime[media,model-execution] @ $PWD/dist/cozy_runtime-<version>-cp312-abi3-manylinux_2_28_x86_64.whl"
+```
+
 Every model-specific optimization first benchmarks `torch.compile`/Inductor as a discovery
 oracle and records profile identity, graph breaks, generated kernels, compile cost, warm
 latency, peak VRAM and output equivalence. Reusable fusion becomes a maintained in-package

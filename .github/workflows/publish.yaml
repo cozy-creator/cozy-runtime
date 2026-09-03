@@ -8,7 +8,55 @@ on:
       - 'v*'
 
 jobs:
+  # The cheap refusals, ahead of the expensive build. ci.yaml owns lint + types + the
+  # behaviour gate on every push; this re-runs the architecture fences against the exact
+  # tagged tree rather than trusting that the tag points at a commit CI already saw.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.12
+      # --locked: fail loudly if uv.lock drifts from pyproject.toml instead of
+      # silently resolving versions nothing ever saw.
+      - run: uv sync --locked
+      - name: Fences
+        run: uv run python checks/architecture.py
+      - name: Version matches tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER="$(uv run python -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          if [ "$TAG" != "$VER" ]; then
+            echo "tag v$TAG != pyproject version $VER"; exit 1
+          fi
+
+  # ONE package, TWO wheel files (cr-094). This is the second one: same source, same
+  # version, tagged cp312-abi3 and carrying `cozy_runtime/_kernels/_C.abi3.so`, so a
+  # linux/x86 install gets the fused Anima kernels by standard wheel-tag selection alone.
+  # The recipe lives in the script, not here, because a developer needs to run the very
+  # same build on a box with no CUDA toolkit.
+  kernel-wheel:
+    needs: gate
+    runs-on: ubuntu-latest
+    # Hang bound, not a work budget: image pull + CUDA toolkit + six-architecture compile.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the cp312-abi3 kernels wheel
+        run: scripts/build-kernel-wheel.sh --out dist --commit "${{ github.sha }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
   publish:
+    needs: [gate, kernel-wheel]
     runs-on: ubuntu-latest
     environment: pypi
     # Hang bound, not a work budget.
@@ -23,30 +71,41 @@ jobs:
 
       - run: uv python install 3.12
 
-      # --locked: fail loudly if uv.lock drifts from pyproject.toml instead of
-      # silently resolving versions nothing ever saw.
       - run: uv sync --locked
 
-      # ci.yaml owns lint + types + the behaviour gate on every push; the publish
-      # gate re-runs the architecture fences against the exact tagged tree rather
-      # than trusting that the tag points at a commit CI already saw.
-      - name: Fences
-        run: uv run python checks/architecture.py
-
-      - name: Version matches tag
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          VER="$(uv run python -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
-          if [ "$TAG" != "$VER" ]; then
-            echo "tag v$TAG != pyproject version $VER"; exit 1
-          fi
-
+      # The pure wheel is first-class, not a fallback: every platform that is not
+      # linux/x86 installs it, and it is the only artifact a macOS or Windows box sees.
       - name: Build (sdist + pure-py wheel)
         env:
           COZY_RUNTIME_BUILD_COMMIT: ${{ github.sha }}
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-wheel
+          path: dist
+
+      # cr-095: the release that silently carried ONE wheel is exactly the regression this
+      # job exists to prevent, so the shape of `dist/` is a refusal rather than a hope.
+      - name: Release carries the sdist and BOTH wheels
+        run: |
+          ls -l dist
+          uv run python - <<'PY'
+          import pathlib, sys
+          v = __import__("tomllib").load(open("pyproject.toml", "rb"))["project"]["version"]
+          want = {
+              f"cozy_runtime-{v}.tar.gz",
+              f"cozy_runtime-{v}-py3-none-any.whl",
+              f"cozy_runtime-{v}-cp312-abi3-manylinux_2_28_x86_64.whl",
+          }
+          dist = pathlib.Path("dist")
+          have = {p.name for p in [*dist.glob("*.whl"), *dist.glob("*.tar.gz")]}
+          if have != want:
+              sys.exit(f"dist is not the release set\n  missing: {sorted(want - have)}\n  extra:   {sorted(have - want)}")
+          print("\n".join(sorted(have)))
+          PY
 
       - name: Publish (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1

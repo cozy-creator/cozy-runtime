@@ -31,7 +31,12 @@ target_include_directories(_C PRIVATE native ${CUDAToolkit_INCLUDE_DIRS})
 target_sources(_C PRIVATE $<TARGET_OBJECTS:rms_rope_kernel>)
 target_link_libraries(_C PRIVATE CUDA::cudart_static ${CMAKE_DL_LIBS})
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_options(_C PRIVATE -Wl,--build-id=none)
+    # Static libstdc++/libgcc is what makes the wheel PUBLISHABLE. Linked dynamically, the
+    # module references its build gcc's GLIBCXX_3.4.31/CXXABI_1.3.13, which pins the wheel to
+    # manylinux_2_39 and excludes every glibc 2.34-2.38 host. Absorbed, the only external
+    # versioned symbols left are glibc's own (max GLIBC_2.34), so auditwheel certifies
+    # manylinux_2_34_x86_64. nanobind is already NB_STATIC, so no C++ ABI crosses this .so.
+    target_link_options(_C PRIVATE -Wl,--build-id=none -static-libstdc++ -static-libgcc)
 endif()
 set_target_properties(_C PROPERTIES SUFFIX ".abi3.so")
 install(TARGETS _C LIBRARY DESTINATION cozy_runtime/_kernels)
