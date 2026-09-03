@@ -48,7 +48,7 @@ def _bindings(tmp_path: Path, body: dict[str, Json]) -> tuple[object, int]:
         cache_root=cache,
         environment_root=tmp_path / "environment",
         selection_root=tmp_path / "selection",
-        artifact_store=tmp_path / "store",
+        tensorfs_root=tmp_path / "store",
         python=Path("/usr/bin/python3"),
         base=base_observation.current(),
     )

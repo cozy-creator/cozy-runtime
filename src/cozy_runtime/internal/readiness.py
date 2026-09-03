@@ -243,7 +243,7 @@ def receipt_payload(
     Six fields went with cr-048 —
     `provision_spec_digest`, `provision_bundle_digest`,
     `measured_installed_environment_receipt_digest`, `staged_placement_set_digest`,
-    `artifact_sources`, `network_cache_degradations` — because a pod that boots empty has
+    `artifact_sources` and cache diagnostics — because a pod that boots empty has
     staged nothing, and a boot-frozen "staged" claim is exactly the acceptance-as-reality
     shape #473 retired. That state is per-placement observed state on the rev-2 wire
     (`converged_revision`, MaterializationState x ServingState), reported continuously

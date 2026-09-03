@@ -26,11 +26,10 @@ import urllib.error
 import urllib.parse
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical, egress, host_paths, package_environment, pull
+from cozy_runtime.internal import canonical, egress, fill, host_paths, package_environment, pull
 from cozy_runtime.internal.config import WorkerHostConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
 
@@ -39,17 +38,8 @@ MAX_PACKAGE_ENVIRONMENT_BYTES = 4 << 30
 BOOT_ROOT = host_paths.BOOT_DATA
 ENVIRONMENT_ROOT = host_paths.ENVIRONMENT_ROOT
 LOCAL_TENSORFS_ROOT = host_paths.TENSORFS_ROOT
-TRANSFER_STAGING_ROOT = host_paths.TRANSFER_STAGING
 MAX_ARTIFACT_BYTES = 8 << 30
 CHUNK_BYTES = 1 << 20
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedBoot:
-    """What a pod knows about itself once it is ready and still empty."""
-
-    tensorfs_root: Path
-    transfer_staging: Path
 
 
 def prepare_boot(
@@ -57,9 +47,8 @@ def prepare_boot(
     *,
     boot_root: Path = BOOT_ROOT,
     tensorfs_root: Path = LOCAL_TENSORFS_ROOT,
-    transfer_staging_root: Path = TRANSFER_STAGING_ROOT,
-) -> PreparedBoot:
-    """Bring the pod to READY-BUT-EMPTY: open TensorFS and local transfer staging.
+) -> Path:
+    """Bring the pod to READY-BUT-EMPTY by opening its local TensorFS Store.
 
     No lease check (xs-007 row 18). This used to refuse `worker_lease_elapsed` against
     `COZY_WORKER_LEASE_EXPIRY_UNIX`, the rental cap tensorhub has since deleted; the
@@ -78,20 +67,14 @@ def prepare_boot(
     """
 
     del config  # the handoff carries nothing this step decides on
-    # Package executors read verified TensorFS objects but never publish them. Root owns
-    # the store; execute/read bits admit the fixed executor uid without making any object
-    # or directory writable to it. Transfer staging is the supervisor's container-local
-    # landing area (it takes ownership after this boot) and also carries the worker's staged
-    # selection documents, which the executor reads by path: the execute bit alone lets
-    # the fixed executor uid traverse to `selections/`; `sets/` stays the supervisor's 0700.
-    _directory(tensorfs_root, mode=0o755, allow_symlink=True)
-    _grant_executor_holds(tensorfs_root)
-    _directory(transfer_staging_root, mode=0o711)
+    # pod-supervisor already ensured this local Store and prepared its reader permissions
+    # through TensorFS. Runtime validates it without creating, chmodding, or reading layout.
+    try:
+        pull.open_store(fill.tensorfs_module(), tensorfs_root)
+    except (fill.FillRefusal, pull.PullRefusal) as exc:
+        raise LaunchRefusal("provision_store_invalid", str(exc)) from exc
     _directory(boot_root)
-    return PreparedBoot(
-        tensorfs_root=tensorfs_root,
-        transfer_staging=transfer_staging_root,
-    )
+    return tensorfs_root
 
 
 def fetch_exact(grant: Mapping[str, Any], root: Path, *, allow_local: bool = False) -> Path:
@@ -252,47 +235,11 @@ def _publish_exact(target: Path, payload: bytes, root: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _grant_executor_holds(store_root: Path) -> None:
-    """Lay the store and grant the executor uid exactly the two writes a reader makes.
-
-    A TensorFS reader registers its hold before the first byte moves — a marker it creates
-    under `tmp/leases` and a shared lock on `tmp/writers/recovery.lock` — so a sweep can
-    never reap an object under a live lease. Those are the only writes package code ever
-    makes to the store: the marker directory takes create-only (sticky, unlistable) and the
-    lock file is openable read-write by everyone; every object, manifest and the catalog
-    stay root's, read-only to the executor.
-    """
-
-    try:
-        import tensorfs
-    except ImportError as exc:  # pragma: no cover - environment, not logic
-        raise LaunchRefusal("provision_store_invalid", "tensorfs reader is absent") from exc
-    try:
-        pull.open_store(tensorfs, store_root)
-    except pull.PullRefusal as exc:
-        raise LaunchRefusal("provision_store_invalid", str(exc)) from exc
-    leases = store_root / "tmp" / "leases"
-    writers = store_root / "tmp" / "writers"
-    for path in (leases, writers):
-        path.mkdir(parents=True, exist_ok=True)
-    (store_root / "tmp").chmod(0o755)
-    leases.chmod(0o1733)
-    writers.chmod(0o755)
-    lock = writers / "recovery.lock"
-    os.close(os.open(lock, os.O_RDWR | os.O_CREAT, 0o666))
-    lock.chmod(0o666)
-
-
-def _directory(path: Path, *, mode: int = 0o700, allow_symlink: bool = False) -> None:
+def _directory(path: Path, *, mode: int = 0o700) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # Only TensorFS may be redirected by the fixed root supervisor into a
-    # provider-mounted volume. Transfer staging and boot state remain ordinary
-    # container-local directories and retain the lstat symlink refusal.
-    info = path.stat() if allow_symlink else path.lstat()
+    info = path.lstat()
     if not path.is_absolute() or not stat.S_ISDIR(info.st_mode):
         raise LaunchRefusal("provision_store_invalid", str(path))
-    # A root-squashed mount can deny chmod to container root even when the
-    # supervisor's fixed-uid helper already installed the exact mode.
     if stat.S_IMODE(info.st_mode) != mode:
         path.chmod(mode)
 

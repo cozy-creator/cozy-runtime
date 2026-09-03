@@ -460,7 +460,7 @@ class AttemptEngine:
         device_process: Callable[[int], int],
         weights: WeightsExchange | None = None,
         owner_scope: Callable[[], str] = lambda: "",
-        artifact_store: Path | None = None,
+        tensorfs_root: Path | None = None,
     ) -> None:
         self.records = records
         self.authorizer = authorizer
@@ -487,7 +487,7 @@ class AttemptEngine:
         self.device_process = device_process
         self.weights = weights
         self.owner_scope = owner_scope
-        self.artifact_store = artifact_store
+        self.tensorfs_root = tensorfs_root
         #: binding digests whose boot warm pass FAILED. Every attempt served under one
         #: carries a per-request confession: the first-call tax was never paid for it.
         self.degraded: dict[str, str] = {}
@@ -888,7 +888,7 @@ class AttemptEngine:
             )
         if not declared:
             return
-        if self.artifact_store is None or not self.artifact_store.is_dir():
+        if self.tensorfs_root is None or not self.tensorfs_root.is_dir():
             raise AttemptRefusal(
                 "job_model_store_unavailable",
                 "this job declares Model parameters and the worker has no existing TensorFS store",
@@ -898,7 +898,7 @@ class AttemptEngine:
         models: dict[str, JobModel] = {}
         try:
             tensorfs = fill.tensorfs_module()
-            store = tensorfs.Store.open(str(self.artifact_store))
+            store = tensorfs.Store.open(str(self.tensorfs_root))
             for parameter in sorted(declared):
                 entry = selected[parameter]
                 manifest = documents.spell(entry.digest)
@@ -1619,7 +1619,7 @@ class AttemptEngine:
                     for parameter, model in sorted(attempt.job_models.items())
                 },
                 "max_input_bytes": 64 << 20,
-                "artifact_store": str(self.artifact_store) if self.artifact_store else "",
+                "tensorfs_root": str(self.tensorfs_root) if self.tensorfs_root else "",
                 "weights_owner_scope": self.owner_scope(),
                 "weights_request_id": attempt.request_id,
                 "invocation_spec_digest": documents.spell(attempt.digest),

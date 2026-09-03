@@ -173,22 +173,16 @@ class HeldManifests:
             self._on_change()
         return held
 
-    def rebuild(self, store: Any, root: Path) -> tuple[int, int]:
-        """Walk every manifest the store's shard layout names and keep the complete ones.
-        Returns (held, named). The layout read here only NAMES candidates — the store's
-        Python facade has no listing door — and TensorFS's verified walk decides each."""
-        named = sorted(
-            f"sha256:{path.stem}"
-            for path in (root / "manifests").glob("*/*/*.json")
-            if len(path.stem) == 64 and all(c in "0123456789abcdef" for c in path.stem)
-        )
-        held = {digest for digest in named if self._complete(store, digest)}
+    def rebuild(self, store: Any) -> int:
+        """Replace the index from TensorFS's verified complete-CozyTensors census."""
+
+        held = set(store.complete_cozytensors_manifests())
         with self._lock:
             changed = held != self._held
             self._held = held
         if changed and self._on_change is not None:
             self._on_change()
-        return len(held), len(named)
+        return len(held)
 
     @staticmethod
     def _complete(store: Any, digest: str) -> bool:
@@ -342,7 +336,7 @@ class Acquirer:
         cache_root: Path,
         environment_root: Path,
         selection_root: Path,
-        artifact_store: Path,
+        tensorfs_root: Path,
         python: Path,
         base: base_observation.Observation | None = None,
         installed_environment: package_environment.InstalledEnvironment | None = None,
@@ -356,7 +350,7 @@ class Acquirer:
         self.cache_root = cache_root
         self.environment_root = environment_root
         self.selection_root = selection_root
-        self.artifact_store = artifact_store
+        self.tensorfs_root = tensorfs_root
         self.python = python
         self.base = base or package_environment.observe_base(python)
         self.installed_environment = installed_environment
@@ -563,7 +557,7 @@ class Acquirer:
             return 0
         try:
             tensorfs = fill.tensorfs_module()
-            store = pull.open_store(tensorfs, self.artifact_store)
+            store = pull.open_store(tensorfs, self.tensorfs_root)
             count = 0
             for model in placement.models:
                 manifest_digest, manifest_length = _ref(model["manifest"], "model.manifest")
@@ -710,7 +704,7 @@ class Acquirer:
                 )
             members: list[ModelBinding] = []
             tensorfs = fill.tensorfs_module()
-            store = pull.open_store(tensorfs, self.artifact_store)
+            store = pull.open_store(tensorfs, self.tensorfs_root)
             for slot in slots:
                 path = f"{name}.models.{slot['slot']}"
                 declared = described_by_path.get(path)
@@ -754,7 +748,7 @@ class Acquirer:
                         model_class=str(declared.get("class", "")),
                         model_binding_path=path,
                         model_parameter_name=str(slot["slot"]),
-                        store=str(self.artifact_store),
+                        store=str(self.tensorfs_root),
                         variant="",
                         reference_snapshot=reference_manifest,
                         components=components,
@@ -809,7 +803,7 @@ class Acquirer:
         if not any(not binding.weightless for binding in bindings.values()):
             return
         try:
-            store = pull.open_store(fill.tensorfs_module(), self.artifact_store)
+            store = pull.open_store(fill.tensorfs_module(), self.tensorfs_root)
             for binding in bindings.values():
                 for model in binding.model_bindings():
                     for digest in {model.reference_snapshot, *model.snapshots.values()}:

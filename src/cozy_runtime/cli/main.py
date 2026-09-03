@@ -53,6 +53,7 @@ verbs:
 
 run/job flags:
   --model [path=]<ref>  override a model binding (repeatable)
+  --tensorfs-root <dir> explicit local Store root for a model-bound source run
   --input <ref>=<dir>   grant one materialized input tree (job only, repeatable)
   --org <name>          publishing org; a job's writes land in <org>/_job-<request-id>
   --out <dir>           output directory (default ./outputs)
@@ -71,8 +72,8 @@ probe flags (both lanes bind the entrypoint's one constructing model slot):
   --zoom <tap>              rerun one block subdivided when the map needs detail
   --out <file>              also write the canonical report/1 document here
 
-serve modes (exactly one):
-  --artifact-store <dir>                     serve selected published model Manifests
+serve storage:
+  --tensorfs-root <dir>    serve selected model Manifests from one explicit local Store
 
 global flags:
   --json           the full typed result as one JSON document

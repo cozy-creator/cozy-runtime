@@ -126,7 +126,7 @@ def test_lying_inventory_refuses_before_any_install() -> None:
         return prepare_package_set(
             pb.PreparePackageSetRequest(
                 download_delegation=delegation,
-                environment_root="/tmp/unused-environment",
+                install_root="/tmp/unused-environment",
                 application="ranged_marco_package:app",
                 model_slot_paths=[],
                 image_inventory=pb.ImageInventory(
@@ -141,7 +141,7 @@ def test_lying_inventory_refuses_before_any_install() -> None:
                 b"ranged-marco==1.0.4 --hash=sha256:" + b"a" * 64 + b"\n",
             ),
             artifact_cache=Path("/tmp/unused-artifacts"),
-            artifact_store=Path("/tmp/unused-store"),
+            tensorfs_root=Path("/tmp/unused-store"),
             environment_root=Path("/tmp/unused-environment"),
             python=Path(sys.executable),
             describe=lambda installed, distribution: b"{}",

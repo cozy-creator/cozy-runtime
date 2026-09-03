@@ -133,22 +133,15 @@ class PullRefusal(Exception):
 
 
 def open_store(tensorfs: Any, root: Path) -> Any:
-    """Open or initialize one TensorFS-owned store root without resolving its layout."""
+    """Open one caller-prepared TensorFS Store without resolving or mutating its layout."""
 
-    root.mkdir(parents=True, exist_ok=True)
     try:
-        if all((root / name).is_dir() for name in ("repos", "manifests", "blobs")):
-            return tensorfs.Store.open(str(root))
-        if any(root.iterdir()):
-            # Let TensorFS produce the typed old-layout/malformed-store refusal. Initializing
-            # beside foreign bytes would create two apparent authorities in one directory.
-            return tensorfs.Store.open(str(root))
-        return tensorfs.Store.init(str(root))
+        return tensorfs.Store.open(str(root))
     except Exception as exc:
         raise PullRefusal(
             "border_refused",
             f"{root}: not a usable TensorFS store — {type(exc).__name__}: {exc}",
-            "repair the backing filesystem or launch against an empty store directory",
+            "have the Store owner ensure it before launching Runtime",
         ) from exc
 
 
@@ -536,7 +529,6 @@ class PullResult:
     presence: dict[str, str] = field(default_factory=dict)
     objects: list[str] = field(default_factory=list)
     sources: dict[str, str] = field(default_factory=dict)
-    cache_degradations: set[str] = field(default_factory=set)
 
     def document(self) -> dict[str, object]:
         return {
@@ -794,7 +786,6 @@ def pull_granted_cozytensors(
     session: str = "",
     streams: int = STREAMS,
     on_object: Callable[[str, int, bool], None] | None = None,
-    cache_store: Any | None = None,
     allow_local: bool = False,
 ) -> PullResult:
     """Admit one exact CozyTensors runtime closure from closed direct HTTPS grants.
@@ -898,7 +889,6 @@ def pull_granted_cozytensors(
         streams=streams,
         on_object=on_object,
         no_proxy=True,
-        cache_store=cache_store,
         complete=tensorfs.fetch_complete_cozytensors,
     )
     return result
@@ -918,28 +908,17 @@ def _execute_plan(
     on_object: Callable[[str, int, bool], None] | None,
     complete: Callable[[Any, bytes], Any],
     no_proxy: bool = False,
-    cache_store: Any | None = None,
 ) -> None:
     """Run one TensorFS-authored plan and require its own completion proof."""
 
     ledger = threading.Lock()
     liveness = _Streams()
 
-    def degraded(code: str) -> None:
-        with ledger:
-            result.cache_degradations.add(code)
-
     def one(item: tuple[str, int]) -> None:
         object_id, length = item
-        is_manifest = object_id.removeprefix("sha256:") == result.manifest_id
         raw = in_hand.get(object_id)
-        if cache_store is not None and _admit_cached(
-            tensorfs, cache_store, store, object_id, length, is_manifest, degraded
-        ):
-            source = "network_cache"
-        elif raw is not None:
+        if raw is not None:
             _admit(tensorfs, store, plan["document"], object_id, _Bytes(raw))
-            _backfill(tensorfs, store, cache_store, object_id, length, is_manifest, degraded)
             source = "cloud"
         else:
             url = urls.get(object_id)
@@ -960,7 +939,6 @@ def _execute_plan(
                 no_proxy=no_proxy,
                 streams=liveness,
             )
-            _backfill(tensorfs, store, cache_store, object_id, length, is_manifest, degraded)
             source = "cloud"
         with ledger:
             result.fetched += 1
@@ -1000,45 +978,6 @@ class _Bytes:
         chunk = self._data[self._at : self._at + n]
         self._at += len(chunk)
         return chunk
-
-
-def _admit_cached(
-    tensorfs: Any,
-    cache_store: Any,
-    local_store: Any,
-    object_id: str,
-    length: int,
-    is_manifest: bool,
-    degraded: Callable[[str], None],
-) -> bool:
-    transfer = tensorfs.transfer_manifest if is_manifest else tensorfs.transfer_object
-    try:
-        transfer(cache_store, local_store, object_id, length)
-    except Exception as exc:
-        code = str(getattr(exc, "code", ""))
-        if code == "OBJECT_ABSENT":
-            return False
-        degraded("corrupt" if code in {"LENGTH_MISMATCH", "OBJECT_CORRUPT"} else "read_unavailable")
-        return False
-    return True
-
-
-def _backfill(
-    tensorfs: Any,
-    local_store: Any,
-    cache_store: Any | None,
-    object_id: str,
-    length: int,
-    is_manifest: bool,
-    degraded: Callable[[str], None],
-) -> None:
-    if cache_store is None:
-        return
-    transfer = tensorfs.transfer_manifest if is_manifest else tensorfs.transfer_object
-    try:
-        transfer(local_store, cache_store, object_id, length)
-    except Exception:
-        degraded("backfill_unavailable")
 
 
 def _fetch(

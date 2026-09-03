@@ -477,7 +477,7 @@ def _drive(
         release="0.0.0",
         source_digest=source_digest,
         artifact_cache=workspace / "artifact-cache",
-        artifact_store=store.root,
+        tensorfs_root=store.root,
         found=found,
     )
     placements = []
@@ -500,7 +500,7 @@ def _drive(
         devices=DEVICE,
         no_warm=True,
         instance_id="ins-shared-lane",
-        artifact_store=staged.artifact_store,
+        tensorfs_root=staged.tensorfs_root,
         artifact_cache=staged.artifact_cache,
         development_project=PACKAGE,
         development_package=staged.placement.development.package,
@@ -699,14 +699,14 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
             release="0.0.0",
             source_digest=source_digest,
             artifact_cache=root / "artifact-cache",
-            artifact_store=store.root,
+            tensorfs_root=store.root,
             found=found,
         )
         options = WorkerOptions(
             root=root / "worker",
             devices="0,1",
             no_warm=True,
-            artifact_store=staged.artifact_store,
+            tensorfs_root=staged.tensorfs_root,
             artifact_cache=staged.artifact_cache,
             development_project=PACKAGE,
             development_package=staged.placement.development.package,

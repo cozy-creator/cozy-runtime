@@ -16,7 +16,7 @@ from cozy_runtime.author import Artifact, CapabilityError, Config, Loader
 from cozy_runtime.author._loader import loading
 from cozy_runtime.internal import base_observation, canonical, fill, package_interface
 from cozy_runtime.internal.encoding import SPEC_PLAIN, launch_providers
-from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
+from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal, HeldManifests
 from cozy_runtime.internal.worker.downloads import DownloadPlan
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
@@ -87,7 +87,7 @@ def _acquirer(tmp_path: Path, store_root: Path) -> Acquirer:
         cache_root=roots["cache"],
         environment_root=roots["environment"],
         selection_root=roots["selection"],
-        artifact_store=store_root,
+        tensorfs_root=store_root,
         python=Path("/usr/bin/python3"),
         base=base_observation.current(),
     )
@@ -108,6 +108,14 @@ def test_model_prep_ignores_absent_snapshot_siblings(tmp_path: Path) -> None:
     }
     assert not store.contains(hashlib.sha256(b"example model\n").hexdigest())
     assert not store.contains(hashlib.sha256(b"not really a png").hexdigest())
+
+
+def test_held_manifest_census_comes_from_tensorfs(tmp_path: Path) -> None:
+    _store_root, manifest_id, _manifest_length, store = _snapshot(tmp_path, include_asset=True)
+    held = HeldManifests()
+
+    assert held.rebuild(store) == 1
+    assert held.digests() == [manifest_id]
 
 
 def test_model_prep_still_requires_header_assets(tmp_path: Path) -> None:
@@ -176,7 +184,7 @@ def test_cold_fit_reads_manifest_header_and_model_assets_from_the_store(tmp_path
             "lane": "main",
         }
     ]
-    candidate = _compatibility_models(selected, artifact_store=store_root)["generate.models.model"]
+    candidate = _compatibility_models(selected, tensorfs_root=store_root)["generate.models.model"]
     assert candidate["config"] == _CONFIG
     assert candidate["assets"] == {"tokenizer/vocab.txt": _ASSET}
 
@@ -194,7 +202,7 @@ def test_cold_fit_reads_manifest_header_and_model_assets_from_the_store(tmp_path
     )
     cold = [dict(selected[0], manifest=cold_manifest)]
     with pytest.raises(PreparationRefusal, match="model_asset_unavailable"):
-        _compatibility_models(cold, artifact_store=cold_root)
+        _compatibility_models(cold, tensorfs_root=cold_root)
 
 
 def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -> None:

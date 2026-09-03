@@ -82,7 +82,7 @@ _SERVE_FLAGS: dict[str, str] = {
     "--grant-root": "--grant-root",
     "--environment-root": "--environment-root",
     "--environment-python": "--environment-python",
-    "--artifact-store": "--artifact-store",
+    "--tensorfs-root": "--tensorfs-root",
     "--artifact-cache": "--artifact-cache",
     "--accelerator-backend": "--accelerator-backend",
     "--executor-uid": "--executor-uid",
@@ -163,7 +163,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             "Creator supplies project, package, release, and source digest together",
             Exit.usage,
         )
-    artifact_flags = ("--artifact-store", "--artifact-cache")
+    artifact_flags = ("--tensorfs-root", "--artifact-cache")
     supplied_artifacts = [flag for flag in artifact_flags if flag in values]
     forbidden_development = [
         flag for flag in ("--environment-root", "--environment-python") if flag in values
@@ -173,7 +173,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             "usage",
             f"--development-project cannot be combined with {', '.join(forbidden_development)}",
             "a source checkout has no published Environment; Creator supplies the local "
-            "TensorFS --artifact-store and the install's --artifact-cache",
+            "--tensorfs-root and the install's --artifact-cache",
             Exit.usage,
         )
     if all(development.values()) and len(supplied_artifacts) != len(artifact_flags):
@@ -200,7 +200,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
                 release=development["--development-release"],
                 source_digest=development["--development-source-digest"],
                 artifact_cache=Path(values["--artifact-cache"]).expanduser().resolve(),
-                artifact_store=Path(values["--artifact-store"]).expanduser().resolve(),
+                tensorfs_root=Path(values["--tensorfs-root"]).expanduser().resolve(),
                 found=found,
             )
         except ConformanceError as exc:
@@ -219,8 +219,8 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
                 Exit.structural,
             ) from exc
         argv += [
-            "--artifact-store",
-            str(staged.artifact_store),
+            "--tensorfs-root",
+            str(staged.tensorfs_root),
             "--artifact-cache",
             str(staged.artifact_cache),
             "--development-project",
@@ -238,13 +238,13 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         raise CliError(
             "usage",
             "ordinary serve requires " + " and ".join(missing),
-            "pass the exact provisioned --artifact-store, or "
+            "pass the exact provisioned --tensorfs-root, or "
             "use Creator's explicit development launch for a local source checkout",
             Exit.usage,
         )
     for flag, worker_flag in _SERVE_FLAGS.items():
         if all(development.values()) and flag in {
-            "--artifact-store",
+            "--tensorfs-root",
             "--artifact-cache",
             "--environment-root",
             "--environment-python",
@@ -270,8 +270,8 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
 
     values: dict[str, str] = {}
     rest = list(args)
-    required = {"--package", "--release", "--source-digest"}
-    allowed = {*required, "--artifact-store"}
+    required = {"--package", "--release", "--source-digest", "--tensorfs-root"}
+    allowed = set(required)
     while rest:
         flag = rest.pop(0)
         if flag not in allowed or not rest:
@@ -279,7 +279,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
                 "usage",
                 f"development-placement received invalid argument {flag!r}",
                 "pass --package <org/name> --release <semver> --source-digest sha256:<hex> "
-                "[--artifact-store <TensorFS root>]",
+                "--tensorfs-root <TensorFS Store root>",
                 Exit.usage,
             )
         values[flag] = rest.pop(0)
@@ -318,11 +318,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
             source_digest=source_digest,
             found=found,
             cozy_home=config.cozy_home,
-            artifact_store=(
-                Path(values["--artifact-store"]).expanduser().resolve()
-                if "--artifact-store" in values
-                else None
-            ),
+            tensorfs_root=Path(values["--tensorfs-root"]).expanduser().resolve(),
         )
     except ConformanceError as exc:
         raise CliError(

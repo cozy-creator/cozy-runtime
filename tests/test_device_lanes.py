@@ -148,7 +148,7 @@ def _slice(
             package_code_digest=revision,
             package_interface_document=body if kind == "entrypoint" else None,
             found=found,
-            development_artifact_store=config.cozy_home / "cas",
+            development_tensorfs_root=config.cozy_home / "tensorfs",
             options=WorkerOptions(root=workspace / "worker", devices=devices, no_warm=True),
             record_owner_hook=capture,
         )

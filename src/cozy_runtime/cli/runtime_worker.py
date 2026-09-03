@@ -10,6 +10,7 @@ import stat
 import sys
 import threading
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import host_paths, package_environment, proctree, readiness
@@ -20,7 +21,7 @@ from cozy_runtime.internal.config import (
     runtime_config_from_host,
 )
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.placement_materialization import PreparedBoot, prepare_boot
+from cozy_runtime.internal.placement_materialization import prepare_boot
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.downloads import tls_certificate_digest
@@ -86,10 +87,10 @@ def _run(config: WorkerHostConfig) -> int:
         raise LaunchRefusal(exc.code, exc.detail) from exc
     accelerator_backend = base.accelerator_backend
     gpus = readiness.runtime_gpus(config.child_base_env, accelerator_backend=accelerator_backend)
-    prepared = prepare_boot(config)
+    tensorfs_root = prepare_boot(config)
     options = _worker_options(
         config,
-        prepared,
+        tensorfs_root,
         boot_id,
         gpus,
         certificate_der=certificate_der,
@@ -159,7 +160,7 @@ def _run(config: WorkerHostConfig) -> int:
 
 def _worker_options(
     config: WorkerHostConfig,
-    prepared: PreparedBoot,
+    tensorfs_root: Path,
     boot_id: str,
     gpus: list[readiness.RuntimeGPU],
     *,
@@ -183,8 +184,8 @@ def _worker_options(
         devices=",".join(str(row["device_index"]) for row in gpus),
         grant_roots=(str(host_paths.MEDIA_ROOT),),
         environment_root=host_paths.ENVIRONMENT_ROOT,
-        artifact_cache=prepared.transfer_staging,
-        artifact_store=prepared.tensorfs_root,
+        artifact_cache=host_paths.TRANSFER_STAGING,
+        tensorfs_root=tensorfs_root,
         worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
         no_warm=True,
         claim_ready=False,
