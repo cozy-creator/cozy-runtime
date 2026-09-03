@@ -54,8 +54,6 @@ def prepare_package_set(
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
-    native_environment: Mapping[str, str] | None = None,
-    native_device_index: int = 0,
 ) -> pb.PreparePackageSetResult:
     """Parse one signed delegation plus the request's release facts (wire 30) and prepare.
 
@@ -109,8 +107,6 @@ def prepare_package_set(
         verified=verified,
         job_plan_root=job_plan_root,
         base=base,
-        native_environment=native_environment,
-        native_device_index=native_device_index,
     )
 
 
@@ -243,8 +239,6 @@ def _prepare_published(
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None,
     base: base_observation.Observation | None,
-    native_environment: Mapping[str, str] | None = None,
-    native_device_index: int = 0,
     installed_environment: package_environment.InstalledEnvironment | None = None,
 ) -> pb.PreparePackageSetResult:
     """Install from the exact export, derive the interface, and author the PlacementSet.
@@ -283,8 +277,6 @@ def _prepare_published(
                 environment_digest=environment_digest,
                 python=python,
                 base=observed_base,
-                native_environment=native_environment,
-                native_device_index=native_device_index,
             )
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
@@ -372,8 +364,6 @@ def check_package_set_compatibility(
     environment_root: Path,
     python: Path,
     base: base_observation.Observation | None = None,
-    native_environment: Mapping[str, str] | None = None,
-    native_device_index: int = 0,
 ) -> pb.CheckPackageSetCompatibilityResult:
     """Fit package code against headers while tensor bodies are still downloading.
 
@@ -411,8 +401,6 @@ def check_package_set_compatibility(
         inventory=inventory,
         locked=locked,
         base=base,
-        native_environment=native_environment,
-        native_device_index=native_device_index,
     )
     candidates = _compatibility_models(models, tensorfs_root=tensorfs_root)
     if set(candidates) != set(slot_paths):
@@ -478,8 +466,6 @@ def _compatibility_environment(
     inventory: image_inventory.Inventory,
     locked: package_environment.LockedRequirements,
     base: base_observation.Observation | None,
-    native_environment: Mapping[str, str] | None = None,
-    native_device_index: int = 0,
 ) -> package_environment.InstalledEnvironment:
     try:
         observed = base or package_environment.observe_base(python)
@@ -505,8 +491,6 @@ def _compatibility_environment(
             environment_digest=environment_digest,
             python=python,
             base=observed,
-            native_environment=native_environment,
-            native_device_index=native_device_index,
         )
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
@@ -647,8 +631,6 @@ def prepare_local_package(
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
-    native_environment: Mapping[str, str] | None = None,
-    native_device_index: int = 0,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Prepare one exact local wheel revision without inventing Hub provenance."""
@@ -681,8 +663,6 @@ def prepare_local_package(
         verified=verified,
         job_plan_root=job_plan_root,
         base=base,
-        native_environment=native_environment,
-        native_device_index=native_device_index,
         development=package,
         materialized=materialized,
     )
@@ -789,8 +769,6 @@ def prepare_package(
     verified: Callable[[str, int, Path], None],
     base: base_observation.Observation | None = None,
     job_plan_root: Path | None = None,
-    native_environment: Mapping[str, str] | None = None,
-    native_device_index: int = 0,
     development: pb.DevelopmentPackage | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
@@ -806,11 +784,8 @@ def prepare_package(
     placement that follows cannot re-acquire them: the session retains the environment and
     serves the placement from it.
 
-    A native dependency wheel is admitted on evidence, not on the caller's identity: the
-    installed bytes are statically inspected, joined to this host's interpreter/libc/loader/GPU
-    seat, and loaded and imported in the bounded operator child under `native_environment` —
-    the caller's own sealed execution environment. Without one there is no qualification host,
-    so the wheel refuses rather than installs.
+    A native dependency wheel installs like any other wheel (cr-093): whether its extension
+    loads is answered by the executor that imports it, not by a prepare-time inspection.
     """
 
     if development is None:
@@ -905,8 +880,6 @@ def prepare_package(
             environment_root,
             python=python,
             base=observed_base,
-            native_environment=native_environment,
-            native_device_index=native_device_index,
         )
     except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
         code = getattr(exc, "code", "package_environment_install_failed")

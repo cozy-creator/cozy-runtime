@@ -26,7 +26,6 @@ from pathlib import Path
 import msgspec
 import pytest
 
-from conftest import sealed_child_environment
 from cozy_runtime.author import App, ConformanceError, Model, WeightsOutput, WeightsSink
 from cozy_runtime.author._describe import describe
 from cozy_runtime.author._loader import Loader
@@ -478,7 +477,6 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
                     python=image_python,
                     describe=describe_real,
                     verified=lambda _digest, _length, _path: None,
-                    native_environment=sealed_child_environment(),
                 )
 
             (root / "artifacts").mkdir()

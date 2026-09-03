@@ -42,7 +42,7 @@ from packaging.tags import Tag, parse_tag
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import base_observation, canonical, native_wheel
+from cozy_runtime.internal import base_observation, canonical
 
 RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
 LOCKED_RECEIPT_FORMAT = "cozy.runtime.LockedEnvironmentReceipt/1"
@@ -380,17 +380,15 @@ def materialize(
     *,
     python: Path = Path(sys.executable),
     base: base_observation.Observation | None = None,
-    native_environment: Mapping[str, str] | None = None,
-    native_device_index: int = 0,
 ) -> InstalledEnvironment:
     """Verify exact wheels and atomically publish one ordinary uv virtual environment.
 
     Content identity is the interpreter ABI/platform, uv version, and sorted package-owned
     wheel digests. The actual base is re-observed for admission and is not part of that identity.
 
-    A native dependency wheel has no bypass. Its exact installed bytes are statically inspected,
-    joined to the observed interpreter/libc/loader/GPU seat, then loaded and imported in the
-    bounded native operator child before the generation can be published or reused.
+    A native dependency wheel installs like any other wheel (cr-093). Whether its extension
+    actually loads and launches is answered where it can only be answered — by the executor
+    that imports it — and, when an author wants an offline proof, by `cozy-native-wheel-proof`.
 
     An image-carried distribution whose observed version falls outside the wheels' declared
     ranges is boot-installed into the venv from the index (cr-070) rather than refused. The
@@ -430,15 +428,7 @@ def materialize(
             reused=True,
             python=python,
         )
-        booted = _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
-        _qualify_native_environment(
-            installed,
-            inspected,
-            observed,
-            native_environment,
-            native_device_index,
-            booted,
-        )
+        _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
         return installed
     reused = final.exists()
     _require_owned_root(root)
@@ -461,15 +451,7 @@ def materialize(
                 reused=False,
                 base=observed,
             )
-            booted = _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
-            _qualify_native_environment(
-                staged,
-                inspected,
-                observed,
-                native_environment,
-                native_device_index,
-                booted,
-            )
+            _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
             _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
             _make_read_only(staging)
             _fsync_dir(staging)
@@ -495,15 +477,7 @@ def materialize(
         python=python,
     )
     if reused:
-        booted = _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
-        _qualify_native_environment(
-            installed,
-            inspected,
-            observed,
-            native_environment,
-            native_device_index,
-            booted,
-        )
+        _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
     return installed
 
 
@@ -683,8 +657,6 @@ def materialize_locked(
     environment_digest: str,
     python: Path = Path(sys.executable),
     base: base_observation.Observation | None = None,
-    native_environment: Mapping[str, str] | None = None,
-    native_device_index: int = 0,
 ) -> InstalledEnvironment:
     """Materialize one venv from the release's exact hash-pinned export (xs-017).
 
@@ -734,14 +706,6 @@ def materialize_locked(
             reused=True,
             python=python,
         )
-        _qualify_native_environment(
-            installed,
-            _locked_inspected(installed.site_packages, install_rows),
-            observed,
-            native_environment,
-            native_device_index,
-            static_host_check=False,
-        )
         return installed
     reused = final.exists()
     _require_owned_root(root)
@@ -755,21 +719,14 @@ def materialize_locked(
         cache = root / f".uv-cache-{os.getpid()}-{uuid.uuid4().hex}"
         try:
             _install_locked(uv, python, staging, cache, locked.indexes, install_rows)
-            staged = _installed_at(
+            # Validates the staged venv's shape; the typed refusal is the point here.
+            _installed_at(
                 staging,
                 content_digest=content_digest,
                 receipt_bytes=receipt_bytes,
                 receipt_digest=receipt_digest,
                 reused=False,
                 base=observed,
-            )
-            _qualify_native_environment(
-                staged,
-                _locked_inspected(staged.site_packages, install_rows),
-                observed,
-                native_environment,
-                native_device_index,
-                static_host_check=False,
             )
             _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
             _make_read_only(staging)
@@ -798,96 +755,7 @@ def materialize_locked(
         reused=reused,
         python=python,
     )
-    if reused:
-        _qualify_native_environment(
-            installed,
-            _locked_inspected(installed.site_packages, install_rows),
-            observed,
-            native_environment,
-            native_device_index,
-            static_host_check=False,
-        )
     return installed
-
-
-def _locked_inspected(
-    site_packages: Path, install_rows: Sequence[LockedRow]
-) -> tuple[_Inspected, ...]:
-    """The locked arm's native-proof inputs, observed from the installed tree.
-
-    The wheel arm inspects archives before install; a locked install never holds archives, so
-    each installed row's RECORD names its members instead. The proof that follows — static
-    ELF inspection, the seat join, the dlopen/import probe in the sealed operator child — is
-    the same one.
-    """
-
-    by_name: dict[str, Path] = {}
-    for entry in site_packages.glob("*.dist-info"):
-        name, separator, _version = entry.name.removesuffix(".dist-info").rpartition("-")
-        if separator and name:
-            by_name[_NORMALIZE.sub("-", name).lower()] = entry
-    inspected: list[_Inspected] = []
-    for row in install_rows:
-        info = by_name.get(row.name)
-        if info is None:
-            raise EnvironmentRefusal(
-                "package_environment_locked_row_missing",
-                f"{row.name}=={row.version} was named by the export and is not installed",
-            )
-        try:
-            record = (info / "RECORD").read_text()
-        except OSError as exc:
-            raise EnvironmentRefusal(
-                "package_environment_locked_record_unreadable", f"{row.name}: {exc}"
-            ) from exc
-        native: list[str] = []
-        roots: set[str] = set()
-        for line in csv.reader(record.splitlines()):
-            if not line or not line[0]:
-                continue
-            member = line[0]
-            pure = PurePosixPath(member)
-            if member.startswith("/") or ".." in pure.parts:
-                continue
-            head = pure.parts[0]
-            if head.endswith((".dist-info", ".data")):
-                continue
-            if pure.suffix.lower() in _NATIVE_SUFFIXES:
-                native.append(member)
-            # An import root is a real top-level module surface: a dot-free package
-            # directory, a top-level module file, or a top-level extension module. An
-            # auditwheel `.libs` support directory is neither.
-            if len(pure.parts) > 1:
-                root = head
-            elif pure.suffix == ".py":
-                root = pure.stem
-            elif pure.suffix.lower() in _NATIVE_SUFFIXES:
-                root = head.split(".", 1)[0]
-            else:
-                continue
-            if _IMPORT_ROOT.fullmatch(root):
-                roots.add(root)
-        inspected.append(
-            _Inspected(
-                wheel=Wheel(
-                    distribution=row.name,
-                    version=row.version,
-                    filename=f"{row.name}-{row.version} (locked)",
-                    digest="sha256:" + "0" * 64,
-                    length=1,
-                    tags=(),
-                    owner="custom",
-                    import_roots=tuple(sorted(roots)),
-                ),
-                path=info,
-                members=(),
-                import_roots=frozenset(roots),
-                requires_python=None,
-                requirements=(),
-                native_members=tuple(sorted(native)),
-            )
-        )
-    return tuple(inspected)
 
 
 def _install_locked(
@@ -1000,71 +868,6 @@ def _installed_at(
         content_digest=content_digest,
         reused=reused,
     )
-
-
-def _qualify_native_environment(
-    installed: InstalledEnvironment,
-    inspected: Sequence[_Inspected],
-    base: base_observation.Observation,
-    environment: Mapping[str, str] | None,
-    device_index: int,
-    boot_versions: Mapping[str, str] | None = None,
-    *,
-    static_host_check: bool = True,
-) -> None:
-    native = tuple(item for item in inspected if item.native_members)
-    if not native:
-        return
-    if not environment:
-        raise EnvironmentRefusal(
-            "package_environment_native_proof_environment_absent",
-            "native dependency wheels require the worker's sealed execution environment",
-        )
-    members = tuple(sorted({member for item in native for member in item.native_members}))
-    roots = tuple(sorted({root for item in native for root in item.import_roots}))
-    if not roots:
-        raise EnvironmentRefusal(
-            "package_environment_native_import_roots_absent",
-            ",".join(item.wheel.filename for item in native),
-        )
-    try:
-        inspection = native_wheel.inspect_tree(installed.site_packages, members)
-        gpu = native_wheel.observe_gpu(device_index) if base.accelerator_backend != "none" else None
-        seat = native_wheel.observe_seat(installed.python, environment)
-        venv_versions = {
-            **{item.wheel.distribution: item.wheel.version for item in inspected},
-            **(boot_versions or {}),
-        }
-        native_wheel.verify_seat(base, seat, gpu=gpu, venv_versions=venv_versions)
-        if static_host_check:
-            native_wheel.qualify_host(
-                inspection,
-                gpu_sm=gpu["sm"] if gpu is not None else None,
-            )
-        request = json.dumps(
-            {
-                "members": list(members),
-                "roots": list(roots),
-                "site_packages": str(installed.site_packages),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        native_wheel.qualify_operator(
-            python=installed.python,
-            fixture="cozy_runtime.internal.native_dependency_probe:probe",
-            expected_result_digest=canonical.digest(
-                {"members": list(members), "roots": list(roots)}
-            ),
-            environment=environment,
-            request=request,
-            # The runaway fence for a dlopen-every-member, import-every-root probe: a spin
-            # is stopped by the kernel at this many CPU-seconds; a slow cold page-in is not
-            # a spin and is not stopped by anything but its own exit.
-            cpu_seconds=120,
-        )
-    except native_wheel.NativeWheelRefusal as exc:
-        raise EnvironmentRefusal(exc.code, exc.detail) from exc
 
 
 def open_existing_environment(python: Path, content_digest: str) -> InstalledEnvironment:

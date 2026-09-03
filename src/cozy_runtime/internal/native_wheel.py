@@ -1,13 +1,13 @@
-"""Bounded native-wheel inspection and host qualification.
+"""The offline native-wheel proof's inspection and host qualification (cr-093).
 
-Wheel extraction calls :func:`inspect_tree` before publishing any native bytes.  That pass is
-purely structural: ELF shape, RPATH/RUNPATH containment, base-library shadowing, and CUDA image
-inventory.  It does not infer a driver floor from bytes and does not import the extension.
-
-The separately authorized hardware proof calls :func:`qualify_host`.  That pass joins the same
-static evidence to the actual node's loader inventory and GPU compute capability.  The final
-operator fixture remains the executable proof; these checks make malformed or hostile wheels fail
-before Python's dynamic loader sees them.
+ONE consumer: `cli/native_wheel_proof.py`, an authoring/qualification tool run on purpose —
+never on a cold pod's prepare. `inspect_installed` reads the installed generation's ELF shape,
+RPATH/RUNPATH containment, base-library shadowing, and CUDA image inventory; `qualify_host`
+joins that to the actual node's loader inventory and GPU compute capability; and
+`qualify_operator` is the proof that matters — it EXECUTES the banked operator fixture in a
+bounded disposable process and compares a result digest. We install our own packages and
+`--require-hashes`-verified PyPI wheels, so none of this is a defence against a hostile wheel;
+it is evidence about an exact prebuilt wheel/base/hardware tuple, banked by its author.
 """
 
 from __future__ import annotations
