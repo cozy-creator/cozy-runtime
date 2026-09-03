@@ -477,6 +477,9 @@ project: a structural census over the real 6.9 GB cozytensors store, read-only.
 Model-producing jobs declare `WeightsOutput` slots and request `WeightsSink`. The sink accepts
 only exact typed `Model` inputs, locks the declaration/output bound, and streams produced values
 directly into TensorFS's real copy/create/derive transaction without a model-sized spool copy.
+Config declarations use TensorFS's closed copy/add/derive grammar. Added and derived config bytes
+are canonicalized by `DerivedWriter.add_config` into the CozyTensors header; their stream length
+is an operational read bound, not published metadata, and configs have no media type.
 An opened transaction may read exact source-part ranges into caller-owned contiguous writable
 buffers (at most one 64 MiB TensorFS grid window); TensorFS validates alias/component/key/role,
 offset and length under the same pinned source lease before any added value commits.
@@ -485,6 +488,4 @@ worker sends exact declaration intent before TensorFS opens, waits for the host'
 ACK, commits the receipt plus sorted ObjectRef/source-ref inventory, and serves bounded object
 ranges on the same WorkerControl stream. Receipt frames and replay ACKs also carry the produced
 Manifest `Ref`, so downstream jobs never parse TensorFS receipt bytes. Runtime keeps no journal;
-pod-supervisor owns durability. Both
-source-preparation results and derived Artifact receipts forward TensorFS canonical
-`ReleaseEvidence/1` bytes exactly; Runtime never reconstructs provenance.
+pod-supervisor owns durability.

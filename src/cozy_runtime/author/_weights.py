@@ -134,38 +134,43 @@ class WeightsTarget:
 
 @dataclass(frozen=True, slots=True)
 class WeightsConfig:
-    """Copy, add, or replace one config in the derived Manifest."""
+    """Copy, add, or derive one inline JCS config in the resulting CozyTensors header.
+
+    ``length`` bounds a readable stream; it is operational and never enters the immutable
+    TensorFS declaration. Byte-backed configs derive their length directly.
+    """
 
     source: str = ""
     source_config: str = ""
-    media_type: str = ""
     data: WeightsBytes | None = None
     length: int = 0
 
     def __post_init__(self) -> None:
         copied = bool(self.source or self.source_config)
-        added = self.data is not None or bool(self.media_type)
-        if bool(self.source) != bool(self.source_config) or not (copied or added):
+        written = self.data is not None
+        if bool(self.source) != bool(self.source_config) or not (copied or written):
             raise CapabilityError(
-                "a weights config is an exact copy, addition, or copy-plus-replacement",
-                code="weights_config_declaration",
-            )
-        if added and (self.data is None or not self.media_type):
-            raise CapabilityError(
-                "an added weights config needs media_type and data",
+                "a weights config is an exact copy, addition, or source-derived replacement",
                 code="weights_config_declaration",
             )
         if self.data is not None:
             known = len(self.data) if isinstance(self.data, (bytes, bytearray, memoryview)) else 0
             if (
-                self.length < 0
+                not isinstance(self.length, int)
+                or isinstance(self.length, bool)
+                or self.length < 0
                 or (known and self.length not in (0, known))
                 or (not known and not self.length)
             ):
                 raise CapabilityError(
-                    "a weights config stream needs its exact non-negative length",
+                    "a weights config stream needs its exact positive length",
                     code="weights_config_length",
                 )
+        elif self.length != 0:
+            raise CapabilityError(
+                "a copied weights config has no stream length",
+                code="weights_config_length",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +243,7 @@ class WeightsHostTransaction(Protocol):
 
     def add_part(self, component: str, key: str, role: str, data: WeightsBytes) -> None: ...
 
-    def add_config(self, name: str, data: WeightsBytes) -> None: ...
+    def add_config(self, name: str, data: WeightsBytes, length: int) -> None: ...
 
     def commit(self) -> WeightsReceipt: ...
 
@@ -350,7 +355,12 @@ class WeightsTransaction:
                 f"weights config {name!r} is undeclared",
                 code="weights_config_ungranted",
             )
-        self._call(lambda: self._host.add_config(name, data), "weights config")
+        length = (
+            len(config.data)
+            if isinstance(config.data, (bytes, bytearray, memoryview))
+            else config.length
+        )
+        self._call(lambda: self._host.add_config(name, data, length), "weights config")
 
     def commit(self) -> WeightsReceipt:
         self._check("WeightsTransaction.commit")
