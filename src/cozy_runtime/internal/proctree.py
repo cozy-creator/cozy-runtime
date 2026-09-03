@@ -1024,6 +1024,21 @@ def process_scope_processes(scope: ProcessTreeScope) -> set[ProcessIdentity]:
     }
 
 
+def describe_scope_census(scope: ExecutorScope) -> str:
+    """One bounded diagnostic line for a reclaim verdict: every live same-UID row with its
+    state, parentage, and token attribution, plus the live-scope registry."""
+    if not isinstance(scope, ProcessTreeScope):
+        return "cgroup"
+    try:
+        rows = [
+            f"{pid}:{row.state},ppid={row.parent_pid},own={int(row.scope_token)}"
+            for pid, row in sorted(_same_uid_processes(scope).items())
+        ]
+    except ContainmentUnavailable as exc:
+        rows = [f"unavailable:{exc}"]
+    return f"scope={scope.token[:8]} uid={scope.uid} rows=[{'; '.join(rows)}]"[:600]
+
+
 def executor_scope_exists(scope: ExecutorScope) -> bool:
     if isinstance(scope, CgroupScope):
         return executor_cgroup_exists(scope)

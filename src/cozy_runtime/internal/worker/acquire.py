@@ -767,7 +767,12 @@ class Acquirer:
                         snapshots=snapshots,
                         model_weight_bytes=model_weight_bytes,
                         sequence_parallel_degrees=degrees,
-                        model=f"{reference['repo']}@{reference['version']}/{reference['lane']}",
+                        # `lane` is an optional repo-pointer fact on the Model document
+                        # (the manifest is the identity): a placement prepared from a
+                        # download delegation carries none, because DownloadModelRef has
+                        # no lane field — the daemon keeps the lane in its own records.
+                        model=f"{reference['repo']}@{reference['version']}"
+                        + (f"/{reference['lane']}" if reference.get("lane") else ""),
                     )
                 )
             members.sort(key=lambda member: member.model_binding_path)
