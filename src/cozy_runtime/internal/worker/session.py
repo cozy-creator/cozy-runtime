@@ -244,6 +244,14 @@ class WorkerOptions:
     """An already-complete local package venv; mutually exclusive with materialization root."""
     tensorfs_root: Path | None = None
     """The one host-local executable TensorFS Store."""
+    pushed_packages_root: Path | None = None
+    """Where the pod's file plane lands an editable revision's PUSHED wheels (th-142 child 4).
+
+    A fixed pod path (`<media>/packages`), stated by the launcher exactly as `triage_root` is,
+    and the ONLY place this worker will open an editable wheel from. The owner used to mint a
+    read capability per wheel and the supervisor used to spend it; the owner now PUTs each one
+    to the pod's file plane and this worker reads the objects it finds there.
+    """
     artifact_cache: Path | None = None
     """Where the dynamic acquisition lane writes the exact bytes it fetches (cr-049).
 
@@ -1614,6 +1622,7 @@ class Worker:
                 request,
                 artifact_cache=Path(self.options.artifact_cache or ""),
                 install_root=Path(self.options.install_root or ""),
+                pushed_packages=Path(self.options.pushed_packages_root or ""),
                 python=Path(self.options.python or sys.executable),
                 describe=describe,
                 verified=mark_verified,

@@ -35,7 +35,11 @@ import pytest
 
 from conftest import image_python
 from cozy_runtime.internal import base_observation, package_environment
-from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package
+from cozy_runtime.internal.worker.package_prepare import (
+    PreparationRefusal,
+    prepare_local_package,
+    prepare_package,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -386,6 +390,160 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
         assert shadowed.value.code == "package_environment_base_distribution_import_roots_conflict"
         assert "cozy-runtime 9.9.9" in shadowed.value.detail
         assert "cannot be replaced" in shadowed.value.detail
+
+
+def test_editable_revision_prepares_from_pushed_wheels() -> None:
+    """THE OWNER PUSHES; THE POD DOES NOT PULL (th-142 child 4).
+
+    A pod's file plane lands an editable revision's wheels at
+    `<media>/packages/<operation>/<sha256 hex>` — content-addressed, because the plane proved
+    each body against its own name before it let it stand there. Nothing about that layout
+    travels on a wire: this preparation DERIVES every source path from the operation id and
+    the digest, so the `path` a message carries cannot make it open anything.
+
+    Everything below is real: real wheels built by uv, laid out exactly as the plane lands
+    them, a real install into a real venv over the real image base, and a real import out of
+    the result. The two refusals are the ones the deleted supervisor-side custody ledger used
+    to raise, taken now where the file is actually opened."""
+
+    uv = shutil.which("uv")
+    assert uv is not None
+    python = image_python()
+    observed = package_environment.observe_base(python)
+
+    with tempfile.TemporaryDirectory(prefix="cozy-pushed-wheels.") as raw:
+        root = Path(raw)
+        dependency = root / "annotated-doc-0.0.5"
+        _write_annotated_doc(dependency, "0.0.5")
+        artifact_cache = root / "artifacts"
+        artifact_cache.mkdir()
+        built = root / "built"
+        built.mkdir()
+        _run(uv, "build", "--wheel", "--out-dir", str(built), str(PACKAGE))
+        _run(uv, "build", "--wheel", "--out-dir", str(built), str(dependency))
+        project_wheel = next(built.glob("marco_polo-*.whl"))
+        dependency_wheel = next(built.glob("annotated_doc-0.0.5-*.whl"))
+        environment = root / "environments"
+        operation = "pushed-wheels-proof"
+
+        # THE PLANE'S OWN LAYOUT. `media/packages/<operation>/<digest hex>`, one file per
+        # object, named by what it hashes to — which is the whole reason the pod needs no
+        # transfer ledger to believe them later.
+        pushed = root / "media" / "packages" / operation
+        pushed.mkdir(parents=True)
+        rows = _wheel_rows([project_wheel, dependency_wheel])
+        for row in rows:
+            source = built / row.filename
+            (pushed / row.digest.hex()).write_bytes(source.read_bytes())
+
+        def prepare(revision_digest: bytes | None) -> pb.PreparePackageSetResult:
+            return prepare_local_package(
+                pb.PrepareLocalPackageRequest(
+                    operation_id=operation,
+                    package=_development("paul/marco-polo", "1.0.4", revision_digest),
+                    # The path field is spelled the way an owner would and IGNORED: these
+                    # rows name a directory this pod has never had.
+                    wheels=[
+                        pb.LocalPackageWheel(
+                            digest=row.digest,
+                            filename=row.filename,
+                            length=row.length,
+                            path="/nowhere/" + row.filename,
+                        )
+                        for row in rows
+                    ],
+                    install_root=str(environment),
+                ),
+                artifact_cache=artifact_cache,
+                install_root=environment,
+                pushed_packages=root / "media" / "packages",
+                python=python,
+                describe=_describe_with(python),
+                verified=lambda _digest, _length, _path: None,
+                base=observed,
+            )
+
+        with pytest.raises(PreparationRefusal) as unknown:
+            prepare(None)
+        revision = _measured_revision(unknown.value)
+
+        prepared = prepare(revision)
+        placement = json.loads(prepared.placement_set.placement_set_canonical_bytes)["placements"][
+            0
+        ]
+        assert placement["development"]["local_revision_digest"] == ("sha256:" + revision.hex())
+        assert placement["development"]["project_wheel"]["distribution"] == "marco-polo"
+        assert [row["distribution"] for row in placement["environment"]["local_wheels"]] == [
+            "annotated-doc"
+        ]
+        (venv_python,) = (environment / "contents").glob("*/bin/python")
+        _run(str(venv_python), "-I", "-c", "import marco_polo_package, annotated_doc", cwd="/")
+
+        # The wheels were staged from the pushed objects, beside the install namespace that
+        # owns them, at their wheel names — never at the paths the message claimed.
+        staged = environment / f".stage-{operation}" / "wheels"
+        assert sorted(path.name for path in staged.iterdir()) == sorted(
+            row.filename for row in rows
+        )
+        assert not Path("/nowhere").exists()
+
+        # An object this pod was never pushed is named, not guessed at.
+        (pushed / rows[0].digest.hex()).unlink()
+        with pytest.raises(PreparationRefusal) as absent:
+            prepare_local_package(
+                pb.PrepareLocalPackageRequest(
+                    operation_id=operation,
+                    package=_development("paul/marco-polo", "1.0.4", revision),
+                    wheels=list(rows),
+                    install_root=str(root / "second"),
+                ),
+                artifact_cache=artifact_cache,
+                install_root=root / "second",
+                pushed_packages=root / "media" / "packages",
+                python=python,
+                describe=_describe_with(python),
+                verified=lambda _digest, _length, _path: None,
+                base=observed,
+            )
+        assert absent.value.code == "local_package_pushed_object_absent"
+
+        # And a carrier that changed under a live operation is refused rather than prepared:
+        # the plane proved these bytes when they landed, and this is the second proof.
+        (pushed / rows[0].digest.hex()).write_bytes(b"x" * rows[0].length)
+        with pytest.raises(PreparationRefusal) as changed:
+            prepare_local_package(
+                pb.PrepareLocalPackageRequest(
+                    operation_id=operation,
+                    package=_development("paul/marco-polo", "1.0.4", revision),
+                    wheels=list(rows),
+                    install_root=str(root / "third"),
+                ),
+                artifact_cache=artifact_cache,
+                install_root=root / "third",
+                pushed_packages=root / "media" / "packages",
+                python=python,
+                describe=_describe_with(python),
+                verified=lambda _digest, _length, _path: None,
+                base=observed,
+            )
+        assert changed.value.code == "local_package_pushed_object_changed"
+
+
+def _describe_with(
+    python: Path,
+) -> Callable[[package_environment.InstalledEnvironment, str], bytes]:
+    """The real package-interface description, out of the installed environment itself."""
+
+    def describe(selected: package_environment.InstalledEnvironment, distribution: str) -> bytes:
+        command = (
+            "from cozy_runtime.internal import package_interface; "
+            "from cozy_runtime.internal.discovery import discover_distribution; "
+            f"found=discover_distribution({distribution!r}); "
+            "print(package_interface.canonical_bytes(package_interface.build(found)).decode())"
+        )
+        return _run(str(selected.python), "-I", "-c", command, cwd="/").stdout.encode()
+
+    return describe
 
 
 def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> None:

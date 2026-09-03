@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -33,6 +34,12 @@ MAX_FILES = 4096
 MAX_FILE_BYTES = 8 << 30
 _DISTRIBUTION = re.compile(r"[-_.]+")
 _OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
+#: The one shape a PUSHED wheel's filename may take. It matters here and nowhere else: this
+#: name is owner-supplied and this module turns it into a path, so a separator, a leading dot
+#: or a parent reference has to be UNREPRESENTABLE rather than filtered. The supervisor used
+#: to hold this rule while it pulled the bytes; th-142 child 4 moved the bytes to the file
+#: plane and the rule to the party that opens the file.
+_WHEEL_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,250}\.whl")
 
 
 class PreparationRefusal(Exception):
@@ -620,11 +627,106 @@ def placement_identity(
     )
 
 
+def stage_pushed_wheels(
+    request: pb.PrepareLocalPackageRequest, *, pushed_packages: Path, wheel_root: Path
+) -> list[pb.LocalPackageWheel]:
+    """Link one editable revision's PUSHED wheels beside the install namespace that owns them.
+
+    THE OWNER PUSHES, THE POD DOES NOT PULL (th-142 child 4). These wheels arrived on the pod's
+    file plane at `<media>/packages/<operation>/<sha256 hex>` — content-addressed, because the
+    plane proved each body against its own name before it let it stand there. Nothing about
+    that arrangement travelled on a wire: `path` on the wire is ignored, and this function
+    DERIVES every source from the operation id and the digest, so a message that names a path
+    cannot make this process open one.
+
+    The digest is re-proved here anyway. That is not redundancy: the file plane proved these
+    bytes when they landed and this is the SECOND, independent proof, taken at the moment the
+    set crosses into an install, so a carrier changed in between cannot be prepared. The
+    supervisor's custody ledger used to take exactly this proof and it is the only part of it
+    that was ever load-bearing.
+    """
+
+    if not pushed_packages.is_absolute() or _OPERATION_ID.fullmatch(request.operation_id) is None:
+        raise PreparationRefusal("local_package_pushed_root_invalid", str(pushed_packages))
+    held = pushed_packages / request.operation_id
+    rows = list(request.wheels)
+    if not 1 <= len(rows) <= MAX_FILES:
+        raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
+    wheel_root.mkdir(parents=True, exist_ok=True)
+    staged: list[pb.LocalPackageWheel] = []
+    for row in rows:
+        if (
+            len(row.digest) != 32
+            or not 0 < row.length <= MAX_FILE_BYTES
+            or _WHEEL_FILENAME.fullmatch(row.filename) is None
+        ):
+            raise PreparationRefusal("package_prepare_file_invalid", row.filename)
+        source = held / row.digest.hex()
+        _prove_pushed_object(source, row)
+        target = wheel_root / row.filename
+        if not _already_staged(target, row):
+            scratch = wheel_root / f".staging-{row.digest.hex()}"
+            scratch.unlink(missing_ok=True)
+            try:
+                os.link(source, scratch)
+            except OSError:
+                # A different filesystem, or a store that refuses links. The bytes are
+                # re-proved above and again by measure_wheel, so a copy is the same object.
+                shutil.copyfile(source, scratch)
+            os.replace(scratch, target)
+        staged.append(
+            pb.LocalPackageWheel(
+                digest=row.digest, filename=row.filename, length=row.length, path=str(target)
+            )
+        )
+    return staged
+
+
+def _prove_pushed_object(source: Path, row: pb.LocalPackageWheel) -> None:
+    """Re-prove one pushed object against the identity the revision names."""
+
+    try:
+        info = source.lstat()
+    except OSError as exc:
+        raise PreparationRefusal(
+            "local_package_pushed_object_absent",
+            f"{row.filename} was never pushed to this pod for this operation",
+        ) from exc
+    if not stat.S_ISREG(info.st_mode) or info.st_size != row.length:
+        raise PreparationRefusal("local_package_pushed_object_absent", row.filename)
+    digest = hashlib.sha256()
+    with source.open("rb") as handle:
+        while chunk := handle.read(1 << 20):
+            digest.update(chunk)
+    if digest.digest() != bytes(row.digest):
+        raise PreparationRefusal(
+            "local_package_pushed_object_changed",
+            f"{row.filename} no longer hashes to the digest this revision names",
+        )
+
+
+def _already_staged(target: Path, row: pb.LocalPackageWheel) -> bool:
+    """A wheel this operation already staged, proved by its bytes and not by its presence."""
+
+    try:
+        info = target.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_size != row.length:
+        return False
+    digest = hashlib.sha256()
+    with target.open("rb") as handle:
+        while chunk := handle.read(1 << 20):
+            digest.update(chunk)
+    return digest.digest() == bytes(row.digest)
+
+
 def prepare_local_package(
     request: pb.PrepareLocalPackageRequest,
     *,
     artifact_cache: Path,
     install_root: Path,
+    pushed_packages: Path,
     python: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
@@ -650,12 +752,13 @@ def prepare_local_package(
         or package.HasField("project_wheel")
     ):
         raise PreparationRefusal("local_package_identity_invalid", request.operation_id)
+    # proto-031: editable wheels stage beside the install namespace that owns them.
+    wheel_root = install_root / f".stage-{request.operation_id}" / "wheels"
     return prepare_package(
         package_name=package.package,
         release=package.release,
-        wheels=request.wheels,
-        # proto-031: editable wheels stage beside the install namespace that owns them.
-        wheel_root=install_root / f".stage-{request.operation_id}" / "wheels",
+        wheels=stage_pushed_wheels(request, pushed_packages=pushed_packages, wheel_root=wheel_root),
+        wheel_root=wheel_root,
         placement_seed=(request.operation_id.encode("ascii") + package.local_revision_digest),
         artifact_cache=artifact_cache,
         install_root=install_root,

@@ -184,6 +184,10 @@ def _worker_options(
         devices=",".join(str(row["device_index"]) for row in gpus),
         grant_roots=(str(host_paths.MEDIA_ROOT),),
         install_root=host_paths.INSTALL_ROOT,
+        # The wheels an owner PUSHED for an editable revision (th-142 child 4). Fixed pod
+        # layout, exactly like triage_root below: the file plane lands them, this worker
+        # reads them, and the two processes stay coupled by the filesystem alone.
+        pushed_packages_root=host_paths.PUSHED_PACKAGES,
         artifact_cache=host_paths.TRANSFER_STAGING,
         tensorfs_root=tensorfs_root,
         worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
