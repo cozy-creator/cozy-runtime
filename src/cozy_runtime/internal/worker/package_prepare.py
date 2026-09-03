@@ -54,7 +54,7 @@ def prepare_package_set(
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
 ) -> pb.PreparePackageSetResult:
-    """Parse one signed delegation plus the request's release facts (wire 30) and prepare.
+    """Parse the desired download set plus the request's release facts (wire 30) and prepare.
 
     The request carries everything the interface used to be opened for — `application` and
     the interface-declared model-slot paths — plus the placed image's pinned inventory and
@@ -71,11 +71,11 @@ def prepare_package_set(
     ):
         raise PreparationRefusal("package_prepare_install_root_invalid", request.install_root)
     try:
-        delegation = documents.read(request.download_delegation, pb.DownloadDelegation)
+        download_set = documents.read(request.download_delegation, pb.DownloadDelegation)
     except documents.DocumentError as exc:
-        raise PreparationRefusal("package_prepare_delegation_invalid", exc.detail) from exc
-    packages = delegation.get("packages")
-    models = delegation.get("models")
+        raise PreparationRefusal("package_prepare_download_set_invalid", exc.detail) from exc
+    packages = download_set.get("packages")
+    models = download_set.get("models")
     if not isinstance(packages, list) or len(packages) != 1 or not isinstance(models, list):
         raise PreparationRefusal(
             "package_prepare_selection_invalid",
@@ -83,7 +83,7 @@ def prepare_package_set(
         )
     selected = packages[0]
     if not isinstance(selected, dict):
-        raise PreparationRefusal("package_prepare_delegation_invalid", "package row")
+        raise PreparationRefusal("package_prepare_download_set_invalid", "package row")
     package_name = str(selected.get("package", ""))
     release = str(selected.get("release", ""))
     application, slot_paths, inventory, locked = _request_facts(request, models)
@@ -371,11 +371,11 @@ def check_package_set_compatibility(
     if Path(request.install_root) != install_root or not install_root.is_absolute():
         raise PreparationRefusal("package_prepare_install_root_invalid", request.install_root)
     try:
-        delegation = documents.read(request.download_delegation, pb.DownloadDelegation)
+        download_set = documents.read(request.download_delegation, pb.DownloadDelegation)
     except documents.DocumentError as exc:
-        raise PreparationRefusal("package_prepare_delegation_invalid", exc.detail) from exc
-    packages = delegation.get("packages")
-    models = delegation.get("models")
+        raise PreparationRefusal("package_prepare_download_set_invalid", exc.detail) from exc
+    packages = download_set.get("packages")
+    models = download_set.get("models")
     if not isinstance(packages, list) or len(packages) != 1 or not isinstance(models, list):
         raise PreparationRefusal(
             "package_prepare_selection_invalid",
@@ -383,7 +383,7 @@ def check_package_set_compatibility(
         )
     selected_package = packages[0]
     if not isinstance(selected_package, dict):
-        raise PreparationRefusal("package_prepare_delegation_invalid", "package row")
+        raise PreparationRefusal("package_prepare_download_set_invalid", "package row")
     package_name = str(selected_package.get("package", ""))
     release = str(selected_package.get("release", ""))
     application, slot_paths, inventory, locked = _request_facts(request, models)
@@ -402,13 +402,13 @@ def check_package_set_compatibility(
     # one callable always declares more than any single invocation binds -- anima
     # declares generate.models.model and quantize.models.source while an invocation
     # binds one of them -- so equality refused every such release. What the guard is
-    # actually for is the other direction: a delegation naming a slot the package does
+    # actually for is the other direction: a download set naming a slot the package does
     # not have.
     undeclared = sorted(set(candidates) - set(slot_paths))
     if undeclared:
         raise PreparationRefusal(
             "package_prepare_model_selection_mismatch",
-            f"the delegation binds {undeclared}, which the release does not declare; "
+            f"the download set binds {undeclared}, which the release does not declare; "
             f"declared={sorted(slot_paths)}",
         )
     requests = tuple(
@@ -615,12 +615,14 @@ def _printable(value: str) -> str:
 def placement_identity(
     package_name: str, release: str, release_digest: str, models: Sequence[canonical.Json]
 ) -> bytes:
-    """The placement's identity is WHAT is prepared, never the credential that
-    authorized it. The delegation carries a per-signing expiry and worker pins
-    (other clocks — cr-004), so seeding identity with its raw bytes made every
-    re-signed converge a brand-new placement and defeated ledger reuse
-    (xs-014 finding 1). Model rows are re-sorted here so identity cannot
-    depend on the author's ordering."""
+    """The placement's identity is WHAT is prepared, never a credential. The document
+    this is derived from used to carry a per-signing expiry and worker pins (other
+    clocks — cr-004), so seeding identity with its raw bytes made every re-signed
+    converge a brand-new placement and defeated ledger reuse (xs-014 finding 1). Those
+    fields are deleted with the whole delegation plane (owner ruling 2026-09-03), so a
+    download set is now a pure function of its content; identity is still derived from
+    the named facts rather than the bytes, because that is what it means. Model rows are
+    re-sorted here so identity cannot depend on the author's ordering."""
 
     def model_key(row: canonical.Json) -> str:
         body = row if isinstance(row, Mapping) else {}
@@ -719,15 +721,15 @@ def prepare_private_placement(
     ):
         raise PreparationRefusal("private_placement_identity_invalid", request.operation_id)
     try:
-        delegation = documents.read(request.download_delegation, pb.DownloadDelegation)
+        download_set = documents.read(request.download_delegation, pb.DownloadDelegation)
     except documents.DocumentError as exc:
-        raise PreparationRefusal("private_placement_delegation_invalid", exc.detail) from exc
-    packages = delegation.get("packages", [])
-    models = delegation.get("models", [])
+        raise PreparationRefusal("private_placement_download_set_invalid", exc.detail) from exc
+    packages = download_set.get("packages", [])
+    models = download_set.get("models", [])
     if packages != [] or not isinstance(models, list) or len(models) > 32:
         raise PreparationRefusal(
-            "private_placement_delegation_invalid",
-            "private model delegation carries no package refs and at most 32 models",
+            "private_placement_download_set_invalid",
+            "a private model download set carries no package refs and at most 32 models",
         )
     digest = str(interface_ref["digest"])
     length = int(interface_ref["length"])
@@ -1222,7 +1224,7 @@ def _resolved_manifest_length(
 
     THE SELECTION DECLARES A DIGEST; THE STORE DECLARES THE LENGTH. `cli/package_prepare`
     requires `manifest_length` on every selection row it accepts, but the pod's rows come
-    from a signed DownloadDelegation whose model entries are lane/manifest/model/package/
+    from a DownloadDelegation whose model entries are lane/manifest/model/package/
     release/slot -- there is no length in them. Reading one and comparing it to the store's
     real length compared 0 against a real number, which no store can satisfy: every modeled
     preparation on a pod refused `package_prepare_model_selection_mismatch` while naming the
@@ -1282,9 +1284,9 @@ def _selected_models(
         for value in selected.values():
             selection = value["selection"]
             digest = str(selection["manifest"])
-            # A DELEGATION NAMES A DIGEST AND NO LENGTH. `cli/package_prepare` requires
+            # A DOWNLOAD SET NAMES A DIGEST AND NO LENGTH. `cli/package_prepare` requires
             # `manifest_length` in every selection row it accepts, but the pod's rows come
-            # from a signed DownloadDelegation whose model entries are
+            # from a DownloadDelegation whose model entries are
             # lane/manifest/model/package/release/slot -- there is no length to read. So
             # this defaulted to 0 and compared 0 against the store's real length, which no
             # store can ever satisfy: every modeled preparation on a pod refused

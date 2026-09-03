@@ -60,16 +60,16 @@ def test_a_digest_the_release_does_not_name_still_refuses() -> None:
     assert DIGEST in refusal.value.detail and OTHER in refusal.value.detail
 
 
-def test_the_delegation_shape_is_exactly_the_cli_shape_minus_the_length() -> None:
+def test_the_download_set_shape_is_exactly_the_cli_shape_minus_the_length() -> None:
     """The two producers of a selection row, locked together.
 
-    `cli/package_prepare` refuses a row whose key set is not exactly `required_model`; the
-    hub's `DelegatedModel` carries every one of those names except `manifest_length`. That
-    one difference is the whole defect, and it is the only one -- so nothing else read off a
-    selection can be absent on the pod path.
+    `cli/package_prepare` refuses a row whose key set is not exactly `required_model`; a
+    download set's model row carries every one of those names except `manifest_length`.
+    That one difference is the whole defect, and it is the only one -- so nothing else read
+    off a selection can be absent on the pod path.
     """
 
     cli_required = {"package", "slot", "model", "release", "lane", "manifest", "manifest_length"}
-    delegated = {"lane", "manifest", "model", "package", "release", "slot"}
-    assert cli_required - delegated == {"manifest_length"}
-    assert delegated - cli_required == set()
+    download_set_row = {"lane", "manifest", "model", "package", "release", "slot"}
+    assert cli_required - download_set_row == {"manifest_length"}
+    assert download_set_row - cli_required == set()

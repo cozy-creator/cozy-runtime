@@ -110,7 +110,7 @@ def test_lying_inventory_refuses_before_any_install() -> None:
     from cozy_runtime.internal import canonical
 
     observed = package_environment.observe_base(Path(sys.executable))
-    delegation = canonical.write(
+    download_set = canonical.write(
         {
             "format": "cozy.worker.v1.DownloadDelegation/1",
             "packages": [{"package": "paul/ranged-marco", "release": "1.0.4"}],
@@ -125,7 +125,7 @@ def test_lying_inventory_refuses_before_any_install() -> None:
         selected = sorted({"cozy-runtime", "msgspec", *inventory_pins})
         return prepare_package_set(
             pb.PreparePackageSetRequest(
-                download_delegation=delegation,
+                download_delegation=download_set,
                 install_root="/tmp/unused-environment",
                 application="ranged_marco_package:app",
                 model_slot_paths=[],

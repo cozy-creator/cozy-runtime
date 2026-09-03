@@ -695,7 +695,7 @@ class Acquirer:
                         model_weight_bytes=model_weight_bytes,
                         sequence_parallel_degrees=degrees,
                         # The manifest is identity; lane remains the human repo pointer the
-                        # signed download delegation carried beside it.
+                        # desired download set carried beside it.
                         model=f"{reference['repo']}@{reference['version']}"
                         + (f"/{reference['lane']}" if reference.get("lane") else ""),
                     )

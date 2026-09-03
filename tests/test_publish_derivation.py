@@ -228,7 +228,7 @@ def test_worker_derive_fence_is_green_and_reds_on_a_planted_import(tmp_path: Pat
     assert len(problems) == 1 and "poisoned.py" in problems[0]
 
 
-def _delegation(package: str, release: str) -> bytes:
+def _download_set(package: str, release: str) -> bytes:
     return canonical.write(
         {
             "format": "cozy.worker.v1.DownloadDelegation/1",
@@ -288,7 +288,7 @@ def test_pod_prep_requires_the_request_facts(tmp_path: Path) -> None:
     ) -> pb.PreparePackageSetResult:
         return prepare_package_set(
             pb.PreparePackageSetRequest(
-                download_delegation=_delegation("paul/marco-polo", "1.0.4"),
+                download_delegation=_download_set("paul/marco-polo", "1.0.4"),
                 install_root=str(tmp_path / "environment"),
                 application=application,
                 model_slot_paths=slots or [],
@@ -465,7 +465,7 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
             def prep(application: str, export_bytes: bytes) -> pb.PreparePackageSetResult:
                 return prepare_package_set(
                     pb.PreparePackageSetRequest(
-                        download_delegation=_delegation("paul/marco-polo", release),
+                        download_delegation=_download_set("paul/marco-polo", release),
                         install_root=str(root / "environments"),
                         application=application,
                         model_slot_paths=[],
@@ -518,7 +518,7 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
             # install.
             verdict = check_package_set_compatibility(
                 pb.PreparePackageSetRequest(
-                    download_delegation=_delegation("paul/marco-polo", release),
+                    download_delegation=_download_set("paul/marco-polo", release),
                     install_root=str(root / "environments"),
                     application="marco_polo_package:app",
                     model_slot_paths=[],
