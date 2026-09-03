@@ -42,7 +42,11 @@ jobs:
           fi
 
       - name: Build (sdist + pure-py wheel)
-        run: uv build
+        env:
+          COZY_RUNTIME_BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
+          uv build
 
       - name: Publish (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
