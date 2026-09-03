@@ -83,13 +83,13 @@ def weights_for(case: Case, truth: RichCensus) -> Artifact:
     Built from ground truth on purpose: the corpus is testing DERIVATION, so the match must
     not be the thing that fails. Match-direction arms are separate (`scripts/verify.py`).
     """
-    topology = {
+    tensor_schema = {
         t.key: TensorSpec(t.shape, t.dtype or "bfloat16", nbytes=_nbytes(t.shape, t.dtype))
         for t in truth.logical
     }
     return Artifact(
         snapshot=f"corpus/{case.name}@1",
-        topology=topology,
+        tensor_schema=tensor_schema,
         config=Config(dict(case.config)),
         custody="canonical",
     )

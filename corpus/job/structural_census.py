@@ -5,7 +5,7 @@ digest-verified materialized input tree, reads canonical headers through the one
 border, derives a projection nobody stored, checkpoints its progress durably, and returns a
 result. It is CPU-class, it writes nothing into the store, and it holds no model residency.
 
-Why THIS derivation: the projection below is `topology_digest`-shaped — component -> key ->
+Why THIS derivation: the projection below is tensor-schema-shaped — component -> key ->
 logical shape, in canonical order — which is exactly the index `tfs-009` freezes and every
 adapter/package admissibility check runs over. Deriving it from real headers over 6.9 GB of
 real objects is the honest smallest version of "a job produces facts about CozyTensors".
@@ -64,7 +64,7 @@ class CensusResult(msgspec.Struct):
     components: int
     tensors: int
     logical_bytes: int
-    topology_digest: str
+    tensor_schema_digest: str
     resumed_from: int
     receipts: list[str]
 
@@ -151,15 +151,17 @@ def census(
 
     projection = {name: [[row["key"], row["shape"]] for row in done[name]] for name in sorted(done)}
     body = canonical_json.encode(projection)
-    topology = canonical_json.digest(projection)
+    tensor_schema = canonical_json.digest(projection)
     # DECLARED, not saved: the durable-save door is disabled while the WeightsSink is
     # unbuilt (#553a). The component trees under `scratch.checkpoint_dir` are what a
     # retried attempt of this run actually reads back, and they are written above.
-    receipts.append(ckpt.declare("topology", body, operation_key="census/topology").declaration_id)
+    receipts.append(
+        ckpt.declare("tensor-schema", body, operation_key="census/tensor-schema").declaration_id
+    )
 
     document = {
         "store": payload.store.ref,
-        "topology_digest": topology,
+        "tensor_schema_digest": tensor_schema,
         "components": {
             name: {
                 "snapshot": payload.snapshots[name],
@@ -177,7 +179,7 @@ def census(
         components=len(done),
         tensors=sum(len(rows) for rows in done.values()),
         logical_bytes=sum(int(r["logical_bytes"]) for rows in done.values() for r in rows),
-        topology_digest=topology,
+        tensor_schema_digest=tensor_schema,
         resumed_from=resumed_from,
         receipts=receipts,
     )

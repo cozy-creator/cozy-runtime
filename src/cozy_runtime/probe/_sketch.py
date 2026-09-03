@@ -162,7 +162,7 @@ def compare(tap: str, step: int, reference: Observation, candidate: Observation)
     if reference.shapes != candidate.shapes:
         raise ProbeRefusal(
             f"tap {tap!r} step {step}: reference fired {reference.shapes}, candidate "
-            f"{candidate.shapes} — lanes change weights, never topology",
+            f"{candidate.shapes} — lanes change weights, never tensor schema",
             code="tap_shape_divergence",
         )
     ref = reference.sketch.double()

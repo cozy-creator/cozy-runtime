@@ -152,8 +152,8 @@ def run_probe(
     if candidate_plan != plan:
         raise ProbeRefusal(
             f"lane {candidate.label!r} resolved a different tap plan than "
-            f"{reference.label!r} — lanes change weights, never topology",
-            code="topology_divergence",
+            f"{reference.label!r} — lanes change weights, never tensor schema",
+            code="tensor_schema_divergence",
         )
     candidate_pass = teacher_forced_pass(candidate_model, plan, trajectory, config)
     candidate_model = None

@@ -254,9 +254,7 @@ def _worker_slot(degrees: tuple[int, ...]) -> WorkerSlot:
         model_class="M",
         model_binding_path="serve.models.m",
         model_parameter_name="m",
-        config_digest="",
         store="",
-        config="",
         variant="",
         reference_snapshot="",
         components=("unet",),
@@ -929,7 +927,6 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
             degree=3,
             devices=("0", "1", "2"),
             plan_digest="sha256:" + "a" * 64,
-            construction_digest="c/t",
             authorized_device_limit_bytes=1,
         )
         assert GroupPlan.read(plan.document()) == plan
@@ -955,7 +952,7 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
 def test_the_plan_agrees_field_by_field_or_refuses() -> None:
     """A follower ASSERTS the broadcast plan; the first field that differs is named and
     the rank never adapts."""
-    plan = GroupPlan(2, ("0", "1"), "sha256:a", "c/t", 1024)
+    plan = GroupPlan(2, ("0", "1"), "sha256:a", 1024)
     plan.assert_agrees(plan, rank=1)
     for field_name, other in (
         ("plan_digest", dataclasses.replace(plan, plan_digest="sha256:b")),

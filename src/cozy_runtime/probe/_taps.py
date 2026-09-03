@@ -2,7 +2,7 @@
 
 Tap identity is the module path in the constructed lane (state_dict key prefix, e.g.
 ``unet.down_blocks.1.attentions.0``) — stable across lanes because both lanes construct the
-SAME class from the SAME config; lanes change weights, never topology.
+SAME class from the SAME config; lanes change weights, never tensor schema.
 
 Block-level by default, never every module. Containers (ModuleList/Sequential/ModuleDict)
 and pure GROUPINGS — modules whose weighted children all live in containers, like a UNet

@@ -8,7 +8,6 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 
-from cozy_runtime.cli import derive as derive_verb
 from cozy_runtime.cli import describe as describe_verb
 from cozy_runtime.cli import host as host_verbs
 from cozy_runtime.cli import hostfacts as hostfacts_verb
@@ -30,7 +29,6 @@ BUILT = (
     "doctor",
     "capability",
     "hostfacts",
-    "derive",
     "probe",
     "new",
     "version",
@@ -49,8 +47,6 @@ verbs:
   doctor                         this host's device/driver/credential facts
   capability [--out <path>]      the OBSERVED (encoding, device) qualification of this card
   hostfacts [<fn>] [k=v …]       this host's capacity facts (exact with a payload)
-  derive --python <venv python> --slot <path> --config <document> [--out <dir>]
-                                 TensorRequirements for one slot and construction document
   probe <fn> [k=v …]             teacher-forced activation diff of two lanes (report/1)
   new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and the two independent semvers
@@ -95,7 +91,6 @@ _OWNS_ARGS = (
     "run",
     "job",
     "hostfacts",
-    "derive",
     "probe",
     "capability",
     "serve",
@@ -206,8 +201,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return package_prepare_verbs.prepare_local_package(config, args, opts)
     if verb == "hostfacts":
         return hostfacts_verb.run(args, opts, config)
-    if verb == "derive":
-        return derive_verb.run(args, opts)
     if verb == "probe":
         return probe_verb.run(args, opts)
     if verb == "capability":

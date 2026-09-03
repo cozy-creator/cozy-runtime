@@ -141,10 +141,8 @@ def test_lane_words_are_not_selection_leaks() -> None:
     assert leaked_release.value.code == "fixed_point"
 
 
-def test_interface_slot_grammar_refuses_the_retired_members() -> None:
-    """The slot is `{path, class, component_use, encoded_leaves}` (model-code-fit §1). A
-    interface carrying `source_profile`, or a `stamps` VALUE, refuses typed with the hub's
-    own names; the empty `stamps` map every pre-cut release ships reads as nothing."""
+def test_interface_slot_grammar_has_no_legacy_members() -> None:
+    """The current slot grammar admits no retired field, including an empty value."""
     app = App()
 
     @app.entrypoint
@@ -161,14 +159,15 @@ def test_interface_slot_grammar_refuses_the_retired_members() -> None:
         mutated["entrypoints"][0]["models"][0].update(members)
         return canonical.write(mutated)
 
-    assert package_interface.read_bytes(planted(stamps={}))
-    with pytest.raises(package_interface.RetiredPackageInterfaceMember) as stamped:
-        package_interface.read_bytes(planted(stamps={"task": "fl2va"}))
-    assert stamped.value.code == "package_interface.stamps_retired"
-    assert "task" in str(stamped.value)
-    with pytest.raises(package_interface.RetiredPackageInterfaceMember) as profiled:
-        package_interface.read_bytes(planted(source_profile="acme/sd-turbo/1.0.0/bf16"))
-    assert profiled.value.code == "package_interface.source_profile_retired"
+    legacy_members: tuple[dict[str, object], ...] = (
+        {"stamps": {}},
+        {"stamps": {"task": "fl2va"}},
+        {"source_profile": "acme/sd-turbo/1.0.0/bf16"},
+    )
+    for legacy in legacy_members:
+        with pytest.raises(package_interface.StalePackageInterface) as retired:
+            package_interface.read_bytes(planted(**legacy))
+        assert retired.value.code == "malformed_package_interface"
     with pytest.raises(package_interface.StalePackageInterface) as unknown:
         package_interface.read_bytes(planted(encoded_leaves="maybe"))
     assert unknown.value.code == "malformed_package_interface"

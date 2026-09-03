@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Mapping
 
@@ -13,7 +12,7 @@ class ModelConfigRefusal(Exception):
     pass
 
 
-def construction_document(configs: object) -> tuple[str, bytes]:
+def construction_config(configs: object) -> bytes:
     """Return one exact config document; multiple component configs become one mapping."""
     if not isinstance(configs, Mapping) or not configs:
         raise ModelConfigRefusal("the CozyTensors header declares no inline construction configs")
@@ -38,7 +37,5 @@ def construction_document(configs: object) -> tuple[str, bytes]:
         decoded[name] = document
         held.append(raw)
     if len(held) == 1:
-        raw = held[0]
-        return "sha256:" + hashlib.sha256(raw).hexdigest(), raw
-    raw = canonical.write(decoded)
-    return "sha256:" + hashlib.sha256(raw).hexdigest(), raw
+        return held[0]
+    return canonical.write(decoded)

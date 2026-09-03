@@ -198,13 +198,13 @@ def _drive(registration: Any, document: dict[str, Any], model: Model[Any], param
 
 def _construct(slot: ModelBinding, label: str, tree: Path, release: str) -> Model[Any]:
     """One lane, constructed through the package's own `Model.load` -> `Loader.construct`
-    with the lane tree as its artifact — topology-matched before a byte moves."""
-    index, topology = _lane_index(label, tree)
+    with the lane tree as its artifact — tensor-schema matched before a byte moves."""
+    index, tensor_schema = _lane_index(label, tree)
     config_path = tree / "config.json"
     config = Config(json.loads(config_path.read_text())) if config_path.is_file() else Config({})
     artifact = Artifact(
         snapshot=f"file://{tree}",
-        topology=topology,
+        tensor_schema=tensor_schema,
         config=config,
         custody="local",
     )
@@ -228,7 +228,7 @@ def _lane_index(
             Exit.not_found,
         )
     index: dict[str, tuple[Path, dict[str, Any], int]] = {}
-    topology: dict[str, Any] = {}
+    tensor_schema: dict[str, Any] = {}
     for path in files:
         header, base = safetensors_io.read_header(path)
         for key, row in header.items():
@@ -242,12 +242,12 @@ def _lane_index(
             index[key] = (path, header, base)
             shape = tuple(int(extent) for extent in row["shape"])
             start, end = (int(x) for x in row["data_offsets"])
-            topology[key] = TensorSpec(
+            tensor_schema[key] = TensorSpec(
                 shape,
                 _DTYPES.get(str(row["dtype"]), str(row["dtype"]).lower()),
                 nbytes=end - start,
             )
-    return index, topology
+    return index, tensor_schema
 
 
 class _LaneBackend:

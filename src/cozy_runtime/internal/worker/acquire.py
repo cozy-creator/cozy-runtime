@@ -20,9 +20,7 @@ from typing import Any, Literal
 
 from cozy_runtime.internal import (
     base_observation,
-    canonical,
     fill,
-    model_config,
     package_environment,
     package_interface,
     placement_materialization,
@@ -33,7 +31,6 @@ from cozy_runtime.internal.worker.downloads import DownloadPlan
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     ModelBinding,
-    model_binding_set_digest,
 )
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -289,10 +286,6 @@ def preinstalled_development(
     _verify_file(interface_path, interface_digest, interface_length)
     try:
         interface = package_interface.read_bytes(interface_path.read_bytes(), str(interface_path))
-    except package_interface.RetiredPackageInterfaceMember as exc:
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
-        ) from exc
     except package_interface.StalePackageInterface as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
@@ -327,8 +320,6 @@ def preinstalled_development(
                 "development_model_slot_changed",
                 str(selected["name"]),
             )
-        for member in members:
-            _verify_file(Path(member.config), member.config_digest, None)
     return AcquiredPlacement(
         None,
         bindings,
@@ -645,10 +636,6 @@ class Acquirer:
             interface = package_interface.read_bytes(
                 interface_path.read_bytes(), str(interface_path)
             )
-        except package_interface.RetiredPackageInterfaceMember as exc:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
-            ) from exc
         except package_interface.StalePackageInterface as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
@@ -688,7 +675,6 @@ class Acquirer:
                     entrypoint=name,
                     release=package_code_digest,
                     environment_digest=documents.spell(placement.environment_digest),
-                    config_digest=canonical.digest({}),
                     model_class="",
                     model_binding_path="",
                     model_parameter_name="",
@@ -732,12 +718,6 @@ class Acquirer:
                     for row in slot.get("components", [])
                 }
                 try:
-                    held = store.manifest(reference_manifest)
-                    header = tensorfs.parse_header(bytes(held["header"]))
-                    config_digest, config_bytes = model_config.construction_document(
-                        header.get("configs")
-                    )
-                    config_path = self._stage(config_digest, config_bytes)
                     model_weight_bytes = sum(
                         int(row["length"]) for row in store.walk_cozytensors(reference_manifest)
                     )
@@ -758,19 +738,15 @@ class Acquirer:
                         model_class=str(declared.get("class", "")),
                         model_binding_path=path,
                         model_parameter_name=str(slot["slot"]),
-                        config_digest=config_digest,
                         store=str(self.artifact_store),
-                        config=str(config_path),
                         variant="",
                         reference_snapshot=reference_manifest,
                         components=components,
                         snapshots=snapshots,
                         model_weight_bytes=model_weight_bytes,
                         sequence_parallel_degrees=degrees,
-                        # `lane` is an optional repo-pointer fact on the Model document
-                        # (the manifest is the identity): a placement prepared from a
-                        # download delegation carries none, because DownloadModelRef has
-                        # no lane field — the daemon keeps the lane in its own records.
+                        # The manifest is identity; lane remains the human repo pointer the
+                        # signed download delegation carried beside it.
                         model=f"{reference['repo']}@{reference['version']}"
                         + (f"/{reference['lane']}" if reference.get("lane") else ""),
                     )
@@ -784,14 +760,12 @@ class Acquirer:
                 release=package_code_digest,
                 models=model_set,
                 environment_digest=documents.spell(placement.environment_digest),
-                config_digest=model_binding_set_digest(model_set),
                 model_class=first.model_class,
                 model_binding_path=first.model_binding_path,
                 model_parameter_name=first.model_parameter_name,
                 application=application,
                 interface_path=str(interface_path),
                 store=first.store,
-                config=first.config,
                 variant=first.variant,
                 reference_snapshot=first.reference_snapshot,
                 components=first.components,

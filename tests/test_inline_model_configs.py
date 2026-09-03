@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-
 import pytest
 
 from cozy_runtime.internal import model_config
@@ -14,14 +12,11 @@ from cozy_runtime.protocol import documents
 def test_one_inline_config_is_the_constructor_document() -> None:
     raw = b'{"hidden_size":2048,"layers":32}'
 
-    digest, document = model_config.construction_document({"transformer": raw})
-
-    assert document == raw
-    assert digest == "sha256:" + hashlib.sha256(raw).hexdigest()
+    assert model_config.construction_config({"transformer": raw}) == raw
 
 
 def test_named_inline_configs_form_one_canonical_constructor_document() -> None:
-    digest, document = model_config.construction_document(
+    document = model_config.construction_config(
         {
             "unet": b'{"channels":[320,640]}',
             "text_encoder": b'{"hidden_size":2048}',
@@ -29,12 +24,11 @@ def test_named_inline_configs_form_one_canonical_constructor_document() -> None:
     )
 
     assert document == (b'{"text_encoder":{"hidden_size":2048},"unet":{"channels":[320,640]}}')
-    assert digest == "sha256:" + hashlib.sha256(document).hexdigest()
 
 
 def test_external_config_reference_is_not_a_config() -> None:
     with pytest.raises(model_config.ModelConfigRefusal, match="malformed inline config"):
-        model_config.construction_document(
+        model_config.construction_config(
             {
                 "unet": {
                     "sha256": "1" * 64,

@@ -147,6 +147,9 @@ class GrpcControlHost:
         tls_cert: Path | None = None,
         tls_key: Path | None = None,
         on_bound: Callable[[str], None] | None = None,
+        compatibility_checker: (
+            Callable[[pb.PreparePackageSetRequest], pb.CheckPackageSetCompatibilityResult] | None
+        ) = None,
         preparer: Callable[[pb.PreparePackageSetRequest], pb.PreparePackageSetResult] | None = None,
         model_source_preparer: (
             Callable[[pb.PrepareModelSourceRequest], pb.PrepareModelSourceResult] | None
@@ -164,6 +167,7 @@ class GrpcControlHost:
         self.tls_cert = tls_cert
         self.tls_key = tls_key
         self.on_bound = on_bound
+        self.compatibility_checker = compatibility_checker
         self.preparer = preparer
         self.model_source_preparer = model_source_preparer
         self.local_package_preparer = local_package_preparer
@@ -184,7 +188,8 @@ class GrpcControlHost:
         self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
         pb_grpc.add_WorkerControlServicer_to_server(_Servicer(plane), self.server)
         loopback_services = (
-            self.preparer is not None
+            self.compatibility_checker is not None
+            or self.preparer is not None
             or self.model_source_preparer is not None
             or self.local_package_preparer is not None
             or self.private_placement_preparer is not None
@@ -193,13 +198,15 @@ class GrpcControlHost:
         if loopback_services and not _loopback_preparation_listener(self.listen):
             raise RuntimeError("the loopback Runtime services can only bind a loopback listener")
         if (
-            self.preparer is not None
+            self.compatibility_checker is not None
+            or self.preparer is not None
             or self.model_source_preparer is not None
             or self.local_package_preparer is not None
             or self.private_placement_preparer is not None
         ):
             pb_grpc.add_RuntimePreparationServicer_to_server(
                 _PreparationServicer(
+                    self.compatibility_checker,
                     self.preparer,
                     self.model_source_preparer,
                     self.local_package_preparer,
@@ -252,6 +259,9 @@ class GrpcControlHost:
 class _PreparationServicer:
     def __init__(
         self,
+        compatibility_handler: (
+            Callable[[pb.PreparePackageSetRequest], pb.CheckPackageSetCompatibilityResult] | None
+        ),
         package_handler: (
             Callable[[pb.PreparePackageSetRequest], pb.PreparePackageSetResult] | None
         ),
@@ -265,10 +275,28 @@ class _PreparationServicer:
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
         ),
     ) -> None:
+        self.compatibility_handler = compatibility_handler
         self.package_handler = package_handler
         self.model_source_handler = model_source_handler
         self.local_package_handler = local_package_handler
         self.private_placement_handler = private_placement_handler
+
+    def CheckPackageSetCompatibility(
+        self, request: pb.PreparePackageSetRequest, context: Any
+    ) -> Any:
+        handler = self.compatibility_handler
+        if handler is None:
+            import grpc
+
+            return context.abort(
+                grpc.StatusCode.UNIMPLEMENTED, "package compatibility checking is unavailable"
+            )
+        try:
+            return handler(request)
+        except Exception as exc:
+            import grpc
+
+            context.abort(grpc.StatusCode.INTERNAL, type(exc).__name__)
 
     def PreparePackageSet(self, request: pb.PreparePackageSetRequest, context: Any) -> Any:
         handler = self.package_handler

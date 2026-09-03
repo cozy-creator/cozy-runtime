@@ -3,7 +3,7 @@
 Model-bound capacity requires the exact selected plan closure. This local verb does not
 mint or approximate that closure, so those rows remain explicitly unbound. Whether code
 FITS a checkpoint is `tensorfs.fit`'s answer (model-code-fit §3), asked by the worker at
-construction and by `cozy-runtime derive` + `tfs fit` by hand; nothing here fits anything.
+construction and by Runtime's private request-time fit; nothing here fits anything.
 """
 
 from __future__ import annotations

@@ -60,7 +60,7 @@ def build_pipeline(config: Config) -> SdxlPipeline:
 
 
 class SdxlPipelineModel(Model[SdxlPipeline]):
-    """Admits by pure topology satisfaction, like every other model in this corpus."""
+    """Admits by pure tensor-schema satisfaction, like every other model in this corpus."""
 
     pipe: SdxlPipeline
 

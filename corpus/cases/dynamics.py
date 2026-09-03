@@ -2,7 +2,7 @@
 
 `__init__` must be meta-device safe: allocate shapes and dtypes, never VALUES (§1.1). Each
 case here reaches for a value that does not exist until the fill, and each must be refused
-by NAME rather than producing a plausible-looking topology built from whatever a
+by NAME rather than producing a plausible-looking tensor schema built from whatever a
 zero-filled tensor happens to say. v1 had NO handling for this class at all — its
 `ShapeEnv` is created and never queried — so this is new ground, not a port.
 """

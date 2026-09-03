@@ -615,6 +615,14 @@ class PreparePackageSetResult(_message.Message):
     placement_set: DesiredPlacementSet
     def __init__(self, placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ...) -> None: ...
 
+class CheckPackageSetCompatibilityResult(_message.Message):
+    __slots__ = ("refusal_code", "refusal_detail")
+    REFUSAL_CODE_FIELD_NUMBER: _ClassVar[int]
+    REFUSAL_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    refusal_code: str
+    refusal_detail: str
+    def __init__(self, refusal_code: _Optional[str] = ..., refusal_detail: _Optional[str] = ...) -> None: ...
+
 class PrepareLocalPackageRequest(_message.Message):
     __slots__ = ("operation_id", "package", "files", "environment_root")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1058,18 +1066,20 @@ class DownloadDelegation(_message.Message):
     def __init__(self, expires_at_unix: _Optional[int] = ..., models: _Optional[_Iterable[_Union[DownloadModelRef, _Mapping]]] = ..., packages: _Optional[_Iterable[_Union[DownloadPackageRef, _Mapping]]] = ..., rental_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_tls_certificate_digest: _Optional[bytes] = ...) -> None: ...
 
 class DownloadModelRef(_message.Message):
-    __slots__ = ("manifest", "model", "release", "package", "slot")
+    __slots__ = ("manifest", "model", "release", "package", "slot", "lane")
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
     MODEL_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     SLOT_FIELD_NUMBER: _ClassVar[int]
+    LANE_FIELD_NUMBER: _ClassVar[int]
     manifest: str
     model: str
     release: str
     package: str
     slot: str
-    def __init__(self, manifest: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ..., package: _Optional[str] = ..., slot: _Optional[str] = ...) -> None: ...
+    lane: str
+    def __init__(self, manifest: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ..., package: _Optional[str] = ..., slot: _Optional[str] = ..., lane: _Optional[str] = ...) -> None: ...
 
 class DownloadPackageRef(_message.Message):
     __slots__ = ("package", "release")

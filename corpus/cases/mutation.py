@@ -7,7 +7,7 @@ layouts are the canonical example of what belongs on the other side of that line
 
 The distinction this file draws, and which the harness must draw mechanically: ordinary
 initialization INSIDE a leaf's own `__init__` (`kaiming_uniform_`, `zero_`) writes values
-that every fill overwrites, so it is invisible to the topology and harmless. A mutation
+that every fill overwrites, so it is invisible to the tensor schema and harmless. A mutation
 AFTER the factory has returned its object is a transform the fill cannot see.
 """
 
@@ -89,7 +89,7 @@ def _parametrized(config: Config) -> Pipeline:
 
 def _hooks(config: Config) -> Pipeline:
     """A load-state-dict pre-hook that rewrites keys — v1's `keymap` territory. It must not
-    change the DERIVED topology, because the derivation never calls `load_state_dict`."""
+    change the derived tensor schema, because derivation never calls `load_state_dict`."""
     width = config.as_int("width", 16)
 
     class Hooked(nn.Module):
@@ -134,7 +134,7 @@ CASES = (
         "register_parametrization re-homing weight under parametrizations.weight.original",
         _parametrized,
         "derived-correct",
-        note="the key MOVES, and the derived topology must say so",
+        note="the key MOVES, and the derived tensor schema must say so",
     ),
     Case(
         "load_state_dict_hook",

@@ -35,7 +35,6 @@ from types import ModuleType
 from typing import Any, Literal, cast
 
 from cozy_runtime.author._loader import Artifact, Census, Loader, census, loading
-from cozy_runtime.internal import tensor_requirements
 
 SUBSTRATE = "meta-device"
 
@@ -264,7 +263,7 @@ def _named_device(args: tuple[object, ...], kwargs: Mapping[str, object]) -> str
 
 #: In-place ops that WRITE a value without reading the one already there. Every leaf torch
 #: ships runs one of these in its own `__init__`, and every fill overwrites the result, so
-#: they are invisible to the topology and must not be refused.
+#: they are invisible to the tensor schema and must not be refused.
 _PURE_WRITE = frozenset(
     {
         "zero_",
@@ -917,12 +916,9 @@ class Derivation:
 
     It is a pure function of (factory, config document): no candidate, no snapshot, no
     hardware variant and no verdict (model-code-fit §3, D3). The `factory` and
-    `config_digest` are the derive/serve fence's terms; `logical_tensors` are the rows a
-    checkpoint header is matched against.
+    `logical_tensors` are the rows a checkpoint header is matched against.
     """
 
-    factory: str
-    config_digest: str
     logical_tensors: tuple[LogicalTensor, ...]
     destination_sets: tuple[DestinationSet, ...]
     derived: tuple[DerivedTensor, ...]
@@ -934,19 +930,24 @@ class Derivation:
     def components(self) -> tuple[str, ...]:
         return tuple(d.component for d in self.destination_sets)
 
-    def rows(self) -> list[tensor_requirements.Row]:
+    def rows(self) -> list[tuple[str, str, str | None, tuple[int, ...]]]:
         """The code destinations as `(component, key, dtype?, shape)` — the one projection
         TensorFS reads, shared with the serving census."""
         return [
-            (t.component, t.key[len(t.component) + 1 :], t.dtype, t.shape)
+            (
+                t.component,
+                t.key[len(t.component) + 1 :],
+                _logical_dtype_constraint(t.dtype),
+                t.shape,
+            )
             for t in self.logical_tensors
         ]
 
-    def tensor_requirements_bytes(self, *, encoded_leaves: str) -> bytes:
-        """Canonical TensorRequirements consumed by exact TensorFS fit."""
-        return tensor_requirements.canonical_bytes(
-            self.rows(), self.components, encoded_leaves=encoded_leaves
-        )
+
+def _logical_dtype_constraint(dtype: str | None) -> str | None:
+    """Ordinary bf16/f16 weights may convert; semantic islands retain exact dtype."""
+
+    return None if dtype in (None, "bfloat16", "float16") else dtype
 
 
 def derive(
@@ -1010,8 +1011,6 @@ def derive(
     _check_agreement(logical, destination_sets, [d.key for c in shallow for d in c.destinations])
     constructed = tuple(d.component for d in destination_sets)
     return Derivation(
-        factory="|".join(r.factory_identity for r in loader.records()),
-        config_digest=artifact.config.digest(),
         logical_tensors=logical,
         destination_sets=destination_sets,
         derived=tuple(sorted(rich.derived, key=lambda d: d.key)),
@@ -1033,7 +1032,7 @@ def _check_agreement(
 ) -> None:
     """EXACT ordered one-to-one agreement between the deep walk and the Loader census.
 
-    Membership proves topology; sequence proves the rows record the same construction
+    Membership proves the tensor schema; sequence proves the rows record the same construction
     traversal the Loader hands to the fill plane.
     """
     actual = list(destinations)

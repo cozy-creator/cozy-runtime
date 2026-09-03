@@ -687,14 +687,10 @@ class ConstructionIdentity:
     release: str
     model_class: str
     artifact: str
-    config_digest: str
     variant: str
 
     def __str__(self) -> str:
-        return (
-            f"{self.model_class}@{self.release} ← {self.artifact} "
-            f"[{self.config_digest[:16]}… {self.variant}]"
-        )
+        return f"{self.model_class}@{self.release} ← {self.artifact} [{self.variant}]"
 
 
 @dataclass(slots=True)
@@ -774,7 +770,6 @@ class ModelRegistry:
             release=self._release,
             model_class=f"{cls.__module__}:{cls.__qualname__}",
             artifact=artifact.snapshot,
-            config_digest=artifact.config.digest(),
             variant=artifact.variant,
         )
         with self._lock:
@@ -888,17 +883,12 @@ class ModelRegistry:
         return Loader(artifact, owner=model, backend=self._backend, mode=mode, device=self._device)
 
 
-_EMPTY_ARTIFACT = Artifact(snapshot="unload://drain", topology={}, config=Config({}))
+_EMPTY_ARTIFACT = Artifact(snapshot="unload://drain", tensor_schema={}, config=Config({}))
 
 
 def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
     """Several `construct` calls in one `load()` are one construction contract."""
     return ConstructionRecord(
-        # The derivation contract uses this exact separator.  Serve and derive joining the
-        # same construction records with different punctuation made the published factory
-        # identity impossible to verify at launch.
-        factory_identity="|".join(r.factory_identity for r in records),
-        config_digest=records[0].config_digest,
         destinations=tuple(d for r in records for d in r.destinations),
         components=tuple(c for r in records for c in r.components),
         schedulers=tuple(s for r in records for s in r.schedulers),

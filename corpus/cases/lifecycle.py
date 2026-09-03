@@ -177,11 +177,11 @@ CASES = (
         _quantized_swap,
         "derived-correct",
         config={"width": 16, "variant": "w4a16"},
-        note="the packed/scales pair IS the derived topology for that variant",
+        note="the packed/scales pair IS the derived tensor schema for that variant",
     ),
     Case(
         "hardware_gate",
-        "construction branching on device capability — a code topology is a function of "
+        "construction branching on device capability — tensor requirements are a function of "
         "the config document alone (model-code-fit D3)",
         _capability_gate,
         "typed-refusal",

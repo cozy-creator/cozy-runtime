@@ -111,7 +111,7 @@ class AttemptPlan:
     `AttemptPlanSummary.quantified_choice`, which is th-024's name for the field."""
     constructed_model_digest: str = ""
     """WHAT WAS ACTUALLY BUILT: the selected bytes, the route that decodes them, the
-    construction (config + topology) and the configuration the fill ran under. The one
+    construction and the exact selected snapshot. The one
     construction identity — the MCC's "logical model" digest beside it is deleted (D12)."""
     request_features_digest: str = ""
     """The exact PreparedRequest this plan was priced against, bound into the plan document
@@ -239,7 +239,7 @@ class PreparedModel:
     """
 
     constructed_model_digest: str = ""
-    """WHAT WAS BUILT: selected bytes, route, materialization, topology, configuration."""
+    """WHAT WAS BUILT: selected bytes, route, materialization, and tensor schema."""
     delivery_rung: str = ""
     """Which `DELIVERY_RUNGS` entry the executor's `DeliveryChooser` took. Empty means
     `verbatim`."""
@@ -258,9 +258,7 @@ class ModelBinding:
     model_class: str
     model_binding_path: str
     model_parameter_name: str
-    config_digest: str
     store: str
-    config: str
     variant: str
     reference_snapshot: str
     components: tuple[str, ...]
@@ -282,8 +280,6 @@ class ModelBinding:
     def key_document(self) -> dict[str, Any]:
         return {
             "store": self.store,
-            "config": self.config,
-            "config_digest": self.config_digest,
             "snapshot": self.reference_snapshot,
             "variant": self.variant,
             "model_class": self.model_class,
@@ -296,23 +292,6 @@ class ModelBinding:
             "model_weight_bytes": self.model_weight_bytes,
             "custody": self.custody,
         }
-
-
-def model_binding_set_digest(models: tuple[ModelBinding, ...]) -> str:
-    """Exact ordered config identity for InvocationSpec/PlacementStatus."""
-
-    if not models:
-        return canonical.digest({})
-    if len(models) == 1:
-        return models[0].config_digest
-    return canonical.digest(
-        {
-            "model_bindings": [
-                {"path": model.model_binding_path, "config_digest": model.config_digest}
-                for model in models
-            ]
-        }
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,8 +311,6 @@ class DeclaredBinding:
     models: tuple[ModelBinding, ...] = ()
     environment_digest: str = ""
     """The exact inline Environment selected beside this binding."""
-    config_digest: str = ""
-    """The exact selected model config, or sha256(canonical {}) when weightless."""
     application: str = ""
     """The exact PackageInterface application imported from the installed venv."""
     interface_path: str = ""
@@ -341,7 +318,6 @@ class DeclaredBinding:
     development_project: str = ""
     """Launch-local source path for DevelopmentPackage discovery; never protocol identity."""
     store: str = ""
-    config: str = ""
     variant: str = ""
     reference_snapshot: str = ""
     """The RESOLVED reference snapshot: the artifact the `variant` names, and the fallback
@@ -405,9 +381,7 @@ class DeclaredBinding:
                 model_class=self.model_class,
                 model_binding_path=self.model_binding_path,
                 model_parameter_name=self.model_parameter_name,
-                config_digest=self.config_digest,
                 store=self.store,
-                config=self.config,
                 variant=self.variant,
                 reference_snapshot=self.reference_snapshot,
                 components=self.components,

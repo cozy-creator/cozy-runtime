@@ -21,12 +21,14 @@ ref, device/dtype override, offload/pin/eviction knob, compile hook or selection
 
 from __future__ import annotations
 
-import hashlib
-import re
+import io
+import os
+import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Literal, Protocol, TypeVar, cast, final, runtime_checkable
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
 
 import msgspec
 
@@ -41,7 +43,7 @@ Mode = Literal["derive", "serve"]
 Custody = Literal["canonical", "local"]
 
 
-# --------------------------------------------------------------------------- topology
+# ---------------------------------------------------------------------- tensor schema
 
 
 @runtime_checkable
@@ -58,7 +60,7 @@ class TensorLike(Protocol):
 
 @runtime_checkable
 class ModuleLike(Protocol):
-    """A component root. The topology walk can only see what `state_dict()` reaches
+    """A component root. The tensor-schema walk can only see what `state_dict()` reaches
     (§1.1 authoring rules) — `torch.nn.Module` satisfies this structurally."""
 
     def state_dict(self) -> Mapping[str, TensorLike]: ...
@@ -66,7 +68,7 @@ class ModuleLike(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class TensorSpec:
-    """One row of a topology table: the logical shape plus how the bytes represent it."""
+    """One tensor-schema row: logical shape plus how the bytes represent it."""
 
     shape: tuple[int, ...]
     dtype: str = "bf16"
@@ -139,10 +141,9 @@ class Config:
     a dynamic `__getattr__` would be exactly the declared `Any` seam §1.7 deletes.
     """
 
-    __slots__ = ("_data", "_document_digest", "_where")
+    __slots__ = ("_data", "_where")
 
     _data: Mapping[str, object]
-    _document_digest: str
     _where: str
 
     def __init__(
@@ -150,7 +151,7 @@ class Config:
         data: Mapping[str, object],
         where: str = "config",
     ) -> None:
-        """Freeze one in-memory config value and derive its SHA-256 identity."""
+        """Freeze one in-memory construction config."""
         for key, value in data.items():
             carrier = _carrier(key, value)
             if carrier is not None:
@@ -164,26 +165,8 @@ class Config:
             if isinstance(value, Mapping):
                 Config(value, f"{where}.{key}")
         frozen = dict(data)
-        rendered = msgspec.json.encode(_canonical(frozen))
-        measured = "sha256:" + hashlib.sha256(rendered).hexdigest()
         object.__setattr__(self, "_data", frozen)
-        object.__setattr__(self, "_document_digest", measured)
         object.__setattr__(self, "_where", where)
-
-    @classmethod
-    def _verified(cls, data: Mapping[str, object], where: str, document_digest: str) -> Config:
-        """Bind data to exact JCS bytes already verified by an internal caller."""
-        if re.fullmatch(r"sha256:[0-9a-f]{64}", document_digest) is None:
-            raise ConformanceError(
-                f"{where} document digest {document_digest!r} is not sha256:<64 lowercase hex>",
-                code="config_digest",
-            )
-        # Re-encoding the parsed value with msgspec would invent a second numeric
-        # profile (for example 0.000001 vs 1e-6). The proof seat and executor have
-        # already verified and hashed the exact stored JCS bytes before this call.
-        config = cls(data, where)
-        object.__setattr__(config, "_document_digest", document_digest)
-        return config
 
     def __setattr__(self, name: str, value: object) -> None:
         raise CapabilityError(
@@ -245,10 +228,6 @@ class Config:
                 code="config_invalid",
             ) from exc
 
-    def digest(self) -> str:
-        """The exact canonical config-document identity used by MCC and binding readers."""
-        return self._document_digest
-
     def _value(self, name: str) -> object:
         try:
             return self._data[name]
@@ -283,7 +262,7 @@ def _canonical(value: object) -> object:
 
 @dataclass(frozen=True, slots=True)
 class Artifact:
-    """The RESOLVED binding a slot loads: one exact snapshot, its topology and its immutable
+    """The RESOLVED binding a slot loads: one exact snapshot, its tensor schema and immutable
     config.
 
     Selection produced this (package.toml default -> `--model` -> deploy binding); author
@@ -293,8 +272,9 @@ class Artifact:
     """
 
     snapshot: str
-    topology: Mapping[str, TensorSpec]
+    tensor_schema: Mapping[str, TensorSpec]
     config: Config
+    assets: Mapping[str, bytes] = field(default_factory=dict)
     variant: str = "plain"
     custody: Custody = "canonical"
     """`canonical` refuses a stored key inside a constructed component that the code does
@@ -316,6 +296,105 @@ class ModelFitRefused(ConformanceError):
     def __init__(self, fit: Fit) -> None:
         super().__init__(f"{fit.get('code')} — {fit.get('detail')}")
         self.fit = dict(fit)
+
+
+@final
+class ModelAssets:
+    """Verified read-only model files embedded in one CozyTensors artifact.
+
+    Names are header paths, never config values. Reads are bounded and return immutable bytes;
+    ``materialized`` exists only for third-party constructors that insist on a filesystem view.
+    The view is private, read-only, and removed before ``Model.load`` returns.
+    """
+
+    MAX_BYTES = 64 << 20
+
+    def __init__(self, values: Mapping[str, bytes], guard: Callable[[str], None]) -> None:
+        self._values = {str(name): bytes(value) for name, value in values.items()}
+        self._guard = guard
+
+    def names(self) -> tuple[str, ...]:
+        self._guard("loader.assets")
+        return tuple(sorted(self._values))
+
+    def read(self, name: str) -> bytes:
+        self._guard("loader.assets.read")
+        raw = self._get(name)
+        if len(raw) > self.MAX_BYTES:
+            raise CapabilityError(
+                f"model asset {name!r} is {len(raw)} B; the bounded Loader limit is "
+                f"{self.MAX_BYTES} B",
+                code="model_asset_too_large",
+            )
+        return raw
+
+    def open(self, name: str) -> io.BytesIO:
+        """An in-memory binary stream over the same immutable verified bytes."""
+
+        return io.BytesIO(self.read(name))
+
+    @contextmanager
+    def materialized(self, prefix: str = "") -> Iterator[Path]:
+        """Temporarily expose one asset or a named subtree as read-only files."""
+
+        self._guard("loader.assets.materialized")
+        prefix = prefix.strip("/")
+        selected = {
+            name: raw
+            for name, raw in self._values.items()
+            if not prefix or name == prefix or name.startswith(prefix + "/")
+        }
+        if not selected:
+            self._missing(prefix or "<all>")
+        total = sum(len(raw) for raw in selected.values())
+        if total > self.MAX_BYTES:
+            raise CapabilityError(
+                f"model asset view {prefix or '<all>'!r} is {total} B; the bounded Loader "
+                f"limit is {self.MAX_BYTES} B",
+                code="model_asset_too_large",
+            )
+        with tempfile.TemporaryDirectory(prefix="cozy-model-assets-") as temporary:
+            root = Path(temporary).resolve()
+            directories: set[Path] = set()
+            for name, raw in selected.items():
+                relative = Path(name)
+                target = (root / relative).resolve()
+                if relative.is_absolute() or not target.is_relative_to(root):
+                    raise CapabilityError(
+                        f"model asset name {name!r} is not a relative path",
+                        code="model_asset_name",
+                    )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(raw)
+                target.chmod(0o444)
+                directories.update((target.parent, *target.parents))
+            for directory in sorted(
+                (path for path in directories if path.is_relative_to(root)),
+                key=lambda path: len(path.parts),
+                reverse=True,
+            ):
+                directory.chmod(0o555)
+            view = root / prefix if prefix else root
+            try:
+                yield view
+            finally:
+                for directory in directories:
+                    with suppress(OSError):
+                        os.chmod(directory, 0o755)
+
+    def _get(self, name: str) -> bytes:
+        try:
+            return self._values[name]
+        except KeyError:
+            self._missing(name)
+
+    def _missing(self, name: str) -> NoReturn:
+        raise InvalidRequest(
+            f"the CozyTensors artifact declares no model asset {name!r} "
+            f"(has: {', '.join(sorted(self._values)) or 'none'})",
+            code="model_asset_missing",
+            fields=[name],
+        )
 
 
 # --------------------------------------------------------------------------- backend
@@ -511,8 +590,6 @@ def registered_adapters() -> tuple[str, ...]:
 class ConstructionRecord:
     """What executing `load()` derived: the tensor requirements and the fill's bookkeeping."""
 
-    factory_identity: str
-    config_digest: str
     destinations: tuple[Destination, ...]
     components: tuple[str, ...]
     schedulers: tuple[str, ...]
@@ -523,24 +600,6 @@ class ConstructionRecord:
     fit: dict[str, object] | None = None
     """The `ok` Fit document this construction was judged by, verbatim; None where no
     header was there to judge against (derive mode)."""
-
-    @property
-    def tensor_requirements_digest(self) -> str:
-        # Sorted by key: the projection is independent of a module's state_dict walk order,
-        # so two equivalent module implementations that enumerate differently name one model.
-        rows = sorted(f"{d.key}:{list(d.spec.shape)}:{d.spec.dtype}" for d in self.destinations)
-        return "blake2b:" + hashlib.blake2b("\n".join(rows).encode(), digest_size=16).hexdigest()
-
-    @property
-    def identity(self) -> str:
-        """The derive/serve fence: the SAME factory and config bytes construct both graphs."""
-        return (
-            "blake2b:"
-            + hashlib.blake2b(
-                f"{self.factory_identity}|{self.config_digest}|{self.tensor_requirements_digest}".encode(),
-                digest_size=16,
-            ).hexdigest()
-        )
 
 
 # --------------------------------------------------------------------------- loader
@@ -553,6 +612,7 @@ class Loader:
 
     __slots__ = (
         "_artifact",
+        "_assets",
         "_backend",
         "_caches",
         "_device",
@@ -573,6 +633,7 @@ class Loader:
         device: Device | None = None,
     ) -> None:
         self._artifact = artifact
+        self._assets = ModelAssets(artifact.assets, self._require_open)
         self._backend: Backend = backend if backend is not None else _NullBackend()
         self._mode: Mode = mode
         self._device = device or Device()
@@ -587,6 +648,13 @@ class Loader:
         """Read-only device identity. Placement is the runtime's; naming it is not a door."""
         self._require_open("loader.device")
         return self._device
+
+    @property
+    def assets(self) -> ModelAssets:
+        """The selected CozyTensors artifact's verified, read-only model assets."""
+
+        self._require_open("loader.assets")
+        return self._assets
 
     def construct(self, t: type[T], *, factory: Callable[[Config], T]) -> T:
         """THE construction primitive: typed config in, walk and match, then one fill path."""
@@ -608,8 +676,6 @@ class Loader:
         ignored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("ignored", ())))
         filled, filled_bytes = self._fill(walked, obj)
         record = ConstructionRecord(
-            factory_identity=identity,
-            config_digest=self._artifact.config.digest(),
             destinations=walked.destinations,
             components=walked.components,
             schedulers=walked.schedulers,
@@ -698,9 +764,9 @@ class Loader:
         try:
             live = self._backend.materialize(obj, walked, encoded_leaves=self._consent())
             for d in walked.destinations:
-                self._backend.fill(d.key, self._artifact.topology[d.key], live[d.key])
+                self._backend.fill(d.key, self._artifact.tensor_schema[d.key], live[d.key])
                 done.append(d.key)
-                total += self._artifact.topology[d.key].nbytes
+                total += self._artifact.tensor_schema[d.key].nbytes
             self._backend.commit()
         except Exception:
             self._backend.poison(done)
@@ -755,8 +821,8 @@ def census(obj: object) -> Census:
     return Census(tuple(destinations), tuple(components), tuple(schedulers), live)
 
 
-def topology_of(obj: object) -> dict[str, TensorSpec]:
-    """The topology table a construction DEMANDS — the same rows a checkpoint header
+def tensor_schema_of(obj: object) -> dict[str, TensorSpec]:
+    """The tensor schema a construction DEMANDS — the same rows a checkpoint header
     supplies. cr-004's derivation harness produces this per candidate under fake tensors."""
     return {d.key: d.spec for d in census(obj).destinations}
 

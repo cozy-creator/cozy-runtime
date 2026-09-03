@@ -105,6 +105,7 @@ def _run(config: WorkerHostConfig) -> int:
         tls_key=host_paths.TLS_PRIVATE_KEY,
     )
     worker = Worker(runtime_config, options, host)
+    host.compatibility_checker = worker.check_package_set_compatibility
     host.preparer = worker.prepare_package_set
     host.model_source_preparer = worker.prepare_model_source
     host.local_package_preparer = worker.prepare_local_package

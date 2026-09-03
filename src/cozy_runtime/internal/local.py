@@ -64,7 +64,6 @@ from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     ModelBinding,
-    model_binding_set_digest,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -120,8 +119,6 @@ class _DevelopmentModel:
     lane: str
     manifest_digest: str
     manifest_length: int
-    config_digest: str
-    config_bytes: bytes
     components: tuple[str, ...]
     store: Path
     variant: str
@@ -1124,20 +1121,12 @@ def development_placement_documents(
                     ],
                 )
             )
-            config_path = ""
-            if artifact_cache is not None:
-                _, staged_config = _stage_exact(
-                    artifact_cache / "selections", selected.config_bytes
-                )
-                config_path = str(staged_config)
             members.append(
                 ModelBinding(
                     model_class=selected.slot.class_key,
                     model_binding_path=selected.slot.path,
                     model_parameter_name=selected.slot.param,
-                    config_digest=selected.config_digest,
                     store=str(selected.store),
-                    config=config_path,
                     variant=selected.variant,
                     reference_snapshot=selected.manifest_digest,
                     components=selected.components,
@@ -1173,12 +1162,10 @@ def development_placement_documents(
             interface_path=interface_path,
             development_project=str(found.project) if found is not None else "",
             store=first.store if first is not None else "",
-            config=first.config if first is not None else "",
             variant=first.variant if first is not None else "",
             reference_snapshot=first.reference_snapshot if first is not None else "",
             components=first.components if first is not None else (),
             snapshots=first.snapshots if first is not None else {},
-            config_digest=model_binding_set_digest(model_set),
             development=True,
             model_weight_bytes=sum(model.model_weight_bytes for model in model_set),
             custody=first.custody if first is not None else "canonical",
@@ -1294,15 +1281,15 @@ def _resolve_development_models(
             )
         manifest_length = len(manifest_bytes)
         try:
-            config_digest, config_bytes = model_config.construction_document(header.get("configs"))
+            config_bytes = model_config.construction_config(header.get("configs"))
         except model_config.ModelConfigRefusal as exc:
             raise RuntimeError(
                 f"development_model_config_invalid: {binding.ref}: {type(exc).__name__}: {exc}"
             ) from exc
         if not header.get("components"):
             raise RuntimeError(f"development_model_components_absent: {binding.ref}")
-        components = _derive_components(found.project, slot.path, config_bytes)
-        _development_assets(binding.ref, header.get("assets", {}))
+        assets = fill.Checkpoint(store_root, manifest_digest).model_assets()
+        components = _derive_components(found.project, slot.path, config_bytes, assets)
         try:
             model_weight_bytes = sum(
                 int(row["length"]) for row in store.walk_cozytensors(manifest_digest)
@@ -1319,8 +1306,6 @@ def _resolve_development_models(
             lane=lane,
             manifest_digest=manifest_digest,
             manifest_length=manifest_length,
-            config_digest=config_digest,
-            config_bytes=config_bytes,
             components=components,
             store=store_root,
             # Repository lane and accelerator hardware are independent facts. Development
@@ -1333,37 +1318,23 @@ def _resolve_development_models(
     return resolved
 
 
-def _derive_components(project: Path, slot: str, config_bytes: bytes) -> tuple[str, ...]:
-    """`Slot.components` = what the derive constructs for this config document (D9), from
-    `cozy-runtime derive`'s bounded child in THIS venv — this process is the package venv's
-    own runtime, and `sys.executable` is its interpreter."""
+def _derive_components(
+    project: Path, slot: str, config_bytes: bytes, assets: Mapping[str, bytes]
+) -> tuple[str, ...]:
+    """What the private bounded child constructs for this config in this package venv."""
     import sys
-    import tempfile
 
-    scratch = Path(tempfile.mkdtemp(prefix="cozy-local-derive-"))
     try:
         request = derive_child.DeriveRequest(
-            (derive_child.SlotRequest(slot, config_bytes),),
+            (derive_child.SlotRequest(slot, config_bytes, assets),),
             project=Path(project).resolve(),
         )
-        (held,) = derive_child.derive_in(Path(sys.executable), request, scratch)
-        return derive_child.constructed_components(held.document)
+        (held,) = derive_child.derive_in(Path(sys.executable), request)
+        return held.components
     except derive_child.DeriveRefusal as exc:
         raise RuntimeError(
             f"development_model_derive_refused: {slot}: {exc.code}: {exc.detail}"
         ) from exc
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-
-
-def _development_assets(binding_ref: str, value: object) -> None:
-    if not isinstance(value, Mapping):
-        raise RuntimeError(f"development_model_assets_invalid: {binding_ref}")
-    if value:
-        raise RuntimeError(
-            "development_model_assets_unsupported: local modeled development does not "
-            f"yet stream TensorFS logical assets for {binding_ref}"
-        )
 
 
 def _exact_model_ref(value: str) -> tuple[str, str, str]:
