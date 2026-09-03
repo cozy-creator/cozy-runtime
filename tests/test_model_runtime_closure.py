@@ -15,6 +15,7 @@ import tensorfs
 from cozy_runtime.author import Artifact, CapabilityError, Config, Loader
 from cozy_runtime.author._loader import loading
 from cozy_runtime.internal import base_observation, canonical, fill, package_interface
+from cozy_runtime.internal.encoding import SPEC_PLAIN, launch_providers
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
 from cozy_runtime.internal.worker.package_prepare import (
@@ -156,6 +157,8 @@ def test_worker_prepare_reads_tensorfs_03_logical_dtype(tmp_path: Path) -> None:
     store_root, manifest_id, _manifest_length, _store = _snapshot(tmp_path, include_asset=True)
     rows = fill.Checkpoint(store_root, manifest_id).rows("unet")
     assert [(row.key, row.dtype, row.shape) for row in rows] == [("unet.weight", "f32", (1,))]
+    assert rows[0].encoded.encoding == SPEC_PLAIN
+    assert SPEC_PLAIN in launch_providers()
 
 
 def test_cold_fit_accepts_only_manifest_header_and_model_assets(tmp_path: Path) -> None:

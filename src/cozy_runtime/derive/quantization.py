@@ -186,12 +186,12 @@ class Bf16Stats(msgspec.Struct):
 
 
 _ARTIFACT_SPECS = {
-    # TensorFS eb21e5c's exact, vector-backed platform specs. Aliases are display;
+    # TensorFS 0.3's exact, vector-backed platform specs. Aliases are display;
     # WeightsTensor always carries the immutable spec identity.
-    "fp8-rowwise/1": ("sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5"),
-    "mxfp8/1": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+    "fp8-rowwise/1": "sha256:c4be0120fb4548306b134f6ee07eb2545a363bc140a005af1ef6543c790cf890",
+    "mxfp8/1": "sha256:7e9b1ad8f2e5ddd236a4d4303042d632a96eadef4f25d44eb0fb63124cec7cfd",
 }
-PLAIN_SPEC = "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd"
+PLAIN_SPEC = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f"
 _MAX_ARTIFACT_PLAN_BYTES = 8 << 20
 _SOURCE_READ_CHUNK = 32 << 20
 _MAX_SOURCE_TENSOR_BYTES = 1 << 30
