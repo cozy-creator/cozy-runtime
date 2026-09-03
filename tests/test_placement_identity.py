@@ -1,9 +1,11 @@
-"""Placement identity is the content prepared, never the credential.
+"""Placement identity is the content prepared, never a credential.
 
-xs-014 finding 1: the seed used to be the raw delegation bytes — whose
-per-signing expiry and worker pins re-identified the SAME package on every
-re-signed converge, defeating ledger reuse and (pre co-tenancy fix) making
-one package's identity depend on its neighbors.
+xs-014 finding 1: the seed used to be the raw document bytes — whose per-signing
+expiry and worker pins re-identified the SAME package on every re-signed converge,
+defeating ledger reuse and (pre co-tenancy fix) making one package's identity depend
+on its neighbors. Those fields are deleted (owner ruling 2026-09-03), so a download
+set is now a pure function of its content; identity still derives from the named
+facts, because that is what identity means.
 """
 
 from __future__ import annotations
@@ -29,8 +31,9 @@ _MODELS = [
 
 
 def test_identity_ignores_credential_clocks() -> None:
-    # Two delegations for the same content differ only in expiry/pins —
-    # which never enter the derivation at all.
+    # Two download sets for the same content are identical bytes now, and even a
+    # document that still carried an expiry or worker pins could not reach the
+    # derivation: it reads named facts, never the bytes.
     first = placement_identity("paul/anima", "1.0.0", "sha256:cc", _MODELS)
     second = placement_identity("paul/anima", "1.0.0", "sha256:cc", list(_MODELS))
     assert first == second

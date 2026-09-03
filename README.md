@@ -81,8 +81,8 @@ PlacementSet is the sole package/model selection. Runtime names only its digest 
 `POST /v1/worker/downloads/resolve` over its existing per-boot mTLS leaf, then downloads the
 returned package wheels and model-weight files directly from their short-lived R2 GET URLs.
 The supervisor may project its decoded private CA as `SSL_CERT_FILE`; Runtime accepts no CA
-payload environment variable, delegation document, certificate bypass, proxy certificate
-header, or authentication fallback.
+payload environment variable, certificate bypass, proxy certificate header, or
+authentication fallback.
 
 | module | role |
 |---|---|
@@ -413,9 +413,8 @@ convergence lane starts package and model acquisition together. As soon as the p
 binding documents are admitted from a standing start, Runtime spawns the executor so interpreter
 and Torch import overlap continued TensorFS hydration; model preparation/fill still waits for the
 exact model closure. READY remains the join of package environment, TensorFS closure, binding resolution and
-device construction. An outgoing placement is never disturbed by this optimization. Same-revision
-delegation renewal changes only access; verified complete objects survive and only missing objects
-move after renewal.
+device construction. An outgoing placement is never disturbed by this optimization. Verified
+complete objects survive a re-issue of the same revision; only missing objects move.
 
 `PlacementStatus.acquisition` exposes that work as observation only. It retains
 package/model start and end values from one process-monotonic clock plus cumulative

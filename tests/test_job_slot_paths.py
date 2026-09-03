@@ -4,7 +4,7 @@
 `models[].path`. Three readers of that document read only the first:
 
 * the hub's facts assembler, so a release whose callables are all jobs shipped
-  `model_slot_paths: []` and the pod refused every delegation that bound a job slot
+  `model_slot_paths: []` and the pod refused every download set that bound a job slot
   (paul/minimax-h3-tools is exactly that shape; its four-lane binds two of nine);
 * `_prepare_published`'s `declared` cross-check, which would then have refused
   `package_prepare_model_slots_disagree` the moment the hub started telling the truth --
@@ -168,7 +168,7 @@ def test_the_release_declares_both_collections_slots(interface: dict[str, Any]) 
 def test_a_job_shaped_selection_prepares(
     interface: dict[str, Any], released: tuple[Path, str, int], tmp_path: Path
 ) -> None:
-    """THE H3 BLOCKER, end to end. The delegation binds the job's slot and nothing else;
+    """THE H3 BLOCKER, end to end. The download set binds the job's slot and nothing else;
     the release declares both. Preparation authors the placement, carries the model row,
     stages the job plan, and binds no entrypoint -- because a job has none to bind."""
 
