@@ -28,7 +28,7 @@ from cozy_runtime.internal.exits import Exit
 REQUEST_FIELDS = {
     "device_index",
     "environment_digest",
-    "environment_root",
+    "install_root",
     "expected_result_digest",
     "fixture",
     "installed_environment_receipt_digest",
@@ -40,7 +40,7 @@ REQUEST_FIELDS = {
 class Request:
     device_index: int | None
     environment_digest: str
-    environment_root: Path
+    install_root: Path
     expected_result_digest: str
     fixture: str
     installed_receipt_digest: str
@@ -58,7 +58,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         request = _request(request_path)
         base = package_environment.observe_base(request.python)
         installed = package_environment.open_generation(
-            request.environment_root,
+            request.install_root,
             receipt_digest=request.installed_receipt_digest,
             environment_digest=request.environment_digest,
             python=request.python,
@@ -192,7 +192,7 @@ def _request(path: Path) -> Request:
     return Request(
         device,
         str(value["environment_digest"]),
-        _existing_directory(_absolute(value["environment_root"], "environment_root")),
+        _existing_directory(_absolute(value["install_root"], "install_root")),
         str(value["expected_result_digest"]),
         fixture,
         str(value["installed_environment_receipt_digest"]),
@@ -235,7 +235,7 @@ def _existing_executable(path: Path) -> Path:
 def _existing_directory(path: Path) -> Path:
     resolved = path.resolve(strict=True)
     if not stat.S_ISDIR(resolved.lstat().st_mode):
-        raise _error("environment_root is not a directory")
+        raise _error("install_root is not a directory")
     return resolved
 
 

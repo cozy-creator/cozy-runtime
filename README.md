@@ -324,7 +324,7 @@ interface, and recognizes exact non-protected project/dependency versions as con
 completed package environment, not as worker-image distributions. A version disagreement or
 protected-family/root collision still refuses. It then authors the PlacementSet without installing
 another environment. Local `serve`
-receives the same `--environment-python`; `--environment-root` is reserved for rental
+receives the same `--environment-python`; `--install-root` is reserved for rental
 materialization and the two flags are mutually exclusive.
 
 The local boot warm pass is also capacity evidence. A typed device OOM falsifies only that

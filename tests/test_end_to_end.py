@@ -320,7 +320,8 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
         impostor = root / "impostor"
         _write_pure_project(impostor, "cozy-runtime", "9.9.9", "cozy_runtime_impostor")
         artifact_cache = root / "artifacts"
-        wheel_set = artifact_cache / "sets" / "package"
+        artifact_cache.mkdir()
+        wheel_set = root / "environments" / ".stage-editable-revision-proof" / "wheels"
         wheel_set.mkdir(parents=True)
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(PACKAGE))
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency))
@@ -349,9 +350,10 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
                 package_name="paul/marco-polo",
                 release="1.0.4",
                 wheels=_wheel_rows(wheels),
+                wheel_root=wheel_set,
                 placement_seed=b"editable-revision-proof",
                 artifact_cache=artifact_cache,
-                environment_root=environment,
+                install_root=environment,
                 python=python,
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,
@@ -414,7 +416,7 @@ def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> 
         )
         (project / "vendor" / "notes.txt").write_text("no module lives here\n")
         artifact_cache = root / "artifacts"
-        wheel_set = artifact_cache / "sets" / "package"
+        wheel_set = root / "environment" / ".stage-empty-project-proof" / "wheels"
         wheel_set.mkdir(parents=True)
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(project))
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(ROOT))
@@ -430,9 +432,10 @@ def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> 
                 package_name="local/hollow",
                 release="1.0.0",
                 wheels=_wheel_rows([project_wheel, runtime_wheel]),
+                wheel_root=wheel_set,
                 placement_seed=b"empty-project-proof",
                 artifact_cache=artifact_cache,
-                environment_root=root / "environment",
+                install_root=root / "environment",
                 python=Path(sys.executable),
                 describe=lambda _installed, _distribution: b"",
                 verified=lambda _digest, _length, _path: None,
@@ -697,7 +700,8 @@ def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -
         _write_native_dependency(dependency, "0.0.1")
 
         artifact_cache = root / "artifacts"
-        wheel_set = artifact_cache / "sets" / "package"
+        artifact_cache.mkdir()
+        wheel_set = root / "environments" / ".stage-native-dependency-admission" / "wheels"
         wheel_set.mkdir(parents=True)
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(PACKAGE))
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency))
@@ -729,9 +733,10 @@ def test_native_dependency_wheel_is_admitted_on_proof_not_on_caller_identity() -
                 package_name="paul/marco-polo",
                 release="1.0.4",
                 wheels=_wheel_rows([project_wheel, native_wheel_path]),
+                wheel_root=wheel_set,
                 placement_seed=b"native-dependency-admission",
                 artifact_cache=artifact_cache,
-                environment_root=environment,
+                install_root=environment,
                 python=python,
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,

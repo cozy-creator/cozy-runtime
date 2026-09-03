@@ -138,7 +138,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             placement_seed=seed,
             artifact_cache=artifact_cache,
             tensorfs_root=tensorfs_root,
-            environment_root=installed_environment.generation,
+            install_root=installed_environment.generation,
             python=environment_python,
             describe=describe,
             installed_environment=installed_environment,

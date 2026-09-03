@@ -36,7 +36,7 @@ from cozy_runtime.internal.refusal import LaunchRefusal
 ENVIRONMENT_FORMAT = "cozy.worker.v1.Environment/1"
 MAX_PACKAGE_ENVIRONMENT_BYTES = 4 << 30
 BOOT_ROOT = host_paths.BOOT_DATA
-ENVIRONMENT_ROOT = host_paths.ENVIRONMENT_ROOT
+INSTALL_ROOT = host_paths.INSTALL_ROOT
 LOCAL_TENSORFS_ROOT = host_paths.TENSORFS_ROOT
 MAX_ARTIFACT_BYTES = 8 << 30
 CHUNK_BYTES = 1 << 20

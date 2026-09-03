@@ -85,7 +85,7 @@ def _acquirer(tmp_path: Path, store_root: Path) -> Acquirer:
     return Acquirer(
         DownloadPlan(),
         cache_root=roots["cache"],
-        environment_root=roots["environment"],
+        install_root=roots["environment"],
         selection_root=roots["selection"],
         tensorfs_root=store_root,
         python=Path("/usr/bin/python3"),

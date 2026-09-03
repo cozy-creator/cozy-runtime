@@ -236,8 +236,8 @@ class WorkerOptions:
     A launcher that knows its own root states it — cozy-creator passes its local root, a
     pod's provisioner passes the media subtree its co-resident server owns — and the
     Authorizer refuses a grant outside every one of them. Empty declares no fence."""
-    environment_root: Path | None = None
-    """The materializer root whose receipt refs select content-keyed immutable package venvs.
+    install_root: Path | None = None
+    """The immutable install root whose receipt refs select content-keyed package venvs.
 
     The provisioner/local installer chooses storage; the worker receives that path and owns
     no retention or GC policy.  Absent means no already-materialized generation is selectable.
@@ -1433,7 +1433,7 @@ class Worker:
                 return package_prepare.check_package_set_compatibility(
                     request,
                     tensorfs_root=Path(self.options.tensorfs_root or ""),
-                    environment_root=Path(self.options.environment_root or ""),
+                    install_root=Path(self.options.install_root or ""),
                     python=Path(self.options.python or sys.executable),
                     base=self.base,
                     native_environment=self.native_environment(),
@@ -1617,7 +1617,7 @@ class Worker:
             result = package_prepare.prepare_local_package(
                 request,
                 artifact_cache=Path(self.options.artifact_cache or ""),
-                environment_root=Path(self.options.environment_root or ""),
+                install_root=Path(self.options.install_root or ""),
                 python=Path(self.options.python or sys.executable),
                 describe=describe,
                 verified=mark_verified,
@@ -1666,7 +1666,7 @@ class Worker:
             request,
             artifact_cache=Path(self.options.artifact_cache or ""),
             tensorfs_root=Path(self.options.tensorfs_root or ""),
-            environment_root=Path(self.options.environment_root or ""),
+            install_root=Path(self.options.install_root or ""),
             python=Path(self.options.python or sys.executable),
             describe=describe,
             verified=mark_verified,
@@ -3290,7 +3290,7 @@ class Worker:
         else:
             prepared_environment = None
         if (
-            self.options.environment_root is None and self.options.environment_python is None
+            self.options.install_root is None and self.options.environment_python is None
         ) or self.options.tensorfs_root is None:
             self._materialization_failed(
                 placement,
@@ -3298,7 +3298,7 @@ class Worker:
                     kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                     subject=placement.placement_id,
                     reason="environment_materialization_input_missing",
-                    detail="this worker was launched without --environment-root or "
+                    detail="this worker was launched without --install-root or "
                     "--environment-python and --tensorfs-root; the worker will not "
                     "guess where the worker put package environments or TensorFS objects",
                 ),
@@ -3353,14 +3353,14 @@ class Worker:
                 installed_environment = package_environment.open_existing_environment(
                     self.options.environment_python, content_digest
                 )
-            environment_root = self.options.environment_root or (
+            install_root = self.options.install_root or (
                 installed_environment.generation if installed_environment is not None else None
             )
-            assert environment_root is not None
+            assert install_root is not None
             acquirer = acquire.Acquirer(
                 downloads.DownloadPlan(),
                 cache_root=self.options.artifact_cache,
-                environment_root=environment_root,
+                install_root=install_root,
                 selection_root=self.options.artifact_cache / "selections",
                 tensorfs_root=self.options.tensorfs_root,
                 python=self.options.environment_python or Path(sys.executable),
@@ -3995,7 +3995,7 @@ class Worker:
         # cannot depend on one argv translation surviving every launch layer. A real pod
         # proved why: its model prepared successfully, then a synthetic warm handler blocked
         # forever in its first CUDA scalar read and kept the placement ACTIVATING.
-        if self.options.environment_root is not None:
+        if self.options.install_root is not None:
             self.note(
                 "warm",
                 "dynamic placement worker: boot warm pass disabled; package execution "
@@ -5249,9 +5249,9 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         help="comma-separated directory trees a file:// grant may address (#506b)",
     )
     parser.add_argument(
-        "--environment-root",
+        "--install-root",
         default="",
-        help="package-environment root containing exact receipts and content-keyed generations",
+        help="immutable install root containing exact receipts and content-keyed generations",
     )
     parser.add_argument(
         "--environment-python",
@@ -5283,9 +5283,9 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-key", default="", help="PEM key for a non-loopback listener")
     args = parser.parse_args(argv)
 
-    if args.environment_root and args.environment_python:
+    if args.install_root and args.environment_python:
         print(
-            "[worker] --environment-root and --environment-python are mutually exclusive",
+            "[worker] --install-root and --environment-python are mutually exclusive",
             file=sys.stderr,
             flush=True,
         )
@@ -5340,7 +5340,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         accelerator_backend=args.accelerator_backend,
         devices=args.devices,
         grant_roots=tuple(r for r in args.grant_root.split(",") if r),
-        environment_root=Path(args.environment_root).resolve() if args.environment_root else None,
+        install_root=Path(args.install_root).resolve() if args.install_root else None,
         environment_python=(
             Path(args.environment_python).expanduser().parent.resolve()
             / Path(args.environment_python).name
