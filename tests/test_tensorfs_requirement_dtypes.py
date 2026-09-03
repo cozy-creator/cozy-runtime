@@ -7,7 +7,8 @@ import base64
 import pytest
 import tensorfs
 
-from cozy_runtime.internal.fill import tensorfs_dtype_name, tensorfs_requirement_dtype
+from cozy_runtime.author._loader import canonical_dtype
+from cozy_runtime.internal.fill import tensorfs_requirement_dtype
 
 HEADERS = {
     "f32": base64.b64decode(
@@ -33,7 +34,7 @@ HEADERS = {
 def test_torch_names_fit_tensorfs_03_headers(
     torch_spelling: str, stored: str, constraint: str | None
 ) -> None:
-    assert tensorfs_dtype_name(torch_spelling) == stored
+    assert canonical_dtype(torch_spelling) == stored
     assert tensorfs_requirement_dtype(torch_spelling) == constraint
     verdict = tensorfs.fit(
         [tensorfs.TensorRequirement("unet", "weight", [1], constraint)],

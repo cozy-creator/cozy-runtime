@@ -63,7 +63,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, census
+from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, canonical_dtype, census
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
@@ -2369,21 +2369,15 @@ def dtype_name(dtype: object) -> str:
     return TORCH_DTYPES.get(name, name)
 
 
-def tensorfs_dtype_name(dtype: object) -> str:
-    """Normalize a Torch or TensorFS spelling into TensorFS's closed dtype namespace."""
-
-    name = str(getattr(dtype, "name", dtype)).removeprefix("torch.")
-    if name in TORCH_DTYPES:
-        return name
-    return next((stored for stored, torch in TORCH_DTYPES.items() if torch == name), name)
-
-
 def tensorfs_requirement_dtype(dtype: object | None) -> str | None:
-    """Constraint spelling for TensorFS fit; ordinary bf16/f16 remain convertible."""
+    """Constraint spelling for TensorFS fit; ordinary bf16/f16 remain convertible.
+
+    `canonical_dtype` also covers a census derived by an OLDER runtime inside the package
+    environment, whose wire rows still spell torch names — the boundary canonicalizes."""
 
     if dtype is None:
         return None
-    name = tensorfs_dtype_name(dtype)
+    name = canonical_dtype(dtype)
     return None if name in ("bf16", "f16") else name
 
 

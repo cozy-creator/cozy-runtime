@@ -85,10 +85,43 @@ class Destination:
     spec: TensorSpec
 
 
+#: TensorFS dtype name -> torch dtype name. This is the ONE thing the store cannot own: it
+#: is a fact about torch, and TensorFS has no business knowing torch exists. It lives HERE
+#: because the census is where a torch dtype first becomes a runtime fact, and the author
+#: surface may import nothing deeper; the encoding planes re-export it. The store still owns
+#: the set of names and their widths, so this map is CHECKED against `tensorfs.DTYPES` by
+#: the fill plane rather than trusted — a name the store knows and this map does not is a
+#: refusal, not a silent passthrough that would land the wrong bytes.
+TORCH_DTYPES: dict[str, str] = {
+    "f16": "float16",
+    "bf16": "bfloat16",
+    "f32": "float32",
+    "f64": "float64",
+    "f8_e4m3fn": "float8_e4m3fn",
+    "f8_e5m2": "float8_e5m2",
+    "i64": "int64",
+    "i32": "int32",
+    "i16": "int16",
+    "i8": "int8",
+    "u8": "uint8",
+    "bool": "bool",
+}
+
+_CANONICAL_DTYPES = {torch_name: name for name, torch_name in TORCH_DTYPES.items()}
+
+
+def canonical_dtype(spelling: object) -> str:
+    """Any spelling of a dtype — `torch.bfloat16`, `"bfloat16"`, `"bf16"` — into TensorFS's
+    closed dtype namespace. THE one canonicalization: every census row and every dtype that
+    crosses toward TensorFS is spelled through here, so the fit/census documents carry only
+    closed-enum tokens. An unknown name passes through for the fill plane to refuse."""
+
+    name = str(getattr(spelling, "name", spelling)).removeprefix("torch.")
+    return name if name in TORCH_DTYPES else _CANONICAL_DTYPES.get(name, name)
+
+
 def _dtype_of(tensor: TensorLike) -> str:
-    dtype = tensor.dtype
-    name = getattr(dtype, "name", None)
-    return str(name if isinstance(name, str) else dtype).removeprefix("torch.")
+    return canonical_dtype(tensor.dtype)
 
 
 # --------------------------------------------------------------------------- config

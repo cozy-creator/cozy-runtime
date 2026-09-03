@@ -49,6 +49,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from cozy_runtime.author._loader import TORCH_DTYPES as _TORCH_DTYPES
+
 #: This module's own refusal codes, added to cr-005's matrix. Closed, like that one.
 REFUSALS = frozenset(
     {
@@ -182,29 +184,12 @@ SPEC_VECTORS: dict[str, tuple[str, str]] = {
 }
 
 
-#: TensorFS dtype name -> torch dtype name. This is the ONE thing the store cannot own: it
-#: is a fact about torch, and TensorFS has no business knowing torch exists. What the store
-#: DOES own is the set of names and their widths, so this map is CHECKED against
-#: `tensorfs.DTYPES` by the fill plane rather than trusted — a name the store knows and this
-#: map does not is a refusal, not a silent passthrough that would land the wrong bytes.
-#:
-#: It lives HERE since #549.10 because three planes need it and two of them are not the fill
-#: plane: `probe.py` builds role tensors out of the vendored spec vectors, and the vector
-#: documents themselves are written in TensorFS dtype names.
-TORCH_DTYPES: dict[str, str] = {
-    "f16": "float16",
-    "bf16": "bfloat16",
-    "f32": "float32",
-    "f64": "float64",
-    "f8_e4m3fn": "float8_e4m3fn",
-    "f8_e5m2": "float8_e5m2",
-    "i64": "int64",
-    "i32": "int32",
-    "i16": "int16",
-    "i8": "int8",
-    "u8": "uint8",
-    "bool": "bool",
-}
+#: TensorFS dtype name -> torch dtype name. Owned by `author/_loader.py` since cr-087 —
+#: the census is where a torch dtype first becomes a runtime fact and the author surface
+#: may import nothing deeper — and re-exported here for the planes #549.10 named: the fill
+#: plane, `probe.py`'s role tensors, and the vendored vector documents, all of which read
+#: TensorFS dtype names.
+TORCH_DTYPES = _TORCH_DTYPES
 
 
 # --------------------------------------------------------------------------- the parts
