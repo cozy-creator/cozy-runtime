@@ -64,6 +64,7 @@ from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker import (
     acquire,
+    activity,
     child,
     downloads,
     grants,
@@ -279,6 +280,13 @@ class WorkerOptions:
     """The uid/gid each committed bundle is handed to — the pod media plane's, so a plane
     that runs as its own uid can open a file the root worker wrote. Absent keeps the
     writer's identity."""
+    activity_path: Path | None = None
+    """Where the reporter publishes what this worker is doing, for the pod supervisor that
+    exec'd it (`worker/activity.py`). Absent — every local worker — publishes nothing:
+    there is no second process holding a rental open."""
+    activity_owner: tuple[int, int] | None = None
+    """The uid/gid each published activity file is handed to, the same handoff the readiness
+    receipt makes. Absent keeps the writer's identity."""
 
 
 @dataclass(slots=True)
@@ -1069,6 +1077,20 @@ class Worker:
         self.supervision.on_exit = self.executor_exited
         self.supervision.on_lane_failure = self.fail_machine
         self.connected = threading.Event()
+        #: The `control_stream_epoch` of every accepted RecordOwner stream being served right
+        #: now. `connected` is narrower — it opens only at SnapshotAck — and a claim that has
+        #: been accepted but not yet acked is still an owner holding this pod, which is the
+        #: fact the supervisor's release decision rests on.
+        self.attached_streams: set[int] = set()
+        #: What this worker is doing, for the pod supervisor that outlives it. Absent off a
+        #: pod: there is no second process there to publish to. (`self.activity` above is
+        #: the narration lane the ObservedWorkerState tick carries — a different thing under
+        #: a near name, and neither reads the other.)
+        self.activity_file = (
+            activity.ActivityFile(options.activity_path, owner=options.activity_owner)
+            if options.activity_path is not None
+            else None
+        )
         self.exit_code: int = int(Exit.ok)
         self.boot_at = time.perf_counter()
         self.warm: list[dict[str, Any]] = []
@@ -2135,6 +2157,7 @@ class Worker:
                 self.shutdown_from_stream()
                 return
             self._send_claim_ack(claim, epoch, send)
+            self.attached_streams.add(epoch)
 
         sender = threading.Thread(
             target=self._lane("control-send", self._pump_outbound, epoch, send, outbound),
@@ -2155,6 +2178,9 @@ class Worker:
             # off the record to find out which key it was about.
             self.note("session", f"the control stream ended: {type(exc).__name__}: {exc}")
         finally:
+            # Unconditional: a SUPERSEDED stream is gone too, and leaving its epoch here
+            # would report an owner that has been fenced out as still holding the pod.
+            self.attached_streams.discard(epoch)
             if self.fence.control_stream_epoch == epoch:
                 self.connected.clear()
                 self.fence.dispatch_open = False
@@ -4884,8 +4910,27 @@ class Worker:
         while not self.stop.wait(REPORT_SECONDS):
             for subject in list(self.monitor.cursors):
                 self.monitor.sample(subject)
+            self.publish_activity()
             if self.connected.is_set():
                 self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+
+    def publish_activity(self) -> None:
+        """Tell the pod supervisor what this worker is doing (`worker/activity.py`).
+
+        It rides the reporter for one reason: a tick that does not happen is the evidence
+        the supervisor needs. A failure to write is NOTED and never raised — the reporter
+        lane dying would silence the file permanently, and a silent file reads as a wedge.
+        """
+        if self.activity_file is None:
+            return
+        try:
+            self.activity_file.publish(
+                owner_attached=bool(self.attached_streams),
+                attempts_in_flight=self.engine.in_flight(),
+                meter=activity.meter(self),
+            )
+        except OSError as exc:
+            self.note("activity", f"the supervisor's activity file was not written: {exc}")
 
     def observed_state(self) -> pb.ObservedWorkerState:
         """The observed half of the pair (§8; was `Report`).

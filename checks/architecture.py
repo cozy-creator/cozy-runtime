@@ -680,6 +680,7 @@ def fence_one_attempt_kernel() -> list[str]:
 #: incapable of changing what is resident, where it sits, or what a method may touch.
 OBSERVATION_MODULES = (
     "author/_observations.py",
+    "internal/worker/activity.py",
     "internal/worker/observe.py",
     "internal/worker/triage.py",
 )

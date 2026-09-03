@@ -2772,3 +2772,8 @@ class AttemptEngine:
         and the wire has no state for "held, not yet admitted".
         """
         return [self._active_row(a) for a in self.history.values() if a.state in self.HELD]
+
+    def in_flight(self) -> int:
+        """How many attempts this worker holds — `active()`'s set, counted without building
+        its rows. It is what the pod supervisor's release decision reads, every tick."""
+        return sum(1 for a in self.history.values() if a.state in self.HELD)
