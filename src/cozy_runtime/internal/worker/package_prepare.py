@@ -57,7 +57,14 @@ def prepare_package_set(
     native_environment: Mapping[str, str] | None = None,
     native_device_index: int = 0,
 ) -> pb.PreparePackageSetResult:
-    """Parse one signed delegation, then use the shared package preparation path."""
+    """Parse one signed delegation plus the request's release facts (wire 30) and prepare.
+
+    The request carries everything the interface used to be opened for — `application` and
+    the interface-declared model-slot paths — plus the placed image's pinned inventory and
+    the release's exact locked-requirements export. No file rides the wire: wheels come from
+    the export's indexes under its own hashes, the interface is derived from the installed
+    environment, and model manifests resolve from the local TensorFS Store.
+    """
 
     if (
         Path(request.environment_root) != environment_root
@@ -84,30 +91,20 @@ def prepare_package_set(
         raise PreparationRefusal("package_prepare_delegation_invalid", "package row")
     package_name = str(selected.get("package", ""))
     release = str(selected.get("release", ""))
-    published_interface, set_directory = _published_interface(
-        request.files,
-        artifact_cache=artifact_cache,
-    )
-    inventory_raw = _read_beside(
-        set_directory / image_inventory.INVENTORY_FILENAME,
-        "package_prepare_image_inventory_missing",
-    )
-    try:
-        inventory = image_inventory.read_bytes(inventory_raw)
-    except image_inventory.ImageInventoryRefusal as exc:
-        raise PreparationRefusal("package_prepare_image_inventory_invalid", exc.detail) from exc
-
-    return prepare_package(
+    application, slot_paths, inventory, locked = _request_facts(request, models)
+    return _prepare_published(
         package_name=package_name,
         release=release,
-        published_interface=published_interface,
-        files=request.files,
+        application=application,
+        model_slot_paths=slot_paths,
+        inventory=inventory,
+        locked=locked,
+        models=models,
         placement_seed=placement_identity(
             package_name, release, str(selected.get("release_digest", "")), models
         ),
         artifact_cache=artifact_cache,
         artifact_store=artifact_store,
-        models=models,
         environment_root=environment_root,
         python=python,
         describe=describe,
@@ -116,14 +113,264 @@ def prepare_package_set(
         base=base,
         native_environment=native_environment,
         native_device_index=native_device_index,
-        inventory=inventory,
+    )
+
+
+def prepare_published_local(
+    *,
+    package_name: str,
+    release: str,
+    locked: package_environment.LockedRequirements,
+    models: Sequence[Any],
+    placement_seed: bytes,
+    artifact_cache: Path,
+    artifact_store: Path,
+    environment_root: Path,
+    python: Path,
+    describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
+    installed_environment: package_environment.InstalledEnvironment,
+    job_plan_root: Path | None = None,
+) -> pb.PreparePackageSetResult:
+    """Creator's local published preparation over its already-materialized locked venv.
+
+    The two facts are adopted from the derived interface — Creator compares that derivation
+    against the committed release itself — and no image inventory exists locally.
+    """
+
+    return _prepare_published(
+        package_name=package_name,
+        release=release,
+        application=None,
+        model_slot_paths=None,
+        inventory=None,
+        locked=locked,
+        models=models,
+        placement_seed=placement_seed,
+        artifact_cache=artifact_cache,
+        artifact_store=artifact_store,
+        environment_root=environment_root,
+        python=python,
+        describe=describe,
+        verified=lambda _digest, _length, _path: None,
+        job_plan_root=job_plan_root,
+        base=None,
+        installed_environment=installed_environment,
+    )
+
+
+def _request_facts(
+    request: pb.PreparePackageSetRequest, models: Sequence[Any]
+) -> tuple[str, tuple[str, ...], image_inventory.Inventory, package_environment.LockedRequirements]:
+    """Admit the wire-30 release facts: the two facts, the inventory, and the lock."""
+
+    application = request.application
+    if not application or _printable(application) != application or len(application) > 256:
+        raise PreparationRefusal("package_prepare_application_invalid", application[:64])
+    slot_paths = tuple(request.model_slot_paths)
+    if (
+        len(slot_paths) > 256
+        or list(slot_paths) != sorted(set(slot_paths))
+        or any(not path or _printable(path) != path or len(path) > 512 for path in slot_paths)
+    ):
+        raise PreparationRefusal("package_prepare_model_slot_paths_invalid", str(len(slot_paths)))
+    for row in models:
+        slot = str(row.get("slot", "")) if isinstance(row, Mapping) else ""
+        if slot not in slot_paths:
+            raise PreparationRefusal("package_prepare_model_slot_unknown", slot)
+    if not request.HasField("image_inventory"):
+        raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
+    try:
+        inventory = image_inventory.from_wire(
+            request.image_inventory.profile,
+            request.image_inventory.python,
+            request.image_inventory.distributions,
+        )
+    except image_inventory.ImageInventoryRefusal as exc:
+        raise PreparationRefusal("package_prepare_image_inventory_invalid", exc.detail) from exc
+    try:
+        locked = package_environment.read_locked_requirements(bytes(request.locked_requirements))
+    except package_environment.EnvironmentRefusal as exc:
+        raise PreparationRefusal("package_prepare_locked_requirements_invalid", exc.detail) from exc
+    return application, slot_paths, inventory, locked
+
+
+def _filtered_rows(
+    package_name: str,
+    release: str,
+    locked: package_environment.LockedRequirements,
+    inventory: image_inventory.Inventory,
+) -> list[package_environment.LockedRow]:
+    """The export minus image-inventory-owned names (cr-070): an inventory-owned NAME is
+    served by the image's site-packages copy and never enters the venv from the lock. The
+    package's own pin must be present — it is what the org index install actually installs."""
+
+    expected = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
+    projects = [row for row in locked.rows if row.name == expected]
+    if len(projects) != 1 or projects[0].version != release:
+        raise PreparationRefusal(
+            "package_prepare_project_pin_missing",
+            f"the export must pin {expected}=={release} exactly once",
+        )
+    install_rows: list[package_environment.LockedRow] = []
+    served: dict[str, str] = {}
+    for row in locked.rows:
+        if row.name != expected and row.name in inventory.versions:
+            served[row.name] = row.version
+            continue
+        install_rows.append(row)
+    if served:
+        listed = ", ".join(
+            f"{name} (image {inventory.versions[name]} over lock {version})"
+            for name, version in sorted(served.items())
+        )
+        print(f"[package-prepare] image inventory serves {listed}", flush=True)
+    return install_rows
+
+
+def _prepare_published(
+    *,
+    package_name: str,
+    release: str,
+    application: str | None,
+    model_slot_paths: tuple[str, ...] | None,
+    inventory: image_inventory.Inventory | None,
+    locked: package_environment.LockedRequirements,
+    models: Sequence[Any],
+    placement_seed: bytes,
+    artifact_cache: Path,
+    artifact_store: Path | None,
+    environment_root: Path,
+    python: Path,
+    describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
+    verified: Callable[[str, int, Path], None],
+    job_plan_root: Path | None,
+    base: base_observation.Observation | None,
+    native_environment: Mapping[str, str] | None = None,
+    native_device_index: int = 0,
+    installed_environment: package_environment.InstalledEnvironment | None = None,
+) -> pb.PreparePackageSetResult:
+    """Install from the exact export, derive the interface, and author the PlacementSet.
+
+    On the wire path the request's two facts cross-check the derived interface and the
+    image inventory filters the export. On the local path (`installed_environment`) the
+    venv already exists from the same export and Creator compares the derived interface
+    against the committed release itself, so the facts are adopted from the derivation.
+    """
+
+    environment = pb.Environment(
+        locked_requirements=pb.Ref(digest=documents.raw(locked.digest), length=locked.length)
+    )
+    environment_body = documents.body(environment)
+    environment_digest = documents.spell(
+        documents.embedded_document_digest(environment_body, "cozy.worker.v1.Environment")
+    )
+    if installed_environment is not None:
+        installed = installed_environment
+    else:
+        if inventory is None:
+            raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
+        try:
+            observed_base = base or package_environment.observe_base(python)
+        except package_environment.EnvironmentRefusal as exc:
+            raise PreparationRefusal(exc.code, exc.detail) from exc
+        lie = image_inventory.disagreement(inventory, observed_base.distribution_versions)
+        if lie is not None:
+            raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
+        install_rows = _filtered_rows(package_name, release, locked, inventory)
+        try:
+            installed = package_environment.materialize_locked(
+                locked,
+                install_rows,
+                environment_root,
+                environment_digest=environment_digest,
+                python=python,
+                base=observed_base,
+                native_environment=native_environment,
+                native_device_index=native_device_index,
+            )
+        except package_environment.EnvironmentRefusal as exc:
+            raise PreparationRefusal(exc.code, exc.detail) from exc
+
+    expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
+    interface_raw = describe(installed, expected_distribution)
+    try:
+        interface_body = package_interface.read_bytes(interface_raw, "derived package interface")
+    except package_interface.StalePackageInterface as exc:
+        raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
+    derived_application = str(interface_body.get("application", ""))
+    if application is not None and derived_application != application:
+        raise PreparationRefusal(
+            "package_prepare_application_disagrees",
+            f"request {application!r} != derived {derived_application!r}",
+        )
+    application = derived_application
+    declared = {
+        str(model.get("path", ""))
+        for entrypoint in interface_body.get("entrypoints", [])
+        if isinstance(entrypoint, dict)
+        for model in entrypoint.get("models", [])
+        if isinstance(model, dict)
+    }
+    if model_slot_paths is not None and declared != set(model_slot_paths):
+        raise PreparationRefusal(
+            "package_prepare_model_slots_disagree",
+            f"request={sorted(model_slot_paths)} derived={sorted(declared)}",
+        )
+    interface_ref = _stage(artifact_cache, interface_raw)
+    jobs = _stage_job_plans(
+        interface_body,
+        root=job_plan_root,
+        build_id=environment_digest,
+        interface_path=artifact_cache / interface_ref[0].removeprefix("sha256:"),
+        installed=installed,
+    )
+    selected_models, entrypoints = _entrypoints(
+        interface_body,
+        package_name=package_name,
+        selections=models,
+        artifact_store=artifact_store,
+        verified=verified,
+        derive=_deriver(installed, application),
+    )
+    if not entrypoints and not jobs:
+        raise PreparationRefusal(
+            "package_prepare_callable_absent",
+            "package has no runnable serving or weightless job callable",
+        )
+    entrypoint_bodies = [documents.body(row) for row in entrypoints]
+    bindings_digest = documents.digest_of(
+        canonical.write(
+            {
+                "entrypoints": entrypoint_bodies,
+                "models": [documents.body(model) for model in selected_models],
+            }
+        )
+    )
+    placement = pb.Placement(
+        placement_id="package-" + hashlib.sha256(placement_seed).hexdigest()[:24],
+        package=pb.PackageSelection(package=package_name, release=release),
+        environment_digest=documents.raw(environment_digest),
+        package_interface=pb.Ref(digest=documents.raw(interface_ref[0]), length=interface_ref[1]),
+        bindings_digest=bindings_digest,
+        models=selected_models,
+        entrypoints=entrypoints,
+        environment=environment,
+    )
+    placement_bytes = canonical.write(
+        {"format": "cozy.worker.v1.PlacementSet/1", "placements": [documents.body(placement)]}
+    )
+    return pb.PreparePackageSetResult(
+        placement_set=pb.DesiredPlacementSet(
+            placement_set_digest=documents.digest_of(placement_bytes),
+            placement_set_canonical_bytes=placement_bytes,
+        )
     )
 
 
 def check_package_set_compatibility(
     request: pb.PreparePackageSetRequest,
     *,
-    artifact_cache: Path,
+    artifact_store: Path,
     environment_root: Path,
     python: Path,
     base: base_observation.Observation | None = None,
@@ -132,9 +379,11 @@ def check_package_set_compatibility(
 ) -> pb.CheckPackageSetCompatibilityResult:
     """Fit package code against headers while tensor bodies are still downloading.
 
-    This private cold-path check accepts only wheels, PackageInterface, model Manifests,
-    CozyTensors headers, and header-declared model assets. It constructs on CPU/meta, calls
-    TensorFS fit with transient rows, and retains no compatibility artifact.
+    Wire 30: no file rides the request. The environment materializes from the export's own
+    indexes and hashes; the selected manifests, their CozyTensors headers, and the
+    header-declared assets are read from the local TensorFS Store the host already admitted
+    them to — a partial object-set lease, never the full tensor closure. It constructs on
+    CPU/meta, calls TensorFS fit with transient rows, and retains no compatibility artifact.
     """
 
     if Path(request.environment_root) != environment_root or not environment_root.is_absolute():
@@ -157,45 +406,24 @@ def check_package_set_compatibility(
         raise PreparationRefusal("package_prepare_delegation_invalid", "package row")
     package_name = str(selected_package.get("package", ""))
     release = str(selected_package.get("release", ""))
-    interface_raw, set_root = _published_interface(request.files, artifact_cache=artifact_cache)
-    try:
-        interface = package_interface.read_bytes(interface_raw, "compatibility package interface")
-        inventory = image_inventory.read_bytes(
-            _read_beside(
-                set_root / image_inventory.INVENTORY_FILENAME,
-                "package_prepare_image_inventory_missing",
-            )
-        )
-    except package_interface.StalePackageInterface as exc:
-        raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
-    except image_inventory.ImageInventoryRefusal as exc:
-        raise PreparationRefusal("package_prepare_image_inventory_invalid", exc.detail) from exc
+    application, slot_paths, inventory, locked = _request_facts(request, models)
     installed = _compatibility_environment(
-        request.files,
-        set_root=set_root,
         package_name=package_name,
         release=release,
         environment_root=environment_root,
         python=python,
         inventory=inventory,
+        locked=locked,
         base=base,
         native_environment=native_environment,
         native_device_index=native_device_index,
     )
-    candidates = _compatibility_models(request.files, models, set_root=set_root)
-    described = {
-        str(model.get("path", "")): model
-        for entrypoint in interface.get("entrypoints", [])
-        if isinstance(entrypoint, dict)
-        for model in entrypoint.get("models", [])
-        if isinstance(model, dict)
-    }
-    if set(candidates) != set(described):
+    candidates = _compatibility_models(models, artifact_store=artifact_store)
+    if set(candidates) != set(slot_paths):
         raise PreparationRefusal(
             "package_prepare_model_selection_mismatch",
-            f"selected={sorted(candidates)} described={sorted(described)}",
+            f"selected={sorted(candidates)} described={sorted(slot_paths)}",
         )
-    application = str(interface.get("application", ""))
     requests = tuple(
         derive_child.SlotRequest(path, row["config"], row["assets"])
         for path, row in sorted(candidates.items())
@@ -210,7 +438,6 @@ def check_package_set_compatibility(
     tensorfs = fill.tensorfs_module()
     for answer in answers:
         candidate = candidates[answer.slot]
-        declaration = described[answer.slot]
         requirements = [
             tensorfs.TensorRequirement(
                 component=component,
@@ -226,7 +453,11 @@ def check_package_set_compatibility(
                     requirements,
                     candidate["header"],
                     custody="canonical",
-                    encoded_leaves=declaration.get("encoded_leaves", "refuse") == "accept",
+                    # The per-slot encoded_leaves declaration lives in the interface, which
+                    # no longer rides the cold path. Lenient here is the one-sided error:
+                    # a header the interface would refuse fails at real preparation, while
+                    # a strict default would falsely cancel valid downloads.
+                    encoded_leaves=True,
                 )
             )
         except tensorfs.errors.Refusal as exc:
@@ -243,14 +474,13 @@ def check_package_set_compatibility(
 
 
 def _compatibility_environment(
-    files: Sequence[pb.LocalDownloadFile],
     *,
-    set_root: Path,
     package_name: str,
     release: str,
     environment_root: Path,
     python: Path,
     inventory: image_inventory.Inventory,
+    locked: package_environment.LockedRequirements,
     base: base_observation.Observation | None,
     native_environment: Mapping[str, str] | None = None,
     native_device_index: int = 0,
@@ -262,120 +492,41 @@ def _compatibility_environment(
     lie = image_inventory.disagreement(inventory, observed.distribution_versions)
     if lie is not None:
         raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
-    facts: list[tuple[package_environment.Wheel, Path, package_environment.VerifiedFile]] = []
-    for row in files:
-        if row.kind not in {
-            pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
-            pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
-        }:
-            continue
-        path = Path(row.path)
-        if (
-            path.parent != set_root
-            or path.name != row.filename
-            or path.resolve(strict=True) != path
-        ):
-            raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
-        owner = "project" if row.kind == pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL else "custom"
-        try:
-            wheel, receipt = package_environment.measure_wheel(
-                path, owner, observed, allow_base_owned=owner == "custom"
-            )
-        except package_environment.EnvironmentRefusal as exc:
-            raise PreparationRefusal(exc.code, exc.detail) from exc
-        digest = documents.spell(bytes(row.digest))
-        if wheel.digest != digest or wheel.length != row.length:
-            raise PreparationRefusal("package_prepare_file_identity_mismatch", row.filename)
-        if owner == "project" and not wheel.import_roots:
-            raise PreparationRefusal(
-                "package_prepare_project_wheel_no_import_roots",
-                f"{row.filename} installs no importable module",
-            )
-        if owner == "custom" and (
-            package_environment.base_owned_wheel(wheel, observed)
-            or wheel.distribution in inventory.versions
-        ):
-            continue
-        facts.append((wheel, path, receipt))
-    projects = [item for item in facts if item[0].owner == "project"]
-    if len(projects) != 1:
-        raise PreparationRefusal("package_prepare_project_wheel_count", str(len(projects)))
-    project = projects[0][0]
-    expected = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
-    if project.distribution != expected or project.version != release:
-        raise PreparationRefusal("package_prepare_project_wheel_mismatch", project.filename)
-    dependencies = sorted(
-        (wheel for wheel, _path, _receipt in facts if wheel.owner == "custom"),
-        key=lambda wheel: wheel.distribution,
+    install_rows = _filtered_rows(package_name, release, locked, inventory)
+    environment = pb.Environment(
+        locked_requirements=pb.Ref(digest=documents.raw(locked.digest), length=locked.length)
     )
-    environment = pb.Environment(wheels=[_wheel_fact(wheel) for wheel in dependencies])
-    environment_body = documents.body(environment)
     environment_digest = documents.spell(
-        documents.embedded_document_digest(environment_body, "cozy.worker.v1.Environment")
-    )
-    package = pb.PackageSelection(
-        package=package_name,
-        release=release,
-        project_wheel=_wheel_fact(project),
+        documents.embedded_document_digest(
+            documents.body(environment), "cozy.worker.v1.Environment"
+        )
     )
     try:
-        source = placement_materialization.package_environment_input(
-            package=documents.body(package),
-            environment=environment_body,
-            environment_digest=environment_digest,
-            wheel_paths={wheel.digest: path for wheel, path, _receipt in facts},
-            verified_wheels={wheel.digest: receipt for wheel, _path, receipt in facts},
-        )
-        return package_environment.materialize(
-            source,
+        return package_environment.materialize_locked(
+            locked,
+            install_rows,
             environment_root,
+            environment_digest=environment_digest,
             python=python,
             base=observed,
             native_environment=native_environment,
             native_device_index=native_device_index,
         )
-    except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
-        raise PreparationRefusal(
-            str(getattr(exc, "code", "package_environment_install_failed")),
-            str(getattr(exc, "detail", type(exc).__name__)),
-        ) from exc
+    except package_environment.EnvironmentRefusal as exc:
+        raise PreparationRefusal(exc.code, exc.detail) from exc
 
 
 def _compatibility_models(
-    files: Sequence[pb.LocalDownloadFile],
     models: Sequence[Any],
     *,
-    set_root: Path,
+    artifact_store: Path,
 ) -> dict[str, dict[str, Any]]:
+    """Read each selected manifest, its CozyTensors header, and the header-declared assets
+    from the local TensorFS Store through one explicit object-set lease — the manifests and
+    small objects the host admits first, never the tensor closure still in flight. An absent
+    manifest or header is a resumable refusal, not a verdict."""
+
     tensorfs = fill.tensorfs_module()
-    manifests: dict[str, tuple[int, Path]] = {}
-    objects: dict[str, tuple[int, Path]] = {}
-    for row in files:
-        if row.kind not in {
-            pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
-            pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
-        }:
-            continue
-        path = Path(row.path)
-        if (
-            path.parent != set_root
-            or path.name != row.filename
-            or path.resolve(strict=True) != path
-        ):
-            raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
-        digest = documents.spell(bytes(row.digest))
-        raw = _read_file(
-            path,
-            int(tensorfs.manifest_max_bytes())
-            if row.kind == pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST
-            else MAX_FILE_BYTES,
-        )
-        if len(raw) != row.length or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
-            raise PreparationRefusal("package_prepare_file_identity_mismatch", row.filename)
-        target = manifests if row.kind == pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST else objects
-        if digest in target:
-            raise PreparationRefusal("package_prepare_file_invalid", row.filename)
-        target[digest] = (row.length, path)
     selections: dict[str, dict[str, Any]] = {}
     wanted_manifests: set[str] = set()
     for value in models:
@@ -397,64 +548,63 @@ def _compatibility_models(
             raise PreparationRefusal("package_prepare_model_selection_mismatch", slot or model)
         wanted_manifests.add(manifest)
         selections[slot] = {
+            "selection": value,
             "manifest": manifest,
             "model": model,
             "release": release,
             "lane": lane,
         }
-    if set(manifests) != wanted_manifests:
-        raise PreparationRefusal(
-            "package_prepare_model_manifest_set_mismatch",
-            f"wanted={sorted(wanted_manifests)} got={sorted(manifests)}",
-        )
-    required_objects: set[str] = set()
     by_manifest: dict[str, dict[str, Any]] = {}
-    for digest, (_length, path) in manifests.items():
-        manifest_raw = path.read_bytes()
+    try:
+        store = pull.open_store(tensorfs, artifact_store)
+    except pull.PullRefusal as exc:
+        raise PreparationRefusal("package_prepare_model_store_absent", str(exc)) from exc
+    for digest in sorted(wanted_manifests):
         try:
+            held = store.manifest(digest)
+            manifest_raw = bytes(held["manifest"])
             header_digest, header_length = acquire.cozytensors_ref(tensorfs, manifest_raw)
-            header_row = objects.get(header_digest)
-            if header_row is None or header_row[0] != header_length:
-                raise ValueError(f"missing header {header_digest}/{header_length}")
-            header_raw = header_row[1].read_bytes()
+            header_raw = bytes(held["header"])
+            if (
+                len(header_raw) != header_length
+                or "sha256:" + hashlib.sha256(header_raw).hexdigest() != header_digest
+            ):
+                raise ValueError(f"held header does not match {header_digest}")
             header = tensorfs.parse_header(header_raw)
             config = model_config.construction_config(header.get("configs"))
+        except PreparationRefusal:
+            raise
         except Exception as exc:
             raise PreparationRefusal(
-                "package_prepare_model_header_invalid", f"{digest}: {type(exc).__name__}: {exc}"
+                "package_prepare_model_header_unavailable",
+                f"{digest}: {type(exc).__name__}: {exc}",
             ) from exc
-        required_objects.add(header_digest)
         assets: dict[str, bytes] = {}
-        for name, asset in sorted(header.get("assets", {}).items()):
-            if not isinstance(asset, dict):
-                raise PreparationRefusal("package_prepare_model_header_invalid", f"{digest}: asset")
-            chunks: list[bytes] = []
-            for segment in asset.get("segments", []):
-                segment_digest = "sha256:" + str(segment.get("sha256", ""))
-                segment_length = int(segment.get("length", 0))
-                segment_row = objects.get(segment_digest)
-                if segment_row is None or segment_row[0] != segment_length:
-                    raise PreparationRefusal(
-                        "package_prepare_model_object_set_mismatch", segment_digest
-                    )
-                required_objects.add(segment_digest)
-                chunks.append(segment_row[1].read_bytes())
-            raw = b"".join(chunks)
-            if (
-                len(raw) != int(asset.get("logical_length", 0))
-                or hashlib.sha256(raw).hexdigest() != str(asset.get("logical_sha256", ""))
-                or len(raw) > 64 << 20
-            ):
+        asset_names = sorted(str(name) for name in header.get("assets", {}))
+        if asset_names:
+            try:
+                segments: list[tuple[str, int]] = [(header_digest, header_length)]
+                for name in asset_names:
+                    asset = header["assets"][name]
+                    for segment in asset.get("segments", []):
+                        segments.append(
+                            (
+                                "sha256:" + str(segment.get("sha256", "")),
+                                int(segment.get("length", 0)),
+                            )
+                        )
+                lease = store.acquire(digest, sorted(set(segments)))
+                try:
+                    for name in asset_names:
+                        assets[name] = bytes(lease.read_asset(header_raw, name, max_bytes=64 << 20))
+                finally:
+                    lease.release()
+            except Exception as exc:
                 raise PreparationRefusal(
-                    "package_prepare_model_asset_mismatch", f"{digest}: {name}"
-                )
-            assets[str(name)] = raw
+                    "package_prepare_model_asset_unavailable",
+                    f"{digest}: {type(exc).__name__}: {exc}",
+                ) from exc
         by_manifest[digest] = {"header": header_raw, "config": config, "assets": assets}
-    if set(objects) != required_objects:
-        raise PreparationRefusal(
-            "package_prepare_model_object_set_mismatch",
-            f"wanted={sorted(required_objects)} got={sorted(objects)}",
-        )
     for selected in selections.values():
         selected.update(by_manifest[selected["manifest"]])
     return selections
@@ -491,52 +641,6 @@ def placement_identity(
     )
 
 
-def _published_interface(
-    files: Sequence[pb.LocalDownloadFile],
-    *,
-    artifact_cache: Path,
-) -> tuple[bytes, Path]:
-    """Read the exact PackageInterface staged beside ordinary verified package files."""
-    rows = [row for row in files if row.kind == pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE]
-    if len(rows) != 1:
-        raise PreparationRefusal("package_prepare_interface_count", str(len(rows)))
-    row = rows[0]
-    path = Path(row.path)
-    parent = path.parent.parent
-    if (
-        len(row.digest) != 32
-        or not 0 < row.length <= canonical.DOC_MAX_BYTES
-        or not path.is_absolute()
-        or row.filename != package_interface.FILENAME
-        or path != parent / package_interface.FILENAME
-        or not parent.is_relative_to(artifact_cache / "sets")
-        or path.resolve() != path
-    ):
-        raise PreparationRefusal("package_prepare_interface_ref_invalid", row.filename)
-    raw = _read_beside(path, "package_prepare_published_interface_invalid")
-    digest = documents.spell(bytes(row.digest))
-    if len(raw) != row.length or documents.spell(hashlib.sha256(raw).digest()) != digest:
-        raise PreparationRefusal(
-            "package_prepare_published_interface_invalid",
-            "staged package-interface bytes do not match its exact file row",
-        )
-    try:
-        package_interface.read_bytes(raw, "published package interface")
-    except package_interface.StalePackageInterface as exc:
-        raise PreparationRefusal("package_prepare_published_interface_invalid", str(exc)) from exc
-    return raw, parent
-
-
-def _read_beside(path: Path, refusal: str) -> bytes:
-    try:
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= canonical.DOC_MAX_BYTES:
-            raise PreparationRefusal(refusal, str(path))
-        return path.read_bytes()
-    except OSError as exc:
-        raise PreparationRefusal(refusal, f"{path}: {type(exc).__name__}") from exc
-
-
 def prepare_local_package(
     request: pb.PrepareLocalPackageRequest,
     *,
@@ -569,19 +673,10 @@ def prepare_local_package(
         or package.HasField("project_wheel")
     ):
         raise PreparationRefusal("local_package_identity_invalid", request.operation_id)
-    if any(
-        row.kind
-        not in {
-            pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
-            pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
-        }
-        for row in request.files
-    ):
-        raise PreparationRefusal("local_package_file_kind_invalid", request.operation_id)
     return prepare_package(
         package_name=package.package,
         release=package.release,
-        files=request.files,
+        wheels=request.wheels,
         placement_seed=(request.operation_id.encode("ascii") + package.local_revision_digest),
         artifact_cache=artifact_cache,
         environment_root=environment_root,
@@ -638,34 +733,6 @@ def prepare_private_placement(
             "private_placement_delegation_invalid",
             "private model delegation carries no package refs and at most 32 models",
         )
-
-    rows = list(request.files)
-    model_files: dict[str, tuple[int, int, Path]] = {}
-    prior = b""
-    parents: set[Path] = set()
-    for row in rows:
-        path = Path(row.path)
-        if (
-            len(row.digest) != 32
-            or row.digest <= prior
-            or not 0 < row.length <= MAX_FILE_BYTES
-            or row.kind
-            not in {
-                pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
-                pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
-            }
-            or not path.is_absolute()
-            or path.name != row.filename
-            or not path.is_relative_to(artifact_cache / "sets")
-            or path.resolve(strict=True) != path
-        ):
-            raise PreparationRefusal("private_placement_file_invalid", row.filename)
-        prior = bytes(row.digest)
-        parents.add(path.parent)
-        model_files[documents.spell(bytes(row.digest))] = (row.kind, row.length, path)
-    if rows and len(parents) != 1:
-        raise PreparationRefusal("private_placement_file_invalid", "files span package sets")
-
     digest = str(interface_ref["digest"])
     length = int(interface_ref["length"])
     try:
@@ -688,7 +755,6 @@ def prepare_private_placement(
         interface_body,
         package_name=str(development.get("package", "")),
         selections=models,
-        files=model_files,
         artifact_store=artifact_store,
         verified=verified,
         derive=_deriver(installed, str(interface_body.get("application", ""))),
@@ -718,7 +784,7 @@ def prepare_package(
     *,
     package_name: str,
     release: str,
-    files: Sequence[pb.LocalDownloadFile],
+    wheels: Sequence[pb.LocalPackageWheel],
     placement_seed: bytes,
     artifact_cache: Path,
     environment_root: Path,
@@ -726,18 +792,18 @@ def prepare_package(
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
     base: base_observation.Observation | None = None,
-    models: Sequence[Any] = (),
-    artifact_store: Path | None = None,
     job_plan_root: Path | None = None,
     native_environment: Mapping[str, str] | None = None,
     native_device_index: int = 0,
-    installed_environment: package_environment.InstalledEnvironment | None = None,
     development: pb.DevelopmentPackage | None = None,
-    published_interface: bytes | None = None,
-    inventory: image_inventory.Inventory | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
-    """Inspect, install, import, and describe one exact package.
+    """Inspect, install, import, and describe one exact local package revision.
+
+    Wire 30 leaves this the ONE preparation that still receives files: an editable
+    revision's wheels exist on no index, so their exact bytes are the install input
+    (xs-017). The project wheel is the row that MEASURES as the package's own
+    distribution and release — no kind row travels.
 
     `materialized` receives the environment this preparation installed. A local revision's
     wheels are the pod host's carriers, deleted once the PlacementSet is journaled, so the
@@ -751,81 +817,41 @@ def prepare_package(
     so the wheel refuses rather than installs.
     """
 
+    if development is None:
+        raise PreparationRefusal("package_prepare_development_absent", package_name)
     expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     try:
         observed_base = base or package_environment.observe_base(python)
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
-    image_owned: dict[str, str] = {}
-    if inventory is not None:
-        # The delivered inventory is the authority on what the image provides; the live
-        # observation is its cross-check (cr-070). A disagreement falsifies the inventory
-        # rather than silently preparing against an image that is not what was registered.
-        lie = image_inventory.disagreement(inventory, observed_base.distribution_versions)
-        if lie is not None:
-            raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
-        image_owned = inventory.versions
-    rows = list(files)
+    rows = list(wheels)
     if not 1 <= len(rows) <= MAX_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
     facts: list[tuple[package_environment.Wheel, Path, package_environment.VerifiedFile]] = []
-    model_files: dict[str, tuple[int, int, Path]] = {}
-    image_served: dict[str, str] = {}
     prior = b""
     parents: set[Path] = set()
     for row in rows:
         if len(row.digest) != 32 or row.digest <= prior or not 0 < row.length <= MAX_FILE_BYTES:
             raise PreparationRefusal("package_prepare_file_invalid", row.filename)
         prior = bytes(row.digest)
-        if row.kind not in {
-            pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
-            pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
-            pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE,
-            pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
-            pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
-        }:
-            raise PreparationRefusal("package_prepare_file_invalid", row.filename)
         path = Path(row.path)
-        interface_file = row.kind == pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE
-        set_root = path.parent.parent if interface_file else path.parent
         if (
             not path.is_absolute()
-            or (
-                row.filename != package_interface.FILENAME
-                if interface_file
-                else path.name != row.filename
-            )
-            or path != set_root / row.filename
+            or path.name != row.filename
+            or path != path.parent / row.filename
             or not path.is_relative_to(artifact_cache / "sets")
             or path.resolve(strict=True) != path
         ):
             raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
-        parents.add(set_root)
+        parents.add(path.parent)
         digest = documents.spell(bytes(row.digest))
-        if interface_file:
-            if (
-                published_interface is None
-                or row.length != len(published_interface)
-                or digest != "sha256:" + hashlib.sha256(published_interface).hexdigest()
-            ):
-                raise PreparationRefusal(
-                    "package_prepare_published_interface_invalid", row.filename
-                )
-            verified(digest, row.length, path)
-            continue
-        if row.kind in {
-            pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
-            pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
-        }:
-            model_files[digest] = (row.kind, row.length, path)
-            continue
-        owner = "project" if row.kind == pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL else "custom"
+        named = package_environment.wheel_name_version(row.filename)
+        if named is None:
+            raise PreparationRefusal("package_prepare_file_invalid", row.filename)
+        owner = "project" if named == (expected_distribution, release) else "custom"
         try:
             wheel, receipt = package_environment.measure_wheel(
-                path,
-                owner,
-                observed_base,
-                allow_base_owned=installed_environment is not None or owner == "custom",
+                path, owner, observed_base, allow_base_owned=owner == "custom"
             )
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
@@ -836,30 +862,20 @@ def prepare_package(
                 "package_prepare_project_wheel_no_import_roots",
                 f"{row.filename} installs no importable module",
             )
-        if installed_environment is None and owner == "custom":
-            if package_environment.base_owned_wheel(wheel, observed_base):
-                # The supplied wheel proves which protected distribution the frozen package
-                # closure selected; the worker image supplies the executable bytes. The
-                # project and remaining dependency metadata constrain the image version.
-                verified(digest, row.length, path)
-                continue
-            if wheel.distribution in image_owned:
-                # Name-based export-minus-provided (cr-070): an inventory-owned NAME is
-                # served by the image's site-packages copy, so its lock wheel never enters
-                # the venv. Lock pins do not constrain image-owned names on pods; a declared
-                # range the image version cannot satisfy boot-installs during materialize.
-                verified(digest, row.length, path)
-                image_served[wheel.distribution] = wheel.version
-                continue
+        try:
+            base_owned = owner == "custom" and package_environment.base_owned_wheel(
+                wheel, observed_base
+            )
+        except package_environment.EnvironmentRefusal as exc:
+            raise PreparationRefusal(exc.code, exc.detail) from exc
+        if base_owned:
+            # The supplied wheel proves which protected distribution the frozen local
+            # closure selected; this host's base supplies the executable bytes.
+            verified(digest, row.length, path)
+            continue
         facts.append((wheel, path, receipt))
     if len(parents) != 1:
         raise PreparationRefusal("package_prepare_file_path_invalid", "files span package sets")
-    if image_served:
-        served = ", ".join(
-            f"{name} (image {image_owned[name]} over lock {version})"
-            for name, version in sorted(image_served.items())
-        )
-        print(f"[package-prepare] image inventory serves {served}", flush=True)
     projects = [item for item in facts if item[0].owner == "project"]
     if len(projects) != 1:
         raise PreparationRefusal("package_prepare_project_wheel_count", str(len(projects)))
@@ -871,44 +887,31 @@ def prepare_package(
         (wheel for wheel, _path, _receipt in facts if wheel.owner == "custom"),
         key=lambda wheel: wheel.distribution,
     )
-    environment = pb.Environment(wheels=[_wheel_fact(wheel) for wheel in dependency_facts])
+    environment = pb.Environment(local_wheels=[_wheel_fact(wheel) for wheel in dependency_facts])
     environment_body = documents.body(environment)
     environment_digest = documents.spell(
         documents.embedded_document_digest(environment_body, "cozy.worker.v1.Environment")
-    )
-    package = pb.PackageSelection(
-        package=package_name,
-        release=release,
-        project_wheel=_wheel_fact(project),
     )
     wheel_paths = {wheel.digest: path for wheel, path, _receipt in facts}
     receipts = {wheel.digest: receipt for wheel, _path, receipt in facts}
     try:
         source = placement_materialization.package_environment_input(
-            package=documents.body(package),
+            package_name=package_name,
+            release=release,
+            project_wheel=documents.body(_wheel_fact(project)),
             environment=environment_body,
             environment_digest=environment_digest,
             wheel_paths=wheel_paths,
             verified_wheels=receipts,
         )
-        if installed_environment is None:
-            installed = package_environment.materialize(
-                source,
-                environment_root,
-                python=python,
-                base=observed_base,
-                native_environment=native_environment,
-                native_device_index=native_device_index,
-            )
-        else:
-            package_environment.verify_existing_environment(
-                source,
-                base=observed_base,
-                installed=installed_environment,
-                native_environment=native_environment,
-                native_device_index=native_device_index,
-            )
-            installed = installed_environment
+        installed = package_environment.materialize(
+            source,
+            environment_root,
+            python=python,
+            base=observed_base,
+            native_environment=native_environment,
+            native_device_index=native_device_index,
+        )
     except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
         code = getattr(exc, "code", "package_environment_install_failed")
         detail = getattr(exc, "detail", type(exc).__name__)
@@ -918,67 +921,33 @@ def prepare_package(
     if materialized is not None:
         materialized(installed)
 
-    if published_interface is None:
-        interface_raw = describe(installed, project.distribution)
-    else:
-        # The PUBLISHED interface is the authoritative wiring (cr-067). Import-time
-        # enumeration still runs -- it is a free cross-check -- but a disagreement
-        # falsifies the release rather than silently rewiring the pod: refuse, and the
-        # record owner relays the defect (th-106).
-        interface_raw = published_interface
-        derived_raw = describe(installed, project.distribution)
-        if derived_raw != published_interface:
-            raise PreparationRefusal(
-                "package_prepare_interface_disagrees",
-                "published "
-                + documents.spell(hashlib.sha256(published_interface).digest())
-                + " != derived "
-                + documents.spell(hashlib.sha256(derived_raw).digest()),
-            )
+    interface_raw = describe(installed, project.distribution)
     try:
         interface_body = package_interface.read_bytes(interface_raw, "prepared package interface")
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
     interface_ref = _stage(artifact_cache, interface_raw)
-    if development is not None:
-        _verify_local_revision(development, interface_ref, rows)
-    jobs = _stage_job_plans(
+    _verify_local_revision(development, interface_ref, rows)
+    _stage_job_plans(
         interface_body,
         root=job_plan_root,
         build_id=project.digest,
         interface_path=artifact_cache / interface_ref[0].removeprefix("sha256:"),
         installed=installed,
     )
-    if development is None:
-        selected_models, entrypoints = _entrypoints(
-            interface_body,
-            package_name=package_name,
-            selections=models,
-            files=model_files,
-            artifact_store=artifact_store,
-            verified=verified,
-            derive=_deriver(installed, str(interface_body.get("application", ""))),
-        )
-    else:
-        # Local package transport freezes code, PackageInterface, and Environment only. A
-        # later ordinary PlacementSet supplies exact modeled serving bindings; JobDirective
-        # + InvocationSpec
-        # supplies a job's exact model inputs. Weightless serving bindings need no later model
-        # authority and are already exact consequences of this retained package interface.
-        selected_models, entrypoints = _entrypoints(
-            interface_body,
-            package_name=package_name,
-            selections=(),
-            files={},
-            artifact_store=None,
-            verified=verified,
-            derive=None,
-        )
-    if development is None and not entrypoints and not jobs:
-        raise PreparationRefusal(
-            "package_prepare_callable_absent",
-            "package has no runnable serving or weightless job callable",
-        )
+    # Local package transport freezes code, PackageInterface, and Environment only. A
+    # later ordinary PlacementSet supplies exact modeled serving bindings; JobDirective
+    # + InvocationSpec supplies a job's exact model inputs. Weightless serving bindings
+    # need no later model authority and are already exact consequences of this retained
+    # package interface.
+    selected_models, entrypoints = _entrypoints(
+        interface_body,
+        package_name=package_name,
+        selections=(),
+        artifact_store=None,
+        verified=verified,
+        derive=None,
+    )
     entrypoint_bodies = [documents.body(row) for row in entrypoints]
     bindings_digest = documents.digest_of(
         canonical.write(
@@ -997,18 +966,15 @@ def prepare_package(
         entrypoints=entrypoints,
         environment=environment,
     )
-    if development is None:
-        placement.package.CopyFrom(package)
-    else:
-        placement.development.CopyFrom(
-            pb.DevelopmentPackage(
-                package=development.package,
-                release=development.release,
-                source_digest=development.source_digest,
-                local_revision_digest=development.local_revision_digest,
-                project_wheel=_wheel_fact(project),
-            )
+    placement.development.CopyFrom(
+        pb.DevelopmentPackage(
+            package=development.package,
+            release=development.release,
+            source_digest=development.source_digest,
+            local_revision_digest=development.local_revision_digest,
+            project_wheel=_wheel_fact(project),
         )
+    )
     placement_body = documents.body(placement)
     placement_bytes = canonical.write(
         {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement_body]}
@@ -1035,7 +1001,7 @@ def _wheel_fact(wheel: package_environment.Wheel) -> pb.WheelFact:
 def _verify_local_revision(
     development: pb.DevelopmentPackage,
     interface_ref: tuple[str, int],
-    files: Sequence[pb.LocalDownloadFile],
+    wheels: Sequence[pb.LocalPackageWheel],
 ) -> None:
     revision = pb.LocalPackageRevision(
         package=development.package,
@@ -1046,10 +1012,9 @@ def _verify_local_revision(
             pb.LocalPackageFileRef(
                 digest=row.digest,
                 filename=row.filename,
-                kind=row.kind,
                 length=row.length,
             )
-            for row in files
+            for row in wheels
         ],
     )
     _raw, measured = documents.identity(revision)
@@ -1094,7 +1059,6 @@ def _entrypoints(
     *,
     package_name: str,
     selections: Sequence[Any],
-    files: Mapping[str, tuple[int, int, Path]],
     artifact_store: Path | None,
     verified: Callable[[str, int, Path], None],
     derive: Deriver | None,
@@ -1102,7 +1066,7 @@ def _entrypoints(
     rows = body.get("entrypoints")
     if not isinstance(rows, list):
         raise PreparationRefusal("package_prepare_interface_invalid", "entrypoints")
-    selected = _selected_models(package_name, selections, files, artifact_store, verified)
+    selected = _selected_models(package_name, selections, artifact_store, verified)
     if selected and derive is None:
         raise PreparationRefusal(
             "package_prepare_derive_refused", "a modeled selection needs the package environment"
@@ -1235,10 +1199,17 @@ def _stage_job_plans(
 def _selected_models(
     package_name: str,
     selections: Sequence[Any],
-    files: Mapping[str, tuple[int, int, Path]],
     artifact_store: Path | None,
     verified: Callable[[str, int, Path], None],
 ) -> dict[str, dict[str, Any]]:
+    """Resolve each selected model from the local TensorFS Store (wire 30).
+
+    The privileged host and TensorFS admitted every model byte before preparation ran; this
+    plane resolves the exact release rows, proves each selected manifest's runtime closure
+    complete with the store's own verified walk, and reads config plus assets through it. No
+    model file rides the request and nothing here writes to the store.
+    """
+
     selected: dict[str, dict[str, Any]] = {}
     for row in selections:
         if not isinstance(row, dict) or row.get("package") != package_name:
@@ -1247,29 +1218,7 @@ def _selected_models(
         if not slot or slot in selected:
             raise PreparationRefusal("package_prepare_model_selection_mismatch", slot)
         selected[slot] = {"selection": row}
-
-    manifest_refs = {str(value["selection"]["manifest"]) for value in selected.values()}
-    manifest_files = {
-        digest: (length, path)
-        for digest, (kind, length, path) in files.items()
-        if kind == pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST
-    }
-    object_files = {
-        digest: (length, path)
-        for digest, (kind, length, path) in files.items()
-        if kind == pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT
-    }
-    carried_models = bool(manifest_files or object_files)
-    if carried_models and set(manifest_files) != manifest_refs:
-        raise PreparationRefusal(
-            "package_prepare_model_manifest_set_mismatch",
-            f"wanted={sorted(manifest_refs)} got={sorted(manifest_files)}",
-        )
     if not selected:
-        if object_files:
-            raise PreparationRefusal(
-                "package_prepare_model_object_set_mismatch", "unexpected objects"
-            )
         return selected
 
     if artifact_store is None:
@@ -1280,79 +1229,36 @@ def _selected_models(
     try:
         tensorfs = fill.tensorfs_module()
         store = pull.open_store(tensorfs, artifact_store)
-        closures: dict[str, set[tuple[str, int]]] = {}
-        reached: set[tuple[str, int]] = set()
-        manifests: dict[str, tuple[int, bytes, Path | None]] = {}
-        if carried_models:
-            for digest, (length, path) in sorted(manifest_files.items()):
-                raw = _read_file(path, int(tensorfs.manifest_max_bytes()))
-                store.put_manifest(raw, digest, length)
-                manifests[digest] = (length, raw, path)
-        else:
-            for value in selected.values():
-                selection = value["selection"]
-                digest = str(selection["manifest"])
-                length = int(selection.get("manifest_length", 0))
-                model = str(selection.get("model", ""))
-                release = str(selection.get("release", ""))
-                lane = str(selection.get("lane", ""))
-                parts = model.split("/")
-                if len(parts) != 2 or not all(parts) or not release or not lane:
-                    raise PreparationRefusal("package_prepare_model_selection_mismatch", model)
-                resolved = store.resolve_release(parts[0], parts[1], release, lane)
-                if (
-                    str(resolved["manifest_digest"]) != digest
-                    or int(resolved["manifest_length"]) != length
-                ):
-                    raise PreparationRefusal(
-                        "package_prepare_model_selection_mismatch",
-                        f"{model}@{release}/{lane} does not resolve to {digest}",
-                    )
-                held = store.manifest(digest)
-                raw = bytes(held["manifest"])
-                if (
-                    length <= 0
-                    or len(raw) != length
-                    or "sha256:" + hashlib.sha256(raw).hexdigest() != digest
-                ):
-                    raise PreparationRefusal("package_prepare_model_manifest_mismatch", digest)
-                manifests[digest] = (length, raw, None)
-        delivered = {(digest, length) for digest, (length, _path) in object_files.items()}
-        placed: set[str] = set()
-        for digest, (_length, raw, _path) in sorted(manifests.items()):
-            if carried_models:
-                # The header is the sole direct snapshot entry needed to discover the runtime
-                # closure. README, sample, license, and other ordinary siblings stay outside
-                # model preparation even when the snapshot retains them.
-                header_digest, header_length = acquire.cozytensors_ref(tensorfs, raw)
-                row = object_files.get(header_digest)
-                if row is None or row[0] != header_length:
-                    raise PreparationRefusal(
-                        "package_prepare_model_object_set_mismatch",
-                        f"{digest} names CozyTensors header {header_digest} "
-                        f"({header_length} B); not delivered",
-                    )
-                if header_digest not in placed:
-                    store.put_file(str(row[1]), header_digest, header_length)
-                    placed.add(header_digest)
-            closure = {
-                (str(row["id"]), int(row["length"])) for row in store.walk_cozytensors(digest)
-            }
-            closures[digest] = closure
-            reached.update(closure)
-        if carried_models and delivered != reached:
-            missing = sorted(digest for digest, _length in reached - delivered)
-            extra = sorted(digest for digest, _length in delivered - reached)
-            raise PreparationRefusal(
-                "package_prepare_model_object_set_mismatch",
-                f"delivered={len(delivered)} reached={len(reached)} "
-                f"missing={missing[:4]} extra={extra[:4]}",
-            )
-        for digest, (length, path) in sorted(object_files.items()):
-            if digest not in placed:
-                store.put_file(str(path), digest, length)
-            verified(digest, length, path)
-        for digest, (length, _raw, manifest_path) in sorted(manifests.items()):
+        manifests: dict[str, tuple[int, bytes]] = {}
+        for value in selected.values():
+            selection = value["selection"]
+            digest = str(selection["manifest"])
+            length = int(selection.get("manifest_length", 0))
+            model = str(selection.get("model", ""))
+            release = str(selection.get("release", ""))
+            lane = str(selection.get("lane", ""))
+            parts = model.split("/")
+            if len(parts) != 2 or not all(parts) or not release or not lane:
+                raise PreparationRefusal("package_prepare_model_selection_mismatch", model)
+            resolved = store.resolve_release(parts[0], parts[1], release, lane)
+            if (
+                str(resolved["manifest_digest"]) != digest
+                or int(resolved["manifest_length"]) != length
+            ):
+                raise PreparationRefusal(
+                    "package_prepare_model_selection_mismatch",
+                    f"{model}@{release}/{lane} does not resolve to {digest}",
+                )
+            held = store.manifest(digest)
+            raw = bytes(held["manifest"])
+            if (
+                length <= 0
+                or len(raw) != length
+                or "sha256:" + hashlib.sha256(raw).hexdigest() != digest
+            ):
+                raise PreparationRefusal("package_prepare_model_manifest_mismatch", digest)
+            manifests[digest] = (length, raw)
+        for digest, (length, _raw) in sorted(manifests.items()):
             store.acquire_cozytensors(digest).release()
             held = store.manifest(digest)
             header = tensorfs.parse_header(bytes(held["header"]))
@@ -1376,8 +1282,6 @@ def _selected_models(
                         config_bytes=config_bytes,
                         assets=assets,
                     )
-            if manifest_path is not None:
-                verified(digest, length, manifest_path)
     except PreparationRefusal:
         raise
     except (acquire.AcquisitionRefusal, pull.PullRefusal, fill.FillRefusal) as exc:

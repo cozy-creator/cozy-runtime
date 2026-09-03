@@ -10,11 +10,14 @@ import tempfile
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import canonical, package_environment, package_interface, spawn
+from cozy_runtime.internal import canonical, package_environment
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.worker.child import ExecutorGone, ExecutorSupervision
-from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package
+from cozy_runtime.internal.worker.package_prepare import (
+    PreparationRefusal,
+    prepare_published_local,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -24,74 +27,30 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         "--artifact-cache",
         "--artifact-store",
         "--environment-python",
+        "--locked-requirements",
         "--package",
-        "--package-interface",
-        "--project-wheel",
         "--release",
     }
-    values = _values(args, required, {"--dependency-wheel", "--model"})
+    values = _values(args, required, {"--model"})
     artifact_cache = Path(values["--artifact-cache"][0]).resolve()
     artifact_store = Path(values["--artifact-store"][0]).resolve()
     environment_python = _venv_python(values["--environment-python"][0])
-    interface_path = Path(values["--package-interface"][0]).resolve()
+    lock_path = Path(values["--locked-requirements"][0]).resolve()
     try:
-        interface_raw = interface_path.read_bytes()
-        package_interface.read_bytes(interface_raw, str(interface_path))
-    except (OSError, package_interface.StalePackageInterface) as exc:
+        locked = package_environment.read_locked_requirements(lock_path.read_bytes())
+    except (OSError, package_environment.EnvironmentRefusal) as exc:
         raise CliError(
-            "package_prepare_interface_unreadable",
+            "package_prepare_locked_requirements_invalid",
             str(exc),
-            "download the exact published metadata/package-interface.json again",
-            Exit.not_found,
+            "supply the release's exact locked-requirements export",
+            Exit.validation,
         ) from exc
-    artifact_paths = [
-        (pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, Path(values["--project-wheel"][0]).resolve()),
-        *(
-            (pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, Path(value).resolve())
-            for value in values.get("--dependency-wheel", [])
-        ),
-        (pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE, interface_path),
-    ]
-    rows: list[pb.LocalDownloadFile] = []
-    for kind, path in artifact_paths:
-        try:
-            info = path.stat()
-            digest = _hash_file(path)
-        except OSError as exc:
-            raise CliError(
-                "package_prepare_file_unreadable",
-                str(path),
-                "download the exact published wheel again",
-                Exit.not_found,
-            ) from exc
-        rows.append(
-            pb.LocalDownloadFile(
-                digest=bytes.fromhex(digest.removeprefix("sha256:")),
-                filename=(package_interface.FILENAME if path == interface_path else path.name),
-                kind=kind,
-                length=info.st_size,
-                path=str(path),
-            )
-        )
-    rows.sort(key=lambda row: row.digest)
     package = values["--package"][0]
     release = values["--release"][0]
-    environment_content_digest = canonical.digest(
-        {
-            "wheels": [
-                documents.spell(bytes(row.digest))
-                for row in rows
-                if row.kind
-                in {
-                    pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
-                    pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
-                }
-            ]
-        }
-    )
     try:
         installed_environment = package_environment.open_existing_environment(
-            environment_python, environment_content_digest
+            environment_python,
+            canonical.digest({"locked_requirements": locked.digest}),
         )
     except package_environment.EnvironmentRefusal as exc:
         raise CliError(
@@ -132,7 +91,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         {
             "package": package,
             "release": release,
-            "environment_content_digest": environment_content_digest,
+            "locked_requirements_digest": locked.digest,
         }
     )
     # Linux caps Unix socket paths at 108 bytes. The generation/cache path is
@@ -171,24 +130,18 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         return raw
 
     try:
-        result = prepare_package(
+        result = prepare_published_local(
             package_name=package,
             release=release,
-            files=rows,
+            locked=locked,
+            models=models,
             placement_seed=seed,
             artifact_cache=artifact_cache,
+            artifact_store=artifact_store,
             environment_root=installed_environment.generation,
             python=environment_python,
             describe=describe,
-            verified=lambda _digest, _length, _path: None,
-            artifact_store=artifact_store,
-            models=models,
-            # The same seal the interface executor above runs under: a native dependency
-            # wheel is qualified against THIS seat, not waved through because the caller
-            # happens to be the local same-user command.
-            native_environment=spawn.seal(config.child_base_env, {}),
             installed_environment=installed_environment,
-            published_interface=interface_raw,
             # The same job-plan root the worker session stages into: without it a
             # job-only package has no runnable callable and local install refuses.
             job_plan_root=config.cozy_home / "job-plans",
@@ -199,7 +152,7 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         raise CliError(
             str(name),
             str(detail),
-            "use wheels compatible with this machine or repair the current local Runtime base",
+            "use a lock compatible with this machine or repair the current local Runtime base",
             Exit.validation,
         ) from exc
     finally:

@@ -1,0 +1,65 @@
+"""Shared test plumbing.
+
+A process has exactly one config authority (`read_config()` refuses a second call), and two
+test files both need the sealed child environment a worker would hand its operator child, so
+the ONE read lives here.
+"""
+
+from __future__ import annotations
+
+import functools
+from pathlib import Path
+
+
+@functools.cache
+def sealed_child_environment() -> dict[str, str]:
+    """The seal a worker would hand the operator child, built through the one env authority."""
+
+    from cozy_runtime.internal import config, spawn
+
+    return spawn.seal(config.read_config().child_base_env, {})
+
+
+@functools.cache
+def image_python() -> Path:
+    """A REAL base interpreter that owns the runtime closure in its own site-packages —
+    the shape a worker image's python actually has.
+
+    A venv python cannot stand in: `uv venv --python <venv-python>` resolves the venv's
+    BASE as the new environment's base, so nothing installed in a venv is ever visible to
+    a `--system-site-packages` child. The one faithful stand-in is a private copy of the
+    real interpreter prefix with the runtime wheel installed into its own site-packages.
+    Built once per test session, in temp, deleted with it."""
+
+    import atexit
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+
+    base = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+    prefix = base.parent.parent
+    root = Path(tempfile.mkdtemp(prefix="cozy-image-prefix."))
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
+    copy = root / "python"
+    shutil.copytree(prefix, copy, symlinks=True)
+    python = copy / "bin" / "python3"
+    assert python.is_file(), python
+    # The copy is ours to modify; the PEP 668 marker guards the shared uv-managed original.
+    for marker in copy.glob("lib/python*/EXTERNALLY-MANAGED"):
+        marker.unlink()
+    uv = shutil.which("uv")
+    assert uv is not None
+    wheels = root / "wheels"
+    subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(wheels), str(Path(__file__).parent.parent)],
+        check=True,
+        capture_output=True,
+    )
+    runtime_wheel = next(wheels.glob("cozy_runtime-*.whl"))
+    subprocess.run(
+        [uv, "pip", "install", "--python", str(python), str(runtime_wheel)],
+        check=True,
+        capture_output=True,
+    )
+    return python

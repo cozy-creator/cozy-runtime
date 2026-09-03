@@ -154,8 +154,10 @@ class WorkerControl(object):
 
 class RuntimePreparationStub(object):
     """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
-    service on its external listener. Runtime receives verified local files and logical refs only:
-    no Tensorhub origin, presigned URL, delegation signature, or worker TLS credential.
+    service on its external listener. Runtime receives logical refs, hub-known release facts, and
+    (local packages only) verified local wheel paths: no presigned URL, delegation signature,
+    worker TLS credential, or index bearer. The anonymous public index directives inside
+    locked_requirements are the one origin that crosses — an https URL, never a credential.
     """
 
     def __init__(self, channel):
@@ -193,8 +195,10 @@ class RuntimePreparationStub(object):
 
 class RuntimePreparationServicer(object):
     """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
-    service on its external listener. Runtime receives verified local files and logical refs only:
-    no Tensorhub origin, presigned URL, delegation signature, or worker TLS credential.
+    service on its external listener. Runtime receives logical refs, hub-known release facts, and
+    (local packages only) verified local wheel paths: no presigned URL, delegation signature,
+    worker TLS credential, or index bearer. The anonymous public index directives inside
+    locked_requirements are the one origin that crosses — an https URL, never a credential.
     """
 
     def CheckPackageSetCompatibility(self, request, context):
@@ -265,8 +269,10 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class RuntimePreparation(object):
     """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
-    service on its external listener. Runtime receives verified local files and logical refs only:
-    no Tensorhub origin, presigned URL, delegation signature, or worker TLS credential.
+    service on its external listener. Runtime receives logical refs, hub-known release facts, and
+    (local packages only) verified local wheel paths: no presigned URL, delegation signature,
+    worker TLS credential, or index bearer. The anonymous public index directives inside
+    locked_requirements are the one origin that crosses — an https URL, never a credential.
     """
 
     @staticmethod

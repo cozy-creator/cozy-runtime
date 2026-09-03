@@ -86,6 +86,31 @@ def read_bytes(raw: bytes) -> Inventory:
     return Inventory(profile=profile, python=str(python), distributions=tuple(distributions))
 
 
+def from_wire(profile: str, python: str, rows: Any) -> Inventory:
+    """Admit the request-carried inventory rows (wire 30); same rules as the staged document."""
+
+    if not isinstance(profile, str) or not profile:
+        raise ImageInventoryRefusal("profile absent")
+    try:
+        Version(str(python))
+    except InvalidVersion as exc:
+        raise ImageInventoryRefusal(f"python {python!r}") from exc
+    distributions: list[tuple[str, str]] = []
+    prior = ""
+    for row in rows:
+        name = str(getattr(row, "distribution", ""))
+        version = str(getattr(row, "version", ""))
+        if canonicalize_name(name) != name or name <= prior:
+            raise ImageInventoryRefusal(f"distribution {name!r}")
+        try:
+            Version(version)
+        except InvalidVersion as exc:
+            raise ImageInventoryRefusal(f"{name} version {version!r}") from exc
+        prior = name
+        distributions.append((name, version))
+    return Inventory(profile=profile, python=str(python), distributions=tuple(distributions))
+
+
 def disagreement(inventory: Inventory, observed_versions: dict[str, str]) -> str | None:
     """The cross-check that demoted the observation: every inventory row must be observed.
 

@@ -20,11 +20,13 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 
 import msgspec
 import pytest
 
+from conftest import sealed_child_environment
 from cozy_runtime.author import App, ConformanceError, Model, WeightsOutput, WeightsSink
 from cozy_runtime.author._describe import describe
 from cozy_runtime.author._loader import Loader
@@ -32,7 +34,6 @@ from cozy_runtime.internal import canonical, package_environment, package_interf
 from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
-    prepare_package,
     prepare_package_set,
 )
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -237,48 +238,64 @@ def _delegation(package: str, release: str) -> bytes:
     )
 
 
-def test_pod_prep_requires_the_exact_published_interface(tmp_path: Path) -> None:
-    """The set path refuses without the hub-committed PackageInterface beside the files.
+def _inventory() -> pb.ImageInventory:
+    """An inventory the bare base interpreter agrees with: it pins nothing the venv needs."""
 
-    Fail-on-parent: before cr-067 the same request proceeded straight to derivation.
+    return pb.ImageInventory(
+        profile="test",
+        python=".".join(str(part) for part in sys.version_info[:3]),
+    )
+
+
+def _image_python(uv: str, root: Path, runtime_wheel: Path) -> Path:
+    """A stand-in for the worker image's python: a real interpreter tree that imports
+    cozy-runtime, built once for the test the way an image bake would."""
+
+    image = root / "image"
+    subprocess.run(
+        [uv, "venv", "--no-project", "--no-config", "--python", sys.executable, str(image)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [uv, "pip", "install", "--python", str(image / "bin" / "python"), str(runtime_wheel)],
+        check=True,
+        capture_output=True,
+    )
+    return image / "bin" / "python"
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_pod_prep_requires_the_request_facts(tmp_path: Path) -> None:
+    """Wire 30: the request's release facts are admitted before anything installs.
+
+    Fail-on-parent: before xs-019 the same request carried a staged interface and wheels.
     """
-    artifact_cache = tmp_path / "artifacts"
-    view = artifact_cache / "sets" / "package"
-    view.mkdir(parents=True)
-    wheel = view / "thing.whl"
-    wheel.write_bytes(b"not really a wheel")
-    row = pb.LocalDownloadFile(
-        digest=hashlib.sha256(wheel.read_bytes()).digest(),
-        filename=wheel.name,
-        kind=pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
-        length=wheel.stat().st_size,
-        path=str(wheel),
+
+    lock = (
+        b"--index-url https://pypi.org/simple\nmarco-polo==1.0.4 --hash=sha256:" + b"a" * 64 + b"\n"
     )
 
-    interface_bytes = package_interface.canonical_bytes(
-        {"format": package_interface.SCHEMA, "application": "a:b", "entrypoints": [], "jobs": []}
-    )
-    interface_digest = "sha256:" + hashlib.sha256(interface_bytes).hexdigest()
-
-    interface_path = view / package_interface.FILENAME
-    interface_row = pb.LocalDownloadFile(
-        digest=bytes.fromhex(interface_digest[7:]),
-        filename=package_interface.FILENAME,
-        kind=pb.LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE,
-        length=len(interface_bytes),
-        path=str(interface_path),
-    )
-    files: list[pb.LocalDownloadFile] = [row, interface_row]
-    files.sort(key=lambda value: value.digest)
-
-    def prep() -> pb.PreparePackageSetResult:
+    def prep(
+        *,
+        application: str = "marco_polo_package:app",
+        slots: list[str] | None = None,
+        inventory: pb.ImageInventory | None = None,
+        locked: bytes = lock,
+    ) -> pb.PreparePackageSetResult:
         return prepare_package_set(
             pb.PreparePackageSetRequest(
-                download_delegation=_delegation("paul/thing", "1.0.0"),
-                files=files,
+                download_delegation=_delegation("paul/marco-polo", "1.0.4"),
                 environment_root=str(tmp_path / "environment"),
+                application=application,
+                model_slot_paths=slots or [],
+                image_inventory=inventory or _inventory(),
+                locked_requirements=locked,
             ),
-            artifact_cache=artifact_cache,
+            artifact_cache=tmp_path / "artifacts",
             artifact_store=tmp_path / "store",
             environment_root=tmp_path / "environment",
             python=Path(sys.executable),
@@ -286,127 +303,219 @@ def test_pod_prep_requires_the_exact_published_interface(tmp_path: Path) -> None
             verified=lambda _digest, _length, _path: None,
         )
 
-    with pytest.raises(PreparationRefusal) as absent:
-        prep()
-    assert absent.value.code == "package_prepare_published_interface_invalid"
+    with pytest.raises(PreparationRefusal) as no_application:
+        prep(application="")
+    assert no_application.value.code == "package_prepare_application_invalid"
 
-    # Wrong bytes at the conventional ordinary-file path cannot satisfy the delegated ref.
-    interface_path.parent.mkdir()
-    interface_path.write_bytes(b"other bytes entirely")
-    with pytest.raises(PreparationRefusal) as mismatched:
-        prep()
-    assert mismatched.value.code == "package_prepare_published_interface_invalid"
+    with pytest.raises(PreparationRefusal) as unsorted:
+        prep(slots=["b.models.x", "a.models.y"])
+    assert unsorted.value.code == "package_prepare_model_slot_paths_invalid"
+
+    with pytest.raises(PreparationRefusal) as no_inventory:
+        prep(inventory=pb.ImageInventory())
+    assert no_inventory.value.code == "package_prepare_image_inventory_invalid"
+
+    with pytest.raises(PreparationRefusal) as no_lock:
+        prep(locked=b"")
+    assert no_lock.value.code == "package_prepare_locked_requirements_invalid"
+
+    with pytest.raises(PreparationRefusal) as bare_row:
+        prep(locked=b"marco-polo==1.0.4\n")
+    assert bare_row.value.code == "package_prepare_locked_requirements_invalid"
+
+    with pytest.raises(PreparationRefusal) as no_pin:
+        prep(
+            locked=b"--index-url https://pypi.org/simple\nsix==1.17.0 --hash=sha256:"
+            + b"b" * 64
+            + b"\n"
+        )
+    assert no_pin.value.code == "package_prepare_project_pin_missing"
 
 
-def test_pod_serves_the_published_interface_and_refuses_a_disagreement() -> None:
-    """The core authority reversal, over a real environment and real wheels.
+class _SimpleIndex:
+    """A real PEP 503 index over the exact wheels the test built, served on loopback."""
 
-    Agree: the placement's interface ref is the PUBLISHED document's digest, and the
-    derive machinery never loads on this plane. Disagree: a typed refusal, never a serve
-    (the parent served from the derived surface in both arms).
+    def __init__(self, root: Path, wheels: list[Path]) -> None:
+        import http.server
+        import threading
+
+        for wheel in wheels:
+            name = wheel.name.split("-", 1)[0].replace("_", "-").lower()
+            project = root / name
+            project.mkdir(parents=True, exist_ok=True)
+            shutil.copy(wheel, project / wheel.name)
+            (project / "index.html").write_text(
+                "<html><body>"
+                + f'<a href="{wheel.name}#sha256={_sha(wheel)}">{wheel.name}</a>'
+                + "</body></html>"
+            )
+        handler = partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _closure_rows(uv: str) -> list[str]:
+    """The release's real registry closure: uv export over this repo's own uv.lock,
+    exactly the derivation the hub performs at grant time."""
+
+    rendered = subprocess.run(
+        [
+            uv,
+            "export",
+            "--frozen",
+            "--no-dev",
+            "--no-emit-project",
+            "--format",
+            "requirements.txt",
+            "--no-progress",
+        ],
+        cwd=str(ROOT),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows: list[str] = []
+    pending = ""
+    for line in rendered.stdout.splitlines():
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        row = (pending + line).strip()
+        pending = ""
+        if row and not row.startswith(("#", "-")):
+            rows.append(row)
+    assert rows, rendered.stdout
+    return rows
+
+
+def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None:
+    """xs-017/xs-019 end to end, no mocks: real wheels, BOTH indexes, a real hash-pinned
+    export, a real uv venv, and a real import of the installed application.
+
+    * the pod materializes its venv from the export alone — PyPI for a registry dependency,
+      the org-shaped loopback index for the release's own wheels, every artifact matched
+      against a hash the export names;
+    * the interface is DERIVED from that install (an actual import in the venv's own
+      interpreter), and the request's application fact cross-checks it;
+    * a wrong application fact refuses typed; a wrong hash refuses at install, which is the
+      dependency-confusion guard doing its job.
     """
+
     uv = shutil.which("uv")
     assert uv is not None
-    with tempfile.TemporaryDirectory(prefix="cozy-published-package_interface.") as raw:
+    with tempfile.TemporaryDirectory(prefix="cozy-published-locked.") as raw:
         root = Path(raw)
-        artifact_cache = root / "artifacts"
-        wheel_set = artifact_cache / "sets" / "package"
+        wheel_set = root / "wheels"
         wheel_set.mkdir(parents=True)
-        subprocess.run(
-            [uv, "build", "--wheel", "--out-dir", str(wheel_set), str(ROOT)],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            [uv, "build", "--wheel", "--out-dir", str(wheel_set), str(PACKAGE)],
-            check=True,
-            capture_output=True,
-        )
+        for source in (ROOT, PACKAGE):
+            subprocess.run(
+                [uv, "build", "--wheel", "--out-dir", str(wheel_set), str(source)],
+                check=True,
+                capture_output=True,
+            )
         runtime_wheel = next(wheel_set.glob("cozy_runtime-*.whl"))
         project_wheel = next(wheel_set.glob("marco_polo-*.whl"))
-        environment = root / "environment"
-        python = environment / "bin" / "python"
-        subprocess.run(
-            [uv, "venv", "--python", sys.executable, str(environment)],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            [uv, "pip", "install", "--python", str(python), str(runtime_wheel), str(project_wheel)],
-            check=True,
-            capture_output=True,
-        )
-        content_digest = "sha256:" + "17" * 32
-        installed = package_environment.open_existing_environment(python, content_digest)
-        (root / "store").mkdir()
-
-        def describe_real(
-            selected: package_environment.InstalledEnvironment, distribution: str
-        ) -> bytes:
-            command = (
-                "from cozy_runtime.internal import package_interface; "
-                "from cozy_runtime.internal.discovery import discover_distribution; "
-                f"found=discover_distribution({distribution!r}); "
-                "print(package_interface.canonical_bytes(package_interface.build(found)).decode())"
+        release = project_wheel.name.split("-")[1]
+        runtime_version = runtime_wheel.name.split("-")[1]
+        image_python = _image_python(uv, root, runtime_wheel)
+        index = _SimpleIndex(root / "index", [runtime_wheel, project_wheel])
+        try:
+            rows = sorted(
+                [
+                    *_closure_rows(uv),
+                    f"cozy-runtime=={runtime_version} --hash=sha256:{_sha(runtime_wheel)}",
+                    f"marco-polo=={release} --hash=sha256:{_sha(project_wheel)}",
+                ]
             )
-            rendered = subprocess.run(
-                [str(selected.python), "-I", "-c", command],
-                cwd="/",
-                check=True,
+            export = "\n".join(
+                [
+                    "--index-url https://pypi.org/simple",
+                    f"--extra-index-url {index.url}",
+                    *rows,
+                    "",
+                ]
+            ).encode()
+
+            def describe_real(
+                selected: package_environment.InstalledEnvironment, distribution: str
+            ) -> bytes:
+                command = (
+                    "from cozy_runtime.internal import package_interface; "
+                    "from cozy_runtime.internal.discovery import discover_distribution; "
+                    f"found=discover_distribution({distribution!r}); "
+                    "print(package_interface.canonical_bytes("
+                    "package_interface.build(found)).decode())"
+                )
+                rendered = subprocess.run(
+                    [str(selected.python), "-I", "-c", command],
+                    cwd="/",
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                assert rendered.returncode == 0, rendered.stderr
+                return rendered.stdout.strip().encode()
+
+            def prep(application: str, export_bytes: bytes) -> pb.PreparePackageSetResult:
+                return prepare_package_set(
+                    pb.PreparePackageSetRequest(
+                        download_delegation=_delegation("paul/marco-polo", release),
+                        environment_root=str(root / "environments"),
+                        application=application,
+                        model_slot_paths=[],
+                        image_inventory=_inventory(),
+                        locked_requirements=export_bytes,
+                    ),
+                    artifact_cache=root / "artifacts",
+                    artifact_store=root / "store",
+                    environment_root=root / "environments",
+                    python=image_python,
+                    describe=describe_real,
+                    verified=lambda _digest, _length, _path: None,
+                    native_environment=sealed_child_environment(),
+                )
+
+            (root / "artifacts").mkdir()
+            (root / "store").mkdir()
+            prepared = prep("marco_polo_package:app", export)
+            placement_bytes = prepared.placement_set.placement_set_canonical_bytes
+            placement = json.loads(placement_bytes)["placements"][0]
+            # The placement carries the lock's identity, never a wheel list.
+            assert placement["package"] == {"package": "paul/marco-polo", "release": release}
+            assert placement["environment"] == {
+                "local_wheels": [],
+                "locked_requirements": {
+                    "digest": "sha256:" + hashlib.sha256(export).hexdigest(),
+                    "length": len(export),
+                },
+            }
+            generation = root / "environments" / "contents"
+            venv_pythons = list(generation.glob("*/bin/python"))
+            assert len(venv_pythons) == 1
+            probe = subprocess.run(
+                [str(venv_pythons[0]), "-I", "-c", "import marco_polo_package"],
                 capture_output=True,
                 text=True,
             )
-            return rendered.stdout.strip().encode()
+            assert probe.returncode == 0, probe.stderr
+            # The uv cache was operation-scoped derived work and is gone after install.
+            assert not list((root / "environments").glob(".uv-cache-*"))
+            # The hard guard, observed live: preparing a package never loads derive.
+            assert "cozy_runtime.internal.derive" not in sys.modules
 
-        derived = describe_real(installed, "marco-polo")
+            with pytest.raises(PreparationRefusal) as disagreed:
+                prep("marco_polo_package:other", export)
+            assert disagreed.value.code == "package_prepare_application_disagrees"
 
-        def rows() -> list[pb.LocalDownloadFile]:
-            out = []
-            for kind, path in (
-                (pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL, project_wheel),
-                (pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL, runtime_wheel),
-            ):
-                data = path.read_bytes()
-                out.append(
-                    pb.LocalDownloadFile(
-                        digest=hashlib.sha256(data).digest(),
-                        filename=path.name,
-                        kind=kind,
-                        length=len(data),
-                        path=str(path),
-                    )
-                )
-            out.sort(key=lambda row: row.digest)
-            return out
-
-        def prep(published: bytes) -> pb.PreparePackageSetResult:
-            return prepare_package(
-                package_name="paul/marco-polo",
-                release="1.0.4",
-                files=rows(),
-                placement_seed=b"published-interface-authority",
-                artifact_cache=artifact_cache,
-                artifact_store=root / "store",
-                environment_root=environment,
-                python=python,
-                describe=describe_real,
-                verified=lambda _digest, _length, _path: None,
-                installed_environment=installed,
-                published_interface=published,
-            )
-
-        prepared = prep(derived)
-        placement_bytes = prepared.placement_set.placement_set_canonical_bytes
-        placement = json.loads(placement_bytes)["placements"][0]
-        assert placement["package_interface"]["digest"] == (
-            "sha256:" + hashlib.sha256(derived).hexdigest()
-        )
-        # The hard guard, observed live: preparing a package never loads derive.
-        assert "cozy_runtime.internal.derive" not in sys.modules
-
-        disagreeing = json.loads(derived)
-        disagreeing["application"] = "marco_polo_package:other"
-        with pytest.raises(PreparationRefusal) as disagreed:
-            prep(canonical.write(disagreeing))
-        assert disagreed.value.code == "package_prepare_interface_disagrees"
-        assert "published sha256:" in disagreed.value.detail
+            poisoned = export.replace(_sha(project_wheel).encode(), _sha(runtime_wheel).encode())
+            with pytest.raises(PreparationRefusal) as mismatched:
+                prep("marco_polo_package:app", poisoned)
+            assert mismatched.value.code == "package_environment_uv_failed"
+        finally:
+            index.close()

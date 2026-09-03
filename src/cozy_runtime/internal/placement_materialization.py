@@ -307,41 +307,30 @@ def _fsync(path: Path) -> None:
 
 def package_environment_input(
     *,
-    package: Mapping[str, Any],
+    package_name: str,
+    release: str,
+    project_wheel: Mapping[str, Any],
     environment: Mapping[str, Any],
     environment_digest: str,
     wheel_paths: Mapping[str, Path],
     verified_wheels: Mapping[str, package_environment.VerifiedFile] | None = None,
 ) -> package_environment.Input:
-    """Join direct executable package facts with the selected inline Environment."""
+    """Join one local revision's exact wheel facts with its inline Environment.
 
-    fields = set(package)
-    published = {"package", "project_wheel", "release"}
-    development = {
-        "package",
-        "local_revision_digest",
-        "project_wheel",
-        "release",
-        "source_digest",
-    }
-    if fields not in (published, development):
-        raise LaunchRefusal(
-            "package_invalid", f"fields={sorted(fields)} expected published or local development"
-        )
-    identity = package["package"]
-    version = package["release"]
+    Wire 30 leaves this join to LOCAL packages only: a published install materializes from
+    its locked-requirements export and never re-derives wheel facts. The project wheel fact
+    rides DevelopmentPackage; the supplied dependency wheels ride Environment.local_wheels.
+    """
+
     if (
-        not isinstance(identity, str)
-        or identity.count("/") != 1
-        or not all(identity.split("/"))
-        or not isinstance(version, str)
-        or not version
+        not isinstance(package_name, str)
+        or package_name.count("/") != 1
+        or not all(package_name.split("/"))
+        or not isinstance(release, str)
+        or not release
     ):
         raise LaunchRefusal("package_invalid", "package or release identity is invalid")
-    if fields == development:
-        _require_digest(package["local_revision_digest"], "package.local_revision_digest")
-
-    _closed(environment, {"wheels"}, "environment")
+    _closed(environment, {"local_wheels"}, "environment")
     measured_environment = (
         "sha256:"
         + hashlib.sha256(canonical.write({**environment, "format": ENVIRONMENT_FORMAT})).hexdigest()
@@ -351,14 +340,14 @@ def package_environment_input(
             "environment_digest_mismatch",
             f"measured {measured_environment}, expected {environment_digest}",
         )
-    project = _wheel(package["project_wheel"], "project", import_roots=True, nested_ref=True)
-    if project.distribution != identity.split("/", 1)[1] or project.version != version:
+    project = _wheel(project_wheel, "project", import_roots=True, nested_ref=True)
+    if project.distribution != package_name.split("/", 1)[1] or project.version != release:
         raise LaunchRefusal("project_wheel_mismatch", "project wheel differs from package release")
     if project.tags != ("py3-none-any",) or not project.filename.endswith("-py3-none-any.whl"):
         raise LaunchRefusal("project_wheel_not_pure", "project wheel must be exactly py3-none-any")
     wheels = [project]
     custom_wheels = _wheels(
-        environment.get("wheels", []), "environment", import_roots=True, nested_ref=True
+        environment.get("local_wheels", []), "environment", import_roots=True, nested_ref=True
     )
     measured_custom_bytes = sum(wheel.length for wheel in custom_wheels)
     if project.length > MAX_PACKAGE_ENVIRONMENT_BYTES - measured_custom_bytes:
