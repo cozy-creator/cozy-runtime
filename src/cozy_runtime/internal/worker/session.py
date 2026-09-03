@@ -1435,131 +1435,122 @@ class Worker:
     ) -> pb.PreparePackageSetResult:
         """Derive one local PlacementSet while package imports stay in the isolated executor."""
 
-        from cozy_runtime.internal.worker import package_prepare
-
         with self.preparation_lock:
-            if (
+            # A worker already serving placements prepares BESIDE them: the describe
+            # executor runs in a preparation-scoped slot, so the serving placements'
+            # executors are never replaced by a preparation. One preparation at a time
+            # (this lock); the slot is retired when the preparation returns. An idle
+            # worker keeps using the primary slot so the desired state that follows
+            # reuses the already-spawned executor and its environment.
+            busy = (
                 self.placement is not None
                 or self.pending is not None
-                or self.bindings
-                or self.hosted
-            ):
+                or bool(self.bindings)
+                or bool(self.hosted)
+            )
+            supervision = self._new_preparation_supervision() if busy else self.supervision
+            try:
+                return self._prepare_package_in(request, supervision, local=local)
+            finally:
+                if busy:
+                    executor = supervision.current
+                    if executor is not None:
+                        try:
+                            supervision.retire_current(executor, "package preparation finished")
+                        except ExecutorGone as exc:
+                            self.note("recovery", f"preparation executor reclaim failed: {exc}")
+                    supervision.close()
+
+    def _new_preparation_supervision(self) -> ExecutorSupervision:
+        """The preparation-scoped executor slot. Package describe needs an isolated
+        executor (package code never gets worker authority), and borrowing the primary
+        slot while placements serve would replace a serving executor with the prepared
+        package's environment."""
+
+        supervision = ExecutorSupervision(
+            root=self.root / "placements" / "prepare",
+            python=self.options.python or sys.executable,
+            base_env=self.config.child_base_env,
+            cozy_home=self.config.cozy_home,
+            executor_uid=self.options.executor_uid,
+            executor_gid=self.options.executor_gid,
+            jit_pod_scope=f"{self.fence.worker_boot_id}-prepare",
+        )
+        supervision.on_lane_failure = self.fail_machine
+        killed = supervision.sweep_orphans()
+        if killed:
+            self.note("recovery", f"preparation: reclaimed {len(killed)} prior executor(s)")
+        return supervision
+
+    def _prepare_package_in(
+        self,
+        request: pb.PreparePackageSetRequest | pb.PrepareLocalPackageRequest,
+        supervision: ExecutorSupervision,
+        *,
+        local: bool,
+    ) -> pb.PreparePackageSetResult:
+        from cozy_runtime.internal.worker import package_prepare
+
+        def describe(
+            installed: package_environment.InstalledEnvironment, distribution: str
+        ) -> bytes:
+            changed = supervision.use_environment(str(installed.python), installed.content_digest)
+            executor = supervision.current
+            lane = self._primary_lane()
+            try:
+                if executor is None:
+                    executor = supervision.spawn(imposed=self.imposed(lane))
+                elif changed or not executor.alive():
+                    executor = supervision.replace(
+                        executor, imposed=self.imposed(lane), why="prepared package changed"
+                    )
+                handoff = supervision.handoff(executor.epoch)
+                output = handoff / "metadata" / "package-interface.json"
+                output.parent.mkdir()
+                # A cold import, torch included: bound by the executor's own measured
+                # work and its death, never by a number of seconds (xs-007 row 8).
+                with executor.watched("describe_installed"):
+                    reply = executor.call(
+                        {
+                            "cmd": "describe_installed",
+                            "distribution": distribution,
+                            "output": str(output),
+                        },
+                        timeout=None,
+                    )
+            except ExecutorGone as exc:
                 raise package_prepare.PreparationRefusal(
-                    "package_prepare_worker_busy",
-                    "replace the active package through desired state",
+                    "package_prepare_executor_failed", exc.detail
+                ) from exc
+            if not reply.get("ok"):
+                raise package_prepare.PreparationRefusal(
+                    "package_prepare_interface_failed",
+                    f"{reply.get('code', 'invalid reply')}: {reply.get('detail', '')}",
                 )
+            try:
+                raw = output.read_bytes()
+            except OSError as exc:
+                raise package_prepare.PreparationRefusal(
+                    "package_prepare_interface_failed", "package-interface output is absent"
+                ) from exc
+            finally:
+                output.unlink(missing_ok=True)
+            digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+            if reply.get("digest") != digest or reply.get("length") != len(raw):
+                raise package_prepare.PreparationRefusal(
+                    "package_prepare_interface_failed", str(reply.get("code", "invalid reply"))
+                )
+            return raw
 
-            def describe(
-                installed: package_environment.InstalledEnvironment, distribution: str
-            ) -> bytes:
-                changed = self.supervision.use_environment(
-                    str(installed.python), installed.content_digest
-                )
-                executor = self.supervision.current
-                lane = self._primary_lane()
-                try:
-                    if executor is None:
-                        executor = self.supervision.spawn(imposed=self.imposed(lane))
-                    elif changed or not executor.alive():
-                        executor = self.supervision.replace(
-                            executor, imposed=self.imposed(lane), why="prepared package changed"
-                        )
-                    handoff = self.supervision.handoff(executor.epoch)
-                    output = handoff / "metadata" / "package-interface.json"
-                    output.parent.mkdir()
-                    # A cold import, torch included: bound by the executor's own measured
-                    # work and its death, never by a number of seconds (xs-007 row 8).
-                    with executor.watched("describe_installed"):
-                        reply = executor.call(
-                            {
-                                "cmd": "describe_installed",
-                                "distribution": distribution,
-                                "output": str(output),
-                            },
-                            timeout=None,
-                        )
-                except ExecutorGone as exc:
-                    raise package_prepare.PreparationRefusal(
-                        "package_prepare_executor_failed", exc.detail
-                    ) from exc
-                if not reply.get("ok"):
-                    raise package_prepare.PreparationRefusal(
-                        "package_prepare_interface_failed",
-                        f"{reply.get('code', 'invalid reply')}: {reply.get('detail', '')}",
-                    )
-                try:
-                    raw = output.read_bytes()
-                except OSError as exc:
-                    raise package_prepare.PreparationRefusal(
-                        "package_prepare_interface_failed", "package-interface output is absent"
-                    ) from exc
-                finally:
-                    output.unlink(missing_ok=True)
-                digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-                if reply.get("digest") != digest or reply.get("length") != len(raw):
-                    raise package_prepare.PreparationRefusal(
-                        "package_prepare_interface_failed", str(reply.get("code", "invalid reply"))
-                    )
-                return raw
+        def mark_verified(digest: str, length: int, path: Path) -> None:
+            self.verified_artifacts.record(digest, length, path)
 
-            def mark_verified(digest: str, length: int, path: Path) -> None:
-                self.verified_artifacts.record(digest, length, path)
-
-            if local:
-                assert isinstance(request, pb.PrepareLocalPackageRequest)
-                materialized: list[package_environment.InstalledEnvironment] = []
-                result = package_prepare.prepare_local_package(
-                    request,
-                    artifact_cache=Path(self.options.artifact_cache or ""),
-                    environment_root=Path(self.options.environment_root or ""),
-                    python=Path(self.options.python or sys.executable),
-                    describe=describe,
-                    verified=mark_verified,
-                    job_plan_root=self.config.cozy_home / "job-plans",
-                    base=self.base,
-                    native_environment=self.native_environment(),
-                    native_device_index=self.native_device_index(),
-                    materialized=materialized.append,
-                )
-                prepared = read_placement_set(result.placement_set)
-                if len(prepared) != 1 or not prepared[0].get("development"):
-                    raise package_prepare.PreparationRefusal(
-                        "local_package_result_invalid",
-                        "local preparation did not return one development Placement",
-                    )
-                entry = prepared[0]
-                package_interface = dict(entry.get("package_interface", {}))
-                stored = Placement(
-                    placement_id=str(entry.get("placement_id", "")),
-                    placement_set_digest=result.placement_set.placement_set_digest,
-                    package=dict(entry.get("package", {})),
-                    development=dict(entry.get("development", {})),
-                    environment_digest=_digest_field(entry.get("environment_digest")),
-                    package_interface=(
-                        str(package_interface.get("digest", "")),
-                        int(package_interface.get("length", 0)),
-                    ),
-                    bindings_digest=_digest_field(entry.get("bindings_digest")),
-                    models=tuple(dict(row) for row in entry.get("models", [])),
-                    entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
-                    environment=dict(entry.get("environment", {})),
-                    document=dict(entry),
-                    installed=materialized[0] if materialized else None,
-                )
-                revision = str(stored.development.get("local_revision_digest", ""))
-                if revision != documents.spell(request.package.local_revision_digest):
-                    raise package_prepare.PreparationRefusal(
-                        "local_package_revision_mismatch",
-                        "prepared Placement changed the declared local revision",
-                    )
-                self.local_operations[(request.operation_id, revision)] = stored
-                self.local_revisions[(stored.placement_id, revision)] = stored
-                return result
-            assert isinstance(request, pb.PreparePackageSetRequest)
-            return package_prepare.prepare_package_set(
+        if local:
+            assert isinstance(request, pb.PrepareLocalPackageRequest)
+            materialized: list[package_environment.InstalledEnvironment] = []
+            result = package_prepare.prepare_local_package(
                 request,
                 artifact_cache=Path(self.options.artifact_cache or ""),
-                artifact_store=Path(self.options.artifact_store or ""),
                 environment_root=Path(self.options.environment_root or ""),
                 python=Path(self.options.python or sys.executable),
                 describe=describe,
@@ -1568,7 +1559,56 @@ class Worker:
                 base=self.base,
                 native_environment=self.native_environment(),
                 native_device_index=self.native_device_index(),
+                materialized=materialized.append,
             )
+            prepared = read_placement_set(result.placement_set)
+            if len(prepared) != 1 or not prepared[0].get("development"):
+                raise package_prepare.PreparationRefusal(
+                    "local_package_result_invalid",
+                    "local preparation did not return one development Placement",
+                )
+            entry = prepared[0]
+            package_interface = dict(entry.get("package_interface", {}))
+            stored = Placement(
+                placement_id=str(entry.get("placement_id", "")),
+                placement_set_digest=result.placement_set.placement_set_digest,
+                package=dict(entry.get("package", {})),
+                development=dict(entry.get("development", {})),
+                environment_digest=_digest_field(entry.get("environment_digest")),
+                package_interface=(
+                    str(package_interface.get("digest", "")),
+                    int(package_interface.get("length", 0)),
+                ),
+                bindings_digest=_digest_field(entry.get("bindings_digest")),
+                models=tuple(dict(row) for row in entry.get("models", [])),
+                entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
+                environment=dict(entry.get("environment", {})),
+                document=dict(entry),
+                installed=materialized[0] if materialized else None,
+            )
+            revision = str(stored.development.get("local_revision_digest", ""))
+            if revision != documents.spell(request.package.local_revision_digest):
+                raise package_prepare.PreparationRefusal(
+                    "local_package_revision_mismatch",
+                    "prepared Placement changed the declared local revision",
+                )
+            self.local_operations[(request.operation_id, revision)] = stored
+            self.local_revisions[(stored.placement_id, revision)] = stored
+            return result
+        assert isinstance(request, pb.PreparePackageSetRequest)
+        return package_prepare.prepare_package_set(
+            request,
+            artifact_cache=Path(self.options.artifact_cache or ""),
+            artifact_store=Path(self.options.artifact_store or ""),
+            environment_root=Path(self.options.environment_root or ""),
+            python=Path(self.options.python or sys.executable),
+            describe=describe,
+            verified=mark_verified,
+            job_plan_root=self.config.cozy_home / "job-plans",
+            base=self.base,
+            native_environment=self.native_environment(),
+            native_device_index=self.native_device_index(),
+        )
 
     def prepare_model_source(
         self, request: pb.PrepareModelSourceRequest
