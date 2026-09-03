@@ -579,20 +579,22 @@ class WeightsTransferCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[WeightsTransferRequest, _Mapping]] = ...) -> None: ...
 
 class PreparePackageSetRequest(_message.Message):
-    __slots__ = ("download_delegation", "application", "model_slot_paths", "image_inventory", "locked_requirements", "install_root")
+    __slots__ = ("download_delegation", "application", "model_slot_paths", "image_inventory", "locked_requirements", "install_root", "download_delegation_signature")
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     APPLICATION_FIELD_NUMBER: _ClassVar[int]
     MODEL_SLOT_PATHS_FIELD_NUMBER: _ClassVar[int]
     IMAGE_INVENTORY_FIELD_NUMBER: _ClassVar[int]
     LOCKED_REQUIREMENTS_FIELD_NUMBER: _ClassVar[int]
     INSTALL_ROOT_FIELD_NUMBER: _ClassVar[int]
+    DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     download_delegation: bytes
     application: str
     model_slot_paths: _containers.RepeatedScalarFieldContainer[str]
     image_inventory: ImageInventory
     locked_requirements: bytes
     install_root: str
-    def __init__(self, download_delegation: _Optional[bytes] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., install_root: _Optional[str] = ...) -> None: ...
+    download_delegation_signature: bytes
+    def __init__(self, download_delegation: _Optional[bytes] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., install_root: _Optional[str] = ..., download_delegation_signature: _Optional[bytes] = ...) -> None: ...
 
 class ImageInventory(_message.Message):
     __slots__ = ("profile", "python", "distributions")
@@ -651,14 +653,16 @@ class LocalPackageWheel(_message.Message):
     def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., length: _Optional[int] = ..., path: _Optional[str] = ...) -> None: ...
 
 class PreparePrivatePlacementRequest(_message.Message):
-    __slots__ = ("operation_id", "local_revision_digest", "download_delegation")
+    __slots__ = ("operation_id", "local_revision_digest", "download_delegation", "download_delegation_signature")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     LOCAL_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
+    DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     local_revision_digest: bytes
     download_delegation: bytes
-    def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ...) -> None: ...
+    download_delegation_signature: bytes
+    def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ...) -> None: ...
 
 class LocalModelSourceFile(_message.Message):
     __slots__ = ("member", "object_id", "length", "path")
