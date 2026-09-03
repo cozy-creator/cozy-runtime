@@ -919,7 +919,6 @@ class Derivation:
     `logical_tensors` are the rows a checkpoint header is matched against.
     """
 
-    factory: str
     logical_tensors: tuple[LogicalTensor, ...]
     destination_sets: tuple[DestinationSet, ...]
     derived: tuple[DerivedTensor, ...]
@@ -1012,7 +1011,6 @@ def derive(
     _check_agreement(logical, destination_sets, [d.key for c in shallow for d in c.destinations])
     constructed = tuple(d.component for d in destination_sets)
     return Derivation(
-        factory="|".join(r.factory_identity for r in loader.records()),
         logical_tensors=logical,
         destination_sets=destination_sets,
         derived=tuple(sorted(rich.derived, key=lambda d: d.key)),

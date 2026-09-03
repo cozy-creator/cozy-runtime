@@ -590,7 +590,6 @@ def registered_adapters() -> tuple[str, ...]:
 class ConstructionRecord:
     """What executing `load()` derived: the tensor requirements and the fill's bookkeeping."""
 
-    factory_identity: str
     destinations: tuple[Destination, ...]
     components: tuple[str, ...]
     schedulers: tuple[str, ...]
@@ -677,7 +676,6 @@ class Loader:
         ignored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("ignored", ())))
         filled, filled_bytes = self._fill(walked, obj)
         record = ConstructionRecord(
-            factory_identity=identity,
             destinations=walked.destinations,
             components=walked.components,
             schedulers=walked.schedulers,
