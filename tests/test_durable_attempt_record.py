@@ -302,6 +302,32 @@ def test_a_worker_with_no_record_root_recovers_nothing(tmp_path: Path) -> None:
     assert recovery.attempts == [] and recovery.rows == []
 
 
+def test_the_file_holds_the_work_in_flight_and_not_the_work_ever_done(tmp_path: Path) -> None:
+    """A long-lived worker serves for weeks. The record must be bounded by what it OWES, not by
+    what it has done, or the boundedness the wire gets from a digest is undone by the disk."""
+    records = WorkerRecords(journal=durable.Journal.under(tmp_path))
+    spec = documents.spell(bytes(range(32)))
+    for ordinal in range(1, durable.COMPACT_AFTER + 2):
+        identity = {"request_id": f"req-{ordinal}", "attempt": 1}
+        records.append("accepted", {**identity, "invocation_spec_digest": spec})
+        records.append(
+            "outcome",
+            {
+                **identity,
+                "invocation_spec_digest": spec,
+                "outcome_id": f"out-{ordinal}",
+                "outcome_digest": spec,
+                "outcome_canonical_b64": base64.b64encode(b"{}").decode(),
+            },
+        )
+        records.append("closed", {**identity, "outcome_id": f"out-{ordinal}"})
+    path = tmp_path / durable.FILENAME
+    lines = [line for line in path.read_text().splitlines() if line]
+    assert len(lines) < durable.COMPACT_AFTER, f"the file kept {len(lines)} dead rows"
+    recovery = durable.recover(durable.Journal.under(tmp_path), boot_id="b", instance_id="i")
+    assert recovery.attempts == [], recovery.attempts
+
+
 def test_a_torn_tail_is_not_a_record(tmp_path: Path) -> None:
     """The crash this file exists for happens mid-write. Bytes that did not all land never
     became a fact, and recovery reads the fold, not the file."""
