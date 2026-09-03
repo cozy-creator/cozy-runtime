@@ -5,7 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
-TRANSFER_STAGING: Final = Path("/var/lib/cozy/tmp/transfers")
+#: The worker's own content-addressed cache of small CONTROL DOCUMENTS -- a prepared
+#: package's PackageInterface, and the selections `acquire` stages beneath it. It is not a
+#: transfer area and has not been one since th-128 deleted the pod-global artifact CAS,
+#: which is also when the worker image stopped creating `/var/lib/cozy/tmp/transfers` and
+#: left the old name pointing at nothing. THE WORKER CREATES THIS ITSELF: no image mkdir
+#: decides who may write here, which is the whole reason the serving half never noticed the
+#: directory had gone -- `acquire._stage` has always made its own root.
+PREPARE_CACHE: Final = Path("/var/lib/cozy/prepare-cache")
 TENSORFS_ROOT: Final = Path("/var/lib/tensorfs")
 BOOT_DATA: Final = Path("/var/lib/cozy/boot")
 BOOT_ID: Final = Path("/run/cozy/bootstrap/pod-boot-id")
