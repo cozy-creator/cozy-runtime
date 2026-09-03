@@ -639,6 +639,19 @@ def spec_vector_document(spec_digest: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) and set(data) == {"cases"} else None
 
 
+def case_dtype(case: Mapping[str, Any]) -> str | None:
+    """The TORCH dtype name one mined case's logical value carries, or None.
+
+    The key is `dtype`. These documents are TensorFS's producer-mined vector artifacts,
+    pinned BY DIGEST in `SPEC_VECTORS`, and their `logical` object is the same shape
+    `vector_tensor` reads one line below — it is NOT the CozyTensors header's `logical`,
+    whose dtype field TensorFS 0.3 renamed to `logical_dtype`. Reading the header's name
+    here matched nothing, and a document that matches nothing reports SKIPPED, which is a
+    pass locally and an absence everywhere else.
+    """
+    return TORCH_DTYPES.get(str((case.get("logical") or {}).get("dtype")))
+
+
 def _spec_vectors(
     torch: Any, provider: Any, device: Any, dtype: Any, dtype_name: str
 ) -> dict[str, Any]:
@@ -661,6 +674,12 @@ def _spec_vectors(
     reported as SKIPPED and neither passes nor fails: it must not mint a record on the
     strength of a check that did not run, and it must not fail a provider for a case the
     producer never emitted.
+
+    A document whose cases declare NO dtype this runtime reads is neither of those things —
+    it is a reader that stopped matching the bytes, and it FAILS. Skipping there is how the
+    observed-capability document quietly emptied itself: `_reportable` drops a skipped
+    check, so every accelerator lost every non-verbatim record and `tensorfs.fit` refused
+    `encoding_unqualified` on a card whose decode had actually passed.
     """
     cases: list[dict[str, Any]] = []
     document = spec_vector_document(str(provider.encoding))
@@ -671,10 +690,20 @@ def _spec_vectors(
             "note": f"no vendored vector document for spec {str(provider.encoding)[:30]}…",
             "passed": True,
         }
-    for case in document.get("cases", ()):
-        logical = case.get("logical") or {}
-        if TORCH_DTYPES.get(str(logical.get("logical_dtype"))) != dtype_name:
+    mined = tuple(document.get("cases", ()))
+    if mined and not any(case_dtype(case) for case in mined):
+        return {
+            "kind": "spec-vectors",
+            "passed": False,
+            "note": f"the vendored document for spec {str(provider.encoding)[:30]}… declares "
+            f"no logical dtype this runtime reads — its cases carry "
+            f"{sorted({str((c.get('logical') or {}).get('dtype')) for c in mined})}, and "
+            "the reader and the mined bytes have to agree before a case can run",
+        }
+    for case in mined:
+        if case_dtype(case) != dtype_name:
             continue
+        logical = case["logical"]
         roles = {role: vector_tensor(torch, blob, device) for role, blob in case["roles"].items()}
         missing = sorted(provider.required - set(roles))
         surplus = sorted(set(roles) - provider.required - provider.optional)
