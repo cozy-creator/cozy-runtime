@@ -293,17 +293,12 @@ def _prepare_published(
             f"request {application!r} != derived {derived_application!r}",
         )
     application = derived_application
-    declared = {
-        str(model.get("path", ""))
-        for entrypoint in interface_body.get("entrypoints", [])
-        if isinstance(entrypoint, dict)
-        for model in entrypoint.get("models", [])
-        if isinstance(model, dict)
-    }
+    declared = _slot_paths(interface_body, "entrypoints", "jobs")
     if model_slot_paths is not None and declared != set(model_slot_paths):
         raise PreparationRefusal(
             "package_prepare_model_slots_disagree",
-            f"request={sorted(model_slot_paths)} derived={sorted(declared)}",
+            f"request-only={sorted(set(model_slot_paths) - declared)} "
+            f"derived-only={sorted(declared - set(model_slot_paths))}",
         )
     interface_ref = _stage(artifact_cache, interface_raw)
     jobs = _stage_job_plans(
@@ -402,15 +397,33 @@ def check_package_set_compatibility(
         base=base,
     )
     candidates = _compatibility_models(models, tensorfs_root=tensorfs_root)
-    if set(candidates) != set(slot_paths):
+    # SUBSET, not equality. `candidates` is keyed by the slots THIS INVOCATION binds;
+    # `slot_paths` describes every slot THE RELEASE declares. A release with more than
+    # one callable always declares more than any single invocation binds -- anima
+    # declares generate.models.model and quantize.models.source while an invocation
+    # binds one of them -- so equality refused every such release. What the guard is
+    # actually for is the other direction: a delegation naming a slot the package does
+    # not have.
+    undeclared = sorted(set(candidates) - set(slot_paths))
+    if undeclared:
         raise PreparationRefusal(
             "package_prepare_model_selection_mismatch",
-            f"selected={sorted(candidates)} described={sorted(slot_paths)}",
+            f"the delegation binds {undeclared}, which the release does not declare; "
+            f"declared={sorted(slot_paths)}",
         )
     requests = tuple(
         derive_child.SlotRequest(path, row["config"], row["assets"])
         for path, row in sorted(candidates.items())
     )
+    if not requests:
+        # NOTHING TO FIT. A set that selects no model has no header to check code against,
+        # and the environment half of this check has already run above. Handing the derive
+        # child an empty slot set refuses `derive_request_invalid: slots is a non-empty
+        # array` -- which is how EVERY modelless preparation died on a pod, naming a
+        # request shape rather than the absent selection, while `prepare_package_set`
+        # would have accepted the same set (`_entrypoints` derives nothing when nothing is
+        # selected). The check must not be stricter than the preparation it guards.
+        return pb.CheckPackageSetCompatibilityResult()
     try:
         answers = derive_child.derive_in(
             installed.python,
@@ -533,6 +546,12 @@ def _compatibility_models(
             "release": release,
             "lane": lane,
         }
+    if not selections:
+        # NOTHING SELECTED: no manifest to read, so no Store to open. Opening one anyway
+        # made a modelless set depend on a Store it never touches. `_selected_models`
+        # returns here for the same reason, and the preparation this check guards
+        # therefore accepted sets the check refused.
+        return selections
     by_manifest: dict[str, dict[str, Any]] = {}
     try:
         store = fill.open_store(tensorfs, tensorfs_root)
@@ -1023,6 +1042,29 @@ def _deriver(installed: package_environment.InstalledEnvironment, application: s
     return derive
 
 
+def _slot_paths(body: Mapping[str, Any], *collections: str) -> set[str]:
+    """Every model-slot path the interface declares in the named callable collections.
+
+    cozy.package.interface/1 declares `models[].path` in BOTH `entrypoints` and `jobs`.
+    Reading only the first is how a release whose callables are all jobs came to describe
+    no model slot at all, and how the one slot a job bound became undeclarable.
+    """
+
+    paths: set[str] = set()
+    for collection in collections:
+        rows = body.get(collection, [])
+        if not isinstance(rows, list):
+            raise PreparationRefusal("package_prepare_interface_invalid", collection)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            models = row.get("models", [])
+            if not isinstance(models, list):
+                raise PreparationRefusal("package_prepare_interface_invalid", "model slots")
+            paths.update(str(model.get("path", "")) for model in models if isinstance(model, dict))
+    return paths
+
+
 def _entrypoints(
     body: Mapping[str, Any],
     *,
@@ -1111,12 +1153,20 @@ def _entrypoints(
     out.sort(key=lambda row: row.name)
     if len({row.name for row in out}) != len(out):
         raise PreparationRefusal("package_prepare_interface_invalid", "duplicate entrypoint")
-    if described_slots != set(selected):
-        raise PreparationRefusal(
-            "package_prepare_model_selection_mismatch",
-            f"missing={sorted(set(selected) - described_slots)} "
-            f"extra={sorted(described_slots - set(selected))}",
-        )
+    unbound = sorted(set(selected) - described_slots)
+    if unbound:
+        # A JOB's model slot is legitimately unbound here. A job has no placement and no
+        # residency: its Model parameter is an attempt-held, derive-only view of one
+        # TensorFS Manifest, so the selection exists to admit those bytes to this pod,
+        # not to construct an Entrypoint binding. Only a selection NO callable declares
+        # -- or one that would leave an entrypoint half-bound -- is a mismatch.
+        stranded = [path for path in unbound if path not in _slot_paths(body, "jobs")]
+        if stranded:
+            raise PreparationRefusal(
+                "package_prepare_model_selection_mismatch",
+                f"nothing binds {stranded}: no job declares them, and no entrypoint that "
+                "declares them had its whole slot set selected",
+            )
     return models, out
 
 
