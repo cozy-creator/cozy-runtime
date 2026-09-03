@@ -2,7 +2,7 @@
 
 One projection, two producers: `cozy-runtime derive` projects the meta-device derivation
 (the PlacementSet's `Slot.components`), and the fill plane projects the serving
-census the moment before a byte is reserved. Both hand `tensorfs.code_topology` the same
+census the moment before a byte is reserved. Both hand `tensorfs.tensor_requirements` the same
 rows, so `tensorfs.fit` answers the same question at every clock. Nothing here matches.
 """
 
@@ -83,7 +83,7 @@ def canonical_bytes(
     admitted = accepts(encoded_leaves)
     contract = "sha256:" + hashlib.sha256(canonical.write(document(held, constructed))).hexdigest()
     tensors = [
-        tensorfs.CodeTensor(
+        tensorfs.TensorRequirement(
             component=component,
             key=key,
             dtype=tensorfs_dtype(dtype),
@@ -93,4 +93,4 @@ def canonical_bytes(
         )
         for component, key, dtype, shape in held
     ]
-    return bytes(tensorfs.code_topology(contract, tensors, list(constructed)))
+    return bytes(tensorfs.tensor_requirements(contract, tensors, list(constructed)))
