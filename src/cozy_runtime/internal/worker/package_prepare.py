@@ -7,9 +7,7 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
-import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -180,8 +178,6 @@ def _published_interface(
         )
     try:
         package_interface.read_bytes(raw, "published package interface")
-    except package_interface.RetiredPackageInterfaceMember as exc:
-        raise PreparationRefusal(exc.code, exc.message) from exc
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("package_prepare_published_interface_invalid", str(exc)) from exc
     return raw, parent
@@ -342,8 +338,6 @@ def prepare_private_placement(
         interface_body = package_interface.read_bytes(
             interface_raw, "prepared local package interface"
         )
-    except package_interface.RetiredPackageInterfaceMember as exc:
-        raise PreparationRefusal(exc.code, exc.message) from exc
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("private_placement_interface_invalid", str(exc)) from exc
     selected_models, entrypoints = _entrypoints(
@@ -599,8 +593,6 @@ def prepare_package(
             )
     try:
         interface_body = package_interface.read_bytes(interface_raw, "prepared package interface")
-    except package_interface.RetiredPackageInterfaceMember as exc:
-        raise PreparationRefusal(exc.code, exc.message) from exc
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
     interface_ref = _stage(artifact_cache, interface_raw)
@@ -738,20 +730,17 @@ def _deriver(installed: package_environment.InstalledEnvironment, application: s
     def derive(slot: str, config_bytes: bytes) -> tuple[str, ...]:
         if not application:
             raise PreparationRefusal("package_prepare_interface_invalid", "application")
-        scratch = Path(tempfile.mkdtemp(prefix="cozy-prepare-derive-"))
         try:
             request = derive_child.DeriveRequest(
                 (derive_child.SlotRequest(slot, config_bytes),),
                 application=application,
             )
-            (held,) = derive_child.derive_in(installed.python, request, scratch)
-            return derive_child.constructed_components(held.document)
+            (held,) = derive_child.derive_in(installed.python, request)
+            return held.components
         except derive_child.DeriveRefusal as exc:
             raise PreparationRefusal(
                 "package_prepare_derive_refused", f"{slot}: {exc.code}: {exc.detail}"
             ) from exc
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
 
     return derive
 

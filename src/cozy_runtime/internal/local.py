@@ -1334,26 +1334,20 @@ def _resolve_development_models(
 
 
 def _derive_components(project: Path, slot: str, config_bytes: bytes) -> tuple[str, ...]:
-    """`Slot.components` = what the derive constructs for this config document (D9), from
-    `cozy-runtime derive`'s bounded child in THIS venv — this process is the package venv's
-    own runtime, and `sys.executable` is its interpreter."""
+    """What the private bounded child constructs for this config in this package venv."""
     import sys
-    import tempfile
 
-    scratch = Path(tempfile.mkdtemp(prefix="cozy-local-derive-"))
     try:
         request = derive_child.DeriveRequest(
             (derive_child.SlotRequest(slot, config_bytes),),
             project=Path(project).resolve(),
         )
-        (held,) = derive_child.derive_in(Path(sys.executable), request, scratch)
-        return derive_child.constructed_components(held.document)
+        (held,) = derive_child.derive_in(Path(sys.executable), request)
+        return held.components
     except derive_child.DeriveRefusal as exc:
         raise RuntimeError(
             f"development_model_derive_refused: {slot}: {exc.code}: {exc.detail}"
         ) from exc
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _development_assets(binding_ref: str, value: object) -> None:

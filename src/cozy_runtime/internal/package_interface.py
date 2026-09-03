@@ -37,18 +37,6 @@ class StalePackageInterface(ConformanceError):
     default_code = "stale_package_interface"
 
 
-class RetiredPackageInterfaceMember(StalePackageInterface):
-    """A slot member the grammar deleted, carrying a value: `stamps` (model-code-fit D1) or
-    `source_profile` (cr-077). Its code names the member — the hub refuses the same names."""
-
-
-#: A slot is `{path, class, component_use, encoded_leaves}` (+ optional `sequence_parallel`).
-#: These are the members it once carried and may not carry a value for. An EMPTY `stamps`
-#: map is read as nothing declared — every release published before this cut ships
-#: `"stamps": {}` and the worker reads those interfaces back; anything in it refuses typed.
-RETIRED_SLOT_KEYS = frozenset({"stamps", "source_profile"})
-
-
 # ------------------------------------------------------------------------ the document
 
 
@@ -357,11 +345,10 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                 slot = _closed(
                     model,
                     {"class", "component_use", "path"},
-                    {"encoded_leaves", "sequence_parallel", *RETIRED_SLOT_KEYS},
+                    {"encoded_leaves", "sequence_parallel"},
                     source,
                     model_path,
                 )
-                _refuse_retired(slot, source, model_path)
                 if "encoded_leaves" in slot and slot["encoded_leaves"] not in ("refuse", "accept"):
                     _invalid(source, f"{model_path}.encoded_leaves", "must be refuse or accept")
                 if "sequence_parallel" in slot:
@@ -574,28 +561,6 @@ def _closed(
         )
         _invalid(source, path, detail)
     return cast(dict[str, Json], value)
-
-
-def _refuse_retired(slot: Mapping[str, Json], source: str, path: str) -> None:
-    """The deleted members refuse by name, at the reader, exactly as the hub does."""
-    if "stamps" in slot:
-        stamps = slot["stamps"]
-        if not isinstance(stamps, dict):
-            _invalid(source, f"{path}.stamps", "must be an object")
-        if stamps:
-            raise RetiredPackageInterfaceMember(
-                f"{source}: {path} carries stamps {sorted(stamps)}; stamps are deleted "
-                "(model-code-fit D1): a semantic twin is a component name or a config fact",
-                code="package_interface.stamps_retired",
-                fields=[path],
-            )
-    if "source_profile" in slot:
-        raise RetiredPackageInterfaceMember(
-            f"{source}: {path} carries source_profile; capability is the slot's class "
-            "annotation (cr-077)",
-            code="package_interface.source_profile_retired",
-            fields=[path],
-        )
 
 
 def _subset_object(value: Json, allowed: set[str], source: str, path: str) -> None:

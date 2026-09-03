@@ -1,37 +1,36 @@
-"""The bounded derive child: request/response documents and the launcher.
+"""The private bounded child for request-time model construction.
 
-`cozy-runtime derive` runs the meta-device derivation in ONE bounded child of the package's
-own interpreter — no network, no weight bytes, no writes, no subprocesses, no CUDA, a memory
-and CPU cap. This module is the seam every caller shares: the verb, local placement, and worker
-package preparation all hand a request here and read a response back. The derive machinery itself
-is imported by the CHILD (`cozy_runtime.cli.derive --derive-child`), never by a caller, so
-the worker's preparation plane stays derive-free by import while `Slot.components` is still
-what the derive constructed (model-code-fit D9).
+The worker sends config bytes through a pipe to the package's own interpreter. The child
+constructs on ``meta`` and returns transient tensor rows through a pipe; neither side writes,
+names, hashes, or retains a TensorRequirements document.
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
-import os
-import stat
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.author import Artifact, Config, ConformanceError, ModelBinding
 from cozy_runtime.internal import canonical, sandbox
+from cozy_runtime.internal.derive import DeriveError, derive
+from cozy_runtime.internal.discovery import discover, discover_installed
+from cozy_runtime.internal.exits import Exit
 
-REQUEST_FORMAT = "cozy.runtime.derive-request/1"
-RESULT_PREFIX = "COZY_DERIVE="
+RESULT_PREFIX = b"COZY_DERIVE="
 MEMORY_CAP_BYTES = 24 << 30
 CPU_CAP_SECONDS = 600
 WALL_CAP_SECONDS = 900
 
+RequirementRow = tuple[str, str, str | None, tuple[int, ...]]
+
 
 class DeriveRefusal(Exception):
-    """One stable derive refusal, carried across the child boundary."""
+    """One stable construction refusal carried across the child boundary."""
 
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(f"{code}: {detail}")
@@ -44,15 +43,10 @@ class SlotRequest:
     slot: str
     config: bytes
 
-    @property
-    def config_digest(self) -> str:
-        return "sha256:" + hashlib.sha256(self.config).hexdigest()
-
 
 @dataclass(frozen=True, slots=True)
 class DeriveRequest:
-    """What one child derives: the package (a project tree, or an installed application)
-    and one config document per slot path. Sorted unique by slot."""
+    """One config per sorted, unique package model-slot path."""
 
     slots: tuple[SlotRequest, ...]
     project: Path | None = None
@@ -65,58 +59,21 @@ class DeriveRequest:
             else {"project": str(self.project)}
         )
         return {
-            "format": REQUEST_FORMAT,
             "package": package,
             "slots": [
-                {"slot": s.slot, "config": base64.b64encode(s.config).decode()} for s in self.slots
+                {"slot": row.slot, "config": base64.b64encode(row.config).decode()}
+                for row in self.slots
             ],
         }
-
-    def write(self, path: Path) -> Path:
-        path.write_bytes(canonical.write(self.render()))
-        return path
 
 
 @dataclass(frozen=True, slots=True)
 class TensorRequirements:
-    """One slot's canonical TensorRequirements bytes and their identity."""
+    """Transient request-time rows. This value is never a file or durable identity."""
 
     slot: str
-    config_digest: str
-    document: bytes
-
-    @property
-    def digest(self) -> str:
-        return "sha256:" + hashlib.sha256(self.document).hexdigest()
-
-
-def constructed_components(document: bytes) -> tuple[str, ...]:
-    """The construction order TensorRequirements records, read back off its bytes."""
-    value = canonical.parse_canonical(document)
-    if not isinstance(value, dict):
-        raise DeriveRefusal("derive_child_invalid", "TensorRequirements is an object")
-    order = value.get("constructed_components")
-    if not isinstance(order, list) or not order or not all(isinstance(c, str) for c in order):
-        raise DeriveRefusal(
-            "derive_child_invalid",
-            "TensorRequirements.constructed_components is a non-empty name list",
-        )
-    return tuple(order)
-
-
-def read_exact(path: Path, name: str) -> bytes:
-    try:
-        info = path.lstat()
-    except OSError as err:
-        raise DeriveRefusal("derive_input_unreadable", f"{name}: {path}: {err.strerror}") from err
-    if not stat.S_ISREG(info.st_mode):
-        raise DeriveRefusal("derive_input_invalid", f"{name}: {path} is not a regular file")
-    if not 0 < info.st_size <= canonical.DOC_MAX_BYTES:
-        raise DeriveRefusal("derive_input_invalid", f"{name}: {path} has length {info.st_size}")
-    raw = path.read_bytes()
-    if len(raw) != info.st_size:
-        raise DeriveRefusal("derive_input_invalid", f"{name}: {path} changed while it was read")
-    return raw
+    rows: tuple[RequirementRow, ...]
+    components: tuple[str, ...]
 
 
 def read_request(raw: bytes) -> DeriveRequest:
@@ -124,10 +81,8 @@ def read_request(raw: bytes) -> DeriveRequest:
         value = canonical.parse_canonical(raw)
     except canonical.CanonicalError as err:
         raise DeriveRefusal("derive_request_invalid", str(err)) from err
-    if not isinstance(value, dict) or set(value) != {"format", "package", "slots"}:
+    if not isinstance(value, dict) or set(value) != {"package", "slots"}:
         raise DeriveRefusal("derive_request_invalid", "request field set")
-    if value["format"] != REQUEST_FORMAT:
-        raise DeriveRefusal("derive_request_invalid", f"format {value['format']!r}")
     package = value["package"]
     if not isinstance(package, dict) or len(package) != 1:
         raise DeriveRefusal("derive_request_invalid", "package names a project or an application")
@@ -144,11 +99,11 @@ def read_request(raw: bytes) -> DeriveRequest:
             raise DeriveRefusal("derive_request_invalid", "application is <module>:<attribute>")
     else:
         raise DeriveRefusal("derive_request_invalid", "package names a project or an application")
-    rows = value["slots"]
-    if not isinstance(rows, list) or not rows:
+    encoded_rows = value["slots"]
+    if not isinstance(encoded_rows, list) or not encoded_rows:
         raise DeriveRefusal("derive_request_invalid", "slots is a non-empty array")
     slots: list[SlotRequest] = []
-    for row in rows:
+    for row in encoded_rows:
         if not isinstance(row, dict) or set(row) != {"slot", "config"}:
             raise DeriveRefusal("derive_request_invalid", "slot row field set")
         slot = row["slot"]
@@ -157,71 +112,52 @@ def read_request(raw: bytes) -> DeriveRequest:
             raise DeriveRefusal("derive_request_invalid", f"slot {slot!r}")
         try:
             config = base64.b64decode(encoded, validate=True)
-            value = canonical.parse_canonical(config)
+            document = canonical.parse_canonical(config)
         except (ValueError, canonical.CanonicalError) as err:
             raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} config: {err}") from err
-        if not isinstance(value, dict):
+        if not isinstance(document, dict):
             raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} config is not an object")
         slots.append(SlotRequest(slot, config))
-    names = [s.slot for s in slots]
+    names = [row.slot for row in slots]
     if names != sorted(set(names)):
         raise DeriveRefusal("derive_request_invalid", "slots are sorted unique by path")
     return DeriveRequest(tuple(slots), project=project, application=application)
 
 
-def derive_in(
-    python: Path, request: DeriveRequest, scratch: Path
-) -> tuple[TensorRequirements, ...]:
-    """Run the bounded child in `python`'s environment and read back TensorRequirements per
-    requested slot. `scratch` holds the request document the child reads."""
-    scratch.mkdir(parents=True, exist_ok=True)
-    request_path = request.write(scratch / f"derive-request-{os.getpid()}.json")
+def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements, ...]:
+    """Construct in the package interpreter and return only transient in-memory rows."""
+
     child_env = sandbox.child_environment({})
     child_env.update(
         {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0", "PYTHONNOUSERSITE": "1"}
     )
     try:
         result = subprocess.run(
-            [
-                str(python),
-                "-I",
-                # -I implies -E, which DISCARDS PYTHONDONTWRITEBYTECODE from the child
-                # environment; -B is the flag form the isolation cannot strip. Without it,
-                # importing any module whose bytecode cache is stale trips the sandbox's
-                # no_filesystem_writes fence on the .pyc write (found live, cr-067 e2e).
-                "-B",
-                "-m",
-                "cozy_runtime.cli.derive",
-                "--derive-child",
-                str(request_path),
-            ],
+            [str(python), "-I", "-B", "-m", "cozy_runtime.internal.derive_child"],
             cwd="/",
             env=child_env,
+            input=canonical.write(request.render()),
             capture_output=True,
-            text=True,
             timeout=WALL_CAP_SECONDS,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as err:
         raise DeriveRefusal("derive_child_failed", f"{type(err).__name__}: {err}") from err
-    finally:
-        request_path.unlink(missing_ok=True)
     encoded = next(
         (
             line.removeprefix(RESULT_PREFIX)
             for line in reversed(result.stdout.splitlines())
             if line.startswith(RESULT_PREFIX)
         ),
-        "",
+        b"",
     )
     if not encoded:
-        stderr = result.stderr.strip()
+        stderr = result.stderr.decode(errors="replace").strip()
         if "No module named cozy_runtime" in stderr or "No module named 'cozy_runtime'" in stderr:
             raise DeriveRefusal(
                 "derive_runtime_absent",
-                f"{python}: its cozy-runtime carries no `derive` verb (the package's lock "
-                "selects an older runtime than the one preparing it); relock the package to "
-                "a runtime that carries it",
+                f"{python}: its cozy-runtime has no private request-time derivation worker; "
+                "relock the package to the current runtime",
             )
         raise DeriveRefusal(
             "derive_child_failed",
@@ -246,51 +182,160 @@ def derive_in(
 def read_response(
     response: Mapping[str, Any], request: DeriveRequest
 ) -> tuple[TensorRequirements, ...]:
-    if set(response) != {"requirements"}:
-        raise DeriveRefusal("derive_child_invalid", "child result has an open field set")
-    rows = response["requirements"]
-    if not isinstance(rows, list):
-        raise DeriveRefusal("derive_child_invalid", "requirements is not an array")
+    if set(response) != {"requirements"} or not isinstance(response["requirements"], list):
+        raise DeriveRefusal("derive_child_invalid", "requirements field")
     out: list[TensorRequirements] = []
-    for row in rows:
-        if not isinstance(row, dict) or set(row) != {
-            "slot",
-            "config_digest",
-            "digest",
-            "length",
-            "bytes",
-        }:
+    for answer in response["requirements"]:
+        if not isinstance(answer, dict) or set(answer) != {"slot", "components", "tensors"}:
             raise DeriveRefusal("derive_child_invalid", "requirements row field set")
-        try:
-            raw = base64.b64decode(str(row["bytes"]), validate=True)
-        except ValueError as err:
-            raise DeriveRefusal("derive_child_invalid", "requirements bytes base64") from err
-        held = TensorRequirements(str(row["slot"]), str(row["config_digest"]), raw)
-        if held.digest != row["digest"] or len(raw) != row["length"]:
-            raise DeriveRefusal("derive_child_invalid", "requirements stored-byte identity")
-        out.append(held)
-    if [(t.slot, t.config_digest) for t in out] != [
-        (s.slot, s.config_digest) for s in request.slots
-    ]:
+        components = answer["components"]
+        tensors = answer["tensors"]
+        if (
+            not isinstance(components, list)
+            or not components
+            or not all(isinstance(component, str) and component for component in components)
+            or len(set(components)) != len(components)
+            or not isinstance(tensors, list)
+        ):
+            raise DeriveRefusal("derive_child_invalid", "requirements shape")
+        rows: list[RequirementRow] = []
+        for tensor in tensors:
+            if not isinstance(tensor, dict) or set(tensor) != {
+                "component",
+                "key",
+                "dtype",
+                "shape",
+            }:
+                raise DeriveRefusal("derive_child_invalid", "tensor row field set")
+            component, key, dtype, shape = (
+                tensor["component"],
+                tensor["key"],
+                tensor["dtype"],
+                tensor["shape"],
+            )
+            if (
+                not isinstance(component, str)
+                or component not in components
+                or not isinstance(key, str)
+                or not key
+                or (dtype is not None and not isinstance(dtype, str))
+                or not isinstance(shape, list)
+                or not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in shape)
+            ):
+                raise DeriveRefusal("derive_child_invalid", "tensor row value")
+            rows.append((component, key, dtype, tuple(shape)))
+        out.append(TensorRequirements(str(answer["slot"]), tuple(rows), tuple(components)))
+    if [answer.slot for answer in out] != [row.slot for row in request.slots]:
         raise DeriveRefusal("derive_child_invalid", "rows do not answer the requested slots")
     return tuple(out)
 
 
-def emit(value: Mapping[str, Any]) -> None:
-    """The child's one output line: a canonical document, base64, behind the prefix."""
-    print(RESULT_PREFIX + base64.b64encode(canonical.write(dict(value))).decode())
-
-
-def render(requirements: Sequence[TensorRequirements]) -> dict[str, Any]:
+def _render(requirements: Sequence[TensorRequirements]) -> dict[str, Any]:
     return {
         "requirements": [
             {
-                "slot": t.slot,
-                "config_digest": t.config_digest,
-                "digest": t.digest,
-                "length": len(t.document),
-                "bytes": base64.b64encode(t.document).decode(),
+                "slot": answer.slot,
+                "components": list(answer.components),
+                "tensors": [
+                    {
+                        "component": component,
+                        "key": key,
+                        "dtype": dtype,
+                        "shape": list(shape),
+                    }
+                    for component, key, dtype, shape in answer.rows
+                ],
             }
-            for t in requirements
+            for answer in requirements
         ]
     }
+
+
+def _emit(value: Mapping[str, Any]) -> None:
+    sys.stdout.buffer.write(RESULT_PREFIX + base64.b64encode(canonical.write(dict(value))) + b"\n")
+
+
+def _derive_twice(binding: ModelBinding, config: Config) -> TensorRequirements:
+    """A transient derivation must still be deterministic within one request."""
+
+    def once() -> TensorRequirements:
+        result = derive(
+            binding.model_class(),
+            Artifact("derive://request", {}, config, custody="canonical"),
+            component_use=binding.components,
+        )
+        rows = tuple(
+            (component, key, dtype, tuple(shape))
+            for component, key, dtype, shape in result.rows()
+        )
+        return TensorRequirements(binding.path, rows, result.components)
+
+    first = once()
+    if once() != first:
+        raise DeriveRefusal(
+            "derive_nondeterministic", f"{binding.path} produced different tensor rows on rebuild"
+        )
+    return first
+
+
+def _warm_torch() -> None:
+    """Warm torch's lazy imports before rlimits, never package code or a GPU."""
+
+    __import__("torch")
+    for name in ("torch._dynamo", "torch._refs"):
+        try:
+            __import__(name)
+        except ModuleNotFoundError as err:
+            if err.name != name:
+                raise
+
+
+def main() -> int:
+    try:
+        request = read_request(sys.stdin.buffer.read(canonical.DOC_MAX_BYTES + 1))
+        _warm_torch()
+        sandbox.install(allow_write_prefixes=())
+        sandbox.bound(address_bytes=MEMORY_CAP_BYTES, cpu_seconds=CPU_CAP_SECONDS)
+        found = (
+            discover(request.project)
+            if request.project is not None
+            else discover_installed(request.application)
+        )
+        bindings = {
+            binding.path: binding
+            for surface in found.surfaces
+            if not surface.hidden
+            for binding in surface.model_bindings
+        }
+        requirements: list[TensorRequirements] = []
+        for row in request.slots:
+            binding = bindings.get(row.slot)
+            if binding is None:
+                raise DeriveRefusal(
+                    "derive_slot_unknown",
+                    f"{row.slot!r} is no model slot of this package "
+                    f"(have {', '.join(sorted(bindings)) or 'none'})",
+                )
+            document = canonical.parse_canonical(row.config)
+            if not isinstance(document, dict):
+                raise DeriveRefusal("derive_input_invalid", f"{row.slot}: config is not an object")
+            requirements.append(_derive_twice(binding, Config(document, "config")))
+    except DeriveRefusal as err:
+        _emit({"error": err.code, "detail": err.detail})
+        return int(Exit.structural)
+    except ConformanceError as err:
+        _emit({"error": str(getattr(err, "code", "derive_conformance")), "detail": str(err)})
+        return int(Exit.structural)
+    except (DeriveError, sandbox.FenceViolation) as err:
+        name = getattr(err, "construct", None) or getattr(err, "fence", None)
+        _emit({"error": str(name or "derive_refused"), "detail": str(err)})
+        return int(Exit.structural)
+    except Exception as err:
+        _emit({"error": "derive_internal", "detail": f"{type(err).__name__}: {err}"})
+        return int(Exit.internal)
+    _emit(_render(requirements))
+    return int(Exit.ok)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

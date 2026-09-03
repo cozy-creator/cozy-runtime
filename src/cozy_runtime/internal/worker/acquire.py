@@ -289,10 +289,6 @@ def preinstalled_development(
     _verify_file(interface_path, interface_digest, interface_length)
     try:
         interface = package_interface.read_bytes(interface_path.read_bytes(), str(interface_path))
-    except package_interface.RetiredPackageInterfaceMember as exc:
-        raise AcquisitionRefusal(
-            pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
-        ) from exc
     except package_interface.StalePackageInterface as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
@@ -645,10 +641,6 @@ class Acquirer:
             interface = package_interface.read_bytes(
                 interface_path.read_bytes(), str(interface_path)
             )
-        except package_interface.RetiredPackageInterfaceMember as exc:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, exc.code, exc.message
-            ) from exc
         except package_interface.StalePackageInterface as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "package_interface_invalid", str(exc)
