@@ -1,7 +1,10 @@
 [project]
 name = "cozy-runtime"
-version = "0.2.17"
+version = "0.2.18"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
+# The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
+# the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
+license-files = ["native/LICENSE", "native/NOTICE"]
 requires-python = ">=3.12,<3.13"
 # The worker speaks `cozy.worker.v1` (worker-protocol/01), so the bindings' two runtimes are
 # ordinary dependencies of the runtime package. The BINDINGS themselves are copied into
@@ -48,8 +51,13 @@ testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 
 [build-system]
+# ONE package, two wheel files per release (cr-094). The in-tree shim delegates to
+# hatchling — the toolchain-free default producing the py3-none-any wheel and the sdist —
+# and, only when COZY_RUNTIME_BUILD_KERNELS=1, to scikit-build-core, which compiles
+# `native/` into `cozy_runtime/_kernels/_C.abi3.so` and tags the wheel cp312-abi3.
 requires = ["hatchling"]
-build-backend = "hatchling.build"
+build-backend = "dual_build_backend"
+backend-path = ["scripts"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cozy_runtime", "src/cozy"]
@@ -57,15 +65,17 @@ packages = ["src/cozy_runtime", "src/cozy"]
 [tool.uv]
 package = true
 
-[tool.uv.workspace]
-members = ["packages/*"]
-
-[tool.uv.sources]
-cozy-runtime-cuda-kernels = { workspace = true }
+# Read only on the COZY_RUNTIME_BUILD_KERNELS=1 wheel build; the root CMakeLists.txt is
+# the reviewed kernels build (static cudart, abi3, the upstream fleet arch policy).
+[tool.scikit-build]
+minimum-version = "1.0"
+cmake.build-type = "Release"
+wheel.packages = ["src/cozy_runtime", "src/cozy"]
+wheel.py-api = "cp312"
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "checks", "tests", "examples", "packages/cozy-runtime-cuda-kernels/src"]
+files = ["src", "checks", "tests", "examples"]
 # The bindings live under the PROTO PACKAGE PATH (`src/cozy/worker/v1`) and are PEP 420
 # namespace packages — no `__init__.py`, because protoc writes none and the copy is
 # byte-identical. mypy needs the source roots stated for that, or it maps
@@ -146,11 +156,6 @@ media = [
 # Runtime owns the model byte plane. Local package environments select this complete
 # capability; base worker images provide TensorFS from the same PyPI range.
 model-execution = ["tensorfs>=0.3.1,<1"]
-# Optional fused Anima CUDA kernels. nanobind + DLPack over the CUDA runtime, abi3: one
-# build serves every NVIDIA image profile (cr-091); non-CUDA profiles keep eager execution.
-cuda-kernels = [
-    "cozy-runtime-cuda-kernels==0.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
 
 [[tool.mypy.overrides]]
 # grpcio ships no type information; the stub module is generated.
@@ -160,7 +165,7 @@ follow_imports = "skip"
 
 [tool.ruff]
 line-length = 100
-src = ["src", "checks", "tests", "examples", "packages"]
+src = ["src", "checks", "tests", "examples", "scripts"]
 # Generated bindings: protoc's line lengths and import style are not ours to lint.
 extend-exclude = ["src/cozy/worker/v1/worker_pb2.py",
                   "src/cozy/worker/v1/worker_pb2_grpc.py",

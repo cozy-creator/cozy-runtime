@@ -37,7 +37,6 @@ _UV_VERSION = re.compile(r"uv ([0-9]+(?:\.[0-9]+){1,3})(?: \([^\n]+\))?")
 # packages, which stay package-owned.
 _PROTECTED_IMPORT_ROOTS = {
     "cozy-runtime": ("cozy", "cozy_runtime"),
-    "cozy-runtime-cuda-kernels": ("cozy_runtime_cuda_kernels",),
     "msgspec": ("msgspec",),
     "numpy": ("numpy",),
     "pillow": ("PIL",),

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.26)
-project(cozy_runtime_cuda_kernels LANGUAGES CXX CUDA)
+project(cozy_runtime_kernels LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,4 +34,4 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(_C PRIVATE -Wl,--build-id=none)
 endif()
 set_target_properties(_C PROPERTIES SUFFIX ".abi3.so")
-install(TARGETS _C LIBRARY DESTINATION cozy_runtime_cuda_kernels)
+install(TARGETS _C LIBRARY DESTINATION cozy_runtime/_kernels)
