@@ -293,6 +293,7 @@ class ModelBinding:
             "custody": self.custody,
         }
 
+
 @dataclass(frozen=True, slots=True)
 class DeclaredBinding:
     """Runtime's private resolved value for one canonical entrypoint binding.

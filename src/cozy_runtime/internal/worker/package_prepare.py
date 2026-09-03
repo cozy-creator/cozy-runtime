@@ -727,9 +727,7 @@ def _deriver(installed: package_environment.InstalledEnvironment, application: s
     this plane never reads it off the header. The child imports the derive machinery; this
     plane imports only the request/response seam (cr-067's guard, kept by construction)."""
 
-    def derive(
-        slot: str, config_bytes: bytes, assets: Mapping[str, bytes]
-    ) -> tuple[str, ...]:
+    def derive(slot: str, config_bytes: bytes, assets: Mapping[str, bytes]) -> tuple[str, ...]:
         if not application:
             raise PreparationRefusal("package_prepare_interface_invalid", "application")
         try:

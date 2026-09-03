@@ -602,6 +602,7 @@ class ConstructionRecord:
     """The `ok` Fit document this construction was judged by, verbatim; None where no
     header was there to judge against (derive mode)."""
 
+
 # --------------------------------------------------------------------------- loader
 
 

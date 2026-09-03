@@ -290,8 +290,7 @@ def _derive_twice(
             component_use=binding.components,
         )
         rows = tuple(
-            (component, key, dtype, tuple(shape))
-            for component, key, dtype, shape in result.rows()
+            (component, key, dtype, tuple(shape)) for component, key, dtype, shape in result.rows()
         )
         return TensorRequirements(binding.path, rows, result.components)
 
@@ -323,9 +322,7 @@ def main() -> int:
     try:
         raw = sys.stdin.buffer.read(PIPE_CAP_BYTES + 1)
         if len(raw) > PIPE_CAP_BYTES:
-            raise DeriveRefusal(
-                "derive_request_invalid", f"request exceeds {PIPE_CAP_BYTES} bytes"
-            )
+            raise DeriveRefusal("derive_request_invalid", f"request exceeds {PIPE_CAP_BYTES} bytes")
         request = read_request(raw)
         _warm_torch()
         sandbox.install(allow_write_prefixes=())

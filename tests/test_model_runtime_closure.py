@@ -122,9 +122,7 @@ def test_model_prep_still_requires_header_assets(tmp_path: Path) -> None:
 
 
 def test_loader_consumes_verified_header_assets(tmp_path: Path) -> None:
-    store_root, manifest_id, _manifest_length, _store = _snapshot(
-        tmp_path, include_asset=True
-    )
+    store_root, manifest_id, _manifest_length, _store = _snapshot(tmp_path, include_asset=True)
     assets = fill.Checkpoint(store_root, manifest_id).model_assets()
     assert assets == {"tokenizer/vocab.txt": _ASSET}
 

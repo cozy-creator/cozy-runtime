@@ -10,14 +10,14 @@ The three structures must never be conflated (§1.1.1):
 
 * `full` carries the timestep embedder, every block AdaLN projection and the final
   modulation projection. Tables are computed live under the transformer's own lease.
-* `curve` is the community pruned topology: a small shared interpolated curve plus narrow
+* `curve` is the community pruned tensor schema: a shared interpolated curve plus narrow
   projections. It still EXECUTES projections and changes numeric semantics. It is a
   separately quality-approved lane, never shorthand for a baked table.
 * `baked` carries exact modulation tables for a closed set of denoise plans and OMITS the
   projection weights. An uncovered plan cannot fall back inside this artifact.
 
 They differ by CONSTRUCTION, not by a request mode: `baked` physically lacks weights that
-`full` contains, so the topology cannot change without selecting a different generation.
+`full` contains, so the tensor schema cannot change without selecting a different generation.
 """
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ def _block(width: int, structure: Structure, index: int) -> nn.Module:
         # calls removable from inference-only loading once the outputs are cached
         block.adaln_proj = nn.Linear(width, width * 6, dtype=torch.bfloat16)  # type: ignore[assignment]
     elif structure == "curve":
-        # the community pruned topology: a NARROW projection over a shared curve
+        # the community pruned tensor schema: a NARROW projection over a shared curve
         block.adaln_narrow = nn.Linear(width // 4, width * 6, bias=False, dtype=torch.bfloat16)  # type: ignore[assignment]
     else:
         # baked: the exact table IS checkpoint data, and the projection does not exist
@@ -236,7 +236,7 @@ class _H3Base(Model[H3Pipeline]):
     def _load(self, loader: Loader, *, task: Task) -> None:
         self.pipe = loader.construct(H3Pipeline, factory=lambda config: build_h3(config, task=task))
         if self.pipe.structure != "baked":
-            # exactly one modulation source exists per bound topology (§1.1.1); a baked
+            # exactly one modulation source exists per bound tensor schema (§1.1.1); a baked
             # construction never touches this cache
             self.tables = loader.cache("adaln_modulation_tables", max_entries=8)
 

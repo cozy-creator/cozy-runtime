@@ -78,7 +78,7 @@ def build_sdxl(config: Config) -> SdxlPipeline:
 
 
 class SdxlModel(Model[SdxlPipeline]):
-    """No class keyword: SDXL admits by PURE TOPOLOGY SATISFACTION (§1.1)."""
+    """No class keyword: SDXL admits by pure tensor-schema satisfaction (§1.1)."""
 
     pipe: SdxlPipeline
 

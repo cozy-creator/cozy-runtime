@@ -18,7 +18,7 @@ import traceback
 from typing import Any
 
 from corpus.harness import Case, diff, ground_truth_census, model_for, weights_for
-from cozy_runtime.internal import canonical, sandbox
+from cozy_runtime.internal import sandbox
 from cozy_runtime.internal.derive import ConstructionFault, HarnessGap, derive
 
 MEMORY_CAP = 24 << 30
@@ -71,7 +71,6 @@ def run(case: Case) -> dict[str, Any]:
             traceback=traceback.format_exc()[-1200:],
         )
     else:
-        out["digest"] = canonical.digest(result.code_topology())
         out["destinations"] = len(result.logical_tensors)
         out["derived_tensors"] = len(result.derived)
         out["components"] = list(result.components)

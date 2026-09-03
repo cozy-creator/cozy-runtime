@@ -1279,9 +1279,7 @@ class StreamingFillBackend:
                     key=key,
                     shape=list(shape),
                     logical_dtype=(
-                        None
-                        if dtype_name(dtype) in ("bf16", "f16")
-                        else dtype_name(dtype)
+                        None if dtype_name(dtype) in ("bf16", "f16") else dtype_name(dtype)
                     ),
                 )
                 for component, key, dtype, shape in rows

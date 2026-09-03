@@ -24,7 +24,7 @@ class SdxlUnetPipeline:
 
     Deliberately the SINGLE-component case: SDXL's four-component whole-pipeline shape is
     already derived in `corpus/sdxl.py`, and what cr-005 needs from this fixture is a real
-    5 GB DestinationSet on an 8 GiB card, not a second copy of the same topology exercise.
+    5 GB DestinationSet on an 8 GiB card, not a second copy of the tensor-schema exercise.
     """
 
     def __init__(self, config: Config) -> None:
@@ -43,7 +43,7 @@ def build_unet(config: Config) -> SdxlUnetPipeline:
 
 
 class SdxlUnetModel(Model[SdxlUnetPipeline]):
-    """No class keyword: this admits by pure topology satisfaction, like `SdxlModel`."""
+    """No class keyword: this admits by pure tensor-schema satisfaction, like `SdxlModel`."""
 
     pipe: SdxlUnetPipeline
 
