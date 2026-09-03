@@ -156,7 +156,7 @@ class _Replayed:
     def add_part(self, component: str, key: str, role: str, data: object) -> None:
         raise AssertionError("a replayed transaction writes nothing")
 
-    def add_config(self, name: str, data: object) -> None:
+    def add_config(self, name: str, data: object, length: int) -> None:
         raise AssertionError("a replayed transaction writes nothing")
 
     def commit(self) -> WeightsReceipt:
@@ -188,7 +188,7 @@ class _Transaction:
         assert isinstance(data, (bytes, bytearray, memoryview))
         self.parts[(component, key, role)] = bytes(data)
 
-    def add_config(self, name: str, data: object) -> None:
+    def add_config(self, name: str, data: object, length: int) -> None:
         raise AssertionError("these lanes only inherit configs")
 
     def commit(self) -> WeightsReceipt:

@@ -51,6 +51,40 @@ class WeightsHostBinding:
     weights_receipt_digest: bytes = b""
 
 
+class _ExactReader:
+    """Expose exactly one declared stream length to TensorFS, then prove EOF."""
+
+    __slots__ = ("ended", "remaining", "source")
+
+    def __init__(self, source: Readable, length: int) -> None:
+        self.source = source
+        self.remaining = length
+        self.ended = False
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+        if self.remaining:
+            want = self.remaining if size < 0 else min(size, self.remaining)
+            chunk = self.source.read(want)
+            if not isinstance(chunk, bytes) or not chunk or len(chunk) > want:
+                raise CapabilityError(
+                    "weights config stream ended before its declared length",
+                    code="weights_config_length",
+                )
+            self.remaining -= len(chunk)
+            return chunk
+        if not self.ended:
+            extra = self.source.read(1)
+            if not isinstance(extra, bytes) or extra:
+                raise CapabilityError(
+                    "weights config stream exceeded its declared length",
+                    code="weights_config_length",
+                )
+            self.ended = True
+        return b""
+
+
 def exchange_file(spool: Path, output_slot: str, kind: str) -> Path:
     """One worker-chosen spool file; no child-authored path crosses the seam."""
     if _OUTPUT_SLOT.fullmatch(output_slot) is None or kind not in _EXCHANGE_KINDS:
@@ -377,24 +411,26 @@ class WeightsTransactionHost:
 
     @staticmethod
     def _config(config: WeightsConfig) -> dict[str, Any]:
-        value: dict[str, Any] = {}
         if config.source:
-            value.update(source=config.source, source_config=config.source_config)
-        if config.data is not None:
-            known = (
-                len(config.data)
-                if isinstance(config.data, (bytes, bytearray, memoryview))
-                else config.length
-            )
-            value.update(media_type=config.media_type, length=known)
-        return value
+            return {
+                "kind": "derive" if config.data is not None else "copy",
+                "source": config.source,
+                "source_config": config.source_config,
+            }
+        return {"kind": "add"}
 
     @staticmethod
-    def _reader(source: WeightsBytes) -> Readable:
+    def _reader(source: WeightsBytes, *, length: int | None = None) -> Readable:
         if isinstance(source, (bytes, bytearray, memoryview)):
-            return BytesIO(bytes(source))
+            raw = bytes(source)
+            if length is not None and len(raw) != length:
+                raise CapabilityError(
+                    "weights config bytes differ from their declared length",
+                    code="weights_config_length",
+                )
+            return BytesIO(raw)
         if isinstance(source, Readable):
-            return source
+            return source if length is None else _ExactReader(source, length)
         raise CapabilityError("weights part source is not readable", code="weights_part_source")
 
     @staticmethod
@@ -471,9 +507,10 @@ class OpenedWeightsTransaction:
             lambda writer: writer.add_part(component, key, role, self.host._reader(data)),
         )
 
-    def add_config(self, name: str, data: WeightsBytes) -> None:
+    def add_config(self, name: str, data: WeightsBytes, length: int) -> None:
         self._call(
-            "weights config", lambda writer: writer.add_config(name, self.host._reader(data))
+            "weights config",
+            lambda writer: writer.add_config(name, self.host._reader(data, length=length)),
         )
 
     def commit(self) -> WeightsReceipt:
