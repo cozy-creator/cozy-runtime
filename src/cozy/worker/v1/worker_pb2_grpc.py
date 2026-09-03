@@ -154,10 +154,12 @@ class WorkerControl(object):
 
 class RuntimePreparationStub(object):
     """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
-    service on its external listener. Runtime receives logical refs, hub-known release facts, and
-    (local packages only) verified local wheel paths: no presigned URL, delegation signature,
-    worker TLS credential, or index bearer. The anonymous public index directives inside
-    locked_requirements are the one origin that crosses — an https URL, never a credential.
+    service on its external listener. Runtime receives logical refs, hub-known release facts,
+    (local packages only) verified local wheel paths, and — from minor 32 — BOTH halves of the
+    signed download delegation, because the party that resolves a model's closure against the hub
+    is now Runtime's own TensorFS: no presigned URL, worker TLS credential, or index bearer. The
+    anonymous public index directives inside locked_requirements are the other origin that
+    crosses — an https URL, never a credential.
     """
 
     def __init__(self, channel):
@@ -195,10 +197,12 @@ class RuntimePreparationStub(object):
 
 class RuntimePreparationServicer(object):
     """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
-    service on its external listener. Runtime receives logical refs, hub-known release facts, and
-    (local packages only) verified local wheel paths: no presigned URL, delegation signature,
-    worker TLS credential, or index bearer. The anonymous public index directives inside
-    locked_requirements are the one origin that crosses — an https URL, never a credential.
+    service on its external listener. Runtime receives logical refs, hub-known release facts,
+    (local packages only) verified local wheel paths, and — from minor 32 — BOTH halves of the
+    signed download delegation, because the party that resolves a model's closure against the hub
+    is now Runtime's own TensorFS: no presigned URL, worker TLS credential, or index bearer. The
+    anonymous public index directives inside locked_requirements are the other origin that
+    crosses — an https URL, never a credential.
     """
 
     def CheckPackageSetCompatibility(self, request, context):
@@ -269,10 +273,12 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class RuntimePreparation(object):
     """Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
-    service on its external listener. Runtime receives logical refs, hub-known release facts, and
-    (local packages only) verified local wheel paths: no presigned URL, delegation signature,
-    worker TLS credential, or index bearer. The anonymous public index directives inside
-    locked_requirements are the one origin that crosses — an https URL, never a credential.
+    service on its external listener. Runtime receives logical refs, hub-known release facts,
+    (local packages only) verified local wheel paths, and — from minor 32 — BOTH halves of the
+    signed download delegation, because the party that resolves a model's closure against the hub
+    is now Runtime's own TensorFS: no presigned URL, worker TLS credential, or index bearer. The
+    anonymous public index directives inside locked_requirements are the other origin that
+    crosses — an https URL, never a credential.
     """
 
     @staticmethod
