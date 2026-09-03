@@ -1423,6 +1423,8 @@ class Worker:
                     environment_root=Path(self.options.environment_root or ""),
                     python=Path(self.options.python or sys.executable),
                     base=self.base,
+                    native_environment=self.native_environment(),
+                    native_device_index=self.native_device_index(),
                 )
             except package_prepare.PreparationRefusal as exc:
                 return pb.CheckPackageSetCompatibilityResult(

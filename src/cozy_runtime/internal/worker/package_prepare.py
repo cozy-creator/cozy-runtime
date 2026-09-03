@@ -127,6 +127,8 @@ def check_package_set_compatibility(
     environment_root: Path,
     python: Path,
     base: base_observation.Observation | None = None,
+    native_environment: Mapping[str, str] | None = None,
+    native_device_index: int = 0,
 ) -> pb.CheckPackageSetCompatibilityResult:
     """Fit package code against headers while tensor bodies are still downloading.
 
@@ -177,6 +179,8 @@ def check_package_set_compatibility(
         python=python,
         inventory=inventory,
         base=base,
+        native_environment=native_environment,
+        native_device_index=native_device_index,
     )
     candidates = _compatibility_models(request.files, models, set_root=set_root)
     described = {
@@ -248,6 +252,8 @@ def _compatibility_environment(
     python: Path,
     inventory: image_inventory.Inventory,
     base: base_observation.Observation | None,
+    native_environment: Mapping[str, str] | None = None,
+    native_device_index: int = 0,
 ) -> package_environment.InstalledEnvironment:
     try:
         observed = base or package_environment.observe_base(python)
@@ -325,6 +331,8 @@ def _compatibility_environment(
             environment_root,
             python=python,
             base=observed,
+            native_environment=native_environment,
+            native_device_index=native_device_index,
         )
     except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
         raise PreparationRefusal(
