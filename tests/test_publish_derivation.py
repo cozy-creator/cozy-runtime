@@ -33,6 +33,7 @@ from cozy_runtime.internal import canonical, package_environment, package_interf
 from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
+    check_package_set_compatibility,
     prepare_package_set,
 )
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -506,6 +507,29 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
             assert not list((root / "environments").glob(".uv-cache-*"))
             # The hard guard, observed live: preparing a package never loads derive.
             assert "cozy_runtime.internal.derive" not in sys.modules
+
+            # THE CHECK MUST NOT BE STRICTER THAN THE PREPARATION IT GUARDS. This set
+            # selects no model, and the host runs the compatibility check before every
+            # PreparePackageSet. It handed the derive child an empty slot set, which
+            # refuses `derive_request_invalid: slots is a non-empty array` -- so a set
+            # `prepare_package_set` accepts right above was refused on the pod, naming a
+            # request shape rather than the absent selection. It reuses the generation
+            # the preparation just built, so there is nothing left to fit and nothing to
+            # install.
+            verdict = check_package_set_compatibility(
+                pb.PreparePackageSetRequest(
+                    download_delegation=_delegation("paul/marco-polo", release),
+                    install_root=str(root / "environments"),
+                    application="marco_polo_package:app",
+                    model_slot_paths=[],
+                    image_inventory=_inventory(),
+                    locked_requirements=export,
+                ),
+                tensorfs_root=root / "store",
+                install_root=root / "environments",
+                python=image_python,
+            )
+            assert verdict.refusal_code == "" and verdict.refusal_detail == ""
 
             with pytest.raises(PreparationRefusal) as disagreed:
                 prep("marco_polo_package:other", export)

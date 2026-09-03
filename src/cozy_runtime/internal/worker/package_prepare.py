@@ -415,6 +415,15 @@ def check_package_set_compatibility(
         derive_child.SlotRequest(path, row["config"], row["assets"])
         for path, row in sorted(candidates.items())
     )
+    if not requests:
+        # NOTHING TO FIT. A set that selects no model has no header to check code against,
+        # and the environment half of this check has already run above. Handing the derive
+        # child an empty slot set refuses `derive_request_invalid: slots is a non-empty
+        # array` -- which is how EVERY modelless preparation died on a pod, naming a
+        # request shape rather than the absent selection, while `prepare_package_set`
+        # would have accepted the same set (`_entrypoints` derives nothing when nothing is
+        # selected). The check must not be stricter than the preparation it guards.
+        return pb.CheckPackageSetCompatibilityResult()
     try:
         answers = derive_child.derive_in(
             installed.python,
@@ -537,6 +546,12 @@ def _compatibility_models(
             "release": release,
             "lane": lane,
         }
+    if not selections:
+        # NOTHING SELECTED: no manifest to read, so no Store to open. Opening one anyway
+        # made a modelless set depend on a Store it never touches. `_selected_models`
+        # returns here for the same reason, and the preparation this check guards
+        # therefore accepted sets the check refused.
+        return selections
     by_manifest: dict[str, dict[str, Any]] = {}
     try:
         store = fill.open_store(tensorfs, tensorfs_root)
