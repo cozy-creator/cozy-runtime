@@ -1,8 +1,8 @@
 """Loopback preparation of supervisor-verified foreign model source files.
 
 Networking and credentials end in pod-supervisor. Runtime validates the small transport
-shape, then hands the exact logical rows to TensorFS 0.0.8. It neither plans model formats
-nor interprets CheckpointEvidence.
+shape, then hands the exact logical rows to TensorFS. It neither plans model formats nor
+synthesizes checkpoint metadata.
 """
 
 from __future__ import annotations
