@@ -26,6 +26,7 @@ import select
 import signal
 import stat
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -789,6 +790,7 @@ class _ProcessSnapshot:
     parent_pid: int
     process_group: int
     scope_token: bool
+    sibling_token: bool = False
 
 
 def _open_pidfd(process: ProcessIdentity) -> int:
@@ -832,10 +834,47 @@ def signal_process(process: ProcessIdentity, sig: int) -> None:
         os.close(descriptor)
 
 
+# LIVE SIBLING SCOPES (pod co-hosting). The pod seat's census owns the executor's whole
+# UID domain, which is sound only while one executor exists per UID. A worker hosting one
+# placement per package runs several executors under the one pod UID, so each supervision
+# registers its live scope here and every census attributes a process VISIBLY carrying a
+# live sibling's token to that sibling instead of counting (and killing) it as this
+# scope's resident. Everything else stays fail-closed exactly as before: a process with a
+# scrubbed, unreadable, or unknown token is every scope's leftover, and the last scope a
+# worker retires has no live siblings, so nothing escapes the worker boundary. The
+# registry is worker-process state: a worker restart clears it and the orphan sweep's
+# recovered scopes are dead by definition and never registered.
+_LIVE_PROCESS_SCOPES: dict[str, int] = {}
+_LIVE_PROCESS_SCOPES_LOCK = threading.Lock()
+
+
+def adopt_process_scope(scope: ExecutorScope) -> None:
+    """Mark one just-owned scope live so sibling censuses attribute its processes to it."""
+    if isinstance(scope, ProcessTreeScope):
+        with _LIVE_PROCESS_SCOPES_LOCK:
+            _LIVE_PROCESS_SCOPES[scope.token] = scope.uid
+
+
+def release_process_scope(scope: ExecutorScope) -> None:
+    if isinstance(scope, ProcessTreeScope):
+        with _LIVE_PROCESS_SCOPES_LOCK:
+            _LIVE_PROCESS_SCOPES.pop(scope.token, None)
+
+
+def _sibling_scope_entries(scope: ProcessTreeScope) -> tuple[bytes, ...]:
+    with _LIVE_PROCESS_SCOPES_LOCK:
+        return tuple(
+            f"{EXECUTOR_SCOPE_ENV}={token}".encode()
+            for token, uid in _LIVE_PROCESS_SCOPES.items()
+            if uid == scope.uid and token != scope.token
+        )
+
+
 def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
     """One full proc census, matching the scope as one complete environment entry."""
     _linux_only("process_tree_census")
     expected = f"{EXECUTOR_SCOPE_ENV}={scope.token}".encode()
+    siblings = _sibling_scope_entries(scope)
     process_uid = scope.uid
     uid_domain = process_uid != os.geteuid()
     snapshots: dict[int, _ProcessSnapshot] = {}
@@ -884,6 +923,7 @@ def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
                 parent_pid=int(fields[1]),
                 process_group=int(fields[2]),
                 scope_token=expected in environment,
+                sibling_token=any(entry in environment for entry in siblings),
             )
         except (FileNotFoundError, ProcessLookupError):
             continue
@@ -909,7 +949,9 @@ def _process_tree_census(
     snapshots = _same_uid_processes(scope)
     uid_domain = scope.uid != os.geteuid()
     owned: set[ProcessIdentity] = {
-        row.identity for row in snapshots.values() if uid_domain or row.scope_token
+        row.identity
+        for row in snapshots.values()
+        if row.scope_token or (uid_domain and not row.sibling_token)
     }
     for process in known:
         row = snapshots.get(process.pid)
@@ -925,8 +967,11 @@ def _process_tree_census(
         expanded = {
             row.identity
             for row in snapshots.values()
-            if row.parent_pid in pids
-            or (row.parent_pid == worker_pid and (row.scope_token or row.state == "Z"))
+            if not (row.sibling_token and not row.scope_token)
+            and (
+                row.parent_pid in pids
+                or (row.parent_pid == worker_pid and (row.scope_token or row.state == "Z"))
+            )
         }
         group_id = leader.pid if leader is not None else 0
         group_is_pinned = group_id > 0 and any(
@@ -954,7 +999,7 @@ def process_scope_contains(scope: ProcessTreeScope, process: ProcessIdentity) ->
     return (
         row is not None
         and row.identity == process
-        and (scope.uid != os.geteuid() or row.scope_token)
+        and (row.scope_token or (scope.uid != os.geteuid() and not row.sibling_token))
         and row.process_group == process.pid
     )
 
@@ -1020,7 +1065,8 @@ def process_scope_processes(scope: ProcessTreeScope) -> set[ProcessIdentity]:
     return {
         row.identity
         for row in _same_uid_processes(scope).values()
-        if (uid_domain and row.state not in {"X", "x", "Z"}) or row.scope_token
+        if row.scope_token
+        or (uid_domain and row.state not in {"X", "x", "Z"} and not row.sibling_token)
     }
 
 
