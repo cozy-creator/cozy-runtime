@@ -289,7 +289,7 @@ def test_pod_prep_requires_the_request_facts(tmp_path: Path) -> None:
         return prepare_package_set(
             pb.PreparePackageSetRequest(
                 download_delegation=_delegation("paul/marco-polo", "1.0.4"),
-                environment_root=str(tmp_path / "environment"),
+                install_root=str(tmp_path / "environment"),
                 application=application,
                 model_slot_paths=slots or [],
                 image_inventory=inventory or _inventory(),
@@ -466,7 +466,7 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
                 return prepare_package_set(
                     pb.PreparePackageSetRequest(
                         download_delegation=_delegation("paul/marco-polo", release),
-                        environment_root=str(root / "environments"),
+                        install_root=str(root / "environments"),
                         application=application,
                         model_slot_paths=[],
                         image_inventory=_inventory(),

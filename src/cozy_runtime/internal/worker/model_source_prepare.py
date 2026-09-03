@@ -43,7 +43,7 @@ def prepare_model_source(
             )
         profiles, files = _request(request)
         tensorfs = fill.tensorfs_module()
-        store = _open_or_init(tensorfs, tensorfs_root)
+        store = tensorfs.Store.ensure(str(tensorfs_root))
         prepared = store.prepare_model_source(
             request.operation_id,
             documents.spell(bytes(request.source_selection_digest)),
@@ -63,19 +63,6 @@ def prepare_model_source(
             code = str(getattr(exc, "code", "refused")).lower()
             return _refused(f"model_source_tensorfs_{code}", "TensorFS refused source preparation")
         raise
-
-
-def _open_or_init(tensorfs: Any, root: Path) -> Any:
-    """pull.py's store discipline, verbatim: open a real store, refuse foreign
-    bytes with TensorFS's own typed STORE_ERA, and initialize only a truly
-    empty directory. A fresh pod's baked-empty TensorFS root refused
-    every source preparation without this (live: run 82, 2026-09-02)."""
-    root.mkdir(parents=True, exist_ok=True)
-    if all((root / name).is_dir() for name in ("repos", "manifests", "blobs")):
-        return tensorfs.Store.open(str(root))
-    if any(root.iterdir()):
-        return tensorfs.Store.open(str(root))
-    return tensorfs.Store.init(str(root))
 
 
 def release_model_source(*, tensorfs_root: Path, operation_id: str) -> None:

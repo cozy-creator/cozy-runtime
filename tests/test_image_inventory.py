@@ -126,7 +126,7 @@ def test_lying_inventory_refuses_before_any_install() -> None:
         return prepare_package_set(
             pb.PreparePackageSetRequest(
                 download_delegation=delegation,
-                environment_root="/tmp/unused-environment",
+                install_root="/tmp/unused-environment",
                 application="ranged_marco_package:app",
                 model_slot_paths=[],
                 image_inventory=pb.ImageInventory(

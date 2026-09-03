@@ -133,22 +133,15 @@ class PullRefusal(Exception):
 
 
 def open_store(tensorfs: Any, root: Path) -> Any:
-    """Open or initialize one TensorFS-owned store root without resolving its layout."""
+    """Open one caller-prepared TensorFS Store without resolving or mutating its layout."""
 
-    root.mkdir(parents=True, exist_ok=True)
     try:
-        if all((root / name).is_dir() for name in ("repos", "manifests", "blobs")):
-            return tensorfs.Store.open(str(root))
-        if any(root.iterdir()):
-            # Let TensorFS produce the typed old-layout/malformed-store refusal. Initializing
-            # beside foreign bytes would create two apparent authorities in one directory.
-            return tensorfs.Store.open(str(root))
-        return tensorfs.Store.init(str(root))
+        return tensorfs.Store.open(str(root))
     except Exception as exc:
         raise PullRefusal(
             "border_refused",
             f"{root}: not a usable TensorFS store — {type(exc).__name__}: {exc}",
-            "repair the backing filesystem or launch against an empty store directory",
+            "have the Store owner ensure it before launching Runtime",
         ) from exc
 
 

@@ -173,22 +173,16 @@ class HeldManifests:
             self._on_change()
         return held
 
-    def rebuild(self, store: Any, root: Path) -> tuple[int, int]:
-        """Walk every manifest the store's shard layout names and keep the complete ones.
-        Returns (held, named). The layout read here only NAMES candidates — the store's
-        Python facade has no listing door — and TensorFS's verified walk decides each."""
-        named = sorted(
-            f"sha256:{path.stem}"
-            for path in (root / "manifests").glob("*/*/*.json")
-            if len(path.stem) == 64 and all(c in "0123456789abcdef" for c in path.stem)
-        )
-        held = {digest for digest in named if self._complete(store, digest)}
+    def rebuild(self, store: Any) -> int:
+        """Replace the index from TensorFS's verified complete-CozyTensors census."""
+
+        held = set(store.complete_cozytensors_manifests())
         with self._lock:
             changed = held != self._held
             self._held = held
         if changed and self._on_change is not None:
             self._on_change()
-        return len(held), len(named)
+        return len(held)
 
     @staticmethod
     def _complete(store: Any, digest: str) -> bool:

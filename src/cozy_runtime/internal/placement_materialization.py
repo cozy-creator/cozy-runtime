@@ -29,7 +29,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import canonical, egress, host_paths, package_environment, pull
+from cozy_runtime.internal import canonical, egress, fill, host_paths, package_environment, pull
 from cozy_runtime.internal.config import WorkerHostConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
 
@@ -67,12 +67,12 @@ def prepare_boot(
     """
 
     del config  # the handoff carries nothing this step decides on
-    # Package executors read verified TensorFS objects but never publish them. Root owns
-    # the store; execute/read bits admit the fixed executor uid without making any object
-    # or directory writable to it. This is always a local Store. An optional NFS repo cache
-    # is a source from which TensorFS admits exact objects, never this directory or a symlink.
-    _directory(tensorfs_root, mode=0o755)
-    _grant_executor_holds(tensorfs_root)
+    # pod-supervisor already ensured this local Store and prepared its reader permissions
+    # through TensorFS. Runtime validates it without creating, chmodding, or reading layout.
+    try:
+        pull.open_store(fill.tensorfs_module(), tensorfs_root)
+    except (fill.FillRefusal, pull.PullRefusal) as exc:
+        raise LaunchRefusal("provision_store_invalid", str(exc)) from exc
     _directory(boot_root)
     return tensorfs_root
 
@@ -233,37 +233,6 @@ def _publish_exact(target: Path, payload: bytes, root: Path) -> None:
         _fsync(root)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def _grant_executor_holds(store_root: Path) -> None:
-    """Lay the store and grant the executor uid exactly the two writes a reader makes.
-
-    A TensorFS reader registers its hold before the first byte moves — a marker it creates
-    under `tmp/leases` and a shared lock on `tmp/writers/recovery.lock` — so a sweep can
-    never reap an object under a live lease. Those are the only writes package code ever
-    makes to the store: the marker directory takes create-only (sticky, unlistable) and the
-    lock file is openable read-write by everyone; every object, manifest and the catalog
-    stay root's, read-only to the executor.
-    """
-
-    try:
-        import tensorfs
-    except ImportError as exc:  # pragma: no cover - environment, not logic
-        raise LaunchRefusal("provision_store_invalid", "tensorfs reader is absent") from exc
-    try:
-        pull.open_store(tensorfs, store_root)
-    except pull.PullRefusal as exc:
-        raise LaunchRefusal("provision_store_invalid", str(exc)) from exc
-    leases = store_root / "tmp" / "leases"
-    writers = store_root / "tmp" / "writers"
-    for path in (leases, writers):
-        path.mkdir(parents=True, exist_ok=True)
-    (store_root / "tmp").chmod(0o755)
-    leases.chmod(0o1733)
-    writers.chmod(0o755)
-    lock = writers / "recovery.lock"
-    os.close(os.open(lock, os.O_RDWR | os.O_CREAT, 0o666))
-    lock.chmod(0o666)
 
 
 def _directory(path: Path, *, mode: int = 0o700) -> None:

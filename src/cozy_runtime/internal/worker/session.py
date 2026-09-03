@@ -1781,13 +1781,13 @@ class Worker:
         try:
             tensorfs = fill.tensorfs_module()
             store = pull.open_store(tensorfs, Path(root))
-            held, named = self.held_manifests.rebuild(store, Path(root))
-        except (fill.FillRefusal, pull.PullRefusal) as exc:
+            held = self.held_manifests.rebuild(store)
+        except Exception as exc:
             self.note("boot", f"held_manifests: none — {exc}"[:256])
             return
         self.note(
             "boot",
-            f"held_manifests: {held} of {named} manifest(s) in {root} verified complete in "
+            f"held_manifests: {held} manifest(s) in {root} verified complete in "
             f"{(time.perf_counter() - started) * 1000:.0f} ms",
         )
 

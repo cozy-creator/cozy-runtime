@@ -16,7 +16,7 @@ from cozy_runtime.author import Artifact, CapabilityError, Config, Loader
 from cozy_runtime.author._loader import loading
 from cozy_runtime.internal import base_observation, canonical, fill, package_interface
 from cozy_runtime.internal.encoding import SPEC_PLAIN, launch_providers
-from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
+from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal, HeldManifests
 from cozy_runtime.internal.worker.downloads import DownloadPlan
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
@@ -108,6 +108,16 @@ def test_model_prep_ignores_absent_snapshot_siblings(tmp_path: Path) -> None:
     }
     assert not store.contains(hashlib.sha256(b"example model\n").hexdigest())
     assert not store.contains(hashlib.sha256(b"not really a png").hexdigest())
+
+
+def test_held_manifest_census_comes_from_tensorfs(tmp_path: Path) -> None:
+    _store_root, manifest_id, _manifest_length, store = _snapshot(
+        tmp_path, include_asset=True
+    )
+    held = HeldManifests()
+
+    assert held.rebuild(store) == 1
+    assert held.digests() == [manifest_id]
 
 
 def test_model_prep_still_requires_header_assets(tmp_path: Path) -> None:

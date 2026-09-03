@@ -67,13 +67,13 @@ def prepare_package_set(
     """
 
     if (
-        Path(request.environment_root) != environment_root
+        Path(request.install_root) != environment_root
         or not environment_root.is_absolute()
         or not tensorfs_root.is_absolute()
         or (job_plan_root is not None and not job_plan_root.is_absolute())
     ):
         raise PreparationRefusal(
-            "package_prepare_environment_root_invalid", request.environment_root
+            "package_prepare_install_root_invalid", request.install_root
         )
     try:
         delegation = documents.read(request.download_delegation, pb.DownloadDelegation)
@@ -386,9 +386,9 @@ def check_package_set_compatibility(
     CPU/meta, calls TensorFS fit with transient rows, and retains no compatibility artifact.
     """
 
-    if Path(request.environment_root) != environment_root or not environment_root.is_absolute():
+    if Path(request.install_root) != environment_root or not environment_root.is_absolute():
         raise PreparationRefusal(
-            "package_prepare_environment_root_invalid", request.environment_root
+            "package_prepare_install_root_invalid", request.install_root
         )
     try:
         delegation = documents.read(request.download_delegation, pb.DownloadDelegation)
@@ -658,11 +658,11 @@ def prepare_local_package(
     """Prepare one exact local wheel revision without inventing Hub provenance."""
 
     if (
-        Path(request.environment_root) != environment_root
+        Path(request.install_root) != environment_root
         or not environment_root.is_absolute()
         or (job_plan_root is not None and not job_plan_root.is_absolute())
     ):
-        raise PreparationRefusal("local_package_environment_root_invalid", request.environment_root)
+        raise PreparationRefusal("local_package_install_root_invalid", request.install_root)
     package = request.package
     if (
         _OPERATION_ID.fullmatch(request.operation_id) is None
