@@ -34,13 +34,21 @@ from dataclasses import dataclass, field, fields
 from types import ModuleType
 from typing import Any, Literal, cast
 
-from cozy_runtime.author._loader import Artifact, Census, Loader, census, loading
+from cozy_runtime.author._loader import (
+    Artifact,
+    Census,
+    Loader,
+    canonical_dtype,
+    census,
+    loading,
+)
 
 SUBSTRATE = "meta-device"
 
 #: The dtype-diet rule, shared with the checkpoint header's plain/1-absence rule (§1.1):
-#: dtype is serialized ONLY where it deviates from bf16. Absence means bf16.
-DEFAULT_DTYPE = "bfloat16"
+#: dtype is serialized ONLY where it deviates from bf16. Absence means bf16. Spelled in
+#: TensorFS's closed namespace, like every census dtype (cr-087).
+DEFAULT_DTYPE = "bf16"
 
 TensorKind = Literal["parameter", "buffer"]
 
@@ -885,8 +893,8 @@ def _group(tensor: Any, groups: dict[object, int]) -> int | None:
 
 
 def _dtype(tensor: Any) -> str | None:
-    """The dtype-diet rule: absence means bf16 (§1.1)."""
-    name = str(tensor.dtype).removeprefix("torch.")
+    """The dtype-diet rule: absence means bf16 (§1.1). Canonical TensorFS spelling."""
+    name = canonical_dtype(tensor.dtype)
     return None if name == DEFAULT_DTYPE else name
 
 
@@ -947,7 +955,7 @@ class Derivation:
 def _logical_dtype_constraint(dtype: str | None) -> str | None:
     """Ordinary bf16/f16 weights may convert; semantic islands retain exact dtype."""
 
-    return None if dtype in (None, "bfloat16", "float16") else dtype
+    return None if dtype in (None, "bf16", "f16") else dtype
 
 
 def derive(

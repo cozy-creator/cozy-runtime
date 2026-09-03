@@ -84,7 +84,7 @@ def weights_for(case: Case, truth: RichCensus) -> Artifact:
     not be the thing that fails. Match-direction arms are separate (`scripts/verify.py`).
     """
     tensor_schema = {
-        t.key: TensorSpec(t.shape, t.dtype or "bfloat16", nbytes=_nbytes(t.shape, t.dtype))
+        t.key: TensorSpec(t.shape, t.dtype or "bf16", nbytes=_nbytes(t.shape, t.dtype))
         for t in truth.logical
     }
     return Artifact(
@@ -96,7 +96,7 @@ def weights_for(case: Case, truth: RichCensus) -> Artifact:
 
 
 def _nbytes(shape: Sequence[int], dtype: str | None) -> int:
-    width = {"float32": 4, "int64": 8, "int32": 4, "uint8": 1, "bool": 1}.get(dtype or "", 2)
+    width = {"f32": 4, "i64": 8, "i32": 4, "u8": 1, "bool": 1}.get(dtype or "", 2)
     total = width
     for dim in shape:
         total *= dim
