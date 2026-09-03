@@ -48,7 +48,7 @@ def prepare_package_set(
     *,
     artifact_cache: Path,
     tensorfs_root: Path,
-    environment_root: Path,
+    install_root: Path,
     python: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
@@ -67,8 +67,8 @@ def prepare_package_set(
     """
 
     if (
-        Path(request.install_root) != environment_root
-        or not environment_root.is_absolute()
+        Path(request.install_root) != install_root
+        or not install_root.is_absolute()
         or not tensorfs_root.is_absolute()
         or (job_plan_root is not None and not job_plan_root.is_absolute())
     ):
@@ -103,7 +103,7 @@ def prepare_package_set(
         ),
         artifact_cache=artifact_cache,
         tensorfs_root=tensorfs_root,
-        environment_root=environment_root,
+        install_root=install_root,
         python=python,
         describe=describe,
         verified=verified,
@@ -123,7 +123,7 @@ def prepare_published_local(
     placement_seed: bytes,
     artifact_cache: Path,
     tensorfs_root: Path,
-    environment_root: Path,
+    install_root: Path,
     python: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     installed_environment: package_environment.InstalledEnvironment,
@@ -146,7 +146,7 @@ def prepare_published_local(
         placement_seed=placement_seed,
         artifact_cache=artifact_cache,
         tensorfs_root=tensorfs_root,
-        environment_root=environment_root,
+        install_root=install_root,
         python=python,
         describe=describe,
         verified=lambda _digest, _length, _path: None,
@@ -237,7 +237,7 @@ def _prepare_published(
     placement_seed: bytes,
     artifact_cache: Path,
     tensorfs_root: Path | None,
-    environment_root: Path,
+    install_root: Path,
     python: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
@@ -279,7 +279,7 @@ def _prepare_published(
             installed = package_environment.materialize_locked(
                 locked,
                 install_rows,
-                environment_root,
+                install_root,
                 environment_digest=environment_digest,
                 python=python,
                 base=observed_base,
@@ -369,7 +369,7 @@ def check_package_set_compatibility(
     request: pb.PreparePackageSetRequest,
     *,
     tensorfs_root: Path,
-    environment_root: Path,
+    install_root: Path,
     python: Path,
     base: base_observation.Observation | None = None,
     native_environment: Mapping[str, str] | None = None,
@@ -384,7 +384,7 @@ def check_package_set_compatibility(
     CPU/meta, calls TensorFS fit with transient rows, and retains no compatibility artifact.
     """
 
-    if Path(request.install_root) != environment_root or not environment_root.is_absolute():
+    if Path(request.install_root) != install_root or not install_root.is_absolute():
         raise PreparationRefusal("package_prepare_install_root_invalid", request.install_root)
     try:
         delegation = documents.read(request.download_delegation, pb.DownloadDelegation)
@@ -406,7 +406,7 @@ def check_package_set_compatibility(
     installed = _compatibility_environment(
         package_name=package_name,
         release=release,
-        environment_root=environment_root,
+        install_root=install_root,
         python=python,
         inventory=inventory,
         locked=locked,
@@ -473,7 +473,7 @@ def _compatibility_environment(
     *,
     package_name: str,
     release: str,
-    environment_root: Path,
+    install_root: Path,
     python: Path,
     inventory: image_inventory.Inventory,
     locked: package_environment.LockedRequirements,
@@ -501,7 +501,7 @@ def _compatibility_environment(
         return package_environment.materialize_locked(
             locked,
             install_rows,
-            environment_root,
+            install_root,
             environment_digest=environment_digest,
             python=python,
             base=observed,
@@ -641,7 +641,7 @@ def prepare_local_package(
     request: pb.PrepareLocalPackageRequest,
     *,
     artifact_cache: Path,
-    environment_root: Path,
+    install_root: Path,
     python: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
@@ -654,8 +654,8 @@ def prepare_local_package(
     """Prepare one exact local wheel revision without inventing Hub provenance."""
 
     if (
-        Path(request.install_root) != environment_root
-        or not environment_root.is_absolute()
+        Path(request.install_root) != install_root
+        or not install_root.is_absolute()
         or (job_plan_root is not None and not job_plan_root.is_absolute())
     ):
         raise PreparationRefusal("local_package_install_root_invalid", request.install_root)
@@ -673,9 +673,11 @@ def prepare_local_package(
         package_name=package.package,
         release=package.release,
         wheels=request.wheels,
+        # proto-031: editable wheels stage beside the install namespace that owns them.
+        wheel_root=install_root / f".stage-{request.operation_id}" / "wheels",
         placement_seed=(request.operation_id.encode("ascii") + package.local_revision_digest),
         artifact_cache=artifact_cache,
-        environment_root=environment_root,
+        install_root=install_root,
         python=python,
         describe=describe,
         verified=verified,
@@ -781,9 +783,10 @@ def prepare_package(
     package_name: str,
     release: str,
     wheels: Sequence[pb.LocalPackageWheel],
+    wheel_root: Path,
     placement_seed: bytes,
     artifact_cache: Path,
-    environment_root: Path,
+    install_root: Path,
     python: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
@@ -796,10 +799,11 @@ def prepare_package(
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact local package revision.
 
-    Wire 30 leaves this the ONE preparation that still receives files: an editable
-    revision's wheels exist on no index, so their exact bytes are the install input
-    (xs-017). The project wheel is the row that MEASURES as the package's own
-    distribution and release — no kind row travels.
+    This is the ONE preparation that still receives files: an editable revision's wheels
+    exist on no index, so their exact bytes are the install input (xs-017). Every row
+    sits directly in `wheel_root` — `<install_root>/.stage-<operation>/wheels` per
+    proto-031 — beside the install namespace that owns it. The project wheel is the row
+    that MEASURES as the package's own distribution and release — no kind row travels.
 
     `materialized` receives the environment this preparation installed. A local revision's
     wheels are the pod host's carriers, deleted once the PlacementSet is journaled, so the
@@ -823,9 +827,10 @@ def prepare_package(
     rows = list(wheels)
     if not 1 <= len(rows) <= MAX_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
+    if not wheel_root.is_absolute():
+        raise PreparationRefusal("package_prepare_file_path_invalid", str(wheel_root))
     facts: list[tuple[package_environment.Wheel, Path, package_environment.VerifiedFile]] = []
     prior = b""
-    parents: set[Path] = set()
     for row in rows:
         if len(row.digest) != 32 or row.digest <= prior or not 0 < row.length <= MAX_FILE_BYTES:
             raise PreparationRefusal("package_prepare_file_invalid", row.filename)
@@ -834,12 +839,10 @@ def prepare_package(
         if (
             not path.is_absolute()
             or path.name != row.filename
-            or path != path.parent / row.filename
-            or not path.is_relative_to(artifact_cache / "sets")
+            or path.parent != wheel_root
             or path.resolve(strict=True) != path
         ):
             raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
-        parents.add(path.parent)
         digest = documents.spell(bytes(row.digest))
         named = package_environment.wheel_name_version(row.filename)
         if named is None:
@@ -870,8 +873,6 @@ def prepare_package(
             verified(digest, row.length, path)
             continue
         facts.append((wheel, path, receipt))
-    if len(parents) != 1:
-        raise PreparationRefusal("package_prepare_file_path_invalid", "files span package sets")
     projects = [item for item in facts if item[0].owner == "project"]
     if len(projects) != 1:
         raise PreparationRefusal("package_prepare_project_wheel_count", str(len(projects)))
@@ -902,7 +903,7 @@ def prepare_package(
         )
         installed = package_environment.materialize(
             source,
-            environment_root,
+            install_root,
             python=python,
             base=observed_base,
             native_environment=native_environment,

@@ -80,7 +80,7 @@ _SERVE_FLAGS: dict[str, str] = {
     # on this machine. A launcher knows its own root and nothing can discover it for one,
     # which is exactly what puts it in this closed set.
     "--grant-root": "--grant-root",
-    "--environment-root": "--environment-root",
+    "--install-root": "--install-root",
     "--environment-python": "--environment-python",
     "--tensorfs-root": "--tensorfs-root",
     "--artifact-cache": "--artifact-cache",
@@ -166,7 +166,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
     artifact_flags = ("--tensorfs-root", "--artifact-cache")
     supplied_artifacts = [flag for flag in artifact_flags if flag in values]
     forbidden_development = [
-        flag for flag in ("--environment-root", "--environment-python") if flag in values
+        flag for flag in ("--install-root", "--environment-python") if flag in values
     ]
     if all(development.values()) and forbidden_development:
         raise CliError(
@@ -246,7 +246,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         if all(development.values()) and flag in {
             "--tensorfs-root",
             "--artifact-cache",
-            "--environment-root",
+            "--install-root",
             "--environment-python",
         }:
             continue

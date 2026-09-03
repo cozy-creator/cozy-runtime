@@ -334,7 +334,7 @@ class Acquirer:
         plan: DownloadPlan,
         *,
         cache_root: Path,
-        environment_root: Path,
+        install_root: Path,
         selection_root: Path,
         tensorfs_root: Path,
         python: Path,
@@ -348,7 +348,7 @@ class Acquirer:
     ) -> None:
         self.plan = plan
         self.cache_root = cache_root
-        self.environment_root = environment_root
+        self.install_root = install_root
         self.selection_root = selection_root
         self.tensorfs_root = tensorfs_root
         self.python = python
@@ -538,7 +538,7 @@ class Acquirer:
                     environment_digest=environment_digest,
                 )
             return package_environment.open_generation(
-                self.environment_root,
+                self.install_root,
                 receipt_digest=receipt_digest,
                 environment_digest=environment_digest,
                 python=self.python,

@@ -142,7 +142,7 @@ def test_lying_inventory_refuses_before_any_install() -> None:
             ),
             artifact_cache=Path("/tmp/unused-artifacts"),
             tensorfs_root=Path("/tmp/unused-store"),
-            environment_root=Path("/tmp/unused-environment"),
+            install_root=Path("/tmp/unused-environment"),
             python=Path(sys.executable),
             describe=lambda installed, distribution: b"{}",
             verified=lambda _digest, _length, _path: None,
