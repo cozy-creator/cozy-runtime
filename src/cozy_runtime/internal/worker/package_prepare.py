@@ -120,6 +120,342 @@ def prepare_package_set(
     )
 
 
+def check_package_set_compatibility(
+    request: pb.PreparePackageSetRequest,
+    *,
+    artifact_cache: Path,
+    environment_root: Path,
+    python: Path,
+    base: base_observation.Observation | None = None,
+) -> pb.CheckPackageSetCompatibilityResult:
+    """Fit package code against headers while tensor bodies are still downloading.
+
+    This private cold-path check accepts only wheels, PackageInterface, model Manifests,
+    CozyTensors headers, and header-declared model assets. It constructs on CPU/meta, calls
+    TensorFS fit with transient rows, and retains no compatibility artifact.
+    """
+
+    if Path(request.environment_root) != environment_root or not environment_root.is_absolute():
+        raise PreparationRefusal(
+            "package_prepare_environment_root_invalid", request.environment_root
+        )
+    try:
+        delegation = documents.read(request.download_delegation, pb.DownloadDelegation)
+    except documents.DocumentError as exc:
+        raise PreparationRefusal("package_prepare_delegation_invalid", exc.detail) from exc
+    packages = delegation.get("packages")
+    models = delegation.get("models")
+    if not isinstance(packages, list) or len(packages) != 1 or not isinstance(models, list):
+        raise PreparationRefusal(
+            "package_prepare_selection_invalid",
+            "exactly one package and a model array are required",
+        )
+    selected_package = packages[0]
+    if not isinstance(selected_package, dict):
+        raise PreparationRefusal("package_prepare_delegation_invalid", "package row")
+    package_name = str(selected_package.get("package", ""))
+    release = str(selected_package.get("release", ""))
+    interface_raw, set_root = _published_interface(request.files, artifact_cache=artifact_cache)
+    try:
+        interface = package_interface.read_bytes(interface_raw, "compatibility package interface")
+        inventory = image_inventory.read_bytes(
+            _read_beside(
+                set_root / image_inventory.INVENTORY_FILENAME,
+                "package_prepare_image_inventory_missing",
+            )
+        )
+    except package_interface.StalePackageInterface as exc:
+        raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
+    except image_inventory.ImageInventoryRefusal as exc:
+        raise PreparationRefusal("package_prepare_image_inventory_invalid", exc.detail) from exc
+    installed = _compatibility_environment(
+        request.files,
+        set_root=set_root,
+        package_name=package_name,
+        release=release,
+        environment_root=environment_root,
+        python=python,
+        inventory=inventory,
+        base=base,
+    )
+    candidates = _compatibility_models(request.files, models, set_root=set_root)
+    described = {
+        str(model.get("path", "")): model
+        for entrypoint in interface.get("entrypoints", [])
+        if isinstance(entrypoint, dict)
+        for model in entrypoint.get("models", [])
+        if isinstance(model, dict)
+    }
+    if set(candidates) != set(described):
+        raise PreparationRefusal(
+            "package_prepare_model_selection_mismatch",
+            f"selected={sorted(candidates)} described={sorted(described)}",
+        )
+    application = str(interface.get("application", ""))
+    requests = tuple(
+        derive_child.SlotRequest(path, row["config"], row["assets"])
+        for path, row in sorted(candidates.items())
+    )
+    try:
+        answers = derive_child.derive_in(
+            installed.python,
+            derive_child.DeriveRequest(requests, application=application),
+        )
+    except derive_child.DeriveRefusal as exc:
+        raise PreparationRefusal(exc.code, exc.detail) from exc
+    tensorfs = fill.tensorfs_module()
+    for answer in answers:
+        candidate = candidates[answer.slot]
+        declaration = described[answer.slot]
+        requirements = [
+            tensorfs.TensorRequirement(
+                component=component,
+                key=key,
+                shape=list(shape),
+                logical_dtype=(None if dtype is None else fill.dtype_name(dtype)),
+            )
+            for component, key, dtype, shape in answer.rows
+        ]
+        try:
+            verdict = dict(
+                tensorfs.fit(
+                    requirements,
+                    candidate["header"],
+                    custody="canonical",
+                    encoded_leaves=declaration.get("encoded_leaves", "refuse") == "accept",
+                )
+            )
+        except tensorfs.errors.Refusal as exc:
+            raise PreparationRefusal(
+                "package_prepare_model_header_invalid", f"{answer.slot}: {exc.code}: {exc}"
+            ) from exc
+        if not verdict.get("ok"):
+            detail = _printable(
+                f"{answer.slot} does not fit {candidate['model']}@{candidate['release']}"
+                f"/{candidate['lane']}: {verdict.get('code')} - {verdict.get('detail')}"
+            )
+            raise PreparationRefusal("checkpoint_incompatible", detail)
+    return pb.CheckPackageSetCompatibilityResult()
+
+
+def _compatibility_environment(
+    files: Sequence[pb.LocalDownloadFile],
+    *,
+    set_root: Path,
+    package_name: str,
+    release: str,
+    environment_root: Path,
+    python: Path,
+    inventory: image_inventory.Inventory,
+    base: base_observation.Observation | None,
+) -> package_environment.InstalledEnvironment:
+    try:
+        observed = base or package_environment.observe_base(python)
+    except package_environment.EnvironmentRefusal as exc:
+        raise PreparationRefusal(exc.code, exc.detail) from exc
+    lie = image_inventory.disagreement(inventory, observed.distribution_versions)
+    if lie is not None:
+        raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
+    facts: list[tuple[package_environment.Wheel, Path, package_environment.VerifiedFile]] = []
+    for row in files:
+        if row.kind not in {
+            pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL,
+            pb.LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL,
+        }:
+            continue
+        path = Path(row.path)
+        if (
+            path.parent != set_root
+            or path.name != row.filename
+            or path.resolve(strict=True) != path
+        ):
+            raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
+        owner = "project" if row.kind == pb.LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL else "custom"
+        try:
+            wheel, receipt = package_environment.measure_wheel(
+                path, owner, observed, allow_base_owned=owner == "custom"
+            )
+        except package_environment.EnvironmentRefusal as exc:
+            raise PreparationRefusal(exc.code, exc.detail) from exc
+        digest = documents.spell(bytes(row.digest))
+        if wheel.digest != digest or wheel.length != row.length:
+            raise PreparationRefusal("package_prepare_file_identity_mismatch", row.filename)
+        if owner == "project" and not wheel.import_roots:
+            raise PreparationRefusal(
+                "package_prepare_project_wheel_no_import_roots",
+                f"{row.filename} installs no importable module",
+            )
+        if owner == "custom" and (
+            package_environment.base_owned_wheel(wheel, observed)
+            or wheel.distribution in inventory.versions
+        ):
+            continue
+        facts.append((wheel, path, receipt))
+    projects = [item for item in facts if item[0].owner == "project"]
+    if len(projects) != 1:
+        raise PreparationRefusal("package_prepare_project_wheel_count", str(len(projects)))
+    project = projects[0][0]
+    expected = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
+    if project.distribution != expected or project.version != release:
+        raise PreparationRefusal("package_prepare_project_wheel_mismatch", project.filename)
+    dependencies = sorted(
+        (wheel for wheel, _path, _receipt in facts if wheel.owner == "custom"),
+        key=lambda wheel: wheel.distribution,
+    )
+    environment = pb.Environment(wheels=[_wheel_fact(wheel) for wheel in dependencies])
+    environment_body = documents.body(environment)
+    environment_digest = documents.spell(
+        documents.embedded_document_digest(environment_body, "cozy.worker.v1.Environment")
+    )
+    package = pb.PackageSelection(
+        package=package_name,
+        release=release,
+        project_wheel=_wheel_fact(project),
+    )
+    try:
+        source = placement_materialization.package_environment_input(
+            package=documents.body(package),
+            environment=environment_body,
+            environment_digest=environment_digest,
+            wheel_paths={wheel.digest: path for wheel, path, _receipt in facts},
+            verified_wheels={wheel.digest: receipt for wheel, _path, receipt in facts},
+        )
+        return package_environment.materialize(
+            source,
+            environment_root,
+            python=python,
+            base=observed,
+        )
+    except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
+        raise PreparationRefusal(
+            str(getattr(exc, "code", "package_environment_install_failed")),
+            str(getattr(exc, "detail", type(exc).__name__)),
+        ) from exc
+
+
+def _compatibility_models(
+    files: Sequence[pb.LocalDownloadFile],
+    models: Sequence[Any],
+    *,
+    set_root: Path,
+) -> dict[str, dict[str, Any]]:
+    tensorfs = fill.tensorfs_module()
+    manifests: dict[str, tuple[int, Path]] = {}
+    objects: dict[str, tuple[int, Path]] = {}
+    for row in files:
+        if row.kind not in {
+            pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST,
+            pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT,
+        }:
+            continue
+        path = Path(row.path)
+        if (
+            path.parent != set_root
+            or path.name != row.filename
+            or path.resolve(strict=True) != path
+        ):
+            raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
+        digest = documents.spell(bytes(row.digest))
+        raw = _read_file(
+            path,
+            int(tensorfs.manifest_max_bytes())
+            if row.kind == pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST
+            else MAX_FILE_BYTES,
+        )
+        if len(raw) != row.length or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
+            raise PreparationRefusal("package_prepare_file_identity_mismatch", row.filename)
+        target = manifests if row.kind == pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST else objects
+        if digest in target:
+            raise PreparationRefusal("package_prepare_file_invalid", row.filename)
+        target[digest] = (row.length, path)
+    selections: dict[str, dict[str, Any]] = {}
+    wanted_manifests: set[str] = set()
+    for value in models:
+        if not isinstance(value, dict):
+            raise PreparationRefusal("package_prepare_model_selection_mismatch", "model row")
+        slot = str(value.get("slot", ""))
+        manifest = str(value.get("manifest", ""))
+        model = str(value.get("model", ""))
+        release = str(value.get("release", ""))
+        lane = str(value.get("lane", ""))
+        if (
+            not slot
+            or slot in selections
+            or not manifest
+            or not release
+            or not lane
+            or len(model.split("/")) != 2
+        ):
+            raise PreparationRefusal("package_prepare_model_selection_mismatch", slot or model)
+        wanted_manifests.add(manifest)
+        selections[slot] = {
+            "manifest": manifest,
+            "model": model,
+            "release": release,
+            "lane": lane,
+        }
+    if set(manifests) != wanted_manifests:
+        raise PreparationRefusal(
+            "package_prepare_model_manifest_set_mismatch",
+            f"wanted={sorted(wanted_manifests)} got={sorted(manifests)}",
+        )
+    required_objects: set[str] = set()
+    by_manifest: dict[str, dict[str, Any]] = {}
+    for digest, (_length, path) in manifests.items():
+        manifest_raw = path.read_bytes()
+        try:
+            header_digest, header_length = acquire.cozytensors_ref(tensorfs, manifest_raw)
+            header_row = objects.get(header_digest)
+            if header_row is None or header_row[0] != header_length:
+                raise ValueError(f"missing header {header_digest}/{header_length}")
+            header_raw = header_row[1].read_bytes()
+            header = tensorfs.parse_header(header_raw)
+            config = model_config.construction_config(header.get("configs"))
+        except Exception as exc:
+            raise PreparationRefusal(
+                "package_prepare_model_header_invalid", f"{digest}: {type(exc).__name__}: {exc}"
+            ) from exc
+        required_objects.add(header_digest)
+        assets: dict[str, bytes] = {}
+        for name, asset in sorted(header.get("assets", {}).items()):
+            if not isinstance(asset, dict):
+                raise PreparationRefusal("package_prepare_model_header_invalid", f"{digest}: asset")
+            chunks: list[bytes] = []
+            for segment in asset.get("segments", []):
+                segment_digest = "sha256:" + str(segment.get("sha256", ""))
+                segment_length = int(segment.get("length", 0))
+                segment_row = objects.get(segment_digest)
+                if segment_row is None or segment_row[0] != segment_length:
+                    raise PreparationRefusal(
+                        "package_prepare_model_object_set_mismatch", segment_digest
+                    )
+                required_objects.add(segment_digest)
+                chunks.append(segment_row[1].read_bytes())
+            raw = b"".join(chunks)
+            if (
+                len(raw) != int(asset.get("logical_length", 0))
+                or hashlib.sha256(raw).hexdigest() != str(asset.get("logical_sha256", ""))
+                or len(raw) > 64 << 20
+            ):
+                raise PreparationRefusal(
+                    "package_prepare_model_asset_mismatch", f"{digest}: {name}"
+                )
+            assets[str(name)] = raw
+        by_manifest[digest] = {"header": header_raw, "config": config, "assets": assets}
+    if set(objects) != required_objects:
+        raise PreparationRefusal(
+            "package_prepare_model_object_set_mismatch",
+            f"wanted={sorted(required_objects)} got={sorted(objects)}",
+        )
+    for selected in selections.values():
+        selected.update(by_manifest[selected["manifest"]])
+    return selections
+
+
+def _printable(value: str) -> str:
+    return "".join(character if " " <= character <= "~" else "?" for character in value)[:1024]
+
+
 def placement_identity(
     package_name: str, release: str, release_digest: str, models: Sequence[canonical.Json]
 ) -> bytes:

@@ -1408,6 +1408,30 @@ class Worker:
 
     # ------------------------------------------------------------------ plumbing
 
+    def check_package_set_compatibility(
+        self, request: pb.PreparePackageSetRequest
+    ) -> pb.CheckPackageSetCompatibilityResult:
+        """Cold metadata-only CPU/meta fit; no device lane or executor is acquired."""
+
+        from cozy_runtime.internal.worker import package_prepare
+
+        with self.preparation_lock:
+            try:
+                return package_prepare.check_package_set_compatibility(
+                    request,
+                    artifact_cache=Path(self.options.artifact_cache or ""),
+                    environment_root=Path(self.options.environment_root or ""),
+                    python=Path(self.options.python or sys.executable),
+                    base=self.base,
+                )
+            except package_prepare.PreparationRefusal as exc:
+                return pb.CheckPackageSetCompatibilityResult(
+                    refusal_code=exc.code,
+                    refusal_detail="".join(
+                        character if " " <= character <= "~" else "?" for character in exc.detail
+                    )[:1024],
+                )
+
     def prepare_package_set(
         self, request: pb.PreparePackageSetRequest
     ) -> pb.PreparePackageSetResult:

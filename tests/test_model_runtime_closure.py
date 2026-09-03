@@ -17,6 +17,11 @@ from cozy_runtime.author._loader import loading
 from cozy_runtime.internal import base_observation, canonical, fill, package_interface
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
+from cozy_runtime.internal.worker.package_prepare import (
+    PreparationRefusal,
+    _compatibility_models,
+)
+from cozy_runtime.protocol import worker_pb2 as pb
 
 # Canonical CozyTensors header produced by TensorFS itself. It contains one inline JCS config, one
 # inline f32 tensor, and one six-byte tokenizer asset. Keeping the bytes fixed makes this a border
@@ -24,12 +29,9 @@ from cozy_runtime.internal.worker.downloads import DownloadPlan
 _HEADER = base64.b64decode(
     "hW1jb3p5dGVuc29ycy8xgYJkdW5ldFgceyJoaWRkZW5fc2l6ZSI6NCwibGF5ZXJzIjoxfYGFc3Rv"
     "a2VuaXplci92b2NhYi50eHRYIJ5ekBAsaZRV6QOf+QMoTgaJOU3TRbsRRWcG8IeYTS63Bmp0ZXh0"
-    "L3BsYWlugYJYIJ5ekBAsaZRV6QOf+QMoTgaJOU3TRbsRRWcG8IeYTS63BoGFjAMLAgEABAUIBwYJC"
-    "oCBg2V2YWx1ZYEAgQCBeJNQbGFpbiBsaXR0bGUtZW5kaWFuIHJvdy1tYWpvciBzdG9yYWdlOiBv"
-    "bmUgYHZhbHVlYCByb2xlIGNhcnJ5aW5nIHRoZSBsb2dpY2FsIGJ5dGVzIHZlcmJhdGltLiBFbnRy"
-    "eSB6ZXJvIG9mIHRoZSByZWdpc3RyeTsgbm90IGEgc3BlY2lhbCBhYnNlbnQgZm9ybS6BglggR2b5"
-    "Mbu3DtQx40s05Pn8XdqBdOlvQ6is152Hme/NQ9IZAgSBgmR1bmV0gYVmd2VpZ2h0AYEBAIGEZXZh"
-    "bHVlAYEBRAAAAAA="
+    "L3BsYWlugYJYIJ5ekBAsaZRV6QOf+QMoTgaJOU3TRbsRRWcG8IeYTS63BoGEjAMLAgEABAUIBwYJC"
+    "oCBg2V2YWx1ZYEAgQCBglggR2b5Mbu3DtQx40s05Pn8XdqBdOlvQ6is152Hme/NQ9IZAgSBgmR1bm"
+    "V0gYVmd2VpZ2h0AYEBAIGEZXZhbHVlAYEBRAAAAAA="
 )
 _CONFIG = b'{"hidden_size":4,"layers":1}'
 _ASSET = b"vocab\n"
@@ -146,6 +148,58 @@ def test_loader_consumes_verified_header_assets(tmp_path: Path) -> None:
         assert not tokenizer.exists()
     with pytest.raises(CapabilityError, match="outside load/unload"):
         capability.read("tokenizer/vocab.txt")
+
+
+def test_cold_fit_accepts_only_manifest_header_and_model_assets(tmp_path: Path) -> None:
+    _store_root, manifest_id, _manifest_length, store = _snapshot(tmp_path, include_asset=True)
+    set_root = tmp_path / "partial"
+    set_root.mkdir()
+    manifest = bytes(store.manifest(manifest_id)["manifest"])
+
+    def row(raw: bytes, kind: pb.LocalDownloadKind) -> pb.LocalDownloadFile:
+        digest = hashlib.sha256(raw).digest()
+        path = (set_root / digest.hex()).resolve()
+        path.write_bytes(raw)
+        return pb.LocalDownloadFile(
+            digest=digest,
+            filename=path.name,
+            kind=kind,
+            length=len(raw),
+            path=str(path),
+        )
+
+    files = [
+        row(manifest, pb.LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST),
+        row(_HEADER, pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT),
+        row(_ASSET, pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT),
+    ]
+    selected = [
+        {
+            "slot": "generate.models.model",
+            "manifest": manifest_id,
+            "model": "example/model",
+            "release": "1",
+            "lane": "main",
+        }
+    ]
+    candidate = _compatibility_models(files, selected, set_root=set_root)["generate.models.model"]
+    assert candidate["config"] == _CONFIG
+    assert candidate["assets"] == {"tokenizer/vocab.txt": _ASSET}
+
+    mismatch = tensorfs.fit(
+        [tensorfs.TensorRequirement("unet", "weight", [2], "f32")],
+        candidate["header"],
+        custody="canonical",
+        encoded_leaves=False,
+    )
+    assert not mismatch["ok"] and mismatch["code"] == "shape_mismatch"
+
+    with pytest.raises(PreparationRefusal, match="object_set_mismatch"):
+        _compatibility_models(
+            [*files, row(b"tensor part", pb.LOCAL_DOWNLOAD_KIND_MODEL_OBJECT)],
+            selected,
+            set_root=set_root,
+        )
 
 
 def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -> None:

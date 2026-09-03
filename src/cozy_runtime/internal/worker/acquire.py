@@ -745,10 +745,8 @@ class Acquirer:
                         snapshots=snapshots,
                         model_weight_bytes=model_weight_bytes,
                         sequence_parallel_degrees=degrees,
-                        # `lane` is an optional repo-pointer fact on the Model document
-                        # (the manifest is the identity): a placement prepared from a
-                        # download delegation carries none, because DownloadModelRef has
-                        # no lane field — the daemon keeps the lane in its own records.
+                        # The manifest is identity; lane remains the human repo pointer the
+                        # signed download delegation carried beside it.
                         model=f"{reference['repo']}@{reference['version']}"
                         + (f"/{reference['lane']}" if reference.get("lane") else ""),
                     )

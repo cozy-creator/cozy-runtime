@@ -419,6 +419,13 @@ policy input, not duplicated per tensor. A non-`ok` verdict is the typed prepare
 `model_fit_refused`. Every PlacementSet writer fills `Slot.components` from the private construction,
 never from the header.
 
+On a cold model-body miss, pod-supervisor may call the loopback-only
+`CheckPackageSetCompatibility` before the body finishes. Runtime accepts only the verified package
+files plus model Manifests, CozyTensors headers, inline config, and header-declared model assets;
+tensor-part files are rejected from this call. It constructs under CUDA-hidden CPU/meta, calls the
+same TensorFS fit, discards the transient rows, and returns `checkpoint_incompatible` on a definite
+mismatch. A resident model skips this extra construction and follows the ordinary load path.
+
 A package whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
 `describe` refuses the release if PyAV is absent. The package interface publishes the hard per-field
 codec ceilings and the attempt-wide retained decoded-value ceiling.
