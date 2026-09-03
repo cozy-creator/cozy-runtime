@@ -212,7 +212,7 @@ def check_package_set_compatibility(
                 component=component,
                 key=key,
                 shape=list(shape),
-                logical_dtype=(None if dtype is None else fill.dtype_name(dtype)),
+                logical_dtype=fill.tensorfs_requirement_dtype(dtype),
             )
             for component, key, dtype, shape in answer.rows
         ]
