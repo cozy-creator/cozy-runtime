@@ -149,11 +149,11 @@ REFUSALS = frozenset(
         # joint decision now and CONFESSES uncalibrated instead of refusing.
         # The `encoded_gemm` route's own two. Distinct on purpose, because they print
         # different remedies: `leaf_unconsented` says the PACKAGE must declare that its
-        # code survives a replaced linear op (an author edit), while `leaf_topology` says
+        # code survives a replaced linear op (an author edit), while `leaf_schema` says
         # the module tree cannot take a leaf where this destination is, or did not end up
         # holding what the substitution declared (a runtime/artifact disagreement).
         "leaf_unconsented",
-        "leaf_topology",
+        "leaf_schema",
         # cr-025's ONE-SELECTION-AUTHORITY law. `plan_divergence`: the resolved plan this
         # generation was priced and identified under names a tensor, an implementation, a
         # route, a geometry or a dtype that is not what this checkpoint holds or this build
@@ -542,6 +542,27 @@ class Checkpoint:
         with store_refusals(f"acquiring a lease on {self.manifest_id[:23]}"):
             return self.store.acquire_cozytensors(self.manifest_id)
 
+    def model_assets(self) -> dict[str, bytes]:
+        """Read the header-declared model files through one verified closure lease."""
+
+        names = sorted(str(name) for name in self.header.get("assets", {}))
+        if not names:
+            return {}
+        with (
+            store_refusals(f"reading model assets from {self.manifest_id[:23]}"),
+            self.acquire() as lease,
+        ):
+            return {
+                name: bytes(
+                    lease.read_asset(
+                        self.header_bytes,
+                        name,
+                        max_bytes=64 << 20,
+                    )
+                )
+                for name in names
+            }
+
 
 @dataclass(frozen=True, slots=True)
 class Servability:
@@ -649,12 +670,12 @@ def servability_for_script(
     return servability(rows, answer)
 
 
-def topology_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
-    """The checkpoint topology table the loader matches the code against.
+def tensor_schema_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
+    """The checkpoint tensor schema the loader matches the code against.
 
     The spec's `encoding` carries the tensor's real ALIAS rather than a constant `plain`:
-    the match itself is over logical shape (an encoding rung changes no topology — every
-    rung of one model shares its `tensor_requirements_digest`), but a table that lied about the
+    the match itself is over logical shape (an encoding route changes no tensor schema), but
+    a table that lied about the
     encoding would be the only place in the runtime that did.
     """
     return {
@@ -690,13 +711,13 @@ def _require_construction_order(value: object, component: str) -> str:
 class LeafReplacement:
     """One destination that became a MODULE instead of a tensor. The substitution, as data.
 
-    `materialize`'s law is that placement moves bytes and never topology, and it is checked
-    key-for-key. Leaf replacement moves topology, which is why it is not placement and why
+    `materialize`'s law is that placement moves bytes and never tensor schema, and it is checked
+    key-for-key. Leaf replacement moves tensor schema, which is why it is not placement and why
     it cannot simply relax that check: what replaces it is a DECLARED substitution, and
     this record is the declaration. `commit` re-censuses and requires that the module tree
     holds exactly `contract_key` gone and `role_keys` arrived — nothing else moved, nothing
     else vanished. A leaf that quietly dropped a bias, or a provider that registered a
-    buffer nobody expected, is a `leaf_topology` refusal rather than a surprise at the
+    buffer nobody expected, is a `leaf_schema` refusal rather than a surprise at the
     first forward pass.
     """
 
@@ -1032,7 +1053,7 @@ class StreamingFillBackend:
         self.encoded_leaves = "refuse"
         #: What leaf replacement actually did, per replaced destination. It is the
         #: SUBSTITUTION MAP the census reconciliation is checked against, and the only
-        #: record that a generation's topology moved — so it is data a reader can print,
+        #: record that a generation's tensor schema moved — so it is data a reader can print,
         #: not an effect they have to infer from the module tree.
         self.replaced: dict[str, LeafReplacement] = {}
         #: contract key -> the data pointer of the destination a leaf will stand for. It
@@ -1225,7 +1246,7 @@ class StreamingFillBackend:
         from. The document comes back verbatim; on `ok` the keys `local` custody ignored
         leave the fill's completeness set so the commit does not miss them.
         """
-        from cozy_runtime.internal import canonical, tensor_requirements
+        from cozy_runtime.internal import canonical
         from cozy_runtime.internal.probe import observed_capability_records
 
         tensorfs = tensorfs_module()
@@ -1252,15 +1273,26 @@ class StreamingFillBackend:
                 for d in walked.destinations
                 if d.component in members
             ]
-            requirements = tensor_requirements.canonical_bytes(
-                rows, constructed, encoded_leaves=encoded_leaves
-            )
+            requirements = [
+                tensorfs.TensorRequirement(
+                    component=component,
+                    key=key,
+                    shape=list(shape),
+                    logical_dtype=(
+                        None
+                        if dtype_name(dtype) in ("bf16", "f16")
+                        else dtype_name(dtype)
+                    ),
+                )
+                for component, key, dtype, shape in rows
+            ]
             with store_refusals(f"fitting {checkpoint.manifest_id[:23]}"):
                 fit = dict(
                     tensorfs.fit(
                         requirements,
                         checkpoint.header_bytes,
                         custody=self.custody,
+                        encoded_leaves=encoded_leaves == "accept",
                         device=self.device_facts.predicate,
                         observations=observations,
                     )
@@ -1291,7 +1323,7 @@ class StreamingFillBackend:
         Baseline residency is ordinary CUDA allocation and that is sufficient (§3.2); a
         promoted Varena adapter would replace this method and nothing else. The census is
         re-taken afterwards and must agree key-for-key: a materialization that changes the
-        topology is not a placement, it is a different construction.
+        tensor schema is not a placement, it is a different construction.
 
         THE CONSENT GATE IS FIRST, before a byte of device memory is reserved. Every row's
         route is the resolved plan's — so an
@@ -1341,7 +1373,7 @@ class StreamingFillBackend:
                 if self.resident_budget and held + size > self.resident_budget:
                     if any(key.startswith(f"{name}.") for key in native):
                         raise _refuse(
-                            "leaf_topology",
+                            "leaf_schema",
                             f"the placement plan would PARK {name!r}, and this component "
                             "serves through encoded leaves. A parked component is staged in "
                             "later by re-filling the checkpoint's own keys, which stop being "
@@ -1352,7 +1384,7 @@ class StreamingFillBackend:
                             "increment and is not silently half-served here",
                             [name],
                         )
-                    # PARKED, not dropped. Its topology is built and its destinations are
+                    # PARKED, not dropped. Its tensor schema is built and its destinations are
                     # known; what it does not have is device bytes, and `stage()` supplies
                     # those on first declared use. A construction that silently skipped it
                     # would be a different model.
@@ -1384,7 +1416,7 @@ class StreamingFillBackend:
             raise _refuse(
                 "destination_absent",
                 "the census after materialization is not the census before it — "
-                "placement moves bytes, never topology",
+                "placement moves bytes, never tensor schema",
             )
         # The baseline the SUBSTITUTION law is checked against later. Taken here, from the
         # census this method just agreed with, so leaf replacement is measured against what
@@ -1562,7 +1594,7 @@ class StreamingFillBackend:
         component, _, local = key.partition(".")
         if not local.endswith(".weight"):
             raise _refuse(
-                "leaf_topology",
+                "leaf_schema",
                 f"{key}: the native route replaces a LINEAR OP and names it by its weight; "
                 f"this destination is not a `.weight`, so there is no module for the stored "
                 "roles to become. The artifact encodes a tensor whose consumer this runtime "
@@ -1571,7 +1603,7 @@ class StreamingFillBackend:
             )
         if len(row.shape) != 2:
             raise _refuse(
-                "leaf_topology",
+                "leaf_schema",
                 f"{key}: the native route computes a scaled GEMM, whose operands have two "
                 f"outer dimensions; this destination is rank {len(row.shape)} "
                 f"{row.shape}. A reshape here would be a different model",
@@ -1588,7 +1620,7 @@ class StreamingFillBackend:
             )
         if not attribute:
             raise _refuse(
-                "leaf_topology",
+                "leaf_schema",
                 f"{key}: the weight belongs to the component ROOT, which has no parent to be "
                 "replaced on — a leaf is installed by `setattr` on the module that owns it, "
                 "and the root is owned by the census",
@@ -1599,7 +1631,7 @@ class StreamingFillBackend:
             owner = getattr(owner, step, None)
             if owner is None:
                 raise _refuse(
-                    "leaf_topology",
+                    "leaf_schema",
                     f"{key}: no module at {component}.{owner_local} to hold a replaced leaf",
                     [key],
                 )
@@ -1611,7 +1643,7 @@ class StreamingFillBackend:
         # match is the memory — that is what "this module owns this destination" means.
         if held is None or _data_ptr(held) != _data_ptr(tensor) or _data_ptr(tensor) == 0:
             raise _refuse(
-                "leaf_topology",
+                "leaf_schema",
                 f"{key}: {component}.{local[: -len('.weight')]} does not own the destination "
                 "this key names — a re-wired weight resolves to a module whose `.weight` is "
                 "different memory, and installing a leaf there would compute a different "
@@ -1625,7 +1657,7 @@ class StreamingFillBackend:
         ]
         if tied:
             raise _refuse(
-                "leaf_topology",
+                "leaf_schema",
                 f"{key}: this destination shares storage with {tied[0]}, and both serve "
                 "through a native leaf. A tie is ONE tensor under two names, so replacing "
                 "the first leaf frees memory the second module still points at — the alias "
@@ -1638,7 +1670,7 @@ class StreamingFillBackend:
         declared_in = getattr(replaced, "in_features", None)
         if (declared_out, declared_in) not in ((None, None), (row.shape[0], row.shape[1])):
             raise _refuse(
-                "leaf_topology",
+                "leaf_schema",
                 f"{key}: {type(replaced).__name__} declares "
                 f"({declared_out}, {declared_in}) and the checkpoint supplies {row.shape}",
                 [key],
@@ -1723,15 +1755,15 @@ class StreamingFillBackend:
             self.forensics.dump("fill_end")
 
     def _reconcile_leaves(self) -> None:
-        """The census law for a generation whose topology MOVED, and the priced-bytes settle.
+        """The census law for a generation whose tensor schema MOVED, and priced bytes settle.
 
         `materialize` holds the placement law — the census after is the census before, key
-        for key, because placement moves bytes and never topology. Leaf replacement is not
-        placement and does move topology, so it cannot ride that law and must not relax it
+        for key, because placement moves bytes and never tensor schema. Leaf replacement is not
+        placement and does move tensor schema, so it cannot ride that law and must not relax it
         either. What holds here instead is the SUBSTITUTION law: the component's census is
         exactly what it was, minus every replaced destination, plus exactly the role keys
         each leaf DECLARED. A key that vanished unannounced, a declared role that never
-        arrived, or a replaced weight still standing are all `leaf_topology` — because each
+        arrived, or a replaced weight still standing are all `leaf_schema` — because each
         one means the module tree is not what the fill plane priced.
 
         Then the component's priced bytes settle to the MEASURED truth rather than to
@@ -1751,12 +1783,12 @@ class StreamingFillBackend:
             want = (before - gone) | arrived
             if present != want:
                 raise _refuse(
-                    "leaf_topology",
+                    "leaf_schema",
                     f"{name}: leaf replacement declared {len(gone)} destination(s) replaced "
                     f"by {len(arrived)} role key(s), and the module tree does not hold that. "
                     f"Missing {sorted(want - present)[:4]}, unexpected "
                     f"{sorted(present - want)[:4]}. A substitution the census cannot confirm "
-                    "is a topology priced wrong",
+                    "is a tensor schema priced wrong",
                     sorted(want ^ present)[:6],
                 )
             self.census_keys[name] = frozenset(present)
@@ -1803,11 +1835,11 @@ class StreamingFillBackend:
         residence tier (§3.2). Re-staging is an ordinary cr-005 fill from the page-cached
         CAS mapping, which is both simpler and, on a warm page cache, faster than a D2H
         copy plus an H2D copy would be. The module is moved to `meta` rather than dropped,
-        so its topology survives and the restage is a reservation, not a construction.
+        so its tensor schema survives and the restage is a reservation, not a construction.
         """
         if any(key.startswith(f"{name}.") for key in self.replaced):
             raise _refuse(
-                "leaf_topology",
+                "leaf_schema",
                 f"{name!r} holds replaced ENCODED LEAVES and cannot be evicted by this "
                 "build. Eviction parks the module on `meta` and `stage` RE-FILLS it against "
                 "the checkpoint's own keys — but this component's keys are no longer the "

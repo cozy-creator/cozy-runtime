@@ -71,7 +71,7 @@ def _rows(reference: PassCapture, other: PassCapture, steps: int) -> list[dict[s
     if stray:
         raise ProbeRefusal(
             f"taps {stray} fired in one lane and never in the reference — lanes change "
-            "weights, never topology",
+            "weights, never tensor schema",
             code="firing_divergence",
         )
     rows: list[dict[str, Any]] = []
@@ -84,7 +84,7 @@ def _rows(reference: PassCapture, other: PassCapture, steps: int) -> list[dict[s
             if ours is None or theirs is None:
                 raise ProbeRefusal(
                     f"tap {path!r} step {step}: fired in one lane and not the other — lanes "
-                    "change weights, never topology",
+                    "change weights, never tensor schema",
                     code="firing_divergence",
                 )
             stats = compare(path, step, ours, theirs)

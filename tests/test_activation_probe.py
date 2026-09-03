@@ -345,14 +345,14 @@ def test_refusals_are_typed() -> None:
         del model.blocks[3]
         return model
 
-    with pytest.raises(ProbeRefusal) as topology:
+    with pytest.raises(ProbeRefusal) as tensor_schema:
         run_probe(
             Lane("ref", _reference_build),
             Lane("shallow", shallow),
             _drive,
             component="denoiser",
         )
-    assert topology.value.code == "topology_divergence"
+    assert tensor_schema.value.code == "tensor_schema_divergence"
 
     def unrecordable_drive(call: Any) -> None:
         call(torch.zeros(1, TOKENS, FEATURES), {"a-set"}, torch.zeros(1, 1, WIDTH))

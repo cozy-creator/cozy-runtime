@@ -132,7 +132,7 @@ def _ctx() -> Context:
 
 def _generation(residency: Lease | None = None) -> Denoiser:
     registry = ModelRegistry(release="cr-060-arm")
-    artifact = Artifact(snapshot=MANIFEST, topology={}, config=Config({}))
+    artifact = Artifact(snapshot=MANIFEST, tensor_schema={}, config=Config({}))
     model = registry.acquire("serve.models.model", Denoiser, artifact)
     if residency is not None:
         object.__setattr__(model, "_cozy_residency", residency)

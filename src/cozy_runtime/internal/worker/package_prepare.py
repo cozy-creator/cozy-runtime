@@ -717,22 +717,24 @@ def _verify_local_revision(
         )
 
 
-#: `(slot path, config bytes) -> the components the derive constructed`.
-Deriver = Callable[[str, bytes], tuple[str, ...]]
+#: `(slot path, config bytes, verified model assets) -> constructed components`.
+Deriver = Callable[[str, bytes, Mapping[str, bytes]], tuple[str, ...]]
 
 
 def _deriver(installed: package_environment.InstalledEnvironment, application: str) -> Deriver:
-    """`cozy-runtime derive` in the package's own environment, one bounded child per slot:
+    """Private request-time construction in the package's own environment:
     `Slot.components` is what the factory constructs for this config document (D9), and
     this plane never reads it off the header. The child imports the derive machinery; this
     plane imports only the request/response seam (cr-067's guard, kept by construction)."""
 
-    def derive(slot: str, config_bytes: bytes) -> tuple[str, ...]:
+    def derive(
+        slot: str, config_bytes: bytes, assets: Mapping[str, bytes]
+    ) -> tuple[str, ...]:
         if not application:
             raise PreparationRefusal("package_prepare_interface_invalid", "application")
         try:
             request = derive_child.DeriveRequest(
-                (derive_child.SlotRequest(slot, config_bytes),),
+                (derive_child.SlotRequest(slot, config_bytes, assets),),
                 application=application,
             )
             (held,) = derive_child.derive_in(installed.python, request)
@@ -809,7 +811,7 @@ def _entrypoints(
             model = selected[path]
             model_id = model_ids[path]
             assert derive is not None
-            constructed = derive(path, model["config_bytes"])
+            constructed = derive(path, model["config_bytes"], model["assets"])
             slots.append(
                 pb.Slot(
                     slot=path.removeprefix(prefix),
@@ -1013,13 +1015,14 @@ def _selected_models(
             held = store.manifest(digest)
             header = tensorfs.parse_header(bytes(held["header"]))
             configs = header.get("configs")
-            if not header.get("components") or header.get("assets") not in ({}, None):
+            if not header.get("components"):
                 raise PreparationRefusal(
                     "package_prepare_model_header_unsupported",
-                    f"{digest}: expected configs, components, and no runtime-consumed assets",
+                    f"{digest}: expected configs and components",
                 )
             try:
-                config_digest, config_bytes = model_config.construction_document(configs)
+                config_bytes = model_config.construction_config(configs)
+                assets = fill.Checkpoint(artifact_store, digest).model_assets()
             except model_config.ModelConfigRefusal as exc:
                 raise PreparationRefusal(
                     "package_prepare_model_config_mismatch", f"{digest}: {exc}"
@@ -1028,8 +1031,8 @@ def _selected_models(
                 if value["selection"]["manifest"] == digest:
                     value.update(
                         manifest_length=length,
-                        config_digest=config_digest,
                         config_bytes=config_bytes,
+                        assets=assets,
                     )
             if manifest_path is not None:
                 verified(digest, length, manifest_path)

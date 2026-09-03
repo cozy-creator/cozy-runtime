@@ -842,7 +842,6 @@ def executor_prepare_command(
                     "components": list(model.components),
                     "snapshots": dict(model.snapshots),
                     "store": model.store,
-                    "config": model.config,
                     "snapshot": model.reference_snapshot,
                     "release": binding.release,
                     "variant": model.variant,

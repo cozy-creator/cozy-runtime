@@ -193,7 +193,7 @@ package code rather than merely unused.
 TensorFS has filled the ordinary module tree, it installs fused RMSNorm + split-half RoPE,
 direct split-half RoPE matrix production, `addcmul` residuals, native RMSNorm and a
 latent-sized zero padding mask. The installation
-compares state-dict topology and every parameter/buffer storage address before and after;
+compares the state-dict tensor schema and every parameter/buffer storage address before and after;
 its source/dependency digest enters constructed-generation identity. Any source, class or
 config drift refuses typed.
 
@@ -236,15 +236,13 @@ plants a self-registering sibling module and proves describe cannot see it.
 
 `internal/package_interface.py` is the schema home for `PackageInterface`/`JobDescriptor`: only
 the launch and invocation facts with current readers. It carries no Runtime-global service
-inventory, diagnostics, config UI metadata, or tensor requirements (the derive owns that), and
+inventory, diagnostics, config UI metadata, or tensor requirements, and
 `_fixed_point` proves over the built document that no release digest, build timestamp,
 machine path or mutable binding reached it. A slot is `{path, class, component_use,
-encoded_leaves}`; the deleted `stamps` and `source_profile` members refuse typed
-(`package_interface.stamps_retired`, `package_interface.source_profile_retired`) when
-they carry a value, and an empty `stamps` map is read as nothing declared because every
-release published before the cut ships one.
+encoded_leaves}`. Deleted members are simply unknown fields; there is no legacy decoder or
+empty-value compatibility shim.
 Packages declare no GPU count, VRAM floor, accelerator class, placement, or free-form hardware
-predicate. Those facts come from the selected model lane and its concrete topology/encoding,
+predicate. Those facts come from the selected model lane and its concrete tensor schema/encoding,
 RecordOwner placement, qualification measurements, and the worker's observed machine. The
 interface reader rejects the retired `resources` key as an unknown field; format `/1` has one
 current grammar and no compatibility decoder.
@@ -341,12 +339,13 @@ package, semantic release, and source digest, then launches Runtime with the mat
 and facts. No project wheel, release.json, Environment, or receipt is invented.
 For a modeled entrypoint, Runtime resolves package.toml through its existing binding owner and
 joins the exact release/lane through the explicitly granted local TensorFS Repository. The
-Placement carries the ordinary exact Manifest/config/component facts; at acquisition
+Placement carries the ordinary exact Manifest/component facts; at acquisition
 the launch Runtime re-reads the source interface and TensorFS Manifest/header/config, derives the
 same binding locally, and compares every accepted fact before STAGED. Creator owns the source-file
 digest and closes its scan race before replacing the whole worker generation after edits; Runtime
-does not invent a second source hash. TensorFS logical assets refuse typed in this first lane
-because the local Repository does not expose them as a directly usable selection authority.
+does not invent a second source hash. Header-declared model assets travel in the CozyTensors
+runtime closure and reach package construction only through Loader's bounded read-only asset
+capability; a temporary private read-only tree exists only for third-party path-based constructors.
 
 A writable delegated cgroup-v2 child remains the preferred executor lifecycle boundary. Ordinary
 RunPod containers instead expose their provider-owned cgroup-v2 scope read-only. Runtime uses its
@@ -410,21 +409,15 @@ materialization, convergence, fallback, or readiness code. Cold proof checks int
 warm proof checks zero downloaded package bytes and exact verified reuse, while the real
 TensorFS cache proof checks non-empty model downloaded/reused accounting.
 
-**The fit (model-code-fit §3).** `cozy-runtime derive --python <venv python> --slot <path>
---config <document> [--application <module:attr> | --dir <project>] [--out <dir>]`
-(`cli/derive.py`) is the code side: `census(factory(config_document))` on the meta device,
-in one bounded child of the package's own interpreter (`internal/derive_child.py` — no
-network, no weight bytes, no writes, no CUDA), emitted as canonical TensorRequirements: rows
-with `accepts` from the class's `encoded_leaves`, plus the components the
-factory constructed in order (D9). Hardware-independent (a construction that reads the
-device refuses, D3) and deterministic — the child derives twice and refuses a construction
-that differs from itself. The checkpoint side is the cozytensors header, and the ONE answer
-is `tensorfs.fit`: the worker's `Loader.construct` censuses the real construction and asks
-it — with the executor's device class and its own `probe.qualify` records — before a byte is
-reserved; a verdict that is not `ok` is the typed prepare refusal `model_fit_refused`
-carrying the Fit document verbatim. The runtime keeps no matcher of its own. Every
-PlacementSet writer (`worker/package_prepare.py`, `internal/local.py`) fills
-`Slot.components` from the derive, never from the header.
+**The fit (model-code-fit §3).** TensorRequirements exist only as transient in-memory rows.
+Runtime executes `factory(config)` on the meta device in the package interpreter's private bounded
+child (no network, weight bytes, writes, or CUDA), then discards the rows after use. There is no
+public derive verb, document, digest, cache, directory, or publication artifact. The serving
+`Loader.construct` performs the same census and calls `tensorfs.fit` directly with requirement
+objects and the CozyTensors header before reserving a destination. Encoding consent is one boolean
+policy input, not duplicated per tensor. A non-`ok` verdict is the typed prepare refusal
+`model_fit_refused`. Every PlacementSet writer fills `Slot.components` from the private construction,
+never from the header.
 
 A package whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
 `describe` refuses the release if PyAV is absent. The package interface publishes the hard per-field

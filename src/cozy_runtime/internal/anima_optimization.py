@@ -157,7 +157,7 @@ def _type_name(value: object) -> str:
 
 
 def _tensor_census(module: Any) -> tuple[tuple[object, ...], tuple[object, ...]]:
-    topology = tuple(
+    tensor_schema = tuple(
         (name, tuple(value.shape), str(value.dtype), _type_name(value))
         for name, value in module.state_dict(keep_vars=True).items()
     )
@@ -168,7 +168,7 @@ def _tensor_census(module: Any) -> tuple[tuple[object, ...], tuple[object, ...]]
             *tuple(module.named_buffers(remove_duplicate=False)),
         )
     )
-    return topology, storage
+    return tensor_schema, storage
 
 
 class _RopeMatrix:
@@ -497,7 +497,7 @@ def _fused_anima_cuda_capability() -> tuple[Any, Any] | None:
 def _apply_fused_anima_cuda_plan(
     model: object, *, torch: Any, anima_kernels: Any
 ) -> AppliedAnimaOptimization:
-    """Apply the strict post-capability plan; all source/config/topology drift refuses."""
+    """Apply the strict post-capability plan; all source/config/tensor-schema drift refuses."""
     _version("diffusers", DIFFUSERS_VERSION)
     from diffusers.models.normalization import RMSNorm
     from diffusers.models.transformers.transformer_cosmos import (
@@ -555,8 +555,8 @@ def _apply_fused_anima_cuda_plan(
     after = _tensor_census(transformer)
     if after != before:
         raise _refuse(
-            "anima_optimization_topology_changed",
-            "the post-fill plan changed state-dict topology or parameter/buffer storage identity",
+            "anima_optimization_tensor_schema_changed",
+            "the post-fill plan changed the tensor schema or parameter/buffer storage identity",
         )
     AnimaPrepareLatentsStep.__call__ = _latent_prepare_call
     return AppliedAnimaOptimization(

@@ -58,8 +58,6 @@ class GroupPlan:
     #: the resolved fill plan's RANK-INVARIANT digest (`rank_invariant_digest`): every
     #: tensor's route, the bytes, the device class - not the card's index
     plan_digest: str
-    #: the construction the fill will build: `config_digest/tensor_requirements_digest`
-    construction_digest: str
     #: the resident ceiling the worker assigned - the same number on every rank
     authorized_device_limit_bytes: int
 
@@ -74,7 +72,6 @@ class GroupPlan:
             degree=int(document["degree"]),
             devices=tuple(str(entry) for entry in document["devices"]),
             plan_digest=str(document["plan_digest"]),
-            construction_digest=str(document["construction_digest"]),
             authorized_device_limit_bytes=int(document["authorized_device_limit_bytes"]),
         )
 

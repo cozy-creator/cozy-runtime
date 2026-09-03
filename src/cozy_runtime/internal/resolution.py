@@ -131,7 +131,7 @@ class PlanRefusal(Exception):
 
 @dataclass(frozen=True, slots=True)
 class Variant:
-    """One artifact of ONE logical model — the same topology, different stored bytes.
+    """One artifact of ONE logical model — the same tensor schema, different stored bytes.
 
     `reference` marks the variant every other one is measured AGAINST. It is the deviation
     origin, so there is exactly one and a candidate set without one has no scale to put
@@ -167,16 +167,12 @@ class Variant:
 class ConstructionFacts:
     """The half of a generation's identity that is NOT about bytes or hardware.
 
-    Hashed into the plan because #549.2's key has to bind the construction contract and the
-    config: a different topology under one variant name is a different resident footprint,
-    and reusing its fill wall was one of the four unbound halves of the old `(variant, rung)`
-    key.
+    Hashed into the plan beside the selected snapshot and per-tensor resolution. The snapshot
+    already commits its inline construction config and tensor schema.
     """
 
     release: str
     model_class: str
-    config_digest: str
-    tensor_requirements_digest: str
     components: tuple[str, ...]
     custody: str = "canonical"
 
@@ -184,8 +180,6 @@ class ConstructionFacts:
         return {
             "release": self.release,
             "model_class": self.model_class,
-            "config_digest": self.config_digest,
-            "tensor_requirements_digest": self.tensor_requirements_digest,
             "components": list(self.components),
             "custody": self.custody,
         }
@@ -805,7 +799,7 @@ def resolve(
     raise PlanRefusal(
         "no_qualified_plan",
         f"no offered artifact variant resolves to an executable plan on "
-        f"{device_line(device)}. The topology is known and understood; what is missing is a "
+        f"{device_line(device)}. The tensor schema is known; what is missing is a "
         "route from these stored bytes to a kernel this device has. "
         + " | ".join(
             f"{r.get('variant', '-')}/{r.get('policy', '-')}: {r.get('verdict')} — "
@@ -840,19 +834,12 @@ def script_plan(
     never selects below it. The executor resolves through `resolve()` with the model
     class's own construction facts; a GPU driver script fills a raw component with no
     model class at all, so this builds the construction identity from the rows alone
-    (`script:<components>`, the empty config) and runs THE SAME `resolve()`. Nothing here
+    (`script:<components>`) and runs THE SAME `resolve()`. Nothing here
     is a second chooser: every candidate, score and confession is `resolve()`'s.
     """
     construction = ConstructionFacts(
         release=release,
         model_class="script:" + "+".join(components),
-        config_digest=canonical.digest({}),
-        tensor_requirements_digest=canonical.digest(
-            {
-                row.key: [list(row.shape), dtype_name(row.dtype), row.encoded.alias]
-                for row in sorted(rows, key=lambda r: str(r.key))
-            }
-        ),
         components=tuple(components),
     )
     variant = Variant(

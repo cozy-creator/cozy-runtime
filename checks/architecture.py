@@ -794,9 +794,8 @@ def fence_supervised_worker_lanes() -> list[str]:
 
 #: cr-067 hard guard, kept under model-code-fit D9: the worker's preparation plane may not
 #: IMPORT the derive machinery or TensorFS's author facade. `Slot.components` is what the
-#: derive constructed, so preparation runs `cozy-runtime derive`'s bounded child in the
-#: package's own environment through the `internal/derive_child.py` seam — a request/response
-#: document plane — and never loads a meta-device construction into the worker process.
+#: private bounded child constructed in the package's own environment through the
+#: `internal/derive_child.py` pipe seam; the worker process never loads the meta construction.
 WORKER_DERIVE_FORBIDDEN = ("cozy_runtime.internal.derive", "cozy_runtime.derive", "tensorfs")
 
 
@@ -808,7 +807,7 @@ def worker_derive_free_violations(worker_dir: pathlib.Path) -> list[str]:
                 if name == banned or name.startswith(banned + "."):
                     problems.append(
                         f"{path.relative_to(worker_dir.parent.parent.parent)}: imports {name} — "
-                        "worker prep modules may not reach derive/TensorRequirements (cr-067)"
+                        "worker prep modules may not reach model derivation (cr-067)"
                     )
     return problems
 

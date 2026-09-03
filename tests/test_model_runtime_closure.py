@@ -12,7 +12,9 @@ from typing import Any, TypedDict
 import pytest
 import tensorfs
 
-from cozy_runtime.internal import base_observation, canonical, package_interface
+from cozy_runtime.author import Artifact, CapabilityError, Config, Loader
+from cozy_runtime.author._loader import loading
+from cozy_runtime.internal import base_observation, canonical, fill, package_interface
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.downloads import DownloadPlan
 
@@ -119,6 +121,35 @@ def test_model_prep_still_requires_header_assets(tmp_path: Path) -> None:
     assert hashlib.sha256(_ASSET).hexdigest() in refused.value.detail
 
 
+def test_loader_consumes_verified_header_assets(tmp_path: Path) -> None:
+    store_root, manifest_id, _manifest_length, _store = _snapshot(
+        tmp_path, include_asset=True
+    )
+    assets = fill.Checkpoint(store_root, manifest_id).model_assets()
+    assert assets == {"tokenizer/vocab.txt": _ASSET}
+
+    class Owner:
+        def _cozy_require_scope(self, what: str) -> None:
+            raise AssertionError(what)
+
+    loader = Loader(
+        Artifact("checkpoint", {}, Config({}), assets=assets),
+        owner=Owner(),
+    )
+    capability = loader.assets
+    with loading(loader):
+        assert capability.names() == ("tokenizer/vocab.txt",)
+        assert capability.read("tokenizer/vocab.txt") == _ASSET
+        assert capability.open("tokenizer/vocab.txt").read() == _ASSET
+        with capability.materialized("tokenizer") as tokenizer:
+            vocab = tokenizer / "vocab.txt"
+            assert vocab.read_bytes() == _ASSET
+            assert vocab.stat().st_mode & 0o222 == 0
+        assert not tokenizer.exists()
+    with pytest.raises(CapabilityError, match="outside load/unload"):
+        capability.read("tokenizer/vocab.txt")
+
+
 def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -> None:
     store_root, manifest_id, manifest_length, store = _snapshot(tmp_path, include_asset=True)
     acquirer = _acquirer(tmp_path, store_root)
@@ -182,6 +213,5 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
     assert tensorfs.parse_header(bytes(store.manifest(manifest_id)["header"]))["configs"] == {
         "unet": _CONFIG
     }
-    assert Path(model.config).read_bytes() == _CONFIG
-    assert model.config_digest == "sha256:" + hashlib.sha256(_CONFIG).hexdigest()
+    assert model.reference_snapshot == manifest_id
     assert documents_count == 1  # PackageInterface only; config is not a downloaded document.

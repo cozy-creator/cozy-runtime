@@ -55,7 +55,14 @@ from cozy_runtime.author._invoke import (
 )
 from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._services import ProgressFrame
-from cozy_runtime.internal import accel, canonical, child_env, package_interface, sandbox
+from cozy_runtime.internal import (
+    accel,
+    canonical,
+    child_env,
+    model_config,
+    package_interface,
+    sandbox,
+)
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
 from cozy_runtime.internal.exits import Exit
@@ -676,7 +683,7 @@ class Executor:
             StreamingFillBackend,
             complete_device_envelope,
             dtype_name,
-            topology_of,
+            tensor_schema_of,
         )
         from cozy_runtime.internal.planfacts import PlanFacts
         from cozy_runtime.internal.probe import qualify
@@ -796,29 +803,21 @@ class Executor:
         )
         objective = str(binding.get("objective") or "latency")
         model_cls = getattr(self.discovered.module, binding["model_class"])
-        # AN ARTIFACT THAT DECLARES NO CONSTRUCTION CONFIG GETS THE EMPTY DOCUMENT, and `{}`
-        # is that artifact's honest config identity rather than a missing one — it hashes
-        # into the plan like any other, and the construction layers already say what it
-        # means ("an artifact that carries none leaves every field at the release's own
-        # value"). Reading `Path("")` instead turned a legitimate config-less checkpoint
-        # into a file-not-found inside prepare.
-        config_document = (
-            json.loads(Path(binding["config"]).read_text()) if binding.get("config") else {}
-        )
-        # The construction half of plan identity, computed from the HEADER and the CONFIG —
-        # both available before a line of the model is built. They are the same facts the
-        # post-construction record carries, one plane earlier, which is the only place a plan
-        # that has to be resolved BEFORE construction can read them.
+        config_checkpoint = next(
+            (
+                checkpoint
+                for checkpoint in checkpoints.values()
+                if checkpoint.manifest_id == reference.snapshot
+            ),
+            None,
+        ) or Checkpoint(reference.store, reference.snapshot)
+        config_bytes = model_config.construction_config(config_checkpoint.header.get("configs"))
+        config_document = canonical.parse_canonical(config_bytes)
+        if not isinstance(config_document, dict):
+            raise RuntimeError("the CozyTensors construction config is not an object")
         construction = ConstructionFacts(
             release=str(binding["release"]),
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
-            config_digest=canonical.digest(config_document),
-            tensor_requirements_digest=canonical.digest(
-                {
-                    key: [list(spec.shape), spec.dtype, spec.encoding]
-                    for key, spec in sorted(topology_of(rows).items())
-                }
-            ),
             components=tuple(names),
             custody=str(binding.get("custody", "canonical")),
         )
@@ -859,9 +858,6 @@ class Executor:
                 degree=self.world,
                 devices=_sealed_entries(),
                 plan_digest=rank_invariant_digest(plan.identity()),
-                construction_digest=(
-                    construction.config_digest + "/" + construction.tensor_requirements_digest
-                ),
                 authorized_device_limit_bytes=authorized,
             )
             if self.rank == 0:
@@ -1009,12 +1005,9 @@ class Executor:
             }
         artifact = Artifact(
             reference.snapshot,
-            topology_of(rows),
-            Config._verified(
-                config_document,
-                "unet.config",
-                construction.config_digest,
-            ),
+            tensor_schema_of(rows),
+            Config(config_document, "model.config"),
+            assets=config_checkpoint.model_assets(),
             # CUSTODY is a BINDING fact, not a runtime constant: a checkpoint that came
             # through the border is canonical and a serve-time extra key is drift, while a
             # local bind of an un-bordered checkpoint tiers its extras (§1.1). Defaulting
@@ -1130,7 +1123,7 @@ class Executor:
         # THE CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is
         # THE RESOLVED PLAN'S OWN DIGEST that says so. The plan digest binds the exact
         # snapshot map, every tensor's implementation digest and route, the device identity,
-        # the runtime source digest and the construction facts (config + topology), so two
+        # the runtime source digest and the construction facts, so two
         # materially different fills of one artifact never share it. There is no second,
         # "logical" identity beside it: the MCC digest and its `expect_construction_digest`
         # fence are deleted whole (model-code-fit D12) — its only consumer was a fence the
@@ -1139,8 +1132,6 @@ class Executor:
         constructed_preimage = canonical.write(
             {
                 "plan_digest": plan.digest(),
-                "tensor_requirements_digest": record.tensor_requirements_digest,
-                "config_digest": record.config_digest,
                 # THE APPLIED CEILING, derived from the card (cl-027).
                 "resident_budget_bytes": resident_budget,
                 "execution_optimization": optimization.document() if optimization else None,
@@ -1174,12 +1165,6 @@ class Executor:
                 # is what the fill committed and the ceiling it committed under.
                 theirs = dict(reply.get("facts") or {})
                 agreed: list[tuple[str, object, object]] = [
-                    (
-                        "tensor_requirements_digest",
-                        record.tensor_requirements_digest,
-                        theirs.get("tensor_requirements_digest"),
-                    ),
-                    ("config_digest", record.config_digest, theirs.get("config_digest")),
                     ("filled_bytes", record.filled_bytes, theirs.get("filled_bytes")),
                     (
                         "resident_budget_bytes",
@@ -1215,8 +1200,6 @@ class Executor:
             "fill_ms": backend.stats.get("fill_ms", 0),
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
-            "tensor_requirements_digest": record.tensor_requirements_digest,
-            "config_digest": record.config_digest,
             "device_free_bytes": memory["driver_free_bytes"],
             "device_total_bytes": memory["driver_total_bytes"],
             "allocator_bytes": memory["allocated_bytes"],

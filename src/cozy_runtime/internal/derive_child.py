@@ -11,20 +11,23 @@ import base64
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from cozy_runtime.author import Artifact, Config, ConformanceError, ModelBinding
+import msgspec
+
 from cozy_runtime.internal import canonical, sandbox
-from cozy_runtime.internal.derive import DeriveError, derive
-from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.exits import Exit
+
+if TYPE_CHECKING:
+    from cozy_runtime.author import Config, ModelBinding
 
 RESULT_PREFIX = b"COZY_DERIVE="
 MEMORY_CAP_BYTES = 24 << 30
 CPU_CAP_SECONDS = 600
 WALL_CAP_SECONDS = 900
+PIPE_CAP_BYTES = 512 << 20
 
 RequirementRow = tuple[str, str, str | None, tuple[int, ...]]
 
@@ -42,6 +45,7 @@ class DeriveRefusal(Exception):
 class SlotRequest:
     slot: str
     config: bytes
+    assets: Mapping[str, bytes] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +65,11 @@ class DeriveRequest:
         return {
             "package": package,
             "slots": [
-                {"slot": row.slot, "config": base64.b64encode(row.config).decode()}
+                {
+                    "slot": row.slot,
+                    "config": row.config,
+                    "assets": dict(sorted(row.assets.items())),
+                }
                 for row in self.slots
             ],
         }
@@ -78,8 +86,8 @@ class TensorRequirements:
 
 def read_request(raw: bytes) -> DeriveRequest:
     try:
-        value = canonical.parse_canonical(raw)
-    except canonical.CanonicalError as err:
+        value = msgspec.msgpack.decode(raw)
+    except msgspec.DecodeError as err:
         raise DeriveRefusal("derive_request_invalid", str(err)) from err
     if not isinstance(value, dict) or set(value) != {"package", "slots"}:
         raise DeriveRefusal("derive_request_invalid", "request field set")
@@ -104,20 +112,30 @@ def read_request(raw: bytes) -> DeriveRequest:
         raise DeriveRefusal("derive_request_invalid", "slots is a non-empty array")
     slots: list[SlotRequest] = []
     for row in encoded_rows:
-        if not isinstance(row, dict) or set(row) != {"slot", "config"}:
+        if not isinstance(row, dict) or set(row) != {"slot", "config", "assets"}:
             raise DeriveRefusal("derive_request_invalid", "slot row field set")
         slot = row["slot"]
-        encoded = row["config"]
-        if not isinstance(slot, str) or not slot or not isinstance(encoded, str):
+        config = row["config"]
+        encoded_assets = row["assets"]
+        if (
+            not isinstance(slot, str)
+            or not slot
+            or not isinstance(config, bytes)
+            or not isinstance(encoded_assets, dict)
+        ):
             raise DeriveRefusal("derive_request_invalid", f"slot {slot!r}")
         try:
-            config = base64.b64decode(encoded, validate=True)
             document = canonical.parse_canonical(config)
-        except (ValueError, canonical.CanonicalError) as err:
+        except canonical.CanonicalError as err:
             raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} config: {err}") from err
         if not isinstance(document, dict):
             raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} config is not an object")
-        slots.append(SlotRequest(slot, config))
+        assets: dict[str, bytes] = {}
+        for name, value in encoded_assets.items():
+            if not isinstance(name, str) or not name or not isinstance(value, bytes):
+                raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} asset")
+            assets[name] = value
+        slots.append(SlotRequest(slot, config, assets))
     names = [row.slot for row in slots]
     if names != sorted(set(names)):
         raise DeriveRefusal("derive_request_invalid", "slots are sorted unique by path")
@@ -136,7 +154,7 @@ def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements,
             [str(python), "-I", "-B", "-m", "cozy_runtime.internal.derive_child"],
             cwd="/",
             env=child_env,
-            input=canonical.write(request.render()),
+            input=msgspec.msgpack.encode(request.render()),
             capture_output=True,
             timeout=WALL_CAP_SECONDS,
             check=False,
@@ -164,8 +182,8 @@ def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements,
             stderr[-1200:] or f"child exited {result.returncode} without a result",
         )
     try:
-        response = canonical.parse_canonical(base64.b64decode(encoded, validate=True))
-    except (ValueError, canonical.CanonicalError) as err:
+        response = msgspec.msgpack.decode(base64.b64decode(encoded, validate=True))
+    except (ValueError, msgspec.DecodeError) as err:
         raise DeriveRefusal("derive_child_invalid", str(err)) from err
     if not isinstance(response, dict):
         raise DeriveRefusal("derive_child_invalid", "child result is not an object")
@@ -252,16 +270,23 @@ def _render(requirements: Sequence[TensorRequirements]) -> dict[str, Any]:
 
 
 def _emit(value: Mapping[str, Any]) -> None:
-    sys.stdout.buffer.write(RESULT_PREFIX + base64.b64encode(canonical.write(dict(value))) + b"\n")
+    sys.stdout.buffer.write(
+        RESULT_PREFIX + base64.b64encode(msgspec.msgpack.encode(dict(value))) + b"\n"
+    )
 
 
-def _derive_twice(binding: ModelBinding, config: Config) -> TensorRequirements:
+def _derive_twice(
+    binding: ModelBinding, config: Config, assets: Mapping[str, bytes]
+) -> TensorRequirements:
     """A transient derivation must still be deterministic within one request."""
+
+    from cozy_runtime.author import Artifact
+    from cozy_runtime.internal.derive import derive
 
     def once() -> TensorRequirements:
         result = derive(
             binding.model_class(),
-            Artifact("derive://request", {}, config, custody="canonical"),
+            Artifact("derive://request", {}, config, assets=assets, custody="canonical"),
             component_use=binding.components,
         )
         rows = tuple(
@@ -291,8 +316,17 @@ def _warm_torch() -> None:
 
 
 def main() -> int:
+    from cozy_runtime.author import Config, ConformanceError
+    from cozy_runtime.internal.derive import DeriveError
+    from cozy_runtime.internal.discovery import discover, discover_installed
+
     try:
-        request = read_request(sys.stdin.buffer.read(canonical.DOC_MAX_BYTES + 1))
+        raw = sys.stdin.buffer.read(PIPE_CAP_BYTES + 1)
+        if len(raw) > PIPE_CAP_BYTES:
+            raise DeriveRefusal(
+                "derive_request_invalid", f"request exceeds {PIPE_CAP_BYTES} bytes"
+            )
+        request = read_request(raw)
         _warm_torch()
         sandbox.install(allow_write_prefixes=())
         sandbox.bound(address_bytes=MEMORY_CAP_BYTES, cpu_seconds=CPU_CAP_SECONDS)
@@ -319,7 +353,7 @@ def main() -> int:
             document = canonical.parse_canonical(row.config)
             if not isinstance(document, dict):
                 raise DeriveRefusal("derive_input_invalid", f"{row.slot}: config is not an object")
-            requirements.append(_derive_twice(binding, Config(document, "config")))
+            requirements.append(_derive_twice(binding, Config(document, "config"), row.assets))
     except DeriveRefusal as err:
         _emit({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
