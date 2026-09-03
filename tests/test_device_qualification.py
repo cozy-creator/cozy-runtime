@@ -28,8 +28,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from cozy_runtime.internal import canonical
-from cozy_runtime.internal.probe import observed_capability_records
+from cozy_runtime.internal.encoding import SPEC_VECTORS
+from cozy_runtime.internal.probe import (
+    case_dtype,
+    observed_capability_records,
+    spec_vector_document,
+)
 
 #: The exact keys TensorFS's `CapabilityRecords::parse_observed` requires, all of them, on
 #: every record. It reads with unknown fields refused, so a surplus key and a missing key are
@@ -212,3 +219,56 @@ def test_the_document_carries_no_per_run_measurement() -> None:
     }
     found = set(re.findall(r"sha256:[0-9a-f]{64}", canonical.write(document).decode()))
     assert found and found <= stable, f"a per-run digest reached the document: {found - stable}"
+
+
+def _torch_here() -> str:
+    try:
+        import torch  # noqa: F401
+    except ImportError as exc:
+        return f"torch must be importable to run a provider over the mined bytes: {exc}"
+    return ""
+
+
+needs_torch = pytest.mark.skipif(bool(_torch_here()), reason=_torch_here() or "")
+
+
+def test_every_vendored_document_is_readable_by_the_reader_that_runs_it() -> None:
+    """The mined bytes and the suite's reader have to name the logical dtype the SAME WAY.
+
+    They stopped: TensorFS 0.3 renamed the CozyTensors header's `logical.dtype` to
+    `logical_dtype`, the rename was applied to this reader too, and these documents are not
+    headers — they are producer-mined vector artifacts, pinned by digest, whose `logical`
+    object still spells it `dtype`. Every case then matched nothing, `_spec_vectors`
+    reported SKIPPED, `_reportable` dropped the skip, and the observed document handed to
+    TensorFS lost every non-verbatim record on every card. This arm reads the documents
+    through the SAME expression the suite does, so the two cannot drift apart again.
+    """
+    assert SPEC_VECTORS, "the reviewed table pins at least one mined document"
+    for digest in SPEC_VECTORS:
+        document = spec_vector_document(digest)
+        assert document is not None, f"{digest} is pinned and its bytes must verify"
+        dtypes = {case_dtype(case) for case in document["cases"]}
+        assert dtypes and None not in dtypes, (
+            f"{digest}: the mined cases declare {dtypes} — the reader read no dtype out of "
+            "bytes that carry one"
+        )
+
+
+@needs_torch
+def test_the_mined_cases_actually_run_against_the_shipped_decoder() -> None:
+    """The whole point of the vectors: a real provider decodes the producer's own bytes.
+
+    Runs on CPU with no card, because the arithmetic is the same one the accelerator
+    qualifies and the question here is whether the check RUNS at all — a skipped check is
+    the failure this file exists to catch.
+    """
+    import torch
+
+    from cozy_runtime.internal.encoding import SPEC_ROWWISE, RowwiseDequant
+    from cozy_runtime.internal.probe import _spec_vectors
+
+    provider = RowwiseDequant(SPEC_ROWWISE)
+    report = _spec_vectors(torch, provider, torch.device("cpu"), torch.bfloat16, "bfloat16")
+    assert not report.get("skipped"), report
+    assert report["passed"], report
+    assert report["cases"], "the bf16 case the mined document carries has to have run"
