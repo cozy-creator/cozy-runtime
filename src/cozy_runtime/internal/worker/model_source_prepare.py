@@ -11,7 +11,6 @@ import re
 import stat
 import urllib.parse
 from pathlib import Path
-from typing import Any
 
 from cozy_runtime.internal import fill
 from cozy_runtime.internal.refusal import LaunchRefusal

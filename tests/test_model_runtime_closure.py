@@ -111,9 +111,7 @@ def test_model_prep_ignores_absent_snapshot_siblings(tmp_path: Path) -> None:
 
 
 def test_held_manifest_census_comes_from_tensorfs(tmp_path: Path) -> None:
-    _store_root, manifest_id, _manifest_length, store = _snapshot(
-        tmp_path, include_asset=True
-    )
+    _store_root, manifest_id, _manifest_length, store = _snapshot(tmp_path, include_asset=True)
     held = HeldManifests()
 
     assert held.rebuild(store) == 1

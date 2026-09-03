@@ -72,9 +72,7 @@ def prepare_package_set(
         or not tensorfs_root.is_absolute()
         or (job_plan_root is not None and not job_plan_root.is_absolute())
     ):
-        raise PreparationRefusal(
-            "package_prepare_install_root_invalid", request.install_root
-        )
+        raise PreparationRefusal("package_prepare_install_root_invalid", request.install_root)
     try:
         delegation = documents.read(request.download_delegation, pb.DownloadDelegation)
     except documents.DocumentError as exc:
@@ -387,9 +385,7 @@ def check_package_set_compatibility(
     """
 
     if Path(request.install_root) != environment_root or not environment_root.is_absolute():
-        raise PreparationRefusal(
-            "package_prepare_install_root_invalid", request.install_root
-        )
+        raise PreparationRefusal("package_prepare_install_root_invalid", request.install_root)
     try:
         delegation = documents.read(request.download_delegation, pb.DownloadDelegation)
     except documents.DocumentError as exc:
