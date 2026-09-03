@@ -132,37 +132,28 @@ def digests_of(alias: str) -> tuple[str, ...]:
 # alias-keyed spelling had neither.
 
 #: `plain/1` — one `value` role carrying the logical bytes verbatim.
-SPEC_PLAIN = "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd"
+SPEC_PLAIN = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f"
 
 #: `fp8-rowwise/1`, rank-1 `[out]` scale. v1's `fp8-w8a8` writer.
-SPEC_ROWWISE = "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5"
+SPEC_ROWWISE = "sha256:c4be0120fb4548306b134f6ee07eb2545a363bc140a005af1ef6543c790cf890"
 
 #: `fp8-rowwise/1`, rank-2 `[out, 1]` scale — a KEPT trailing unit axis, physically distinct.
-SPEC_ROWWISE_KEEPDIM = "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78"
+SPEC_ROWWISE_KEEPDIM = "sha256:6773dfe384aeb380d8d32de9f0b384a59a3294a96da4f3f1c8b956e194e3ff2e"
 
 #: `fp8-scaled-scalar/1` WITH the rank-0 activation `input_scale` (H3's 150 modules).
 #:
-#: MOVED at tensorfs `940973f`, and this file did not move with it — so from that commit
-#: until now this runtime could not serve ANY fp8-scaled-scalar artifact: `launch_providers`
-#: refused `spec_unreviewed` naming two digests the installed registry does not carry.
-#: Nothing caught it because the only such artifact is H3 and H3 had only ever been driven
-#: through the model path, never through this provider path (#555h's "the SERVING path is
-#: not output-verified", made concrete). The review behind the new digest: same alias, the
-#: same role set (`data`, `input_scale`, `weight_scale`), and — decisively — the vendored
-#: vector document this provider is READ AGAINST is byte-identical to the one the new spec
-#: names (`cac6671a…`). What moved in the spec document is its prose and its acquisition of
-#: those very vectors; the physical byte contract did not.
-SPEC_SCALED_SCALAR = "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f"
+#: TensorFS 0.3 removed prose from EncodingSpec identity. Roles and the exact vendored vector
+#: bytes remain unchanged; only the reviewed spec identity moves.
+SPEC_SCALED_SCALAR = "sha256:762e1d49dd11df1d9e99893213f232cf72797bf879aa6f07bc138ec86c04bac3"
 
 #: `fp8-scaled-scalar/1` weight-scale only (H3's 50 `mlp.fc2`). One artifact, two role sets.
-#: Same move, same review: roles (`data`, `weight_scale`) unchanged and the vendored vectors
-#: (`e7bf8223…`) are the ones the new spec names.
+#: Roles (`data`, `weight_scale`) and vendored vector bytes remain unchanged under 0.3.
 SPEC_SCALED_SCALAR_WEIGHT_ONLY = (
-    "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489"
+    "sha256:7bede606ac5329020c2653eb04663b0d94d6c778e60234479509eddcce38240c"
 )
 
 #: `mxfp8/1` — E4M3 elements, one E8M0 byte per 32-element block along the last axis.
-SPEC_MXFP8 = "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80"
+SPEC_MXFP8 = "sha256:7e9b1ad8f2e5ddd236a4d4303042d632a96eadef4f25d44eb0fb63124cec7cfd"
 
 #: Reviewed digest -> (vendored fixture filename, exact vector-byte digest) from that nested spec.
 #: Qualification checks both before executing a case. `plain/1`'s route decodes nothing, so it
