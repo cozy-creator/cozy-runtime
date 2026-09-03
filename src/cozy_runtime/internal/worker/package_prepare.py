@@ -23,7 +23,6 @@ from cozy_runtime.internal import (
     package_environment,
     package_interface,
     placement_materialization,
-    pull,
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import acquire
@@ -536,8 +535,8 @@ def _compatibility_models(
         }
     by_manifest: dict[str, dict[str, Any]] = {}
     try:
-        store = pull.open_store(tensorfs, tensorfs_root)
-    except pull.PullRefusal as exc:
+        store = fill.open_store(tensorfs, tensorfs_root)
+    except fill.FillRefusal as exc:
         raise PreparationRefusal("package_prepare_model_store_absent", str(exc)) from exc
     for digest in sorted(wanted_manifests):
         try:
@@ -1198,7 +1197,7 @@ def _selected_models(
 
     try:
         tensorfs = fill.tensorfs_module()
-        store = pull.open_store(tensorfs, tensorfs_root)
+        store = fill.open_store(tensorfs, tensorfs_root)
         manifests: dict[str, tuple[int, bytes]] = {}
         for value in selected.values():
             selection = value["selection"]
@@ -1254,7 +1253,7 @@ def _selected_models(
                     )
     except PreparationRefusal:
         raise
-    except (acquire.AcquisitionRefusal, pull.PullRefusal, fill.FillRefusal) as exc:
+    except (acquire.AcquisitionRefusal, fill.FillRefusal) as exc:
         raise PreparationRefusal(
             "package_prepare_model_refused", f"{getattr(exc, 'code', type(exc).__name__)}: {exc}"
         ) from exc

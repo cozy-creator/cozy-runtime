@@ -17,7 +17,7 @@ owning its device scope, burning nothing.
 
 The sampling constants are turned down because they are RESOLUTION, not contract. The rule
 under test is "still for longer than this boot's own longest pause, and never for less than
-the floor derived from the pull ledger's", and it is the same rule at any cadence.
+the floor derived from the transport ledger's", and it is the same rule at any cadence.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import child_env, liveness, package_interface, pull
+from cozy_runtime.internal import child_env, liveness, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.local import (
@@ -52,7 +52,7 @@ PACKAGE = ROOT / "examples" / "marco-polo"
 
 needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 
-#: The resolution the arms run at. The pull ledger's floor becomes 0.5 s and the readiness
+#: The resolution the arms run at. The noise floor becomes 0.5 s and the readiness
 #: watch's derived floor `STILL_FACTOR` times that.
 SAMPLE = 0.1
 STALL_SAMPLES = 5
@@ -61,16 +61,15 @@ STALL_SAMPLES = 5
 @pytest.fixture(autouse=True)
 def fine_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(liveness, "SAMPLE_SECONDS", SAMPLE)
-    monkeypatch.setattr(pull, "STALL_SAMPLE_SECONDS", SAMPLE)
-    monkeypatch.setattr(pull, "STALL_SAMPLES", STALL_SAMPLES)
+    monkeypatch.setattr(liveness, "STILL_SAMPLES", STALL_SAMPLES)
 
 
-def pull_floor() -> float:
-    return pull.STALL_SAMPLES * pull.STALL_SAMPLE_SECONDS
+def noise_floor() -> float:
+    return liveness.noise_floor()
 
 
 def boot_floor() -> float:
-    return liveness.STILL_FACTOR * pull_floor()
+    return liveness.STILL_FACTOR * noise_floor()
 
 
 @contextlib.contextmanager
@@ -132,12 +131,12 @@ def _run(root: Path, hook: Any) -> tuple[SliceOutcome, float]:
 def test_a_boot_that_keeps_working_is_never_cut(monkeypatch: pytest.MonkeyPatch) -> None:
     """The slow arm: a boot far longer than the old cap's equivalent completes.
 
-    The old 1800 s cap was 60 times the pull ledger's 30 s floor. At this resolution that is
+    The old 1800 s cap was 60 times the transport ledger's 30 s floor. At this resolution that is
     60 times 0.5 s, so the convergence lane is made to work — hash, pause, hash — for that
     long before it spawns the executor: a boot that is moving the whole time and never, in
     any one pause, still for longer than the derived floor. The run must reach its terminal.
     """
-    long_boot = 60 * pull_floor()
+    long_boot = 60 * noise_floor()
 
     def hook(owner: LocalRecordOwner, worker: Worker) -> None:
         spawn = worker.supervision.spawn

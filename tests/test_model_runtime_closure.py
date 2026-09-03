@@ -17,7 +17,6 @@ from cozy_runtime.author._loader import loading
 from cozy_runtime.internal import base_observation, canonical, fill, package_interface
 from cozy_runtime.internal.encoding import SPEC_PLAIN, launch_providers
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal, HeldManifests
-from cozy_runtime.internal.worker.downloads import DownloadPlan
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     _compatibility_models,
@@ -83,7 +82,6 @@ def _acquirer(tmp_path: Path, store_root: Path) -> Acquirer:
     for path in roots.values():
         path.mkdir()
     return Acquirer(
-        DownloadPlan(),
         cache_root=roots["cache"],
         install_root=roots["environment"],
         selection_root=roots["selection"],

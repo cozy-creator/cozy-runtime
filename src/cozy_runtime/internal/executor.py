@@ -1845,7 +1845,7 @@ class Executor:
                     "detail": f"TensorFS store refused ({type(exc).__name__})",
                 }
         elif surface.weights_outputs:
-            from cozy_runtime.internal import fill, pull
+            from cozy_runtime.internal import fill
 
             store_value = str(command.get("tensorfs_root", ""))
             if not store_value:
@@ -1855,9 +1855,9 @@ class Executor:
                     "detail": "this weights-producing job has no verified TensorFS store",
                 }
             try:
-                store = pull.open_store(fill.tensorfs_module(), Path(store_value))
-            except pull.PullRefusal as exc:
-                return {"ok": False, "code": "tensorfs_store_unavailable", "detail": exc.message}
+                store = fill.open_store(fill.tensorfs_module(), Path(store_value))
+            except fill.FillRefusal as exc:
+                return {"ok": False, "code": "tensorfs_store_unavailable", "detail": str(exc)}
         try:
             job_models = self._job_models(surface, command, store)
         except CapabilityError as exc:

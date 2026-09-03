@@ -1227,7 +1227,7 @@ def _verify_grants(
         ):
             # The trusted local proof seat has no acquisition receipt, so it verifies here.
             # Production acquisition always supplies one and therefore never hashes a wheel
-            # a second time after fetch_exact already admitted it.
+            # a second time after admission already verified it.
             if info.st_size != wheel.length or _hash_file(grant.path) != wheel.digest:
                 raise EnvironmentRefusal("package_environment_wheel_digest_mismatch", wheel.digest)
         elif verified.digest != wheel.digest:

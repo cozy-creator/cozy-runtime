@@ -59,7 +59,6 @@ from cozy_runtime.internal import (
     hostfacts,
     package_environment,
     proctree,
-    pull,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
@@ -1773,7 +1772,7 @@ class Worker:
         started = time.perf_counter()
         try:
             tensorfs = fill.tensorfs_module()
-            store = pull.open_store(tensorfs, Path(root))
+            store = fill.open_store(tensorfs, Path(root))
             held = self.held_manifests.rebuild(store)
         except Exception as exc:
             self.note("boot", f"held_manifests: none — {exc}"[:256])
@@ -3351,7 +3350,6 @@ class Worker:
             )
             assert install_root is not None
             acquirer = acquire.Acquirer(
-                downloads.DownloadPlan(),
                 cache_root=self.options.artifact_cache,
                 install_root=install_root,
                 selection_root=self.options.artifact_cache / "selections",

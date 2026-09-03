@@ -120,6 +120,7 @@ REFUSALS = frozenset(
         "lease_revoked",  # the read lease covering these bytes was revoked mid-fill
         "checkpoint_unreadable",  # the snapshot's header/document bytes do not parse
         "reader_unavailable",  # the tfs-007 `tensorfs` facade is not installed here
+        "store_unusable",  # a caller-prepared Store root that TensorFS refuses to open
         # The stored carrier does not match the encoding spec it CITES: a role set that is
         # not the spec's exact set, or a role whose shape is not what the spec's relation
         # derives. Distinct from `role_mismatch` on purpose — that one says THIS RUNTIME's
@@ -293,6 +294,19 @@ def tensorfs_module() -> Any:
             "will not invent one",
         ) from exc
     return tensorfs
+
+
+def open_store(tensorfs: Any, root: Path) -> Any:
+    """Open one caller-prepared TensorFS Store without resolving or mutating its layout."""
+
+    try:
+        return tensorfs.Store.open(str(root))
+    except Exception as exc:
+        raise _refuse(
+            "store_unusable",
+            f"{root}: not a usable TensorFS store — {type(exc).__name__}: {exc}; "
+            "have the Store owner ensure it before launching Runtime",
+        ) from exc
 
 
 #: How a TensorFS refusal is spoken in THIS plane's vocabulary. Closed and explicit: a code

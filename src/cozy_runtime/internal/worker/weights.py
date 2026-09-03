@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, cast
 from urllib.parse import urlparse
 
-from cozy_runtime.internal import egress, fill, pull
+from cozy_runtime.internal import egress, fill
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -925,7 +925,7 @@ class WeightsExchange:
                 raise WeightsExchangeError(
                     "tensorfs_store_unavailable", "this worker has no verified TensorFS Store"
                 )
-            self.store = pull.open_store(fill.tensorfs_module(), self.store_root)
+            self.store = fill.open_store(fill.tensorfs_module(), self.store_root)
         return self.store
 
     def _writer_epoch(self, transaction_id: str) -> int:

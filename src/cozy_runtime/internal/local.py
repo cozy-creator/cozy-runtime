@@ -54,7 +54,6 @@ from cozy_runtime.internal import (
     model_config,
     package_interface,
     proctree,
-    pull,
 )
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.pathkey import opaque_key
@@ -363,12 +362,13 @@ class LocalRecordOwner:
         run stops the watch.
 
         The floor is DERIVED, not chosen. The deepest silence a healthy boot is permitted
-        to show is the pull ledger's own stall floor (`pull.STALL_SAMPLES *
-        STALL_SAMPLE_SECONDS`): a stream that has moved nothing for that long is re-asked
-        for, and the re-ask is progress this watch can see. An outside observer must be
-        more patient than that inner one, by the same factor the inner one applies to its
-        own measurements — so the floor is `STILL_FACTOR *` the pull floor, and a boot that
-        never paused is called wedged at that and not before.
+        to show is the runtime's one noise floor (`liveness.noise_floor()`) — the same
+        floor the transport's own stall ledger acts on (now TensorFS's, cr-090): a stream
+        that has moved nothing for that long is re-asked for, and the re-ask is progress
+        this watch can see. An outside observer must be more patient than that inner one,
+        by the same factor the inner one applies to its own measurements — so the floor is
+        `STILL_FACTOR * noise_floor()`, and a boot that never paused is called wedged at
+        that and not before.
         """
         threading.Thread(
             target=self._watch, args=(worker,), daemon=True, name="ready-watch"
@@ -379,7 +379,7 @@ class LocalRecordOwner:
         while not self.done.wait(liveness.SAMPLE_SECONDS):
             if self.dispatched:
                 return
-            floor = liveness.STILL_FACTOR * pull.STALL_SAMPLES * pull.STALL_SAMPLE_SECONDS
+            floor = liveness.STILL_FACTOR * liveness.noise_floor()
             pace.observe(self._boot_meter(worker))
             if not pace.wedged(floor):
                 continue
