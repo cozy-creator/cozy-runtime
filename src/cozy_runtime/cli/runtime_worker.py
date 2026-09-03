@@ -184,7 +184,7 @@ def _worker_options(
         devices=",".join(str(row["device_index"]) for row in gpus),
         grant_roots=(str(host_paths.MEDIA_ROOT),),
         install_root=host_paths.INSTALL_ROOT,
-        artifact_cache=host_paths.TRANSFER_STAGING,
+        artifact_cache=host_paths.PREPARE_CACHE,
         tensorfs_root=tensorfs_root,
         worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
         no_warm=True,

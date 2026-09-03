@@ -1275,6 +1275,20 @@ def _read_file(path: Path, maximum: int) -> bytes:
 
 
 def _stage(root: Path, raw: bytes) -> tuple[str, int]:
+    """Stage one control document into the worker's content-addressed cache.
+
+    THIS FUNCTION OWNS ITS ROOT, and the mode it leaves behind is a uid decision. Its
+    sibling `acquire._stage` has always done both -- `mkdir(parents=True)` and `chmod
+    0444` -- which is why the serving half survived th-128 deleting
+    `/var/lib/cozy/tmp/transfers` from the worker image and this half did not: run 188
+    refused a rented pod with `[Errno 2] No such file or directory:
+    '/var/lib/cozy/prepare-cache/.prepare-<uuid>'` because nothing had created the
+    directory. The mode matters for the same reason the directory does: the document's
+    PATH is recorded into job plans and handed to the EXECUTOR, which runs as its own uid
+    and does `Path(interface_path).read_bytes()` -- so a root-owned 0400 file is a second
+    refusal waiting one layer further in."""
+
+    root.mkdir(parents=True, exist_ok=True, mode=0o755)
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     target = root / digest.removeprefix("sha256:")
     if target.exists():
@@ -1282,7 +1296,7 @@ def _stage(root: Path, raw: bytes) -> tuple[str, int]:
             raise PreparationRefusal("package_prepare_cache_conflict", digest)
         return digest, len(raw)
     temporary = root / f".prepare-{uuid.uuid4().hex}"
-    descriptor_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+    descriptor_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
     try:
         with os.fdopen(descriptor_fd, "wb") as stream:
             stream.write(raw)
