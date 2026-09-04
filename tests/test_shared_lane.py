@@ -680,6 +680,29 @@ def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
         # and the driver agrees: one tenant's weights are on the card (two could not be,
         # the target was chosen so — and had both stayed, free would be under zero)
         assert turn.free_bytes <= target - weights, (turn.free_bytes, target, weights)
+    # THE CARD IS TAKEN LATE (cr-104). Q's device-free half — Torch, the runtime's
+    # construction modules, its package and whatever that package defers — is warmed BEFORE
+    # P is asked to give the card up, so P keeps computing through an import that will never
+    # touch it. The proof is the ORDER of the notes: the `preconstruct warmed` line for the
+    # tenant a vacate is FOR must precede that vacate. Under the old shape the whole prepare
+    # held the lane's device lock, so `_make_room` emptied the card first and the import then
+    # ran for seconds on a card nothing was using.
+    warmed = re.compile(r"'([^']+)': preconstruct warmed epoch \d+ in [\d.]+ ms OFF the lane lock")
+    vacated_for = re.compile(r"vacated \d+ B in [\d.]+ ms for '([^']+)'")
+    sequence: list[tuple[str, str]] = []
+    for _kind, step in notes:
+        warm = warmed.search(step)
+        if warm:
+            sequence.append(("warmed", warm.group(1)))
+            continue
+        vacate = vacated_for.search(step)
+        if vacate:
+            sequence.append(("vacated-for", vacate.group(1)))
+    assert [row for row in sequence if row[0] == "warmed"], [step for _k, step in notes]
+    for index, (event, slot) in enumerate(sequence):
+        if event != "vacated-for":
+            continue
+        assert ("warmed", slot) in sequence[:index], (slot, sequence)
     # NO RESPAWN: a swap changes residency, never the process. Both epochs are 1 throughout.
     for turn in owner.turns:
         assert {row["executor_epoch"] for row in turn.rows.values()} == {1}, turn.rows
