@@ -27,6 +27,8 @@ The arithmetic arms below use the pod's own numbers and no device. The end-to-en
 
 from __future__ import annotations
 
+from typing import Any
+
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
     UNCALIBRATED_ACTIVATION_BYTES,
@@ -121,13 +123,13 @@ def _bank_solo_serve(
     ledger.device_free = was
 
 
-def _walk(ledger: Ledger) -> tuple[str, dict]:
+def _walk(ledger: Ledger) -> tuple[str, dict[str, Any]]:
     chooser = PlanChooser(ledger)
     _terms, _rows, chosen, walk = chooser._walk(_binding(), CELL)
     return chosen, walk
 
 
-def _row(walk: dict, rung: str) -> dict:
+def _row(walk: dict[str, Any], rung: str) -> dict[str, Any]:
     return next(row for row in walk["rungs"] if row["rung"] == rung)
 
 

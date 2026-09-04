@@ -12,11 +12,12 @@ the runtime) allocating between turns, which the driver reports and the lane mea
 same way. The distinction the arm turns on is not who took the room; it is that the
 activation envelope was banked when the room was there and is read after it is gone.
 
-The fixture is `corpus/tenant`'s `sweep` entrypoint, which opens ONE SCOPE PER COMPONENT.
-That matters: `touch` declares every component in a single scope, so it ends fully resident
-under either rung and cannot observe a demotion at all. `sweep`'s workspace HALVES until it
-fits, which is what the real kernels do (cuBLAS/cuDNN workspace selection) and is the reason
-an envelope measured on a roomier card is an upper bound rather than a requirement.
+The fixture is `corpus/scoped`, the same synthetic checkpoint `corpus/tenant` holds but with
+ONE SCOPE PER COMPONENT. That matters: the tenant's `touch` declares every component in a
+single scope, so it ends fully resident under either rung and cannot observe a demotion at
+all. Its workspace HALVES until it fits, which is what the real kernels do (cuBLAS/cuDNN
+workspace selection) and is the reason an envelope measured on a roomier card is an upper
+bound rather than a requirement.
 
 THE RED STATE: turn 2 planned `component_staged`, its peak device memory below its own
 weight set, and its row left holding one component with two evicted — the pod's 25 s steady
@@ -45,7 +46,7 @@ from test_shared_lane import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-PACKAGE = ROOT / "corpus" / "tenant"
+PACKAGE = ROOT / "corpus" / "scoped"
 #: what the fixture's kernels ask for. They take less when the answer is no.
 WORKSPACE_MIB = 4096
 

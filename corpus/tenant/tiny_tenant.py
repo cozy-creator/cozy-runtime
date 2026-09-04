@@ -7,15 +7,9 @@ device memory through the real fill plane, so a lane holding two of it has a rea
 to make. Sizes come from the artifact's own config, which the fixture writer derives from
 the header — the package names no shape of its own.
 
-Two entrypoints, because a placement rung is only observable when the scopes DIFFER.
-`touch` opens one component-use scope over EVERY component: the scope's demand is the whole
-model, which is exactly the demand a lane must arbitrate between two tenants that do not
-both fit (cr-022). A single scope is also why `touch` cannot see cr-100 at all — it ends
-fully resident under either rung, so the staged rung and the resident one are the same
-picture. `sweep` opens one scope PER COMPONENT, which is the shape of a real pipeline
-(encode, denoise, decode) and the shape a demotion is visible in: under `component_staged`
-each scope frees what it does not declare, so a generation that entered fully resident
-leaves holding one component.
+One entrypoint, `touch`, opens one component-use scope over EVERY component: the scope's
+demand is the whole model, which is exactly the demand a lane must arbitrate between two
+tenants that do not both fit.
 """
 
 from __future__ import annotations
@@ -33,21 +27,9 @@ class TouchInput(msgspec.Struct, forbid_unknown_fields=True):
     seed: int = 7
 
 
-class SweepInput(msgspec.Struct, forbid_unknown_fields=True):
-    seed: int = 7
-    workspace_mib: int = 2048
-    """How much scratch the kernels would LIKE. Not an axis, so every request for this
-    entrypoint normalizes to the same shape cell however the appetite is set."""
-
-
 class TouchOutput(msgspec.Struct):
     checksum: float
     components: list[str]
-
-
-class SweepOutput(msgspec.Struct):
-    checksum: float
-    workspace_bytes: int
 
 
 class TenantPipeline:
@@ -149,61 +131,6 @@ class TenantModel(Model[TenantPipeline]):
                     total = total + torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
             return float(torch.tanh(total))
 
-    def _read(self, name: str, seed: int) -> Any:
-        """One element of every parameter of one component, through the guarded root."""
-        import torch
-
-        with torch.inference_mode():
-            total = torch.zeros((), dtype=torch.float32, device="cuda")
-            for parameter in self.pipe.components[name].parameters():
-                value = parameter.flatten()[seed % parameter.numel()].float()
-                total = total + torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
-            return total
-
-    def _workspace(self, want: int) -> tuple[Any, int]:
-        """Take the biggest workspace that fits, HALVING until one does.
-
-        This is the fixture's whole reason to exist. Real kernels do this: cuBLAS and cuDNN
-        select a workspace from what the allocator can give them, so the same model at the
-        same shape peaked at 3.91 GiB alone on a 15.6 GiB card and 1.92 GiB with a co-tenant
-        beside it — reproducibly, same bits out (decisions 698, cr-097). A peak measured on
-        a roomier card is therefore an upper bound the kernels CHOSE, and a fixture whose
-        demand is a constant cannot express the thing the planner has to get right. The
-        package is not allowed to ask how much room there is (the runtime owns residency
-        and `mem_get_info` is not reachable from here), which is also how a real kernel
-        finds out: it asks for what it wants and takes less when the answer is no.
-        """
-        import torch
-
-        size = max(int(want), 16 << 20)
-        while size > (16 << 20):
-            try:
-                return torch.empty(size, dtype=torch.uint8, device="cuda"), size
-            except torch.cuda.OutOfMemoryError:
-                size //= 2
-        return torch.empty(16 << 20, dtype=torch.uint8, device="cuda"), 16 << 20
-
-    @uses_components("text_encoder")
-    def encode(self, seed: int, want: int) -> tuple[Any, int]:
-        scratch, size = self._workspace(want)
-        total = self._read("text_encoder", seed)
-        del scratch
-        return total, size
-
-    @uses_components("unet")
-    def denoise(self, seed: int, want: int) -> Any:
-        scratch, _size = self._workspace(want)
-        total = self._read("unet", seed)
-        del scratch
-        return total
-
-    @uses_components("vae")
-    def decode(self, seed: int, want: int) -> Any:
-        scratch, _size = self._workspace(want)
-        total = self._read("vae", seed)
-        del scratch
-        return total
-
 
 @app.entrypoint
 def touch(ctx: Context, payload: TouchInput, model: TenantModel, tel: Telemetry) -> TouchOutput:
@@ -211,27 +138,3 @@ def touch(ctx: Context, payload: TouchInput, model: TenantModel, tel: Telemetry)
     checksum = model.touch(view._seed)
     tel.metric("checksum", checksum)
     return TouchOutput(checksum=checksum, components=sorted(model.pipe.components))
-
-
-@app.entrypoint
-def sweep(ctx: Context, payload: SweepInput, model: TenantModel, tel: Telemetry) -> SweepOutput:
-    """Three scopes in a row, the shape of a pipeline: encode, denoise, decode.
-
-    Each scope declares ONE component, so `all_resident` and `component_staged` are
-    genuinely different plans over the same weights — the resident rung runs all three
-    scopes against the set the fill left, the staged rung frees what each scope does not
-    declare and stages it back for the next one. That difference is the whole subject of
-    cr-100 and is invisible to a package with a single whole-model scope.
-    """
-    view = model.for_request(ctx, seed=payload.seed)
-    want = max(int(payload.workspace_mib), 0) << 20
-    encoded, size = model.encode(view._seed, want)
-    denoised = model.denoise(view._seed, want)
-    decoded = model.decode(view._seed, want)
-    import torch
-
-    with torch.inference_mode():
-        checksum = float(torch.tanh(encoded + denoised + decoded))
-    tel.metric("checksum", checksum)
-    tel.metric("workspace_bytes", size)
-    return SweepOutput(checksum=checksum, workspace_bytes=size)

@@ -9,10 +9,3 @@ object = "tiny_tenant:app"
 model = "cozytest/tenant"
 release = "1"
 lane = "bf16"
-
-# cr-100's arm needs the SAME model under per-component scopes: a single whole-model scope
-# ends fully resident under either placement rung, so it cannot observe a demotion at all.
-[bindings."sweep.models.model"]
-model = "cozytest/tenant"
-release = "1"
-lane = "bf16"
