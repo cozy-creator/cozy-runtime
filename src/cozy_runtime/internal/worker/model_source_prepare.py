@@ -3,13 +3,17 @@
 Networking and credentials end in pod-supervisor. Runtime validates the small transport
 shape, then hands the exact logical rows to TensorFS. It neither plans model formats nor
 synthesizes checkpoint metadata.
+
+No ADDRESS crosses this call. The request still carries `source_uri` and `declared_license`
+for the supervisor's own bookkeeping, but TensorFS stopped taking them in `03c9713` and this
+module stopped forwarding — or validating — them: a fact that reaches nobody is not this
+module's to police. The seam itself is held by `tests/test_tensorfs_binding_contract.py`.
 """
 
 from __future__ import annotations
 
 import re
 import stat
-import urllib.parse
 from pathlib import Path
 
 from cozy_runtime.internal import fill
@@ -48,8 +52,6 @@ def prepare_model_source(
             documents.spell(bytes(request.source_selection_digest)),
             profiles,
             files,
-            request.source_uri,
-            request.declared_license,
         )
         return _result(request, prepared)
     except ModelSourceRefusal as exc:
@@ -81,10 +83,6 @@ def _request(
     if (
         _IDENTIFIER.fullmatch(request.operation_id) is None
         or len(request.source_selection_digest) != 32
-        or not _source_uri(request.source_uri)
-        or not _printable(
-            request.declared_license, weights_limits.MAX_MODEL_SOURCE_LICENSE_BYTES, empty=True
-        )
     ):
         raise ModelSourceRefusal(
             "model_source_prepare_identity_invalid", "source preparation identity is invalid"
@@ -217,32 +215,6 @@ def _member(value: str) -> bool:
         and not value.startswith((".", "/"))
         and "\\" not in value
         and all(part not in ("", ".", "..") for part in value.split("/"))
-    )
-
-
-def _source_uri(value: str) -> bool:
-    if not _printable(value, weights_limits.MAX_MODEL_SOURCE_URI_BYTES, empty=False):
-        return False
-    try:
-        parsed = urllib.parse.urlsplit(value)
-    except ValueError:
-        return False
-    if (
-        parsed.query
-        or parsed.fragment
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        return False
-    if parsed.scheme == "hf":
-        return bool(
-            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", parsed.hostname or "")
-            and re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9._-]{0,127}@[0-9a-f]{40}", parsed.path)
-        )
-    return (
-        parsed.scheme == "civitai"
-        and bool(parsed.hostname and parsed.hostname.isdigit())
-        and not parsed.path
     )
 
 
