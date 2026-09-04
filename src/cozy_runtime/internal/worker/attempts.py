@@ -2025,7 +2025,13 @@ class AttemptEngine:
                 plan.shape_cell or "-",
             )
         )
-        confession = self.demand.bank(lane, plan.headroom_bytes, actual)
+        # THE DESCRIPTION, not the enforcement figure (cr-100). An attempt admitted against
+        # 0 B — because the only observation of this shape was made on a roomier card — has
+        # still been described by that observation, and banking the description is what
+        # makes the instrument able to falsify it.
+        confession = self.demand.bank(
+            lane, plan.activation_envelope_bytes or plan.headroom_bytes, actual
+        )
         if confession is not None:
             attempt.confess(confession.kind, confession.quantified)
 

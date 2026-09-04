@@ -277,6 +277,11 @@ class Turn:
     outcome: dict[str, Any] = dataclasses.field(default_factory=dict)
     free_bytes: int = -1
     rows: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+    after: Callable[[], None] | None = None
+    """Run BETWEEN turns, once this one's outcome is recorded and before the next is
+    dispatched: the seat is free, no attempt is in flight, and the device is quiet. It is
+    how a test changes the CARD between attempts — the room a measurement was banked under
+    is exactly what cr-100 is about, and nothing else in this harness can move it."""
 
 
 class TwoTenantOwner(LocalRecordOwner):
@@ -449,9 +454,16 @@ class TwoTenantOwner(LocalRecordOwner):
                     "executor_epoch": (
                         row.supervision.epoch if row.supervision is not None else -1
                     ),
+                    # THE LADDER WALK THIS ATTEMPT WAS PRICED BY, as the chooser kept it.
+                    # `rows` already reads the worker's own ledger; the walk is the other
+                    # half of the same picture and is what says WHICH RUNG ran.
+                    "walk": dict(row.chooser.walks[-1]) if row.chooser.walks else {},
+                    "activations_by_cell": dict(row.ledger.activations_by_cell),
                 }
         self.turns.append(turn)
         self.current = None
+        if turn.after is not None:
+            turn.after()
         if self.pending:
             self._next()
             return
@@ -461,15 +473,15 @@ class TwoTenantOwner(LocalRecordOwner):
 
 
 def _drive(
-    store: TenantStore, turns: list[Turn], root: Path
+    store: TenantStore, turns: list[Turn], root: Path, package: Path = PACKAGE
 ) -> tuple[TwoTenantOwner, Worker, list[tuple[str, str]]]:
     """Two placements of `corpus/tenant` on the one-card worker, `turns` dispatched in order."""
     config = _config(root / "home")
-    found = discover(PACKAGE)
+    found = discover(package)
     body = package_interface.build(found)
     workspace = root / "run"
     workspace.mkdir(parents=True, exist_ok=True)
-    source_digest = development_source_digest(PACKAGE)
+    source_digest = development_source_digest(package)
     staged = stage_development_placement(
         config.cozy_home,
         body,
@@ -502,7 +514,7 @@ def _drive(
         instance_id="ins-shared-lane",
         tensorfs_root=staged.tensorfs_root,
         artifact_cache=staged.artifact_cache,
-        development_project=PACKAGE,
+        development_project=package,
         development_package=staged.placement.development.package,
         development_release=staged.placement.development.release,
         development_source_digest=documents.spell(staged.placement.development.source_digest),
@@ -519,7 +531,7 @@ def _drive(
     worker.note = note  # type: ignore[method-assign]
     worker.watches.tap = owner.tap_progress
     owner.watch(worker)
-    with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):
+    with contextlib.chdir(package), contextlib.redirect_stdout(sys.stderr):
         worker.run()
     return owner, worker, notes
 
@@ -534,9 +546,12 @@ def _turn(placement_id: str, request_id: str, seed: int) -> Turn:
 def _vacates(notes: list[tuple[str, str]]) -> list[tuple[str, str, int, int, int]]:
     """(victim, for-whom, freed, driver free before, driver free after) per vacate note."""
     found = []
+    # The duration is part of the line and part of the pattern: half of a model swap is
+    # this eviction, and its cost was being inferred from a construction's fill leg
+    # instead of measured (cr-100).
     pattern = re.compile(
-        r"lane-0: '([^']+)' \(epoch \d+ pid \d+\) vacated (\d+) B for '([^']+)' on .*?"
-        r"the driver reports (\d+) -> (\d+) B free"
+        r"lane-0: '([^']+)' \(epoch \d+ pid \d+\) vacated (\d+) B in [\d.]+ ms for "
+        r"'([^']+)' on .*?the driver reports (\d+) -> (\d+) B free"
     )
     for kind, step in notes:
         if kind != "residency":
