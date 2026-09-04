@@ -10,6 +10,10 @@ read by the compiled facade through `internal.fill.Checkpoint`; the recipe is bu
 production `Executor._checkpoint_recipes`; the request is resolved by the production
 `Executor.prepare_request` and executed by `run_prepared`, so the assertion is on what the
 HANDLER received — not on a field having parsed.
+
+Requires a TensorFS facade that speaks the six-element header root. Against an older one the
+store read refuses `WRONG_TYPE: header: array arity 6, expected 5`, which is the correct
+answer and names the dependency: land and publish tensorfs#101 first, then refresh the lock.
 """
 
 from __future__ import annotations

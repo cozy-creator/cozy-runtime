@@ -151,9 +151,11 @@ class WeightsTransactionHost:
             return {}
         import tensorfs
 
+        from cozy_runtime.internal.fill import header_metadata
+
         ((manifest, _length),) = sources.values()
         header = tensorfs.parse_header(bytes(self.store.manifest(manifest)["header"]))
-        return {str(k): str(v) for k, v in header.get("metadata", {}).items()}
+        return header_metadata(header)
 
     def open(self, request: WeightsCommit) -> WeightsHostTransaction:
         """Lock one tfs-019 declaration before exposing any source reader or writer."""

@@ -399,6 +399,22 @@ class PlanRow:
         return self.encoded.stored_nbytes
 
 
+def header_metadata(header: Mapping[str, object]) -> dict[str, str]:
+    """The header's advisory key/value rows (tfs-059), read defensively.
+
+    `Header` is TensorFS's own TypedDict and gains keys as the format does, so this reads
+    through `Mapping` rather than the stub: a runtime built against an older facade must
+    still type-check, and one running against it degrades to "this checkpoint says nothing"
+    rather than to an attribute error. It cannot silently mislead — a facade too old to
+    know the field is also too old to PARSE a header that carries one, and refuses at the
+    store read long before this.
+    """
+    rows = header.get("metadata")
+    if not isinstance(rows, Mapping):
+        return {}
+    return {str(key): str(value) for key, value in rows.items()}
+
+
 class Checkpoint:
     """One model manifest in a TensorFS store, opened through the tfs-007 facade.
 
@@ -442,7 +458,7 @@ class Checkpoint:
         layer of `ModelDefault` resolution, which reads only the keys a package's fields
         claimed by name.
         """
-        return {str(k): str(v) for k, v in self.header.get("metadata", {}).items()}
+        return header_metadata(self.header)
 
     def has(self, component: str) -> bool:
         """Does the header carry this component? A constructed component it does not carry
