@@ -256,6 +256,47 @@ class GrpcControlHost:
         self.stopped.set()
 
 
+def _refuse(context: Any, exc: BaseException) -> Any:
+    """Answer one failed preparation call, saying WHICH KIND of failure it was.
+
+    The host on the other end of this loopback journals a refusal as the permanent answer
+    to an immutable request, and it decides whether to do that from the status code here.
+    So the status is not decoration: it is the difference between "this request cannot be
+    prepared" and "I failed at it this time".
+
+    Every arm of this servicer used to be `except Exception: abort(FAILED_PRECONDITION,
+    str(exc))`, which said "verdict" about everything. A missing scratch directory, a
+    TensorFS store still opening, a lease revoked mid-read and a genuinely incompatible
+    package set all left this process under the one code whose meaning is "do not retry
+    until the system state is fixed" — and the host wrote it down. On 2026-09-03 that
+    turned a transient fault into a pod that answered the identical request from a cached
+    refusal, instantly and with no work attempted, for its whole billed life.
+
+    Three answers, and the middle one is the one that did not exist:
+
+      FAILED_PRECONDITION  a typed PreparationRefusal. This request is refused, and the
+                           identical bytes cannot be answered differently later.
+      INTERNAL             this Runtime failed AT the request. The owner is answered so
+                           nothing redials, and nothing is written down, so the next ask
+                           actually runs.
+      UNAVAILABLE          the work could not start or was cut. No answer at all; ask again.
+
+    The polarity is an ALLOW-LIST of verdicts defaulting to not-a-verdict, which is the
+    opposite default from a retry classifier and correct for the same reason: the safe
+    default is the one whose mistake is recoverable.
+    """
+    import grpc
+
+    from . import package_prepare
+
+    if isinstance(exc, package_prepare.PreparationRefusal):
+        return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
+    # The type is part of the diagnosis and was being discarded: `PermissionError` and
+    # `FileNotFoundError` send an operator to two different places, and `str(exc)` alone
+    # frequently names neither.
+    return context.abort(grpc.StatusCode.INTERNAL, f"{type(exc).__name__}: {exc}"[:1024])
+
+
 class _PreparationServicer:
     def __init__(
         self,
@@ -294,9 +335,7 @@ class _PreparationServicer:
         try:
             return handler(request)
         except Exception as exc:
-            import grpc
-
-            context.abort(grpc.StatusCode.INTERNAL, type(exc).__name__)
+            return _refuse(context, exc)
 
     def PreparePackageSet(self, request: pb.PreparePackageSetRequest, context: Any) -> Any:
         handler = self.package_handler
@@ -309,9 +348,7 @@ class _PreparationServicer:
         try:
             return handler(request)
         except Exception as exc:
-            import grpc
-
-            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
+            return _refuse(context, exc)
 
     def PrepareModelSource(self, request: pb.PrepareModelSourceRequest, context: Any) -> Any:
         handler = self.model_source_handler
@@ -324,9 +361,7 @@ class _PreparationServicer:
         try:
             return handler(request)
         except Exception as exc:
-            import grpc
-
-            context.abort(grpc.StatusCode.INTERNAL, type(exc).__name__)
+            return _refuse(context, exc)
 
     def PrepareLocalPackage(self, request: pb.PrepareLocalPackageRequest, context: Any) -> Any:
         handler = self.local_package_handler
@@ -339,9 +374,7 @@ class _PreparationServicer:
         try:
             return handler(request)
         except Exception as exc:
-            import grpc
-
-            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
+            return _refuse(context, exc)
 
     def PreparePrivatePlacement(
         self, request: pb.PreparePrivatePlacementRequest, context: Any
@@ -356,9 +389,7 @@ class _PreparationServicer:
         try:
             return handler(request)
         except Exception as exc:
-            import grpc
-
-            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
+            return _refuse(context, exc)
 
 
 def _loopback_preparation_listener(listen: str) -> bool:

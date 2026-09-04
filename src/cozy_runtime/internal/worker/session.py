@@ -206,6 +206,42 @@ def _delivery_observation(delivery: Mapping[str, Any]) -> str:
     )
 
 
+class _InterfaceFault(Exception):
+    """A preparation step that FAILED rather than refused.
+
+    It is deliberately not a `PreparationRefusal`: the loopback servicer answers a typed
+    refusal with FAILED_PRECONDITION, which the pod host journals as the permanent answer
+    to an immutable request, and a fault about this pod's condition must never be written
+    into that row. This one reaches the servicer's default arm and is answered INTERNAL —
+    the owner is told now, and nothing is cached.
+    """
+
+
+def _interface_failure(reply: Mapping[str, object]) -> Exception:
+    """Turn one not-ok executor reply into the right kind of exception.
+
+    `executor.classify` already computed `terminal` and `origin` and put them in the reply;
+    reading only `code` and `detail` discarded the verdict the executor had made. A package
+    author's ConformanceError and a PermissionError from the runtime's own plumbing are not
+    the same failure and must not settle the same way.
+
+    `origin` is read too, and it is the reason this is not simply `if terminal`. The
+    unhandled-exception default attributes an unrecognised exception to the AUTHOR, so an
+    infrastructure fault arrives here already mislabelled; a failure the executor did not
+    positively attribute to the package is not treated as a verdict about the package.
+    """
+    from cozy_runtime.internal.worker import package_prepare
+
+    code = str(reply.get("code", "invalid reply"))
+    detail = str(reply.get("detail", ""))
+    said = f"{code}: {detail}" if detail else code
+    terminal = bool(reply.get("terminal", True))
+    origin = str(reply.get("origin", ""))
+    if terminal and origin in ("author", "package"):
+        return package_prepare.PreparationRefusal("package_prepare_interface_failed", said)
+    return _InterfaceFault(said)
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerOptions:
     """One worker's settings, as a typed value rather than a parser's leftovers.
@@ -1607,22 +1643,35 @@ class Worker:
                     "package_prepare_executor_failed", exc.detail
                 ) from exc
             if not reply.get("ok"):
-                raise package_prepare.PreparationRefusal(
-                    "package_prepare_interface_failed",
-                    f"{reply.get('code', 'invalid reply')}: {reply.get('detail', '')}",
-                )
+                # THE EXECUTOR ALREADY DECIDED THIS AND WE WERE THROWING IT AWAY. Its
+                # reply carries `terminal` and `origin` beside `code` and `detail`
+                # (executor.classify), and reading only two of the four collapsed a
+                # package's ConformanceError, a device OOM, and a PermissionError raised by
+                # the runtime's own plumbing into one terminal refusal. The origin matters
+                # as much as the verdict: `unhandled_exception` defaults to blaming the
+                # AUTHOR, so an infrastructure fault sent an operator to debug the package.
+                raise _interface_failure(reply)
             try:
                 raw = output.read_bytes()
             except OSError as exc:
-                raise package_prepare.PreparationRefusal(
-                    "package_prepare_interface_failed", "package-interface output is absent"
+                # An absent output after an `ok` reply is a filesystem fact about this pod,
+                # not a statement about the request, and the errno is the whole diagnosis.
+                raise _InterfaceFault(
+                    f"package-interface output is absent: {type(exc).__name__}: {exc}"
                 ) from exc
             finally:
                 output.unlink(missing_ok=True)
             digest = "sha256:" + hashlib.sha256(raw).hexdigest()
             if reply.get("digest") != digest or reply.get("length") != len(raw):
+                # QUOTE BOTH SIDES OF BOTH COMPARISONS. This reported a digest/length
+                # disagreement as `reply.get("code")` — absent on an ok reply, so the
+                # detail was the literal words "invalid reply" and an operator could not
+                # tell which of the two values disagreed, or by how much.
                 raise package_prepare.PreparationRefusal(
-                    "package_prepare_interface_failed", str(reply.get("code", "invalid reply"))
+                    "package_prepare_interface_failed",
+                    f"the executor's document does not match its own claim: "
+                    f"digest {reply.get('digest')!r} vs {digest!r}, "
+                    f"length {reply.get('length')!r} vs {len(raw)}",
                 )
             return raw
 
