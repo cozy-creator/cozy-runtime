@@ -413,6 +413,26 @@ class ComponentResidency:
         # per staged component, `read_bytes` is what the block layer actually served, so a
         # cold re-read is distinguishable from a page-cache hit instead of assumed.
         fill_ms = 0
+        # THE LEGS OF THE OTHER HALF (cr-103). `restore_ms` minus `fill_ms` was 9018 ms of
+        # a 9734 ms restore with nothing said about it, because the swap path had never
+        # been instrumented the way `prepare` now is. Each staged component reports the
+        # legs that partition its own `ms`, and they are summed here.
+        legs = {
+            "reserve_ms": 0,
+            "lease_ms": 0,
+            "enqueue_ms": 0,
+            "commit_ms": 0,
+            "ring_ms": 0,
+            "copy_ms": 0,
+            "fence_ms": 0,
+            "destinations": 0,
+        }
+        # OBJECTS ARE COUNTED PER SNAPSHOT, NOT PER COMPONENT. Four components of one
+        # manifest touch one set of stored objects, so summing each component's count
+        # would report four times what the store actually holds — the same mistake the
+        # component-keyed lease map made, one plane up. `destinations` above IS summed:
+        # tensors put back are per component and do not overlap.
+        objects: dict[str, int] = {}
         read_before = _read_bytes()
         for name in wanted:
             if name in self.backend.components:
@@ -426,7 +446,11 @@ class ComponentResidency:
                 held[name] = "the device has no room for it without evicting a neighbour"
                 continue
             try:
-                fill_ms += int(self.backend.stage(name).get("stream_ms", 0))
+                staged = self.backend.stage(name)
+                fill_ms += int(staged.get("stream_ms", 0))
+                for leg in legs:
+                    legs[leg] += int(staged.get(leg, 0))
+                objects[self.backend.checkpoints[name].manifest_id] = int(staged.get("objects", 0))
             except FillRefusal as exc:
                 raise self._poison(
                     exc.code,
@@ -464,6 +488,7 @@ class ComponentResidency:
             "allocator_delta_bytes": self._allocated() - allocated,
             "restore_ms": round(took, 2),
             "fill_ms": fill_ms,
+            "legs": {**legs, "objects": sum(objects.values())},
             "read_bytes": max(read_after - read_before, 0) if read_after >= 0 else -1,
         }
 

@@ -4113,18 +4113,27 @@ class Worker:
         # needs on the line that reports the time, not values that die in the reply.
         _stages: tuple[tuple[str, float], ...] = reply["facts"].get("stages") or ()
         if _stages:
-            # THE EXPENSIVE LEGS MUST SURVIVE THE TRUNCATION (cr-141). `note` caps a step
-            # at 256 characters, and the ledger is emitted in EXECUTION order -- which puts
-            # the cheap prologue first and cut the line off at `admission`, hiding
-            # `lease_acquire`, `construct_and_fill` and `execution_plan`. Measured on a
-            # rented L40, that was the last 4 s of a 7.5 s prepare: the four legs an
-            # operator most needs were exactly the four the cap ate. Zero-cost legs are
-            # dropped (a leg cr-104 moved off the lock reports 0 ms and says nothing here),
-            # and whatever still does not fit is summarised rather than silently lost.
+            # THE EXPENSIVE LEGS AND THEIR PROVENANCE BOTH SURVIVE THE CAP (cr-141 over
+            # cr-103). `note` caps a step at 256 characters, and the ledger is emitted in
+            # EXECUTION order -- which puts the cheap prologue first and cut the line off
+            # at `admission`, hiding `lease_acquire`, `construct_and_fill` and
+            # `execution_plan`. Measured on a rented L40, that was the last 4 s of a 7.5 s
+            # prepare: the four legs an operator most needs were exactly the four the cap
+            # ate. The two suffixes are priced into the budget FIRST rather than appended
+            # and hoped for -- "measured" vs "reused" is what tells a warm pod from a cold
+            # one, and it is worthless if the cap eats it instead of a 78 ms leg.
+            _q = reply["facts"].get("qualification") or {}
+            _l = reply["facts"].get("leases") or {}
+            tail = (f" [qualification {_q['source']} {_q['key'][:12]}]" if _q else "") + (
+                f" [{_l['leases']} lease(s) over {_l['objects']} object(s) in "
+                f"{_l['acquisitions']} acquisition(s)]"
+                if _l
+                else ""
+            )
             legs = [(name, ms) for name, ms in _stages if ms >= 0.5]
             head = f"{placement_id!r} prepare legs: "
             shown: list[str] = []
-            budget = 256 - len(head) - 24
+            budget = 256 - len(head) - len(tail) - 24
             for name, ms in sorted(legs, key=lambda leg: -leg[1]):
                 text = f"{name} {ms:.0f}ms"
                 if budget - len(text) - 2 < 0:
@@ -4140,7 +4149,8 @@ class Worker:
                 "boot",
                 head
                 + ", ".join(sorted(shown, key=lambda text: order[text.rsplit(" ", 1)[0]]))
-                + (f" (+{hidden} under {floor:.0f}ms)" if hidden else ""),
+                + (f" (+{hidden} under {floor:.0f}ms)" if hidden else "")
+                + tail,
             )
         _w: tuple[int, ...] = reply["facts"].get("substrate_census") or ()
         if len(_w) == 3 and _w[1]:
@@ -4534,11 +4544,37 @@ class Worker:
             took = float(report.get("restore_ms", 0.0))
             fill_ms = float(report.get("fill_ms", 0.0))
             read = int(report.get("read_bytes", -1))
+            # THE SWAP'S OWN LEGS (cr-103), beside the total they explain — the same
+            # treatment `prepare` got. "9018 ms outside the fill leg" named a duration and
+            # attributed none of it, which is how a restore stayed unexplained across two
+            # issues; these four legs say which part of the re-stage spent it.
+            legs = dict(report.get("legs") or {})
+            objects = int(legs.pop("objects", 0))
+            destinations = int(legs.pop("destinations", 0))
+            copy_ms = float(legs.get("copy_ms", 0))
+            # MS PER OBJECT, OUTSIDE THE COPY. The arithmetic says ~7 GB from page cache
+            # over PCIe 4.0 x16 is ~1.5 s and from NVMe ~3.5 s, and the measured restore
+            # was 9.7 s — so if what is left over scales with the OBJECT COUNT rather than
+            # with bytes, the fix is batching and not faster I/O. That is one division and
+            # it decides which, so it is printed rather than left to be inferred.
+            per_object = (
+                f", {(took - copy_ms) / objects:.2f} ms/object outside the copy" if objects else ""
+            )
             self.note(
                 "residency",
                 f"{lane.lane_id}: {slot!r} restored {gained} B "
                 f"({', '.join(sorted(restored))}) in {took:.0f} ms — fill leg "
-                f"{fill_ms / 1000:.3f} s, {took - fill_ms:.0f} ms outside it, "
+                f"{fill_ms / 1000:.3f} s, {took - fill_ms:.0f} ms outside it"
+                + (
+                    " ["
+                    + ", ".join(f"{name} {int(ms)}ms" for name, ms in legs.items())
+                    + f" over {objects} object(s), {destinations} destination(s)"
+                    + per_object
+                    + "]"
+                    if legs
+                    else ""
+                )
+                + ", "
                 + (
                     "block-device reads unreadable"
                     if read < 0
