@@ -146,6 +146,17 @@ def _refuse_compile() -> Iterator[None]:
     and killed the CUDA context process-wide while the drive finished green against the
     corpse). v2 has no graph-mint consumer that needs the call to survive, so the honest
     answer is the refusal: the fix lane is the package deleting the call.
+
+    READ THIS NARROWLY (cr-086). It refuses compilation DURING CONSTRUCTION, and nothing
+    more. Both spellings are refused, but for two different reasons: `torch.compile(module)`
+    renames destinations as described above, while `nn.Module.compile` renames nothing and
+    is refused because it is LAZY — derive is derive-by-execution, so the callable it
+    installs would trace under fake tensors and launch real kernels on fake pointers, which
+    is the pgw#1659 scar verbatim. Neither reason reaches the INVOCATION path, which this
+    context manager does not cover: a package that wants diffusers' regional
+    `compile_repeated_blocks(fullgraph=True)` calls it on a filled module at invocation or
+    under `ctx.boot_warmup`, where the destinations are already materialized and the tensors
+    are real. This is not a ruling that `torch.compile` cannot ship.
     """
     torch = torch_module()
     original = torch.compile
