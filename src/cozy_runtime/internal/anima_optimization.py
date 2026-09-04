@@ -463,6 +463,48 @@ def _require_transformer_config(transformer: Any) -> None:
         )
 
 
+def fused_anima_capability_refusal() -> str:
+    """WHY the fused lane is unavailable, in one line, or "" when it is available.
+
+    `_fused_anima_cuda_capability` has six silent `return None` edges and an operator who
+    sees a slow run cannot tell which one fired — or that any fired at all (cr-102 /
+    proto-038). This recomputes the same gate for REPORTING only; it decides nothing and
+    never enters generation identity.
+    """
+    torch_version = _installed_version("torch")
+    if torch_version is None:
+        return "torch is not installed"
+    try:
+        installed = Version(torch_version)
+    except InvalidVersion:
+        return f"torch version {torch_version!r} does not parse"
+    if installed.public != FUSED_ANIMA_TORCH_RELEASE:
+        return f"torch {installed.public} != the fused lane's {FUSED_ANIMA_TORCH_RELEASE}"
+    try:
+        torch = import_module("torch")
+    except ImportError:
+        return "torch does not import"
+    if getattr(getattr(torch, "version", None), "cuda", None) != FUSED_ANIMA_CUDA_RELEASE:
+        return (
+            f"torch.version.cuda {getattr(getattr(torch, 'version', None), 'cuda', None)!r} "
+            f"!= the fused lane's {FUSED_ANIMA_CUDA_RELEASE!r}"
+        )
+    cuda = getattr(torch, "cuda", None)
+    try:
+        if cuda is None or not cuda.is_available():
+            return "torch reports no available CUDA device"
+    except (AttributeError, RuntimeError) as exc:
+        return f"torch.cuda.is_available() raised {type(exc).__name__}"
+    try:
+        import_module(FUSED_ANIMA_CUDA_KERNEL_MODULE + "._C")
+    except ImportError as exc:
+        return (
+            f"{FUSED_ANIMA_CUDA_KERNEL_MODULE}._C does not import ({exc}) — this wheel "
+            "carries no compiled kernels, so this generation runs the eager path"
+        )
+    return ""
+
+
 def _fused_anima_cuda_capability() -> tuple[Any, Any] | None:
     """Return the exact supported Torch/native pair, or ``None`` for eager execution."""
     torch_version = _installed_version("torch")

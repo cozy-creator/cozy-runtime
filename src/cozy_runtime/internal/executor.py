@@ -667,6 +667,18 @@ class Executor:
         binding = command["binding"]
         budgets = command["budgets"]
         started = time.perf_counter()
+        # THE SEGMENT LEDGER (cr-102). A `prepare` that reports one total and one fill leg
+        # cannot say which of construction, qualification or lease acquisition spent the
+        # wall clock, and that ambiguity kept a 20s cost unattributed across three issues.
+        stages: list[tuple[str, float]] = []
+        _mark = [started]
+
+        def stage(name: str) -> None:
+            now = time.perf_counter()
+            stages.append((name, round((now - _mark[0]) * 1000, 1)))
+            _mark[0] = now
+
+        self._stages = stages
         if not binding.get("model_class"):
             return self._prepare_weightless(binding, started)
         if "authorized_device_limit_bytes" not in command:
@@ -694,12 +706,14 @@ class Executor:
         import torch  # the ONE torch import in the runtime, and it is in THIS process
 
         self.torch = torch
+        stage("torch_import")
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
         from cozy_runtime.author._model import component_use
         from cozy_runtime.internal.anima_optimization import (
             AnimaOptimizationRefusal,
             apply_anima_execution_plan,
+            fused_anima_capability_refusal,
         )
         from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
@@ -721,10 +735,12 @@ class Executor:
             resolve,
         )
 
+        stage("runtime_imports")
         refused = self._initialize_device(torch)
         if refused is not None:
             return refused
         cuda_ms = (time.perf_counter() - started) * 1000
+        stage("cuda_init")
         changed = _env_changes()
         if changed:
             return {
@@ -752,6 +768,7 @@ class Executor:
 
         if self.discovered is None:
             self._discover_provisioned(binding)
+        stage("package_import")
 
         # The store IS the artifact identity: one snapshot digest, and TensorFS answers with
         # the header, the plan and the verified lease. The interim path needed a store root
@@ -787,6 +804,7 @@ class Executor:
         # lane's devices, so there is nothing to select here and no index to carry.
         device_index = self.rank if self.world > 1 else 0
         device_facts = measure_device(torch, device_index)
+        stage("measure_device")
         hardware_variant = str(binding.get("variant") or "")
         if not hardware_variant:
             if device_facts.kind != "cuda" or device_facts.sm <= 0:
@@ -815,6 +833,7 @@ class Executor:
         # resolved over the rows the header does supply and nothing here refuses first.
         present = [name for name in names if checkpoints[name].has(name)]
         rows = [r for name in present for r in checkpoints[name].rows(name)]
+        stage("checkpoint_headers")
         # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
         # lane's card, so a multi-GPU pod's records name the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding["release"])
@@ -827,6 +846,7 @@ class Executor:
             release=binding["release"],
             runtime=runtime_identity,
         )
+        stage("qualify")
         objective = str(binding.get("objective") or "latency")
         model_cls = getattr(self.discovered.module, binding["model_class"])
         config_checkpoint = next(
@@ -841,6 +861,7 @@ class Executor:
         config_document = canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
             raise RuntimeError("the CozyTensors construction config is not an object")
+        stage("construction_config")
         construction = ConstructionFacts(
             release=str(binding["release"]),
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
@@ -876,6 +897,7 @@ class Executor:
                 "detail": str(exc).splitlines()[0][:900],
                 "plan": {"walk": exc.walk, "objective": binding.get("objective")},
             }
+        stage("resolve")
         if self.world > 1:
             # RANK 0 DECIDES, EVERY RANK OBEYS (cr-068). Rank 0 hands its followers the same
             # prepare with the plan it resolved; a follower resolves the same inputs on its
@@ -941,6 +963,7 @@ class Executor:
             forensics_dir=self.fill_forensics_dir,
             custody=str(binding.get("custody", "canonical")),
         )
+        stage("backend_ctor")
         # THE ARITHMETIC, BEFORE THE FIRST BYTE (#574b). The provisioned binding derives its
         # destination residency from the MCC's complete logical+derived tensor census. The
         # header independently prices logical rows and the selected route's native/decode
@@ -1029,6 +1052,7 @@ class Executor:
                     "evidence_class": "measured",
                 },
             }
+        stage("admission")
         artifact = Artifact(
             reference.snapshot,
             tensor_schema_of(rows),
@@ -1054,12 +1078,15 @@ class Executor:
             backend.expect(
                 {name: tuple(r.key for r in checkpoints[name].rows(name)) for name in present}
             )
+            stage("lease_acquire")
             model = registry.acquire(binding["model_binding_path"], model_cls, artifact)
+            stage("construct_and_fill")
             optimization = apply_anima_execution_plan(
                 model,
                 application=str(binding["application"]),
                 model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
             )
+            stage("execution_plan")
         except ModelFitRefused as exc:
             # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
             # loader asked before `materialize`, so the only thing to undo is the read
@@ -1220,6 +1247,18 @@ class Executor:
             **group_facts,
             "cuda_init_ms": round(cuda_ms, 2),
             "prepare_ms": round((time.perf_counter() - started) * 1000, 2),
+            # THE SEGMENT LEDGER (cr-102), in execution order. `prepare_ms` minus `fill_ms`
+            # was a 20s number nobody could attribute; these are the legs that spend it.
+            "stages": list(stages) + [(f"construct.{name}", ms) for name, ms in record.stage_ms],
+            # THE WEIGHTLESS PROMISE, OBSERVED (cr-102). `serving_substrate` swaps every
+            # parameter to `meta` as it is registered; this is the count that says it did.
+            "weightless": list(record.weightless),
+            # WHY the fused lane was unavailable, when it was (cr-102 / proto-038). The
+            # verdict itself already rode in `execution_optimization` below and nothing
+            # rendered it; a `None` with no reason is the part an operator cannot act on.
+            "execution_optimization_refusal": (
+                "" if optimization else fused_anima_capability_refusal()
+            ),
             # An all-inline checkpoint commits without opening the object stream. No stream
             # wall was measured in that case, and zero is the exact value rather than an
             # absent-stat KeyError after a successful construction.
