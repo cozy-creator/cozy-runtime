@@ -846,6 +846,7 @@ class Executor:
             AnimaOptimizationRefusal,
             apply_anima_execution_plan,
             fused_anima_capability_refusal,
+            sage_attention_refusal,
         )
         from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
@@ -1394,6 +1395,12 @@ class Executor:
             "execution_optimization_refusal": (
                 "" if optimization else fused_anima_capability_refusal()
             ),
+            # WHY SageAttention was unavailable, when it was (cr-105). Separate from the
+            # line above because the two are independent: the fused plan can APPLY with
+            # SDPA self-attention, and that is exactly the case an operator cannot see
+            # from `execution_optimization` alone — the plan reads APPLIED either way and
+            # only the operations list differs.
+            "sage_attention_refusal": sage_attention_refusal(),
             # An all-inline checkpoint commits without opening the object stream. No stream
             # wall was measured in that case, and zero is the exact value rather than an
             # absent-stat KeyError after a successful construction.

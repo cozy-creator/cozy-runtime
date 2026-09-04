@@ -4142,6 +4142,14 @@ class Worker:
                 )
             ),
         )
+        # An APPLIED plan whose operations omit SageAttention is the case the line above
+        # cannot show: it reads APPLIED either way (cr-105). Name the absence and why.
+        _sage = reply["facts"].get("sage_attention_refusal")
+        if _sage:
+            self.note(
+                "boot",
+                f"{placement_id!r} self-attention: TORCH SDPA — SageAttention is off ({_sage})",
+            )
         self.note(
             "boot",
             f"{placement_id!r} prepared {len(group)} binding(s) in {took:.0f} ms — "

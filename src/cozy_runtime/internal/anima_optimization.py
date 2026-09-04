@@ -30,6 +30,19 @@ FUSED_ANIMA_CUDA_KERNEL_MODULE = "cozy_runtime._kernels"
 FUSED_ANIMA_CUDA_KERNEL_REVISION = "0.1.0"
 FUSED_ANIMA_TORCH_RELEASE = "2.13.0"
 FUSED_ANIMA_CUDA_RELEASE = "13.0"
+# SageAttention rides the SAME exact-source fence as the CUDA kernel: the PyPI wheel is
+# pure Triton (no nvcc, no CUDA-release coupling), so the fleet carries it as an ordinary
+# dependency and the plan pins the release it was measured against. Diffusers' own SAGE
+# backend is NOT the route — it gates on `sageattention>=2.1.1`, which exists only as a
+# GitHub source build. This plan owns its self-attention call site already, so it calls
+# `sageattn` directly and keeps one refusal surface instead of two.
+SAGE_ATTENTION_DISTRIBUTION = "sageattention"
+SAGE_ATTENTION_RELEASE = "1.0.6"
+#: Self-attention is the only site SageAttention is installed at. Cross-attention keeps
+#: Torch SDPA: its K/V are the ~512 text tokens, so it is a small minority of attention
+#: time, and INT8-quantizing a short K is where Sage's accuracy is worst.
+SAGE_SELF_ATTENTION_PLAN = "sage-int8-qk-self-attention"
+TORCH_SDPA_ATTENTION_PLAN = "torch-sdpa"
 
 _APPLICATION = "anima:app"
 _MODEL_CLASS = "anima:AnimaModel"
@@ -51,19 +64,41 @@ _SOURCE_DIGESTS = {
         "084c60d95676ae003e285fb57ec6b9c3416ffba6e0a0f62d2097f26b8c8aa999"
     ),
 }
-_IDENTITY_DOCUMENT = {
-    "diffusers": DIFFUSERS_VERSION,
-    FUSED_ANIMA_CUDA_KERNEL_MODULE: FUSED_ANIMA_CUDA_KERNEL_REVISION,
-    "plan": "direct-split-half-rope-matrix",
-    "sources": _SOURCE_DIGESTS,
+_SAGE_SOURCE_DIGESTS = {
+    "sageattention.sageattn": "ffa235d683ec3a1e4860d6c23e1edd59e416aa291d484cc607d2c87dc2b2d049",
 }
-OPTIMIZATION_ID = (
-    "sha256:"
-    + hashlib.sha256(
-        b"cozy.runtime.anima-cosmos-optimization\0"
-        + json.dumps(_IDENTITY_DOCUMENT, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-)
+
+
+def _optimization_identity(attention_plan: str) -> str:
+    """The generation identity of one execution plan, including its ATTENTION arithmetic.
+
+    SageAttention quantizes Q/K to INT8: it is a different computation, not a faster
+    spelling of the same one (measured 1.35% relative L2 against SDPA at Anima's shapes).
+    Two arithmetics must therefore never share an identity, so the attention plan and its
+    source fence enter the digest rather than riding as an unrecorded mode.
+    """
+    document: dict[str, object] = {
+        "diffusers": DIFFUSERS_VERSION,
+        FUSED_ANIMA_CUDA_KERNEL_MODULE: FUSED_ANIMA_CUDA_KERNEL_REVISION,
+        "plan": "direct-split-half-rope-matrix",
+        "self_attention": attention_plan,
+        "sources": _SOURCE_DIGESTS,
+    }
+    if attention_plan == SAGE_SELF_ATTENTION_PLAN:
+        document[SAGE_ATTENTION_DISTRIBUTION] = SAGE_ATTENTION_RELEASE
+        document["sage_sources"] = _SAGE_SOURCE_DIGESTS
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            b"cozy.runtime.anima-cosmos-optimization\0"
+            + json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+
+
+#: The identity of the plan with stock Torch SDPA self-attention — the arithmetic every
+#: banked Anima measurement before SageAttention was taken under.
+OPTIMIZATION_ID = _optimization_identity(TORCH_SDPA_ATTENTION_PLAN)
 _TRANSFORMER_CONFIG = {
     "_class_name": "CosmosTransformer3DModel",
     "_diffusers_version": "0.39.0.dev0",
@@ -103,6 +138,11 @@ class AppliedAnimaOptimization:
     identity: str
     source: str
     operations: tuple[str, ...]
+    #: The live self-attention processors this plan installed. They are NOT part of the
+    #: document: they exist so a caller can read `self_attention_calls` AFTER generating
+    #: and prove the fused processor actually ran. "The capability reported available" is
+    #: not evidence that a kernel executed; a call-site counter is.
+    processors: tuple[Any, ...] = ()
 
     def document(self) -> dict[str, object]:
         return {
@@ -110,6 +150,11 @@ class AppliedAnimaOptimization:
             "source": self.source,
             "operations": list(self.operations),
         }
+
+    @property
+    def self_attention_calls(self) -> int:
+        """How many times the fused self-attention processor has been entered."""
+        return sum(int(processor.calls) for processor in self.processors)
 
 
 def _refuse(code: str, detail: str) -> AnimaOptimizationRefusal:
@@ -255,10 +300,20 @@ def _direct_rope_forward(rope: Any, hidden_states: Any, fps: int | None = None) 
 
 
 class _FusedSelfAttention:
-    def __init__(self, torch: Any, anima_kernels: Any, rope: _RopeMatrix) -> None:
+    def __init__(
+        self,
+        torch: Any,
+        anima_kernels: Any,
+        rope: _RopeMatrix,
+        sageattn: Callable[..., Any] | None = None,
+    ) -> None:
         self.torch = torch
         self.anima_kernels = anima_kernels
         self.rope = rope
+        self.sageattn = sageattn
+        #: Observed at the CALL SITE, so "the kernel ran" is a fact rather than an
+        #: inference from "the capability reported available" (cr-105 measurement rule).
+        self.calls = 0
 
     def __call__(
         self,
@@ -297,14 +352,28 @@ class _FusedSelfAttention:
         query_width, key_width, value_width = query.shape[3], key.shape[3], value.shape[3]
         key = key.repeat_interleave(query_width // key_width, dim=3)
         value = value.repeat_interleave(query_width // value_width, dim=3)
-        output = dispatch_attention_fn(
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
-        )
+        self.calls += 1
+        if self.sageattn is None:
+            output = dispatch_attention_fn(
+                query.transpose(1, 2),
+                key.transpose(1, 2),
+                value.transpose(1, 2),
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        else:
+            # `tensor_layout="NHD"` is the (batch, sequence, heads, width) view these
+            # BHSD-contiguous tensors already transpose into — the identical spelling
+            # `dispatch_attention_fn` is handed above, so the two arms differ in
+            # arithmetic alone and not in layout.
+            output = self.sageattn(
+                query.transpose(1, 2),
+                key.transpose(1, 2),
+                value.transpose(1, 2),
+                tensor_layout="NHD",
+                is_causal=False,
+            )
         output = output.flatten(2, 3).type_as(query)
         return attn.to_out[1](attn.to_out[0](output))
 
@@ -392,7 +461,14 @@ def _latent_prepare_call(step: Any, components: Any, state: Any) -> Any:
         return components, state
 
 
-def _install_block_plan(block: Any, *, anima_kernels: Any, torch: Any, rope: _RopeMatrix) -> None:
+def _install_block_plan(
+    block: Any,
+    *,
+    anima_kernels: Any,
+    torch: Any,
+    rope: _RopeMatrix,
+    sageattn: Callable[..., Any] | None,
+) -> _FusedSelfAttention:
     from diffusers.models.transformers.transformer_cosmos import CosmosAttnProcessor2_0
 
     if (
@@ -405,11 +481,19 @@ def _install_block_plan(block: Any, *, anima_kernels: Any, torch: Any, rope: _Ro
             "anima_optimization_block_shape",
             "Anima Cosmos block projections or attention processors do not match the plan",
         )
-    block.attn1.set_processor(_FusedSelfAttention(torch, anima_kernels, rope))
+    processor = _FusedSelfAttention(torch, anima_kernels, rope, sageattn)
+    block.attn1.set_processor(processor)
     block.forward = MethodType(_block_forward, block)
+    return processor
 
 
-def _install_transformer_plan(transformer: Any, *, anima_kernels: Any, torch: Any) -> None:
+def _install_transformer_plan(
+    transformer: Any,
+    *,
+    anima_kernels: Any,
+    torch: Any,
+    sageattn: Callable[..., Any] | None = None,
+) -> tuple[_FusedSelfAttention, ...]:
     from diffusers.models.normalization import RMSNorm
     from diffusers.models.transformers.transformer_cosmos import (
         CosmosTransformerBlock,
@@ -438,8 +522,12 @@ def _install_transformer_plan(transformer: Any, *, anima_kernels: Any, torch: An
                 "Anima RMSNorm affine/bias/epsilon does not match the fused plan",
             )
         norm.forward = MethodType(_native_rms_forward, norm)
-    for block in blocks:
-        _install_block_plan(block, anima_kernels=anima_kernels, torch=torch, rope=rope)
+    processors = tuple(
+        _install_block_plan(
+            block, anima_kernels=anima_kernels, torch=torch, rope=rope, sageattn=sageattn
+        )
+        for block in blocks
+    )
     transformer.rope.forward = MethodType(_direct_rope_forward, transformer.rope)
 
     original_forward = transformer.forward
@@ -452,6 +540,7 @@ def _install_transformer_plan(transformer: Any, *, anima_kernels: Any, torch: An
             rope.clear()
 
     transformer.forward = MethodType(forward, transformer)
+    return processors
 
 
 def _require_transformer_config(transformer: Any) -> None:
@@ -503,6 +592,46 @@ def fused_anima_capability_refusal() -> str:
             "carries no compiled kernels, so this generation runs the eager path"
         )
     return ""
+
+
+def sage_attention_refusal() -> str:
+    """WHY SageAttention self-attention is unavailable, in one line, or "" when it is.
+
+    The same reporting-only contract as `fused_anima_capability_refusal`: it recomputes
+    the gate for the boot line, decides nothing, and never enters generation identity.
+    """
+    installed = _installed_version(SAGE_ATTENTION_DISTRIBUTION)
+    if installed is None:
+        return (
+            f"{SAGE_ATTENTION_DISTRIBUTION}=={SAGE_ATTENTION_RELEASE} is not installed — "
+            "self-attention runs Torch SDPA"
+        )
+    if installed != SAGE_ATTENTION_RELEASE:
+        return f"{SAGE_ATTENTION_DISTRIBUTION} {installed} != the plan's {SAGE_ATTENTION_RELEASE}"
+    try:
+        sageattn = import_module(SAGE_ATTENTION_DISTRIBUTION).sageattn
+    except (ImportError, AttributeError) as exc:
+        return f"{SAGE_ATTENTION_DISTRIBUTION}.sageattn does not import ({exc})"
+    actual = _source_digest(sageattn)
+    if actual != _SAGE_SOURCE_DIGESTS["sageattention.sageattn"]:
+        return (
+            f"sageattention.sageattn has source sha256:{actual}, not the reviewed "
+            f"sha256:{_SAGE_SOURCE_DIGESTS['sageattention.sageattn']}"
+        )
+    return ""
+
+
+def _sage_self_attention_capability() -> Callable[..., Any] | None:
+    """Return the exact reviewed `sageattn`, or ``None`` to keep Torch SDPA."""
+    if _installed_version(SAGE_ATTENTION_DISTRIBUTION) != SAGE_ATTENTION_RELEASE:
+        return None
+    try:
+        sageattn = import_module(SAGE_ATTENTION_DISTRIBUTION).sageattn
+    except (ImportError, AttributeError):
+        return None
+    if _source_digest(sageattn) != _SAGE_SOURCE_DIGESTS["sageattention.sageattn"]:
+        return None
+    return sageattn  # type: ignore[no-any-return]
 
 
 def _fused_anima_cuda_capability() -> tuple[Any, Any] | None:
@@ -592,8 +721,13 @@ def _apply_fused_anima_cuda_plan(
         )
     _require_transformer_config(transformer)
 
+    sageattn = _sage_self_attention_capability()
+    attention_plan = TORCH_SDPA_ATTENTION_PLAN if sageattn is None else SAGE_SELF_ATTENTION_PLAN
+
     before = _tensor_census(transformer)
-    _install_transformer_plan(transformer, anima_kernels=anima_kernels, torch=torch)
+    processors = _install_transformer_plan(
+        transformer, anima_kernels=anima_kernels, torch=torch, sageattn=sageattn
+    )
     after = _tensor_census(transformer)
     if after != before:
         raise _refuse(
@@ -601,17 +735,22 @@ def _apply_fused_anima_cuda_plan(
             "the post-fill plan changed the tensor schema or parameter/buffer storage identity",
         )
     AnimaPrepareLatentsStep.__call__ = _latent_prepare_call
-    return AppliedAnimaOptimization(
-        OPTIMIZATION_ID,
+    plan_source = (
         f"diffusers=={DIFFUSERS_VERSION};"
-        f"{FUSED_ANIMA_CUDA_KERNEL_MODULE}=={FUSED_ANIMA_CUDA_KERNEL_REVISION}",
-        (
-            "fused_rmsnorm_split_half_rope",
-            "addcmul_residuals",
-            "latent_sized_zero_padding_mask",
-            "native_rms_norm",
-            "direct_split_half_rope_matrix",
-        ),
+        f"{FUSED_ANIMA_CUDA_KERNEL_MODULE}=={FUSED_ANIMA_CUDA_KERNEL_REVISION}"
+    )
+    operations = [
+        "fused_rmsnorm_split_half_rope",
+        "addcmul_residuals",
+        "latent_sized_zero_padding_mask",
+        "native_rms_norm",
+        "direct_split_half_rope_matrix",
+    ]
+    if sageattn is not None:
+        plan_source += f";{SAGE_ATTENTION_DISTRIBUTION}=={SAGE_ATTENTION_RELEASE}"
+        operations.append("sage_int8_qk_self_attention")
+    return AppliedAnimaOptimization(
+        _optimization_identity(attention_plan), plan_source, tuple(operations), processors
     )
 
 
