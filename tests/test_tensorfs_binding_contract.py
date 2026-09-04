@@ -1,0 +1,312 @@
+"""The runtime↔tensorfs seam has no compiler; this is what stands in for one (xs-024 §0).
+
+`tensorfs` is a compiled PyO3 extension in a SEPARATE REPOSITORY, resolved by version range
+(`tensorfs>=0.3.1,<1`). Nothing in either tree checks that a call site still matches the
+binding it calls:
+
+- **mypy cannot.** tensorfs ships `py.typed`, but `_ext.pyi` is 41 lines whose operative
+  content is `Store.__getattr__(self, name) -> Any` and a module-level `__getattr__ -> Any`.
+  Every method on this page type-checks as `Any` under `strict = true`. The runtime's own
+  `fill.tensorfs_module() -> Any` erases what little is left.
+- **The wheel is a binary.** A parameter deleted in Rust changes no Python source here, so
+  no review, diff or lint sees it.
+
+That gap was not hypothetical. tensorfs `03c9713` (#64, 2026-09-02) deleted `source_uri` and
+`declared_license` from `Store.prepare_model_source`; `worker/model_source_prepare.py` kept
+passing them for two days, so every foreign-source preparation on a pod raised `TypeError`
+before tensorfs was entered. Nothing went red, because nothing tested that file.
+
+Two arms, and the second is the one that would have caught it:
+
+1. **The frozen table.** Every tensorfs entry point cozy-runtime calls, with the exact
+   signature it was written against. A rename, an added parameter, a reordering or a
+   removal on the Rust side turns this red on the next `uv sync`.
+2. **The real call.** `prepare_model_source`/`release_model_source` driven through the real
+   runtime function against a real `Store` on disk. Arity is proved by binding, not by
+   reading — the strongest form available without a compiler.
+
+WHAT THIS CANNOT COVER, stated so nobody mistakes the coverage for more than it is:
+
+- **Types and semantics.** `inspect.signature` sees names and defaults, never that
+  `files` wants `list[tuple[str, str, int, str]]` or that a `str` now means a path. A Rust
+  parameter that keeps its name and changes its meaning passes this test.
+- **The other two mechanisms.** cozy-runtime also reaches tensorfs through the `tfs` CLI's
+  TEXT stdout (pod-supervisor, the daemon, the hub) and through vendored artifacts. Neither
+  is a Python signature and neither is checked here (xs-024 §1B, §1C).
+- **Anything the runtime does not call.** ~110 exports, ~34 exercised. A change to the
+  other two thirds is invisible here, correctly.
+- **The version actually installed on a pod.** This checks the wheel in THIS environment.
+  Worker images pin their own, and the startup handshake that would close that is xs-024 §1.
+"""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import inspect
+from pathlib import Path
+
+import pytest
+import tensorfs
+
+from cozy_runtime.internal.worker import model_source_prepare
+from cozy_runtime.protocol import worker_pb2 as pb
+
+SRC = Path(__file__).resolve().parent.parent / "src" / "cozy_runtime"
+
+#: Every callable tensorfs entry point cozy-runtime calls, against the signature it was
+#: written for. Transcribed from the installed extension, not from the Rust source: the
+#: wheel is what a pod runs. A diff here is a seam change and wants a human, not a re-freeze.
+CALLED: dict[str, str] = {
+    "fit": (
+        "(requirements: 'Sequence[TensorRequirement]', header: 'bytes', *, custody: 'str', "
+        "encoded_leaves: 'bool', device: 'str | None' = None, "
+        "observations: 'bytes | None' = None) -> 'dict[str, object]'"
+    ),
+    "plan": "(header, traversal, components=None, window=Ellipsis)",
+    "parse_header": "(data: 'bytes', closure: 'Closure | None' = None) -> 'Header'",
+    "parse_manifest": "(data)",
+    "seed_digests": "()",
+    "TensorRequirement": (
+        "(component: 'str', key: 'str', shape: 'Sequence[int]', "
+        "logical_dtype: 'str | None' = None) -> None"
+    ),
+    "Store.open": "(root=None)",
+    "Store.ensure": "(root=None)",
+    "Store.prepare_readers": "(self, /)",
+    "Store.manifest": "(self, /, hex)",
+    "Store.put_file": "(self, /, path, expect=None, expect_length=None)",
+    "Store.put_manifest": "(self, /, data, expect=None, expect_length=None)",
+    "Store.acquire": "(self, /, manifest, objects)",
+    "Store.acquire_cozytensors": "(self, /, hex)",
+    "Store.walk": "(self, /, hex)",
+    "Store.walk_cozytensors": "(self, /, hex)",
+    "Store.resolve_release": "(self, /, org, name, version, lane)",
+    "Store.complete_cozytensors_manifests": "(self, /)",
+    "Store.begin_derived": (
+        "(self, /, transaction_id, writer_session_id, sources, targets, configs, order, "
+        "max_new_bytes)"
+    ),
+    "Store.derived_lookup": "(self, /, transaction_id)",
+    "Store.derived_fence": "(self, /, transaction_id, writer_session_id)",
+    "Store.derived_abandon": "(self, /, transaction_id)",
+    "Store.derived_dispose": "(self, /, transaction_id)",
+    # THE ONE THAT BROKE. Four arguments. `repo_cache` exists on tensorfs master as a
+    # keyword-only mount point; the Store↔cache binding lane deletes it, and no caller here
+    # threads a path (xs-024 §5). A wheel bump past tensorfs#98 therefore turns THIS entry
+    # red before that lane lands — which is the guard working. Re-freeze only after
+    # confirming the four positional arguments still bind, and never by adding a fifth.
+    "Store.prepare_model_source": (
+        "(self, /, operation_id, source_selection_digest, profiles, files)"
+    ),
+    "Store.release_model_source": "(self, /, operation_id)",
+    "ReadLease.stream": "(self, /, plan, slots, on_batch, readers=4)",
+    "ReadLease.read_into": "(self, /, object, object_length, off, length, into)",
+    "ReadLease.read_asset": "(self, /, header, name, max_bytes=67108864)",
+    "ReadLease.release": "(self, /)",
+    "DerivedWriter.add_part": "(self, /, component, key, role, reader)",
+    "DerivedWriter.add_config": "(self, /, name, reader)",
+    "DerivedWriter.commit": "(self, /)",
+    "DerivedWriter.fence": "(self, /)",
+    "DerivedWriter.source_read_into": "(self, /, source, component, key, role, off, into)",
+    "Batch.release": "(self, /)",
+    "Batch.items": "(self, /)",
+    "ReadPlan.items": "(self, /)",
+}
+
+#: Non-callable crossings: read, never called, so they carry no signature to freeze. Their
+#: DISAPPEARANCE is still a break, which is all this set asserts.
+READ: frozenset[str] = frozenset(
+    {
+        "DTYPES",
+        "errors.Refusal",
+        "ReadLease.live",
+        "Batch.slot",
+        "Batch.nbytes",
+        "ReadPlan.order",
+        "ReadPlan.bytes",
+    }
+)
+
+#: Module attributes reached by name that are not themselves called or read as values —
+#: the types cozy-runtime names to get at the members above.
+NAMED: frozenset[str] = frozenset({"Store", "ReadLease", "errors"})
+
+
+def _resolve(dotted: str) -> object:
+    value: object = tensorfs
+    for part in dotted.split("."):
+        value = getattr(value, part)
+    return value
+
+
+def _signature(dotted: str) -> str:
+    return str(inspect.signature(_resolve(dotted)))  # type: ignore[arg-type]
+
+
+def test_every_entry_point_cozy_runtime_calls_still_exists() -> None:
+    """A DELETED binding is the loudest form of this break, so it gets its own arm."""
+
+    missing = [name for name in sorted(CALLED | {n: "" for n in READ}) if not _exists(name)]
+    assert not missing, (
+        f"tensorfs {tensorfs.__version__} no longer exposes {missing}; cozy-runtime calls "
+        "them. Repair the call sites, do not delete the entries."
+    )
+
+
+def _exists(dotted: str) -> bool:
+    try:
+        _resolve(dotted)
+    except AttributeError:
+        return False
+    return True
+
+
+def test_every_entry_point_cozy_runtime_calls_keeps_its_frozen_signature() -> None:
+    """The arm that would have gone red on 2026-09-02 instead of on a rented pod."""
+
+    drifted = {
+        name: (frozen, _signature(name))
+        for name, frozen in sorted(CALLED.items())
+        if _signature(name) != frozen
+    }
+    assert not drifted, (
+        f"tensorfs {tensorfs.__version__} changed a binding cozy-runtime calls:\n"
+        + "\n".join(
+            f"  {name}\n    written against: {was}\n    installed:       {now}"
+            for name, (was, now) in drifted.items()
+        )
+        + "\nFix the call site FIRST; re-freeze only once the caller agrees."
+    )
+
+
+def test_the_signature_check_would_notice_a_deleted_parameter() -> None:
+    """The guard's own red arm: prove the comparison detects the exact break it exists for."""
+
+    installed = _signature("Store.prepare_model_source")
+    six = installed.replace(", files)", ", files, source_uri, declared_license)")
+    assert six != installed
+    assert CALLED["Store.prepare_model_source"] == installed
+
+
+def test_the_frozen_table_names_every_tensorfs_attribute_the_source_reaches() -> None:
+    """Keeps the table honest as call sites are ADDED, which is how a table normally rots.
+
+    Module-level only. A method on a `Store` held in a local variable cannot be resolved
+    statically without types, and tensorfs's stub supplies none — so `Store.*`, `ReadLease.*`
+    and `DerivedWriter.*` above are maintained by hand and are the guard's soft edge.
+    """
+
+    covered = {name.split(".")[0] for name in CALLED} | {n.split(".")[0] for n in READ} | NAMED
+    reached: dict[str, str] = {}
+    for path in sorted(SRC.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "tensorfs":
+                for alias in node.names:
+                    reached.setdefault(alias.name, f"{path.name}:{node.lineno}")
+            elif isinstance(node, ast.Attribute) and _names_the_module(node.value):
+                reached.setdefault(node.attr, f"{path.name}:{node.lineno}")
+    uncovered = {name: where for name, where in sorted(reached.items()) if name not in covered}
+    assert not uncovered, (
+        f"these tensorfs attributes are reached by cozy-runtime but are not in this "
+        f"module's frozen table, so a Rust-side change to them is unguarded: {uncovered}"
+    )
+
+
+def _names_the_module(node: ast.expr) -> bool:
+    """`tensorfs.X` — whether the module came from `import tensorfs` or `tensorfs_module()`."""
+
+    if isinstance(node, ast.Name):
+        return node.id == "tensorfs"
+    return isinstance(node, ast.Attribute) and node.attr == "tensorfs"
+
+
+def _request(tmp_path: Path, *, operation_id: str) -> pb.PrepareModelSourceRequest:
+    """One shape-valid request over a real file, so validation passes and the call crosses."""
+
+    blob = tmp_path / "model.safetensors"
+    blob.write_bytes(b"a real file that is not a real checkpoint" * 8)
+    data = blob.read_bytes()
+    return pb.PrepareModelSourceRequest(
+        operation_id=operation_id,
+        source_selection_digest=hashlib.sha256(b"selection").digest(),
+        profiles=[pb.ModelSourceProfile(slot="unet", profile="sdxl/unet")],
+        files=[
+            pb.LocalModelSourceFile(
+                member="model.safetensors",
+                object_id="sha256:" + hashlib.sha256(data).hexdigest(),
+                length=len(data),
+                path=str(blob),
+            )
+        ],
+    )
+
+
+def test_prepare_model_source_reaches_tensorfs_and_comes_back_typed(tmp_path: Path) -> None:
+    """The integration arm. A shape-valid request must REACH the binding.
+
+    The file is deliberately not a checkpoint, so tensorfs answers with a typed refusal
+    rather than a manifest — which is the point. A refusal proves the arguments BOUND. With
+    the six-argument call this repair deleted, this test raises `TypeError` instead, because
+    `prepare_model_source` re-raises anything that is not a tensorfs `Refusal`.
+    """
+
+    root = tmp_path / "tensorfs"
+    tensorfs.Store.ensure(str(root))
+
+    result = model_source_prepare.prepare_model_source(
+        _request(tmp_path, operation_id="op-contract-1"), tensorfs_root=root
+    )
+
+    assert result.outcome == pb.MODEL_SOURCE_PREPARE_OUTCOME_REFUSED
+    assert result.safe_code.startswith("model_source_tensorfs_"), result.safe_code
+
+
+def test_release_model_source_reaches_tensorfs_and_comes_back_typed(tmp_path: Path) -> None:
+    """The same proof for the lifecycle half, which has its own arity."""
+
+    root = tmp_path / "tensorfs"
+    tensorfs.Store.ensure(str(root))
+
+    with pytest.raises(tensorfs.errors.Refusal):
+        model_source_prepare.release_model_source(
+            tensorfs_root=root, operation_id="op-contract-absent"
+        )
+
+
+def test_prepare_model_source_refuses_a_relative_store_before_touching_tensorfs(
+    tmp_path: Path,
+) -> None:
+    """The refusal paths of this module had no coverage at all; give them a floor."""
+
+    result = model_source_prepare.prepare_model_source(
+        _request(tmp_path, operation_id="op-contract-2"), tensorfs_root=Path("relative/store")
+    )
+
+    assert result.outcome == pb.MODEL_SOURCE_PREPARE_OUTCOME_REFUSED
+    assert result.safe_code == "model_source_store_invalid"
+
+
+def test_prepare_model_source_refuses_an_unsorted_profile_set(tmp_path: Path) -> None:
+    request = _request(tmp_path, operation_id="op-contract-3")
+    del request.profiles[:]
+    request.profiles.extend(
+        [
+            pb.ModelSourceProfile(slot="vae", profile="sdxl/vae"),
+            pb.ModelSourceProfile(slot="unet", profile="sdxl/unet"),
+        ]
+    )
+
+    result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
+
+    assert result.safe_code == "model_source_profile_order"
+
+
+def test_prepare_model_source_refuses_a_file_whose_length_is_a_lie(tmp_path: Path) -> None:
+    request = _request(tmp_path, operation_id="op-contract-4")
+    request.files[0].length += 1
+
+    result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
+
+    assert result.safe_code == "model_source_file_identity_invalid"
