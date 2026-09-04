@@ -138,8 +138,12 @@ def _request(
             or metadata.st_size != row.length
             or paths.setdefault(path, row.object_id) != row.object_id
         ):
+            # The member is named because this gate has 48 candidates on an H3 ingest and
+            # one static string cannot say which failed: run 290 refused here after moving
+            # 210.3 GB and the row identified nothing.
             raise ModelSourceRefusal(
-                "model_source_file_identity_invalid", "verified source path identity is invalid"
+                "model_source_file_identity_invalid",
+                f"verified source path identity is invalid for {row.member}",
             )
         files.append((row.member, row.object_id, row.length, str(path)))
     return profiles, files

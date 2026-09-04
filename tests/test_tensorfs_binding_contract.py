@@ -347,6 +347,9 @@ def test_two_different_objects_claiming_one_path_are_still_refused(tmp_path: Pat
     result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
 
     assert result.safe_code == "model_source_file_identity_invalid"
+    # Which member failed must be in the detail: 48 candidates and one static string is
+    # how run 290 refused after moving 210.3 GB while naming nothing.
+    assert "z-second-member.safetensors" in result.safe_detail
 
 
 def test_prepare_model_source_refuses_a_file_whose_length_is_a_lie(tmp_path: Path) -> None:
