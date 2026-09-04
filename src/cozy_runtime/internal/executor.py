@@ -1625,6 +1625,25 @@ class Executor:
         self.facts = {
             "cuda_init_ms": sum(float(facts.get("cuda_init_ms", 0)) for _, facts in facts_rows),
             "prepare_ms": sum(float(facts.get("prepare_ms", 0)) for _, facts in facts_rows),
+            # THE SEGMENT LEDGER AND THE SUBSTRATE CENSUS, FOR A MANY-MODEL PREPARE TOO
+            # (cr-130). cr-102 added both to `_prepare_first` and nowhere else, so a
+            # placement with two or more models reported one summed `prepare_ms` and no
+            # legs at all -- exactly the unattributable total cr-102 exists to end, kept
+            # alive on the path where it is hardest to reason about because there are now
+            # several constructions inside the one number. The legs carry their model's
+            # parameter name, because "which model spent it" is the first question.
+            "stages": [
+                (f"{parameter}.{name}", ms)
+                for parameter, facts in facts_rows
+                for name, ms in (facts.get("stages") or ())
+            ],
+            # Summed elementwise: (parameters on meta, parameters on a real device, the
+            # bytes those real ones hold). One model allocating its weights on the host is
+            # the alarm whether or not its siblings behaved.
+            "substrate_census": [
+                sum(int((facts.get("substrate_census") or (0, 0, 0))[i]) for _, facts in facts_rows)
+                for i in range(3)
+            ],
             "fill_ms": sum(float(facts.get("fill_ms", 0)) for _, facts in facts_rows),
             "filled": sum(int(facts.get("filled", 0)) for _, facts in facts_rows),
             "filled_bytes": sum(int(facts.get("filled_bytes", 0)) for _, facts in facts_rows),

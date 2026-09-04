@@ -4113,26 +4113,44 @@ class Worker:
         # needs on the line that reports the time, not values that die in the reply.
         _stages: tuple[tuple[str, float], ...] = reply["facts"].get("stages") or ()
         if _stages:
-            # The `qualify` leg's PROVENANCE rides the line that reports its duration
-            # (cr-103): "measured" and "reused" are the two shapes that leg has, and a
-            # reader who cannot tell them apart cannot tell a warm pod from a cold one.
+            # THE EXPENSIVE LEGS AND THEIR PROVENANCE BOTH SURVIVE THE CAP (cr-141 over
+            # cr-103). `note` caps a step at 256 characters, and the ledger is emitted in
+            # EXECUTION order -- which puts the cheap prologue first and cut the line off
+            # at `admission`, hiding `lease_acquire`, `construct_and_fill` and
+            # `execution_plan`. Measured on a rented L40, that was the last 4 s of a 7.5 s
+            # prepare: the four legs an operator most needs were exactly the four the cap
+            # ate. The two suffixes are priced into the budget FIRST rather than appended
+            # and hoped for -- "measured" vs "reused" is what tells a warm pod from a cold
+            # one, and it is worthless if the cap eats it instead of a 78 ms leg.
             _q = reply["facts"].get("qualification") or {}
-            # And what the `lease_acquire` leg actually took out: leases held, times it
-            # went to the store, and the objects pinned against FD_HEADROOM. One
-            # acquisition per component was three quarters of that leg on a four-component
-            # single-snapshot model, and no line said so.
             _l = reply["facts"].get("leases") or {}
+            tail = (f" [qualification {_q['source']} {_q['key'][:12]}]" if _q else "") + (
+                f" [{_l['leases']} lease(s) over {_l['objects']} object(s) in "
+                f"{_l['acquisitions']} acquisition(s)]"
+                if _l
+                else ""
+            )
+            legs = [(name, ms) for name, ms in _stages if ms >= 0.5]
+            head = f"{placement_id!r} prepare legs: "
+            shown: list[str] = []
+            budget = 256 - len(head) - len(tail) - 24
+            for name, ms in sorted(legs, key=lambda leg: -leg[1]):
+                text = f"{name} {ms:.0f}ms"
+                if budget - len(text) - 2 < 0:
+                    break
+                budget -= len(text) + 2
+                shown.append(text)
+            order = {name: index for index, (name, _) in enumerate(legs)}
+            hidden = len(legs) - len(shown)
+            # The hidden legs are all cheaper than the cheapest SHOWN one. That bound is
+            # what an operator can act on: it says what the omission is worth at most.
+            floor = min((ms for name, ms in legs if f"{name} {ms:.0f}ms" in shown), default=0.0)
             self.note(
                 "boot",
-                f"{placement_id!r} prepare legs: "
-                + ", ".join(f"{name} {ms:.0f}ms" for name, ms in _stages)
-                + (f" [qualification {_q['source']} {_q['key'][:12]}]" if _q else "")
-                + (
-                    f" [{_l['leases']} lease(s) over {_l['objects']} object(s) in "
-                    f"{_l['acquisitions']} acquisition(s)]"
-                    if _l
-                    else ""
-                ),
+                head
+                + ", ".join(sorted(shown, key=lambda text: order[text.rsplit(" ", 1)[0]]))
+                + (f" (+{hidden} under {floor:.0f}ms)" if hidden else "")
+                + tail,
             )
         _w: tuple[int, ...] = reply["facts"].get("substrate_census") or ()
         if len(_w) == 3 and _w[1]:
