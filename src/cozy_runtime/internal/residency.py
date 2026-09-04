@@ -417,7 +417,17 @@ class ComponentResidency:
         # a 9734 ms restore with nothing said about it, because the swap path had never
         # been instrumented the way `prepare` now is. Each staged component reports the
         # four legs that partition its own `ms`; they are summed here in the same order.
-        legs = {"reserve_ms": 0, "lease_ms": 0, "enqueue_ms": 0, "commit_ms": 0}
+        legs = {
+            "reserve_ms": 0,
+            "lease_ms": 0,
+            "enqueue_ms": 0,
+            "commit_ms": 0,
+            "ring_ms": 0,
+            "copy_ms": 0,
+            "fence_ms": 0,
+            "objects": 0,
+            "destinations": 0,
+        }
         read_before = _read_bytes()
         for name in wanted:
             if name in self.backend.components:

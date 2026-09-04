@@ -4530,14 +4530,29 @@ class Worker:
             # treatment `prepare` got. "9018 ms outside the fill leg" named a duration and
             # attributed none of it, which is how a restore stayed unexplained across two
             # issues; these four legs say which part of the re-stage spent it.
-            legs = report.get("legs") or {}
+            legs = dict(report.get("legs") or {})
+            objects = int(legs.pop("objects", 0))
+            destinations = int(legs.pop("destinations", 0))
+            copy_ms = float(legs.get("copy_ms", 0))
+            # MS PER OBJECT, OUTSIDE THE COPY. The arithmetic says ~7 GB from page cache
+            # over PCIe 4.0 x16 is ~1.5 s and from NVMe ~3.5 s, and the measured restore
+            # was 9.7 s — so if what is left over scales with the OBJECT COUNT rather than
+            # with bytes, the fix is batching and not faster I/O. That is one division and
+            # it decides which, so it is printed rather than left to be inferred.
+            per_object = (
+                f", {(took - copy_ms) / objects:.2f} ms/object outside the copy" if objects else ""
+            )
             self.note(
                 "residency",
                 f"{lane.lane_id}: {slot!r} restored {gained} B "
                 f"({', '.join(sorted(restored))}) in {took:.0f} ms — fill leg "
                 f"{fill_ms / 1000:.3f} s, {took - fill_ms:.0f} ms outside it"
                 + (
-                    " [" + ", ".join(f"{name} {int(ms)}ms" for name, ms in legs.items()) + "]"
+                    " ["
+                    + ", ".join(f"{name} {int(ms)}ms" for name, ms in legs.items())
+                    + f" over {objects} object(s), {destinations} destination(s)"
+                    + per_object
+                    + "]"
                     if legs
                     else ""
                 )

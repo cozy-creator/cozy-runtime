@@ -1812,9 +1812,21 @@ class StreamingFillBackend:
             try:
                 for tensor in self.enqueued.values():
                     ring.track(tensor)
+                # THE COPY LEG, SPLIT OFF THE RING (cr-103). `stream_ms` is the whole
+                # transaction: allocate the page-locked ring, track every destination,
+                # read, copy, decode, fence, release. Only the middle of that scales with
+                # BYTES; the rest scales with the number of destinations and slots. A swap
+                # whose cost is per-object rather than per-byte is invisible in one total,
+                # and which of the two it is decides whether the fix is faster I/O or
+                # bigger batches.
+                tracked = time.perf_counter_ns()
                 windows = self._stream(ring)
+                copied = time.perf_counter_ns()
                 ring.finish()
                 accel.synchronize(self.torch, self.kind)
+                self.stats["ring_ms"] = (tracked - started) // 1_000_000
+                self.stats["copy_ms"] = (copied - tracked) // 1_000_000
+                self.stats["fence_ms"] = (time.perf_counter_ns() - copied) // 1_000_000
                 self.stats["windows"] = windows
                 self.stats["waits"] = ring.waits
                 self.pinned = {
@@ -1984,7 +1996,7 @@ class StreamingFillBackend:
             fresh = census(_Holder({name: member}))
         reserved = time.perf_counter_ns()
         self.vram_charge[name] = want
-        self._acquire(name)
+        objects = len(self._acquire(name).objects)
         leased = time.perf_counter_ns()
         # OUT OF `parked` BEFORE THE FILL. `fill` skips a parked component's destinations —
         # they are on `meta` and have no bytes — so staging while still marked parked
@@ -2033,6 +2045,15 @@ class StreamingFillBackend:
             "lease_ms": (leased - reserved) // 1_000_000,
             "enqueue_ms": (enqueued - leased) // 1_000_000,
             "commit_ms": (ended - enqueued) // 1_000_000,
+            # The copy leg alone, and the two counts a per-object cost would scale with.
+            # `objects` is the STORED objects the leased snapshot holds; `destinations` is
+            # the tensors this component put back. Reported rather than divided here: the
+            # ratio is the reader's question and this plane does not decide on it.
+            "copy_ms": int(self.stats.get("copy_ms", 0)),
+            "ring_ms": int(self.stats.get("ring_ms", 0)),
+            "fence_ms": int(self.stats.get("fence_ms", 0)),
+            "objects": objects,
+            "destinations": len(fresh.destinations),
         }
         self.stage_log.append(row)
         del self.stage_log[:-64]
