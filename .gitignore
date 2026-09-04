@@ -12,3 +12,5 @@ corpus/pipeline/imports/
 corpus/pipeline/tokenizer/
 corpus/pipeline/tokenizer_2/
 outputs/
+# The compiled kernel extension, built in-tree for local research runs.
+src/cozy_runtime/_kernels/*.abi3.so

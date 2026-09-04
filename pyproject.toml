@@ -143,6 +143,19 @@ follow_imports = "skip"
 module = ["cozy_runtime.internal.derive"]
 warn_unused_ignores = false
 
+# The custom-operator registration and its proof are the two places that DECORATE with and
+# SUBCLASS torch. The checking venv has no torch (§1.0 keeps it an optional extra), so
+# `torch.library.custom_op` and `nn.Module` are both `Any` here and strict mode reads that
+# as "untyped decorator" / "subclass of Any". The consequence is recorded rather than
+# papered over with ignores that would themselves be unused wherever torch IS installed.
+[[tool.mypy.overrides]]
+module = [
+    "cozy_runtime._kernels.ops",
+    "test_kernel_compile_composition",
+]
+disallow_untyped_decorators = false
+disallow_subclassing_any = false
+
 [project.optional-dependencies]
 # The derivation harness and the serving executor. Corpus venvs install this.
 derive = ["torch>=2.13,<3"]
