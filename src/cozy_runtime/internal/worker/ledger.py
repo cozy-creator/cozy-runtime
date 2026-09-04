@@ -236,6 +236,14 @@ class Ledger:
     #: each with a 25.8 s rebuild, until the requeue budget ran out.
     carried_activations_by_cell: dict[str, int] = field(default_factory=dict)
     carried_activation_scopes_by_cell: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: cell -> THE DRIVER-FREE BYTES THE MEASUREMENT WAS TAKEN UNDER (cr-097, third cut).
+    #: An activation peak is not interpretable without it. Kernels expand into the headroom
+    #: they are given — cuBLAS/cuDNN workspace selection, allocator behaviour — so the same
+    #: model at the same shape measured 3.91 GiB alone on a 15.6 GiB card and 1.92 GiB with
+    #: a co-tenant beside it, reproducibly. A peak observed with the card empty is therefore
+    #: an upper bound the kernels CHOSE, not a requirement they HAVE, and a bare scalar
+    #: cannot say which it is. This is what lets a reader tell.
+    carried_activation_free_by_cell: dict[str, int] = field(default_factory=dict)
     #: cell -> the free bytes under which an attempt for it ALREADY FAILED on the device
     #: (cr-097). A lower bound on demand, never an envelope; see `observe_device_shortfall`.
     carried_shortfall_by_cell: dict[str, int] = field(default_factory=dict)
@@ -447,9 +455,13 @@ class Ledger:
                 # knowing. A failed attempt's fact goes to `observe_device_shortfall`,
                 # which is a different slot holding a different KIND of number.
                 if succeeded:
-                    self.carried_activations_by_cell[cell] = max(
-                        self.carried_activations_by_cell.get(cell, 0), measured
-                    )
+                    previous = self.carried_activations_by_cell.get(cell, 0)
+                    self.carried_activations_by_cell[cell] = max(previous, measured)
+                    if measured >= previous:
+                        # The CONDITIONS travel with the number, always together: a peak
+                        # whose free-bytes context was dropped is exactly the category
+                        # error this issue is about.
+                        self.carried_activation_free_by_cell[cell] = self.device_free
                     carried = self.carried_activation_scopes_by_cell.setdefault(cell, {})
                     for method, value in scopes.items():
                         carried[method] = max(carried.get(method, 0), value)
@@ -467,6 +479,42 @@ class Ledger:
         self.carried_shortfall_by_cell[cell] = max(
             self.carried_shortfall_by_cell.get(cell, 0), int(free_bytes)
         )
+
+    def carried_conditions_apply(self, cell: str) -> bool:
+        """Whether a CARRIED measurement for `cell` may be enforced right now (cr-097).
+
+        True when it was observed with no more room than there is now, so the number is a
+        requirement the kernels actually had; false when it was observed on a roomier card,
+        where it is an upper bound they chose. A basis of 0 means nothing was banked, and
+        the uncalibrated path owns that case with its own may-not-refuse rule.
+        """
+        basis = self.activation_basis_free(cell)
+        return basis == 0 or basis <= self.device_free
+
+    def activation_basis_free(self, cell: str) -> int:
+        """The driver-free bytes the carried activation measurement for `cell` was observed
+        under, or 0 when there is none (cr-097).
+
+        A caller compares it with the free bytes NOW. Measured under conditions at least as
+        tight as the present ones, the number is a requirement and may refuse. Measured on a
+        roomier card, it is an upper bound the kernels chose and may only DEEPEN the ladder
+        — never refuse, and never evict a co-tenant. Getting that backwards would move the
+        defect from "this tenant is slow" to "the OTHER tenant is thrown off the card for no
+        reason", which is quieter and worse: the victim is not even the tenant being served.
+        """
+        exact = self.carried_activation_free_by_cell.get(cell, 0)
+        if exact:
+            return exact
+        # A cross-cell read already labels itself an upper bound; its conditions are the
+        # widest cell's, so the same comparison still applies.
+        if self.carried_activation_free_by_cell:
+            widest = max(
+                self.carried_activations_by_cell,
+                key=lambda k: self.carried_activations_by_cell[k],
+                default="",
+            )
+            return self.carried_activation_free_by_cell.get(widest, 0)
+        return 0
 
     def insufficient_for(self, cell: str, free_now: int) -> int:
         """The banked floor when this cell is KNOWN not to fit in `free_now`, else 0.
@@ -533,6 +581,17 @@ class Ledger:
                 key=lambda key: max(self.activation_scopes_by_cell[key].values(), default=0),
             )
             return dict(self.activation_scopes_by_cell[widest])
+        # THE CARRIED SCOPES OBEY THE SAME CONDITIONS RULE AS THE CARRIED ENVELOPE
+        # (cr-097). This is the consumer that reaches furthest: `plan.py` turns these into
+        # `scope_headrooms`, the worker sends them to the executor on `open_attempt`, and
+        # `admit` refuses `device_shortfall` on `size + headroom` INSIDE the executor —
+        # past `Coefficient.enforceable`, which is where every other over-estimate is
+        # caught. A per-scope peak measured on a roomier card would refuse an attempt there
+        # that would have succeeded, and no gate upstream would see it. So a carried scope
+        # measurement that does not apply is simply absent, and the caller falls back to
+        # the same bound it uses when nothing was ever measured.
+        if self.carried_activation_free_by_cell and not self.carried_conditions_apply(cell):
+            return {}
         exact = self.carried_activation_scopes_by_cell.get(cell)
         if exact:
             return dict(exact)

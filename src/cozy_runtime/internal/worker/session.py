@@ -4338,12 +4338,13 @@ class Worker:
         unrelated rebuild happened to re-prepare it — with the co-tenant resident and
         untouched throughout, which is the proof the room was there all along.
 
-        The restore is sized against the ATTEMPT'S ENVELOPE, not against the weights alone.
-        Filling a tenant back to full residency and leaving its own kernels no room is the
-        mirror of reading a fill-inflated peak as a resting requirement: both mistake one
-        kind of number for another, and this one ends in an OOM inside the handler where
-        nothing can decide. The envelope is the widest activation measurement this row
-        holds, in any generation, and the uncalibrated bound when it holds none.
+        It is governed by THE SAME RULE PREPARE USES and by no other. An earlier cut gated
+        each component on the attempt's banked activation envelope; that refused `unet` by
+        1.1 GiB on every attempt and left the tenant at 2x its solo handler time — because
+        the envelope was measured on an empty card, and kernels expand into whatever
+        headroom they are given. Prepare and restore are the same physical act, putting a
+        generation's weights on a card, and a private stricter test for one of them was not
+        a safety measure but the very asymmetry this issue is about.
         """
         missing = row.ledger.missing_resident()
         if not missing:
@@ -4356,15 +4357,9 @@ class Worker:
         if memory.state != "measured":
             return
         row.ledger.observe_device_free(memory.free_bytes, memory.total_bytes)
-        envelope, _source = row.ledger.activations_for("")
-        if envelope <= 0:
-            envelope = UNCALIBRATED_ACTIVATION_BYTES
         try:
             with executor.watched("restore"):
-                reply = executor.call(
-                    {"cmd": "restore", "names": sorted(missing), "envelope": int(envelope)},
-                    timeout=None,
-                )
+                reply = executor.call({"cmd": "restore", "names": sorted(missing)}, timeout=None)
         except ExecutorGone as exc:
             row.ledger.device_unreadable(f"the executor died while restoring: {exc}")
             self.note("residency", f"{slot!r} died while restoring: {exc}"[:256])
@@ -4386,8 +4381,8 @@ class Worker:
             self.note(
                 "residency",
                 f"{lane.lane_id}: {slot!r} restored {gained} B "
-                f"({', '.join(sorted(restored))}) for {why} against a {envelope} B "
-                f"envelope; the driver reports {memory.free_bytes} -> {after.free_bytes} B free",
+                f"({', '.join(sorted(restored))}) for {why}; the driver reports "
+                f"{memory.free_bytes} -> {after.free_bytes} B free",
             )
         if held:
             self.note(

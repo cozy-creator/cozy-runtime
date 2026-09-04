@@ -248,12 +248,9 @@ class _CompositeResidency:
             "vacate_ms": round(sum(float(report["vacate_ms"]) for report in reports.values()), 2),
         }
 
-    def restore(self, names: tuple[str, ...] = (), envelope: int = 0) -> dict[str, Any]:
+    def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]:
         """Every slot re-fills what it can without evicting; the reports merge as above."""
-        reports = {
-            name: row.restore(names=names, envelope=envelope)
-            for name, row in sorted(self.rows.items())
-        }
+        reports = {name: row.restore(names=names) for name, row in sorted(self.rows.items())}
         prefix = len(reports) > 1
 
         def keyed(name: str, component: str) -> str:
@@ -2304,7 +2301,7 @@ class Executor:
                 return self._group_refusal(exc, closing=False)
         return {**self.probe(), "vacated": vacated}
 
-    def restore(self, names: tuple[str, ...] = (), envelope: int = 0) -> dict[str, Any]:
+    def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]:
         """RE-FILL what a vacate took, when the card has room for it (cr-097).
 
         The symmetric half of `vacate`, and it did not exist: a generation the lane emptied
@@ -2324,11 +2321,11 @@ class Executor:
             # EVERY RANK RESTORES (cr-068), for the reason every rank vacates: the ranks
             # hold one plan between them and a partially restored group is not a plan.
             try:
-                self.group.broadcast({"cmd": "restore", "names": list(names), "envelope": envelope})
+                self.group.broadcast({"cmd": "restore", "names": list(names)})
             except GroupRefusal as exc:
                 return self._group_refusal(exc, closing=False)
         try:
-            restored = self.residency.restore(names=names, envelope=envelope)
+            restored = self.residency.restore(names=names)
         except ResidencyRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
         accel.synchronize(self.torch, self.device_kind)
@@ -2658,10 +2655,7 @@ def main(argv: list[str] | None = None) -> int:
             elif name == "vacate":
                 reply = executor.vacate()
             elif name == "restore":
-                reply = executor.restore(
-                    names=tuple(str(n) for n in (command.get("names") or ())),
-                    envelope=int(command.get("envelope", 0)),
-                )
+                reply = executor.restore(names=tuple(str(n) for n in (command.get("names") or ())))
             elif name == "shutdown":
                 if executor.group is not None:
                     executor.group.close()

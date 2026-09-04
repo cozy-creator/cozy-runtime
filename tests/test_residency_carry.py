@@ -121,3 +121,82 @@ def test_the_construction_set_is_what_a_restore_asks_for() -> None:
     # And a generation that legitimately never built a component can never "restore" it.
     _generation(ledger, pid=4243)
     assert "text_encoder" not in ledger.missing_resident()
+
+
+def test_a_measurement_carries_the_conditions_it_was_taken_under() -> None:
+    """cr-097 third cut: a bare peak is not interpretable.
+
+    Kernels expand into the headroom they are given, so the same model at the same shape
+    measured 3.91 GiB alone on a 15.6 GiB card and 1.92 GiB with a co-tenant beside it.
+    Banking the peak without the free bytes it was observed under leaves the next reader
+    unable to tell an upper bound the kernels CHOSE from a requirement they HAVE.
+    """
+    ledger = Ledger(worker_pid=1)
+    _generation(ledger)
+    ledger.observe_device_free(15 << 30, 16 << 30)
+    ledger.observe_attempt({"activation_peaks": {"generate": 4 << 30}}, cell=CELL, succeeded=True)
+    assert ledger.activation_basis_free(CELL) == 15 << 30
+    # A bigger measurement moves the conditions with it; a smaller one leaves both alone,
+    # so the pair always describes the same observation.
+    ledger.observe_device_free(7 << 30, 16 << 30)
+    ledger.observe_attempt({"activation_peaks": {"generate": 2 << 30}}, cell=CELL, succeeded=True)
+    assert ledger.carried_activations_by_cell[CELL] == 4 << 30
+    assert ledger.activation_basis_free(CELL) == 15 << 30
+
+
+def test_an_envelope_measured_on_a_roomier_card_may_not_refuse() -> None:
+    """THE HAZARD THIS CLOSES. Enforcing an empty-card peak under a full card would evict a
+    co-tenant that did not need evicting, or refuse an attempt that would have succeeded --
+    moving the defect from "this tenant is slow" to "the OTHER tenant is thrown off the
+    card", which is quieter and worse because the victim is not the tenant being served.
+
+    `plan.py` reads exactly this comparison to decide the coefficient's provenance, and
+    only a `measured` basis may refuse or select a worse rung.
+    """
+    ledger = Ledger(worker_pid=1)
+    _generation(ledger)
+    ledger.observe_device_free(15 << 30, 16 << 30)
+    ledger.observe_attempt({"activation_peaks": {"generate": 4 << 30}}, cell=CELL, succeeded=True)
+    _generation(ledger, pid=4243)
+    basis = ledger.activation_basis_free(CELL)
+    # A co-tenant has taken the card down to less room than the measurement was taken in:
+    # the number stands as a bound, and the comparison says it may not be enforced.
+    ledger.observe_device_free(7 << 30, 16 << 30)
+    assert basis > ledger.device_free
+    # Back on a card at least as roomy as the one it was measured on, it is a requirement.
+    ledger.observe_device_free(15 << 30, 16 << 30)
+    assert basis <= ledger.device_free
+
+
+def test_an_uncalibrated_cell_has_no_conditions_to_compare() -> None:
+    """No measurement, no basis -- and `plan.py` treats a zero basis as "applies", because
+    the uncalibrated path already has its own may-not-refuse rule and must not be given a
+    second one that behaves differently."""
+    ledger = Ledger(worker_pid=1)
+    _generation(ledger)
+    assert ledger.activation_basis_free(CELL) == 0
+
+
+def test_the_carried_scope_headrooms_obey_the_same_conditions_rule() -> None:
+    """THE CONSUMER THAT REACHES FURTHEST. `plan.py` turns the per-scope measurements into
+    `scope_headrooms`, the worker sends them to the executor on `open_attempt`, and `admit`
+    refuses `device_shortfall` on `size + headroom` INSIDE the executor — past
+    `Coefficient.enforceable`, which is where every other over-estimate is caught.
+
+    So a per-scope peak measured on a roomier card would refuse an attempt there that would
+    have succeeded, with no gate upstream able to see it. A carried scope measurement that
+    does not apply must be ABSENT, not merely un-enforceable.
+    """
+    ledger = Ledger(worker_pid=1)
+    _generation(ledger)
+    ledger.observe_device_free(15 << 30, 16 << 30)
+    ledger.observe_attempt({"activation_peaks": {"generate": 4 << 30}}, cell=CELL, succeeded=True)
+    _generation(ledger, pid=4243)
+    # A co-tenant has taken the card below the conditions the scopes were measured under.
+    ledger.observe_device_free(7 << 30, 16 << 30)
+    assert not ledger.carried_conditions_apply(CELL)
+    assert ledger.activation_scopes_for(CELL) == {}
+    # Room at least as tight as the measurement's, and the scopes are a requirement again.
+    ledger.observe_device_free(15 << 30, 16 << 30)
+    assert ledger.carried_conditions_apply(CELL)
+    assert ledger.activation_scopes_for(CELL) == {"generate": 4 << 30}
