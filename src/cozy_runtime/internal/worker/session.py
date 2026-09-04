@@ -3807,18 +3807,31 @@ class Worker:
             return "logical model digest mismatch", False
 
         first = group[0]
-        with tenant.lane.device if not first.weightless else contextlib.nullcontext():
-            return self._prepare_construction(tenant, group, construction_key, binding_set)
+        # THE CARD IS TAKEN LATE (cr-104). Owning the process and warming its device-free
+        # half hold no device bytes and need no lock; only the half that MOVES bytes does.
+        # Held for the whole prepare, the lock kept a co-tenant off a card that the tenant
+        # taking it would not touch for another 4-20 s of Torch, runtime and package
+        # imports -- and `_make_room` had already vacated that co-tenant to get there, so
+        # the card was emptied and then left idle for the length of an import.
+        lock = contextlib.nullcontext() if first.weightless else tenant.lane.device
+        with lock:
+            owned = self._own_executor(tenant, group)
+        if isinstance(owned, str):
+            return owned, False
+        if not first.weightless:
+            self._preconstruct(tenant, owned, first)
+        with lock:
+            return self._prepare_construction(tenant, group, construction_key, binding_set, owned)
 
-    def _prepare_construction(
-        self,
-        tenant: Tenant,
-        group: list[DeclaredBinding],
-        construction_key: str,
-        binding_set: frozenset[str],
-    ) -> tuple[str, bool]:
-        """The device half of `_prepare_generation`, under the lane's device lock."""
-        lane, slot = tenant.lane, tenant.slot
+    def _own_executor(self, tenant: Tenant, group: list[DeclaredBinding]) -> child.Executor | str:
+        """Spawn, keep or replace this tenant's executor. Returns it, or a latch string.
+
+        Separated from the prepare so the process exists BEFORE the device-free warmup that
+        overlaps a co-tenant (cr-104). A replacement kills a process holding device bytes,
+        so this runs under the lane's lock like every other act that moves the card's
+        occupancy; nothing here fills.
+        """
+        lane = tenant.lane
         placement_id = tenant.placement.placement_id
         executor = tenant.supervision.current
         try:
@@ -3860,7 +3873,82 @@ class Worker:
             )
         except ExecutorGone as exc:
             self.note("boot", f"{placement_id!r}: executor_activation_failed: {exc}"[:256])
-            return f"executor_activation_failed: {exc}"[:200], False
+            return f"executor_activation_failed: {exc}"[:200]
+        return executor
+
+    def _preconstruct(
+        self, tenant: Tenant, executor: child.Executor, first: DeclaredBinding
+    ) -> None:
+        """Warm the executor's device-free half WITHOUT the lane's device lock (cr-104).
+
+        This is the whole of the overlap: while a co-tenant computes on the card, the next
+        tenant's process imports Torch, the runtime's construction modules, its package and
+        whatever the package defers. It moves no weight byte and asks the lane for nothing,
+        so EVERY failure here is a missed saving and never a refusal -- the prepare that
+        follows does the same work under the lock and refuses there, typed, exactly as it
+        does today. That is why this returns nothing and latches nothing.
+        """
+        command = executor_prepare_command(
+            first, devices=tenant.lane.devices, authorized_device_limit_bytes=0
+        )
+        command["cmd"] = "preconstruct"
+        command.pop("authorized_device_limit_bytes", None)
+        placement_id = tenant.placement.placement_id
+        started = time.perf_counter()
+        try:
+            reply = executor.call(command, timeout=None)
+        except ExecutorGone as exc:
+            # The prepare below will spawn or refuse on the same fact, with the record.
+            self.note("boot", f"{placement_id!r}: preconstruct lost epoch {executor.epoch}: {exc}")
+            return
+        took = (time.perf_counter() - started) * 1000
+        if not reply.get("ok"):
+            self.note(
+                "boot",
+                f"{placement_id!r}: preconstruct declined ({reply.get('code')}): "
+                f"{str(reply.get('detail'))[:160]}",
+            )
+            return
+        if reply.get("skipped"):
+            return
+        stages = reply.get("stages") or ()
+        self.note(
+            "boot",
+            f"{placement_id!r}: preconstruct warmed epoch {executor.epoch} in {took:.0f} ms "
+            "OFF the lane lock: "
+            + ", ".join(f"{name} {ms:.0f}ms" for name, ms in stages)
+            + (
+                f" [warmup failed: {reply.get('warmup_error')}]"
+                if reply.get("warmup_error")
+                else ""
+            )
+            + (
+                " [the package opened CUDA itself]"
+                if reply.get("adopted_package_cuda_init")
+                else ""
+            ),
+        )
+
+    def _prepare_construction(
+        self,
+        tenant: Tenant,
+        group: list[DeclaredBinding],
+        construction_key: str,
+        binding_set: frozenset[str],
+        executor: child.Executor,
+    ) -> tuple[str, bool]:
+        """The device half of `_prepare_generation`, under the lane's device lock."""
+        lane, slot = tenant.lane, tenant.slot
+        placement_id = tenant.placement.placement_id
+        if tenant.supervision.current is not executor:
+            # The lock was released for the warmup, so ownership could have moved under it.
+            # Whatever owns the slot now prepares on the next convergence; this generation
+            # does not fill into a process the supervision has already let go.
+            self.note(
+                "boot",
+                f"{placement_id!r}: epoch {executor.epoch} was replaced during its warmup",
+            )
+            return "executor_replaced_during_warmup", False
 
         first = group[0]
         started = time.perf_counter()
@@ -4030,7 +4118,7 @@ class Worker:
                 f"{placement_id!r} prepare legs: "
                 + ", ".join(f"{name} {ms:.0f}ms" for name, ms in _stages),
             )
-        _w: tuple[int, ...] = reply["facts"].get("weightless") or ()
+        _w: tuple[int, ...] = reply["facts"].get("substrate_census") or ()
         if len(_w) == 3 and _w[1]:
             self.note(
                 "boot",

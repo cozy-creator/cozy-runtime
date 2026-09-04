@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -332,6 +333,25 @@ class _CompositeResidency:
         }
 
 
+#: The runtime modules a construction imports, named ONCE so `preconstruct` can warm
+#: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
+#: is a missed saving and never a wrong answer: the prepare imports what it needs either
+#: way, and a warm `sys.modules` is the only difference.
+_CONSTRUCTION_MODULES = (
+    "cozy_runtime.author",
+    "cozy_runtime.author._loader",
+    "cozy_runtime.author._model",
+    "cozy_runtime.internal.anima_optimization",
+    "cozy_runtime.internal.derive",
+    "cozy_runtime.internal.encoding",
+    "cozy_runtime.internal.fill",
+    "cozy_runtime.internal.planfacts",
+    "cozy_runtime.internal.probe",
+    "cozy_runtime.internal.residency",
+    "cozy_runtime.internal.resolution",
+)
+
+
 class Executor:
     """One epoch's mutable state. Everything here dies with the process."""
 
@@ -547,6 +567,118 @@ class Executor:
             "followers": list(self.group.pids()) if self.group is not None else [],
         }
         return None
+
+    def preconstruct(self, command: dict[str, Any]) -> dict[str, Any]:
+        """THE DEVICE-FREE HALF OF A CONSTRUCTION, run OFF the lane's device lock (cr-104).
+
+        A prepare's first seconds move no bytes at all: Torch imports, the runtime's own
+        modules import, the package imports, and the package's deferred libraries and
+        dynamic types get built. Measured warm on one host: Torch 1.31 s, the runtime block
+        0.14 s, `import diffusers` 2.77 s -- deferred out of `import anima`, which is 5 ms,
+        so the cost lands INSIDE the construction -- and SDXL's `_hidiffusion_unet_type()`
+        2.69 s on its first call and 0 ms after. None of it touches the card. All of it used
+        to run with the lane's device lock held and a co-tenant ALREADY VACATED for it: the
+        card was emptied, then sat idle for the whole import.
+
+        The worker calls this BEFORE it takes the lock, so the imports overlap whatever is
+        still computing on the card. Everything here is idempotent -- the `prepare` that
+        follows re-executes the same import statements against a warm `sys.modules` and
+        finds `_device_ready` and `discovered` already set -- so a prepare costs what it
+        costs today minus exactly what ran here.
+
+        A GROUP does not preconstruct. Rank 0 forms the group inside `prepare` and every
+        rank's device is made current through that rendezvous; warming one rank early puts
+        an init boundary on the wrong side of it for no gain, since a group holds its whole
+        lane anyway and has no co-tenant to overlap with.
+        """
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if self.world > 1:
+            return {"ok": True, "skipped": "group", "stages": []}
+        binding = command.get("binding") or {}
+        if not binding:
+            models = command.get("models") or []
+            binding = dict(models[0].get("binding") or {}) if models else {}
+        if not binding.get("model_class"):
+            return {"ok": True, "skipped": "weightless", "stages": []}
+        changed = _env_changes()
+        if changed:
+            return {
+                "ok": False,
+                "code": "env_seal_broken",
+                "detail": "the executor environment changed before Torch import "
+                f"({', '.join(changed)}); no CUDA initialization was attempted",
+            }
+        started = time.perf_counter()
+        stages: list[tuple[str, float]] = []
+        _mark = [started]
+
+        def stage(name: str) -> None:
+            now = time.perf_counter()
+            stages.append((name, round((now - _mark[0]) * 1000, 1)))
+            _mark[0] = now
+
+        import torch
+
+        self.torch = torch
+        stage("torch_import")
+        for name in _CONSTRUCTION_MODULES:
+            importlib.import_module(name)
+        stage("runtime_imports")
+        # NO DEVICE INITIALIZATION HERE, DELIBERATELY. A co-tenant is computing on this card
+        # while this runs, and a CUDA context is a few hundred MiB that no lane ceiling
+        # covers; taking them out from under a neighbour mid-attempt is the OOM this whole
+        # change exists to avoid. `prepare` still opens the runtime's ONE init boundary,
+        # under the lock, in the order it always has -- and `_make_room` measures the card
+        # after this returns, so the incoming tenant is priced against the truth either way.
+        opened = accel.initialized(torch, self.device_kind)
+        if self.discovered is None:
+            self._discover_provisioned(binding)
+        stage("package_import")
+        warmup_error = self._warm_package()
+        stage("package_warmup")
+        adopted = not opened and accel.initialized(torch, self.device_kind)
+        if adopted:
+            # THE PACKAGE OPENED CUDA ITSELF, at import or in its `warmup`. Under the old
+            # shape that happened after the runtime's boundary and was invisible; refusing
+            # `cuda_initialized_before_runtime` now would break a package that works today
+            # over a warmup it never asked for. So the context is ADOPTED -- the seal leaves
+            # this process exactly one visible card and a group never preconstructs, so
+            # there is no wrong device to have picked -- and the worker is told, because it
+            # is still a package defect and the operator is the one who can get it fixed.
+            self._device_ready = True
+            accel.reset_peak(torch, self.device_kind)
+        return {
+            "ok": True,
+            "stages": stages,
+            "warmed": not warmup_error,
+            "warmup_error": warmup_error,
+            "adopted_package_cuda_init": adopted,
+            "rss_bytes": _rss(),
+        }
+
+    def _warm_package(self) -> str:
+        """Give the package its ONE chance to pay its deferred import cost off the lock.
+
+        A package's `__init__` is deliberately lazy, and that is right for every caller but
+        this one: deferred, the cost lands inside the construction, under the device lock,
+        on the far side of the vacate. A module-level `warmup()` is where a package says
+        what it would rather pay early. It takes no arguments, returns nothing, and MUST
+        NOT touch the device -- another tenant owns the card while this runs.
+        """
+        module = getattr(self.discovered, "module", None)
+        warm = getattr(module, "warmup", None)
+        if not callable(warm):
+            return ""
+        try:
+            warm()
+        except Exception as exc:
+            # A WARMUP IS AN OPTIMIZATION AND NEVER A VERDICT. Whatever it failed to do the
+            # construction does again for real under the lock and refuses there with the
+            # real code; poisoning the generation here would turn a missed saving into a
+            # lost placement.
+            return f"{type(exc).__name__}: {exc}"[:200]
+        return ""
 
     def prepare(self, command: dict[str, Any]) -> dict[str, Any]:
         """Consume this epoch's one construction attempt.
@@ -1252,7 +1384,10 @@ class Executor:
             "stages": list(stages) + [(f"construct.{name}", ms) for name, ms in record.stage_ms],
             # THE WEIGHTLESS PROMISE, OBSERVED (cr-102). `serving_substrate` swaps every
             # parameter to `meta` as it is registered; this is the count that says it did.
-            "weightless": list(record.weightless),
+            # NOT `weightless`: that key already meant "this binding declares no model" on
+            # a weightless prepare's own facts, and one name for a bool and a census made
+            # the worker read `len(True)` and crash EVERY weightless activation (cr-104).
+            "substrate_census": list(record.weightless),
             # WHY the fused lane was unavailable, when it was (cr-102 / proto-038). The
             # verdict itself already rode in `execution_optimization` below and nothing
             # rendered it; a `None` with no reason is the part an operator cannot act on.
@@ -2679,6 +2814,8 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.run(command)
             elif name == "describe_installed":
                 reply = executor.describe_installed(command)
+            elif name == "preconstruct":
+                reply = executor.preconstruct(command)
             elif name == "prepare":
                 reply = executor.prepare(command)
             elif name == "prepare_request":
