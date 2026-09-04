@@ -712,6 +712,37 @@ def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
     for step in _restores(notes):
         assert " ms — fill leg " in step and " outside it" in step, step
         assert "page cache" in step or "cold" in step or "unreadable" in step, step
+        # AND WHERE THAT COST WENT (cr-103). "9018 ms outside the fill leg" named a
+        # duration and attributed none of it. The legs partition the re-stage, so they
+        # have to be present AND consistent: the four sum inside the restore's own total,
+        # the copy and its ring and fence sum inside the commit, and the two counts a
+        # per-object cost would scale with are real. Nothing here asserts a DURATION —
+        # this box is thermally variable and a threshold would be a coin flip — it
+        # asserts that the arithmetic closes, which is what a dropped or double-counted
+        # leg breaks.
+        reported = re.search(r" in ([\d.]+) ms — fill leg ", step)
+        assert reported is not None, step
+        total = float(reported.group(1))
+        legs = {
+            name: int(value)
+            for name, value in re.findall(r"(\w+_ms) (\d+)ms", step.split(" [", 1)[1])
+        }
+        assert set(legs) == {
+            "reserve_ms",
+            "lease_ms",
+            "enqueue_ms",
+            "commit_ms",
+            "ring_ms",
+            "copy_ms",
+            "fence_ms",
+        }, legs
+        partition = legs["reserve_ms"] + legs["lease_ms"] + legs["enqueue_ms"] + legs["commit_ms"]
+        assert partition <= total + 1, (partition, total, step)
+        assert legs["ring_ms"] + legs["copy_ms"] + legs["fence_ms"] <= legs["commit_ms"] + 1, step
+        counted = re.search(r"over (\d+) object\(s\), (\d+) destination\(s\)", step)
+        assert counted is not None, step
+        assert int(counted.group(1)) > 0 and int(counted.group(2)) > 0, step
+        assert "ms/object outside the copy" in step, step
         pids = {slot: row["executor_pid"] for slot, row in turn.rows.items()}
         assert pids == {slot: row["executor_pid"] for slot, row in owner.turns[0].rows.items()}, (
             pids
