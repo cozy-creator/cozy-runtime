@@ -2031,10 +2031,12 @@ class StreamingFillBackend:
         # AND ITS OWN SEGMENT LEDGER (cr-103). cr-100 reported `stream_ms` inside `ms` and
         # nothing about the difference, so a 9734 ms restore whose fill leg was 716 ms had
         # 9018 ms nobody could attribute — the same ambiguity `prepare` carried until its
-        # legs were named. These four legs partition `ms`: reserving the device bytes and
-        # walking the re-placed module (`reserve_ms`), taking the read lease (`lease_ms`),
-        # validating each destination against its stored row (`enqueue_ms`), and the copy
-        # itself (`stream_ms`, unchanged and still the tfs-018-comparable number).
+        # legs were named. Four legs PARTITION `ms`: reserving the device bytes and walking
+        # the re-placed module (`reserve_ms`), taking the read lease (`lease_ms`),
+        # validating each destination against its stored row (`enqueue_ms`), and the
+        # transaction that moves them (`commit_ms`). `ring_ms`/`copy_ms`/`fence_ms` split
+        # that last one again; `stream_ms` is unchanged and still the tfs-018-comparable
+        # number.
         row = {
             "component": name,
             "action": "stage",

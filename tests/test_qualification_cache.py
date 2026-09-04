@@ -250,6 +250,25 @@ def test_a_truncated_or_unparsable_document_is_not_used(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- keeping it
 
 
+def test_a_document_that_could_not_be_used_is_replaced_rather_than_left(tmp_path: Path) -> None:
+    """A miss caused by a bad document must still keep the good one.
+
+    If the read's reason stood in for the write's, a rig that hit one corrupt or mis-filed
+    document would re-measure on every prepare for the life of that key — the cache-that-
+    never-fires failure, arrived at from the one direction the happy path cannot see.
+    """
+    result = recorded()
+    cache = tmp_path / "qualification"
+    key = key_of(result)
+    cache.mkdir(parents=True)
+    (cache / f"{key}.json").write_text(json.dumps({"key": "sha256:" + "f" * 64, "result": result}))
+    assert probe._read_qualification(str(cache), key)[0] is None
+
+    assert probe._write_qualification(str(cache), key, result) == ""
+    stored, why = probe._read_qualification(str(cache), key)
+    assert why == "" and stored == result
+
+
 def test_what_is_written_is_what_is_read_back(tmp_path: Path) -> None:
     """The writer and the reader agree, or the cache never fires and nobody notices."""
     result = recorded()

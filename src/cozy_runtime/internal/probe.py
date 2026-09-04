@@ -1160,12 +1160,17 @@ def qualified(
     capabilities, result = qualify(
         torch, providers, device, output_dtypes, release=release, runtime=runtime
     )
+    # A MISS ALWAYS WRITES, including a miss caused by a document that was there and was
+    # not usable. Reusing the read's reason as the write's would leave a corrupt or
+    # mis-filed document in place forever, so a rig that hit one once would re-measure on
+    # every prepare for the life of the key with nothing said about why.
+    kept = _write_qualification(cache, key, result)
     return Qualification(
         capabilities,
         result,
         key,
         measured=True,
-        note=note or _write_qualification(cache, key, result),
+        note="; ".join(dict.fromkeys(part for part in (note, kept) if part)),
     )
 
 
