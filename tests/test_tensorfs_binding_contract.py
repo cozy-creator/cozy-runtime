@@ -182,12 +182,18 @@ def test_every_entry_point_cozy_runtime_calls_keeps_its_frozen_signature() -> No
 
 
 def test_the_signature_check_would_notice_a_deleted_parameter() -> None:
-    """The guard's own red arm: prove the comparison detects the exact break it exists for."""
+    """The guard's own red arm: prove the comparison detects the exact break it exists for.
 
-    installed = _signature("Store.prepare_model_source")
-    fewer = installed.replace(", roster, landed)", ", files)")
-    assert fewer != installed
-    assert CALLED["Store.prepare_model_source"] == installed
+    It mutates the FROZEN string, never the installed one, so it proves the COMPARISON works
+    whatever wheel happens to be present. Whether the installed binding agrees with the table
+    is the neighbouring test's job; conflating the two made this arm go red for ordinary
+    version skew instead of for a broken comparison, which is the one thing it exists to
+    detect and the one thing that would then be invisible.
+    """
+
+    frozen = CALLED["Store.prepare_model_source"]
+    assert ", roster, landed)" in frozen
+    assert frozen.replace(", roster, landed)", ", files)") != frozen
 
 
 def test_the_frozen_table_names_every_tensorfs_attribute_the_source_reaches() -> None:
