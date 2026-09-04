@@ -62,7 +62,17 @@ def prepare_model_source(
         tensorfs_refusal = getattr(getattr(locals().get("tensorfs"), "errors", None), "Refusal", ())
         if tensorfs_refusal and isinstance(exc, tensorfs_refusal):
             code = str(getattr(exc, "code", "refused")).lower()
-            return _refused(f"model_source_tensorfs_{code}", "TensorFS refused source preparation")
+            # TensorFS says WHICH key, path or member it refused on; a fixed string threw
+            # that away. Run 294 refused `duplicate_key` after moving 210.3 GB and the
+            # operator's row named nothing, so the cause was found by reading code rather
+            # than by reading the error. The detail is TensorFS's own words, capped.
+            detail = str(getattr(exc, "detail", "") or exc).strip()
+            return _refused(
+                f"model_source_tensorfs_{code}",
+                f"TensorFS refused source preparation: {detail[:400]}"
+                if detail
+                else "TensorFS refused source preparation",
+            )
         raise
 
 

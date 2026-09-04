@@ -329,6 +329,26 @@ def test_two_members_carrying_one_object_share_one_path_and_are_admitted(
     assert result.safe_code != "model_source_file_identity_invalid"
 
 
+def test_a_tensorfs_refusal_carries_its_own_words(tmp_path: Path) -> None:
+    """TensorFS says WHICH key it refused on; a fixed string threw that away.
+
+    Run 294 refused `model_source_tensorfs_duplicate_key` after moving 210.3 GB and the
+    operator's row read only "TensorFS refused source preparation" — so the duplicated
+    path had to be found by reading tensorfs source. The code was preserved and the one
+    fact that localises it was not.
+    """
+
+    request = _request(tmp_path, operation_id="op-contract-detail")
+    # An absent store makes tensorfs refuse with a detail naming what it could not find.
+    result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "absent")
+
+    assert result.outcome == pb.MODEL_SOURCE_PREPARE_OUTCOME_REFUSED
+    assert result.safe_code.startswith("model_source_tensorfs_")
+    # The detail is no longer the bare fixed string: TensorFS's own words survive.
+    assert result.safe_detail != "TensorFS refused source preparation"
+    assert len(result.safe_detail) > len("TensorFS refused source preparation")
+
+
 def test_two_different_objects_claiming_one_path_are_still_refused(tmp_path: Path) -> None:
     """The invariant the duplicate-path check actually protects, kept.
 
