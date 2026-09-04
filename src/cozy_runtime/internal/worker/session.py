@@ -4044,8 +4044,7 @@ class Worker:
             "boot",
             f"{placement_id!r} execution plan: "
             + (
-                f"APPLIED {_opt.get('identity', '?')} "
-                f"operations={list(_opt.get('operations', ()))}"
+                f"APPLIED {_opt.get('identity', '?')} operations={list(_opt.get('operations', ()))}"
                 if _opt
                 else "NOT APPLIED — this generation runs the unfused path"
                 + (

@@ -1249,9 +1249,7 @@ class Executor:
             "prepare_ms": round((time.perf_counter() - started) * 1000, 2),
             # THE SEGMENT LEDGER (cr-102), in execution order. `prepare_ms` minus `fill_ms`
             # was a 20s number nobody could attribute; these are the legs that spend it.
-            "stages": list(stages) + [
-                (f"construct.{name}", ms) for name, ms in record.stage_ms
-            ],
+            "stages": list(stages) + [(f"construct.{name}", ms) for name, ms in record.stage_ms],
             # THE WEIGHTLESS PROMISE, OBSERVED (cr-102). `serving_substrate` swaps every
             # parameter to `meta` as it is registered; this is the count that says it did.
             "weightless": list(record.weightless),
