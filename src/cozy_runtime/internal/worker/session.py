@@ -4020,6 +4020,41 @@ class Worker:
             custody=str(reply["facts"].get("custody", "canonical")),
             ignored_extra_keys=", ".join(reply["facts"].get("ignored_extra_keys", ())),
         )
+        # THE SEGMENT LEDGER AND THE OPTIMIZER'S VERDICT (cr-102). The prepare's own
+        # breakdown and whether the fused execution plan applied are facts an operator
+        # needs on the line that reports the time, not values that die in the reply.
+        _stages = reply["facts"].get("stages") or ()
+        if _stages:
+            self.note(
+                "boot",
+                f"{placement_id!r} prepare legs: "
+                + ", ".join(f"{name} {ms:.0f}ms" for name, ms in _stages),
+            )
+        _w = reply["facts"].get("weightless") or ()
+        if len(_w) == 3 and _w[1]:
+            self.note(
+                "boot",
+                f"{placement_id!r} WEIGHTLESS CONSTRUCTION DID NOT HOLD: {_w[1]} of "
+                f"{_w[0] + _w[1]} parameter(s) were allocated on a real device during "
+                f"construction ({_w[2] / 2**30:.3f} GiB) and every one of them is "
+                "discarded by `to_empty` — the substrate did not fire",
+            )
+        _opt = reply["facts"].get("execution_optimization")
+        self.note(
+            "boot",
+            f"{placement_id!r} execution plan: "
+            + (
+                f"APPLIED {_opt.get('identity', '?')} "
+                f"operations={list(_opt.get('operations', ()))}"
+                if _opt
+                else "NOT APPLIED — this generation runs the unfused path"
+                + (
+                    f" ({reply['facts'].get('execution_optimization_refusal')})"
+                    if reply["facts"].get("execution_optimization_refusal")
+                    else ""
+                )
+            ),
+        )
         self.note(
             "boot",
             f"{placement_id!r} prepared {len(group)} binding(s) in {took:.0f} ms — "

@@ -24,6 +24,7 @@ from __future__ import annotations
 import io
 import os
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -633,6 +634,17 @@ class ConstructionRecord:
     fit: dict[str, object] | None = None
     """The `ok` Fit document this construction was judged by, verbatim; None where no
     header was there to judge against (derive mode)."""
+    weightless: tuple[int, int, int] = (0, 0, 0)
+    """DID THE WEIGHTLESS SUBSTRATE FIRE (cr-102 / proto-038 q1): parameters on `meta`,
+    parameters on a real device, and the bytes those real ones hold, observed after the
+    factory returned. `serving_substrate` promises "parameters weightless"; nothing
+    observed whether the promise held, and a construction that silently allocates its
+    weights on the host costs seconds and gigabytes that no reported number names."""
+    stage_ms: tuple[tuple[str, float], ...] = ()
+    """THE CONSTRUCTION'S OWN LEGS (cr-102): the package factory, the census, the fit
+    verdict and the fill, in execution order. The backend's `fill_ms` measures only the
+    object-stream wall, so without these the difference between a slow package factory
+    and a slow materialization is not observable from a prepare reply."""
 
 
 # --------------------------------------------------------------------------- loader
@@ -693,7 +705,12 @@ class Loader:
         """THE construction primitive: typed config in, walk and match, then one fill path."""
         self._require_open("loader.construct")
         identity = factory_identity(factory)
+        _legs: list[tuple[str, float]] = []
+        _t0 = time.perf_counter()
         obj = factory(self._artifact.config)
+        _legs.append(("factory", round((time.perf_counter() - _t0) * 1000, 1)))
+        _weightless = _weightless_census(obj)
+        _t0 = time.perf_counter()
         if not isinstance(obj, t):
             raise ConformanceError(
                 f"factory {identity} returned {type(obj).__name__}, declared {t.__name__} — "
@@ -701,13 +718,18 @@ class Loader:
                 code="factory_result",
             )
         walked = census(obj)
+        _legs.append(("census", round((time.perf_counter() - _t0) * 1000, 1)))
+        _t0 = time.perf_counter()
         # THE ONE VERDICT, before a byte is reserved (model-code-fit §3). The backend holds
         # the checkpoint header and asks `tensorfs.fit`; this plane matches nothing itself.
         fit = self._backend.fit(walked, encoded_leaves=self._consent())
         if fit is not None and not fit.get("ok"):
             raise ModelFitRefused(fit)
         ignored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("ignored", ())))
+        _legs.append(("fit", round((time.perf_counter() - _t0) * 1000, 1)))
+        _t0 = time.perf_counter()
         filled, filled_bytes = self._fill(walked, obj)
+        _legs.append(("fill", round((time.perf_counter() - _t0) * 1000, 1)))
         record = ConstructionRecord(
             destinations=walked.destinations,
             components=walked.components,
@@ -716,6 +738,8 @@ class Loader:
             filled_bytes=filled_bytes,
             ignored_extras=ignored,
             fit=dict(fit) if fit is not None else None,
+            stage_ms=tuple(_legs),
+            weightless=_weightless,
         )
         self._records.append(record)
         self._objects.append(obj)
@@ -816,6 +840,24 @@ class Census:
     components: tuple[str, ...]
     schedulers: tuple[str, ...]
     live: Mapping[str, TensorLike]
+
+
+def _weightless_census(obj: object) -> tuple[int, int, int]:
+    """Parameters on `meta`, parameters on a real device, and the real ones' bytes."""
+    meta = real = real_bytes = 0
+    members = getattr(obj, "components", None)
+    values = members.values() if isinstance(members, Mapping) else ()
+    for member in values:
+        parameters = getattr(member, "parameters", None)
+        if not callable(parameters):
+            continue
+        for tensor in parameters():
+            if getattr(getattr(tensor, "device", None), "type", "") == "meta":
+                meta += 1
+            else:
+                real += 1
+                real_bytes += tensor.numel() * tensor.element_size()
+    return meta, real, real_bytes
 
 
 def census(obj: object) -> Census:
