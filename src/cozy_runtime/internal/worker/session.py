@@ -4023,14 +4023,14 @@ class Worker:
         # THE SEGMENT LEDGER AND THE OPTIMIZER'S VERDICT (cr-102). The prepare's own
         # breakdown and whether the fused execution plan applied are facts an operator
         # needs on the line that reports the time, not values that die in the reply.
-        _stages = reply["facts"].get("stages") or ()
+        _stages: tuple[tuple[str, float], ...] = reply["facts"].get("stages") or ()
         if _stages:
             self.note(
                 "boot",
                 f"{placement_id!r} prepare legs: "
                 + ", ".join(f"{name} {ms:.0f}ms" for name, ms in _stages),
             )
-        _w = reply["facts"].get("weightless") or ()
+        _w: tuple[int, ...] = reply["facts"].get("weightless") or ()
         if len(_w) == 3 and _w[1]:
             self.note(
                 "boot",
