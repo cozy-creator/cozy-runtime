@@ -4113,10 +4113,34 @@ class Worker:
         # needs on the line that reports the time, not values that die in the reply.
         _stages: tuple[tuple[str, float], ...] = reply["facts"].get("stages") or ()
         if _stages:
+            # THE EXPENSIVE LEGS MUST SURVIVE THE TRUNCATION (cr-141). `note` caps a step
+            # at 256 characters, and the ledger is emitted in EXECUTION order -- which puts
+            # the cheap prologue first and cut the line off at `admission`, hiding
+            # `lease_acquire`, `construct_and_fill` and `execution_plan`. Measured on a
+            # rented L40, that was the last 4 s of a 7.5 s prepare: the four legs an
+            # operator most needs were exactly the four the cap ate. Zero-cost legs are
+            # dropped (a leg cr-104 moved off the lock reports 0 ms and says nothing here),
+            # and whatever still does not fit is summarised rather than silently lost.
+            legs = [(name, ms) for name, ms in _stages if ms >= 0.5]
+            head = f"{placement_id!r} prepare legs: "
+            shown: list[str] = []
+            budget = 256 - len(head) - 24
+            for name, ms in sorted(legs, key=lambda leg: -leg[1]):
+                text = f"{name} {ms:.0f}ms"
+                if budget - len(text) - 2 < 0:
+                    break
+                budget -= len(text) + 2
+                shown.append(text)
+            order = {name: index for index, (name, _) in enumerate(legs)}
+            hidden = len(legs) - len(shown)
+            # The hidden legs are all cheaper than the cheapest SHOWN one. That bound is
+            # what an operator can act on: it says what the omission is worth at most.
+            floor = min((ms for name, ms in legs if f"{name} {ms:.0f}ms" in shown), default=0.0)
             self.note(
                 "boot",
-                f"{placement_id!r} prepare legs: "
-                + ", ".join(f"{name} {ms:.0f}ms" for name, ms in _stages),
+                head
+                + ", ".join(sorted(shown, key=lambda text: order[text.rsplit(" ", 1)[0]]))
+                + (f" (+{hidden} under {floor:.0f}ms)" if hidden else ""),
             )
         _w: tuple[int, ...] = reply["facts"].get("substrate_census") or ()
         if len(_w) == 3 and _w[1]:
