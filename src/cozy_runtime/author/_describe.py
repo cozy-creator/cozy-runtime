@@ -21,7 +21,7 @@ from cozy_runtime.author._assets import asset_kinds
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, require_decoder_dependency
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
-from cozy_runtime.author._markers import AssetBound
+from cozy_runtime.author._markers import AssetBound, CheckpointConvention, _ModelDefaultMarker
 from cozy_runtime.author._model import EXCLUDED_KEYWORDS, Model
 from cozy_runtime.author._services import JOB_ONLY, SERVING_ONLY, UNGRANTABLE
 from cozy_runtime.author._signature import ModelBinding, Surface
@@ -52,6 +52,28 @@ def assert_declaration_shape(declaration: object) -> None:
                 )
             for kind in kinds:
                 bound.check_kind(kind)
+        convention = node.marker(CheckpointConvention)
+        if convention is not None:
+            # A convention on a field the WIRE CANNOT OMIT would be a silent overwrite of
+            # what the caller sent — there is no room for a checkpoint value under an
+            # always-present one — and a convention nested inside a sub-struct is not a
+            # request field resolution reaches. Both refuse at BUILD (cr-101).
+            if "." in node.path:
+                raise ConformanceError(
+                    f"{owner}.{node.path} carries CheckpointConvention below the top level; "
+                    "only a top-level request field is resolvable from a checkpoint",
+                    code="convention_target",
+                    fields=[node.path],
+                )
+            if node.marker(_ModelDefaultMarker) is None:
+                raise ConformanceError(
+                    f"{owner}.{node.path} carries CheckpointConvention"
+                    f"({convention.key!r}) without ModelDefault; a checkpoint fills a field "
+                    "the caller OMITTED, so a field the wire cannot omit has nothing for it "
+                    "to fill",
+                    code="convention_target",
+                    fields=[node.path],
+                )
 
 
 def _grantable(surface: Surface) -> None:

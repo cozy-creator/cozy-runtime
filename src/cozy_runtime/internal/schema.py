@@ -21,7 +21,11 @@ import msgspec
 
 from cozy_runtime.author._assets import Asset, AudioAsset, FileAsset, ImageAsset, Tree, VideoAsset
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import AssetBound, _ModelDefaultMarker
+from cozy_runtime.author._markers import (
+    AssetBound,
+    CheckpointConvention,
+    _ModelDefaultMarker,
+)
 from cozy_runtime.author._walker import is_struct, strip, unwrap_optional
 from cozy_runtime.internal.canonical import Json, write
 
@@ -239,6 +243,10 @@ def _field(field: msgspec.structs.FieldInfo, seen: frozenset[type]) -> Json:
     if constraints:
         doc["constraints"] = constraints
     for marker in markers:
+        if isinstance(marker, CheckpointConvention):
+            # Published so a caller can see, before sending anything, which fields a
+            # checkpoint is allowed to fill and under which header key (cr-101).
+            doc["checkpoint_convention"] = marker.key
         if isinstance(marker, AssetBound):
             bound: dict[str, Json] = {}
             if marker.max_bytes is not None:

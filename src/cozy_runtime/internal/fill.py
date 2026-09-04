@@ -433,6 +433,17 @@ class Checkpoint:
 
         self._aliases = aliases()
 
+    @property
+    def metadata(self) -> dict[str, str]:
+        """The header's advisory key/value rows (tfs-059).
+
+        Ordinary DATA: TensorFS checked their grammar and the values of the keys IT knows,
+        and nothing here interprets any of them. The one consumer today is the checkpoint
+        layer of `ModelDefault` resolution, which reads only the keys a package's fields
+        claimed by name.
+        """
+        return {str(k): str(v) for k, v in self.header.get("metadata", {}).items()}
+
     def has(self, component: str) -> bool:
         """Does the header carry this component? A constructed component it does not carry
         is the fit's `component_missing`, so nothing here refuses it first."""

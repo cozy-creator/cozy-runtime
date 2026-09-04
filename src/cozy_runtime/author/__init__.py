@@ -45,7 +45,13 @@ from cozy_runtime.author._decode import (
     MediaDecodeError,
     MediaDecoder,
 )
-from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, decode_request
+from cozy_runtime.author._defaults import (
+    Clamp,
+    Overlay,
+    Recipe,
+    checkpoint_recipe,
+    decode_request,
+)
 from cozy_runtime.author._demand import RequestFeatures
 from cozy_runtime.author._describe import assert_declaration_shape, describe
 from cozy_runtime.author._errors import (
@@ -90,6 +96,7 @@ from cozy_runtime.author._loader import (
 from cozy_runtime.author._markers import (
     AssetBound,
     Bound,
+    CheckpointConvention,
     ModelDefault,
     Preflight,
     Shape,
@@ -165,6 +172,7 @@ __all__ = [
     "Cancelled",
     "CapabilityError",
     "CheckpointConflict",
+    "CheckpointConvention",
     "CheckpointDeclaration",
     "CheckpointSave",
     "CheckpointSinkUnbuilt",
@@ -251,6 +259,7 @@ __all__ = [
     "assert_declaration_shape",
     "attempt",
     "canonical_json",
+    "checkpoint_recipe",
     "classify",
     "decode_request",
     "describe",

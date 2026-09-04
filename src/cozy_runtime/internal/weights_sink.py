@@ -145,6 +145,16 @@ class WeightsTransactionHost:
         self.bind_intent = bind_intent
         self.record_receipt = record_receipt
 
+    def _carried_metadata(self, sources: Mapping[str, tuple[str, int]]) -> dict[str, str]:
+        """The one source's header metadata, or nothing. Never a merge of several."""
+        if len(sources) != 1:
+            return {}
+        import tensorfs
+
+        ((manifest, _length),) = sources.values()
+        header = tensorfs.parse_header(bytes(self.store.manifest(manifest)["header"]))
+        return {str(k): str(v) for k, v in header.get("metadata", {}).items()}
+
     def open(self, request: WeightsCommit) -> WeightsHostTransaction:
         """Lock one tfs-019 declaration before exposing any source reader or writer."""
         maximum = self.output_bounds.get(request.output_slot)
@@ -163,6 +173,11 @@ class WeightsTransactionHost:
                 )
             sources[alias] = (manifest, length)
         transaction_id = self.transaction_id(request.output_slot)
+        # A derived artifact over ONE source is that checkpoint under a new construction, so
+        # its advisory rows (tfs-059 — prompt conventions today) carry with it. Over several
+        # sources there is no single answer and none is invented: silently keeping one
+        # parent's conventions would be worse than stating none.
+        metadata = self._carried_metadata(sources)
         targets = {name: self._target(target) for name, target in request.targets.items()}
         configs = {name: self._config(config) for name, config in request.configs.items()}
         expected_declaration = {
@@ -172,6 +187,7 @@ class WeightsTransactionHost:
             },
             "configs": configs,
             "max_new_bytes": request.max_new_bytes,
+            "metadata": metadata,
             "order": [list(row) for row in request.order],
             "sources": {
                 alias: {"manifest": {"sha256": manifest.removeprefix("sha256:"), "length": length}}
@@ -235,6 +251,7 @@ class WeightsTransactionHost:
                 sources,
                 targets,
                 configs,
+                metadata,
                 list(request.order),
                 request.max_new_bytes,
             )

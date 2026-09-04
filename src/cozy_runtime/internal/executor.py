@@ -45,6 +45,7 @@ from typing import Any
 
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._context import Device
+from cozy_runtime.author._defaults import Recipe, checkpoint_recipe
 from cozy_runtime.author._errors import CapabilityError, Outcome, classify
 from cozy_runtime.author._invoke import (
     Invocation,
@@ -369,6 +370,11 @@ class Executor:
         self.residency: Any = None
         self.model_executors: list[Executor] = []
         self.models: dict[str, Any] = {}
+        #: model PARAMETER name -> (checkpoint ref, the bound header's metadata rows). This
+        #: is what makes the `checkpoint` layer of ModelDefault resolution real (cr-101):
+        #: the facts travel with the weights, so they are read once, here, where the
+        #: checkpoint is actually bound, and never re-resolved per request.
+        self.checkpoint_conventions: dict[str, tuple[str, dict[str, str]]] = {}
         self.surface_names: dict[str, Any] = {}
         self.discovered: Any = None
         self.ready = False
@@ -1140,6 +1146,11 @@ class Executor:
         self.backend = backend
         self.registry = registry
         self.models = {binding["model_parameter_name"]: model}
+        conventions = config_checkpoint.metadata
+        if conventions:
+            self.checkpoint_conventions = {
+                str(binding["model_parameter_name"]): (str(reference.snapshot), conventions)
+            }
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY, installed on the constructed
         # generation. From here on, entering a declared scope admits and materializes its
         # set before the body runs; the package cannot observe that it happened.
@@ -1354,6 +1365,7 @@ class Executor:
                     "detail": f"prepared model object did not bind parameter {parameter!r}",
                 }
             self.models[parameter] = child.models[parameter]
+            self.checkpoint_conventions.update(child.checkpoint_conventions)
         residencies = {
             parameter: child.residency
             for parameter, child, _ in children
@@ -1522,6 +1534,29 @@ class Executor:
 
     # ------------------------------------------------------------------ invoke
 
+    def _checkpoint_recipes(self, entrypoint: str) -> list[Recipe]:
+        """The bound checkpoints' prompt conventions, as ModelDefault recipes (cr-101).
+
+        Built per request because the ENTRYPOINT decides which fields exist; the header
+        facts themselves were read once at bind. A convention for a model parameter this
+        entrypoint does not declare is not offered — a recipe naming an unknown binding
+        refuses, and a second entrypoint's slot is not this one's business.
+        """
+        surface = self.surface_names.get(entrypoint)
+        if surface is None or not self.checkpoint_conventions:
+            return []
+        params = set(surface.model_params)
+        recipes = []
+        for parameter, (ref, metadata) in sorted(self.checkpoint_conventions.items()):
+            if parameter not in params:
+                continue
+            recipe = checkpoint_recipe(
+                surface.payload_type, metadata, ref=ref, binding_path=parameter
+            )
+            if recipe is not None:
+                recipes.append(recipe)
+        return recipes
+
     def prepare_request(self, command: dict[str, Any]) -> dict[str, Any]:
         """Resolve ONE request through the kernel's pre-admission half, and retain it.
 
@@ -1551,7 +1586,11 @@ class Executor:
             }
         registration = self.discovered.app.get(command["entrypoint"])
         try:
-            prepared = prepare(registration, command["payload"])
+            prepared = prepare(
+                registration,
+                command["payload"],
+                recipes=self._checkpoint_recipes(command["entrypoint"]),
+            )
         except Exception as exc:
             outcome = classify(exc)
             return {
@@ -1571,7 +1610,12 @@ class Executor:
             "ok": True,
             "features": dict(prepared.features.values),
             "adjustments": [
-                {"field": row.field, "requested": str(row.requested), "applied": str(row.applied)}
+                {
+                    "field": row.field,
+                    "requested": str(row.requested),
+                    "applied": str(row.applied),
+                    "source": row.source,
+                }
                 for row in prepared.overlay.rows
             ],
             **prepared.digests(),
@@ -1726,7 +1770,10 @@ class Executor:
                     "field": row.field,
                     "requested": str(row.requested),
                     "applied": str(row.applied),
-                    "reason": f"{row.kind}: {row.reason}"[:256],
+                    # PROVENANCE, not decoration: a caller who sees a negative prompt
+                    # they never sent has to be able to find out that a checkpoint
+                    # supplied it, and which one (cr-101).
+                    "reason": f"{row.kind}: {row.reason} [{row.source}]"[:256],
                 }
                 for row in (envelope.adjustments if envelope else ())
             ],

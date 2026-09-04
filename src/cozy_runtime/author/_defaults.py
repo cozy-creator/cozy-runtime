@@ -24,7 +24,7 @@ import msgspec
 
 from cozy_runtime.author._assets import asset_dec_hook
 from cozy_runtime.author._errors import DefaultResolutionError, InvalidRequest
-from cozy_runtime.author._markers import _ModelDefaultMarker
+from cozy_runtime.author._markers import CheckpointConvention, _ModelDefaultMarker
 from cozy_runtime.author._services import AdjustmentRow
 from cozy_runtime.author._walker import MISSING, Node, walk
 
@@ -72,6 +72,47 @@ def marked_fields(payload_type: object) -> dict[str, Node]:
         for node in walk(payload_type)
         if "." not in node.path and node.marker(_ModelDefaultMarker) is not None
     }
+
+
+def convention_fields(payload_type: object) -> dict[str, str]:
+    """Marked fields that name a header metadata key -> that key (cr-101).
+
+    Only a `ModelDefault` field can carry a convention: a field the wire cannot omit has
+    nothing for a checkpoint to fill, so binding one would be a silent overwrite of what
+    the caller sent. `describe` proves that at declaration time.
+    """
+    out: dict[str, str] = {}
+    for name, node in marked_fields(payload_type).items():
+        convention = node.marker(CheckpointConvention)
+        if convention is not None:
+            out[name] = convention.key
+    return out
+
+
+def checkpoint_recipe(
+    payload_type: object,
+    metadata: Mapping[str, str],
+    *,
+    ref: str,
+    binding_path: str | None = None,
+) -> Recipe | None:
+    """One `Recipe` from a cozytensors header's metadata rows, or None if it says nothing.
+
+    A header key that no field claims is IGNORED, not refused — that is the whole forward
+    compatibility rule: a checkpoint published against a newer key set still serves on a
+    runtime that predates it, minus the convention it cannot spell. The reverse (a field
+    whose key the header omits) is the ordinary code fallback.
+    """
+    values = {
+        field: metadata[key]
+        for field, key in convention_fields(payload_type).items()
+        if key in metadata
+    }
+    if not values:
+        return None
+    return Recipe(
+        source=f"checkpoint:{ref}", layer="checkpoint", values=values, binding_path=binding_path
+    )
 
 
 def _convert(value: object, node: Node, where: str) -> object:

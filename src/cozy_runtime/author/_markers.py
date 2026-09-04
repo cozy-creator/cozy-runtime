@@ -54,6 +54,44 @@ Preflight: TypeAlias = Annotated[T, PREFLIGHT]
 
 
 @dataclass(frozen=True, slots=True)
+class CheckpointConvention:
+    """Binds ONE `ModelDefault` field to one cozytensors header metadata key (cr-101).
+
+    A prompt convention is a property of what the CHECKPOINT was trained on — Pony-lineage
+    weights want `score_9, score_8_up` and reject `score_1..3`, Illustrious/NoobAI want
+    `masterpiece, best quality` and treat `score_*` as noise — so it travels in the header
+    beside the bytes, not in whatever package happens to serve them. The package still owns
+    the FIELD: its name, its type, its bounds, and its code fallback. This annotation only
+    says which header key fills it when the caller omits it:
+
+        negative_prompt: Annotated[
+            ModelDefault[str], CheckpointConvention("prompt.negative_default")
+        ] = ""
+
+    The value then rides the ordinary ModelDefault overlay, so precedence is the one rule
+    the platform already has — explicit request, then adapter recipe, then checkpoint, then
+    the package's code fallback — and the resolved value reaches the caller as an
+    `adjusted` row naming `checkpoint:<ref>`. A header key no field claims is ignored, which
+    is what lets a new key ship without breaking a runtime that predates it.
+    """
+
+    key: str
+
+    def __post_init__(self) -> None:
+        if not self.key or len(self.key) > 128:
+            raise ConformanceError(
+                f"CheckpointConvention key {self.key!r} is out of bounds",
+                code="convention_key",
+            )
+        if not all(c.isalnum() or c in "_-./" for c in self.key):
+            raise ConformanceError(
+                f"CheckpointConvention key {self.key!r} leaves the header's name grammar — "
+                "the header's keys are [A-Za-z0-9_./-]",
+                code="convention_key",
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class Shape[K]:
     """Author-only knowledge: a preset value's mapping to demand axes.
 
