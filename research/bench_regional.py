@@ -28,6 +28,7 @@ def main() -> None:
     ap.add_argument("--reps", type=int, default=15)
     ap.add_argument("--inner", type=int, default=2)
     ap.add_argument("--whole", action="store_true", help="also compile the whole model")
+    ap.add_argument("--plan", choices=["raw", "op"], default=None)
     args = ap.parse_args()
 
     print(ab.device_note())
@@ -35,6 +36,9 @@ def main() -> None:
     print(f"anima CosmosTransformer3DModel, num_layers={args.layers}, {tokens} tokens, bf16, warm")
 
     model = anima_model.build(num_layers=args.layers)
+    if args.plan:
+        anima_model.apply_fused_plan(model, via=args.plan, strict=args.layers == 28)
+        print(f"  shipping fused Anima plan installed, kernel reached via {args.plan!r}")
     kwargs = anima_model.inputs(latent_hw=args.latent_hw)
 
     def call() -> None:

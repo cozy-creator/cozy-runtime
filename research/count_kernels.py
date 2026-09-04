@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from bench_model import Arms
 
 
-def measure(arms: Arms, name: str) -> tuple[int, float, Counter[str]]:
+def measure(arms: Arms, name: str) -> tuple[int, float, Counter[str], dict[str, float]]:
     arms.install(name)
     for _ in range(3):
         arms.call()
@@ -29,13 +29,15 @@ def measure(arms: Arms, name: str) -> tuple[int, float, Counter[str]]:
     launches = 0
     total_us = 0.0
     names: Counter[str] = Counter()
+    micros: dict[str, float] = {}
     for event in prof.events():
         if event.device_type != torch.autograd.DeviceType.CUDA:
             continue
         launches += int(event.count)
         total_us += float(event.self_device_time_total)
         names[event.key] += int(event.count)
-    return launches, total_us / 1000.0, names
+        micros[event.key] = micros.get(event.key, 0.0) + float(event.self_device_time_total)
+    return launches, total_us / 1000.0, names, micros
 
 
 def main() -> None:
@@ -50,7 +52,7 @@ def main() -> None:
     print(f"num_layers={args.layers}, latent {args.latent_hw}^2, bf16")
     base: tuple[int, float] | None = None
     for name in args.arms:
-        launches, ms, names = measure(arms, name)
+        launches, ms, names, micros = measure(arms, name)
         if base is None:
             base = (launches, ms)
             print(f"  {name:22s} {launches:5d} kernels   {ms:8.3f} ms device")
@@ -60,8 +62,10 @@ def main() -> None:
                 f"{ms:8.3f} ms device (x{base[1] / ms:.3f})"
             )
         if args.top:
-            for key, count in names.most_common(args.top):
-                print(f"        {count:4d}  {key[:90]}")
+            ranked = sorted(micros.items(), key=lambda kv: -kv[1])[: args.top]
+            for key, us in ranked:
+                share = 100.0 * us / max(ms * 1000.0, 1e-9)
+                print(f"        {us / 1000.0:8.2f} ms {share:5.1f}%  x{names[key]:<4d} {key[:78]}")
 
 
 if __name__ == "__main__":

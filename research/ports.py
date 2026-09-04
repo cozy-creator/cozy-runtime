@@ -156,6 +156,12 @@ class _BatchedAdaLn:
     `linear_1` into one (L*3*R, C) matrix and `linear_2` into one batched (L*3, 3C, R)
     turns 3*L*2 = 168 launch-bound batch-1 GEMMs into 2 launches. Inductor did NOT do this
     (it kept one extern mm per norm); the capture is what made the shape obvious.
+
+    COST, stated: the stacked copies DUPLICATE those weights in VRAM — ~350 MiB on the real
+    28-block model (88 MiB of `linear_1` plus 264 MiB of `linear_2`), about 9% on top of a
+    3.9 GiB transformer. That is the price of measuring it as a post-fill patch. It is not
+    the price of shipping it: the runtime owns the byte plane, so the fill could place these
+    rows stacked in the first place and the duplicate disappears.
     """
 
     def __init__(self, model: Any) -> None:

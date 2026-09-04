@@ -30,9 +30,15 @@ def interleaved(
     reps: int = 21,
     inner: int = 3,
     warmup: int = 5,
+    epoch: int = 1,
 ) -> dict[str, dict[str, float]]:
     """Each arm is (name, fn) or (name, fn, setup). `setup` runs OUTSIDE the timed region,
-    so arms that share one module tree can swap their plan in without paying for it."""
+    so arms that share one module tree can swap their plan in without paying for it.
+
+    `epoch` takes that many consecutive samples per visit. Raise it only when the setup is
+    expensive enough to distort the run (relaying out 5 GiB of SDXL conv weights, say):
+    it trades interleaving granularity for setup cost, and drift cancels across visits
+    rather than across single samples."""
     normalized = [(a[0], a[1], a[2] if len(a) > 2 else None) for a in arms]
     for _, fn, setup in normalized:
         if setup is not None:
@@ -49,7 +55,8 @@ def interleaved(
                 setup()
                 fn()
                 torch.cuda.synchronize()
-            samples[name].append(_time_once(fn, inner))
+            for _ in range(epoch):
+                samples[name].append(_time_once(fn, inner))
 
     out: dict[str, dict[str, float]] = {}
     for name, values in samples.items():

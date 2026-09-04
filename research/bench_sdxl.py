@@ -94,6 +94,7 @@ def main() -> None:
     ap.add_argument("--latent-hw", type=int, default=128)
     ap.add_argument("--reps", type=int, default=15)
     ap.add_argument("--inner", type=int, default=2)
+    ap.add_argument("--epoch", type=int, default=1)
     ap.add_argument("--compile", action="store_true")
     args = ap.parse_args()
 
@@ -101,6 +102,7 @@ def main() -> None:
     print(f"SDXL UNet2DConditionModel, fp16, batch {args.batch}, latent {args.latent_hw}^2, warm")
 
     model = sdxl_model.build()
+    torch.cuda.empty_cache()
     kwargs = sdxl_model.inputs(latent_hw=args.latent_hw, batch=args.batch)
     from diffusers.models.attention_processor import Attention
 
@@ -158,7 +160,7 @@ def main() -> None:
         arms.append(("compiled (nhwc)", ccall, None))
 
     torch.cuda.empty_cache()
-    results = ab.interleaved(arms, reps=args.reps, inner=args.inner)
+    results = ab.interleaved(arms, reps=args.reps, inner=args.inner, epoch=args.epoch)
     ab.report(f"SDXL UNet forward (batch {args.batch}, {args.latent_hw}^2 latent)", results, "nchw")
     print(f"  peak CUDA memory {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
