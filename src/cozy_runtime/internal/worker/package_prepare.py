@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -1377,10 +1378,29 @@ def _stage(root: Path, raw: bytes) -> tuple[str, int]:
     and does `Path(interface_path).read_bytes()` -- so a root-owned 0400 file is a second
     refusal waiting one layer further in."""
 
+    # THE MODE IS SET, NOT REQUESTED. `mkdir(mode=)` and `os.open(mode=)` are both masked
+    # by the process umask, so the modes this function asks for are the modes it gets only
+    # under umask 0022. Measured against this exact code shape: 0022 -> 755/444,
+    # 0027 -> 750/440, 0077 -> 700/400. A root-owned 0400 document is precisely what this
+    # module's own negative control proves the executor cannot read, and the executor reads
+    # this path as its own uid.
+    #
+    # It is also PERMANENT on the pod that hits it: `exist_ok=True` never re-applies a
+    # directory mode, and the write below short-circuits on `target.exists()`, so no retry
+    # can repair either. A fresh pod with a different umask works and the same pod never
+    # does — the shape that makes a fault look deterministic and hides its cause.
+    #
+    # `acquire._stage`, the sibling this docstring says it matches, has always chmod'd
+    # explicitly. This half only asked.
     root.mkdir(parents=True, exist_ok=True, mode=0o755)
+    root.chmod(0o755)
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     target = root / digest.removeprefix("sha256:")
     if target.exists():
+        # A document left by a prior preparation under a stricter umask is unreadable to
+        # the executor that will be handed its path, and re-reading it here proves nothing
+        # about that. Re-assert the mode on the path we are about to publish.
+        _readable(target, 0o444)
         if _read_file(target, max(len(raw), 1)) != raw:
             raise PreparationRefusal("package_prepare_cache_conflict", digest)
         return digest, len(raw)
@@ -1391,10 +1411,25 @@ def _stage(root: Path, raw: bytes) -> tuple[str, int]:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
+        # Before the link, so the document is never visible under a masked mode.
+        _readable(temporary, 0o444)
         os.link(temporary, target)
     except FileExistsError:
+        _readable(target, 0o444)
         if _read_file(target, max(len(raw), 1)) != raw:
             raise PreparationRefusal("package_prepare_cache_conflict", digest) from None
     finally:
         temporary.unlink(missing_ok=True)
     return digest, len(raw)
+
+
+def _readable(path: Path, mode: int) -> None:
+    """Set an exact mode, tolerating a path this process does not own.
+
+    The mode is the point: every caller here publishes a path that a DIFFERENT uid will
+    open. A chmod that fails because another uid already owns the file is not a reason to
+    refuse a preparation — the file may well already carry the right mode — so the failure
+    is left to the read that actually needs it, which reports what it could not open.
+    """
+    with contextlib.suppress(OSError):
+        path.chmod(mode)
