@@ -1,49 +1,49 @@
-"""The runtime↔tensorfs seam has no compiler; this is what stands in for one (xs-024 §0).
+"""The runtime↔tensorfs seam, and the two things its compiler cannot say about itself.
 
-`tensorfs` is a compiled PyO3 extension in a SEPARATE REPOSITORY, resolved by version range
-(`tensorfs>=0.3.1,<1`). Nothing in either tree checks that a call site still matches the
-binding it calls:
+`tensorfs` is a compiled PyO3 extension in a SEPARATE REPOSITORY, resolved by version range.
+Until tfs-077 nothing in either tree checked that a call site still matched the binding it
+called: tensorfs shipped `py.typed` over an `_ext.pyi` whose operative content was
+`__getattr__ -> Any`, so every method on that page type-checked as `Any` under
+`strict = true`, and `fill.tensorfs_module() -> Any` erased what little was left.
+`Store.prepare_model_source` was called with six arguments against a five-parameter binding
+and shipped (cozy-runtime#296); it refused every model-source preparation on a rented pod.
 
-- **mypy cannot.** tensorfs ships `py.typed`, but `_ext.pyi` is 41 lines whose operative
-  content is `Store.__getattr__(self, name) -> Any` and a module-level `__getattr__ -> Any`.
-  Every method on this page type-checks as `Any` under `strict = true`. The runtime's own
-  `fill.tensorfs_module() -> Any` erases what little is left.
-- **The wheel is a binary.** A parameter deleted in Rust changes no Python source here, so
-  no review, diff or lint sees it.
+THIS FILE USED TO BE THE COMPILER. It carried a hand-transcribed table of 34 frozen
+signatures — the subset someone remembered — and compared them against `inspect.signature`
+on every run. That table is GONE, and so is the arm that policed its coverage. tensorfs now
+ships a complete `_ext.pyi` with no escape hatch, held against the built extension by
+`tensorfs/scripts/stub_conform.py` for all ~110 exports rather than 34, in the repository
+where the change is made rather than in the consumer a wheel bump later. Two mechanisms for
+one job is a liability; the stub wins and the table goes.
 
-That gap was not hypothetical. tensorfs `03c9713` (#64, 2026-09-02) deleted `source_uri` and
-`declared_license` from `Store.prepare_model_source`; `worker/model_source_prepare.py` kept
-passing them for two days, so every foreign-source preparation on a pod raised `TypeError`
-before tensorfs was entered. Nothing went red, because nothing tested that file.
+What the stub cannot do is vouch for itself, and that is what is left here:
 
-Two arms, and the second is the one that would have caught it:
+1. **THAT THE STUB IS REAL.** mypy reports success just as cheerfully over an `Any` as over
+   a checked call. If a resolved wheel predates tfs-077, or a `__getattr__` comes back, the
+   whole strict-mode run silently stops checking this seam and stays green — the exact
+   failure mode that cost two pods. That is invisible to mypy and visible here.
 
-1. **The frozen table.** Every tensorfs entry point cozy-runtime calls, with the exact
-   signature it was written against. A rename, an added parameter, a reordering or a
-   removal on the Rust side turns this red on the next `uv sync`.
-2. **The real call.** `prepare_model_source`/`release_model_source` driven through the real
-   runtime function against a real `Store` on disk. Arity is proved by binding, not by
-   reading — the strongest form available without a compiler.
+2. **THAT THE CHECK CAN FAIL.** A check that cannot fail is indistinguishable from no
+   check, so the six-argument call that shipped is put back through mypy on every run and
+   required to be REJECTED.
 
-WHAT THIS CANNOT COVER, stated so nobody mistakes the coverage for more than it is:
+3. **THAT THE ARGUMENTS MEAN WHAT THEY SAY.** `_ext.pyi` asserts `files` is
+   `Sequence[tuple[str, str, int, StrPath]]`; nothing compares that to Rust, because pyo3
+   erases types into `PyObject` and `__text_signature__` carries no annotation. The
+   integration arms below drive the real runtime function against a real `Store` on disk,
+   where a refusal proves the arguments BOUND — the strongest form available.
 
-- **Types and semantics.** `inspect.signature` sees names and defaults, never that
-  `files` wants `list[tuple[str, str, int, str]]` or that a `str` now means a path. A Rust
-  parameter that keeps its name and changes its meaning passes this test.
-- **The other two mechanisms.** cozy-runtime also reaches tensorfs through the `tfs` CLI's
-  TEXT stdout (pod-supervisor, the daemon, the hub) and through vendored artifacts. Neither
-  is a Python signature and neither is checked here (xs-024 §1B, §1C).
-- **Anything the runtime does not call.** ~110 exports, ~34 exercised. A change to the
-  other two thirds is invisible here, correctly.
-- **The version actually installed on a pod.** This checks the wheel in THIS environment.
-  Worker images pin their own, and the startup handshake that would close that is xs-024 §1.
+STILL NOT COVERED, stated so the coverage is not mistaken for more than it is: the `tfs`
+CLI's TEXT stdout and vendored artifacts are also crossings and neither is a Python
+signature (xs-024 §1B, §1C); and this checks the wheel in THIS environment, while worker
+images pin their own (xs-024 §1).
 """
 
 from __future__ import annotations
 
 import ast
 import hashlib
-import inspect
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -52,174 +52,142 @@ import tensorfs
 from cozy_runtime.internal.worker import model_source_prepare
 from cozy_runtime.protocol import worker_pb2 as pb
 
-SRC = Path(__file__).resolve().parent.parent / "src" / "cozy_runtime"
-
-#: Every callable tensorfs entry point cozy-runtime calls, against the signature it was
-#: written for. Transcribed from the installed extension, not from the Rust source: the
-#: wheel is what a pod runs. A diff here is a seam change and wants a human, not a re-freeze.
-CALLED: dict[str, str] = {
-    "fit": (
-        "(requirements: 'Sequence[TensorRequirement]', header: 'bytes', *, custody: 'str', "
-        "encoded_leaves: 'bool', device: 'str | None' = None, "
-        "observations: 'bytes | None' = None) -> 'dict[str, object]'"
-    ),
-    "plan": "(header, traversal, components=None, window=Ellipsis)",
-    "parse_header": "(data: 'bytes', closure: 'Closure | None' = None) -> 'Header'",
-    "parse_manifest": "(data)",
-    "seed_digests": "()",
-    "TensorRequirement": (
-        "(component: 'str', key: 'str', shape: 'Sequence[int]', "
-        "logical_dtype: 'str | None' = None) -> None"
-    ),
-    "Store.open": "(root=None)",
-    "Store.ensure": "(root=None)",
-    "Store.prepare_readers": "(self, /)",
-    "Store.manifest": "(self, /, hex)",
-    "Store.put_file": "(self, /, path, expect=None, expect_length=None)",
-    "Store.put_manifest": "(self, /, data, expect=None, expect_length=None)",
-    "Store.acquire": "(self, /, manifest, objects)",
-    "Store.acquire_cozytensors": "(self, /, hex)",
-    "Store.walk": "(self, /, hex)",
-    "Store.walk_cozytensors": "(self, /, hex)",
-    "Store.resolve_release": "(self, /, org, name, version, lane)",
-    "Store.complete_cozytensors_manifests": "(self, /)",
-    "Store.begin_derived": (
-        "(self, /, transaction_id, writer_session_id, sources, targets, configs, order, "
-        "max_new_bytes)"
-    ),
-    "Store.derived_lookup": "(self, /, transaction_id)",
-    "Store.derived_fence": "(self, /, transaction_id, writer_session_id)",
-    "Store.derived_abandon": "(self, /, transaction_id)",
-    "Store.derived_dispose": "(self, /, transaction_id)",
-    # THE ONE THAT BROKE. Four arguments. `repo_cache` exists on tensorfs master as a
-    # keyword-only mount point; the Store↔cache binding lane deletes it, and no caller here
-    # threads a path (xs-024 §5). A wheel bump past tensorfs#98 therefore turns THIS entry
-    # red before that lane lands — which is the guard working. Re-freeze only after
-    # confirming the four positional arguments still bind, and never by adding a fifth.
-    "Store.prepare_model_source": (
-        "(self, /, operation_id, source_selection_digest, profiles, files)"
-    ),
-    "Store.release_model_source": "(self, /, operation_id)",
-    "ReadLease.stream": "(self, /, plan, slots, on_batch, readers=4)",
-    "ReadLease.read_into": "(self, /, object, object_length, off, length, into)",
-    "ReadLease.read_asset": "(self, /, header, name, max_bytes=67108864)",
-    "ReadLease.release": "(self, /)",
-    "DerivedWriter.add_part": "(self, /, component, key, role, reader)",
-    "DerivedWriter.add_config": "(self, /, name, reader)",
-    "DerivedWriter.commit": "(self, /)",
-    "DerivedWriter.fence": "(self, /)",
-    "DerivedWriter.source_read_into": "(self, /, source, component, key, role, off, into)",
-    "Batch.release": "(self, /)",
-    "Batch.items": "(self, /)",
-    "ReadPlan.items": "(self, /)",
-}
-
-#: Non-callable crossings: read, never called, so they carry no signature to freeze. Their
-#: DISAPPEARANCE is still a break, which is all this set asserts.
-READ: frozenset[str] = frozenset(
-    {
-        "DTYPES",
-        "errors.Refusal",
-        "ReadLease.live",
-        "Batch.slot",
-        "Batch.nbytes",
-        "ReadPlan.order",
-        "ReadPlan.bytes",
-    }
-)
-
-#: Module attributes reached by name that are not themselves called or read as values —
-#: the types cozy-runtime names to get at the members above.
-NAMED: frozenset[str] = frozenset({"Store", "ReadLease", "errors"})
+#: The one binding this seam has broken on, twice. Four parameters after `self`.
+SEAM = "prepare_model_source"
 
 
-def _resolve(dotted: str) -> object:
-    value: object = tensorfs
-    for part in dotted.split("."):
-        value = getattr(value, part)
-    return value
+def _stub() -> tuple[Path, str]:
+    """The `.pyi` that SHIPS BESIDE the installed extension — the one mypy actually reads."""
 
-
-def _signature(dotted: str) -> str:
-    return str(inspect.signature(_resolve(dotted)))  # type: ignore[arg-type]
-
-
-def test_every_entry_point_cozy_runtime_calls_still_exists() -> None:
-    """A DELETED binding is the loudest form of this break, so it gets its own arm."""
-
-    missing = [name for name in sorted(CALLED | {n: "" for n in READ}) if not _exists(name)]
-    assert not missing, (
-        f"tensorfs {tensorfs.__version__} no longer exposes {missing}; cozy-runtime calls "
-        "them. Repair the call sites, do not delete the entries."
+    path = Path(tensorfs._ext.__file__).with_name("_ext.pyi")
+    assert path.exists(), (
+        f"tensorfs {tensorfs.__version__} ships `py.typed` and no `_ext.pyi` at {path}: it "
+        "promises every consumer a checked seam and delivers an unchecked one"
     )
+    return path, path.read_text()
 
 
-def _exists(dotted: str) -> bool:
-    try:
-        _resolve(dotted)
-    except AttributeError:
-        return False
-    return True
+def test_the_installed_tensorfs_ships_a_stub_that_can_actually_refuse() -> None:
+    """The guard that keeps mypy from being vacuous, which mypy cannot be.
 
-
-def test_every_entry_point_cozy_runtime_calls_keeps_its_frozen_signature() -> None:
-    """The arm that would have gone red on 2026-09-02 instead of on a rented pod."""
-
-    drifted = {
-        name: (frozen, _signature(name))
-        for name, frozen in sorted(CALLED.items())
-        if _signature(name) != frozen
-    }
-    assert not drifted, (
-        f"tensorfs {tensorfs.__version__} changed a binding cozy-runtime calls:\n"
-        + "\n".join(
-            f"  {name}\n    written against: {was}\n    installed:       {now}"
-            for name, (was, now) in drifted.items()
-        )
-        + "\nFix the call site FIRST; re-freeze only once the caller agrees."
-    )
-
-
-def test_the_signature_check_would_notice_a_deleted_parameter() -> None:
-    """The guard's own red arm: prove the comparison detects the exact break it exists for."""
-
-    installed = _signature("Store.prepare_model_source")
-    six = installed.replace(", files)", ", files, source_uri, declared_license)")
-    assert six != installed
-    assert CALLED["Store.prepare_model_source"] == installed
-
-
-def test_the_frozen_table_names_every_tensorfs_attribute_the_source_reaches() -> None:
-    """Keeps the table honest as call sites are ADDED, which is how a table normally rots.
-
-    Module-level only. A method on a `Store` held in a local variable cannot be resolved
-    statically without types, and tensorfs's stub supplies none — so `Store.*`, `ReadLease.*`
-    and `DerivedWriter.*` above are maintained by hand and are the guard's soft edge.
+    `py.typed` is a FACT this package asserts about itself, and for two months it was false.
+    A green strict-mode run over `__getattr__ -> Any` looks exactly like a green strict-mode
+    run over a checked call, so nothing downstream could tell the difference — and a version
+    range that resolves to a pre-tfs-077 wheel puts it back without a line changing here.
     """
 
-    covered = {name.split(".")[0] for name in CALLED} | {n.split(".")[0] for n in READ} | NAMED
-    reached: dict[str, str] = {}
-    for path in sorted(SRC.rglob("*.py")):
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "tensorfs":
-                for alias in node.names:
-                    reached.setdefault(alias.name, f"{path.name}:{node.lineno}")
-            elif isinstance(node, ast.Attribute) and _names_the_module(node.value):
-                reached.setdefault(node.attr, f"{path.name}:{node.lineno}")
-    uncovered = {name: where for name, where in sorted(reached.items()) if name not in covered}
-    assert not uncovered, (
-        f"these tensorfs attributes are reached by cozy-runtime but are not in this "
-        f"module's frozen table, so a Rust-side change to them is unguarded: {uncovered}"
+    path, source = _stub()
+    assert (path.parent / "py.typed").exists(), "tensorfs stopped shipping `py.typed`"
+
+    tree = ast.parse(source)
+    hatches = [
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "__getattr__"
+    ]
+    assert not hatches, (
+        f"tensorfs {tensorfs.__version__}'s `_ext.pyi` has a `__getattr__` again. Every "
+        "attribute it covers types as `Any`, mypy stops checking this seam, and every run in "
+        "this repository goes green over it. That is how cozy-runtime#296 shipped."
+    )
+
+    store = next(
+        (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "Store"), None
+    )
+    assert store is not None, "`_ext.pyi` no longer declares Store"
+    seam = next((n for n in store.body if isinstance(n, ast.FunctionDef) and n.name == SEAM), None)
+    assert seam is not None, (
+        f"`_ext.pyi` declares Store without `{SEAM}`. The stub is the seam's compiler, and "
+        "an undeclared method is an attribute error mypy will not find."
+    )
+    names = [a.arg for a in seam.args.posonlyargs + seam.args.args]
+    assert names == ["self", "operation_id", "source_selection_digest", "profiles", "files"], (
+        f"`Store.{SEAM}` in the installed stub takes {names}. tensorfs CI holds the stub "
+        "against the built extension, so this is a real seam change: repair the call sites "
+        "in this repository, then follow the new signature here."
     )
 
 
-def _names_the_module(node: ast.expr) -> bool:
-    """`tensorfs.X` — whether the module came from `import tensorfs` or `tensorfs_module()`."""
+def _mypy(tmp_path: Path, name: str, body: str) -> tuple[str, int]:
+    """One snippet through THIS repository's own mypy configuration, as CI runs it."""
 
-    if isinstance(node, ast.Name):
-        return node.id == "tensorfs"
-    return isinstance(node, ast.Attribute) and node.attr == "tensorfs"
+    from mypy import api
+
+    module = tmp_path / f"{name}.py"
+    module.write_text(textwrap.dedent(body).lstrip())
+    out, _err, status = api.run(["--no-incremental", str(module)])
+    return out, status
+
+
+def test_mypy_rejects_the_six_argument_call_that_shipped(tmp_path: Path) -> None:
+    """The check's own red arm. A check that cannot fail is indistinguishable from no check.
+
+    This is cozy-runtime#296 put back: `prepare_model_source` called with `source_uri` and
+    `declared_license` after tensorfs `03c9713` deleted them. It passed mypy for two days and
+    then refused every foreign-source preparation on a rented pod. It must not pass now.
+
+    The four-argument arm runs beside it, because a checker that rejects everything proves
+    nothing either.
+    """
+
+    good, good_status = _mypy(
+        tmp_path,
+        "binds",
+        """
+        import tensorfs
+
+        def call(store: tensorfs.Store) -> None:
+            store.prepare_model_source("op", "sha256:00", [], [])
+        """,
+    )
+    assert good_status == 0, f"the call the binding DOES take was rejected:\n{good}"
+
+    bad, bad_status = _mypy(
+        tmp_path,
+        "over_call",
+        """
+        import tensorfs
+
+        def call(store: tensorfs.Store) -> None:
+            store.prepare_model_source("op", "sha256:00", [], [], "uri", "license")
+        """,
+    )
+    assert bad_status != 0, (
+        "mypy ACCEPTED a six-argument call to a four-parameter binding. The seam is typing "
+        f"as `Any` again — tensorfs {tensorfs.__version__}'s stub, this repository's mypy "
+        "configuration, or `fill.TensorfsFacade`. This is exactly the state in which "
+        "cozy-runtime#296 shipped."
+    )
+    assert "prepare_model_source" in bad, bad
+
+
+def test_mypy_rejects_a_call_through_the_facade_accessor(tmp_path: Path) -> None:
+    """The seam is reached through `fill.tensorfs_module()` at nineteen sites, not by import.
+
+    That accessor returned `Any` until tfs-077, so typing the stub alone would have fixed
+    nothing at any of them. `fill.TensorfsFacade` is what carries the types across, and mypy
+    checks the real module against it at the one `return` — so this arm covers the accessor
+    and the protocol together.
+    """
+
+    out, status = _mypy(
+        tmp_path,
+        "through_fill",
+        """
+        from pathlib import Path
+
+        from cozy_runtime.internal import fill
+
+        def call(root: Path) -> None:
+            store = fill.open_store(fill.tensorfs_module(), root)
+            store.prepare_model_source("op", "sha256:00", [], [], "uri", "license")
+        """,
+    )
+    assert status != 0, (
+        "`fill.tensorfs_module()` is erasing the seam to `Any` again; every call site that "
+        f"goes through it is unchecked. mypy said:\n{out}"
+    )
+    assert "prepare_model_source" in out, out
 
 
 def _request(tmp_path: Path, *, operation_id: str) -> pb.PrepareModelSourceRequest:

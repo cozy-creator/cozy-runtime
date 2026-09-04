@@ -61,7 +61,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, canonical_dtype, census
 from cozy_runtime.internal import accel
@@ -79,6 +79,12 @@ from cozy_runtime.internal.encoding import (
 )
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
 from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan, TensorResolution
+
+if TYPE_CHECKING:
+    # tfs-007's facade is an OPTIONAL compiled dependency; the base package stays
+    # installable without it. The import is deferred at runtime and named here so the
+    # seam has real types rather than `Any` (tfs-077).
+    import tensorfs
 
 # ------------------------------------------------------------------------- refusals
 
@@ -277,7 +283,57 @@ def complete_device_envelope(
 # ------------------------------------------------------------------- the TensorFS reader
 
 
-def tensorfs_module() -> Any:
+class _TensorfsErrors(Protocol):
+    """`tensorfs.errors`, as far as this plane reaches into it."""
+
+    Refusal: type[tensorfs.errors.Refusal]
+
+
+class TensorfsFacade(Protocol):
+    """Every tfs-007 name this plane reaches for, at the type the facade declares for it.
+
+    `tensorfs_module()` used to return `Any`, so `Store.prepare_model_source` could be — and
+    was — called with six arguments against a five-parameter binding under `strict = true`
+    and shipped (cozy-runtime#296, tfs-077). The import is deferred, so the module cannot be
+    named as a return type; this protocol is how the deferral keeps its types.
+
+    THIS PROTOCOL CANNOT DRIFT SILENTLY. `tensorfs_module` returns the module itself, and
+    mypy checks the module against every member below on the way out: a name tensorfs
+    renames, a parameter it adds, a return type it changes is a type error HERE, at the one
+    line where the two packages meet, rather than an `Any` at nineteen call sites. Adding a
+    member is how a new crossing is opened, and the member is checked the moment it exists.
+    """
+
+    Store: type[tensorfs.Store]
+    TensorRequirement: type[tensorfs.TensorRequirement]
+    DTYPES: dict[str, int]
+    errors: _TensorfsErrors
+
+    def parse_header(
+        self, data: bytes, closure: tensorfs.Closure | None = None
+    ) -> tensorfs.Header: ...
+    def parse_manifest(self, data: bytes) -> Any: ...
+    def seed_digests(self) -> list[tuple[str, str]]: ...
+    def plan(
+        self,
+        header: bytes,
+        traversal: Sequence[tuple[str, str]],
+        components: Sequence[str] | None = None,
+        window: int = ...,
+    ) -> tensorfs.ReadPlan: ...
+    def fit(
+        self,
+        requirements: Sequence[tensorfs.TensorRequirement],
+        header: bytes,
+        *,
+        custody: str,
+        encoded_leaves: bool,
+        device: str | None = None,
+        observations: bytes | None = None,
+    ) -> dict[str, object]: ...
+
+
+def tensorfs_module() -> TensorfsFacade:
     """The tfs-007 facade, or a typed refusal naming what is missing.
 
     TensorFS is a compiled extension and the base runtime package stays installable without
@@ -296,11 +352,11 @@ def tensorfs_module() -> Any:
     return tensorfs
 
 
-def open_store(tensorfs: Any, root: Path) -> Any:
+def open_store(facade: TensorfsFacade, root: Path) -> tensorfs.Store:
     """Open one caller-prepared TensorFS Store without resolving or mutating its layout."""
 
     try:
-        return tensorfs.Store.open(str(root))
+        return facade.Store.open(str(root))
     except Exception as exc:
         raise _refuse(
             "store_unusable",

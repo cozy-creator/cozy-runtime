@@ -29,7 +29,7 @@ dev = [
     "pytest>=8.4",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.3.1,<1",
+    "tensorfs>=0.3.6,<1",
     "types-protobuf>=6.30",
     "av>=18.1,<19",
     # `cozy_runtime.derive` is numpy code; the checking venv installs numpy so mypy checks
@@ -107,12 +107,14 @@ ignore_missing_imports = true
 module = ["av", "av.*"]
 ignore_missing_imports = true
 
-# `tensorfs` is tfs-007's compiled facade. It SHIPS type information (`py.typed` plus a
-# hand-written `_ext.pyi`), so this is not a case of an untyped dependency. The development
-# environment installs it for model-bound Runtime tests; the base package still does not.
-[[tool.mypy.overrides]]
-module = ["tensorfs", "tensorfs.*"]
-ignore_missing_imports = true
+# `tensorfs` HAS NO OVERRIDE, on purpose (tfs-077). It is tfs-007's compiled facade and it
+# ships real type information: `py.typed`, and a complete `_ext.pyi` that tensorfs CI holds
+# against the built extension name for name and parameter for parameter. The override that
+# used to sit here was `ignore_missing_imports = true`, whose comment said tensorfs "SHIPS
+# type information, so this is not a case of an untyped dependency" — while the setting
+# itself meant that a checking venv WITHOUT tensorfs typed the whole seam as `Any` and
+# passed. A `strict = true` run over an absent dependency is not a strict run. Absent
+# tensorfs, mypy now fails with `import-not-found` and says which dependency is missing.
 
 # `corpus/` is the adversarial corpus and the real-torch H3 fixture. Checking it here would
 # be checking torch-shaped code against a torch that is not installed, which produces
@@ -155,7 +157,7 @@ media = [
 ]
 # Runtime owns the model byte plane. Local package environments select this complete
 # capability; base worker images provide TensorFS from the same PyPI range.
-model-execution = ["tensorfs>=0.3.1,<1"]
+model-execution = ["tensorfs>=0.3.6,<1"]
 
 [[tool.mypy.overrides]]
 # grpcio ships no type information; the stub module is generated.
