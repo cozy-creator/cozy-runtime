@@ -56,6 +56,24 @@ from cozy_runtime.internal import accel
 from cozy_runtime.internal.fill import FillRefusal, StreamingFillBackend
 
 
+def _read_bytes() -> int:
+    """Bytes THIS process has actually pulled from the block layer, or -1 (cr-100).
+
+    The one cheap way to tell a warm page-cache re-stage from a cold read: page faults on
+    the mapped CAS objects are charged here, cache hits are not. Observation only, and it
+    is allowed to be unavailable — every non-Linux host reports -1 rather than a zero that
+    would read as "warm".
+    """
+    try:
+        with open("/proc/self/io", "rb") as rows:
+            for row in rows:
+                if row.startswith(b"read_bytes:"):
+                    return int(row.split(b":")[1])
+    except (OSError, ValueError):
+        return -1
+    return -1
+
+
 class ResidencyRefusal(Exception):
     """The declared set cannot be admitted. Carries the structured shortfall."""
 
@@ -388,6 +406,14 @@ class ComponentResidency:
         held: dict[str, str] = {}
         allocated = self._allocated()
         started = time.perf_counter()
+        # THE SWAP'S OWN COST, MEASURED (cr-100). Until now the only host->device number
+        # anyone had was a CONSTRUCTION's fill leg, and a swap's cost was inferred from it
+        # — a number measured under one set of conditions read as a fact about another,
+        # which is the class this whole cycle keeps finding. `stream_ms` is the copy leg
+        # per staged component, `read_bytes` is what the block layer actually served, so a
+        # cold re-read is distinguishable from a page-cache hit instead of assumed.
+        fill_ms = 0
+        read_before = _read_bytes()
         for name in wanted:
             if name in self.backend.components:
                 continue
@@ -400,7 +426,7 @@ class ComponentResidency:
                 held[name] = "the device has no room for it without evicting a neighbour"
                 continue
             try:
-                self.backend.stage(name)
+                fill_ms += int(self.backend.stage(name).get("stream_ms", 0))
             except FillRefusal as exc:
                 raise self._poison(
                     exc.code,
@@ -430,12 +456,15 @@ class ComponentResidency:
         self.staged_ms += took
         self.attempt_staged_ms += took
         self.allocator_delta_bytes += self._allocated() - allocated
+        read_after = _read_bytes()
         return {
             "restored": restored,
             "held": held,
             "restored_bytes": sum(restored.values()),
             "allocator_delta_bytes": self._allocated() - allocated,
             "restore_ms": round(took, 2),
+            "fill_ms": fill_ms,
+            "read_bytes": max(read_after - read_before, 0) if read_after >= 0 else -1,
         }
 
     # ------------------------------------------------------------------ poison

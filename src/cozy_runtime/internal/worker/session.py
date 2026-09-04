@@ -4378,10 +4378,28 @@ class Worker:
         held = (reply.get("restored") or {}).get("held") or {}
         if gained or restored:
             after = lane.memory(kind)
+            # THE OTHER HALF OF A SWAP, MEASURED RATHER THAN INFERRED (cr-100). `restore_ms`
+            # is the whole re-fill, `fill_ms` the host->device leg inside it, and
+            # `read_bytes` what the block layer actually served — a warm page cache reads
+            # ~0 there, so "the re-stage was warm" stops being an assumption. Nothing here
+            # decides anything: a duration that starts governing behaviour is the next
+            # measurement to be enforced outside its conditions.
+            report = reply.get("restored") or {}
+            took = float(report.get("restore_ms", 0.0))
+            fill_ms = float(report.get("fill_ms", 0.0))
+            read = int(report.get("read_bytes", -1))
             self.note(
                 "residency",
                 f"{lane.lane_id}: {slot!r} restored {gained} B "
-                f"({', '.join(sorted(restored))}) for {why}; the driver reports "
+                f"({', '.join(sorted(restored))}) in {took:.0f} ms — fill leg "
+                f"{fill_ms / 1000:.3f} s, {took - fill_ms:.0f} ms outside it, "
+                + (
+                    "block-device reads unreadable"
+                    if read < 0
+                    else f"{read} B read from the block layer "
+                    f"({'cold' if read > gained // 2 else 'warm page cache'})"
+                )
+                + f" — for {why}; the driver reports "
                 f"{memory.free_bytes} -> {after.free_bytes} B free",
             )
         if held:
@@ -4466,13 +4484,13 @@ class Worker:
             if executor is None:
                 continue
             before = memory.free_bytes
-            freed = self._vacate(victim, row, executor, why)
+            freed, took = self._vacate(victim, row, executor, why)
             memory = lane.memory(kind)
             self.note(
                 "residency",
                 f"{lane.lane_id}: {victim!r} (epoch {executor.epoch} pid {executor.pid}) "
-                f"vacated {freed} B for {slot!r} on {why}; the driver reports "
-                f"{before} -> {memory.free_bytes} B free",
+                f"vacated {freed} B in {took:.0f} ms for {slot!r} on {why}; the driver "
+                f"reports {before} -> {memory.free_bytes} B free",
             )
             if memory.state != "measured" or fits(memory):
                 return
@@ -4482,17 +4500,23 @@ class Worker:
             f"back for {why}; the plan decides on {memory.free_bytes} B free",
         )
 
-    def _vacate(self, victim: str, row: LaneRow, executor: child.Executor, why: str) -> int:
+    def _vacate(
+        self, victim: str, row: LaneRow, executor: child.Executor, why: str
+    ) -> tuple[int, float]:
         """Ask one co-tenant's executor to free every component it holds; bank the
-        after-state on its row. Returns the bytes it reports freed (0 on refusal or death:
-        a dead executor freed everything, and the re-measurement says so)."""
+        after-state on its row. Returns the bytes it reports freed and how long the free
+        took (0 on refusal or death: a dead executor freed everything, and the
+        re-measurement says so). HALF OF A SWAP IS AN EVICTION and the other half is a
+        re-fill; both halves are timed now, because the cost of alternating two models on
+        one card was being inferred from a construction's fill leg instead of measured
+        (cr-100)."""
         try:
             with executor.watched("vacate"):
                 reply = executor.call({"cmd": "vacate"}, timeout=None)
         except ExecutorGone as exc:
             row.ledger.device_unreadable(f"the executor died while vacating: {exc}")
             self.note("residency", f"{victim!r} died while vacating: {exc}"[:256])
-            return 0
+            return 0, 0.0
         if not reply.get("ok"):
             self.note(
                 "residency",
@@ -4500,7 +4524,7 @@ class Worker:
                     :256
                 ],
             )
-            return 0
+            return 0, 0.0
         freed = row.ledger.observe_vacate(reply, why)
         row.ledger.device_process = self.read_device_process(executor.pid)
         held = (reply.get("vacated") or {}).get("held") or {}
@@ -4510,7 +4534,7 @@ class Worker:
                 f"{victim!r} kept {sorted(held)}: "
                 + "; ".join(f"{name}: {reason}" for name, reason in sorted(held.items()))[:300],
             )
-        return freed
+        return freed, float((reply.get("vacated") or {}).get("vacate_ms", 0.0))
 
     # ------------------------------------------------------------------ dispatch
 

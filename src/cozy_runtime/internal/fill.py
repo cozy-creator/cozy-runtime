@@ -1938,7 +1938,17 @@ class StreamingFillBackend:
         self._commit_enqueued()
         self.components[name] = member
         took = (time.perf_counter_ns() - started) // 1_000_000
-        row = {"component": name, "action": "stage", "bytes": want, "ms": took}
+        # THE SAME SPLIT `prepare` REPORTS (cr-100): `ms` is the whole stage, `stream_ms`
+        # is the leg that actually moves bytes to the device — reserve, read, copy, fence.
+        # A swap's cost has only ever been inferred from a construction's fill leg, which
+        # is a number measured under different conditions; this is the swap's own.
+        row = {
+            "component": name,
+            "action": "stage",
+            "bytes": want,
+            "ms": took,
+            "stream_ms": int(self.stats.get("stream_ms", 0)),
+        }
         self.stage_log.append(row)
         del self.stage_log[:-64]
         return row

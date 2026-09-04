@@ -247,6 +247,19 @@ class Ledger:
     #: cell -> the free bytes under which an attempt for it ALREADY FAILED on the device
     #: (cr-097). A lower bound on demand, never an envelope; see `observe_device_shortfall`.
     carried_shortfall_by_cell: dict[str, int] = field(default_factory=dict)
+    #: cell -> THE LEAST DRIVER-FREE BYTES THIS CELL HAS COMPLETED IN WITH NOTHING MOVING
+    #: (cr-100). The exact counterpart of the row above, in the same units and comparable
+    #: with the card the same way: one says "at this much room, this shape FAILED", this
+    #: one says "at this much room, this shape FINISHED, with its whole resident set
+    #: standing still". Two direct observations of the question a rung actually asks.
+    #:
+    #: It exists because an activation PEAK cannot answer that question. A peak is what the
+    #: kernels took given the room they had, so a peak from a roomier card is an upper
+    #: bound they chose (decisions 698) and a peak from a tighter one says nothing about a
+    #: roomier one. A completed serve at F free bytes is not an inference at all — it is
+    #: the outcome the plan is trying to predict, already observed, and it outranks the
+    #: envelope wherever the two disagree.
+    carried_resident_free_by_cell: dict[str, int] = field(default_factory=dict)
     #: set when an attempt staged or evicted: the activation basis moved under it
     activations_moved: bool = False
     #: attempts closed since the device baseline was last measured. Zero means the next
@@ -419,6 +432,14 @@ class Ledger:
         Without it, `peak_allocated - the post-fill baseline` is valid only while the resident
         set stands still; a moved basis is named absent rather than reported as a small number.
         """
+        # A SERVE THAT FINISHED WITHOUT MOVING A BYTE IS A FACT ABOUT THE CARD, not about
+        # the kernels' appetite (cr-100). It is banked before anything below, because it
+        # does not depend on an activation peak being readable: whatever the peak was, the
+        # whole resident set stood still and the work completed in the room that was left.
+        if succeeded and cell and not resident_moved and self.device_free >= 0:
+            previous = self.carried_resident_free_by_cell.get(cell)
+            if previous is None or self.device_free < previous:
+                self.carried_resident_free_by_cell[cell] = self.device_free
         scopes = {
             str(method): int(value)
             for method, value in (metrics.get("activation_peaks") or {}).items()
@@ -529,6 +550,16 @@ class Ledger:
             return floor
         return 0
 
+    def resident_sufficiency(self, cell: str) -> int:
+        """The least free bytes this cell has COMPLETED in with nothing moving, else 0.
+
+        The mirror of `insufficient_for` and read the same way: a caller compares it with
+        the free bytes it has now, and a number no larger than what it has is a serve that
+        already happened under conditions no roomier than these. It PERMITS; it never
+        refuses, because the absence of an observation is not evidence against one.
+        """
+        return self.carried_resident_free_by_cell.get(cell, 0)
+
     def activations_for(self, cell: str) -> tuple[int, str]:
         """The activation envelope for ONE shape cell, and where the number came from.
 
@@ -572,6 +603,15 @@ class Ledger:
         return 0, ""
 
     def activation_scopes_for(self, cell: str) -> dict[str, int]:
+        # ONE PREDICATE, AT THE TOP, FOR EVERY SCOPE MEASUREMENT — carried or this
+        # generation's own (cr-100). cr-097 gated only the carried maps, which left the
+        # same over-estimate live inside the generation that measured it: a serve run
+        # alone banks per-scope peaks, a co-tenant arrives, and `admit` then refuses
+        # `device_shortfall` on `size + headroom` INSIDE the executor, past every upstream
+        # check, against a number measured on a card that no longer exists. A scope
+        # measurement that does not apply is ABSENT, whoever measured it.
+        if not self.carried_conditions_apply(cell):
+            return {}
         exact = self.activation_scopes_by_cell.get(cell)
         if exact:
             return dict(exact)
@@ -589,9 +629,8 @@ class Ledger:
         # caught. A per-scope peak measured on a roomier card would refuse an attempt there
         # that would have succeeded, and no gate upstream would see it. So a carried scope
         # measurement that does not apply is simply absent, and the caller falls back to
-        # the same bound it uses when nothing was ever measured.
-        if self.carried_activation_free_by_cell and not self.carried_conditions_apply(cell):
-            return {}
+        # the same bound it uses when nothing was ever measured. The gate itself is at the
+        # top of this function now (cr-100), where it covers the generation's own map too.
         exact = self.carried_activation_scopes_by_cell.get(cell)
         if exact:
             return dict(exact)

@@ -131,6 +131,14 @@ class AttemptPlan:
     scope_headroom_bytes: tuple[tuple[str, int], ...] = ()
     """Measured activation scratch by component-use method. The scalar headroom is its max;
     staged admission uses each method's own value so unrelated weight/scratch maxima never add."""
+    activation_envelope_bytes: int = 0
+    """What this shape has been OBSERVED to allocate, whether or not that observation may
+    be enforced here (cr-100). `headroom_bytes` above is what the attempt is admitted
+    against and can be smaller — deliberately, when the observation was made on a roomier
+    card. This one is the DESCRIPTION, and it is what the demand falsifier banks: an
+    envelope that overstates demand shows no miss, one that understates confesses. It is
+    outside `document()` because it decides nothing, and a plan's identity is its
+    decisions."""
 
     def document(self) -> dict[str, Any]:
         return {
@@ -467,7 +475,12 @@ RUNGS: tuple[tuple[str, str, str], ...] = (
 
 #: How a coefficient was established. Enforcement arms ONLY at `measured` (§3.2): the v1
 #: incident is an UNCALIBRATED 25% headroom charge refusing a lane on the very card that was
-#: serving it. `bound` is the author's labelled hatch and is never rendered as a measurement.
+#: serving it. `bound` is the author's labelled hatch — and, since cr-097, a real
+#: measurement read outside the conditions it was measured in, which is the same kind of
+#: number: an upper bound. `uncalibrated` is the third state, and it is NOT the same as
+#: `bound`: a bound knows the shape has run and what it took with more room, an
+#: uncalibrated coefficient knows nothing at all. `_walk` treats them differently for
+#: exactly that reason (cr-100).
 PROVENANCE = ("uncalibrated", "bound", "measured", "ledger")
 
 
@@ -574,7 +587,16 @@ class PlanChooser:
             # (which changes no bits) and it may NOT refuse, exactly like an authored
             # bound. Enforcing it anyway would evict a co-tenant that did not need
             # evicting, or refuse an attempt that would have succeeded.
+            #
+            # THREE GRADES, THREE DIFFERENT STATES OF KNOWLEDGE, and the walk has to tell
+            # them apart (cr-100). `measured` is a requirement and may deny a rung.
+            # `bound` is a real observation of THIS shape read outside its conditions —
+            # it knows the serve completed and knows what the kernels took when they had
+            # more room, and it may not cost a tenant residency it is already holding.
+            # `uncalibrated` below knows nothing at all, which is why it still deepens.
             applies = self.ledger.carried_conditions_apply(cell)
+            basis = self.ledger.activation_basis_free(cell)
+            observed = source or "measured on this generation"
             terms.append(
                 Coefficient("activations", activations, "measured", source)
                 if applies
@@ -582,14 +604,20 @@ class PlanChooser:
                     "activations",
                     activations,
                     "bound",
-                    "",
+                    f"an upper bound, not a requirement: {observed}, observed with "
+                    f"{basis} B free against {self.ledger.device_free} B now",
                 )
             )
         else:
-            # No serve has been banked on this generation, so there is no measurement. The
-            # authored bound is LABELLED and cannot arm enforcement: an uncalibrated number
-            # may not refuse and may not select a worse rung.
-            terms.append(Coefficient("activations", UNCALIBRATED_ACTIVATION_BYTES, "bound", ""))
+            # NOTHING HAS EVER BEEN MEASURED for this shape — a different state from an
+            # observation read out of its conditions, and it gets its own provenance. An
+            # uncalibrated number may not refuse; it MAY deepen, because with no serve
+            # behind it the deeper rung is the only conservative answer available, and
+            # cr-063 measured what happens without one (an all-resident warm pass that
+            # OOMs on an 8 GB card where the staged rung serves).
+            terms.append(
+                Coefficient("activations", UNCALIBRATED_ACTIVATION_BYTES, "uncalibrated", "")
+            )
         if self.ledger.out_of_allocator > 0:
             terms.append(
                 Coefficient(
@@ -637,9 +665,27 @@ class PlanChooser:
         ]
         largest = max([max(sizes.values(), default=declared.model_weight_bytes), *scoped])
         activations = terms["activations"]
+        free = self.ledger.device_free
+        # WHAT MAY DENY A RUNG, AND WHAT MAY ONLY DESCRIBE ONE (cr-100).
+        #
+        # `Coefficient.enforceable` already says a number may refuse OR SELECT A WORSE RUNG
+        # only on a measured basis. The walk was the consumer that honoured the first half
+        # and not the second: an envelope the ledger had just labelled `bound` — an upper
+        # bound the kernels chose on a roomier card — was still the number that pushed a
+        # FULLY RESIDENT generation onto the staged rung. Measured on an rtx-a4000: sdxl
+        # 12.6 s alone, ~25 s on every later run once a co-tenant had touched the pod,
+        # with `all_resident` scored short by 1.18 GiB of activations it never had to have
+        # and the staged rung "fitting" only because it is allowed to free the 6.46 GiB of
+        # weights a restore had just put back.
+        #
+        # So an inapplicable envelope is charged NOTHING where it would only be spending
+        # bytes the tenant already holds, and everything where a rung would have to ACQUIRE
+        # bytes: declining to move gigabytes on a guess is conservative, while spending
+        # residency that is already paid for on the same guess is not.
+        enforceable_headroom = 0 if activations.provenance == "bound" else activations.value
         measured_scopes = self.ledger.activation_scopes_for(cell)
         scope_headrooms = {
-            method: measured_scopes.get(method, activations.value)
+            method: measured_scopes.get(method, enforceable_headroom)
             for method in self.ledger.declared_scopes
         }
         scope_demands = {
@@ -647,6 +693,21 @@ class PlanChooser:
             + scope_headrooms[method]
             for method, names in self.ledger.declared_scopes.items()
         }
+        # THE SHALLOW RUNG'S HEADROOM, and the two direct observations that may overrule
+        # the envelope in either direction. Both are in driver-free bytes, both compare
+        # with the card as it stands, and neither is an inference from a peak:
+        #   * a SHORTFALL — this cell already FAILED on this device with at least this much
+        #     room, so a picture no better than that one cannot get a different answer.
+        #   * a SUFFICIENCY — this cell already COMPLETED, with its resident set standing
+        #     still, on a card with no more room than this one. That is the outcome the
+        #     rung is trying to predict, already observed, so it outranks an envelope.
+        resident_headroom = enforceable_headroom if absent_bytes == 0 else activations.value
+        headroom_basis = activations.provenance if resident_headroom else "already_resident"
+        sufficiency = self.ledger.resident_sufficiency(cell)
+        if absent_bytes == 0 and sufficiency and free >= 0 and sufficiency <= free:
+            resident_headroom = 0
+            headroom_basis = "completed_resident"
+        shortfall = self.ledger.insufficient_for(cell, free) if free >= 0 else 0
         rows: list[dict[str, Any]] = []
         chosen = ""
         # THE CONSTRUCTION FLOOR. A generation whose deployment ceiling PARKED components
@@ -681,18 +742,23 @@ class PlanChooser:
                     }
                 )
                 continue
-            # Both rungs charge the same ACTIVATION headroom and differ in the WEIGHTS
-            # they must bring back: `all_resident` needs every absent component and can
-            # free nothing, so its capacity is bare allocatable; `component_staged` holds
-            # one declared set at a time and may free every resident component first
-            # (cl-003).
+            # The rungs differ in the WEIGHTS they must bring back and in what they are
+            # allowed to free: `all_resident` needs every absent component and can free
+            # nothing, so its capacity is bare allocatable; `component_staged` holds one
+            # declared set at a time and may free every resident component first (cl-003).
+            # They differ in HEADROOM too, and that is cr-100's half: the staged rung is
+            # priced on what it must raise, while the shallow rung — when it has nothing
+            # to bring back — is priced on the activations alone, and only on a figure
+            # that may be enforced under the conditions that hold right now.
+            denied = 0
             if placement == "all_resident":
-                headroom = activations.value + absent_bytes
+                headroom = resident_headroom + absent_bytes
                 capacity = allocatable
+                denied = shortfall
             else:
-                headroom = max(scope_demands.values(), default=activations.value + largest)
+                headroom = max(scope_demands.values(), default=enforceable_headroom + largest)
                 capacity = allocatable + sum(resident.values())
-            fits = allocatable < 0 or capacity >= headroom
+            fits = (allocatable < 0 or capacity >= headroom) and not denied
             row = {
                 "rung": placement,
                 "verdict": "fits" if fits else "short",
@@ -702,6 +768,11 @@ class PlanChooser:
                 "absent_bytes": absent_bytes,
                 "why": why,
             }
+            if placement == "all_resident":
+                row["headroom_basis"] = headroom_basis
+                if denied:
+                    row["verdict"] = "refused_on_measured_shortfall"
+                    row["denied_at_free_bytes"] = denied
             rows.append(row)
             if fits and not chosen:
                 chosen = placement
@@ -720,6 +791,16 @@ class PlanChooser:
             "scope_demand_bytes": dict(scope_demands),
             "rungs": rows,
             "shape_cell": cell,
+            # WHAT THIS ATTEMPT IS ADMITTED AGAINST, beside the envelope it was described
+            # with. They are the same number whenever the envelope may be enforced, and
+            # they part company exactly when it may not — which is the fact a reader needs
+            # in front of them rather than one they have to reconstruct.
+            "enforceable_headroom_bytes": enforceable_headroom,
+            "resident_headroom_bytes": resident_headroom,
+            "headroom_basis": headroom_basis,
+            "device_free_bytes": free,
+            "resident_sufficiency_free_bytes": sufficiency,
+            "measured_shortfall_free_bytes": shortfall,
         }
         return terms, rows, chosen, walk
 
@@ -812,7 +893,15 @@ class PlanChooser:
             reserved_vram_bytes=weights,
             model_weight_bytes=weights,
             resident_bytes=sum(resident.values()),
-            headroom_bytes=activations.value,
+            # WHAT THE EXECUTOR ADMITS AGAINST IS WHAT THE PLAN DECIDED WITH (cr-100).
+            # `headroom_bytes` and the per-scope map ride `open_attempt` into `admit`,
+            # which refuses `device_shortfall` on `size + headroom` INSIDE the executor,
+            # past every upstream check. Sending the envelope after the walk has ruled it
+            # inapplicable would re-litigate the conditions rule one layer down, in the
+            # one place no gate above can see — the exact reach cr-097 named for the
+            # carried scopes and closed there.
+            headroom_bytes=int(walk["enforceable_headroom_bytes"]),
+            activation_envelope_bytes=activations.value,
             scope_headroom_bytes=tuple(sorted(scope_headrooms.items())),
             entrypoint_binding_digest=declared.entrypoint_binding_digest,
             constructed_model_digest=prepared_model.constructed_model_digest,
@@ -828,7 +917,9 @@ class PlanChooser:
                 f"{chosen}: {len(resident) + len(absent) or 1} component(s) totalling "
                 f"{weights} B of which {absent_bytes} B is not resident, with "
                 f"{allocatable} B allocatable and {activations.value} B of activations "
-                f"({activations.provenance}); request {prepared.entrypoint} "
+                f"({activations.provenance}), admitted against "
+                f"{walk['enforceable_headroom_bytes']} B "
+                f"({walk['headroom_basis']}); request {prepared.entrypoint} "
                 f"on shape cell {prepared.cell()}{confession}"
             ),
         )
@@ -929,19 +1020,33 @@ class PlanChooser:
                 },
             )
         if not activations.enforceable:
-            # An UNCALIBRATED coefficient MAY NOT REFUSE. It may deepen the ladder, because
+            # A NON-MEASURED coefficient MAY NOT REFUSE. It may deepen the ladder, because
             # a placement rung changes weight placement only — never the kernel, never the
             # request, never the bits (proven: the staged and resident plans produce the
             # same image digest). The v1 incident this protects against is a refusal on an
             # uncalibrated headroom charge, on the very card that was serving the lane.
+            #
+            # READ THIS BEFORE REACHING FOR THIS BRANCH TO FIX AN OVER-ESTIMATE (cr-100).
+            # Arriving here means NO rung fit, so "deepest" is the only thing left and
+            # marking a measurement inapplicable HERE can only ever select the SLOWEST
+            # path. That is the trap cr-097's first cut fell into. An inapplicable
+            # measurement is answered in `_walk`, where it stops denying a rung the tenant
+            # can already afford; by the time the walk has run out of rungs, the shortfall
+            # is in bytes that have to MOVE, and no relabelling of the envelope changes it.
             deepest = next(p for p, _, status in reversed(RUNGS) if status == "proven")
             walk["deepened_to"] = deepest
-            walk["deepened_on"] = "uncalibrated"
+            walk["deepened_on"] = activations.provenance
+            grade = (
+                "no serve has ever been banked for this shape"
+                if activations.provenance == "uncalibrated"
+                else "the banked serve for this shape was measured with more room than "
+                "there is now, so it is an upper bound the kernels chose"
+            )
             return deepest, (
-                f" | UNCALIBRATED: no serve has been banked on this generation, so the "
-                f"{activations.value} B activation envelope is an authored bound. It may "
-                f"deepen placement (which changes no bits) and it may NOT refuse, so the "
-                f"ladder goes to {deepest} and the first serve banks the measurement"
+                f" | {activations.provenance.upper()}: {grade}, so the "
+                f"{activations.value} B activation envelope may not refuse. It may deepen "
+                f"placement (which changes no bits), so the ladder goes to {deepest} and "
+                f"the next serve banks what this card actually needed"
             )
         deepest = next(p for p, _, status in reversed(RUNGS) if status == "proven")
         walk["deepened_to"] = deepest

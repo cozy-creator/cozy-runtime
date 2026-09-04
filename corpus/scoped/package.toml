@@ -1,0 +1,12 @@
+# cr-100's fixture: the SAME synthetic checkpoint `corpus/tenant` uses, under ONE SCOPE PER
+# COMPONENT. It is a separate package rather than a second entrypoint on the tenant because
+# two entrypoints binding one model are two CONSTRUCTIONS (the slot path is inside the
+# construction key) and one executor owns exactly one prepared generation.
+
+[application]
+object = "scoped_tenant:app"
+
+[bindings."sweep.models.model"]
+model = "cozytest/tenant"
+release = "1"
+lane = "bf16"
