@@ -574,8 +574,7 @@ class PlanChooser:
             # (which changes no bits) and it may NOT refuse, exactly like an authored
             # bound. Enforcing it anyway would evict a co-tenant that did not need
             # evicting, or refuse an attempt that would have succeeded.
-            basis = self.ledger.activation_basis_free(cell)
-            applies = basis == 0 or basis <= self.ledger.device_free
+            applies = self.ledger.carried_conditions_apply(cell)
             terms.append(
                 Coefficient("activations", activations, "measured", source)
                 if applies

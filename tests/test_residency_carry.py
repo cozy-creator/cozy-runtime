@@ -175,3 +175,28 @@ def test_an_uncalibrated_cell_has_no_conditions_to_compare() -> None:
     ledger = Ledger(worker_pid=1)
     _generation(ledger)
     assert ledger.activation_basis_free(CELL) == 0
+
+
+def test_the_carried_scope_headrooms_obey_the_same_conditions_rule() -> None:
+    """THE CONSUMER THAT REACHES FURTHEST. `plan.py` turns the per-scope measurements into
+    `scope_headrooms`, the worker sends them to the executor on `open_attempt`, and `admit`
+    refuses `device_shortfall` on `size + headroom` INSIDE the executor — past
+    `Coefficient.enforceable`, which is where every other over-estimate is caught.
+
+    So a per-scope peak measured on a roomier card would refuse an attempt there that would
+    have succeeded, with no gate upstream able to see it. A carried scope measurement that
+    does not apply must be ABSENT, not merely un-enforceable.
+    """
+    ledger = Ledger(worker_pid=1)
+    _generation(ledger)
+    ledger.observe_device_free(15 << 30, 16 << 30)
+    ledger.observe_attempt({"activation_peaks": {"generate": 4 << 30}}, cell=CELL, succeeded=True)
+    _generation(ledger, pid=4243)
+    # A co-tenant has taken the card below the conditions the scopes were measured under.
+    ledger.observe_device_free(7 << 30, 16 << 30)
+    assert not ledger.carried_conditions_apply(CELL)
+    assert ledger.activation_scopes_for(CELL) == {}
+    # Room at least as tight as the measurement's, and the scopes are a requirement again.
+    ledger.observe_device_free(15 << 30, 16 << 30)
+    assert ledger.carried_conditions_apply(CELL)
+    assert ledger.activation_scopes_for(CELL) == {"generate": 4 << 30}

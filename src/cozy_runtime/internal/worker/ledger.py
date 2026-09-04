@@ -480,6 +480,17 @@ class Ledger:
             self.carried_shortfall_by_cell.get(cell, 0), int(free_bytes)
         )
 
+    def carried_conditions_apply(self, cell: str) -> bool:
+        """Whether a CARRIED measurement for `cell` may be enforced right now (cr-097).
+
+        True when it was observed with no more room than there is now, so the number is a
+        requirement the kernels actually had; false when it was observed on a roomier card,
+        where it is an upper bound they chose. A basis of 0 means nothing was banked, and
+        the uncalibrated path owns that case with its own may-not-refuse rule.
+        """
+        basis = self.activation_basis_free(cell)
+        return basis == 0 or basis <= self.device_free
+
     def activation_basis_free(self, cell: str) -> int:
         """The driver-free bytes the carried activation measurement for `cell` was observed
         under, or 0 when there is none (cr-097).
@@ -570,6 +581,17 @@ class Ledger:
                 key=lambda key: max(self.activation_scopes_by_cell[key].values(), default=0),
             )
             return dict(self.activation_scopes_by_cell[widest])
+        # THE CARRIED SCOPES OBEY THE SAME CONDITIONS RULE AS THE CARRIED ENVELOPE
+        # (cr-097). This is the consumer that reaches furthest: `plan.py` turns these into
+        # `scope_headrooms`, the worker sends them to the executor on `open_attempt`, and
+        # `admit` refuses `device_shortfall` on `size + headroom` INSIDE the executor —
+        # past `Coefficient.enforceable`, which is where every other over-estimate is
+        # caught. A per-scope peak measured on a roomier card would refuse an attempt there
+        # that would have succeeded, and no gate upstream would see it. So a carried scope
+        # measurement that does not apply is simply absent, and the caller falls back to
+        # the same bound it uses when nothing was ever measured.
+        if self.carried_activation_free_by_cell and not self.carried_conditions_apply(cell):
+            return {}
         exact = self.carried_activation_scopes_by_cell.get(cell)
         if exact:
             return dict(exact)
