@@ -76,6 +76,7 @@ from cozy_runtime.internal.worker import (
 )
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
+    DEVICE_SHORTFALL_CODES,
     ORIGIN,
     STATUS,
     AttemptEngine,
@@ -4135,6 +4136,10 @@ class Worker:
                     },
                     resident_moved=bool(outcome["resident_moved"]),
                     cell=str(outcome["shape_cell"]),
+                    # A COMPLETED warm pass, so this peak is a measurement and may
+                    # calibrate later generations (cr-097). The failed branch below never
+                    # reaches here, which is the point.
+                    succeeded=True,
                 )
             if outcome["outcome"] == "failed":
                 self.engine.degraded[plan_id] = str(outcome["reason"])[:160]
@@ -4257,12 +4262,140 @@ class Worker:
         tenant = attempt.placement_id
         lane.touch(tenant)
         row = lane.row(tenant)
+        why = f"attempt {attempt.request_id}#{attempt.attempt}"
 
         def fits(memory: accel.DeviceMemory) -> bool:
             row.ledger.observe_device_free(memory.free_bytes, memory.total_bytes)
             return bool(row.chooser.fits(declared))
 
-        self._make_room(lane, tenant, fits, f"attempt {attempt.request_id}#{attempt.attempt}")
+        # FIRST, TAKE BACK WHAT WAS TAKEN (cr-097). A tenant a co-tenant's prepare emptied
+        # is priced, otherwise, against a hole nobody put back — which is how a placement
+        # that had 10 GiB of room to itself spent seven consecutive attempts at +118%.
+        # This evicts nothing, so it runs before the arbitration below rather than instead
+        # of it: what it cannot restore, `_make_room` is still free to make room for.
+        self._restore_residency(lane, tenant, row, why)
+        # THEN, THE RETRY RULE. A retry under the residency picture that already produced a
+        # device OOM is the same request asked twice and cannot get a different answer.
+        self._break_oom_repeat(lane, tenant, row, fits, why)
+        self._make_room(lane, tenant, fits, why)
+
+    def _restore_residency(self, lane: DeviceLane, slot: str, row: LaneRow, why: str) -> None:
+        """RE-FILL a tenant the lane emptied, when the card has room. Evicts NOBODY (cr-097).
+
+        `vacate` had no counterpart, and the gap was the defect: a tenant vacated for a
+        co-tenant's prepare stayed empty for the life of its generation, re-admitting per
+        scope on every attempt at a cost the device had room to stop paying. Measured live
+        on an A4000: 8739 ms fully resident, 18909 ms after the vacate, 9056 ms once an
+        unrelated rebuild happened to re-prepare it — with the co-tenant resident and
+        untouched throughout, which is the proof the room was there all along.
+
+        The restore is sized against the ATTEMPT'S ENVELOPE, not against the weights alone.
+        Filling a tenant back to full residency and leaving its own kernels no room is the
+        mirror of reading a fill-inflated peak as a resting requirement: both mistake one
+        kind of number for another, and this one ends in an OOM inside the handler where
+        nothing can decide. The envelope is the widest activation measurement this row
+        holds, in any generation, and the uncalibrated bound when it holds none.
+        """
+        missing = row.ledger.missing_resident()
+        if not missing:
+            return
+        executor = row.executor()
+        if executor is None:
+            return
+        kind = accel.host_backend_family()
+        memory = lane.memory(kind)
+        if memory.state != "measured":
+            return
+        row.ledger.observe_device_free(memory.free_bytes, memory.total_bytes)
+        envelope, _source = row.ledger.activations_for("")
+        if envelope <= 0:
+            envelope = UNCALIBRATED_ACTIVATION_BYTES
+        try:
+            with executor.watched("restore"):
+                reply = executor.call(
+                    {"cmd": "restore", "names": sorted(missing), "envelope": int(envelope)},
+                    timeout=None,
+                )
+        except ExecutorGone as exc:
+            row.ledger.device_unreadable(f"the executor died while restoring: {exc}")
+            self.note("residency", f"{slot!r} died while restoring: {exc}"[:256])
+            return
+        if not reply.get("ok", True):
+            self.note(
+                "residency",
+                f"{slot!r} refused to restore: {reply.get('code')}: {reply.get('detail', '')}"[
+                    :256
+                ],
+            )
+            return
+        gained = row.ledger.observe_restore(reply, why)
+        row.ledger.device_process = self.read_device_process(executor.pid)
+        restored = (reply.get("restored") or {}).get("restored") or {}
+        held = (reply.get("restored") or {}).get("held") or {}
+        if gained or restored:
+            after = lane.memory(kind)
+            self.note(
+                "residency",
+                f"{lane.lane_id}: {slot!r} restored {gained} B "
+                f"({', '.join(sorted(restored))}) for {why} against a {envelope} B "
+                f"envelope; the driver reports {memory.free_bytes} -> {after.free_bytes} B free",
+            )
+        if held:
+            self.note(
+                "residency",
+                f"{slot!r} left {sorted(held)} absent: "
+                + "; ".join(f"{name}: {reason}" for name, reason in sorted(held.items()))[:300],
+            )
+
+    def _break_oom_repeat(
+        self,
+        lane: DeviceLane,
+        slot: str,
+        row: LaneRow,
+        fits: Callable[[accel.DeviceMemory], bool],
+        why: str,
+    ) -> None:
+        """A RETRY MUST BE A DIFFERENT REQUEST, or it must refuse (cr-097).
+
+        proto-037 fixed the mirror of this: a refusal is resumable only if the same request
+        could get a different answer later. Here the answer COULD change, but only if
+        something about the device changes first — and nothing did. Measured live: four
+        attempts for one request, each 38.3 s of execution plus a 25.8 s executor rebuild,
+        every one of them dying on the same allocator while an IDLE co-tenant held 6.07 GiB,
+        until the requeue budget ran out. Roughly two and a half minutes of paid GPU to
+        prove the same thing four times.
+
+        So when this tenant's last attempt died on the device and the lane looks exactly as
+        it did then, the co-tenants vacate — LRU-first, the ordinary arbitration, just with
+        a demand the chooser's own `fits` is not allowed to talk it out of. If nothing can
+        be freed, the picture cannot change and the attempt refuses TYPED and quantified
+        instead of spending the handler to rediscover the allocator.
+        """
+        if not row.oom_signature or row.oom_signature != lane.residency_signature():
+            return
+        self.note(
+            "residency",
+            f"{lane.lane_id}: {slot!r} last died on the device under this exact residency "
+            f"({row.oom_signature}); making room before {why} rather than repeating it",
+        )
+        # `fits` deliberately ignored: it is what admitted the attempt that OOMed.
+        self._make_room(lane, slot, lambda _memory: False, f"{why} after a device OOM")
+        if row.oom_signature != lane.residency_signature():
+            row.oom_signature = ""
+            return
+        kind = accel.host_backend_family()
+        memory = lane.memory(kind)
+        floor = max(row.ledger.carried_shortfall_by_cell.values(), default=0)
+        raise AttemptRefusal(
+            "device_shortfall",
+            f"an attempt for this placement already failed on the device with "
+            f"{floor} B free on {lane.lane_id}, no co-tenant holds bytes that could be "
+            f"given back, and the lane is unchanged ({row.oom_signature}). Retrying would "
+            f"run the same request against the same device and reach the same allocator; "
+            f"the driver reports {memory.free_bytes} B free",
+            cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
+            origin=ORIGIN.CAUSE_ORIGIN_RUNTIME,
+        )
 
     def _make_room(
         self,
@@ -4713,9 +4846,32 @@ class Worker:
         if not isinstance(released, Released):
             self.send(pb.WorkerFrame(attempt_outcome=released))
             return
+        self._mark_device_outcome(attempt, released, lane)
         lane.post.put(released)
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+
+    def _mark_device_outcome(
+        self, attempt: AttemptRecord, released: Released, lane: DeviceLane
+    ) -> None:
+        """Remember WHETHER THE DEVICE KILLED THIS ATTEMPT, and under what picture (cr-097).
+
+        Recorded on the lane row rather than on the ledger because the ledger restarts with
+        the next generation and an OOM is precisely what replaces the generation: the fact
+        would die in the rebuild it caused, which is the whole shape of this defect. The row
+        outlives the rebuild — `lane.forget` runs only when the placement LEAVES the lane —
+        so the next attempt can see what the last one hit.
+        """
+        outcome = released.reply.get("outcome") or {}
+        row = lane.rows.get(attempt.placement_id)
+        if row is None:
+            return
+        if str(outcome.get("terminal", "")) == "succeeded":
+            # A serve got through under this picture, so nothing about it is a trap.
+            row.oom_signature = ""
+            return
+        if str(outcome.get("code", "")) in DEVICE_SHORTFALL_CODES:
+            row.oom_signature = lane.residency_signature()
 
     def finish(self, released: Released) -> None:
         """POST PHASE -> OUTCOME -> SEND, on the lane's post thread.

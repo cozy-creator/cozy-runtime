@@ -339,6 +339,93 @@ class ComponentResidency:
             "vacate_ms": round(took, 2),
         }
 
+    def restore(self, names: tuple[str, ...] = (), envelope: int = 0) -> dict[str, Any]:
+        """RE-FILL what a vacate took, TAKING THE CARD FROM NOBODY (cr-097).
+
+        `vacate` had no counterpart, and that asymmetry was the whole defect: a tenant the
+        lane emptied for a co-tenant stayed empty for the life of its generation. Its own
+        later attempts re-admitted per scope and settled into a partial residency the card
+        had room to end -- measured at +118% handler time (8739 ms -> 18909 ms) across
+        seven consecutive attempts on a device holding 10 GiB free, ended only when an
+        unrelated rebuild re-prepared the generation by accident.
+
+        THIS EVICTS NOTHING. There is no `_make_headroom` and no `_make_room` here, and
+        that is the point rather than an omission: restoring by displacing a neighbour
+        would be the evict-refill oscillation the owner named a defect, and it would make
+        an alternating two-model workload pay a fill on every attempt. A component that
+        does not fit RIGHT NOW is left absent and named in `held`; the next admission
+        stages it on demand exactly as it does today, so the worst case is what happens
+        already.
+
+        The fence and the mid-mutation rule do not bend. A stage that fails after mutation
+        began poisons for the same reason it does in `admit` -- a half-arrived component
+        is the same hazard whoever asked for it -- while a measured shortfall is simply a
+        component not restored, because this is an optimization and refusing an attempt
+        for it would be worse than the state it repairs.
+        """
+        self._require_clean("restore")
+        # THE ENVELOPE IS PASSED IN, NEVER READ OFF `self.headroom` (cr-097). Between
+        # attempts `self.headroom` is whatever the LAST `open_attempt` left — stale, and
+        # zero on a fresh generation — so sizing a fill against it is the same class of
+        # error as reading a fill-inflated peak as a resting requirement, just pointed the
+        # other way. The caller passes the envelope the NEXT attempt will need, so a
+        # restore can never fill this tenant into a state where its own attempt has no
+        # room to run.
+        wanted = tuple(names) if names else tuple(sorted(self.backend.checkpoints))
+        restored: dict[str, int] = {}
+        held: dict[str, str] = {}
+        allocated = self._allocated()
+        started = time.perf_counter()
+        for name in wanted:
+            if name in self.backend.components:
+                continue
+            if name not in self.backend.checkpoints:
+                held[name] = "this generation has no checkpoint for it"
+                continue
+            size = self._size(name)
+            if not self._fits(size + envelope):
+                # Measured, before a byte moves, against the SAME meter admission uses.
+                held[name] = "the device has no room for it without evicting a neighbour"
+                continue
+            try:
+                self.backend.stage(name)
+            except FillRefusal as exc:
+                raise self._poison(
+                    exc.code,
+                    f"restoring component {name!r} failed after mutation began: {exc}. "
+                    "The executor process is the transaction -- this generation is "
+                    "poisoned and the worker replaces the process (#613)",
+                ) from exc
+            except accel.oom_error(self.torch, self.kind) as exc:
+                # The pre-check passed and the allocator disagreed. Nothing half-arrived
+                # is recoverable, so this poisons exactly as the same surprise does in
+                # `admit`; it is not downgraded to `held` merely because restore is
+                # optional work.
+                self.poisoned = self.poisoned or (
+                    f"device_shortfall: restoring {name!r} hit the allocator after the "
+                    "measured pre-check passed -- a mid-mutation surprise, so the "
+                    "generation is poisoned and the process is replaced (#613)"
+                )
+                held[name] = f"device_out_of_memory: {exc}"[:200]
+                break
+            self.stages += 1
+            self.attempt_stages += 1
+            restored[name] = size
+            fence = self.fences.setdefault(name, Fence())
+            self.clock += 1
+            fence.last_used = self.clock
+        took = (time.perf_counter() - started) * 1000
+        self.staged_ms += took
+        self.attempt_staged_ms += took
+        self.allocator_delta_bytes += self._allocated() - allocated
+        return {
+            "restored": restored,
+            "held": held,
+            "restored_bytes": sum(restored.values()),
+            "allocator_delta_bytes": self._allocated() - allocated,
+            "restore_ms": round(took, 2),
+        }
+
     # ------------------------------------------------------------------ poison
 
     def _fault(self, code: str, detail: str) -> None:

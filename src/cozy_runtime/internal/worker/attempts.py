@@ -167,6 +167,13 @@ GROUP_FAULT_CODES = frozenset(
     }
 )
 
+#: The device-capacity codes a FAILED attempt can carry (cr-097). Their peak is a
+#: truncated lower bound and may never calibrate; the picture they died under is recorded
+#: instead, as a refusal-grade fact. `device_shortfall` is the runtime's own pre-mutation
+#: refusal and `device_out_of_memory` is the allocator's surprise past it — both say the
+#: same thing about the next attempt under the same picture.
+DEVICE_SHORTFALL_CODES = frozenset({"device_out_of_memory", "device_shortfall"})
+
 _TERMINAL = {
     "succeeded": (STATUS.OUTCOME_STATUS_SUCCEEDED, CAUSE.CAUSE_CODE_UNSPECIFIED),
     "refused": (STATUS.OUTCOME_STATUS_REFUSED, CAUSE.CAUSE_CODE_INVALID_REQUEST),
@@ -1688,9 +1695,21 @@ class AttemptEngine:
                         attempt.residency.get("attempt_stages")
                         or attempt.residency.get("attempt_evictions")
                     )
-                    self.ledger_for(attempt).observe_attempt(
-                        reply.get("metrics", {}), resident_moved=moved, cell=cell
+                    terminal = str((reply.get("outcome") or {}).get("terminal", ""))
+                    failed_code = str((reply.get("outcome") or {}).get("code", ""))
+                    ledger = self.ledger_for(attempt)
+                    ledger.observe_attempt(
+                        reply.get("metrics", {}),
+                        resident_moved=moved,
+                        cell=cell,
+                        succeeded=terminal == "succeeded",
                     )
+                    if terminal != "succeeded" and failed_code in DEVICE_SHORTFALL_CODES:
+                        # cr-097: the attempt died climbing, so its peak is a truncated
+                        # lower bound and may not calibrate. What IS usable is the picture
+                        # it died under — recorded so the next attempt for this shape can
+                        # refuse typed instead of spending the handler to rediscover it.
+                        ledger.observe_device_shortfall(cell, ledger.device_free)
                     self.bank_demand(attempt, reply.get("metrics", {}), moved)
                 else:
                     attempt.confess(

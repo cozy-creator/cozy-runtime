@@ -210,6 +210,35 @@ class Ledger:
     #: shape cell -> component-use method -> measured scratch peak while that method's
     #: declared component set was resident. Staged admission prices matching pairs only.
     activation_scopes_by_cell: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: THE SAME TWO MAPS, ACROSS GENERATIONS (cr-097).
+    #:
+    #: §3.2 says reservations are executor-generation-scoped and the ledger restarts WITH
+    #: the new generation, never reconstructed from DEVICE STATE. That invariant is not
+    #: weakened here, and the distinction is the reason: §3.2 protects against claiming to
+    #: know what a device holds after the process that filled it was replaced. An
+    #: activation envelope is not device state. It is a property of a MODEL and a REQUEST
+    #: SHAPE — what these kernels allocate at this shape — and it would be equally true on
+    #: another card in another datacenter. Nothing about it describes the replaced
+    #: process's residency, so carrying it forward asserts nothing §3.2 forbids.
+    #:
+    #: The shape cell is what keeps that honest: a measurement read for the wrong shape
+    #: would be the same lie by another route, so these are keyed by cell and nothing else
+    #: is inferred across cells that `activations_for` does not already label as an upper
+    #: bound. The placement id and the lane hold the model and the card fixed for the life
+    #: of the row (`lane.forget` drops it when the placement leaves), so a carried number
+    #: can never be read for a different model.
+    #:
+    #: It has to. `plan.py` may not refuse on an UNCALIBRATED envelope, so the 1 GiB
+    #: placeholder deepens the ladder and runs. When the real demand is 3.9 GiB and a
+    #: co-tenant holds the slack that used to hide the gap, the attempt OOMs, poisons the
+    #: executor, and the rebuild wiped the measurement that would have refused the retry —
+    #: so the retry was uncalibrated again. Measured live: four identical 38.3 s failures,
+    #: each with a 25.8 s rebuild, until the requeue budget ran out.
+    carried_activations_by_cell: dict[str, int] = field(default_factory=dict)
+    carried_activation_scopes_by_cell: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: cell -> the free bytes under which an attempt for it ALREADY FAILED on the device
+    #: (cr-097). A lower bound on demand, never an envelope; see `observe_device_shortfall`.
+    carried_shortfall_by_cell: dict[str, int] = field(default_factory=dict)
     #: set when an attempt staged or evicted: the activation basis moved under it
     activations_moved: bool = False
     #: attempts closed since the device baseline was last measured. Zero means the next
@@ -231,6 +260,12 @@ class Ledger:
     #: per-component RESIDENT device bytes, by component name. The staging plane's own
     #: arithmetic, and the input the chooser's rung prices are computed from.
     resident: dict[str, int] = field(default_factory=dict)
+    #: WHAT THE CONSTRUCTION FILLED, kept whole for the life of the generation (cr-097).
+    #: `resident` follows the device and a vacate empties it; this does not move, so the
+    #: worker can tell "this generation never held it" from "the lane took it away" and
+    #: ask for it back. A generation that legitimately parked a component never had it
+    #: here, so a restore can never contradict the construction's own ceiling.
+    constructed: dict[str, int] = field(default_factory=dict)
     #: components this generation knows about but is not holding right now, with their size
     evicted: dict[str, int] = field(default_factory=dict)
     #: components CONSTRUCTION parked, because the deployment's resident ceiling did not
@@ -313,6 +348,8 @@ class Ledger:
         self.accelerator = ""
         self.activations_by_cell.clear()
         self.activation_scopes_by_cell.clear()
+        # `carried_activations_by_cell` / `carried_activation_scopes_by_cell` are NOT
+        # cleared: they outlive the generation deliberately (cr-097, see their field docs).
         self.activations_moved = False
         self.closed_since_baseline = 0
         self.executor_pid = executor_pid
@@ -320,6 +357,7 @@ class Ledger:
         self.devices.clear()
         self.unreadable.clear()
         self.resident.clear()
+        self.constructed.clear()
         self.evicted.clear()
         self.parked = ()
         self.declared_scopes.clear()
@@ -337,6 +375,7 @@ class Ledger:
         self.device_allocated = self.device_baseline
         self.device_reserved = int(facts.get("reserved_bytes", -1))
         self.resident = {k: int(v) for k, v in (facts.get("resident") or {}).items()}
+        self.constructed = dict(self.resident)
         self.parked = tuple(str(name) for name in (facts.get("parked") or ()))
         # Parked components WITH their sizes, from the construction that parked them: what
         # the next attempt may have to stage in is priced from the first plan, not from
@@ -359,7 +398,11 @@ class Ledger:
         # replaces the new generation's unknown facts; it never repairs the old numbers.
 
     def observe_attempt(
-        self, metrics: dict[str, Any], resident_moved: bool = False, cell: str = ""
+        self,
+        metrics: dict[str, Any],
+        resident_moved: bool = False,
+        cell: str = "",
+        succeeded: bool = False,
     ) -> None:
         """What one attempt's kernel allocated ON TOP of the resident weights.
 
@@ -393,6 +436,50 @@ class Ledger:
                 held = self.activation_scopes_by_cell.setdefault(cell, {})
                 for method, value in scopes.items():
                     held[method] = max(held.get(method, 0), value)
+                # ONLY A SUCCEEDING SERVE MAY CALIBRATE (cr-097). The generation-scoped
+                # maps above still record a fault's peak, which is what an operator wants
+                # to read; the CARRIED map may not, because a peak observed on an attempt
+                # that died on its way up is a TRUNCATED LOWER BOUND, not a measurement.
+                # Banking it would make the retry calibrated AND WRONG — priced too low,
+                # `enforceable`, and therefore able to refuse nothing while running
+                # straight back into the same OOM. That is strictly worse than
+                # uncalibrated, whose may-not-refuse rule is at least honest about not
+                # knowing. A failed attempt's fact goes to `observe_device_shortfall`,
+                # which is a different slot holding a different KIND of number.
+                if succeeded:
+                    self.carried_activations_by_cell[cell] = max(
+                        self.carried_activations_by_cell.get(cell, 0), measured
+                    )
+                    carried = self.carried_activation_scopes_by_cell.setdefault(cell, {})
+                    for method, value in scopes.items():
+                        carried[method] = max(carried.get(method, 0), value)
+
+    def observe_device_shortfall(self, cell: str, free_bytes: int) -> None:
+        """A failed attempt's REFUSAL-GRADE fact (cr-097): at `free_bytes` free on this
+        lane, this shape cell did not fit. It is a LOWER BOUND on demand and never an
+        envelope — the attempt died climbing, so its true peak is strictly greater than
+        anything it was observed to reach. Kept apart from `carried_activations_by_cell`
+        in the TYPE, not by convention, because the one thing that must never happen is a
+        truncated peak being read as a measurement.
+        """
+        if not cell or free_bytes < 0:
+            return
+        self.carried_shortfall_by_cell[cell] = max(
+            self.carried_shortfall_by_cell.get(cell, 0), int(free_bytes)
+        )
+
+    def insufficient_for(self, cell: str, free_now: int) -> int:
+        """The banked floor when this cell is KNOWN not to fit in `free_now`, else 0.
+
+        The comparison is deliberately `<=`: a picture no better than the one that already
+        failed cannot produce a different answer, which is the whole of the retry rule. A
+        picture with MORE room is not answered here — it may or may not fit, and finding
+        out is exactly what a genuinely different attempt is for.
+        """
+        floor = self.carried_shortfall_by_cell.get(cell, 0)
+        if floor and free_now <= floor:
+            return floor
+        return 0
 
     def activations_for(self, cell: str) -> tuple[int, str]:
         """The activation envelope for ONE shape cell, and where the number came from.
@@ -413,6 +500,27 @@ class Ledger:
                 f"no serve has been banked on cell {cell}; the widest cell measured on this "
                 f"generation ({widest}) is the upper bound this request is priced against"
             )
+        # NOTHING ON THIS GENERATION — which is the normal state of a generation the last
+        # attempt's OOM just rebuilt. A measurement carried from an earlier generation of
+        # the same placement on the same lane is still a measurement (cr-097): it prices
+        # the retry against what the model actually allocated instead of against the 1 GiB
+        # placeholder that may not refuse.
+        exact = self.carried_activations_by_cell.get(cell, 0)
+        if exact:
+            return exact, (
+                f"scope-local max_memory_allocated() minus its resident component baseline, "
+                f"on cell {cell}, measured on an earlier generation of this placement"
+            )
+        if self.carried_activations_by_cell:
+            widest = max(
+                self.carried_activations_by_cell,
+                key=lambda k: self.carried_activations_by_cell[k],
+            )
+            return self.carried_activations_by_cell[widest], (
+                f"no serve has been banked on cell {cell} in any generation; the widest "
+                f"cell measured on an earlier generation of this placement ({widest}) is "
+                f"the upper bound this request is priced against"
+            )
         return 0, ""
 
     def activation_scopes_for(self, cell: str) -> dict[str, int]:
@@ -425,6 +533,17 @@ class Ledger:
                 key=lambda key: max(self.activation_scopes_by_cell[key].values(), default=0),
             )
             return dict(self.activation_scopes_by_cell[widest])
+        exact = self.carried_activation_scopes_by_cell.get(cell)
+        if exact:
+            return dict(exact)
+        if self.carried_activation_scopes_by_cell:
+            widest = max(
+                self.carried_activation_scopes_by_cell,
+                key=lambda key: max(
+                    self.carried_activation_scopes_by_cell[key].values(), default=0
+                ),
+            )
+            return dict(self.carried_activation_scopes_by_cell[widest])
         return {}
 
     def observe_residency(self, residency: dict[str, Any]) -> None:
@@ -462,6 +581,32 @@ class Ledger:
             self.baseline_notes.append(f"vacated ({why}): {shift:+d} B allocator, {freed} B freed")
             del self.baseline_notes[:-8]
         return freed
+
+    def observe_restore(self, reply: dict[str, Any], why: str) -> int:
+        """This generation took back bytes the lane had vacated (cr-097).
+
+        The mirror of `observe_vacate` and it moves the baseline the same way, for the same
+        reason: the next attempt reconciles against where the device IS, not against the
+        construction's fill or against the hole the vacate left. Returns the bytes the
+        executor reports restored.
+        """
+        before = self.device_allocated
+        self.observe_probe(reply)
+        restored = reply.get("restored") or {}
+        gained = int(restored.get("restored_bytes", 0))
+        if self.device_allocated >= 0:
+            shift = self.device_allocated - before if before >= 0 else 0
+            self.device_baseline = self.device_allocated
+            self.baseline_notes.append(
+                f"restored ({why}): {shift:+d} B allocator, {gained} B refilled"
+            )
+            del self.baseline_notes[:-8]
+        return gained
+
+    def missing_resident(self) -> dict[str, int]:
+        """What the construction filled and the device no longer holds (cr-097): the exact
+        set a restore asks for. Empty for a generation that holds everything it built."""
+        return {name: size for name, size in self.constructed.items() if name not in self.resident}
 
     def observe_device_free(self, free: int, total: int) -> None:
         """The driver's view of the whole device, read by the WORKER through NVML now.
