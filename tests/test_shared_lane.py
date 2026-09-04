@@ -563,6 +563,16 @@ def _vacates(notes: list[tuple[str, str]]) -> list[tuple[str, str, int, int, int
     return found
 
 
+def _restores(notes: list[tuple[str, str]]) -> list[str]:
+    """Every restore note, so the arm that produces one can check what it REPORTS.
+
+    A swap is a vacate and a re-fill, and until cr-100 neither reported a duration — the
+    cost of alternating two models on one card was inferred from a CONSTRUCTION's fill leg,
+    which is a different act under different conditions.
+    """
+    return [step for kind, step in notes if kind == "residency" and " restored " in step]
+
+
 # --------------------------------------------------------------------------- the co-fit arm
 
 
@@ -673,6 +683,12 @@ def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
     # NO RESPAWN: a swap changes residency, never the process. Both epochs are 1 throughout.
     for turn in owner.turns:
         assert {row["executor_epoch"] for row in turn.rows.values()} == {1}, turn.rows
+    # AND THE SWAP SAYS WHAT IT COST (cr-100). The vacate's duration is inside `_vacates`'
+    # own pattern above; a restore splits the host->device leg out of its total and says
+    # whether the bytes came from the page cache or the block layer.
+    for step in _restores(notes):
+        assert " ms — fill leg " in step and " outside it" in step, step
+        assert "page cache" in step or "cold" in step or "unreadable" in step, step
         pids = {slot: row["executor_pid"] for slot, row in turn.rows.items()}
         assert pids == {slot: row["executor_pid"] for slot, row in owner.turns[0].rows.items()}, (
             pids
