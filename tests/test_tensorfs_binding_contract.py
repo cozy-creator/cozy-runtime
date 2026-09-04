@@ -92,12 +92,13 @@ CALLED: dict[str, str] = {
     "Store.derived_abandon": "(self, /, transaction_id)",
     "Store.derived_dispose": "(self, /, transaction_id)",
     # THE ONE THAT BROKE. Four arguments. `repo_cache` exists on tensorfs master as a
-    # keyword-only mount point; the Store↔cache binding lane deletes it, and no caller here
-    # threads a path (xs-024 §5). A wheel bump past tensorfs#98 therefore turns THIS entry
-    # red before that lane lands — which is the guard working. Re-freeze only after
-    # confirming the four positional arguments still bind, and never by adding a fifth.
+    # FIVE positional arguments since the per-file lane: the fourth is the ROSTER — every
+    # selected member with its header — and the fifth is `landed`, the subset whose carriers
+    # are readable now. The split is the request's identity: the roster is hashed and arrival
+    # is not, so asking again over a growing `landed` is the same request rather than a
+    # conflicting one. Re-freeze only after confirming all five still bind.
     "Store.prepare_model_source": (
-        "(self, /, operation_id, source_selection_digest, profiles, files)"
+        "(self, /, operation_id, source_selection_digest, profiles, roster, landed)"
     ),
     "Store.release_model_source": "(self, /, operation_id)",
     "ReadLease.stream": "(self, /, plan, slots, on_batch, readers=4)",
@@ -184,8 +185,8 @@ def test_the_signature_check_would_notice_a_deleted_parameter() -> None:
     """The guard's own red arm: prove the comparison detects the exact break it exists for."""
 
     installed = _signature("Store.prepare_model_source")
-    six = installed.replace(", files)", ", files, source_uri, declared_license)")
-    assert six != installed
+    fewer = installed.replace(", roster, landed)", ", files)")
+    assert fewer != installed
     assert CALLED["Store.prepare_model_source"] == installed
 
 
@@ -228,18 +229,25 @@ def _request(tmp_path: Path, *, operation_id: str) -> pb.PrepareModelSourceReque
     blob = tmp_path / "model.safetensors"
     blob.write_bytes(b"a real file that is not a real checkpoint" * 8)
     data = blob.read_bytes()
+    # Every roster row carries the carrier's header prefix: a conversion plan is a pure
+    # function of headers, so the binding takes them whether or not the carrier has landed.
+    header = tmp_path / "model.safetensors.header"
+    body = b'{"weight":{"data_offsets":[0,4],"dtype":"F32","shape":[1]}}'
+    header.write_bytes(len(body).to_bytes(8, "little") + body)
     return pb.PrepareModelSourceRequest(
         operation_id=operation_id,
         source_selection_digest=hashlib.sha256(b"selection").digest(),
         profiles=[pb.ModelSourceProfile(slot="unet", profile="sdxl/unet")],
-        files=[
+        roster=[
             pb.LocalModelSourceFile(
                 member="model.safetensors",
                 object_id="sha256:" + hashlib.sha256(data).hexdigest(),
                 length=len(data),
                 path=str(blob),
+                header_path=str(header),
             )
         ],
+        landed=["model.safetensors"],
     )
 
 
@@ -305,7 +313,7 @@ def test_prepare_model_source_refuses_an_unsorted_profile_set(tmp_path: Path) ->
 
 def test_prepare_model_source_refuses_a_file_whose_length_is_a_lie(tmp_path: Path) -> None:
     request = _request(tmp_path, operation_id="op-contract-4")
-    request.files[0].length += 1
+    request.roster[0].length += 1
 
     result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
 

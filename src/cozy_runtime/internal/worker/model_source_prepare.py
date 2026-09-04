@@ -25,6 +25,8 @@ _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _MEMBER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 _PROFILE = re.compile(r"[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*")
 _OBJECT_ID = re.compile(r"sha256:[0-9a-f]{64}")
+#: TensorFS refuses a carrier header wider than this, so reading one is bounded.
+_MAX_HEADER_BYTES = 16 * 1024 * 1024
 
 
 class ModelSourceRefusal(Exception):
@@ -44,14 +46,15 @@ def prepare_model_source(
             raise ModelSourceRefusal(
                 "model_source_store_invalid", "TensorFS store path is not absolute"
             )
-        profiles, files = _request(request)
+        profiles, roster, landed = _request(request)
         tensorfs = fill.tensorfs_module()
         store = tensorfs.Store.ensure(str(tensorfs_root))
         prepared = store.prepare_model_source(
             request.operation_id,
             documents.spell(bytes(request.source_selection_digest)),
             profiles,
-            files,
+            roster,
+            landed,
         )
         return _result(request, prepared)
     except ModelSourceRefusal as exc:
@@ -79,7 +82,11 @@ def release_model_source(*, tensorfs_root: Path, operation_id: str) -> None:
 
 def _request(
     request: pb.PrepareModelSourceRequest,
-) -> tuple[list[tuple[str, str]], list[tuple[str, str, int, str]]]:
+) -> tuple[
+    list[tuple[str, str]],
+    list[tuple[str, str, int, str, bytes]],
+    list[str],
+]:
     if (
         _IDENTIFIER.fullmatch(request.operation_id) is None
         or len(request.source_selection_digest) != 32
@@ -101,50 +108,109 @@ def _request(
     ):
         raise ModelSourceRefusal("model_source_profile_invalid", "source profile is invalid")
 
-    rows = list(request.files)
+    rows = list(request.roster)
     if not 1 <= len(rows) <= weights_limits.MAX_MODEL_SOURCE_FILES:
         raise ModelSourceRefusal("model_source_file_count", "source file count is invalid")
     if [row.member for row in rows] != sorted({row.member for row in rows}):
         raise ModelSourceRefusal("model_source_file_order", "source files are not sorted")
 
-    files: list[tuple[str, str, int, str]] = []
+    # The roster names every selected member; only the ones the supervisor says have LANDED
+    # have bytes on disk. A member still in flight is a normal, expected row here — checking
+    # its carrier would refuse the very ask this RPC exists to make.
+    landed = list(request.landed)
+    if len(landed) != len(set(landed)) or not set(landed) <= {row.member for row in rows}:
+        raise ModelSourceRefusal(
+            "model_source_landed_invalid", "landed members are not a distinct roster subset"
+        )
+
+    roster: list[tuple[str, str, int, str, bytes]] = []
     paths: set[Path] = set()
     for row in rows:
         path = Path(row.path)
+        header_path = Path(row.header_path)
         if (
             not _member(row.member)
             or _OBJECT_ID.fullmatch(row.object_id) is None
             or row.length <= 0
             or not _printable(row.path, 4096, empty=False)
             or not path.is_absolute()
+            or not _printable(row.header_path, 4096, empty=False)
+            or not header_path.is_absolute()
         ):
             raise ModelSourceRefusal("model_source_file_invalid", "source file fact is invalid")
-        try:
-            resolved = path.resolve(strict=True)
-            metadata = path.lstat()
-        except OSError as exc:
-            raise ModelSourceRefusal(
-                "model_source_file_unavailable", "verified source file is unavailable"
-            ) from exc
-        if (
-            resolved != path
-            or stat.S_ISLNK(metadata.st_mode)
-            or not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_size != row.length
-            or path in paths
-        ):
+        if path in paths:
             raise ModelSourceRefusal(
                 "model_source_file_identity_invalid", "verified source path identity is invalid"
             )
         paths.add(path)
-        files.append((row.member, row.object_id, row.length, str(path)))
-    return profiles, files
+        # The header is always required: a conversion plan is a pure function of the
+        # headers, so every member's header must be readable before ANY carrier can be
+        # converted. It is what the supervisor bought by range before the weights.
+        roster.append((row.member, row.object_id, row.length, str(path), _header(header_path)))
+        if row.member in landed:
+            _landed_carrier(path, row.length)
+    return profiles, roster, landed
+
+
+def _header(path: Path) -> bytes:
+    """One carrier's `u64le length || JSON` prefix, as the supervisor wrote it."""
+
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ModelSourceRefusal(
+            "model_source_header_unavailable", "source header is unavailable"
+        ) from exc
+    if (
+        resolved != path
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or not 8 < metadata.st_size <= _MAX_HEADER_BYTES
+    ):
+        raise ModelSourceRefusal(
+            "model_source_header_invalid", "source header path identity is invalid"
+        )
+    return path.read_bytes()
+
+
+def _landed_carrier(path: Path, length: int) -> None:
+    """A member the supervisor says has landed must really be there, at its exact length."""
+
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ModelSourceRefusal(
+            "model_source_file_unavailable", "verified source file is unavailable"
+        ) from exc
+    if (
+        resolved != path
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size != length
+    ):
+        raise ModelSourceRefusal(
+            "model_source_file_identity_invalid", "verified source path identity is invalid"
+        )
 
 
 def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareModelSourceResult:
-    if not isinstance(value, dict) or not isinstance(value.get("replayed"), bool):
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("replayed"), bool)
+        or not isinstance(value.get("complete"), bool)
+    ):
         raise ModelSourceRefusal(
             "model_source_tensorfs_result_invalid", "TensorFS returned an invalid result"
+        )
+    spent = _spent(request, value.get("spent"))
+    if not value["complete"]:
+        # ADVANCED is not a verdict. Work was converted and durably journalled, the artifact
+        # is still owed carriers, and the supervisor asks again as more of them land. The
+        # spent carriers it may drop now are the whole reason this answer exists.
+        return pb.PrepareModelSourceResult(
+            outcome=pb.MODEL_SOURCE_PREPARE_OUTCOME_ADVANCED, spent=spent
         )
     rows = value.get("sources")
     if not isinstance(rows, list) or len(rows) != len(request.profiles):
@@ -191,7 +257,23 @@ def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareM
             else pb.MODEL_SOURCE_PREPARE_OUTCOME_PREPARED
         ),
         sources=sources,
+        spent=spent,
     )
+
+
+def _spent(request: pb.PrepareModelSourceRequest, value: object) -> list[str]:
+    """Roster members no remaining conversion op will read."""
+
+    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+        raise ModelSourceRefusal(
+            "model_source_tensorfs_result_invalid", "TensorFS returned an invalid spent set"
+        )
+    spent = [name for name in value if isinstance(name, str)]
+    if not set(spent) <= {row.member for row in request.roster}:
+        raise ModelSourceRefusal(
+            "model_source_tensorfs_result_invalid", "TensorFS named a spent member off-roster"
+        )
+    return sorted(spent)
 
 
 def _refused(code: str, detail: str) -> pb.PrepareModelSourceResult:

@@ -1748,6 +1748,10 @@ class Worker:
             result = model_source_prepare.prepare_model_source(
                 request, tensorfs_root=Path(self.options.tensorfs_root or "")
             )
+            # ADVANCED is deliberately absent. Shutdown releases every tracked operation,
+            # and releasing one drops its conversion journal — which for an operation still
+            # taking carriers is exactly the half-finished work the journal exists to keep.
+            # An operation becomes releasable when it has a result to adopt or reject.
             if result.outcome in {
                 pb.MODEL_SOURCE_PREPARE_OUTCOME_PREPARED,
                 pb.MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED,

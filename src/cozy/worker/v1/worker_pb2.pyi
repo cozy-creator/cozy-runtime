@@ -266,6 +266,7 @@ class ModelSourcePrepareOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrappe
     MODEL_SOURCE_PREPARE_OUTCOME_PREPARED: _ClassVar[ModelSourcePrepareOutcome]
     MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED: _ClassVar[ModelSourcePrepareOutcome]
     MODEL_SOURCE_PREPARE_OUTCOME_REFUSED: _ClassVar[ModelSourcePrepareOutcome]
+    MODEL_SOURCE_PREPARE_OUTCOME_ADVANCED: _ClassVar[ModelSourcePrepareOutcome]
 
 class LocalPackageFileState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -466,6 +467,7 @@ MODEL_SOURCE_PREPARE_OUTCOME_UNSPECIFIED: ModelSourcePrepareOutcome
 MODEL_SOURCE_PREPARE_OUTCOME_PREPARED: ModelSourcePrepareOutcome
 MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED: ModelSourcePrepareOutcome
 MODEL_SOURCE_PREPARE_OUTCOME_REFUSED: ModelSourcePrepareOutcome
+MODEL_SOURCE_PREPARE_OUTCOME_ADVANCED: ModelSourcePrepareOutcome
 LOCAL_PACKAGE_FILE_STATE_UNSPECIFIED: LocalPackageFileState
 LOCAL_PACKAGE_FILE_STATE_RECEIVING: LocalPackageFileState
 LOCAL_PACKAGE_FILE_STATE_VERIFIED: LocalPackageFileState
@@ -665,16 +667,18 @@ class PreparePrivatePlacementRequest(_message.Message):
     def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ...) -> None: ...
 
 class LocalModelSourceFile(_message.Message):
-    __slots__ = ("member", "object_id", "length", "path")
+    __slots__ = ("member", "object_id", "length", "path", "header_path")
     MEMBER_FIELD_NUMBER: _ClassVar[int]
     OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
     LENGTH_FIELD_NUMBER: _ClassVar[int]
     PATH_FIELD_NUMBER: _ClassVar[int]
+    HEADER_PATH_FIELD_NUMBER: _ClassVar[int]
     member: str
     object_id: str
     length: int
     path: str
-    def __init__(self, member: _Optional[str] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., path: _Optional[str] = ...) -> None: ...
+    header_path: str
+    def __init__(self, member: _Optional[str] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., path: _Optional[str] = ..., header_path: _Optional[str] = ...) -> None: ...
 
 class ModelSourceProfile(_message.Message):
     __slots__ = ("slot", "profile")
@@ -695,32 +699,36 @@ class PreparedModelSource(_message.Message):
     def __init__(self, slot: _Optional[str] = ..., profile: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
 class PrepareModelSourceRequest(_message.Message):
-    __slots__ = ("operation_id", "source_selection_digest", "profiles", "files", "source_uri", "declared_license")
+    __slots__ = ("operation_id", "source_selection_digest", "profiles", "roster", "source_uri", "declared_license", "landed")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PROFILES_FIELD_NUMBER: _ClassVar[int]
-    FILES_FIELD_NUMBER: _ClassVar[int]
+    ROSTER_FIELD_NUMBER: _ClassVar[int]
     SOURCE_URI_FIELD_NUMBER: _ClassVar[int]
     DECLARED_LICENSE_FIELD_NUMBER: _ClassVar[int]
+    LANDED_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     source_selection_digest: bytes
     profiles: _containers.RepeatedCompositeFieldContainer[ModelSourceProfile]
-    files: _containers.RepeatedCompositeFieldContainer[LocalModelSourceFile]
+    roster: _containers.RepeatedCompositeFieldContainer[LocalModelSourceFile]
     source_uri: str
     declared_license: str
-    def __init__(self, operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., files: _Optional[_Iterable[_Union[LocalModelSourceFile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ...) -> None: ...
+    landed: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., roster: _Optional[_Iterable[_Union[LocalModelSourceFile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ..., landed: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class PrepareModelSourceResult(_message.Message):
-    __slots__ = ("outcome", "sources", "safe_code", "safe_detail")
+    __slots__ = ("outcome", "sources", "safe_code", "safe_detail", "spent")
     OUTCOME_FIELD_NUMBER: _ClassVar[int]
     SOURCES_FIELD_NUMBER: _ClassVar[int]
     SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
     SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    SPENT_FIELD_NUMBER: _ClassVar[int]
     outcome: ModelSourcePrepareOutcome
     sources: _containers.RepeatedCompositeFieldContainer[PreparedModelSource]
     safe_code: str
     safe_detail: str
-    def __init__(self, outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+    spent: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., spent: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class RecordOwnerFrame(_message.Message):
     __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "weights_finalize_request", "weights_host_ack", "weights_transfer_request", "weights_read_request", "model_source_file_request", "model_source_prepare_request", "local_package_abort", "weights_upload_request", "local_package_fetch_request")
