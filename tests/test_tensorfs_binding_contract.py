@@ -303,6 +303,55 @@ def test_prepare_model_source_refuses_an_unsorted_profile_set(tmp_path: Path) ->
     assert result.safe_code == "model_source_profile_order"
 
 
+def test_two_members_carrying_one_object_share_one_path_and_are_admitted(
+    tmp_path: Path,
+) -> None:
+    """A content-addressed Store makes member->path NON-injective, and that is correct.
+
+    MiniMax-H3's `FL2VA/transformer/model.safetensors.index.json` and its `Ref2VA/`
+    counterpart are byte-identical, so its 48 selected members admit 47 objects and two
+    members name one file. Run 290 downloaded all 210.3 GB and then refused here, on
+    `model_source_file_identity_invalid`, because the duplicate-path check read a shared
+    path as a fault. It could not fire before tfs-060: those two members had never been
+    fetched, so the pair had never reached this loop.
+    """
+
+    request = _request(tmp_path, operation_id="op-contract-shared")
+    twin = pb.LocalModelSourceFile()
+    twin.CopyFrom(request.files[0])
+    twin.member = "z-second-member.safetensors"
+    request.files.append(twin)
+
+    result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
+
+    # It reaches TensorFS rather than refusing here. The store path is absent, so the
+    # answer is a store refusal -- proof the identity gate passed the shared path.
+    assert result.safe_code != "model_source_file_identity_invalid"
+
+
+def test_two_different_objects_claiming_one_path_are_still_refused(tmp_path: Path) -> None:
+    """The invariant the duplicate-path check actually protects, kept.
+
+    A shared path is legitimate only when the objects agree. Two DIFFERENT object ids on
+    one file is a real fault and must stay a refusal, or the repair above would have
+    widened the gate instead of correcting it.
+    """
+
+    request = _request(tmp_path, operation_id="op-contract-collide")
+    twin = pb.LocalModelSourceFile()
+    twin.CopyFrom(request.files[0])
+    twin.member = "z-second-member.safetensors"
+    twin.object_id = "sha256:" + "0" * 64
+    request.files.append(twin)
+
+    result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
+
+    assert result.safe_code == "model_source_file_identity_invalid"
+    # Which member failed must be in the detail: 48 candidates and one static string is
+    # how run 290 refused after moving 210.3 GB while naming nothing.
+    assert "z-second-member.safetensors" in result.safe_detail
+
+
 def test_prepare_model_source_refuses_a_file_whose_length_is_a_lie(tmp_path: Path) -> None:
     request = _request(tmp_path, operation_id="op-contract-4")
     request.files[0].length += 1
