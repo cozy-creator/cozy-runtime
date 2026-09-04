@@ -93,7 +93,9 @@ CALLED: dict[str, str] = {
     "Store.derived_dispose": "(self, /, transaction_id)",
     # THE ONE THAT BROKE. Four arguments. `repo_cache` exists on tensorfs master as a
     # keyword-only mount point; the Store↔cache binding lane deletes it, and no caller here
-    # threads a path (xs-024 §5).
+    # threads a path (xs-024 §5). A wheel bump past tensorfs#98 therefore turns THIS entry
+    # red before that lane lands — which is the guard working. Re-freeze only after
+    # confirming the four positional arguments still bind, and never by adding a fifth.
     "Store.prepare_model_source": (
         "(self, /, operation_id, source_selection_digest, profiles, files)"
     ),
