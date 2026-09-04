@@ -565,7 +565,27 @@ class PlanChooser:
         ]
         activations, source = self.ledger.activations_for(cell)
         if activations > 0:
-            terms.append(Coefficient("activations", activations, "measured", source))
+            # A MEASUREMENT IS ONLY ENFORCEABLE UNDER THE CONDITIONS IT WAS MEASURED IN
+            # (cr-097). Activation demand is not a constant: kernels expand into the
+            # headroom they are given, so the same model at the same shape measured
+            # 3.91 GiB alone on a 15.6 GiB card and 1.92 GiB with a co-tenant beside it.
+            # A peak observed with MORE room than there is now is an upper bound the
+            # kernels chose, not a requirement they have -- so it may deepen the ladder
+            # (which changes no bits) and it may NOT refuse, exactly like an authored
+            # bound. Enforcing it anyway would evict a co-tenant that did not need
+            # evicting, or refuse an attempt that would have succeeded.
+            basis = self.ledger.activation_basis_free(cell)
+            applies = basis == 0 or basis <= self.ledger.device_free
+            terms.append(
+                Coefficient("activations", activations, "measured", source)
+                if applies
+                else Coefficient(
+                    "activations",
+                    activations,
+                    "bound",
+                    "",
+                )
+            )
         else:
             # No serve has been banked on this generation, so there is no measurement. The
             # authored bound is LABELLED and cannot arm enforcement: an uncalibrated number

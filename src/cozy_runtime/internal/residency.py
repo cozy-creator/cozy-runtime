@@ -339,7 +339,7 @@ class ComponentResidency:
             "vacate_ms": round(took, 2),
         }
 
-    def restore(self, names: tuple[str, ...] = (), envelope: int = 0) -> dict[str, Any]:
+    def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]:
         """RE-FILL what a vacate took, TAKING THE CARD FROM NOBODY (cr-097).
 
         `vacate` had no counterpart, and that asymmetry was the whole defect: a tenant the
@@ -364,13 +364,25 @@ class ComponentResidency:
         for it would be worse than the state it repairs.
         """
         self._require_clean("restore")
-        # THE ENVELOPE IS PASSED IN, NEVER READ OFF `self.headroom` (cr-097). Between
-        # attempts `self.headroom` is whatever the LAST `open_attempt` left — stale, and
-        # zero on a fresh generation — so sizing a fill against it is the same class of
-        # error as reading a fill-inflated peak as a resting requirement, just pointed the
-        # other way. The caller passes the envelope the NEXT attempt will need, so a
-        # restore can never fill this tenant into a state where its own attempt has no
-        # room to run.
+        # THE SAME RULE PREPARE USES, AND DELIBERATELY NO OTHER (cr-097, second cut).
+        #
+        # The first cut gated each component on `size + the attempt's activation envelope`.
+        # That looked careful and was wrong, on measured evidence: the envelope is banked
+        # from a SUCCEEDING serve, and a serve run on an empty card takes more than the same
+        # serve run beside a co-tenant — 3.91 GiB alone against 1.92 GiB co-resident, same
+        # model, same shape. Kernels expand into the headroom they are given (workspace
+        # selection, allocator behaviour); the envelope is an upper bound they CHOSE, not a
+        # requirement they have. Gating on it made restore refuse `unet` by 1.1 GiB forever
+        # and left the tenant at 2x its solo handler time — the exact degradation restore
+        # exists to end.
+        #
+        # So this asks only what PREPARE asks: does the component fit on the card right now,
+        # taking the card from nobody. `constructed` is by definition a set prepare already
+        # held under its authorized ceiling, so restoring back to it can never exceed what
+        # this generation has already been proven to hold; the only thing that changed since
+        # is the co-tenant, and `_fits` measures that directly through the allocator. Prepare
+        # and restore are the same act — putting a generation's weights on a card — and an
+        # act with two different rules was the asymmetry this issue is about.
         wanted = tuple(names) if names else tuple(sorted(self.backend.checkpoints))
         restored: dict[str, int] = {}
         held: dict[str, str] = {}
@@ -383,7 +395,7 @@ class ComponentResidency:
                 held[name] = "this generation has no checkpoint for it"
                 continue
             size = self._size(name)
-            if not self._fits(size + envelope):
+            if not self._fits(size):
                 # Measured, before a byte moves, against the SAME meter admission uses.
                 held[name] = "the device has no room for it without evicting a neighbour"
                 continue
