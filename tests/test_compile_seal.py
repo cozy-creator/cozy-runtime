@@ -79,17 +79,8 @@ def _compile_something() -> None:
     from torch import nn
 
     dynamo.reset()
-
-    class Tiny(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.a = nn.Linear(16, 16)
-            self.b = nn.Linear(16, 16)
-
-        def forward(self, x: object) -> object:
-            return self.b(torch.nn.functional.silu(self.a(x)))
-
-    torch.compile(Tiny().eval(), fullgraph=True)(torch.randn(4, 16))
+    tiny = nn.Sequential(nn.Linear(16, 16), nn.SiLU(), nn.Linear(16, 16)).eval()
+    torch.compile(tiny, fullgraph=True)(torch.randn(4, 16))
 
 
 def _seal_under(imposed: dict[str, str]) -> dict[str, object]:
