@@ -725,7 +725,9 @@ def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
         total = float(reported.group(1))
         legs = {
             name: int(value)
-            for name, value in re.findall(r"(\w+_ms) (\d+)ms", step.split(" [", 1)[1])
+            for name, value in re.findall(
+                r"(\w+_ms) (\d+)ms", step.split(" [", 1)[1].split("]", 1)[0]
+            )
         }
         assert set(legs) == {
             "reserve_ms",
