@@ -103,6 +103,13 @@ class LaneRow:
     supervision: child.ExecutorSupervision | None = None
     #: the lane clock at this tenant's latest admission or prepare: LRU victim order
     last_used: int = 0
+    #: THE LANE RESIDENCY SIGNATURE under which this tenant's last attempt died of a device
+    #: OOM, or "" when it did not (cr-097). A retry under the SAME signature is the same
+    #: request asked twice and cannot get a different answer -- measured as four identical
+    #: 38.3 s failures, each followed by a 25.8 s executor rebuild, while an IDLE co-tenant
+    #: held 6.07 GiB. The arbitration reads it to make the retry a different request, or to
+    #: refuse it typed instead of spending the handler again.
+    oom_signature: str = ""
 
     def resident_bytes(self) -> int:
         return sum(self.ledger.resident.values())
@@ -230,6 +237,16 @@ class DeviceLane:
         eviction order, design §4.6)."""
         held = [(key, row) for key, row in self.holding() if key != slot]
         return sorted(held, key=lambda item: item[1].last_used)
+
+    def residency_signature(self) -> str:
+        """WHO HOLDS WHAT ON THIS LANE, right now, as one comparable word (cr-097).
+
+        The question a retry has to be able to answer: is the device in the same state it
+        was in when the last attempt died? Bytes rather than names, because a co-tenant
+        that vacated half its components changed the answer even though the set of tenants
+        did not.
+        """
+        return ";".join(f"{slot}={row.resident_bytes()}" for slot, row in sorted(self.rows.items()))
 
     def resident_placement_ids(self) -> list[str]:
         """`DeviceLane.resident_placement_ids` (proto-026 / cr-080): the placements of this

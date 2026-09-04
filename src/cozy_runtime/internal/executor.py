@@ -248,6 +248,35 @@ class _CompositeResidency:
             "vacate_ms": round(sum(float(report["vacate_ms"]) for report in reports.values()), 2),
         }
 
+    def restore(self, names: tuple[str, ...] = (), envelope: int = 0) -> dict[str, Any]:
+        """Every slot re-fills what it can without evicting; the reports merge as above."""
+        reports = {
+            name: row.restore(names=names, envelope=envelope)
+            for name, row in sorted(self.rows.items())
+        }
+        prefix = len(reports) > 1
+
+        def keyed(name: str, component: str) -> str:
+            return f"{name}/{component}" if prefix else str(component)
+
+        return {
+            "restored": {
+                keyed(name, component): int(size)
+                for name, report in reports.items()
+                for component, size in report["restored"].items()
+            },
+            "held": {
+                keyed(name, component): str(why)
+                for name, report in reports.items()
+                for component, why in report["held"].items()
+            },
+            "restored_bytes": sum(int(report["restored_bytes"]) for report in reports.values()),
+            "allocator_delta_bytes": sum(
+                int(report["allocator_delta_bytes"]) for report in reports.values()
+            ),
+            "restore_ms": round(sum(float(report["restore_ms"]) for report in reports.values()), 2),
+        }
+
     def document(self) -> dict[str, Any]:
         documents = {name: row.document() for name, row in sorted(self.rows.items())}
         prefix = len(documents) > 1
@@ -2275,6 +2304,47 @@ class Executor:
                 return self._group_refusal(exc, closing=False)
         return {**self.probe(), "vacated": vacated}
 
+    def restore(self, names: tuple[str, ...] = (), envelope: int = 0) -> dict[str, Any]:
+        """RE-FILL what a vacate took, when the card has room for it (cr-097).
+
+        The symmetric half of `vacate`, and it did not exist: a generation the lane emptied
+        stayed empty until something rebuilt the process. The worker calls this between
+        attempts, under the same lane seat, BEFORE it prices the attempt -- so the plan is
+        chosen against the residency the tenant is entitled to rather than against the hole
+        a co-tenant left in it. It evicts nothing; a component that does not fit is simply
+        not restored.
+        """
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if self.torch is None or self.residency is None:
+            return {**self.probe(), "restored": {"restored": {}, "held": {}, "restored_bytes": 0}}
+        from cozy_runtime.internal.residency import ResidencyRefusal
+
+        if self.group is not None:
+            # EVERY RANK RESTORES (cr-068), for the reason every rank vacates: the ranks
+            # hold one plan between them and a partially restored group is not a plan.
+            try:
+                self.group.broadcast({"cmd": "restore", "names": list(names), "envelope": envelope})
+            except GroupRefusal as exc:
+                return self._group_refusal(exc, closing=False)
+        try:
+            restored = self.residency.restore(names=names, envelope=envelope)
+        except ResidencyRefusal as exc:
+            return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
+        accel.synchronize(self.torch, self.device_kind)
+        if self.group is not None:
+            try:
+                for reply in self.group.collect("restore"):
+                    if not reply.get("ok"):
+                        raise GroupRefusal(
+                            f"a follower refused to restore: {reply.get('code')}: "
+                            f"{reply.get('detail', '')}"[:600],
+                            code="group_broken",
+                        )
+            except GroupRefusal as exc:
+                return self._group_refusal(exc, closing=False)
+        return {**self.probe(), "restored": restored}
+
     def probe(self) -> dict[str, Any]:
         if self.torch is None:
             return {"ok": True, "torch": False, "rss_bytes": _rss()}
@@ -2477,7 +2547,9 @@ def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- main
 
 #: What a follower rank answers. It has no worker: rank 0 is its whole control plane.
-_FOLLOWER_COMMANDS = frozenset({"hello", "join", "prepare", "run", "vacate", "probe", "shutdown"})
+_FOLLOWER_COMMANDS = frozenset(
+    {"hello", "join", "prepare", "run", "vacate", "restore", "probe", "shutdown"}
+)
 
 #: A follower's refusal codes rank 0 relays as-is; any other refusal is the group not
 #: forming, named with the follower's own detail.
@@ -2585,6 +2657,11 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.probe()
             elif name == "vacate":
                 reply = executor.vacate()
+            elif name == "restore":
+                reply = executor.restore(
+                    names=tuple(str(n) for n in (command.get("names") or ())),
+                    envelope=int(command.get("envelope", 0)),
+                )
             elif name == "shutdown":
                 if executor.group is not None:
                     executor.group.close()
