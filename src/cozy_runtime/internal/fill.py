@@ -876,6 +876,83 @@ class StagingRing:
 State = Literal["open", "staging", "ready", "poisoned"]
 
 
+class ReadLeases:
+    """Every verified read lease one generation holds, keyed by WHAT A LEASE COVERS.
+
+    A lease is a hold on a SNAPSHOT. The fill plane asks for one per COMPONENT, and the
+    components of a single-snapshot model all read from the same snapshot — so a map keyed
+    by component name made the identical hold be taken once per component. Measured on
+    sdxl: four acquisitions of the same 2,602-object lease, 1091/1104/1160/1257 ms, and
+    10,408 pinned file descriptors for 2,602 distinct objects — against the FD_HEADROOM
+    admission `acquire_cozytensors` performs on its way in (cr-102/cr-103).
+
+    It lives here, apart from the backend, because the backend's constructor measures a
+    device and runs the qualification suite: lease bookkeeping that could only be exercised
+    behind those could only be proved by a fill on a card, and this is arithmetic over a
+    real store that a test can drive directly. A component-per-snapshot binding (cr-008b)
+    still takes one lease per distinct snapshot, which is the point — the key is the
+    snapshot, not the model.
+    """
+
+    def __init__(self, checkpoints: Mapping[str, Checkpoint]) -> None:
+        self.checkpoints = checkpoints
+        self.held: dict[str, Any] = {}
+        #: How many times this generation went to the store. The EFFECT the keying has to
+        #: show, reported rather than asserted about the code: one per distinct manifest.
+        self.acquisitions = 0
+        #: HIGH-WATER, like `pinned`: what was held at the peak, not what is held now. A
+        #: full-resident generation releases at its first commit, so a live count read
+        #: from the prepare facts is always zero and says nothing about the descriptors
+        #: this fill actually spent against FD_HEADROOM.
+        self.peak = {"objects": 0, "bytes": 0}
+
+    def acquire(self, component: str) -> Any:
+        """The lease covering this component's manifest, taken once and reused."""
+        checkpoint = self.checkpoints.get(component)
+        if checkpoint is None:
+            raise _refuse(
+                "destination_absent",
+                f"no checkpoint is bound for component {component!r} (bound: "
+                f"{', '.join(sorted(self.checkpoints)) or 'none'})",
+            )
+        manifest = checkpoint.manifest_id
+        lease = self.held.get(manifest)
+        if lease is None or not lease.live:
+            lease = self.held[manifest] = checkpoint.acquire()
+            self.acquisitions += 1
+            self.peak = {
+                "objects": max(self.peak["objects"], self._objects()),
+                "bytes": max(self.peak["bytes"], self._bytes()),
+            }
+        return lease
+
+    def _objects(self) -> int:
+        return sum(len(one.objects) for one in self.held.values())
+
+    def _bytes(self) -> int:
+        return sum(int(one.bytes) for one in self.held.values())
+
+    def release(self) -> None:
+        """Give every hold back. Idempotent: a poison and a commit may both reach here."""
+        held, self.held = self.held, {}
+        for lease in held.values():
+            if lease is not None and lease.live:
+                lease.release()
+
+    def document(self) -> dict[str, int]:
+        """What this generation leased, in the units the FD_HEADROOM admission is spent in.
+
+        `leases` is what is held right now; `objects` and `bytes` are the peak, because a
+        commit releases and a report of the after state would say a fill leased nothing.
+        """
+        return {
+            "leases": len(self.held),
+            "acquisitions": self.acquisitions,
+            "objects": max(self.peak["objects"], self._objects()),
+            "bytes": max(self.peak["bytes"], self._bytes()),
+        }
+
+
 class StreamingFillBackend:
     """The `author.Backend` implementation that moves real bytes (§1.1's ONE fill path).
 
@@ -953,7 +1030,7 @@ class StreamingFillBackend:
         #: position rather than a heartbeat — a stalled transfer stops moving it, while a
         #: slow one keeps moving it however slowly.
         self.on_position = on_position
-        self.leases: dict[str, Any] = {}
+        self.leases = ReadLeases(self.checkpoints)
         self.state: State = "open"
         self.enqueued: dict[str, Any] = {}
         self.expected: dict[str, frozenset[str]] = {}
@@ -1238,22 +1315,17 @@ class StreamingFillBackend:
         self.expected = {name: frozenset(keys) for name, keys in sets.items()}
         for name in sets:
             self._acquire(name)
-        self.stats["lease_bytes"] = sum(int(v.bytes) for v in self.leases.values())
-        self.stats["lease_objects"] = sum(len(v.objects) for v in self.leases.values())
+        # ONE ROW PER MANIFEST, so these are the objects and bytes actually held rather
+        # than the same snapshot counted once per component that reads from it.
+        held = self.leases.document()
+        self.stats["lease_bytes"] = held["bytes"]
+        self.stats["lease_objects"] = held["objects"]
+        self.stats["lease_acquisitions"] = held["acquisitions"]
+        self.stats["leases"] = held["leases"]
 
     def _acquire(self, component: str) -> Any:
-        """The verified read lease for ONE component, acquired once and reused."""
-        lease = self.leases.get(component)
-        if lease is None or not lease.live:
-            checkpoint = self.checkpoints.get(component)
-            if checkpoint is None:
-                raise _refuse(
-                    "destination_absent",
-                    f"no checkpoint is bound for component {component!r} (bound: "
-                    f"{', '.join(sorted(self.checkpoints)) or 'none'})",
-                )
-            lease = self.leases[component] = checkpoint.acquire()
-        return lease
+        """The verified read lease covering this component's manifest (see `ReadLeases`)."""
+        return self.leases.acquire(component)
 
     def fit(self, walked: Census, *, encoded_leaves: str) -> Mapping[str, object] | None:
         """THE ONE VERDICT (model-code-fit §3): `tensorfs.fit` over the serving census and
@@ -1829,10 +1901,7 @@ class StreamingFillBackend:
         """
         if self.hold_lease:
             return
-        held, self.leases = self.leases, {}
-        for lease in held.values():
-            if lease is not None and lease.live:
-                lease.release()
+        self.leases.release()
 
     def close(self) -> None:
         """End the generation's hold. Called when the executor tears the generation down."""
@@ -1913,8 +1982,10 @@ class StreamingFillBackend:
             member.to_empty(device=self.device, recurse=True)
             _restore_derived(member, self.derived.get(name, {}))
             fresh = census(_Holder({name: member}))
+        reserved = time.perf_counter_ns()
         self.vram_charge[name] = want
         self._acquire(name)
+        leased = time.perf_counter_ns()
         # OUT OF `parked` BEFORE THE FILL. `fill` skips a parked component's destinations —
         # they are on `meta` and have no bytes — so staging while still marked parked
         # enqueues NOTHING and commits an allocation full of whatever was in that memory.
@@ -1925,6 +1996,7 @@ class StreamingFillBackend:
         self.parked.pop(name, None)
         for destination in fresh.destinations:
             self.fill(destination.key, destination.spec, fresh.live[destination.key])
+        enqueued = time.perf_counter_ns()
         expected = self.expected.get(name, frozenset())
         missing = sorted(key for key in expected if key not in self.enqueued)
         if missing:
@@ -1937,17 +2009,30 @@ class StreamingFillBackend:
             )
         self._commit_enqueued()
         self.components[name] = member
-        took = (time.perf_counter_ns() - started) // 1_000_000
+        ended = time.perf_counter_ns()
+        took = (ended - started) // 1_000_000
         # THE SAME SPLIT `prepare` REPORTS (cr-100): `ms` is the whole stage, `stream_ms`
         # is the leg that actually moves bytes to the device — reserve, read, copy, fence.
         # A swap's cost has only ever been inferred from a construction's fill leg, which
         # is a number measured under different conditions; this is the swap's own.
+        #
+        # AND ITS OWN SEGMENT LEDGER (cr-103). cr-100 reported `stream_ms` inside `ms` and
+        # nothing about the difference, so a 9734 ms restore whose fill leg was 716 ms had
+        # 9018 ms nobody could attribute — the same ambiguity `prepare` carried until its
+        # legs were named. These four legs partition `ms`: reserving the device bytes and
+        # walking the re-placed module (`reserve_ms`), taking the read lease (`lease_ms`),
+        # validating each destination against its stored row (`enqueue_ms`), and the copy
+        # itself (`stream_ms`, unchanged and still the tfs-018-comparable number).
         row = {
             "component": name,
             "action": "stage",
             "bytes": want,
             "ms": took,
             "stream_ms": int(self.stats.get("stream_ms", 0)),
+            "reserve_ms": (reserved - started) // 1_000_000,
+            "lease_ms": (leased - reserved) // 1_000_000,
+            "enqueue_ms": (enqueued - leased) // 1_000_000,
+            "commit_ms": (ended - enqueued) // 1_000_000,
         }
         self.stage_log.append(row)
         del self.stage_log[:-64]

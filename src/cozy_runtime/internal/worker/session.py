@@ -4113,10 +4113,26 @@ class Worker:
         # needs on the line that reports the time, not values that die in the reply.
         _stages: tuple[tuple[str, float], ...] = reply["facts"].get("stages") or ()
         if _stages:
+            # The `qualify` leg's PROVENANCE rides the line that reports its duration
+            # (cr-103): "measured" and "reused" are the two shapes that leg has, and a
+            # reader who cannot tell them apart cannot tell a warm pod from a cold one.
+            _q = reply["facts"].get("qualification") or {}
+            # And what the `lease_acquire` leg actually took out: leases held, times it
+            # went to the store, and the objects pinned against FD_HEADROOM. One
+            # acquisition per component was three quarters of that leg on a four-component
+            # single-snapshot model, and no line said so.
+            _l = reply["facts"].get("leases") or {}
             self.note(
                 "boot",
                 f"{placement_id!r} prepare legs: "
-                + ", ".join(f"{name} {ms:.0f}ms" for name, ms in _stages),
+                + ", ".join(f"{name} {ms:.0f}ms" for name, ms in _stages)
+                + (f" [qualification {_q['source']} {_q['key'][:12]}]" if _q else "")
+                + (
+                    f" [{_l['leases']} lease(s) over {_l['objects']} object(s) in "
+                    f"{_l['acquisitions']} acquisition(s)]"
+                    if _l
+                    else ""
+                ),
             )
         _w: tuple[int, ...] = reply["facts"].get("substrate_census") or ()
         if len(_w) == 3 and _w[1]:
@@ -4510,11 +4526,22 @@ class Worker:
             took = float(report.get("restore_ms", 0.0))
             fill_ms = float(report.get("fill_ms", 0.0))
             read = int(report.get("read_bytes", -1))
+            # THE SWAP'S OWN LEGS (cr-103), beside the total they explain — the same
+            # treatment `prepare` got. "9018 ms outside the fill leg" named a duration and
+            # attributed none of it, which is how a restore stayed unexplained across two
+            # issues; these four legs say which part of the re-stage spent it.
+            legs = report.get("legs") or {}
             self.note(
                 "residency",
                 f"{lane.lane_id}: {slot!r} restored {gained} B "
                 f"({', '.join(sorted(restored))}) in {took:.0f} ms — fill leg "
-                f"{fill_ms / 1000:.3f} s, {took - fill_ms:.0f} ms outside it, "
+                f"{fill_ms / 1000:.3f} s, {took - fill_ms:.0f} ms outside it"
+                + (
+                    " [" + ", ".join(f"{name} {int(ms)}ms" for name, ms in legs.items()) + "]"
+                    if legs
+                    else ""
+                )
+                + ", "
                 + (
                     "block-device reads unreadable"
                     if read < 0

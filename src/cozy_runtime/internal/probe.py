@@ -36,16 +36,33 @@ because "mxfp8 works here" is not a fact — "this implementation of mxfp8 works
 4. **record** — the tfs-013 key with the evidence digest of exactly this observation.
 
 The suite QUALIFIES a fixed kernel set; it does not search one. Its seconds are returned as
-an observation. A new Runtime process probes again; Runtime owns no durable fact database.
+an observation.
+
+**The result is KEPT, and this module's first paragraph is now true (cr-103).** It said the
+suite runs once per tuple and persists; the last paragraph said "a new Runtime process
+probes again", and the code did the second thing — 3.2-6.1 s of every model-bearing
+prepare, re-measuring facts about a card and a build that had not moved. `qualified` stores
+one document per `qualification_key` and reuses it when every term of that key matches, so
+the second model on a warm pod pays none of it. It is a CACHE OF A MEASUREMENT, never a
+substitute for one: the key carries the whole device identity (`DeviceFacts` — "every field
+is stable for the life of the machine, which is what lets a probe result be keyed by it"),
+the runtime identity (whose `source_digest` covers this very file, so an edit to a decode
+or to the suite invalidates every document that measured the old one), the exact provider
+implementation digests, and the output dtypes the suite was run over. Anything a stored
+document could be wrong about is a term of the key, and a stored document that does not
+match its own key is discarded.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
+import os
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -1027,6 +1044,178 @@ def _table(result: Mapping[str, Any]) -> Capabilities:
             )
         )
     return caps
+
+
+#: Bumped when a stored document's MEANING changes in a way no other term of the key
+#: catches. Every other term is derived from what was measured, so this exists for the one
+#: case they cannot cover: a change to what this file does with a document it reads back.
+QUALIFICATION_FORMAT = 1
+
+#: How many stored qualifications one cache directory keeps. A document is ~11-33 KB and a
+#: key changes only when the card, the build, the providers or the dtypes do, so this is
+#: not a working-set bound — it is a floor under unbounded growth on a rig that upgrades
+#: its driver every week.
+QUALIFICATION_KEEP = 64
+
+
+@dataclass(frozen=True, slots=True)
+class Qualification:
+    """One admission table, and WHERE IT CAME FROM.
+
+    The provenance is not decoration. A cache whose firing nobody can see is a cache
+    nobody can prove fired, and the whole claim of this change is that it fires on the
+    second prepare — so `source` rides the prepare facts and the worker prints it.
+    """
+
+    capabilities: Capabilities
+    result: dict[str, Any]
+    key: str
+    measured: bool
+    note: str = ""
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "source": "measured" if self.measured else "reused",
+            "suite_ms": int(self.result.get("suite_ms", 0)),
+            "observations": len(self.result.get("observations", ())),
+            "note": self.note,
+        }
+
+
+def qualification_key(
+    providers: Mapping[str, Any],
+    device: DeviceFacts,
+    output_dtypes: Sequence[str],
+    *,
+    runtime: RuntimeIdentity,
+) -> str:
+    """Everything a qualification result depends on, and nothing that it does not.
+
+    * **the device**, whole. `DeviceFacts` exists to be the thing a probe result is keyed
+      by — card, index, NVML configuration (power cap and MIG profile), the REAL driver,
+      the CUDA runtime torch was built against, and the OS/arch. Two "same model" cards at
+      different power caps are not the same measurement subject.
+    * **the runtime**, whole. `source_digest` is over `encoding/`, `instruments.py`,
+      `probe.py` and `resolution.py` as installed, so editing a decode, a leaf forward or
+      this suite changes the key. `torch_build` and `release` ride with it.
+    * **the providers**, by `implementation_digest` — name, route, floor, oracle, roles,
+      code revision and reviewed spec set. An implementation whose arithmetic changed is a
+      different implementation and gets a different key.
+    * **the output dtypes**, because the suite runs per dtype and a document measured over
+      `["bfloat16"]` has nothing to say about a `float16` destination. The match is exact
+      rather than by superset: reusing a wider document would mint records for dtypes this
+      construction never asked about, and a narrower one would silently qualify nothing.
+
+    NOT in the key: free VRAM, host load, the clock, the manifest, the model, the package.
+    None of them can change what the suite measures, and putting any of them in would make
+    the cache miss forever, which is the failure mode that looks exactly like working.
+    """
+    return canonical.digest(
+        {
+            "format": QUALIFICATION_FORMAT,
+            "device": device.document(),
+            "runtime": runtime.document(),
+            "providers": {
+                str(spec): sorted(
+                    implementation_digest(one)
+                    for one in (value if isinstance(value, tuple | list) else (value,))
+                )
+                for spec, value in providers.items()
+            },
+            "output_dtypes": [str(name) for name in output_dtypes],
+        }
+    )
+
+
+def qualified(
+    torch: Any,
+    providers: Mapping[str, Any],
+    device: DeviceFacts,
+    output_dtypes: Sequence[str],
+    *,
+    release: str,
+    runtime: RuntimeIdentity | None = None,
+    cache: str = "",
+) -> Qualification:
+    """The admission table for these inputs, measured once per key and kept.
+
+    `cache` is a DIRECTORY, not a switch: unset means nowhere to keep a result, and the
+    served code path is identical either way — the suite runs, the same table comes back,
+    and nothing is stored. Every filesystem failure is the same outcome as an empty cache,
+    named in `note` and never raised: a rig whose cache directory is unwritable must still
+    serve, and it must not serve a table it did not obtain.
+
+    A stored document is USED only when it carries its own key and that key is the one
+    these inputs produce. The table is then rebuilt from the stored observations by the
+    same `_table` the measured path uses, so a reused qualification and a measured one are
+    the same function of the same evidence.
+    """
+    if runtime is None:
+        runtime = measure_runtime(torch, release)
+    key = qualification_key(providers, device, output_dtypes, runtime=runtime)
+    stored, note = _read_qualification(cache, key)
+    if stored is not None:
+        return Qualification(_table(stored), stored, key, measured=False, note=note)
+    capabilities, result = qualify(
+        torch, providers, device, output_dtypes, release=release, runtime=runtime
+    )
+    return Qualification(
+        capabilities,
+        result,
+        key,
+        measured=True,
+        note=note or _write_qualification(cache, key, result),
+    )
+
+
+def _read_qualification(cache: str, key: str) -> tuple[dict[str, Any] | None, str]:
+    """The stored document for this key, or nothing and the reason there is nothing."""
+    if not cache:
+        return None, "no cache directory"
+    path = Path(cache) / f"{key}.json"
+    try:
+        document = json.loads(path.read_bytes())
+    except FileNotFoundError:
+        return None, ""
+    except (OSError, ValueError) as exc:
+        return None, f"unreadable: {type(exc).__name__}"
+    if not isinstance(document, dict) or document.get("key") != key:
+        # A document that does not carry the key it is filed under is not evidence about
+        # these inputs, whatever it is evidence about.
+        return None, "stored document does not carry its own key"
+    result = document.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("observations"), list):
+        return None, "stored document carries no observations"
+    return result, ""
+
+
+def _write_qualification(cache: str, key: str, result: Mapping[str, Any]) -> str:
+    """Keep this measurement for the next process. Returns why it was not kept, or ""."""
+    if not cache:
+        return "no cache directory"
+    directory = Path(cache)
+    temporary = directory / f".{key}.{os.getpid()}"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps({"key": key, "result": dict(result)}))
+        temporary.chmod(0o600)
+        os.replace(temporary, directory / f"{key}.json")
+        _prune_qualifications(directory)
+    except (OSError, ValueError) as exc:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        return f"not kept: {type(exc).__name__}"
+    return ""
+
+
+def _prune_qualifications(directory: Path) -> None:
+    """Keep the newest `QUALIFICATION_KEEP` documents. Best effort, never fatal."""
+    with contextlib.suppress(OSError):
+        stored = sorted(directory.glob("*.json"), key=lambda one: one.stat().st_mtime)
+        for old in stored[: max(len(stored) - QUALIFICATION_KEEP, 0)]:
+            with contextlib.suppress(OSError):
+                old.unlink()
 
 
 class UnreportableObservation(Exception):

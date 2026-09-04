@@ -119,6 +119,21 @@ def _sealed_entries() -> tuple[str, ...]:
     )
 
 
+def _qualification_cache() -> str:
+    """Where a measured qualification is kept between executors, from the SEAL.
+
+    `COZY_HOME` is already a reviewed imposition — the executor resolves the same CAS as
+    the worker through it — and the worker already keeps node-local caches under it. This
+    is a path, not a switch: an unset or relative value means nowhere to keep a result and
+    the suite simply runs, which is what every executor did before cr-103. The directory
+    is not created here; `probe.qualified` makes it when it has something to keep.
+    """
+    home = _SEALED.get("COZY_HOME", "").strip()
+    if not home or not Path(home).is_absolute():
+        return ""
+    return str(Path(home) / "qualification")
+
+
 def _env_document() -> dict[str, Any]:
     """One coherent post-CUDA seal verdict for an executor reply."""
     changed = _env_changes()
@@ -858,7 +873,7 @@ class Executor:
             tensor_schema_of,
         )
         from cozy_runtime.internal.planfacts import PlanFacts
-        from cozy_runtime.internal.probe import qualify
+        from cozy_runtime.internal.probe import qualified
         from cozy_runtime.internal.residency import ComponentResidency
         from cozy_runtime.internal.resolution import (
             ConstructionFacts,
@@ -970,14 +985,21 @@ class Executor:
         # lane's card, so a multi-GPU pod's records name the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding["release"])
         providers = launch_providers()
-        qualified = qualify(
+        # MEASURED ONCE PER (card, build, providers, dtypes), NOT ONCE PER PREPARE
+        # (cr-103). The decode suite is 3.2-6.1 s of every model-bearing prepare and none
+        # of its inputs change between two models on one warm pod, which is the swap case
+        # exactly. `qualified` keys the result on the whole of what determines it and
+        # keeps it under COZY_HOME; a term that moves is a miss and the suite runs.
+        qualification = qualified(
             torch,
             providers,
             device_facts,
             sorted({dtype_name(r.dtype) for r in rows}),
             release=binding["release"],
             runtime=runtime_identity,
+            cache=_qualification_cache(),
         )
+        qualified_pair = (qualification.capabilities, qualification.result)
         stage("qualify")
         objective = str(binding.get("objective") or "latency")
         model_cls = getattr(self.discovered.module, binding["model_class"])
@@ -1010,7 +1032,7 @@ class Executor:
                 variants=[reference],
                 rows_for={reference.name: rows},
                 providers=providers,
-                capabilities=qualified[0],
+                capabilities=qualification.capabilities,
                 device=device_facts,
                 runtime=runtime_identity,
                 construction=construction,
@@ -1091,7 +1113,7 @@ class Executor:
             release=binding["release"],
             # The suite already ran, above, to resolve the plan. Running it a second time
             # here would re-measure a device fact that has not changed.
-            qualified=qualified,
+            qualified=qualified_pair,
             forensics_dir=self.fill_forensics_dir,
             custody=str(binding.get("custody", "canonical")),
         )
@@ -1382,6 +1404,10 @@ class Executor:
             # THE SEGMENT LEDGER (cr-102), in execution order. `prepare_ms` minus `fill_ms`
             # was a 20s number nobody could attribute; these are the legs that spend it.
             "stages": list(stages) + [(f"construct.{name}", ms) for name, ms in record.stage_ms],
+            # WHERE THE QUALIFY LEG'S ANSWER CAME FROM (cr-103). A cache nobody can see
+            # fire is a cache nobody can prove fires, and "it got faster" is not evidence
+            # on a thermally variable card. `source` says measured or reused, per prepare.
+            "qualification": qualification.document(),
             # THE WEIGHTLESS PROMISE, OBSERVED (cr-102). `serving_substrate` swaps every
             # parameter to `meta` as it is registered; this is the count that says it did.
             # NOT `weightless`: that key already meant "this binding declares no model" on
@@ -1414,6 +1440,12 @@ class Executor:
             "authorized_device_limit_bytes": authorized,
             "rss_bytes": _rss(),
             "pinned": dict(backend.pinned),
+            # WHAT THIS GENERATION HOLDS OPEN (cr-103). `lease_acquire` was 1.9-3.4 s of
+            # the prepare and three quarters of it was the same snapshot leased once per
+            # component; the count is here so the saving is a number an operator reads
+            # rather than a claim, and so the descriptors pinned against FD_HEADROOM are
+            # visible beside the admission that spends them.
+            "leases": backend.leases.document(),
             "store": backend.stats.get("store", {}),
             "gpu_name": accel.device_identity(torch, self.device_kind)["name"],
             "torch_version": torch.__version__,
