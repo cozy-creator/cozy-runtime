@@ -108,7 +108,12 @@ def _request(
         raise ModelSourceRefusal("model_source_file_order", "source files are not sorted")
 
     files: list[tuple[str, str, int, str]] = []
-    paths: set[Path] = set()
+    # A TensorFS Store is content addressed, so a path is an OBJECT's identity, never a
+    # member's: two members carrying identical bytes resolve to one file and MUST. H3's
+    # FL2VA and Ref2VA transformer indexes are byte-identical, so its 48 members admit 47
+    # objects. What a duplicate path can still prove is a real fault -- two DIFFERENT
+    # objects claiming one file -- so the path is checked against the object it carries.
+    paths: dict[Path, str] = {}
     for row in rows:
         path = Path(row.path)
         if (
@@ -131,12 +136,11 @@ def _request(
             or stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISREG(metadata.st_mode)
             or metadata.st_size != row.length
-            or path in paths
+            or paths.setdefault(path, row.object_id) != row.object_id
         ):
             raise ModelSourceRefusal(
                 "model_source_file_identity_invalid", "verified source path identity is invalid"
             )
-        paths.add(path)
         files.append((row.member, row.object_id, row.length, str(path)))
     return profiles, files
 
