@@ -1741,7 +1741,7 @@ class WeightsObjectSource(_message.Message):
     def __init__(self, object_id: _Optional[str] = ..., length: _Optional[int] = ..., source_ref: _Optional[str] = ...) -> None: ...
 
 class WeightsIntentFrame(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "tensorfs_declaration_digest", "requested_writer_epoch", "tensorfs_declaration_canonical_bytes")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "tensorfs_declaration_digest", "requested_writer_epoch", "tensorfs_declaration_canonical_bytes", "weights_transaction_id")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1752,6 +1752,7 @@ class WeightsIntentFrame(_message.Message):
     TENSORFS_DECLARATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     REQUESTED_WRITER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     TENSORFS_DECLARATION_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -1762,7 +1763,8 @@ class WeightsIntentFrame(_message.Message):
     tensorfs_declaration_digest: bytes
     requested_writer_epoch: int
     tensorfs_declaration_canonical_bytes: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., requested_writer_epoch: _Optional[int] = ..., tensorfs_declaration_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+    weights_transaction_id: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., requested_writer_epoch: _Optional[int] = ..., tensorfs_declaration_canonical_bytes: _Optional[bytes] = ..., weights_transaction_id: _Optional[str] = ...) -> None: ...
 
 class WeightsHostAck(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "weights_transaction_id", "writer_epoch", "tensorfs_declaration_digest", "stage", "outcome", "refusal", "weights_receipt", "manifest")
@@ -2275,7 +2277,7 @@ class LocalPackageAbortStatus(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., local_revision_digest: _Optional[bytes] = ..., outcome: _Optional[_Union[LocalPackageAbortOutcome, str]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class WeightsFinalizeRequest(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "invocation_spec_digest", "output_slot", "disposition", "weights_receipt_digest", "scratch_root_id", "owner_authority_scope")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "invocation_spec_digest", "output_slot", "disposition", "weights_receipt_digest", "scratch_root_id", "owner_authority_scope", "invocation_spec_canonical_bytes")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -2286,6 +2288,7 @@ class WeightsFinalizeRequest(_message.Message):
     WEIGHTS_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     SCRATCH_ROOT_ID_FIELD_NUMBER: _ClassVar[int]
     OWNER_AUTHORITY_SCOPE_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -2296,7 +2299,8 @@ class WeightsFinalizeRequest(_message.Message):
     weights_receipt_digest: bytes
     scratch_root_id: str
     owner_authority_scope: str
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., disposition: _Optional[_Union[WeightsFinalizeDisposition, str]] = ..., weights_receipt_digest: _Optional[bytes] = ..., scratch_root_id: _Optional[str] = ..., owner_authority_scope: _Optional[str] = ...) -> None: ...
+    invocation_spec_canonical_bytes: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., disposition: _Optional[_Union[WeightsFinalizeDisposition, str]] = ..., weights_receipt_digest: _Optional[bytes] = ..., scratch_root_id: _Optional[str] = ..., owner_authority_scope: _Optional[str] = ..., invocation_spec_canonical_bytes: _Optional[bytes] = ...) -> None: ...
 
 class WeightsFinalizeResult(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "invocation_spec_digest", "output_slot", "outcome", "weights_receipt", "owner_authority_scope")

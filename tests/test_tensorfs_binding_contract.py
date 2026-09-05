@@ -91,6 +91,7 @@ CALLED: dict[str, str] = {
     "Store.derived_fence": "(self, /, transaction_id, writer_session_id)",
     "Store.derived_abandon": "(self, /, transaction_id)",
     "Store.derived_dispose": "(self, /, transaction_id)",
+    "Store.derived_adopt": "(self, /, transaction_id, scratch_root_id)",
     # The incremental roster/landed seam replaces the full-file barrier in xs-025.
     "Store.prepare_model_source": (
         "(self, /, operation_id, source_selection_digest, profiles, roster, landed, "

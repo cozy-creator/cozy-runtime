@@ -29,8 +29,28 @@ def _decision(request: pb.WeightsFinalizeRequest, owner_scope: str) -> dict[str,
         or not request.request_id
         or len(request.invocation_spec_digest) != 32
         or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", request.output_slot) is None
+        or request.ByteSize() > weights_limits.MAX_INLINE_CONTROL_BYTES
     ):
         raise FinalizationRefusal("weights finalization has an invalid owner/request/spec/slot")
+    if (
+        documents.digest_of(request.invocation_spec_canonical_bytes)
+        != request.invocation_spec_digest
+    ):
+        raise FinalizationRefusal(
+            "weights finalization's original invocation digest does not match"
+        )
+    try:
+        spec = documents.read(request.invocation_spec_canonical_bytes, pb.InvocationSpec)
+    except documents.DocumentError as exc:
+        raise FinalizationRefusal(
+            "weights finalization has no canonical invocation declaration"
+        ) from exc
+    if "job" not in spec or not any(
+        row.get("output_id") == request.output_slot
+        and row.get("mime_type") == "application/vnd.cozy.model-manifest"
+        for row in spec.get("outputs", ())
+    ):
+        raise FinalizationRefusal("weights finalization names no declared model output")
     uncommitted = request.disposition == pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED
     if request.disposition not in {
         pb.WEIGHTS_FINALIZE_DISPOSITION_ADOPT,
@@ -39,16 +59,10 @@ def _decision(request: pb.WeightsFinalizeRequest, owner_scope: str) -> dict[str,
     } or len(request.weights_receipt_digest) != (0 if uncommitted else 32):
         raise FinalizationRefusal("weights finalization has an invalid disposition or receipt")
     if request.disposition == pb.WEIGHTS_FINALIZE_DISPOSITION_ADOPT:
-        expected = "weights-scratch-" + canonical_json.digest(
-            {
-                "format": "cozy.runtime.WeightsScratchRootIdentity/1",
-                "owner_authority_scope": owner_scope,
-                "request_id": request.request_id,
-                "output_slot": request.output_slot,
-            }
-        ).removeprefix("sha256:")
-        if request.scratch_root_id != expected:
-            raise FinalizationRefusal("weights adoption names another private scratch root")
+        # Creator assigns the retention name; TensorFS owns its storage and replay.
+        # Validate its public ASCII-name contract before journaling the decision.
+        if re.fullmatch(r"[A-Za-z0-9_./-]{1,128}", request.scratch_root_id) is None:
+            raise FinalizationRefusal("weights adoption has an invalid private scratch root name")
     elif request.scratch_root_id:
         raise FinalizationRefusal("weights abandonment cannot name an adopted scratch root")
     return {
@@ -117,31 +131,14 @@ def _receipt(
 
 
 def _authorize(
-    request: pb.WeightsFinalizeRequest, attempts: Sequence[AttemptRecord], state: str
+    request: pb.WeightsFinalizeRequest, attempts: Sequence[AttemptRecord], writer_active: bool
 ) -> None:
     matching = [attempt for attempt in attempts if attempt.request_id == request.request_id]
     if any(attempt.state not in {"outcome", "closed"} for attempt in matching):
         raise FinalizationRefusal("weights finalization cannot race an active attempt")
     matching = [attempt for attempt in matching if attempt.digest == request.invocation_spec_digest]
-    if not matching:
-        raise FinalizationRefusal("weights finalization names no recorded terminal invocation")
-    if any(
-        row.get("output_id") == request.output_slot
-        and row.get("mime_type") == "application/vnd.cozy.model-manifest"
-        for attempt in matching
-        for row in attempt.spec.get("outputs", ())
-    ):
-        return
-    # A refusal before canonical decoding has no trusted output declarations and cannot
-    # have opened a writer. Its owner's no-writer cleanup still installs a tombstone:
-    # future late intents for this exact request/spec/slot cannot create one afterwards.
-    if (
-        request.disposition == pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED
-        and state in {"absent", "abandoned"}
-        and all(not attempt.spec and attempt.executions == 0 for attempt in matching)
-    ):
-        return
-    raise FinalizationRefusal("weights finalization names no declared model output")
+    if writer_active and not matching:
+        raise FinalizationRefusal("an existing writer has no matching recorded terminal attempt")
 
 
 def finalize(
@@ -156,6 +153,7 @@ def finalize(
     if not tensorfs_root.is_absolute() or not journal_root.is_absolute():
         raise FinalizationRefusal("weights finalization requires absolute worker storage roots")
     decision = _decision(request, owner_scope)
+    _authorize(request, attempts, False)
     transaction_id = weights_sink.weights_transaction_id(
         owner_scope,
         request.request_id,
@@ -203,13 +201,8 @@ def finalize(
             raise FinalizationRefusal("weights finalization requires an existing committed receipt")
         committed_receipt = _receipt(request, transaction_id, observed["receipt"])
     if previous is None:
-        _authorize(request, attempts, observed["state"])
+        _authorize(request, attempts, bool(observed.get("writer_session_id")))
         _record(intent, encoded)
-    elif any(
-        attempt.request_id == request.request_id and attempt.state not in {"outcome", "closed"}
-        for attempt in attempts
-    ):
-        raise FinalizationRefusal("weights finalization recovery cannot race an active attempt")
     result = pb.WeightsFinalizeResult(
         request_id=request.request_id,
         invocation_spec_digest=request.invocation_spec_digest,

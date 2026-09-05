@@ -1445,6 +1445,7 @@ class AttemptEngine:
                 return self.weights.intent(
                     attempt,
                     output_slot=output_slot,
+                    transaction_id=str(frame.get("weights_transaction_id", "")),
                     declaration_digest=documents.raw(
                         str(frame.get("tensorfs_declaration_digest", ""))
                     ),

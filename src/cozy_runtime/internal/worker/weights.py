@@ -347,6 +347,7 @@ class WeightsExchange:
         attempt: Any,
         *,
         output_slot: str,
+        transaction_id: str,
         declaration_digest: bytes,
         declaration: bytes,
         requested_writer_epoch: int,
@@ -357,6 +358,9 @@ class WeightsExchange:
             )
         if (
             len(declaration_digest) != 32
+            or not transaction_id.startswith("sha256:")
+            or len(transaction_id) != 71
+            or any(character not in "0123456789abcdef" for character in transaction_id[7:])
             or not declaration
             or len(declaration) > weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
             or hashlib.sha256(declaration).digest() != declaration_digest
@@ -370,6 +374,7 @@ class WeightsExchange:
                 attempt_ordinal=attempt.attempt,
                 invocation_spec_digest=attempt.digest,
                 output_slot=output_slot,
+                weights_transaction_id=transaction_id,
                 tensorfs_declaration_digest=declaration_digest,
                 requested_writer_epoch=requested_writer_epoch,
                 tensorfs_declaration_canonical_bytes=declaration,
@@ -796,6 +801,10 @@ class WeightsExchange:
         elif ack.refusal or not ack.weights_transaction_id or ack.writer_epoch <= 0:
             raise WeightsExchangeError(
                 "weights_host_ack_invalid", "recorded ACK lacks transaction authority"
+            )
+        elif ack.weights_transaction_id != sent.weights_transaction_id:
+            raise WeightsExchangeError(
+                "weights_host_ack_mismatch", "host ACK changed Runtime's supplied transaction id"
             )
         if ack.HasField("weights_receipt") != ack.HasField("manifest"):
             raise WeightsExchangeError(

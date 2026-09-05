@@ -123,7 +123,7 @@ class WeightsTransactionHost:
         writer_session_id: int,
         allowed_sources: Mapping[str, int],
         output_bounds: Mapping[str, int],
-        bind_intent: Callable[[str, bytes, bytes], WeightsHostBinding] | None = None,
+        bind_intent: Callable[[str, str, bytes, bytes], WeightsHostBinding] | None = None,
         record_receipt: Callable[[WeightsReceipt], None] | None = None,
     ) -> None:
         if (
@@ -181,7 +181,7 @@ class WeightsTransactionHost:
         declaration = canonical_json.encode(expected_declaration)
         declaration_digest = hashlib.sha256(declaration).digest()
         binding = (
-            self.bind_intent(request.output_slot, declaration_digest, declaration)
+            self.bind_intent(request.output_slot, transaction_id, declaration_digest, declaration)
             if self.bind_intent is not None
             else WeightsHostBinding(transaction_id, self.writer_session_id)
         )
@@ -559,7 +559,7 @@ class OpenedWeightsTransaction:
 def weights_transaction_id(
     owner_scope: str, request_id: str, invocation_spec_digest: str, output_slot: str
 ) -> str:
-    """One identity shared by writer creation and owner-directed finalization."""
+    """Runtime alone assigns this ID for creation and finalization; hosts record and echo it."""
     subject = canonical_json.encode(
         {
             "owner_authority_scope": owner_scope,
@@ -568,7 +568,7 @@ def weights_transaction_id(
             "output_slot": output_slot,
         }
     )
-    return "sha256:" + hashlib.sha256(b"cozy.runtime.weights-transaction\0" + subject).hexdigest()
+    return "sha256:" + hashlib.sha256(b"cozy.runtime.artifact-transaction\0" + subject).hexdigest()
 
 
 def protocol_receipt(

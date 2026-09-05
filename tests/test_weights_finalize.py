@@ -9,19 +9,34 @@ from typing import Any
 import pytest
 import tensorfs
 
-from cozy_runtime import canonical_json
 from cozy_runtime.internal import weights_sink
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.weights import WeightsExchange, WeightsExchangeError
 from cozy_runtime.internal.worker.weights_finalize import FinalizationRefusal, finalize
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_derived_config_runtime import _released_source
 
 
 def _request() -> pb.WeightsFinalizeRequest:
+    raw, digest = documents.identity(
+        pb.InvocationSpec(
+            environment_digest="sha256:" + "e" * 64,
+            payload_digest="sha256:" + "d" * 64,
+            outputs=[
+                pb.OutputBinding(
+                    output_id="model",
+                    mime_type="application/vnd.cozy.model-manifest",
+                    max_bytes=1 << 20,
+                )
+            ],
+            job=pb.JobInvocationSpec(build_id="b" * 64, job_descriptor_id="c" * 64),
+        )
+    )
     return pb.WeightsFinalizeRequest(
         request_id="request-finalize",
-        invocation_spec_digest=b"s" * 32,
+        invocation_spec_digest=digest,
+        invocation_spec_canonical_bytes=raw,
         output_slot="model",
         owner_authority_scope="owner",
         disposition=pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED,
@@ -90,14 +105,7 @@ def _committed(tmp_path: Path) -> tuple[pb.WeightsFinalizeRequest, Path, Any]:
     )
     request.disposition = pb.WEIGHTS_FINALIZE_DISPOSITION_ADOPT
     request.weights_receipt_digest = digest
-    request.scratch_root_id = "weights-scratch-" + canonical_json.digest(
-        {
-            "format": "cozy.runtime.WeightsScratchRootIdentity/1",
-            "owner_authority_scope": "owner",
-            "request_id": request.request_id,
-            "output_slot": "model",
-        }
-    ).removeprefix("sha256:")
+    request.scratch_root_id = "creator-retention-name"
     return request, root, store
 
 
@@ -130,10 +138,48 @@ def test_undeclared_slot_and_active_attempt_are_refused_without_a_tombstone(tmp_
     assert store.derived_lookup(_transaction(request))["state"] == "absent"
 
 
+def test_original_declaration_is_verified_after_history_loss(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    request = _request()
+    original = request.invocation_spec_canonical_bytes
+    request.invocation_spec_canonical_bytes = b"{}"
+    with pytest.raises(FinalizationRefusal, match="digest"):
+        _finish(request, root, [])
+    request.invocation_spec_canonical_bytes = original
+    assert _finish(request, root, []).outcome == pb.WEIGHTS_FINALIZE_OUTCOME_ABANDONED
+
+
+def test_history_loss_does_not_authorize_fencing_an_existing_writer(tmp_path: Path) -> None:
+    store, manifest, length = _released_source(tmp_path)
+    request = _request()
+    writer = _writer(store, request, manifest, length)
+    with pytest.raises(FinalizationRefusal, match="existing writer"):
+        _finish(request, tmp_path / "store", [])
+    assert writer.commit()["transaction_id"] == _transaction(request)
+
+
+def test_transaction_identity_matches_the_shared_protocol_vector() -> None:
+    import json
+
+    path = Path(__file__).parent / "testdata/worker-protocol/canonical/weights_receipt.json"
+    row = json.loads(path.read_bytes())
+    actual = weights_sink.weights_transaction_id(
+        row["owner_authority_scope"],
+        row["request_id"],
+        row["invocation_spec_digest"],
+        row["output_slot"],
+    )
+    assert actual == row["weights_transaction_id"]
+
+
 def test_named_adoption_replays_and_conflicting_disposition_cannot_release_it(
     tmp_path: Path,
 ) -> None:
     request, root, store = _committed(tmp_path)
+    request.scratch_root_id = "invalid retention name"
+    with pytest.raises(FinalizationRefusal, match="root name"):
+        _finish(request, root, [_attempt(request)])
+    request.scratch_root_id = "creator-retention-name"
     result = _finish(request, root, [_attempt(request)])
     assert result.outcome == pb.WEIGHTS_FINALIZE_OUTCOME_ADOPTED
     assert result.weights_receipt.weights_receipt_digest == request.weights_receipt_digest
