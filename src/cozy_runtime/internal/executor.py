@@ -2135,13 +2135,14 @@ class Executor:
             invocation_spec_digest = str(command.get("invocation_spec_digest", ""))
 
             def bind_intent(
-                output_slot: str, declaration_digest: bytes, declaration: bytes
+                output_slot: str, transaction_id: str, declaration_digest: bytes, declaration: bytes
             ) -> weights_sink.WeightsHostBinding:
                 weights_sink.write_exchange_file(spool, output_slot, "declaration", declaration)
                 answer = self._durable(
                     "weights_intent",
                     {
                         "output_slot": output_slot,
+                        "weights_transaction_id": transaction_id,
                         "tensorfs_declaration_digest": documents.spell(declaration_digest),
                         "tensorfs_declaration_length": len(declaration),
                         "requested_writer_epoch": 0,

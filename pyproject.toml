@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.2.20"
+version = "0.2.21"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
@@ -29,7 +29,7 @@ dev = [
     "pytest>=8.4",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.3.7,<0.3.8",
+    "tensorfs>=0.3.8,<0.3.9",
     "types-protobuf>=6.30",
     "av>=18.1,<19",
     # `cozy_runtime.derive` is numpy code; the checking venv installs numpy so mypy checks
@@ -155,9 +155,9 @@ media = [
 ]
 # Runtime owns the model byte plane. Local package environments select this complete
 # capability; base worker images provide TensorFS from the same PyPI range.
-# 0.3.8 makes the derived writer's work fingerprint mandatory. This release still
-# uses the 0.3.7 derived signature; its source-checkpoint APIs require that floor.
-model-execution = ["tensorfs>=0.3.7,<0.3.8"]
+# 0.3.8 adds durable named adoption. The following required writer-fingerprint
+# hardcut needs its corresponding Runtime caller update.
+model-execution = ["tensorfs>=0.3.8,<0.3.9"]
 
 [[tool.mypy.overrides]]
 # grpcio ships no type information; the stub module is generated.

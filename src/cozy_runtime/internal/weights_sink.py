@@ -123,7 +123,7 @@ class WeightsTransactionHost:
         writer_session_id: int,
         allowed_sources: Mapping[str, int],
         output_bounds: Mapping[str, int],
-        bind_intent: Callable[[str, bytes, bytes], WeightsHostBinding] | None = None,
+        bind_intent: Callable[[str, str, bytes, bytes], WeightsHostBinding] | None = None,
         record_receipt: Callable[[WeightsReceipt], None] | None = None,
     ) -> None:
         if (
@@ -181,7 +181,7 @@ class WeightsTransactionHost:
         declaration = canonical_json.encode(expected_declaration)
         declaration_digest = hashlib.sha256(declaration).digest()
         binding = (
-            self.bind_intent(request.output_slot, declaration_digest, declaration)
+            self.bind_intent(request.output_slot, transaction_id, declaration_digest, declaration)
             if self.bind_intent is not None
             else WeightsHostBinding(transaction_id, self.writer_session_id)
         )
@@ -308,16 +308,8 @@ class WeightsTransactionHost:
             ) from exc
 
     def transaction_id(self, output_slot: str) -> str:
-        subject = canonical_json.encode(
-            {
-                "owner_authority_scope": self.owner_scope,
-                "request_id": self.request_id,
-                "invocation_spec_digest": self.invocation_spec_digest,
-                "output_slot": output_slot,
-            }
-        )
-        return (
-            "sha256:" + hashlib.sha256(b"cozy.runtime.weights-transaction\0" + subject).hexdigest()
+        return weights_transaction_id(
+            self.owner_scope, self.request_id, self.invocation_spec_digest, output_slot
         )
 
     def fence(self, output_slot: str) -> bool:
@@ -348,11 +340,7 @@ class WeightsTransactionHost:
         return self._wrap(output_slot, transaction_id, facts, replayed=True)
 
     def release(self, output_slot: str) -> WeightsReceipt:
-        """Release a committed transaction root after publication or rejection.
-
-        TensorFS currently has no scratch-root transfer operation.  This is therefore the
-        honest ABANDON path, not an ADOPT implementation.
-        """
+        """Release a committed transaction root after publication or rejection."""
         transaction_id = self.transaction_id(output_slot)
         result = self.store.derived_dispose(transaction_id)
         facts = result.get("receipt") if isinstance(result, dict) else None
@@ -566,6 +554,21 @@ class OpenedWeightsTransaction:
             f"TensorFS {what} refused: {type(cause).__name__}: {cause}{fence_error}",
             code="weights_tensorfs_refused",
         ) from cause
+
+
+def weights_transaction_id(
+    owner_scope: str, request_id: str, invocation_spec_digest: str, output_slot: str
+) -> str:
+    """Runtime alone assigns this ID for creation and finalization; hosts record and echo it."""
+    subject = canonical_json.encode(
+        {
+            "owner_authority_scope": owner_scope,
+            "request_id": request_id,
+            "invocation_spec_digest": invocation_spec_digest,
+            "output_slot": output_slot,
+        }
+    )
+    return "sha256:" + hashlib.sha256(b"cozy.runtime.artifact-transaction\0" + subject).hexdigest()
 
 
 def protocol_receipt(

@@ -212,13 +212,17 @@ def _run_intent(rig: Rig) -> dict[str, Any]:
     result: dict[str, Any] = {}
 
     def call() -> None:
-        result["value"] = rig.exchange.intent(
-            _attempt(),
-            output_slot=OUTPUT_SLOT,
-            declaration_digest=DECLARATION_DIGEST,
-            declaration=DECLARATION,
-            requested_writer_epoch=0,
-        )
+        try:
+            result["value"] = rig.exchange.intent(
+                _attempt(),
+                transaction_id=TRANSACTION,
+                output_slot=OUTPUT_SLOT,
+                declaration_digest=DECLARATION_DIGEST,
+                declaration=DECLARATION,
+                requested_writer_epoch=0,
+            )
+        except weights.WeightsExchangeError as exc:
+            result["error"] = exc
 
     thread = threading.Thread(target=call, daemon=True)
     thread.start()
@@ -237,6 +241,7 @@ def test_open_exchange_selects_the_lane_and_the_ack_settles_after_a_barrier(rig:
     assert intent.record_owner_epoch == rig.fence.record_owner_epoch
     assert intent.control_stream_epoch == rig.fence.control_stream_epoch
     assert intent.tensorfs_declaration_canonical_bytes == DECLARATION
+    assert intent.weights_transaction_id == TRANSACTION
     # The intent went out ON the Exchange and NOT as a WorkerControl frame.
     assert rig.control.frames == []
 
@@ -315,3 +320,19 @@ def test_without_an_exchange_the_intent_rides_worker_control(rig: Rig) -> None:
     pending["thread"].join(WAIT)
     assert not pending["thread"].is_alive(), "the control-lane ACK did not settle the intent"
     assert pending["result"]["value"]["writer_epoch"] == 2
+
+
+def test_host_cannot_replace_the_runtime_supplied_transaction_id(rig: Rig) -> None:
+    supervisor = StandInSupervisor(rig.stub)
+    _await(rig.exchange.exchange_open, "the Exchange did not register as open")
+    pending = _run_intent(rig)
+    intent = supervisor.next_intent()
+    assert intent.weights_transaction_id == TRANSACTION
+    answer = _recorded_ack(intent, writer_epoch=1, envelope=rig.fence)
+    answer.weights_transaction_id = "sha256:" + "b" * 64
+    supervisor.ack(answer)
+    pending["thread"].join(WAIT)
+    assert not pending["thread"].is_alive()
+    assert "value" not in pending["result"]
+    assert pending["result"]["error"].code == "weights_host_ack_mismatch"
+    supervisor.close()
