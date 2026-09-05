@@ -185,7 +185,7 @@ def test_corrupt_head_never_authorizes_members_and_never_exposes_get_capability(
 ) -> None:
     source = tensorfs.Store.ensure(str(tmp_path / "source"))
     subject, objects = _link(source)
-    with _origin() as (base, remote, _requests):
+    with _origin() as (base, remote, requests):
         remote.update(objects)
         remote[subject.head.digest.hex()] = b"wrong bytes"
         req = _transfer(subject, subject.head)
@@ -193,3 +193,5 @@ def test_corrupt_head_never_authorizes_members_and_never_exposes_get_capability(
         result = checkpoint.transfer(req, tensorfs_root=tmp_path / "fresh", allow_local=True)
         assert result.state == pb.WEIGHTS_TRANSFER_STATE_FAILED
         assert "do-not-log" not in str(result)
+        assert ("GET", subject.head.digest.hex()) in requests
+        assert not tensorfs.Store.open(str(tmp_path / "fresh")).contains(subject.head.digest.hex())
