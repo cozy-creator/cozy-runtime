@@ -103,20 +103,22 @@ class ArtifactQuantizationResult(msgspec.Struct):
     tensorfs_receipt_digest: str
     replayed: bool
     encoded_keys: int
+    reused_keys: int
     inherited_keys: int
     source_bytes_read_this_run: int
     new_bytes_written_this_run: int
     saturated_elements_this_run: int
-    worst_relative_frobenius: float
+    worst_relative_frobenius: float | None
     conformance: EncodingConformance
 
 
 class QuantizationStats(msgspec.Struct):
     encoded_keys: int
+    reused_keys: int
     source_bytes_read: int
     new_bytes_written: int
     saturated_elements: int
-    worst_relative_frobenius: float
+    worst_relative_frobenius: float | None
 
 
 class SourcePart(Protocol):
@@ -497,8 +499,14 @@ def quantize_component_into(
     saturated = 0
     worst = 0.0
     total = len(tensors)
+    completed = transaction.completed_parts
+    reused = 0
     for done, tensor in enumerate(tensors, 1):
         ctx.raise_if_cancelled()
+        if all((target_component, tensor.key, role) in completed for role in ("data", "scale")):
+            reused += 1
+            tel.progress(done / total, stage=f"{encoding}-{target_component}")
+            continue
         values, read = _source_values(
             transaction, tensor, source=source, source_component=source_component
         )
@@ -524,10 +532,21 @@ def quantize_component_into(
             or (scale.dtype, scale.shape) != expected_scale
         ):
             raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
-        transaction.add_part(target_component, tensor.key, "data", encoded.payload)
-        transaction.add_part(target_component, tensor.key, "scale", scale.raw)
-        written = len(encoded.payload) + len(scale.raw)
         relative = encoded.relative_frobenius()
+        if payload.max_relative_frobenius is not None and relative > payload.max_relative_frobenius:
+            raise UnsupportedInput(
+                f"{source_component}.{tensor.key}: relative Frobenius {relative:.6f} exceeds "
+                f"the declared tripwire {payload.max_relative_frobenius}",
+                code="quantization_tripwire",
+            )
+        # A role becomes resumable only after every numerical acceptance check. A
+        # half-written group is recomputed; TensorFS accepts only identical role replay.
+        written = 0
+        for role, raw in (("data", encoded.payload), ("scale", scale.raw)):
+            transaction.add_part(target_component, tensor.key, role, raw)
+            if (target_component, tensor.key, role) not in completed:
+                written += len(raw)
+        transaction.checkpoint()
         worst = max(worst, relative)
         source_bytes += read
         new_bytes += written
@@ -544,18 +563,13 @@ def quantize_component_into(
         tel.progress(done / total, stage=f"{encoding}-{target_component}")
         del values, encoded, scale
 
-    if payload.max_relative_frobenius is not None and worst > payload.max_relative_frobenius:
-        raise UnsupportedInput(
-            f"worst per-tensor relative Frobenius {worst:.6f} exceeds the declared "
-            f"tripwire {payload.max_relative_frobenius}",
-            code="quantization_tripwire",
-        )
     return QuantizationStats(
-        encoded_keys=total,
+        encoded_keys=total - reused,
+        reused_keys=reused,
         source_bytes_read=source_bytes,
         new_bytes_written=new_bytes,
         saturated_elements=saturated,
-        worst_relative_frobenius=worst,
+        worst_relative_frobenius=None if reused else worst,
     )
 
 
@@ -741,12 +755,13 @@ def _artifact_quantize(
                 artifact_transaction_id=receipt.weights_transaction_id,
                 tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
                 replayed=True,
-                encoded_keys=len(plan.tensors),
+                encoded_keys=0,
+                reused_keys=len(plan.tensors),
                 inherited_keys=len(plan.order) - len(plan.tensors),
                 source_bytes_read_this_run=0,
                 new_bytes_written_this_run=0,
                 saturated_elements_this_run=0,
-                worst_relative_frobenius=0.0,
+                worst_relative_frobenius=None,
                 conformance=EncodingConformance(
                     True,
                     ["TensorFS replayed the previously committed exact transaction"],
@@ -772,14 +787,20 @@ def _artifact_quantize(
     source_bytes = sum(stat.source_bytes_read for stat in stats)
     new_bytes = sum(stat.new_bytes_written for stat in stats)
     saturated = sum(stat.saturated_elements for stat in stats)
-    worst = max(stat.worst_relative_frobenius for stat in stats)
+    measured = [stat.worst_relative_frobenius for stat in stats]
+    worst = (
+        None
+        if any(value is None for value in measured)
+        else max((value for value in measured if value is not None), default=0.0)
+    )
     tel.metric("quantization.source_bytes", float(source_bytes), unit="bytes")
     tel.metric("quantization.new_bytes", float(new_bytes), unit="bytes")
     return ArtifactQuantizationResult(
         artifact_transaction_id=receipt.weights_transaction_id,
         tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
         replayed=False,
-        encoded_keys=len(plan.tensors),
+        encoded_keys=sum(stat.encoded_keys for stat in stats),
+        reused_keys=sum(stat.reused_keys for stat in stats),
         inherited_keys=len(plan.order) - len(plan.tensors),
         source_bytes_read_this_run=source_bytes,
         new_bytes_written_this_run=new_bytes,

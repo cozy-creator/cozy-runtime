@@ -186,21 +186,23 @@ class WeightsTransactionHost:
         transaction_id = self.transaction_id(request.output_slot)
         targets = {name: self._target(target) for name, target in request.targets.items()}
         configs = {name: self._config(config) for name, config in request.configs.items()}
-        expected_declaration = {
-            "work_fingerprint": self.work_fingerprint,
-            "components": {
-                name: self._locked_target(target)
-                for name, target in sorted(request.targets.items())
-            },
-            "configs": configs,
-            "max_new_bytes": request.max_new_bytes,
-            "order": [list(row) for row in request.order],
-            "sources": {
-                alias: {"manifest": {"sha256": manifest.removeprefix("sha256:"), "length": length}}
-                for alias, (manifest, length) in sources.items()
-            },
-        }
-        declaration = canonical_json.encode(expected_declaration)
+        try:
+            declaration = self.store.derived_declaration(
+                sources,
+                targets,
+                configs,
+                list(request.order),
+                request.max_new_bytes,
+                work_fingerprint=self.work_fingerprint,
+            )
+            if not isinstance(declaration, bytes) or not declaration:
+                raise ValueError("native declaration has no canonical bytes")
+            expected_declaration = canonical_json.decode(declaration)
+        except Exception as exc:
+            raise CapabilityError(
+                f"TensorFS weights declaration refused: {type(exc).__name__}: {exc}",
+                code="weights_tensorfs_refused",
+            ) from exc
         declaration_digest = hashlib.sha256(declaration).digest()
         binding = (
             self.bind_intent(request.output_slot, transaction_id, declaration_digest, declaration)
@@ -237,6 +239,7 @@ class WeightsTransactionHost:
                 request=request,
                 transaction_id=transaction_id,
                 declaration=expected_declaration,
+                declaration_digest=documents.spell(declaration_digest),
                 writer=None,
                 receipt=receipt,
                 writer_epoch=binding.writer_epoch,
@@ -274,6 +277,7 @@ class WeightsTransactionHost:
             request=request,
             transaction_id=transaction_id,
             declaration=expected_declaration,
+            declaration_digest=documents.spell(declaration_digest),
             writer=writer,
             receipt=None,
             writer_epoch=binding.writer_epoch,
@@ -401,31 +405,6 @@ class WeightsTransactionHost:
         return value
 
     @staticmethod
-    def _locked_target(target: WeightsTarget) -> dict[str, Any]:
-        """TensorFS receipt spelling after the Python facade has typed the declaration."""
-        value: dict[str, Any] = {
-            "drop": sorted(target.drop),
-            "add": {
-                key: {
-                    "encoding": tensor.encoding,
-                    "logical": {
-                        "logical_dtype": tensor.logical_dtype,
-                        "shape": list(tensor.shape),
-                    },
-                    "parts": {
-                        role: {"dtype": part.dtype, "shape": list(part.shape)}
-                        for role, part in sorted(tensor.parts.items())
-                    },
-                }
-                for key, tensor in sorted(target.add.items())
-            },
-        }
-        if target.source:
-            value["source"] = target.source
-            value["source_component"] = target.source_component
-        return value
-
-    @staticmethod
     def _config(config: WeightsConfig) -> dict[str, Any]:
         if config.source:
             return {
@@ -491,6 +470,7 @@ class OpenedWeightsTransaction:
         request: WeightsCommit,
         transaction_id: str,
         declaration: object,
+        declaration_digest: str,
         writer: Any,
         receipt: WeightsReceipt | None,
         writer_epoch: int,
@@ -500,6 +480,7 @@ class OpenedWeightsTransaction:
         self.request = request
         self.transaction_id = transaction_id
         self.declaration = declaration
+        self.declaration_digest = declaration_digest
         self.writer = writer
         self.receipt = receipt
         self.replayed = receipt is not None
@@ -571,7 +552,7 @@ class OpenedWeightsTransaction:
                         output_slot=self.request.output_slot,
                         weights_transaction_id=self.transaction_id,
                         writer_epoch=self.writer_epoch,
-                        declaration_digest=canonical_json.digest(self.declaration),
+                        declaration_digest=self.declaration_digest,
                         head=head[0],
                         head_length=head[1],
                         plan_digest=facts["plan_digest"],
