@@ -2608,6 +2608,24 @@ class Worker:
             # The pre-21 upload lane. A supervisor on RuntimeWeights calls Upload unary
             # instead; this frame answer stays for one that has not opened it.
             self.send(self.weights.upload(inner))
+        elif kind == "weights_finalize_request":
+            from . import weights_finalize
+
+            try:
+                result = weights_finalize.finalize(
+                    inner,
+                    owner_scope=self.fence.record_owner_id,
+                    attempts=tuple(self.engine.history.values()),
+                    tensorfs_root=Path(self.options.tensorfs_root or ""),
+                    journal_root=self.root,
+                    on_abandon=self.weights.abandon,
+                )
+            except Exception as exc:
+                self.note(
+                    "artifact", f"weights finalization refused: {type(exc).__name__}: {exc}"[:512]
+                )
+            else:
+                self.send(pb.WorkerFrame(weights_finalize_result=result))
 
     def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:
         """A closed outcome leaves the lane's RELEASED set — a SLOT COUNT change when the
@@ -4937,12 +4955,25 @@ class Worker:
         held = self.engine.history.get((offered.request_id, offered.attempt_ordinal))
         if held is not None and held.state in ("outcome", "closed"):
             held = None
-        attempt = held or AttemptRecord(
-            request_id=offered.request_id,
-            attempt=offered.attempt_ordinal,
-            digest=offered.invocation_spec_digest,
-            spec={},
-        )
+        if held is None:
+            spec: dict[str, Any] = {}
+            if (
+                documents.digest_of(offered.invocation_spec_canonical_bytes)
+                == offered.invocation_spec_digest
+            ):
+                with contextlib.suppress(documents.DocumentError):
+                    spec = documents.read(
+                        offered.invocation_spec_canonical_bytes, pb.InvocationSpec
+                    )
+            attempt = AttemptRecord(
+                request_id=offered.request_id,
+                attempt=offered.attempt_ordinal,
+                digest=offered.invocation_spec_digest,
+                spec=spec,
+                kind="job" if "job" in spec else "serving",
+            )
+        else:
+            attempt = held
         outcome = self.engine.outcome(
             attempt,
             STATUS.OUTCOME_STATUS_REFUSED,

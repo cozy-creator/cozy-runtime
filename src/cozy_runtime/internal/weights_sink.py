@@ -308,16 +308,8 @@ class WeightsTransactionHost:
             ) from exc
 
     def transaction_id(self, output_slot: str) -> str:
-        subject = canonical_json.encode(
-            {
-                "owner_authority_scope": self.owner_scope,
-                "request_id": self.request_id,
-                "invocation_spec_digest": self.invocation_spec_digest,
-                "output_slot": output_slot,
-            }
-        )
-        return (
-            "sha256:" + hashlib.sha256(b"cozy.runtime.weights-transaction\0" + subject).hexdigest()
+        return weights_transaction_id(
+            self.owner_scope, self.request_id, self.invocation_spec_digest, output_slot
         )
 
     def fence(self, output_slot: str) -> bool:
@@ -348,11 +340,7 @@ class WeightsTransactionHost:
         return self._wrap(output_slot, transaction_id, facts, replayed=True)
 
     def release(self, output_slot: str) -> WeightsReceipt:
-        """Release a committed transaction root after publication or rejection.
-
-        TensorFS currently has no scratch-root transfer operation.  This is therefore the
-        honest ABANDON path, not an ADOPT implementation.
-        """
+        """Release a committed transaction root after publication or rejection."""
         transaction_id = self.transaction_id(output_slot)
         result = self.store.derived_dispose(transaction_id)
         facts = result.get("receipt") if isinstance(result, dict) else None
@@ -566,6 +554,21 @@ class OpenedWeightsTransaction:
             f"TensorFS {what} refused: {type(cause).__name__}: {cause}{fence_error}",
             code="weights_tensorfs_refused",
         ) from cause
+
+
+def weights_transaction_id(
+    owner_scope: str, request_id: str, invocation_spec_digest: str, output_slot: str
+) -> str:
+    """One identity shared by writer creation and owner-directed finalization."""
+    subject = canonical_json.encode(
+        {
+            "owner_authority_scope": owner_scope,
+            "request_id": request_id,
+            "invocation_spec_digest": invocation_spec_digest,
+            "output_slot": output_slot,
+        }
+    )
+    return "sha256:" + hashlib.sha256(b"cozy.runtime.weights-transaction\0" + subject).hexdigest()
 
 
 def protocol_receipt(
