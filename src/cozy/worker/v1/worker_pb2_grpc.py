@@ -183,6 +183,16 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceResult.FromString,
                 _registered_method=True)
+        self.SourceCheckpointPage = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/SourceCheckpointPage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.FromString,
+                _registered_method=True)
+        self.SourceCheckpointTransfer = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/SourceCheckpointTransfer',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.FromString,
+                _registered_method=True)
         self.PrepareLocalPackage = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/PrepareLocalPackage',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareLocalPackageRequest.SerializeToString,
@@ -223,6 +233,18 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SourceCheckpointPage(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SourceCheckpointTransfer(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def PrepareLocalPackage(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -252,6 +274,16 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.PrepareModelSource,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceResult.SerializeToString,
+            ),
+            'SourceCheckpointPage': grpc.unary_unary_rpc_method_handler(
+                    servicer.SourceCheckpointPage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.SerializeToString,
+            ),
+            'SourceCheckpointTransfer': grpc.unary_unary_rpc_method_handler(
+                    servicer.SourceCheckpointTransfer,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.SerializeToString,
             ),
             'PrepareLocalPackage': grpc.unary_unary_rpc_method_handler(
                     servicer.PrepareLocalPackage,
@@ -352,6 +384,60 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/PrepareModelSource',
             cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceRequest.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SourceCheckpointPage(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/SourceCheckpointPage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SourceCheckpointTransfer(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/SourceCheckpointTransfer',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -608,6 +694,16 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
                 _registered_method=True)
+        self.SourceCheckpointPage = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/SourceCheckpointPage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.FromString,
+                _registered_method=True)
+        self.SourceCheckpointTransfer = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/SourceCheckpointTransfer',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.FromString,
+                _registered_method=True)
         self.LocalPackageFetch = channel.unary_stream(
                 '/cozy.worker.v1.PodHost/LocalPackageFetch',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFetchCall.SerializeToString,
@@ -683,6 +779,18 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SourceCheckpointPage(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SourceCheckpointTransfer(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def LocalPackageFetch(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -728,6 +836,16 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.ModelSourcePrepare,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.SerializeToString,
+            ),
+            'SourceCheckpointPage': grpc.unary_unary_rpc_method_handler(
+                    servicer.SourceCheckpointPage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.SerializeToString,
+            ),
+            'SourceCheckpointTransfer': grpc.unary_unary_rpc_method_handler(
+                    servicer.SourceCheckpointTransfer,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.SerializeToString,
             ),
             'LocalPackageFetch': grpc.unary_stream_rpc_method_handler(
                     servicer.LocalPackageFetch,
@@ -905,6 +1023,60 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/ModelSourcePrepare',
             cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SourceCheckpointPage(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/SourceCheckpointPage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SourceCheckpointTransfer(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/SourceCheckpointTransfer',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.FromString,
             options,
             channel_credentials,
             insecure,

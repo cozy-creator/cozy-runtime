@@ -154,6 +154,12 @@ class GrpcControlHost:
         model_source_preparer: (
             Callable[[pb.PrepareModelSourceRequest], pb.PrepareModelSourceResult] | None
         ) = None,
+        source_checkpoint_pager: (
+            Callable[[pb.SourceCheckpointPageRequest], pb.SourceCheckpointPageResult] | None
+        ) = None,
+        source_checkpoint_transfer: (
+            Callable[[pb.SourceCheckpointTransferRequest], pb.SourceCheckpointTransferStatus] | None
+        ) = None,
         local_package_preparer: (
             Callable[[pb.PrepareLocalPackageRequest], pb.PreparePackageSetResult] | None
         ) = None,
@@ -170,6 +176,8 @@ class GrpcControlHost:
         self.compatibility_checker = compatibility_checker
         self.preparer = preparer
         self.model_source_preparer = model_source_preparer
+        self.source_checkpoint_pager = source_checkpoint_pager
+        self.source_checkpoint_transfer = source_checkpoint_transfer
         self.local_package_preparer = local_package_preparer
         self.private_placement_preparer = private_placement_preparer
         #: The loopback weights seam (proto-025), served only when a pod supervisor is the
@@ -191,6 +199,8 @@ class GrpcControlHost:
             self.compatibility_checker is not None
             or self.preparer is not None
             or self.model_source_preparer is not None
+            or self.source_checkpoint_pager is not None
+            or self.source_checkpoint_transfer is not None
             or self.local_package_preparer is not None
             or self.private_placement_preparer is not None
             or self.weights is not None
@@ -201,6 +211,8 @@ class GrpcControlHost:
             self.compatibility_checker is not None
             or self.preparer is not None
             or self.model_source_preparer is not None
+            or self.source_checkpoint_pager is not None
+            or self.source_checkpoint_transfer is not None
             or self.local_package_preparer is not None
             or self.private_placement_preparer is not None
         ):
@@ -211,6 +223,8 @@ class GrpcControlHost:
                     self.model_source_preparer,
                     self.local_package_preparer,
                     self.private_placement_preparer,
+                    self.source_checkpoint_pager,
+                    self.source_checkpoint_transfer,
                 ),
                 self.server,
             )
@@ -315,12 +329,40 @@ class _PreparationServicer:
         private_placement_handler: (
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
         ),
+        source_checkpoint_pager: (
+            Callable[[pb.SourceCheckpointPageRequest], pb.SourceCheckpointPageResult] | None
+        ) = None,
+        source_checkpoint_transfer: (
+            Callable[[pb.SourceCheckpointTransferRequest], pb.SourceCheckpointTransferStatus] | None
+        ) = None,
     ) -> None:
         self.compatibility_handler = compatibility_handler
         self.package_handler = package_handler
         self.model_source_handler = model_source_handler
         self.local_package_handler = local_package_handler
         self.private_placement_handler = private_placement_handler
+        self.source_checkpoint_pager = source_checkpoint_pager
+        self.source_checkpoint_transfer = source_checkpoint_transfer
+
+    def SourceCheckpointPage(self, request: pb.SourceCheckpointPageRequest, context: Any) -> Any:
+        if self.source_checkpoint_pager is None:
+            import grpc
+
+            return context.abort(
+                grpc.StatusCode.UNIMPLEMENTED, "source checkpoint page unavailable"
+            )
+        return self.source_checkpoint_pager(request)
+
+    def SourceCheckpointTransfer(
+        self, request: pb.SourceCheckpointTransferRequest, context: Any
+    ) -> Any:
+        if self.source_checkpoint_transfer is None:
+            import grpc
+
+            return context.abort(
+                grpc.StatusCode.UNIMPLEMENTED, "source checkpoint transfer unavailable"
+            )
+        return self.source_checkpoint_transfer(request)
 
     def CheckPackageSetCompatibility(
         self, request: pb.PreparePackageSetRequest, context: Any

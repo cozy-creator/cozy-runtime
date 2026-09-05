@@ -1751,9 +1751,28 @@ class Worker:
             if result.outcome in {
                 pb.MODEL_SOURCE_PREPARE_OUTCOME_PREPARED,
                 pb.MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED,
+                pb.MODEL_SOURCE_PREPARE_OUTCOME_INCOMPLETE,
             }:
                 self.model_source_operations.add(request.operation_id)
             return result
+
+    def source_checkpoint_page(
+        self, request: pb.SourceCheckpointPageRequest
+    ) -> pb.SourceCheckpointPageResult:
+        from . import model_source_checkpoint
+
+        return model_source_checkpoint.page(
+            request, tensorfs_root=Path(self.options.tensorfs_root or "")
+        )
+
+    def source_checkpoint_transfer(
+        self, request: pb.SourceCheckpointTransferRequest
+    ) -> pb.SourceCheckpointTransferStatus:
+        from . import model_source_checkpoint
+
+        return model_source_checkpoint.transfer(
+            request, tensorfs_root=Path(self.options.tensorfs_root or "")
+        )
 
     def release_model_source(self, operation_id: str) -> None:
         """Explicit cooperative cleanup; pod teardown remains the remote durability boundary."""
