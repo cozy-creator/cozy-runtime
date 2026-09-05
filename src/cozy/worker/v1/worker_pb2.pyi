@@ -259,6 +259,7 @@ class ModelSourceFileState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     MODEL_SOURCE_FILE_STATE_DOWNLOADING: _ClassVar[ModelSourceFileState]
     MODEL_SOURCE_FILE_STATE_VERIFIED: _ClassVar[ModelSourceFileState]
     MODEL_SOURCE_FILE_STATE_FAILED: _ClassVar[ModelSourceFileState]
+    MODEL_SOURCE_FILE_STATE_CONVERTED: _ClassVar[ModelSourceFileState]
 
 class ModelSourcePrepareOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -463,6 +464,7 @@ MODEL_SOURCE_FILE_STATE_ACCEPTED: ModelSourceFileState
 MODEL_SOURCE_FILE_STATE_DOWNLOADING: ModelSourceFileState
 MODEL_SOURCE_FILE_STATE_VERIFIED: ModelSourceFileState
 MODEL_SOURCE_FILE_STATE_FAILED: ModelSourceFileState
+MODEL_SOURCE_FILE_STATE_CONVERTED: ModelSourceFileState
 MODEL_SOURCE_PREPARE_OUTCOME_UNSPECIFIED: ModelSourcePrepareOutcome
 MODEL_SOURCE_PREPARE_OUTCOME_PREPARED: ModelSourcePrepareOutcome
 MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED: ModelSourcePrepareOutcome

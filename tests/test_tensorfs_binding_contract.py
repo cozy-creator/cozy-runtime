@@ -94,7 +94,7 @@ CALLED: dict[str, str] = {
     # The incremental roster/landed seam replaces the full-file barrier in xs-025.
     "Store.prepare_model_source": (
         "(self, /, operation_id, source_selection_digest, profiles, roster, landed, "
-        "*, checkpoints=())"
+        "*, checkpoints=Ellipsis)"
     ),
     "Store.release_model_source": "(self, /, operation_id)",
     "Store.source_checkpoint_page": (
@@ -190,8 +190,8 @@ def test_the_signature_check_would_notice_a_deleted_parameter() -> None:
     """The guard's own red arm: prove the comparison detects the exact break it exists for."""
 
     installed = _signature("Store.prepare_model_source")
-    six = installed.replace(", files)", ", files, source_uri, declared_license)")
-    assert six != installed
+    missing_landed = installed.replace(", landed,", ",")
+    assert missing_landed != installed
     assert CALLED["Store.prepare_model_source"] == installed
 
 

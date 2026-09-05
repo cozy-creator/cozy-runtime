@@ -7,9 +7,11 @@ import hashlib
 import io
 import json
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import tensorfs
@@ -22,7 +24,7 @@ def _ref(raw: bytes) -> pb.Ref:
     return pb.Ref(digest=hashlib.sha256(raw).digest(), length=len(raw))
 
 
-def _link(store: object) -> tuple[pb.SourceCheckpointPageRequest, dict[str, bytes]]:
+def _link(store: Any) -> tuple[pb.SourceCheckpointPageRequest, dict[str, bytes]]:
     payloads = [b"first tensor" * 341, b"second tensor" * 257]
     progress = b'{"converter":"opaque-to-transport"}'
     refs = sorted((_ref(raw) for raw in payloads), key=lambda row: row.digest)
@@ -39,7 +41,7 @@ def _link(store: object) -> tuple[pb.SourceCheckpointPageRequest, dict[str, byte
     raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
     objects = {_ref(body).digest.hex(): body for body in [*payloads, progress, raw]}
     for body in objects.values():
-        store.put_reader(io.BytesIO(body))
+        store.put_reader(io.BytesIO(body), _ref(body).digest.hex(), len(body))
     return pb.SourceCheckpointPageRequest(
         operation_id="op-resume",
         source_selection_digest=b"s" * 32,
@@ -51,7 +53,7 @@ def _link(store: object) -> tuple[pb.SourceCheckpointPageRequest, dict[str, byte
 
 
 @contextmanager
-def _origin():
+def _origin() -> Iterator[tuple[str, dict[str, bytes], list[tuple[str, str]]]]:
     objects: dict[str, bytes] = {}
     requests: list[tuple[str, str]] = []
 
