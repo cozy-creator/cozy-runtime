@@ -164,47 +164,47 @@
     },
     "claim": {
       "bytes": 112,
-      "sha256": "5cae5f9d35dbaec823dcbd7bab806a334ec77048f15d5f0e335347291fcf5a42",
+      "sha256": "eab9683105b9c66e52a68781e16bd33888c6e2c851b2009bcd812725eb9c856f",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
     "claim_ack": {
       "bytes": 329,
-      "sha256": "fe67a76bfd0264b79cc5bbed1755694515ec943a3092db469ac31b205bfe5a42",
+      "sha256": "60e5514f188378ef410b2b32f7c6ca57c0f5604a86118077754eba5e2614e2b5",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "claim_ack_base_patched": {
       "bytes": 329,
-      "sha256": "d85ed960e947af93e6f307c6946da78e205bd3f2e06d9ca3a40f4eb401c7810b",
+      "sha256": "d84e38a3032633e243762b69d6a509f0ea0c93285116e46d4e8b219ad0983af5",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "desired_state_job": {
       "bytes": 298,
-      "sha256": "95df38860dcb7a4da111f0e868c167fb008d4c669dd35ef72a0115991cec925f",
+      "sha256": "3c49b8057993cd8681e808635ae3d7ca401adb16b8245719ba3c86cc691994da",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
     "desired_state_local_package_set": {
       "bytes": 293,
-      "sha256": "2404c437ca16d5ff2a04f91356d6aa952f9f1b00c32f77521f7d0b2f62dbb3cf",
+      "sha256": "872b9041a96b7b65f9b9b8e3781f814023721eea0bf7f471d09ac47717e06fb9",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
     "desired_state_package_set": {
       "bytes": 686,
-      "sha256": "d367f74e1adb20d738db2b7e6b946f9d8c762043d0875922f094aaf8d384d39c",
+      "sha256": "730dcb02ef51f13cc3c524316369b27d20964845cc292aeca3f93f0d41059f91",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
     "desired_state_placement_set": {
       "bytes": 2569,
-      "sha256": "6c013096b2be2231d3d82198d52e2b3c317ac9a4260f4f4fa9487df37c50bce8",
+      "sha256": "78d96e25465c419938b67058fcba5b0917b41c8dcd5f1beeecd7bda51b37d4e5",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
     "desired_state_placement_set_pinned": {
       "bytes": 2589,
-      "sha256": "42d4e27018a1cf2d180359f3e0a0857e4c0a686a9039c9681ec68f0f4323f914",
+      "sha256": "969925e496f4efd6717a8c577bac743459a406d86826cb2b0bfa06d87d0055bb",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
     "desired_state_private_placement_set": {
       "bytes": 650,
-      "sha256": "bc080177b5e7130b80ea5bd356258cf85d9047d5c10e3d3ba15ae53d465a3201",
+      "sha256": "af97874a3a5dac42f9b191ca3a43bb059a5cf17088d43aee4c0d5242a2374b9d",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
     "local_package_abandoned": {
@@ -248,13 +248,13 @@
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "model_source_file_request": {
-      "bytes": 349,
-      "sha256": "3fa5183c3643440c0442114913197802e648f41f58a7adb08699e91aa86c6347",
+      "bytes": 488,
+      "sha256": "d3cec4b4732bf089b41dab221ab4bb0939b57f97b3bd3b9e89e91e45e8afbd58",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
     "model_source_file_request_refresh": {
-      "bytes": 394,
-      "sha256": "5b015a63b7d73808d425e1ee8c8a295eb26921003531341c7898c930458aa53a",
+      "bytes": 533,
+      "sha256": "11efea4fe8ae683ba537ea5eb1ff1d78bcac170c9d72b5a1df1e99aa54e4f4db",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
     "model_source_file_retry_progress": {
@@ -277,9 +277,19 @@
       "sha256": "a68da932606c85a661bcdfae4b03c16cf4d2ffd7585b38e88e70fb5b923c2eac",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
+    "model_source_prepare_resume": {
+      "bytes": 325,
+      "sha256": "9a5335ef62f6e374bff0a9fc9794377538a0b04af1c1d8220744a05c532315a8",
+      "type": "cozy.worker.v1.RecordOwnerFrame"
+    },
     "model_source_prepared": {
       "bytes": 243,
       "sha256": "4808ffa32836145079b03b3f11dbeaf6a3e3b45ed8e1a6ee9bb0972b72925273",
+      "type": "cozy.worker.v1.WorkerFrame"
+    },
+    "model_source_prepared_incomplete": {
+      "bytes": 171,
+      "sha256": "4b6355fe6ea88ff3051e40c8a1d915c61d4521837bca5bf0888756431025bbd2",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "model_source_prepared_replay": {
@@ -289,82 +299,82 @@
     },
     "observed_state_acquisition_cold": {
       "bytes": 444,
-      "sha256": "4a2bb39552f33cd1de4c180e5d7f2cec6ec392ffbdba12cb06c5015557df92fd",
+      "sha256": "d01426ed0c056f250355f48af596db1476dfc9de46e518d6dd5934710ea07b98",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_acquisition_partial": {
       "bytes": 353,
-      "sha256": "5ffbb2e0a58df3ebc3423659eb15a029c3522c5bfd9378f687de16341ee05aac",
+      "sha256": "5919f6f003fdddfdd1aa6cf99519aa6b8bffa366a8d3227bc49cf6f07a48fe83",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_acquisition_warm": {
       "bytes": 444,
-      "sha256": "ba1f2f9f0890aa4e8053e69f49de19654361ed21d8c955100dc7d19bf85f51f2",
+      "sha256": "f3cab66d7546b7ea04febe660c046b498f7d4d37f4afb991077d136b936bd1c8",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_activating": {
       "bytes": 324,
-      "sha256": "489a80670381c291bf2c03fb2de1644b2b886645c848fc2ccc6546d084290ad9",
+      "sha256": "a0eaaedf0d3283b675aab8fd99522e09d903ccbae656702bd6fbe45e93915fe0",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_fallback_restored": {
       "bytes": 575,
-      "sha256": "1ec9af1c83c34678d5a85a4dbf8c4ca90315e1ac543d1cf6d29d7e5a99b12218",
+      "sha256": "f433b7abe9fd254d8d97b3500fb77e5c500cf785b120d224b39c34aed5457c62",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_group_lane": {
       "bytes": 442,
-      "sha256": "c708a9f862a7d4d31964b49048e87b9b3c2fa720740856c2fbd5e4530dc929f6",
+      "sha256": "83cd68fb3c061aac81c1bf97ee7bea83334a0c862a5bdecbe67d86952173a1e3",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_job": {
       "bytes": 48,
-      "sha256": "49fd376f61b00b3c8f500a94b7d3f7d593ba85242bb237b5800870bc5e922f4c",
+      "sha256": "3d1b15da901c4a6bdee2e5103081e9bcdb6a5acea6134b17d11edef1f3fd7ffd",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_lane_queue": {
       "bytes": 1329,
-      "sha256": "0991e7d2e015bd78f89c74c569be8cdbd2e3432a5d6ae0d6be3520c2d2733a91",
+      "sha256": "ab850a7ef9aa1c5964f3a8f8611726200ad2f16e3253073a3091cae2e1e4e53f",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_pre_barrier": {
       "bytes": 437,
-      "sha256": "75c135e2fcc266387ff3d5262e75bef0b3392ce1a397bd4844775d7ca17147b9",
+      "sha256": "99dc32aca6f741eb19e77200d7d1dff6584ca3ef18fd4c75f21f3b86149f90fa",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_residency": {
       "bytes": 1051,
-      "sha256": "59ddf7b9e794c62e1e382480d2a3943bf4b03c0ac1a931121ff013e787d36aea",
+      "sha256": "b8b386597e3975f2e75b75535d62514fe7eaebbee6168a964126c6c8ec16940e",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_serving": {
       "bytes": 754,
-      "sha256": "bb02eb9e5f2c402442a9a7e0a76f6c9f169fc61a0114809dbeac47c63c5532ee",
+      "sha256": "c11a4c29c1ca9e172a1498ae0f833d1a3858e54fb9de54cbb5273582dcbdca57",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "observed_state_two_lanes": {
       "bytes": 801,
-      "sha256": "84ac0a649b8249804b95975f309481d399e92faff59f89ab284efe766ef37184",
+      "sha256": "6cb460085ed2f10da1431299779928614f2c1af70f2e06ff6ce009805fa9c660",
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "pod_host_local_package_abort_call": {
       "bytes": 221,
-      "sha256": "91f4c1df3253718493b6bda86431880724566e28a4afd6e9500d5c17a015c29e",
+      "sha256": "ea4b83c48dd709a683ec572dd1b071985da692433d278f59fe8b81e8288a4fb4",
       "type": "cozy.worker.v1.LocalPackageAbortCall"
     },
     "pod_host_local_package_fetch_call": {
       "bytes": 788,
-      "sha256": "c2cab31ef28c3a82fad66e52475690fe985527630cdf52e94c1c326d52b14b4f",
+      "sha256": "f741f118d14f1bbec487355de480c9a994cd823e6e3c9bfffda46b317d00a6bd",
       "type": "cozy.worker.v1.LocalPackageFetchCall"
     },
     "pod_host_model_source_file_call": {
-      "bytes": 458,
-      "sha256": "659b77732f2c2b4aff35ff8245f695924ea83cf419a961572e72dd763e84bb61",
+      "bytes": 597,
+      "sha256": "2a768a59127288b3cb510820df069c9b46e6e8b6c9733bb5082c65903cc80b33",
       "type": "cozy.worker.v1.ModelSourceFileCall"
     },
     "pod_host_model_source_prepare_call": {
       "bytes": 345,
-      "sha256": "62f7fd2b6b012bf2608729fc9220724576077276ac6a3ac82fc897b633c7a954",
+      "sha256": "7a0cb301e0aa0c0506a8569e8edc1045762b35b373222e9ffc6af0d92b4a92f1",
       "type": "cozy.worker.v1.ModelSourcePrepareCall"
     },
     "pod_host_prepare_event_downloading": {
@@ -389,22 +399,32 @@
     },
     "pod_host_prepare_local_package_call": {
       "bytes": 380,
-      "sha256": "cdf4c7e043e63b59c4696e42d6f8ee222b0883c0ae1b384b4ec54996ad2bc521",
+      "sha256": "05140881666dfcdbcdf29e1d678e392d1e8e77c67ee53e98118ff741fd130a18",
       "type": "cozy.worker.v1.PrepareLocalPackageCall"
     },
     "pod_host_prepare_package_set_call": {
       "bytes": 1206,
-      "sha256": "2880485403474e88416a8e85348169c47f493454e8aa6d869af8f746bf0aade2",
+      "sha256": "45f151d8763da0e9b5434030bd16ccdb4aa3bf9ae9f2a8b0594931e6d030e769",
       "type": "cozy.worker.v1.PreparePackageSetCall"
     },
     "pod_host_prepare_private_placement_call": {
       "bytes": 737,
-      "sha256": "c1f0e13be3f81a1ab5f0495fd32cc9ec7e8ef3f30751584716ff7734e13eb1f3",
+      "sha256": "ae4979ba71f03eb0008bdc9ffe811fbf79f10ed06094d99eb338da92608eee4b",
       "type": "cozy.worker.v1.PreparePrivatePlacementCall"
+    },
+    "pod_host_source_checkpoint_page_call": {
+      "bytes": 271,
+      "sha256": "3f7de3f8a1762dcd5b7aa604ea1b7368772e1baf012336a824446d6d1049f7cb",
+      "type": "cozy.worker.v1.SourceCheckpointPageCall"
+    },
+    "pod_host_source_checkpoint_transfer_call": {
+      "bytes": 559,
+      "sha256": "7d89e9723376ec60148337d456916753ed2190b6b0826bae9872d86636de4cbf",
+      "type": "cozy.worker.v1.SourceCheckpointTransferCall"
     },
     "pod_host_weights_transfer_call": {
       "bytes": 897,
-      "sha256": "afde7213a24a6c7ce6b34605d6218fd19e929b1f344d749b65b4e6fe1f1c1640",
+      "sha256": "62c19c2846ca3f0a591c473c3f6065797deb820c9201814e533344acc0e8fd5f",
       "type": "cozy.worker.v1.WeightsTransferCall"
     },
     "prepare_local_package_request": {
@@ -413,13 +433,23 @@
       "type": "cozy.worker.v1.PrepareLocalPackageRequest"
     },
     "prepare_model_source_request": {
-      "bytes": 632,
-      "sha256": "bf20a12446ebff92e09149e41120998a9f25b34a40c387dbae5f3415ca5fea74",
+      "bytes": 777,
+      "sha256": "03c17e43ff6c94d9856700f44b81ced3f421f0ad06d3c724faf12619d19f6083",
+      "type": "cozy.worker.v1.PrepareModelSourceRequest"
+    },
+    "prepare_model_source_request_partial": {
+      "bytes": 864,
+      "sha256": "637b9c858db788a781c3b0bc83716adbe5d92c2afe5a117f902deef3bad4ca3f",
       "type": "cozy.worker.v1.PrepareModelSourceRequest"
     },
     "prepare_model_source_result": {
       "bytes": 163,
       "sha256": "73042afb4947f09e47cfb12cb572e217e9875dd1f3e68ee01669730597ca6c70",
+      "type": "cozy.worker.v1.PrepareModelSourceResult"
+    },
+    "prepare_model_source_result_incomplete": {
+      "bytes": 137,
+      "sha256": "e1a0991f78aa1767c20e883e3f3b6cc04e7166b7543514476ceb530153ea8243",
       "type": "cozy.worker.v1.PrepareModelSourceResult"
     },
     "prepare_model_source_result_refused": {
@@ -461,6 +491,31 @@
       "bytes": 94,
       "sha256": "26978d22adbeeee6e8e9b1b336d857f324537db4ea8fa1db10bae05b313efa4a",
       "type": "cozy.worker.v1.RecordOwnerFrame"
+    },
+    "source_checkpoint_page_request": {
+      "bytes": 158,
+      "sha256": "7d95a3575d539b3858230fe3e9f55f4cc58176b061c88ff70b44f13a114ace01",
+      "type": "cozy.worker.v1.SourceCheckpointPageRequest"
+    },
+    "source_checkpoint_page_result": {
+      "bytes": 282,
+      "sha256": "615d5988312758fbccdedeefd5e0860782451c2a4cdb660c6f4f2c53c988f1d6",
+      "type": "cozy.worker.v1.SourceCheckpointPageResult"
+    },
+    "source_checkpoint_transfer_download": {
+      "bytes": 270,
+      "sha256": "4e1814532331adc56a13c67e8ddd1589ac2d7d97f746e79d4656698aa7fd1421",
+      "type": "cozy.worker.v1.SourceCheckpointTransferRequest"
+    },
+    "source_checkpoint_transfer_held": {
+      "bytes": 296,
+      "sha256": "7ffbfef79279b07b503251d5d50a7ef83bd11dee9622306d8f5fb57d5970ebfc",
+      "type": "cozy.worker.v1.SourceCheckpointTransferStatus"
+    },
+    "source_checkpoint_transfer_upload": {
+      "bytes": 446,
+      "sha256": "3fb5120fcc3b1aab0c2236ddbdf1aa7e507fde961cbd852b85a2a7c74835b9e3",
+      "type": "cozy.worker.v1.SourceCheckpointTransferRequest"
     },
     "weights_finalize_request": {
       "bytes": 166,
@@ -568,5 +623,5 @@
       "type": "cozy.worker.v1.WorkerFrame"
     }
   },
-  "wire_minor": 32
+  "wire_minor": 34
 }

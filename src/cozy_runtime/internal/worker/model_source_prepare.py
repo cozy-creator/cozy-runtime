@@ -1,4 +1,4 @@
-"""Loopback preparation of supervisor-verified foreign model source files.
+"""Loopback conversion of a fixed source roster as verified carriers arrive.
 
 Networking and credentials end in pod-supervisor. Runtime validates the small transport
 shape, then hands the exact logical rows to TensorFS. It neither plans model formats nor
@@ -44,14 +44,16 @@ def prepare_model_source(
             raise ModelSourceRefusal(
                 "model_source_store_invalid", "TensorFS store path is not absolute"
             )
-        profiles, files = _request(request)
+        profiles, roster, landed, checkpoints = _request(request)
         tensorfs = fill.tensorfs_module()
         store = tensorfs.Store.ensure(str(tensorfs_root))
         prepared = store.prepare_model_source(
             request.operation_id,
             documents.spell(bytes(request.source_selection_digest)),
             profiles,
-            files,
+            roster,
+            landed,
+            checkpoints=checkpoints,
         )
         return _result(request, prepared)
     except ModelSourceRefusal as exc:
@@ -89,7 +91,12 @@ def release_model_source(*, tensorfs_root: Path, operation_id: str) -> None:
 
 def _request(
     request: pb.PrepareModelSourceRequest,
-) -> tuple[list[tuple[str, str]], list[tuple[str, str, int, str]]]:
+) -> tuple[
+    list[tuple[str, str]],
+    list[tuple[str, str, int, str, bytes]],
+    list[str],
+    list[tuple[str, str, int]],
+]:
     if (
         _IDENTIFIER.fullmatch(request.operation_id) is None
         or len(request.source_selection_digest) != 32
@@ -117,7 +124,8 @@ def _request(
     if [row.member for row in rows] != sorted({row.member for row in rows}):
         raise ModelSourceRefusal("model_source_file_order", "source files are not sorted")
 
-    files: list[tuple[str, str, int, str]] = []
+    roster: list[tuple[str, str, int, str, bytes]] = []
+    landed: list[str] = []
     # A TensorFS Store is content addressed, so a path is an OBJECT's identity, never a
     # member's: two members carrying identical bytes resolve to one file and MUST. H3's
     # FL2VA and Ref2VA transformer indexes are byte-identical, so its 48 members admit 47
@@ -135,17 +143,18 @@ def _request(
         ):
             raise ModelSourceRefusal("model_source_file_invalid", "source file fact is invalid")
         try:
-            resolved = path.resolve(strict=True)
-            metadata = path.lstat()
+            resolved = path.resolve(strict=row.verified)
+            metadata = path.lstat() if row.verified else None
         except OSError as exc:
             raise ModelSourceRefusal(
-                "model_source_file_unavailable", "verified source file is unavailable"
+                "model_source_file_unavailable", f"source file is unavailable for {row.member}"
             ) from exc
         if (
             resolved != path
-            or stat.S_ISLNK(metadata.st_mode)
-            or not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_size != row.length
+            or (
+                metadata is not None
+                and (not stat.S_ISREG(metadata.st_mode) or metadata.st_size != row.length)
+            )
             or paths.setdefault(path, row.object_id) != row.object_id
         ):
             # The member is named because this gate has 48 candidates on an H3 ingest and
@@ -155,17 +164,72 @@ def _request(
                 "model_source_file_identity_invalid",
                 f"verified source path identity is invalid for {row.member}",
             )
-        files.append((row.member, row.object_id, row.length, str(path)))
-    return profiles, files
+        header = _header(row.header_path, row.member)
+        roster.append((row.member, row.object_id, row.length, str(path), header))
+        if row.verified:
+            landed.append(row.member)
+    slots = {slot for slot, _ in profiles}
+    checkpoints: list[tuple[str, str, int]] = []
+    prior = ""
+    for checkpoint in request.checkpoints:
+        if (
+            checkpoint.slot <= prior
+            or checkpoint.slot not in slots
+            or len(checkpoint.head.digest) != 32
+            or checkpoint.head.length <= 0
+            or len(checkpoint.plan_digest) != 32
+        ):
+            raise ModelSourceRefusal(
+                "model_source_checkpoint_invalid", "source restore checkpoint is invalid"
+            )
+        prior = checkpoint.slot
+        checkpoints.append(
+            (
+                checkpoint.slot,
+                documents.spell(bytes(checkpoint.head.digest)),
+                checkpoint.head.length,
+            )
+        )
+    return profiles, roster, landed, checkpoints
+
+
+def _header(value: str, member: str) -> bytes:
+    path = Path(value)
+    try:
+        if (
+            not _printable(value, 4096, empty=False)
+            or not path.is_absolute()
+            or path.resolve(strict=True) != path
+            or not stat.S_ISREG(path.lstat().st_mode)
+        ):
+            raise ValueError("invalid header path")
+        with path.open("rb") as stream:
+            header = stream.read(weights_limits.MAX_MODEL_SOURCE_HEADER_BYTES + 1)
+        if not 0 < len(header) <= weights_limits.MAX_MODEL_SOURCE_HEADER_BYTES:
+            raise ValueError("header exceeds its byte bound")
+        return header
+    except (OSError, ValueError) as exc:
+        raise ModelSourceRefusal(
+            "model_source_header_invalid", f"source header is unavailable or invalid for {member}"
+        ) from exc
 
 
 def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareModelSourceResult:
-    if not isinstance(value, dict) or not isinstance(value.get("replayed"), bool):
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("replayed"), bool)
+        or not isinstance(value.get("complete"), bool)
+        or (value["replayed"] and not value["complete"])
+    ):
         raise ModelSourceRefusal(
             "model_source_tensorfs_result_invalid", "TensorFS returned an invalid result"
         )
     rows = value.get("sources")
-    if not isinstance(rows, list) or len(rows) != len(request.profiles):
+    if (
+        not isinstance(rows, list)
+        or len(rows) > len(request.profiles)
+        or (value["complete"] and len(rows) != len(request.profiles))
+    ):
         raise ModelSourceRefusal(
             "model_source_tensorfs_result_invalid", "TensorFS returned an incomplete result"
         )
@@ -202,14 +266,73 @@ def _result(request: pb.PrepareModelSourceRequest, value: object) -> pb.PrepareM
                 manifest=pb.Ref(digest=documents.raw(manifest), length=length),
             )
         )
+    checkpoints = _checkpoint_result(value.get("checkpoints"), expected)
+    spent = value.get("spent")
+    members = {row.member for row in request.files}
+    if (
+        not isinstance(spent, list)
+        or any(not isinstance(member, str) or member not in members for member in spent)
+        or spent != sorted(set(spent))
+    ):
+        raise ModelSourceRefusal(
+            "model_source_tensorfs_result_invalid", "TensorFS returned invalid spent carriers"
+        )
     return pb.PrepareModelSourceResult(
         outcome=(
-            pb.MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED
+            pb.MODEL_SOURCE_PREPARE_OUTCOME_INCOMPLETE
+            if not value["complete"]
+            else pb.MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED
             if value["replayed"]
             else pb.MODEL_SOURCE_PREPARE_OUTCOME_PREPARED
         ),
         sources=sources,
+        checkpoints=checkpoints,
+        spent_members=spent,
     )
+
+
+def _checkpoint_result(rows: object, profiles: dict[str, str]) -> list[pb.ModelSourceCheckpoint]:
+    if not isinstance(rows, list) or len(rows) > len(profiles):
+        raise ModelSourceRefusal(
+            "model_source_tensorfs_result_invalid", "TensorFS returned invalid checkpoints"
+        )
+    checkpoints: list[pb.ModelSourceCheckpoint] = []
+    prior = ""
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ModelSourceRefusal(
+                "model_source_tensorfs_result_invalid", "TensorFS returned a malformed checkpoint"
+            )
+        slot, head, plan = row.get("slot"), row.get("head"), row.get("plan_digest")
+        length, index, completed = row.get("head_length"), row.get("index"), row.get("bytes")
+        if (
+            not isinstance(slot, str)
+            or slot <= prior
+            or slot not in profiles
+            or not isinstance(head, str)
+            or _OBJECT_ID.fullmatch(head) is None
+            or not isinstance(plan, str)
+            or _OBJECT_ID.fullmatch(plan) is None
+            or any(
+                type(number) is not int or not 0 <= number < 1 << 64
+                for number in (length, index, completed)
+            )
+            or length == 0
+        ):
+            raise ModelSourceRefusal(
+                "model_source_tensorfs_result_invalid", "TensorFS returned invalid checkpoint facts"
+            )
+        prior = slot
+        checkpoints.append(
+            pb.ModelSourceCheckpoint(
+                slot=slot,
+                head=pb.Ref(digest=documents.raw(head), length=length),
+                plan_digest=documents.raw(plan),
+                index=index,
+                bytes=completed,
+            )
+        )
+    return checkpoints
 
 
 def _refused(code: str, detail: str) -> pb.PrepareModelSourceResult:

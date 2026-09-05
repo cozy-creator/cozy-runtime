@@ -266,6 +266,7 @@ class ModelSourcePrepareOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrappe
     MODEL_SOURCE_PREPARE_OUTCOME_PREPARED: _ClassVar[ModelSourcePrepareOutcome]
     MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED: _ClassVar[ModelSourcePrepareOutcome]
     MODEL_SOURCE_PREPARE_OUTCOME_REFUSED: _ClassVar[ModelSourcePrepareOutcome]
+    MODEL_SOURCE_PREPARE_OUTCOME_INCOMPLETE: _ClassVar[ModelSourcePrepareOutcome]
 
 class LocalPackageFileState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -466,6 +467,7 @@ MODEL_SOURCE_PREPARE_OUTCOME_UNSPECIFIED: ModelSourcePrepareOutcome
 MODEL_SOURCE_PREPARE_OUTCOME_PREPARED: ModelSourcePrepareOutcome
 MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED: ModelSourcePrepareOutcome
 MODEL_SOURCE_PREPARE_OUTCOME_REFUSED: ModelSourcePrepareOutcome
+MODEL_SOURCE_PREPARE_OUTCOME_INCOMPLETE: ModelSourcePrepareOutcome
 LOCAL_PACKAGE_FILE_STATE_UNSPECIFIED: LocalPackageFileState
 LOCAL_PACKAGE_FILE_STATE_RECEIVING: LocalPackageFileState
 LOCAL_PACKAGE_FILE_STATE_VERIFIED: LocalPackageFileState
@@ -553,6 +555,22 @@ class ModelSourcePrepareCall(_message.Message):
     claim: Claim
     request: ModelSourcePrepareRequest
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ...) -> None: ...
+
+class SourceCheckpointPageCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: SourceCheckpointPageRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[SourceCheckpointPageRequest, _Mapping]] = ...) -> None: ...
+
+class SourceCheckpointTransferCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: SourceCheckpointTransferRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[SourceCheckpointTransferRequest, _Mapping]] = ...) -> None: ...
 
 class LocalPackageFetchCall(_message.Message):
     __slots__ = ("claim", "request")
@@ -665,16 +683,20 @@ class PreparePrivatePlacementRequest(_message.Message):
     def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ...) -> None: ...
 
 class LocalModelSourceFile(_message.Message):
-    __slots__ = ("member", "object_id", "length", "path")
+    __slots__ = ("member", "object_id", "length", "path", "header_path", "verified")
     MEMBER_FIELD_NUMBER: _ClassVar[int]
     OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
     LENGTH_FIELD_NUMBER: _ClassVar[int]
     PATH_FIELD_NUMBER: _ClassVar[int]
+    HEADER_PATH_FIELD_NUMBER: _ClassVar[int]
+    VERIFIED_FIELD_NUMBER: _ClassVar[int]
     member: str
     object_id: str
     length: int
     path: str
-    def __init__(self, member: _Optional[str] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., path: _Optional[str] = ...) -> None: ...
+    header_path: str
+    verified: bool
+    def __init__(self, member: _Optional[str] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., path: _Optional[str] = ..., header_path: _Optional[str] = ..., verified: bool = ...) -> None: ...
 
 class ModelSourceProfile(_message.Message):
     __slots__ = ("slot", "profile")
@@ -694,33 +716,191 @@ class PreparedModelSource(_message.Message):
     manifest: Ref
     def __init__(self, slot: _Optional[str] = ..., profile: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
+class ModelSourceCheckpoint(_message.Message):
+    __slots__ = ("slot", "head", "plan_digest", "index", "bytes")
+    SLOT_FIELD_NUMBER: _ClassVar[int]
+    HEAD_FIELD_NUMBER: _ClassVar[int]
+    PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    INDEX_FIELD_NUMBER: _ClassVar[int]
+    BYTES_FIELD_NUMBER: _ClassVar[int]
+    slot: str
+    head: Ref
+    plan_digest: bytes
+    index: int
+    bytes: int
+    def __init__(self, slot: _Optional[str] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., plan_digest: _Optional[bytes] = ..., index: _Optional[int] = ..., bytes: _Optional[int] = ...) -> None: ...
+
+class SourceCheckpointObject(_message.Message):
+    __slots__ = ("ref", "manifest")
+    REF_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    ref: Ref
+    manifest: bool
+    def __init__(self, ref: _Optional[_Union[Ref, _Mapping]] = ..., manifest: bool = ...) -> None: ...
+
+class SourceCheckpointPageRequest(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "slot", "plan_digest", "head", "offset", "limit")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    SLOT_FIELD_NUMBER: _ClassVar[int]
+    PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    HEAD_FIELD_NUMBER: _ClassVar[int]
+    OFFSET_FIELD_NUMBER: _ClassVar[int]
+    LIMIT_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    operation_id: str
+    source_selection_digest: bytes
+    slot: str
+    plan_digest: bytes
+    head: Ref
+    offset: int
+    limit: int
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., slot: _Optional[str] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., offset: _Optional[int] = ..., limit: _Optional[int] = ...) -> None: ...
+
+class SourceCheckpointPageResult(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "slot", "plan_digest", "head", "index", "bytes", "previous", "progress", "objects", "next_offset", "has_more", "safe_code", "safe_detail")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    SLOT_FIELD_NUMBER: _ClassVar[int]
+    PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    HEAD_FIELD_NUMBER: _ClassVar[int]
+    INDEX_FIELD_NUMBER: _ClassVar[int]
+    BYTES_FIELD_NUMBER: _ClassVar[int]
+    PREVIOUS_FIELD_NUMBER: _ClassVar[int]
+    PROGRESS_FIELD_NUMBER: _ClassVar[int]
+    OBJECTS_FIELD_NUMBER: _ClassVar[int]
+    NEXT_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    HAS_MORE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    operation_id: str
+    source_selection_digest: bytes
+    slot: str
+    plan_digest: bytes
+    head: Ref
+    index: int
+    bytes: int
+    previous: Ref
+    progress: Ref
+    objects: _containers.RepeatedCompositeFieldContainer[SourceCheckpointObject]
+    next_offset: int
+    has_more: bool
+    safe_code: str
+    safe_detail: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., slot: _Optional[str] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., index: _Optional[int] = ..., bytes: _Optional[int] = ..., previous: _Optional[_Union[Ref, _Mapping]] = ..., progress: _Optional[_Union[Ref, _Mapping]] = ..., objects: _Optional[_Iterable[_Union[SourceCheckpointObject, _Mapping]]] = ..., next_offset: _Optional[int] = ..., has_more: bool = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+
+class SourceCheckpointTransferRequest(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "slot", "plan_digest", "head", "object", "transfer_id", "grant_revision", "upload_grant", "download_url")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    SLOT_FIELD_NUMBER: _ClassVar[int]
+    PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    HEAD_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_FIELD_NUMBER: _ClassVar[int]
+    TRANSFER_ID_FIELD_NUMBER: _ClassVar[int]
+    GRANT_REVISION_FIELD_NUMBER: _ClassVar[int]
+    UPLOAD_GRANT_FIELD_NUMBER: _ClassVar[int]
+    DOWNLOAD_URL_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    operation_id: str
+    source_selection_digest: bytes
+    slot: str
+    plan_digest: bytes
+    head: Ref
+    object: SourceCheckpointObject
+    transfer_id: str
+    grant_revision: int
+    upload_grant: WeightsUploadGrant
+    download_url: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., slot: _Optional[str] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., object: _Optional[_Union[SourceCheckpointObject, _Mapping]] = ..., transfer_id: _Optional[str] = ..., grant_revision: _Optional[int] = ..., upload_grant: _Optional[_Union[WeightsUploadGrant, _Mapping]] = ..., download_url: _Optional[str] = ...) -> None: ...
+
+class SourceCheckpointTransferStatus(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "slot", "plan_digest", "head", "object", "transfer_id", "grant_revision", "state", "transferred_bytes", "http_status", "checksum_sha256", "safe_code", "safe_detail")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    SLOT_FIELD_NUMBER: _ClassVar[int]
+    PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    HEAD_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_FIELD_NUMBER: _ClassVar[int]
+    TRANSFER_ID_FIELD_NUMBER: _ClassVar[int]
+    GRANT_REVISION_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    TRANSFERRED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    HTTP_STATUS_FIELD_NUMBER: _ClassVar[int]
+    CHECKSUM_SHA256_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    operation_id: str
+    source_selection_digest: bytes
+    slot: str
+    plan_digest: bytes
+    head: Ref
+    object: SourceCheckpointObject
+    transfer_id: str
+    grant_revision: int
+    state: WeightsTransferState
+    transferred_bytes: int
+    http_status: int
+    checksum_sha256: str
+    safe_code: str
+    safe_detail: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., slot: _Optional[str] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., object: _Optional[_Union[SourceCheckpointObject, _Mapping]] = ..., transfer_id: _Optional[str] = ..., grant_revision: _Optional[int] = ..., state: _Optional[_Union[WeightsTransferState, str]] = ..., transferred_bytes: _Optional[int] = ..., http_status: _Optional[int] = ..., checksum_sha256: _Optional[str] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+
 class PrepareModelSourceRequest(_message.Message):
-    __slots__ = ("operation_id", "source_selection_digest", "profiles", "files", "source_uri", "declared_license")
+    __slots__ = ("operation_id", "source_selection_digest", "profiles", "files", "source_uri", "declared_license", "checkpoints")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PROFILES_FIELD_NUMBER: _ClassVar[int]
     FILES_FIELD_NUMBER: _ClassVar[int]
     SOURCE_URI_FIELD_NUMBER: _ClassVar[int]
     DECLARED_LICENSE_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINTS_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     source_selection_digest: bytes
     profiles: _containers.RepeatedCompositeFieldContainer[ModelSourceProfile]
     files: _containers.RepeatedCompositeFieldContainer[LocalModelSourceFile]
     source_uri: str
     declared_license: str
-    def __init__(self, operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., files: _Optional[_Iterable[_Union[LocalModelSourceFile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ...) -> None: ...
+    checkpoints: _containers.RepeatedCompositeFieldContainer[ModelSourceCheckpoint]
+    def __init__(self, operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., files: _Optional[_Iterable[_Union[LocalModelSourceFile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ...) -> None: ...
 
 class PrepareModelSourceResult(_message.Message):
-    __slots__ = ("outcome", "sources", "safe_code", "safe_detail")
+    __slots__ = ("outcome", "sources", "safe_code", "safe_detail", "checkpoints", "spent_members")
     OUTCOME_FIELD_NUMBER: _ClassVar[int]
     SOURCES_FIELD_NUMBER: _ClassVar[int]
     SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
     SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINTS_FIELD_NUMBER: _ClassVar[int]
+    SPENT_MEMBERS_FIELD_NUMBER: _ClassVar[int]
     outcome: ModelSourcePrepareOutcome
     sources: _containers.RepeatedCompositeFieldContainer[PreparedModelSource]
     safe_code: str
     safe_detail: str
-    def __init__(self, outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+    checkpoints: _containers.RepeatedCompositeFieldContainer[ModelSourceCheckpoint]
+    spent_members: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ..., spent_members: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class RecordOwnerFrame(_message.Message):
     __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "weights_finalize_request", "weights_host_ack", "weights_transfer_request", "weights_read_request", "model_source_file_request", "model_source_prepare_request", "local_package_abort", "weights_upload_request", "local_package_fetch_request")
@@ -1891,7 +2071,7 @@ class WeightsTransferStatus(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., weights_transaction_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., grant_revision: _Optional[int] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., update_sequence: _Optional[int] = ..., state: _Optional[_Union[WeightsTransferState, str]] = ..., transferred_bytes: _Optional[int] = ..., http_status: _Optional[int] = ..., etag: _Optional[str] = ..., checksum_sha256: _Optional[str] = ..., attempts: _Optional[int] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class ModelSourceFileRequest(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "member", "object_id", "length", "provider", "url", "expires_at_unix", "capability_revision")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "member", "object_id", "length", "provider", "url", "expires_at_unix", "capability_revision", "header")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1904,6 +2084,7 @@ class ModelSourceFileRequest(_message.Message):
     URL_FIELD_NUMBER: _ClassVar[int]
     EXPIRES_AT_UNIX_FIELD_NUMBER: _ClassVar[int]
     CAPABILITY_REVISION_FIELD_NUMBER: _ClassVar[int]
+    HEADER_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -1916,7 +2097,8 @@ class ModelSourceFileRequest(_message.Message):
     url: str
     expires_at_unix: int
     capability_revision: int
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., member: _Optional[str] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., provider: _Optional[_Union[ModelSourceProvider, str]] = ..., url: _Optional[str] = ..., expires_at_unix: _Optional[int] = ..., capability_revision: _Optional[int] = ...) -> None: ...
+    header: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., member: _Optional[str] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., provider: _Optional[_Union[ModelSourceProvider, str]] = ..., url: _Optional[str] = ..., expires_at_unix: _Optional[int] = ..., capability_revision: _Optional[int] = ..., header: _Optional[bytes] = ...) -> None: ...
 
 class ModelSourceFileStatus(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "member", "object_id", "length", "capability_revision", "state", "transferred_bytes", "attempts", "safe_code", "safe_detail")
@@ -1951,7 +2133,7 @@ class ModelSourceFileStatus(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., member: _Optional[str] = ..., object_id: _Optional[str] = ..., length: _Optional[int] = ..., capability_revision: _Optional[int] = ..., state: _Optional[_Union[ModelSourceFileState, str]] = ..., transferred_bytes: _Optional[int] = ..., attempts: _Optional[int] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class ModelSourcePrepareRequest(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "profiles", "source_uri", "declared_license")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "profiles", "source_uri", "declared_license", "checkpoints")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1960,6 +2142,7 @@ class ModelSourcePrepareRequest(_message.Message):
     PROFILES_FIELD_NUMBER: _ClassVar[int]
     SOURCE_URI_FIELD_NUMBER: _ClassVar[int]
     DECLARED_LICENSE_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINTS_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -1968,10 +2151,11 @@ class ModelSourcePrepareRequest(_message.Message):
     profiles: _containers.RepeatedCompositeFieldContainer[ModelSourceProfile]
     source_uri: str
     declared_license: str
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ...) -> None: ...
+    checkpoints: _containers.RepeatedCompositeFieldContainer[ModelSourceCheckpoint]
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ...) -> None: ...
 
 class ModelSourcePrepared(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "outcome", "sources", "safe_code", "safe_detail")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "outcome", "sources", "safe_code", "safe_detail", "checkpoints")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1981,6 +2165,7 @@ class ModelSourcePrepared(_message.Message):
     SOURCES_FIELD_NUMBER: _ClassVar[int]
     SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
     SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINTS_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -1990,7 +2175,8 @@ class ModelSourcePrepared(_message.Message):
     sources: _containers.RepeatedCompositeFieldContainer[PreparedModelSource]
     safe_code: str
     safe_detail: str
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+    checkpoints: _containers.RepeatedCompositeFieldContainer[ModelSourceCheckpoint]
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ...) -> None: ...
 
 class LocalPackageFileGrant(_message.Message):
     __slots__ = ("digest", "filename", "length", "url")

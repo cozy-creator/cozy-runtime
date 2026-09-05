@@ -91,15 +91,21 @@ CALLED: dict[str, str] = {
     "Store.derived_fence": "(self, /, transaction_id, writer_session_id)",
     "Store.derived_abandon": "(self, /, transaction_id)",
     "Store.derived_dispose": "(self, /, transaction_id)",
-    # THE ONE THAT BROKE. Four arguments. `repo_cache` exists on tensorfs master as a
-    # keyword-only mount point; the Store↔cache binding lane deletes it, and no caller here
-    # threads a path (xs-024 §5). A wheel bump past tensorfs#98 therefore turns THIS entry
-    # red before that lane lands — which is the guard working. Re-freeze only after
-    # confirming the four positional arguments still bind, and never by adding a fifth.
+    # The incremental roster/landed seam replaces the full-file barrier in xs-025.
     "Store.prepare_model_source": (
-        "(self, /, operation_id, source_selection_digest, profiles, files)"
+        "(self, /, operation_id, source_selection_digest, profiles, roster, landed, "
+        "*, checkpoints=())"
     ),
     "Store.release_model_source": "(self, /, operation_id)",
+    "Store.source_checkpoint_page": (
+        "(self, /, head_id, head_length, *, operation_id, slot, plan_digest, offset=0, limit=128)"
+    ),
+    "Store.source_checkpoint_push": (
+        "(self, /, object_id, length, manifest, grant, *, allow_local=False)"
+    ),
+    "Store.source_checkpoint_fetch": (
+        "(self, /, object_id, length, manifest, url, *, allow_local=False)"
+    ),
     "ReadLease.stream": "(self, /, plan, slots, on_batch, readers=4)",
     "ReadLease.read_into": "(self, /, object, object_length, off, length, into)",
     "ReadLease.read_asset": "(self, /, header, name, max_bytes=67108864)",
@@ -238,6 +244,8 @@ def _request(tmp_path: Path, *, operation_id: str) -> pb.PrepareModelSourceReque
                 object_id="sha256:" + hashlib.sha256(data).hexdigest(),
                 length=len(data),
                 path=str(blob),
+                header_path=str(blob),
+                verified=True,
             )
         ],
     )
@@ -379,3 +387,70 @@ def test_prepare_model_source_refuses_a_file_whose_length_is_a_lie(tmp_path: Pat
     result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
 
     assert result.safe_code == "model_source_file_identity_invalid"
+
+
+def test_unverified_payload_need_not_exist_before_header_preflight(tmp_path: Path) -> None:
+    request = _request(tmp_path, operation_id="op-header-first")
+    request.files[0].path = str(tmp_path / "not-downloaded.safetensors")
+    request.files[0].verified = False
+
+    result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
+
+    # The actual TensorFS binding, rather than Runtime path validation, rejects this
+    # deliberately invalid header. No fabricated Store or downloaded payload is involved.
+    assert result.outcome == pb.MODEL_SOURCE_PREPARE_OUTCOME_REFUSED
+    assert result.safe_code.startswith("model_source_tensorfs_"), result.safe_code
+
+
+def test_verified_payload_must_exist_before_conversion(tmp_path: Path) -> None:
+    request = _request(tmp_path, operation_id="op-verified-missing")
+    request.files[0].path = str(tmp_path / "not-downloaded.safetensors")
+
+    result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
+
+    assert result.safe_code == "model_source_file_unavailable"
+
+
+def test_header_bound_is_enforced_before_reading_a_model_sized_file(tmp_path: Path) -> None:
+    from cozy_runtime.protocol import weights_limits
+
+    request = _request(tmp_path, operation_id="op-header-bound")
+    header = tmp_path / "oversized-header"
+    with header.open("wb") as stream:
+        stream.truncate(weights_limits.MAX_MODEL_SOURCE_HEADER_BYTES + 1)
+    request.files[0].header_path = str(header)
+
+    result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "s")
+
+    assert result.safe_code == "model_source_header_invalid"
+
+
+def test_incomplete_result_preserves_checkpoint_and_spent_carriers(tmp_path: Path) -> None:
+    request = _request(tmp_path, operation_id="op-partial-result")
+    result = model_source_prepare._result(
+        request,
+        {
+            "complete": False,
+            "replayed": False,
+            "sources": [],
+            "spent": [request.files[0].member],
+            "checkpoints": [
+                {
+                    "slot": "unet",
+                    "head": "sha256:" + "a" * 64,
+                    "head_length": 512,
+                    "plan_digest": "sha256:" + "b" * 64,
+                    "index": 0,
+                    "bytes": 4096,
+                }
+            ],
+        },
+    )
+    assert result.outcome == pb.MODEL_SOURCE_PREPARE_OUTCOME_INCOMPLETE
+    assert not result.sources
+    assert list(result.spent_members) == [request.files[0].member]
+    assert result.checkpoints[0].head.digest == bytes.fromhex("a" * 64)
+    assert result.checkpoints[0].head.length == 512
+    assert result.checkpoints[0].plan_digest == bytes.fromhex("b" * 64)
+    assert result.checkpoints[0].index == 0
+    assert result.checkpoints[0].bytes == 4096

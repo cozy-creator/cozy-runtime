@@ -109,6 +109,8 @@ def _run(config: WorkerHostConfig) -> int:
     host.compatibility_checker = worker.check_package_set_compatibility
     host.preparer = worker.prepare_package_set
     host.model_source_preparer = worker.prepare_model_source
+    host.source_checkpoint_pager = worker.source_checkpoint_page
+    host.source_checkpoint_transfer = worker.source_checkpoint_transfer
     host.local_package_preparer = worker.prepare_local_package
     host.private_placement_preparer = worker.prepare_private_placement
     # The loopback weights seam (proto-025). The supervisor opens Exchange per control
