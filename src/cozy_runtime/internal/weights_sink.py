@@ -165,20 +165,21 @@ class WeightsTransactionHost:
         transaction_id = self.transaction_id(request.output_slot)
         targets = {name: self._target(target) for name, target in request.targets.items()}
         configs = {name: self._config(config) for name, config in request.configs.items()}
-        expected_declaration = {
-            "components": {
-                name: self._locked_target(target)
-                for name, target in sorted(request.targets.items())
-            },
-            "configs": configs,
-            "max_new_bytes": request.max_new_bytes,
-            "order": [list(row) for row in request.order],
-            "sources": {
-                alias: {"manifest": {"sha256": manifest.removeprefix("sha256:"), "length": length}}
-                for alias, (manifest, length) in sources.items()
-            },
-        }
-        declaration = canonical_json.encode(expected_declaration)
+        try:
+            # TensorFS owns this declaration schema and its canonical bytes. Runtime
+            # carries those exact bytes into the host intent; it does not reconstruct
+            # the native receipt spelling from the Python facade's input spelling.
+            declaration = self.store.derived_declaration(
+                sources, targets, configs, list(request.order), request.max_new_bytes
+            )
+            if not isinstance(declaration, bytes) or not declaration:
+                raise ValueError("native declaration has no canonical bytes")
+            expected_declaration = canonical_json.decode(declaration)
+        except Exception as exc:
+            raise CapabilityError(
+                f"TensorFS weights declaration refused: {type(exc).__name__}: {exc}",
+                code="weights_tensorfs_refused",
+            ) from exc
         declaration_digest = hashlib.sha256(declaration).digest()
         binding = (
             self.bind_intent(request.output_slot, transaction_id, declaration_digest, declaration)
@@ -359,31 +360,6 @@ class WeightsTransactionHost:
                     "logical_dtype": tensor.logical_dtype,
                     "shape": list(tensor.shape),
                     "encoding": tensor.encoding,
-                    "parts": {
-                        role: {"dtype": part.dtype, "shape": list(part.shape)}
-                        for role, part in sorted(tensor.parts.items())
-                    },
-                }
-                for key, tensor in sorted(target.add.items())
-            },
-        }
-        if target.source:
-            value["source"] = target.source
-            value["source_component"] = target.source_component
-        return value
-
-    @staticmethod
-    def _locked_target(target: WeightsTarget) -> dict[str, Any]:
-        """TensorFS receipt spelling after the Python facade has typed the declaration."""
-        value: dict[str, Any] = {
-            "drop": sorted(target.drop),
-            "add": {
-                key: {
-                    "encoding": tensor.encoding,
-                    "logical": {
-                        "logical_dtype": tensor.logical_dtype,
-                        "shape": list(tensor.shape),
-                    },
                     "parts": {
                         role: {"dtype": part.dtype, "shape": list(part.shape)}
                         for role, part in sorted(tensor.parts.items())
