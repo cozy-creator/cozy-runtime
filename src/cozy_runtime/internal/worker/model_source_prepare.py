@@ -79,7 +79,7 @@ def prepare_model_source(
 
 
 def release_model_source(*, tensorfs_root: Path, operation_id: str) -> None:
-    """Explicit local lifecycle cleanup; remote pod absence remains the correctness boundary."""
+    """Release the native operation through its existing lifecycle owner."""
 
     if _IDENTIFIER.fullmatch(operation_id) is None:
         raise ModelSourceRefusal("model_source_operation_invalid", "operation id is invalid")
@@ -87,6 +87,19 @@ def release_model_source(*, tensorfs_root: Path, operation_id: str) -> None:
         raise ModelSourceRefusal("model_source_store_invalid", "TensorFS store path is invalid")
     tensorfs = fill.tensorfs_module()
     tensorfs.Store.open(str(tensorfs_root)).release_model_source(operation_id)
+
+
+def source_operations(*, tensorfs_root: Path) -> list[str]:
+    """Read the native operation inventory; Runtime owns no filesystem scanner."""
+    if not tensorfs_root.is_absolute():
+        raise ModelSourceRefusal("model_source_store_invalid", "TensorFS store path is invalid")
+    try:
+        return list(fill.tensorfs_module().Store.open(str(tensorfs_root)).model_source_operations())
+    except Exception as exc:
+        raise LaunchRefusal(
+            "model_source_inventory_unavailable",
+            "the fixed pod requires a readable TensorFS source-operation inventory",
+        ) from exc
 
 
 def _request(
