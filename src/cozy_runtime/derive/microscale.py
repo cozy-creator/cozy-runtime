@@ -87,9 +87,16 @@ def e4m3_encode(values: np.ndarray) -> np.ndarray:
     v = np.nan_to_num(
         np.asarray(values, dtype=np.float32), nan=0.0, posinf=E4M3_MAX, neginf=-E4M3_MAX
     )
-    mag = np.minimum(np.abs(v).astype(np.float64), E4M3_MAX)
-    idx = _nearest_even(E4M3_MAG, mag)
-    out: np.ndarray = (idx | np.where(np.signbit(v), 0x80, 0x00).astype(np.uint8)).astype(np.uint8)
+    mag = np.minimum(np.abs(v), np.float32(E4M3_MAX))
+    bits = mag.view(np.uint32)
+    # Normal values discard 20 of float32's 23 mantissa bits. Adding half an
+    # ulp minus one, plus the retained LSB, rounds ties to even; carry also
+    # rounds across exponent boundaries. Adjust exponent bias from 127 to 7.
+    rounded = ((bits + np.uint32(0x7FFFF) + ((bits >> 20) & 1)) >> 20) - (120 << 3)
+    # E4M3 subnormals have fixed spacing 2**-9. Multiplication is exact here,
+    # and rint applies the same even-tie rule, including the smallest normal.
+    idx = np.where(mag < np.float32(2.0**-6), np.rint(mag * 512), rounded).astype(np.uint8)
+    out: np.ndarray = idx | (np.signbit(v).astype(np.uint8) << 7)
     return out
 
 
