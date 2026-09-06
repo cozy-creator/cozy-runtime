@@ -23,10 +23,10 @@ class PageUnit:
         for path, module in self.owners:
             prefix = f"{component}.{path}." if path else f"{component}."
             for name, tensor in module.named_parameters(recurse=False, remove_duplicate=False):
-                result[prefix + name] = tensor
+                result[prefix + name] = tensor.detach()
             for name, tensor in module.named_buffers(recurse=False, remove_duplicate=False):
                 if name not in module._non_persistent_buffers_set:
-                    result[prefix + name] = tensor
+                    result[prefix + name] = tensor.detach()
         return result
 
 

@@ -319,11 +319,10 @@ def _check_inplace(name: str, args: tuple[object, ...], seen: Observations) -> N
     registered encoding with a runtime provider (the Marlin-class case), never author
     repacking, which would also desynchronize derive from serve.
 
-    `copy_` is refused unconditionally, and the reason is the substrate rather than a
-    heuristic: under meta parameters EVERY tensor in scope is empty, so a construction-time
-    `copy_` either reads the destination or copies something equally empty. Neither is a
-    fact. (A storage-identity test was tried first and is too weak — `w.copy_(w.t()
-    .contiguous())` breaks the storage link while still reading every value.)
+    `copy_` into a checkpoint destination is refused: a storage-identity test is too
+    weak (`w.copy_(w.t().contiguous())` breaks the link while still reading every value).
+    Non-persistent buffers are derived from config, never filled from a checkpoint; their
+    initialization may finish after registration, as upstream rotary embeddings do.
     """
     import torch
 
@@ -334,8 +333,8 @@ def _check_inplace(name: str, args: tuple[object, ...], seen: Observations) -> N
     seen.holds.append(target)
     # A value transform on a local constructor temporary is ordinary
     # initialization: the audio VAE's Kaiser-sinc filter normalizes before it
-    # becomes a persistent buffer. Once a tensor is registered, the same op is
-    # a load-time transform of a destination and remains storage territory.
+    # becomes a persistent buffer. Once a tensor is a checkpoint destination, the
+    # same op is a load-time transform and remains storage territory.
     if name in _PURE_WRITE or seen.registered.get(id(target)) is not target:
         return
     raise ConstructionFault(
@@ -437,7 +436,7 @@ def _guard_mode(seen: Observations) -> Any:
 
 @contextmanager
 def _track_registrations(seen: Observations) -> Iterator[None]:
-    """Record the clock edge where a local tensor becomes model state."""
+    """Record the edge where a local tensor becomes a checkpoint destination."""
     torch = torch_module()
     nn = torch.nn
     parameter = nn.Module.register_parameter
@@ -452,7 +451,7 @@ def _track_registrations(seen: Observations) -> Iterator[None]:
     def register_buffer(module: Any, name: str, value: Any, persistent: bool = True) -> None:
         buffer(module, name, value, persistent=persistent)
         held = module._buffers.get(name)
-        if isinstance(held, torch.Tensor):
+        if persistent and isinstance(held, torch.Tensor):
             seen.registered[id(held)] = held
 
     nn.Module.register_parameter = register_parameter
@@ -522,7 +521,7 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
     def register_buffer(module: Any, name: str, value: Any, persistent: bool = True) -> None:
         original_buffer(module, name, value, persistent=persistent)
         held = module._buffers.get(name)
-        if isinstance(held, torch.Tensor):
+        if persistent and isinstance(held, torch.Tensor):
             seen.registered[id(held)] = held
 
     swap = torch.__future__.get_swap_module_params_on_conversion()

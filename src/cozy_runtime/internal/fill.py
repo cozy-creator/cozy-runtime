@@ -78,6 +78,7 @@ from cozy_runtime.internal.encoding import (
     measure_device,
 )
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
+from cozy_runtime.internal.paging import BlockLayout, PageUnit, partition
 from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan, TensorResolution
 
 # ------------------------------------------------------------------------- refusals
@@ -1062,6 +1063,11 @@ class StreamingFillBackend:
         #: not a measurement: construction must be reproducible, and the attempt-time ladder
         #: is where measured free VRAM decides things (cr-008b).
         self.resident_budget = 0
+        self.paging: dict[str, BlockLayout] = {}
+        self.paging_hooks: list[Any] = []
+        self.paging_specs: dict[str, TensorSpec] = {}
+        self.paging_plans: dict[str, Any] = {}
+        self.page_resident: dict[str, PageUnit] = {}
         self.stats: dict[str, Any] = {"windows": 0, "waits": 0}
         #: Why this generation was poisoned and what the allocator held at that instant.
         #: Empty until a failure lands; the refusal reply carries it as evidence. Nothing
@@ -1439,6 +1445,9 @@ class StreamingFillBackend:
                 native[:6],
             )
         roots = dict(_members(obj))
+        self.paging_specs = {
+            destination.key: destination.spec for destination in walked.destinations
+        }
         started = time.perf_counter_ns()
         self._mark(
             "materialize_begin", walked_components=list(walked.components), roots=sorted(roots)
@@ -1455,6 +1464,23 @@ class StreamingFillBackend:
                 # and its derived tables have to survive to be restored, which they cannot
                 # if the capture happens only on the resident branch.
                 derived = self.derived[name] = _derived_values(member)
+                if (
+                    self.resident_budget
+                    and size > self.resident_budget
+                    and not any(
+                        key.startswith(f"{name}.") and resolution.route != "verbatim"
+                        for key, resolution in self.resolved.items()
+                    )
+                ):
+                    try:
+                        layout = partition(member)
+                    except ValueError as exc:
+                        raise _refuse(
+                            "leaf_schema", f"{name}: unsafe paging layout: {exc}", [name]
+                        ) from exc
+                    if layout is not None:
+                        self.paging[name] = layout
+                        self.hold_lease = True
                 if self.resident_budget and held + size > self.resident_budget:
                     if any(key.startswith(f"{name}.") for key in native):
                         raise _refuse(
@@ -1917,6 +1943,9 @@ class StreamingFillBackend:
 
     def close(self) -> None:
         """End the generation's hold. Called when the executor tears the generation down."""
+        for hook in self.paging_hooks:
+            hook.remove()
+        self.paging_hooks.clear()
         self.hold_lease = False
         self.release_lease()
 
@@ -1931,6 +1960,16 @@ class StreamingFillBackend:
         copy plus an H2D copy would be. The module is moved to `meta` rather than dropped,
         so its tensor schema survives and the restage is a reservation, not a construction.
         """
+        if name in self.paging:
+            if name in self.page_resident:
+                raise _refuse(
+                    "leaf_schema", "cannot evict a component during a block forward", [name]
+                )
+            if name not in self.components:
+                return 0
+            self._park_page(self.paging[name].common)
+            self.parked[name] = self.components.pop(name)
+            return self.vram_charge.pop(name, 0)
         if any(key.startswith(f"{name}.") for key in self.replaced):
             raise _refuse(
                 "leaf_schema",
@@ -1977,6 +2016,13 @@ class StreamingFillBackend:
                 f"{', '.join(sorted(self.parked)) or 'none'}) — staging moves bytes for a "
                 "component the construction already built, never for a new one",
             )
+        if name in self.paging:
+            common = self.paging[name].common
+            self.parked.pop(name)
+            self._fill_page(name, common)
+            self.components[name] = member
+            self.vram_charge[name] = common.nbytes
+            return {"component": name, "bytes": common.nbytes, "paging": True}
         from cozy_runtime.internal.derive import placing
 
         started = time.perf_counter_ns()
@@ -2060,6 +2106,67 @@ class StreamingFillBackend:
         self.stage_log.append(row)
         del self.stage_log[:-64]
         return row
+
+    def _fill_page(self, name: str, unit: PageUnit) -> None:
+        """Reserve only this unit, then use the ordinary validated TensorFS fill transaction."""
+        from cozy_runtime.internal.derive import placing
+
+        if self.enqueued:
+            raise _refuse("incomplete_fill", "another fill is already pending", [name])
+        with placing():
+            owners = {id(module) for _, module in unit.owners}
+            for _, module in unit.owners:
+                module.to_empty(device=self.device, recurse=False)
+            _restore_derived(
+                self.components.get(name),
+                {
+                    key: value
+                    for key, value in self.derived.get(name, {}).items()
+                    if id(key[0]) in owners
+                },
+            )
+            live = unit.live(name)
+        expected = {f"{name}.{key}" for key in unit.keys}
+        if set(live) != expected or not expected <= self.expected.get(name, frozenset()):
+            raise _refuse("incomplete_fill", "paging unit destinations changed", [name, unit.path])
+        for key, tensor in live.items():
+            spec = self.paging_specs[key]
+            if tuple(tensor.shape) != spec.shape:
+                raise _refuse("length_mismatch", f"{key}: paging destination shape changed", [key])
+            self.fill(key, spec, tensor)
+        if live:
+            self._commit_enqueued()
+        self.state = "ready"
+
+    def _park_page(self, unit: PageUnit) -> None:
+        from cozy_runtime.internal.derive import placing
+
+        with placing():
+            for _, module in unit.owners:
+                self._free_storages(
+                    tensor
+                    for _, tensor in (
+                        *module.named_parameters(recurse=False),
+                        *module.named_buffers(recurse=False),
+                    )
+                )
+                module.to_empty(device=self.torch.device("meta"), recurse=False)
+
+    def stage_page(self, name: str, unit: PageUnit) -> None:
+        if name not in self.components or name in self.page_resident:
+            raise _refuse(
+                "leaf_schema", "paging requires one admitted component and no live block", [name]
+            )
+        self._fill_page(name, unit)
+        self.page_resident[name] = unit
+        self.vram_charge[name] += unit.nbytes
+
+    def evict_page(self, name: str, unit: PageUnit) -> None:
+        if self.page_resident.get(name) is not unit:
+            raise _refuse("leaf_schema", "paging eviction does not name the live block", [name])
+        self._park_page(unit)
+        self.page_resident.pop(name)
+        self.vram_charge[name] -= unit.nbytes
 
     def poison(self, keys: Sequence[str]) -> None:
         """Abort the new generation: mark it poisoned and free NOTHING (#613).
@@ -2384,7 +2491,27 @@ class StreamingFillBackend:
         stats: dict[str, Any] = {}
         for component, group in by_component.items():
             traversal = [(row.component, row.name) for row in group]
-            plan = self.checkpoints[component].read_plan(traversal, self.window_bytes, (component,))
+            if component in self.paging:
+                complete = self.paging_plans.get(component)
+                if complete is None:
+                    complete_traversal = [
+                        (component, self.plan[key].name)
+                        for key in self.paging_specs
+                        if key in self.plan and self.plan[key].component == component
+                    ]
+                    complete = self.checkpoints[component].read_plan(
+                        complete_traversal, self.window_bytes, (component,)
+                    )
+                    self.paging_plans[component] = complete
+                # Native selection keeps its windows and order after the complete
+                # constructor/header traversal has passed validation.
+                plan = complete.select(
+                    [row.role_what(part.role) for row in group for part in row.encoded.parts]
+                )
+            else:
+                plan = self.checkpoints[component].read_plan(
+                    traversal, self.window_bytes, (component,)
+                )
             order = _require_construction_order(plan.order, component)
             traversal_digest = _traversal_digest([row.key for row in group])
             history: list[dict[str, Any]] = self.stats.setdefault("traversals", [])

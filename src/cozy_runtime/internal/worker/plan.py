@@ -646,8 +646,10 @@ class PlanChooser:
         # came to be planned `all_resident` on a generation holding one 167 MB VAE, with the
         # 6.3 GiB it would have to re-stage charged to nobody (cl-003).
         absent = self.ledger.evicted or {}
-        absent_bytes = sum(absent.values())
-        declared_bytes = sum(resident.values()) + absent_bytes
+        nominal = {**absent, **resident}
+        nominal.update({name: layout["total_bytes"] for name, layout in self.ledger.paging.items()})
+        absent_bytes = sum(max(size - resident.get(name, 0), 0) for name, size in nominal.items())
+        declared_bytes = sum(nominal.values())
         # `device_allocatable` is what a NEW reservation can actually get. It already
         # accounts for whatever this generation holds, so the ladder's arithmetic is over
         # HEADROOM: what the attempt needs ON TOP of the weights that are already there.
@@ -658,7 +660,10 @@ class PlanChooser:
         # priced before and which under-charges every method that declares several
         # (codex audit, adopted 2026-08-25). Never below the single-component figure: a
         # generation that reported no scopes is priced exactly as it was.
-        sizes = {**absent, **resident}
+        sizes = {
+            name: self.ledger.paging.get(name, {}).get("working_bytes", size)
+            for name, size in nominal.items()
+        }
         scoped = [
             sum(sizes.get(name, 0) for name in dict.fromkeys(names))
             for names in self.ledger.declared_scopes.values()
