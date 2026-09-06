@@ -22,8 +22,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packages-root", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
-    parser.add_argument("component", choices=["text_encoder", "fl2va_dit"])
+    parser.add_argument("component", choices=["text_encoder", "fl2va_dit", "video_vae"])
     parser.add_argument("--terminal-arm", choices=["failure", "alias", "opaque"], default="failure")
+    parser.add_argument("--terminal-cache", choices=["enabled", "disabled"], default="enabled")
     arguments = parser.parse_args()
     arguments.work_dir.mkdir(parents=True, exist_ok=True)
     sys.path[:0] = [
@@ -91,6 +92,30 @@ def main() -> None:
 
         def outputs(value: Any) -> tuple[Any, ...]:
             return (value.hidden_states[-1].cpu(),)
+    elif component == "video_vae":
+        from diffusers import AutoencoderKLMiniMaxH3
+        from diffusers.modular_pipelines.minimax_h3.decoders import MiniMaxH3VideoDecodeStep
+        from diffusers.modular_pipelines.minimax_h3.modular_pipeline import MiniMaxH3ModularPipeline
+
+        config = config[component]
+        config.update(
+            block_out_channels=[32, 32, 64, 64, 64, 128],
+            decoder_num_attention_heads=4,
+            decoder_attention_head_dim=32,
+        )
+
+        def factory() -> Any:
+            return AutoencoderKLMiniMaxH3.from_config(copy.deepcopy(config)).eval()
+
+        inputs = {"latents": torch.randn((1, 24, 7, 20, 20), device="cuda") * 0.1}
+
+        def outputs(value: Any) -> tuple[Any, ...]:
+            return (value.cpu(),)
+
+        def invoke(model: Any) -> Any:
+            pipe = MiniMaxH3ModularPipeline(blocks=MiniMaxH3VideoDecodeStep())
+            pipe.update_components(vae=model)
+            return pipe(latents=inputs["latents"], output_type="pt", output="videos")
     else:
         official = importlib.import_module("official")
         _build_dit, _dit_spec = official._build_dit, official._dit_spec
@@ -125,6 +150,11 @@ def main() -> None:
 
         def outputs(value: Any) -> tuple[Any, ...]:
             return (value.sample.cpu(), value.audio_sample.cpu())
+
+    if component != "video_vae":
+
+        def invoke(model: Any) -> Any:
+            return model(**inputs)
 
     reference = factory()
     with serving_substrate("sm{}{}".format(*torch.cuda.get_device_capability()), Observations()):
@@ -179,7 +209,7 @@ def main() -> None:
         del state, transaction, host
         reference.to("cuda")
         with torch.no_grad():
-            expected = outputs(reference(**inputs))
+            expected = outputs(invoke(reference))
         print(json.dumps({"phase": "resident_reference"}), flush=True)
         del reference
         gc.collect()
@@ -210,6 +240,25 @@ def main() -> None:
         backend.commit()
         del live, walked
         residency = ComponentResidency(backend=backend, torch=torch, placement="component_staged")
+        visited: list[Any] = []
+        expected_cache = [True]
+
+        def inspect_enter(unit: Any, module: Any, args: Any) -> None:
+            assert not torch.is_autocast_cache_enabled()
+            if component == "video_vae":
+                assert not torch.is_grad_enabled() and not torch.is_inference_mode_enabled()
+                assert torch.is_autocast_enabled("cuda")
+                assert torch.get_autocast_dtype("cuda") == torch.float16
+            visited.append(unit)
+
+        def inspect_exit(module: Any, args: Any, output: Any) -> None:
+            assert torch.is_autocast_cache_enabled() == expected_cache[0]
+
+        from functools import partial
+
+        for unit in backend.paging[component].blocks:
+            unit.owners[0][1].register_forward_pre_hook(partial(inspect_enter, unit))
+            unit.owners[0][1].register_forward_hook(inspect_exit, always_call=True)
         torch.cuda.reset_peak_memory_stats()
         start = time.monotonic()
         try:
@@ -217,7 +266,15 @@ def main() -> None:
                 residency.open_attempt("component_staged", 0)
                 with torch.no_grad():
                     residency.admit("forward", (component,))
-                    actual = outputs(model(**inputs))
+                    expected_cache[0] = iteration == 0
+                    with torch.autocast(
+                        "cuda",
+                        enabled=component == "video_vae",
+                        dtype=torch.float16,
+                        cache_enabled=expected_cache[0],
+                    ):
+                        actual = outputs(invoke(model))
+                        assert torch.is_autocast_cache_enabled() == expected_cache[0]
                     residency.release("forward", (component,))
                 assert all(torch.equal(a, e) for a, e in zip(actual, expected, strict=True)), [
                     (a - e).abs().max().item() for a, e in zip(actual, expected, strict=True)
@@ -263,8 +320,9 @@ def main() -> None:
             with torch.no_grad():
                 residency.admit("forward", (component,))
             stages = residency.stages
+            expected_cache[0] = torch.is_autocast_cache_enabled()
             try:
-                model(**inputs)
+                visited[0].owners[0][1]()  # reject before the block can inspect arguments
             except ResidencyRefusal as exc:
                 assert exc.code == "paging_autograd"
             else:
@@ -275,67 +333,67 @@ def main() -> None:
                 json.dumps({"red": "working_set_and_autograd", "no_weight_mutation": True}),
                 flush=True,
             )
-            executed = next(
-                unit
-                for unit in backend.paging[component].blocks
-                if (
-                    "language_model.layers.0" in unit.path
-                    if component == "text_encoder"
-                    else "token_refiner.refiner_blocks.0" in unit.path
-                )
-            )
+            executed = visited[0]
+            expected_cache[0] = arguments.terminal_cache == "enabled"
+            with torch.autocast(
+                "cuda",
+                enabled=component == "video_vae",
+                dtype=torch.float16,
+                cache_enabled=expected_cache[0],
+            ):
+                if arguments.terminal_arm == "failure":
 
-            if arguments.terminal_arm == "failure":
+                    def fail_forward(*args: Any) -> None:
+                        raise RuntimeError("controlled block failure")
 
-                def fail_forward(*args: Any) -> None:
-                    raise RuntimeError("controlled block failure")
+                    failure_hook = executed.owners[0][1].register_forward_pre_hook(fail_forward)
+                    with torch.no_grad():
+                        residency.admit("forward", (component,))
+                        try:
+                            invoke(model)
+                        except RuntimeError as exc:
+                            assert str(exc) == "controlled block failure"
+                        else:
+                            raise AssertionError("controlled failure not reached")
+                    failure_hook.remove()
+                else:
+                    # A real returned view, with nested containers and nonzero offset. The
+                    # module's usual inference is irrelevant to this storage-lifetime red arm.
+                    block = executed.owners[0][1]
+                    retained = []
 
-                failure_hook = executed.owners[0][1].register_forward_pre_hook(fail_forward)
-                with torch.no_grad():
-                    residency.admit("forward", (component,))
-                    try:
-                        model(**inputs)
-                    except RuntimeError as exc:
-                        assert str(exc) == "controlled block failure"
-                    else:
-                        raise AssertionError("controlled failure not reached")
-                failure_hook.remove()
-            else:
-                # A real returned view, with nested containers and nonzero offset. The
-                # module's usual inference is irrelevant to this storage-lifetime red arm.
-                block = executed.owners[0][1]
-                retained = []
+                    def return_view(*args: Any, **kwargs: Any) -> Any:
+                        view = next(block.parameters()).flatten()[1:3]
+                        retained.append(view)
+                        if arguments.terminal_arm == "opaque":
+                            from types import SimpleNamespace
 
-                def return_view(*args: Any, **kwargs: Any) -> Any:
-                    view = next(block.parameters()).flatten()[1:3]
-                    retained.append(view)
-                    if arguments.terminal_arm == "opaque":
-                        from types import SimpleNamespace
+                            return SimpleNamespace(hidden_weight=view)
+                        return {"nested": (None, [view])}
 
-                        return SimpleNamespace(hidden_weight=view)
-                    return {"nested": (None, [view])}
-
-                block.forward = return_view
-                with torch.no_grad():
-                    residency.admit("forward", (component,))
-                    try:
-                        model(**inputs)
-                    except ResidencyRefusal as exc:
-                        assert exc.code == (
-                            "paging_output_schema"
-                            if arguments.terminal_arm == "opaque"
-                            else "paging_output_alias"
-                        )
-                    else:
-                        raise AssertionError("returned weight view was freed")
-                assert retained and retained[0].untyped_storage().nbytes() > 0
-                assert torch.equal(retained[0], next(block.parameters()).flatten()[1:3])
-            assert bool(residency.poisoned) and backend.page_resident.get(component) is executed
+                    block.forward = return_view
+                    with torch.no_grad():
+                        residency.admit("forward", (component,))
+                        try:
+                            invoke(model)
+                        except ResidencyRefusal as exc:
+                            assert exc.code == (
+                                "paging_output_schema"
+                                if arguments.terminal_arm == "opaque"
+                                else "paging_output_alias"
+                            )
+                        else:
+                            raise AssertionError("returned weight view was freed")
+                    assert retained and retained[0].untyped_storage().nbytes() > 0
+                    assert torch.equal(retained[0], next(block.parameters()).flatten()[1:3])
+                assert bool(residency.poisoned) and backend.page_resident.get(component) is executed
+                assert torch.is_autocast_cache_enabled() == expected_cache[0]
             print(
                 json.dumps(
                     {
                         "red": arguments.terminal_arm,
                         "generation_poisoned": True,
+                        "autocast_cache_restored": True,
                         "failed_block_retained_until_process_exit": True,
                     }
                 ),
