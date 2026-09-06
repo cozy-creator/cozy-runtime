@@ -46,7 +46,6 @@ import hashlib
 import inspect
 from pathlib import Path
 
-import pytest
 import tensorfs
 
 from cozy_runtime.internal.worker import model_source_prepare
@@ -279,10 +278,9 @@ def test_release_model_source_reaches_tensorfs_and_comes_back_typed(tmp_path: Pa
     root = tmp_path / "tensorfs"
     tensorfs.Store.ensure(str(root))
 
-    with pytest.raises(tensorfs.errors.Refusal):
-        model_source_prepare.release_model_source(
-            tensorfs_root=root, operation_id="op-contract-absent"
-        )
+    model_source_prepare.release_model_source(tensorfs_root=root, operation_id="op-contract-absent")
+    model_source_prepare.release_model_source(tensorfs_root=root, operation_id="op-contract-absent")
+    assert tensorfs.Store.open(str(root)).model_source_operations() == []
 
 
 def test_prepare_model_source_refuses_a_relative_store_before_touching_tensorfs(

@@ -62,6 +62,7 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import (
     acquire,
     activity,
@@ -259,6 +260,8 @@ class WorkerOptions:
     """Externally provisioned boot id for fixed pods; local workers mint one in-process."""
     ownership_required: bool = False
     """A retained pod readiness envelope requires existing accepted control history."""
+    owns_tensorfs_store: bool = False
+    """The fixed pod owns this Store; local workers may share one and own only their work."""
     #: PROVENANCE, and every one of these is EMPTY when the launch did not supply it (#494g).
     #: The defaults used to name a real SDXL release and a `sha256:00…00` artifact, which rode
     #: real ClaimAcks and real BootFailures as if they had been measured. Absent is absent: an
@@ -1046,6 +1049,17 @@ class Worker:
         self.control_lock = threading.RLock()
         self.preparation_lock = threading.Lock()
         self.model_source_operations: set[str] = set()
+        self.restart_requested = False
+        if options.owns_tensorfs_store:
+            try:
+                self.model_source_operations.update(
+                    model_source_prepare.source_operations(
+                        tensorfs_root=Path(options.tensorfs_root or "")
+                    )
+                )
+            except Exception:
+                self.supervision.close()
+                raise
         # Exact code/PackageInterface/Environment revisions prepared over the loopback seam.
         # This is same-process admission state, not a Runtime journal. After worker restart the
         # RecordOwner replays preparation before a model-bound PlacementSet can join it.
@@ -1766,6 +1780,12 @@ class Worker:
         """Hand exact supervisor-verified source facts to the shared TensorFS core."""
 
         with self.preparation_lock:
+            if self.stop.is_set():
+                return pb.PrepareModelSourceResult(
+                    outcome=pb.MODEL_SOURCE_PREPARE_OUTCOME_REFUSED,
+                    safe_code="model_source_preparer_unavailable",
+                    safe_detail="the worker is stopping",
+                )
             result = model_source_prepare.prepare_model_source(
                 request, tensorfs_root=Path(self.options.tensorfs_root or "")
             )
@@ -1796,7 +1816,7 @@ class Worker:
         )
 
     def release_model_source(self, operation_id: str) -> None:
-        """Explicit cooperative cleanup; pod teardown remains the remote durability boundary."""
+        """Release one native source operation under the preparation lock."""
 
         with self.preparation_lock:
             model_source_prepare.release_model_source(
@@ -2701,6 +2721,12 @@ class Worker:
         for lane in self.lanes:
             lane.work.put(None)
             lane.post.put(None)
+
+    def request_restart(self) -> None:
+        """A local operator requests process replacement while retaining source work."""
+        if not self.stop.is_set():
+            self.restart_requested = True
+            self.request_stop()
 
     def shutdown_from_stream(self) -> None:
         self.request_stop()
@@ -5701,7 +5727,23 @@ class Worker:
         self.convergences.put(None)
         self.watches.end_all()
         self.host.stop()
-        for operation_id in sorted(self.model_source_operations):
+        # Drain an in-flight preparation before releasing process ownership. New
+        # preparations observe stop under the same lock and cannot recreate cleanup.
+        operations: list[str] = []
+        with self.preparation_lock:
+            if not self.restart_requested:
+                try:
+                    operations = (
+                        model_source_prepare.source_operations(
+                            tensorfs_root=Path(self.options.tensorfs_root or "")
+                        )
+                        if self.options.owns_tensorfs_store
+                        else sorted(self.model_source_operations)
+                    )
+                except LaunchRefusal as exc:
+                    self.exit_code = int(Exit.internal)
+                    self.note("shutdown", f"source operation cleanup unavailable: {exc.code}")
+        for operation_id in operations:
             try:
                 self.release_model_source(operation_id)
             except Exception as exc:
@@ -5721,6 +5763,7 @@ class Worker:
                 {
                     "worker_boot_id": self.fence.worker_boot_id,
                     "control_stream_epoch": self.fence.control_stream_epoch,
+                    "restart_requested": self.restart_requested,
                     "executor_epochs": sum(supervision.spawns for supervision in supervisions),
                     "admission_epoch": self.admission_epoch,
                     "executed": self.engine.executed,
