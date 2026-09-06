@@ -168,6 +168,11 @@ class RuntimePreparationStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.ProtocolInfo = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/ProtocolInfo',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
+                _registered_method=True)
         self.CheckPackageSetCompatibility = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
@@ -183,15 +188,20 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceResult.FromString,
                 _registered_method=True)
-        self.SourceCheckpointPage = channel.unary_unary(
-                '/cozy.worker.v1.RuntimePreparation/SourceCheckpointPage',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageRequest.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.FromString,
+        self.ValidateWeightsCheckpoint = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/ValidateWeightsCheckpoint',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ValidateWeightsCheckpointRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ValidateWeightsCheckpointResult.FromString,
                 _registered_method=True)
-        self.SourceCheckpointTransfer = channel.unary_unary(
-                '/cozy.worker.v1.RuntimePreparation/SourceCheckpointTransfer',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferRequest.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.FromString,
+        self.CheckpointPage = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/CheckpointPage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageResult.FromString,
+                _registered_method=True)
+        self.CheckpointTransfer = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/CheckpointTransfer',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferStatus.FromString,
                 _registered_method=True)
         self.PrepareLocalPackage = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/PrepareLocalPackage',
@@ -215,6 +225,12 @@ class RuntimePreparationServicer(object):
     crosses — an https URL, never a credential.
     """
 
+    def ProtocolInfo(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def CheckPackageSetCompatibility(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -233,13 +249,19 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def SourceCheckpointPage(self, request, context):
+    def ValidateWeightsCheckpoint(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def SourceCheckpointTransfer(self, request, context):
+    def CheckpointPage(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CheckpointTransfer(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -260,6 +282,11 @@ class RuntimePreparationServicer(object):
 
 def add_RuntimePreparationServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'ProtocolInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.ProtocolInfo,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.SerializeToString,
+            ),
             'CheckPackageSetCompatibility': grpc.unary_unary_rpc_method_handler(
                     servicer.CheckPackageSetCompatibility,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.FromString,
@@ -275,15 +302,20 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceResult.SerializeToString,
             ),
-            'SourceCheckpointPage': grpc.unary_unary_rpc_method_handler(
-                    servicer.SourceCheckpointPage,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageRequest.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.SerializeToString,
+            'ValidateWeightsCheckpoint': grpc.unary_unary_rpc_method_handler(
+                    servicer.ValidateWeightsCheckpoint,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ValidateWeightsCheckpointRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ValidateWeightsCheckpointResult.SerializeToString,
             ),
-            'SourceCheckpointTransfer': grpc.unary_unary_rpc_method_handler(
-                    servicer.SourceCheckpointTransfer,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferRequest.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.SerializeToString,
+            'CheckpointPage': grpc.unary_unary_rpc_method_handler(
+                    servicer.CheckpointPage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageResult.SerializeToString,
+            ),
+            'CheckpointTransfer': grpc.unary_unary_rpc_method_handler(
+                    servicer.CheckpointTransfer,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferStatus.SerializeToString,
             ),
             'PrepareLocalPackage': grpc.unary_unary_rpc_method_handler(
                     servicer.PrepareLocalPackage,
@@ -312,6 +344,33 @@ class RuntimePreparation(object):
     anonymous public index directives inside locked_requirements are the other origin that
     crosses — an https URL, never a credential.
     """
+
+    @staticmethod
+    def ProtocolInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/ProtocolInfo',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def CheckPackageSetCompatibility(request,
@@ -395,7 +454,7 @@ class RuntimePreparation(object):
             _registered_method=True)
 
     @staticmethod
-    def SourceCheckpointPage(request,
+    def ValidateWeightsCheckpoint(request,
             target,
             options=(),
             channel_credentials=None,
@@ -408,9 +467,9 @@ class RuntimePreparation(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/cozy.worker.v1.RuntimePreparation/SourceCheckpointPage',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageRequest.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.FromString,
+            '/cozy.worker.v1.RuntimePreparation/ValidateWeightsCheckpoint',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ValidateWeightsCheckpointRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ValidateWeightsCheckpointResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -422,7 +481,7 @@ class RuntimePreparation(object):
             _registered_method=True)
 
     @staticmethod
-    def SourceCheckpointTransfer(request,
+    def CheckpointPage(request,
             target,
             options=(),
             channel_credentials=None,
@@ -435,9 +494,36 @@ class RuntimePreparation(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/cozy.worker.v1.RuntimePreparation/SourceCheckpointTransfer',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferRequest.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.FromString,
+            '/cozy.worker.v1.RuntimePreparation/CheckpointPage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CheckpointTransfer(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/CheckpointTransfer',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -669,6 +755,11 @@ class PodHostStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.ProtocolInfo = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ProtocolInfo',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
+                _registered_method=True)
         self.PreparePackageSet = channel.unary_stream(
                 '/cozy.worker.v1.PodHost/PreparePackageSet',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.SerializeToString,
@@ -694,15 +785,15 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
                 _registered_method=True)
-        self.SourceCheckpointPage = channel.unary_unary(
-                '/cozy.worker.v1.PodHost/SourceCheckpointPage',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.FromString,
+        self.CheckpointPage = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/CheckpointPage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageResult.FromString,
                 _registered_method=True)
-        self.SourceCheckpointTransfer = channel.unary_unary(
-                '/cozy.worker.v1.PodHost/SourceCheckpointTransfer',
-                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferCall.SerializeToString,
-                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.FromString,
+        self.CheckpointTransfer = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/CheckpointTransfer',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferStatus.FromString,
                 _registered_method=True)
         self.LocalPackageFetch = channel.unary_stream(
                 '/cozy.worker.v1.PodHost/LocalPackageFetch',
@@ -718,6 +809,11 @@ class PodHostStub(object):
                 '/cozy.worker.v1.PodHost/WeightsTransfer',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferStatus.FromString,
+                _registered_method=True)
+        self.WeightsIntentReady = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/WeightsIntentReady',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
                 _registered_method=True)
 
 
@@ -749,6 +845,14 @@ class PodHostServicer(object):
     ---------------------------------------------------------------------------
     """
 
+    def ProtocolInfo(self, request, context):
+        """Static, read-only compatibility probe over the existing pinned TLS connection.
+        The Host forwards its actual Runtime's loopback result; it does not guess a version.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def PreparePackageSet(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -779,13 +883,13 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def SourceCheckpointPage(self, request, context):
+    def CheckpointPage(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def SourceCheckpointTransfer(self, request, context):
+    def CheckpointTransfer(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -809,9 +913,20 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def WeightsIntentReady(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PodHostServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'ProtocolInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.ProtocolInfo,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.SerializeToString,
+            ),
             'PreparePackageSet': grpc.unary_stream_rpc_method_handler(
                     servicer.PreparePackageSet,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.FromString,
@@ -837,15 +952,15 @@ def add_PodHostServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.SerializeToString,
             ),
-            'SourceCheckpointPage': grpc.unary_unary_rpc_method_handler(
-                    servicer.SourceCheckpointPage,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.SerializeToString,
+            'CheckpointPage': grpc.unary_unary_rpc_method_handler(
+                    servicer.CheckpointPage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageResult.SerializeToString,
             ),
-            'SourceCheckpointTransfer': grpc.unary_unary_rpc_method_handler(
-                    servicer.SourceCheckpointTransfer,
-                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferCall.FromString,
-                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.SerializeToString,
+            'CheckpointTransfer': grpc.unary_unary_rpc_method_handler(
+                    servicer.CheckpointTransfer,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferStatus.SerializeToString,
             ),
             'LocalPackageFetch': grpc.unary_stream_rpc_method_handler(
                     servicer.LocalPackageFetch,
@@ -861,6 +976,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.WeightsTransfer,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferStatus.SerializeToString,
+            ),
+            'WeightsIntentReady': grpc.unary_unary_rpc_method_handler(
+                    servicer.WeightsIntentReady,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -897,6 +1017,33 @@ class PodHost(object):
     Locally PodHost is not a service: the daemon calls the same host functions in-process.
     ---------------------------------------------------------------------------
     """
+
+    @staticmethod
+    def ProtocolInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ProtocolInfo',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def PreparePackageSet(request,
@@ -1034,7 +1181,7 @@ class PodHost(object):
             _registered_method=True)
 
     @staticmethod
-    def SourceCheckpointPage(request,
+    def CheckpointPage(request,
             target,
             options=(),
             channel_credentials=None,
@@ -1047,9 +1194,9 @@ class PodHost(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/cozy.worker.v1.PodHost/SourceCheckpointPage',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointPageResult.FromString,
+            '/cozy.worker.v1.PodHost/CheckpointPage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1061,7 +1208,7 @@ class PodHost(object):
             _registered_method=True)
 
     @staticmethod
-    def SourceCheckpointTransfer(request,
+    def CheckpointTransfer(request,
             target,
             options=(),
             channel_credentials=None,
@@ -1074,9 +1221,9 @@ class PodHost(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/cozy.worker.v1.PodHost/SourceCheckpointTransfer',
-            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferCall.SerializeToString,
-            cozy_dot_worker_dot_v1_dot_worker__pb2.SourceCheckpointTransferStatus.FromString,
+            '/cozy.worker.v1.PodHost/CheckpointTransfer',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointTransferStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1158,6 +1305,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/WeightsTransfer',
             cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsTransferStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WeightsIntentReady(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/WeightsIntentReady',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
             options,
             channel_credentials,
             insecure,

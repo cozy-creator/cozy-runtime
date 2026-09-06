@@ -1,7 +1,7 @@
 """Stateless Runtime side of the WeightsSink host exchange.
 
 The supervisor is the durable authority. Runtime keeps only waiters and live TensorFS read
-leases and sends intent before the executor opens a writer; the worker and executor share only
+leases and native writer handles after host authorization; the worker and executor share only
 fixed files in the already-brokered attempt spool for declaration/receipt bytes too large for
 their control seam.
 
@@ -47,6 +47,7 @@ from typing import Any, BinaryIO, cast
 from urllib.parse import urlparse
 
 from cozy_runtime.internal import egress, fill
+from cozy_runtime.internal.weights_writer import WriterBroker
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -103,7 +104,11 @@ Lane = tuple[str, int]
 #: The three-field envelope a send was stamped with; the ack echoes it exactly.
 Envelope = tuple[int, int, str]
 
-_EVENT_FIELD = {"weights_intent": "intent", "weights_receipt": "receipt"}
+_EVENT_FIELD = {
+    "weights_intent": "intent",
+    "weights_receipt": "receipt",
+    "weights_checkpoint": "checkpoint",
+}
 
 
 def _envelope(message: Any) -> Envelope:
@@ -209,6 +214,123 @@ class WeightsExchange:
         #: presence IS the lane choice; nothing else configures it.
         self._stream: _ExchangeStream | None = None
         self._streams_opened = 0
+        self.writer_broker = WriterBroker(self._store, checkpoint=self.record_checkpoint)
+
+    def record_checkpoint(
+        self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]
+    ) -> None:
+        """Publish the parent native writer's own observation, never child-authored refs."""
+        checkpoint = pb.CheckpointRef(
+            head=pb.Ref(digest=documents.raw(facts["head"]), length=facts["head_length"]),
+            plan_digest=documents.raw(facts["plan_digest"]),
+            index=facts["index"],
+            bytes=facts["bytes"],
+        )
+        frame = pb.WorkerFrame(
+            weights_checkpoint=pb.WeightsCheckpointFrame(
+                request_id=attempt.request_id,
+                attempt_ordinal=attempt.attempt,
+                invocation_spec_digest=attempt.digest,
+                output_slot=binding.slot,
+                weights_transaction_id=transaction,
+                writer_epoch=binding.epoch,
+                tensorfs_declaration_digest=binding.declaration_digest,
+                checkpoint=checkpoint,
+            )
+        )
+        ack = self._exchange(
+            self._key(
+                attempt.request_id, attempt.attempt, binding.slot, pb.WEIGHTS_HOST_STAGE_CHECKPOINT
+            ),
+            frame,
+            canceled=lambda: bool(attempt.canceling),
+        )
+        self._validate_ack(ack, frame.weights_checkpoint, pb.WEIGHTS_HOST_STAGE_CHECKPOINT)
+        if ack.outcome == pb.WEIGHTS_HOST_OUTCOME_REFUSED:
+            raise WeightsExchangeError(
+                pb.WeightsHostRefusal.Name(ack.refusal).lower(),
+                "the weights host refused checkpoint",
+            )
+
+    def validate_checkpoint(
+        self, request: pb.ValidateWeightsCheckpointRequest
+    ) -> pb.ValidateWeightsCheckpointResult:
+        """Validate restored work while the current intent still awaits its writer ACK."""
+        intent, subject = request.intent, request.intent.weights
+        result = pb.ValidateWeightsCheckpointResult(weights=subject)
+        if intent.HasField("checkpoint"):
+            result.checkpoint.CopyFrom(intent.checkpoint)
+        try:
+            current = self.stamp(pb.WeightsIntentFrame())
+            if (
+                intent.record_owner_epoch != current.record_owner_epoch
+                or intent.worker_boot_id != current.worker_boot_id
+                or intent.control_stream_epoch != 0
+                or request.ByteSize() > weights_limits.MAX_INLINE_CONTROL_BYTES
+                or subject.writer_epoch == 0
+                or len(request.tensorfs_declaration_canonical_bytes)
+                > weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
+            ):
+                raise WeightsExchangeError(
+                    "weights_checkpoint_scope", "checkpoint scope is not current"
+                )
+            with self._lock:
+                pending = self._pending.get(
+                    self._key(
+                        subject.request_id,
+                        intent.attempt_ordinal,
+                        subject.output_slot,
+                        pb.WEIGHTS_HOST_STAGE_INTENT,
+                    )
+                )
+                if (
+                    pending is None
+                    or self.stop.is_set()
+                    or subject.weights_transaction_id in self._abandoned
+                ):
+                    raise WeightsExchangeError(
+                        "weights_checkpoint_scope", "no current intent awaits restore"
+                    )
+                sent = pending.frame.weights_intent
+                if (
+                    sent.weights_transaction_id != subject.weights_transaction_id
+                    or sent.invocation_spec_digest != subject.invocation_spec_digest
+                    or sent.tensorfs_declaration_digest != subject.tensorfs_declaration_digest
+                    or sent.tensorfs_declaration_canonical_bytes
+                    != request.tensorfs_declaration_canonical_bytes
+                ):
+                    raise WeightsExchangeError(
+                        "weights_checkpoint_scope", "checkpoint differs from current intent"
+                    )
+            if intent.HasField("checkpoint"):
+                checkpoint = intent.checkpoint
+                store = self._store()
+                page = store.checkpoint_page(
+                    documents.spell(checkpoint.head.digest),
+                    checkpoint.head.length,
+                    operation_id=subject.request_id,
+                    slot=subject.output_slot,
+                    plan_digest=documents.spell(checkpoint.plan_digest),
+                    limit=1,
+                )
+                if page["index"] != checkpoint.index or page["bytes"] != checkpoint.bytes:
+                    raise WeightsExchangeError(
+                        "weights_checkpoint_scope", "checkpoint counters differ from native Link"
+                    )
+                store.validate_derived_checkpoint(
+                    subject.weights_transaction_id,
+                    request.tensorfs_declaration_canonical_bytes,
+                    documents.spell(checkpoint.head.digest),
+                    checkpoint.head.length,
+                    operation_id=subject.request_id,
+                    slot=subject.output_slot,
+                    plan_digest=documents.spell(checkpoint.plan_digest),
+                )
+            result.valid = True
+        except Exception as exc:
+            result.safe_code = str(getattr(exc, "code", "weights_checkpoint_invalid"))[:128]
+            result.safe_detail = f"checkpoint validation refused ({type(exc).__name__})"
+        return result
 
     # ------------------------------------------------------------- the host's lanes
 
@@ -396,14 +518,28 @@ class WeightsExchange:
                 pb.WeightsHostRefusal.Name(ack.refusal).lower(), "the weights host refused intent"
             )
         with self._lock:
-            known = self._bindings.setdefault(
-                ack.weights_transaction_id,
-                (ack.writer_epoch, declaration_digest),
-            )
-        if known != (ack.writer_epoch, declaration_digest):
-            raise WeightsExchangeError(
-                "weights_host_ack_mismatch", "transaction binding changed within one Runtime"
-            )
+            known = self._bindings.get(ack.weights_transaction_id)
+            if known is not None and (
+                known[1] != declaration_digest or ack.writer_epoch < known[0]
+            ):
+                raise WeightsExchangeError(
+                    "weights_host_ack_mismatch",
+                    "transaction declaration changed or writer epoch regressed",
+                )
+            self._bindings[ack.weights_transaction_id] = (ack.writer_epoch, declaration_digest)
+        checkpoint = (
+            (documents.spell(ack.checkpoint.head.digest), ack.checkpoint.head.length)
+            if ack.HasField("checkpoint")
+            else None
+        )
+        self.writer_broker.authorize(
+            attempt,
+            ack.weights_transaction_id,
+            ack.writer_epoch,
+            declaration_digest,
+            output_slot,
+            checkpoint,
+        )
         receipt_digest = b""
         if ack.HasField("weights_receipt"):
             receipt_digest = self._receipt_ref(ack.weights_receipt)
@@ -437,6 +573,7 @@ class WeightsExchange:
             "weights_transaction_id": ack.weights_transaction_id,
             "writer_epoch": ack.writer_epoch,
             "weights_receipt_digest": documents.spell(receipt_digest) if receipt_digest else "",
+            "checkpoint": checkpoint,
         }
 
     def receipt(
@@ -565,6 +702,7 @@ class WeightsExchange:
 
     def close(self) -> None:
         """Release every live TensorFS read lease; durable facts remain with the host."""
+        self.writer_broker.close()
         with self._lock:
             held, self._held = list(self._held.values()), {}
             stream, self._stream = self._stream, None
@@ -575,6 +713,7 @@ class WeightsExchange:
 
     def abandon(self, transaction_id: str) -> None:
         """Stop late receipt/transfer registration and release this output's read lease."""
+        self.writer_broker.close(transaction_id)
         with self._lock:
             self._abandoned.add(transaction_id)
             held = self._held.pop(transaction_id, None)
@@ -763,6 +902,10 @@ class WeightsExchange:
                         "weights_host_exchange_canceled", "attempt ended before host ACK"
                     )
             assert pending.ack is not None
+            if canceled() or self.stop.is_set():
+                raise WeightsExchangeError(
+                    "weights_host_exchange_canceled", "attempt ended before host ACK"
+                )
             return pending.ack
         finally:
             with self._lock:
@@ -794,6 +937,7 @@ class WeightsExchange:
                 or ack.writer_epoch
                 or ack.HasField("weights_receipt")
                 or ack.HasField("manifest")
+                or ack.HasField("checkpoint")
             ):
                 raise WeightsExchangeError(
                     "weights_host_ack_invalid", "refusal carries transaction authority"
@@ -810,12 +954,31 @@ class WeightsExchange:
             raise WeightsExchangeError(
                 "weights_host_ack_invalid", "receipt and produced Manifest appear together"
             )
-        if stage == pb.WEIGHTS_HOST_STAGE_RECEIPT:
+        if ack.HasField("checkpoint") and (
+            len(ack.checkpoint.head.digest) != 32
+            or ack.checkpoint.head.length == 0
+            or len(ack.checkpoint.plan_digest) != 32
+        ):
+            raise WeightsExchangeError(
+                "weights_host_ack_invalid", "checkpoint ACK has invalid refs"
+            )
+        if stage == pb.WEIGHTS_HOST_STAGE_CHECKPOINT:
+            if (
+                ack.writer_epoch != sent.writer_epoch
+                or ack.checkpoint != sent.checkpoint
+                or ack.HasField("weights_receipt")
+                or ack.HasField("manifest")
+            ):
+                raise WeightsExchangeError(
+                    "weights_host_ack_mismatch", "checkpoint ACK changed native observation"
+                )
+        elif stage == pb.WEIGHTS_HOST_STAGE_RECEIPT:
             if (
                 ack.weights_transaction_id != sent.weights_transaction_id
                 or ack.writer_epoch != sent.writer_epoch
                 or not ack.HasField("weights_receipt")
                 or ack.manifest != sent.manifest
+                or ack.HasField("checkpoint")
             ):
                 raise WeightsExchangeError(
                     "weights_host_ack_mismatch", "receipt ACK changed transaction identity"

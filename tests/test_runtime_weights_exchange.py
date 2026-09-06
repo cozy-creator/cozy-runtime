@@ -21,6 +21,7 @@ What they hold the Runtime to:
 
 from __future__ import annotations
 
+import io
 import threading
 from collections.abc import Iterator
 from concurrent import futures
@@ -32,9 +33,11 @@ from typing import Any
 
 import grpc
 import pytest
+import tensorfs
 
 from cozy_runtime.internal.worker import weights
-from cozy_runtime.internal.worker.control import _RuntimeWeightsServicer
+from cozy_runtime.internal.worker.control import _PreparationServicer, _RuntimeWeightsServicer
+from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
@@ -181,6 +184,7 @@ class Rig:
     control: ControlLane
     stub: Any
     server: Any
+    preparation: Any
 
 
 @pytest.fixture()
@@ -188,7 +192,7 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
     fence = Fence()
     control = ControlLane(fence)
     exchange = weights.WeightsExchange(
-        store_root=tmp_path,
+        store_root=tmp_path / "store",
         send=control.send,
         stamp=fence.stamp,
         stop=threading.Event(),
@@ -196,12 +200,25 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
     )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
     pb_grpc.add_RuntimeWeightsServicer_to_server(_RuntimeWeightsServicer(exchange), server)
+    pb_grpc.add_RuntimePreparationServicer_to_server(
+        _PreparationServicer(
+            None, None, None, None, None, weights_checkpoint_validator=exchange.validate_checkpoint
+        ),
+        server,
+    )
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     channel = grpc.insecure_channel(f"127.0.0.1:{port}")
     stub = pb_grpc.RuntimeWeightsStub(channel)
     try:
-        yield Rig(exchange=exchange, fence=fence, control=control, stub=stub, server=server)
+        yield Rig(
+            exchange=exchange,
+            fence=fence,
+            control=control,
+            stub=stub,
+            server=server,
+            preparation=pb_grpc.RuntimePreparationStub(channel),
+        )
     finally:
         exchange.close()
         channel.close()
@@ -335,4 +352,133 @@ def test_host_cannot_replace_the_runtime_supplied_transaction_id(rig: Rig) -> No
     assert not pending["thread"].is_alive()
     assert "value" not in pending["result"]
     assert pending["result"]["error"].code == "weights_host_ack_mismatch"
+    supervisor.close()
+
+
+def test_protocol_probe_is_static_and_does_not_open_a_store_or_change_fence(rig: Rig) -> None:
+    before = (
+        rig.fence.record_owner_epoch,
+        rig.fence.control_stream_epoch,
+        rig.fence.worker_boot_id,
+    )
+    assert not rig.exchange.store_root.exists()
+    for _ in range(2):
+        info = rig.preparation.ProtocolInfo(pb.ProtocolInfoRequest(), timeout=WAIT)
+        assert (info.minimum_wire_minor, info.wire_minor) == (MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR)
+    assert before == (
+        rig.fence.record_owner_epoch,
+        rig.fence.control_stream_epoch,
+        rig.fence.worker_boot_id,
+    )
+    assert not rig.exchange.store_root.exists()
+    assert not rig.exchange._pending and not rig.exchange.writer_broker.bindings
+
+
+def test_restored_native_work_validates_under_pending_intent_without_importing_writer(
+    rig: Rig, tmp_path: Path
+) -> None:
+    original = tensorfs.Store.init(tmp_path / "original")
+    restored = tensorfs.Store.init(rig.exchange.store_root)
+    plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
+    targets = {
+        "model": {
+            "drop": [],
+            "add": {
+                "weight": {
+                    "logical_dtype": "f32",
+                    "shape": [512],
+                    "encoding": plain,
+                    "parts": {"value": {"dtype": "f32", "shape": [512]}},
+                }
+            },
+        }
+    }
+    order = [("model", "weight")]
+    fingerprint = "sha256:" + "65" * 32
+    declaration = original.derived_declaration(
+        {}, targets, {}, order, 2048, work_fingerprint=fingerprint
+    )
+    writer = original.begin_derived(
+        TRANSACTION, 7, {}, targets, {}, order, 2048, work_fingerprint=fingerprint
+    )
+    writer.add_part("model", "weight", "value", io.BytesIO(b"\x31" * 2048))
+    head = writer.checkpoint("req-1", OUTPUT_SLOT)
+    writer.fence()
+    tensorfs.transfer_object(original, restored, head["head"], head["head_length"])
+    page = original.checkpoint_page(
+        head["head"],
+        head["head_length"],
+        operation_id="req-1",
+        slot=OUTPUT_SLOT,
+        plan_digest=head["plan_digest"],
+    )
+    assert page["previous"] is None
+    for obj in page["objects"]:
+        tensorfs.transfer_object(original, restored, obj["object_id"], obj["length"])
+    assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
+
+    supervisor = StandInSupervisor(rig.stub)
+    _await(rig.exchange.exchange_open, "exchange did not open")
+    result: dict[str, Any] = {}
+
+    def intent_call() -> None:
+        result["value"] = rig.exchange.intent(
+            _attempt(),
+            output_slot=OUTPUT_SLOT,
+            transaction_id=TRANSACTION,
+            declaration_digest=sha256(declaration).digest(),
+            declaration=declaration,
+            requested_writer_epoch=0,
+        )
+
+    pending = threading.Thread(target=intent_call, daemon=True)
+    pending.start()
+    sent = supervisor.next_intent()
+    checkpoint = pb.CheckpointRef(
+        head=pb.Ref(digest=bytes.fromhex(head["head"][7:]), length=head["head_length"]),
+        plan_digest=bytes.fromhex(head["plan_digest"][7:]),
+        index=head["index"],
+        bytes=head["bytes"],
+    )
+    ready = pb.WeightsIntentReadyRequest(
+        record_owner_epoch=rig.fence.record_owner_epoch,
+        worker_boot_id=rig.fence.worker_boot_id,
+        attempt_ordinal=sent.attempt_ordinal,
+        weights=pb.WeightsCheckpointSubject(
+            request_id=sent.request_id,
+            invocation_spec_digest=sent.invocation_spec_digest,
+            output_slot=sent.output_slot,
+            weights_transaction_id=sent.weights_transaction_id,
+            writer_epoch=8,
+            tensorfs_declaration_digest=sent.tensorfs_declaration_digest,
+        ),
+        checkpoint=checkpoint,
+    )
+    request = pb.ValidateWeightsCheckpointRequest(
+        intent=ready, tensorfs_declaration_canonical_bytes=declaration
+    )
+    accepted = rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
+    assert accepted.valid and accepted.checkpoint == checkpoint
+    assert pending.is_alive() and result == {}
+    assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
+    assert not rig.exchange.writer_broker.bindings
+    assert supervisor.event_count() == 0  # no periodic intent resend while Ready is delayed
+    for mutation in ("counter", "declaration", "scope"):
+        wrong = pb.ValidateWeightsCheckpointRequest()
+        wrong.CopyFrom(request)
+        if mutation == "counter":
+            wrong.intent.checkpoint.bytes += 1
+        elif mutation == "declaration":
+            wrong.tensorfs_declaration_canonical_bytes += b" "
+        else:
+            wrong.intent.weights.output_slot = "other"
+        refused = rig.preparation.ValidateWeightsCheckpoint(wrong, timeout=WAIT)
+        assert not refused.valid and refused.safe_code
+    ack = _recorded_ack(sent, writer_epoch=8, envelope=rig.fence)
+    ack.checkpoint.CopyFrom(checkpoint)
+    supervisor.ack(ack)
+    pending.join(WAIT)
+    assert not pending.is_alive()
+    assert result["value"]["checkpoint"] == (head["head"], head["head_length"])
+    assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
     supervisor.close()

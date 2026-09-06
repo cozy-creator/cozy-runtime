@@ -370,6 +370,7 @@ class AttemptRecord:
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
     #: Host-ACKed WeightsReceipt/1 refs, one per interface-declared output slot.
     weights_receipts: dict[str, pb.WeightsReceiptRef] = dataclasses_field(default_factory=dict)
+    weights_work_fingerprint: str = ""
     job_models: dict[str, JobModel] = dataclasses_field(default_factory=dict)
     model_leases: list[Any] = dataclasses_field(default_factory=list)
 
@@ -428,6 +429,7 @@ class AttemptRecord:
         self.residency = {}
         self.publication = {}
         self.weights_receipts = {}
+        self.weights_work_fingerprint = ""
         self.job_models = {}
         self.model_leases = []
 
@@ -468,6 +470,7 @@ class AttemptEngine:
         weights: WeightsExchange | None = None,
         owner_scope: Callable[[], str] = lambda: "",
         tensorfs_root: Path | None = None,
+        work_fingerprint: Callable[[AttemptRecord], str] | None = None,
     ) -> None:
         self.records = records
         self.authorizer = authorizer
@@ -495,6 +498,7 @@ class AttemptEngine:
         self.weights = weights
         self.owner_scope = owner_scope
         self.tensorfs_root = tensorfs_root
+        self.work_fingerprint = work_fingerprint
         #: binding digests whose boot warm pass FAILED. Every attempt served under one
         #: carries a per-request confession: the first-call tax was never paid for it.
         self.degraded: dict[str, str] = {}
@@ -827,7 +831,7 @@ class AttemptEngine:
                 origin=ORIGIN.CAUSE_ORIGIN_CLIENT if caller else ORIGIN.CAUSE_ORIGIN_WORKER,
             ) from exc
 
-    def _job_model_declarations(self, binding: JobBinding, descriptor_id: str) -> dict[str, str]:
+    def _job_declaration(self, binding: JobBinding, descriptor_id: str) -> Mapping[str, Any]:
         """Read the exact installed package interface without importing package code."""
         try:
             interface_path = Path(binding.package_interface)
@@ -851,7 +855,19 @@ class AttemptEngine:
             )
             if len(rows) != 1:
                 raise ValueError("installed package interface has no unique selected job")
-            models = rows[0].get("models", [])
+            return rows[0]
+        except AttemptRefusal:
+            raise
+        except Exception as exc:
+            raise AttemptRefusal(
+                "job_model_interface_invalid",
+                f"the installed job interface cannot bind Model parameters ({type(exc).__name__})",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            ) from exc
+
+    def _job_model_declarations(self, binding: JobBinding, descriptor_id: str) -> dict[str, str]:
+        try:
+            models = self._job_declaration(binding, descriptor_id).get("models", [])
             if not isinstance(models, list):
                 raise ValueError("selected job models are not an array")
             declared: dict[str, str] = {}
@@ -1438,8 +1454,28 @@ class AttemptEngine:
                 "detail": "this worker has no WeightsSink host",
             }
         try:
+            if kind == "weights_writer":
+                return self.weights.writer_broker.handle(attempt, frame)
             output_slot = str(frame.get("output_slot", ""))
             if kind == "weights_intent":
+                if attempt.job is None:
+                    raise ValueError("a weights intent requires the current job")
+                declared = self._job_declaration(attempt.job, attempt.job.job_descriptor_id)
+                outputs = {
+                    str(row["output_id"]): row for row in declared.get("weights_outputs", [])
+                }
+                bound = attempt.grant.outputs.get(output_slot)
+                if (
+                    output_slot not in outputs
+                    or bound is None
+                    or (
+                        bound.max_bytes != outputs[output_slot]["max_bytes"]
+                        or bound.mime_type != outputs[output_slot]["mime_type"]
+                    )
+                ):
+                    raise ValueError(
+                        "weights intent is outside the package and invocation output contract"
+                    )
                 length = int(frame.get("tensorfs_declaration_length", 0))
                 raw = weights_exchange_bytes(attempt.spool, output_slot, "declaration", length)
                 return self.weights.intent(
@@ -1583,6 +1619,9 @@ class AttemptEngine:
             # reach a granted destination.
             grants.abort_outputs(spool)
             return self.abandon(attempt, str(exc))
+        finally:
+            if self.weights is not None:
+                self.weights.writer_broker.close_attempt(attempt)
         return self.release(attempt, reply, spool, key)
 
     @staticmethod
@@ -1606,6 +1645,8 @@ class AttemptEngine:
             for input_id, granted in attempt.inputs.items()
         }
         if attempt.job is not None:
+            if not attempt.weights_work_fingerprint and self.work_fingerprint is not None:
+                attempt.weights_work_fingerprint = self.work_fingerprint(attempt)
             return {
                 "cmd": "run_job",
                 "request_id": key,
@@ -1631,6 +1672,7 @@ class AttemptEngine:
                 "weights_owner_scope": self.owner_scope(),
                 "weights_request_id": attempt.request_id,
                 "invocation_spec_digest": documents.spell(attempt.digest),
+                "weights_work_fingerprint": attempt.weights_work_fingerprint,
                 "budget": {
                     "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
                     "gpu_count": self.job_device_count,
@@ -2062,19 +2104,32 @@ class AttemptEngine:
 
         Outputs bind to granted destinations by STABLE OUTPUT ID — the result's own field
         path (`image`, `pair.thumb`, `frames.0`) — with EXACT SET EQUALITY against the
-        grant. Never by list index: two outputs that arrive in a different order must still
+        media grant subset. Declared weights outputs finish through exact host-acknowledged
+        native receipts before they leave that subset. Never by list index: outputs must still
         land in their own destinations, and a position cannot express that. A produced
         output the RecordOwner did not grant, or a granted destination the attempt did not
         fill, refuses the tail WHOLE — an output transaction is not partially successful.
         """
         rows = list(reply.get("outputs", ()))
+        weights_outputs: set[str] = set()
+        if attempt.job is not None:
+            declared = self._job_declaration(attempt.job, attempt.job.job_descriptor_id)
+            weights_outputs = {str(row["output_id"]) for row in declared.get("weights_outputs", [])}
+        if set(attempt.weights_receipts) != weights_outputs:
+            return (
+                None,
+                "weights_receipt_set_mismatch: every weights output requires "
+                "a host-acknowledged receipt",
+            )
+        granted = set(attempt.grant.outputs) - weights_outputs
+        if not weights_outputs <= set(attempt.grant.outputs):
+            return None, "weights_receipt_set_mismatch: a weights output has no granted destination"
         spool = attempt.spool
-        if not rows and not attempt.grant.outputs:
+        if not rows and not granted:
             return None, None
         if spool is None:
             return None, "the attempt has no spool to read outputs from"
         produced = {str(row["output_id"]): row for row in rows}
-        granted = set(attempt.grant.outputs)
         if set(produced) != granted:
             grants.abort_outputs(spool)
             return None, (

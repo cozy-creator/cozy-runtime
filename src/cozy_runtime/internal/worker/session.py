@@ -59,9 +59,11 @@ from cozy_runtime.internal import (
     hostfacts,
     package_environment,
     proctree,
+    weights_sink,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import (
     acquire,
     activity,
@@ -117,7 +119,7 @@ from cozy_runtime.internal.worker.plan import (
     shape_cell,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
@@ -257,6 +259,10 @@ class WorkerOptions:
     instance_id: str = ""
     worker_boot_id: str = ""
     """Externally provisioned boot id for fixed pods; local workers mint one in-process."""
+    ownership_required: bool = False
+    """A retained pod readiness envelope requires existing accepted control history."""
+    owns_tensorfs_store: bool = False
+    """The fixed pod owns this Store; local workers may share one and own only their work."""
     #: PROVENANCE, and every one of these is EMPTY when the launch did not supply it (#494g).
     #: The defaults used to name a real SDXL release and a `sha256:00…00` artifact, which rode
     #: real ClaimAcks and real BootFailures as if they had been measured. Absent is absent: an
@@ -422,15 +428,15 @@ class OwnershipFence:
     narration lane and now sits on the worker.
 
     `record_owner_epoch` is authority-granter-minted; `control_stream_epoch` is
-    WORKER-minted, incremented for every accepted stream; `worker_boot_id` is minted at worker
-    boot and never reused. The caller owns recovery across worker processes. The executor
-    epoch is PLACEMENT truth (#454) and deliberately not here.
+    WORKER-minted, incremented for every accepted stream. Fixed pods retain both the boot
+    identity and accepted counters across process replacement; local workers mint a fresh
+    boot. The executor epoch is PLACEMENT truth (#454) and deliberately not here.
     """
 
     worker_boot_id: str = ""
     record_owner_epoch: int = 0
     record_owner_id: str = ""
-    #: TRUE once this process accepted a (record_owner_epoch, record_owner_id) pair.
+    #: TRUE once this pod boot accepted a (record_owner_epoch, record_owner_id) pair.
     record_owner_recorded: bool = False
     control_stream_epoch: int = 0  # worker-minted; 0 = never claimed
     snapshot_id: str = ""  # the snapshot the CURRENT stream must ack
@@ -1018,6 +1024,25 @@ class Worker:
             executor_gid=options.executor_gid,
             jit_pod_scope=self.fence.worker_boot_id,
         )
+        # ExecutorSupervision already holds the process-lifetime worker-root lease.
+        # Restore only under that lease so two processes cannot allocate one stream.
+        self.ownership_path = self.root / "ownership.json" if options.worker_boot_id else None
+        if self.ownership_path is not None:
+            from cozy_runtime.internal.worker import ownership
+
+            try:
+                owner, identity, stream = ownership.read(
+                    self.ownership_path,
+                    self.fence.worker_boot_id,
+                    required=options.ownership_required,
+                )
+            except Exception:
+                self.supervision.close()
+                raise
+            self.fence.record_owner_epoch = owner
+            self.fence.record_owner_id = identity
+            self.fence.control_stream_epoch = stream
+            self.fence.record_owner_recorded = stream != 0
         self.supervision.on_change = self.executor_changed
         # One accepted stream at a time may mutate control state. Claims take this through
         # their snapshot, so ownership cannot move in the middle of convergence and a frame
@@ -1025,6 +1050,17 @@ class Worker:
         self.control_lock = threading.RLock()
         self.preparation_lock = threading.Lock()
         self.model_source_operations: set[str] = set()
+        self.restart_requested = False
+        if options.owns_tensorfs_store:
+            try:
+                self.model_source_operations.update(
+                    model_source_prepare.source_operations(
+                        tensorfs_root=Path(options.tensorfs_root or "")
+                    )
+                )
+            except Exception:
+                self.supervision.close()
+                raise
         # Exact code/PackageInterface/Environment revisions prepared over the loopback seam.
         # This is same-process admission state, not a Runtime journal. After worker restart the
         # RecordOwner replays preparation before a model-bound PlacementSet can join it.
@@ -1094,6 +1130,12 @@ class Worker:
             weights=self.weights,
             owner_scope=lambda: self.fence.record_owner_id,
             tensorfs_root=options.tensorfs_root,
+            work_fingerprint=lambda attempt: weights_sink.work_fingerprint(
+                attempt.spec,
+                attempt.job.environment_content_digest if attempt.job else "",
+                self.base,
+                hostfacts.measure(options.accelerator_backend),
+            ),
         )
         self.engine.boot_id = self.fence.worker_boot_id
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
@@ -1745,6 +1787,12 @@ class Worker:
         """Hand exact supervisor-verified source facts to the shared TensorFS core."""
 
         with self.preparation_lock:
+            if self.stop.is_set():
+                return pb.PrepareModelSourceResult(
+                    outcome=pb.MODEL_SOURCE_PREPARE_OUTCOME_REFUSED,
+                    safe_code="model_source_preparer_unavailable",
+                    safe_detail="the worker is stopping",
+                )
             result = model_source_prepare.prepare_model_source(
                 request, tensorfs_root=Path(self.options.tensorfs_root or "")
             )
@@ -1756,26 +1804,24 @@ class Worker:
                 self.model_source_operations.add(request.operation_id)
             return result
 
-    def source_checkpoint_page(
-        self, request: pb.SourceCheckpointPageRequest
-    ) -> pb.SourceCheckpointPageResult:
-        from . import model_source_checkpoint
+    def checkpoint_page(self, request: pb.CheckpointPageRequest) -> pb.CheckpointPageResult:
+        from . import checkpoint_transport
 
-        return model_source_checkpoint.page(
+        return checkpoint_transport.page(
             request, tensorfs_root=Path(self.options.tensorfs_root or "")
         )
 
-    def source_checkpoint_transfer(
-        self, request: pb.SourceCheckpointTransferRequest
-    ) -> pb.SourceCheckpointTransferStatus:
-        from . import model_source_checkpoint
+    def checkpoint_transfer(
+        self, request: pb.CheckpointTransferRequest
+    ) -> pb.CheckpointTransferStatus:
+        from . import checkpoint_transport
 
-        return model_source_checkpoint.transfer(
+        return checkpoint_transport.transfer(
             request, tensorfs_root=Path(self.options.tensorfs_root or "")
         )
 
     def release_model_source(self, operation_id: str) -> None:
-        """Explicit cooperative cleanup; pod teardown remains the remote durability boundary."""
+        """Release one native source operation under the preparation lock."""
 
         with self.preparation_lock:
             model_source_prepare.release_model_source(
@@ -2303,10 +2349,10 @@ class Worker:
                 pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
                 "the bootstrap credential is absent or wrong",
             )
-        if not self.claim_ready.is_set():
+        if claim.wire_minor < MIN_COMPATIBLE_WIRE_MINOR:
             return reject(
-                pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
-                "the worker listener is bound but the readiness barrier is not committed",
+                pb.ClaimRejection.CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE,
+                "peer is below the supported wire compatibility floor",
             )
         if claim.worker_id and claim.worker_id != self.options.worker_id:
             return reject(
@@ -2314,6 +2360,11 @@ class Worker:
                 f"this worker is {self.options.worker_id!r}",
             )
         with self.claim_lock:
+            if not self.claim_ready.is_set() or self.stop.is_set():
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
+                    "the worker listener is bound but the readiness barrier is not committed",
+                )
             # `record_owner_recorded`, not the epoch: the high-water authority this worker
             # accepted is DURABLE (#494e), so a restart still refuses the owner it superseded
             # before the restart instead of welcoming it back as the first claim of a fresh
@@ -2336,9 +2387,18 @@ class Worker:
                     pb.ClaimRejection.CLAIM_REJECTION_EPOCH_HELD,
                     "equal epoch, different RecordOwner: the epoch is held",
                 )
-            # RECORD BEFORE ACKNOWLEDGING so a reconnect to this process cannot race the
-            # ownership fence. The caller owns recovery across worker processes.
-            self.record_ownership(claim)
+            # The existing stream counter is synced before its ClaimAck. A failed
+            # write closes admission; a fresh process must read the stored authority.
+            try:
+                self.record_ownership(claim)
+            except (OSError, ValueError):
+                self.claim_ready.clear()
+                self.fence.dispatch_open = False
+                self.request_stop()
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
+                    "the next control stream could not be durably recorded",
+                )
             superseded = self.fence.control_stream_epoch
             self.fence.record_owner_epoch = claim.record_owner_epoch
             self.fence.record_owner_id = claim.record_owner_id
@@ -2370,8 +2430,18 @@ class Worker:
     def record_ownership(self, claim: pb.Claim) -> None:
         """Record the authority this claim carries before ClaimAck.
 
-        Called with `claim_lock` held so reconnects cannot race the in-process fence.
+        Called under `claim_lock` and the existing process-lifetime worker-root lease.
         """
+        if self.ownership_path is not None:
+            from cozy_runtime.internal.worker import ownership
+
+            ownership.write(
+                self.ownership_path,
+                self.fence.worker_boot_id,
+                claim.record_owner_epoch,
+                claim.record_owner_id,
+                self.fence.control_stream_epoch + 1,
+            )
         self.records.append(
             "ownership",
             {
@@ -2661,6 +2731,12 @@ class Worker:
         for lane in self.lanes:
             lane.work.put(None)
             lane.post.put(None)
+
+    def request_restart(self) -> None:
+        """A local operator requests process replacement while retaining source work."""
+        if not self.stop.is_set():
+            self.restart_requested = True
+            self.stop.set()
 
     def shutdown_from_stream(self) -> None:
         self.request_stop()
@@ -5646,6 +5722,10 @@ class Worker:
         return self.exit_code
 
     def shutdown(self) -> None:
+        # Fence new claims before the existing worker-root lease can be released.
+        # Any claim already syncing its counter finishes under the same lock.
+        with self.claim_lock:
+            self.claim_ready.clear()
         supervisions = [self.supervision] + [hosted.supervision for hosted in self.hosted.values()]
         seam = [
             supervision.current.channel.accounting()
@@ -5657,7 +5737,23 @@ class Worker:
         self.convergences.put(None)
         self.watches.end_all()
         self.host.stop()
-        for operation_id in sorted(self.model_source_operations):
+        # Drain an in-flight preparation before releasing process ownership. New
+        # preparations observe stop under the same lock and cannot recreate cleanup.
+        operations: list[str] = []
+        with self.preparation_lock:
+            if not self.restart_requested:
+                try:
+                    operations = (
+                        model_source_prepare.source_operations(
+                            tensorfs_root=Path(self.options.tensorfs_root or "")
+                        )
+                        if self.options.owns_tensorfs_store
+                        else sorted(self.model_source_operations)
+                    )
+                except LaunchRefusal as exc:
+                    self.exit_code = int(Exit.internal)
+                    self.note("shutdown", f"source operation cleanup unavailable: {exc.code}")
+        for operation_id in operations:
             try:
                 self.release_model_source(operation_id)
             except Exception as exc:
@@ -5677,6 +5773,7 @@ class Worker:
                 {
                     "worker_boot_id": self.fence.worker_boot_id,
                     "control_stream_epoch": self.fence.control_stream_epoch,
+                    "restart_requested": self.restart_requested,
                     "executor_epochs": sum(supervision.spawns for supervision in supervisions),
                     "admission_epoch": self.admission_epoch,
                     "executed": self.engine.executed,

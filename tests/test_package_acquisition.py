@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from cozy_runtime.internal import base_observation, canonical, package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
+from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.session import Placement
 from cozy_runtime.protocol import documents
 
@@ -34,7 +36,9 @@ def _interface(entrypoints: list[Json]) -> dict[str, Json]:
     }
 
 
-def _bindings(tmp_path: Path, body: dict[str, Json]) -> tuple[object, int]:
+def _bindings(
+    tmp_path: Path, body: dict[str, Json], selected: tuple[str, ...] = ()
+) -> tuple[Mapping[str, DeclaredBinding], int]:
     raw = canonical.write(body)
     digest = canonical.digest(body)
     cache = tmp_path / "cache"
@@ -59,7 +63,14 @@ def _bindings(tmp_path: Path, body: dict[str, Json]) -> tuple[object, int]:
         package_interface=(digest, len(raw)),
         bindings_digest=documents.digest_of(canonical.write({"entrypoints": [], "models": []})),
         models=(),
-        entrypoints=(),
+        entrypoints=tuple(
+            {
+                "name": name,
+                "entrypoint_binding_digest": canonical.digest({"entrypoint": name}),
+                "slots": [],
+            }
+            for name in selected
+        ),
         environment={},
         document={},
     )
@@ -88,3 +99,26 @@ def test_package_set_refuses_invalid_interface_entrypoints(
         _bindings(tmp_path, _interface(entrypoints))
 
     assert refused.value.code == "package_interface_invalid"
+
+
+@pytest.mark.parametrize("selected", [("first",), ("second",), ("first", "second")])
+def test_package_set_admits_selected_interface_entrypoints(
+    tmp_path: Path, selected: tuple[str, ...]
+) -> None:
+    bindings, count = _bindings(
+        tmp_path, _interface([_entrypoint("first"), _entrypoint("second")]), selected
+    )
+    assert {binding.entrypoint for binding in bindings.values()} == set(selected)
+    assert count == 1
+
+
+@pytest.mark.parametrize(
+    ("selected", "code"),
+    [((), "binding_entrypoint_set_mismatch"), (("absent",), "binding_package_interface_invalid")],
+)
+def test_package_set_refuses_empty_or_unknown_selection(
+    tmp_path: Path, selected: tuple[str, ...], code: str
+) -> None:
+    with pytest.raises(AcquisitionRefusal) as refused:
+        _bindings(tmp_path, _interface([_entrypoint("first"), _entrypoint("second")]), selected)
+    assert refused.value.code == code

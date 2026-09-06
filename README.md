@@ -225,6 +225,24 @@ uv tool install --force --python 3.12 \
   "cozy-runtime[media,model-execution] @ $PWD/dist/cozy_runtime-<version>-cp312-abi3-manylinux_2_28_x86_64.whl"
 ```
 
+For Python development edits, reuse a verified published native wheel without running CUDA:
+
+```sh
+uv run --script scripts/build-dev-wheel.py \
+  --native-wheel /path/to/cozy_runtime-<version>-cp312-abi3-manylinux_2_28_x86_64.whl \
+  --native-sha256 <that-wheel-sha256> --out dist/dev
+```
+
+This builds the current working tree, including uncommitted Python edits. It checks the native
+sources, build configuration and wrapper against the donor's embedded commit; changes require a
+normal native build. The result remains one standard Runtime wheel. Its local dev version binds
+both input wheels and the build script, and `COMMIT="unknown"` avoids claiming Git HEAD for a
+dirty snapshot. `SOURCE_WHEEL_SHA256` identifies the exact Python wheel retained under the
+output's `source-wheels/`; `native-provenance.json` records the donor commit and wheel/binary
+hashes. Standard `wheel unpack` and `wheel pack` verify and
+regenerate RECORD. Install the resulting wheel through the developer pod's coordinated software
+update; this command builds an artifact and does not replace a running worker.
+
 Every model-specific optimization first benchmarks `torch.compile`/Inductor as a discovery
 oracle and records profile identity, graph breaks, generated kernels, compile cost, warm
 latency, peak VRAM and output equivalence. Reusable fusion becomes a maintained in-package

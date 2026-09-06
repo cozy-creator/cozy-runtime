@@ -109,8 +109,9 @@ def _run(config: WorkerHostConfig) -> int:
     host.compatibility_checker = worker.check_package_set_compatibility
     host.preparer = worker.prepare_package_set
     host.model_source_preparer = worker.prepare_model_source
-    host.source_checkpoint_pager = worker.source_checkpoint_page
-    host.source_checkpoint_transfer = worker.source_checkpoint_transfer
+    host.checkpoint_pager = worker.checkpoint_page
+    host.checkpoint_transfer = worker.checkpoint_transfer
+    host.weights_checkpoint_validator = worker.weights.validate_checkpoint
     host.local_package_preparer = worker.prepare_local_package
     host.private_placement_preparer = worker.prepare_private_placement
     # The loopback weights seam (proto-025). The supervisor opens Exchange per control
@@ -149,8 +150,14 @@ def _run(config: WorkerHostConfig) -> int:
     def stop_signal(_signum: int, _frame: object) -> None:
         stop_worker()
 
+    def restart_signal(_signum: int, _frame: object) -> None:
+        # Only the root operator can signal this process. The supervisor watcher
+        # closes transport outside the signal handler after noticing the stop event.
+        worker.request_restart()
+
     signal.signal(signal.SIGTERM, stop_signal)
     signal.signal(signal.SIGINT, stop_signal)
+    signal.signal(signal.SIGHUP, restart_signal)
     threading.Thread(
         target=_watch_supervisor,
         args=(worker, stop_worker),
@@ -182,6 +189,8 @@ def _worker_options(
         worker_id=config.worker_id,
         instance_id=boot_id,
         worker_boot_id=boot_id,
+        ownership_required=host_paths.READINESS_ENVELOPE.exists(),
+        owns_tensorfs_store=True,
         accelerator_backend=accelerator_backend,
         devices=",".join(str(row["device_index"]) for row in gpus),
         grant_roots=(str(host_paths.MEDIA_ROOT),),
@@ -245,6 +254,7 @@ def _watch_supervisor(worker: Worker, stop: Callable[[], None]) -> None:
             print("[worker] fd 3 carried data; only EOF is valid", file=sys.stderr, flush=True)
         stop()
         return
+    stop()  # a local restart request also ends the host's blocking serve loop
 
 
 if __name__ == "__main__":

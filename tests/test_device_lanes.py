@@ -195,11 +195,8 @@ def _owner_below_lanes(owner: LocalRecordOwner) -> None:
 
 
 @needs_executor
-def test_a_two_device_serving_envelope_refuses_an_owner_below_minor_22() -> None:
-    """THE FENCE. A serving set from a RecordOwner that negotiated minor 21 on a two-lane
-    worker refuses `device_lanes_unsupported` (that owner reads one count over two lanes),
-    the fault names the minor that carries `lanes[]`, no executor is ever spawned, and
-    the worker stays ONLINE (it answered; it did not fail)."""
+def test_old_wire_owner_is_refused_before_device_envelope_changes() -> None:
+    """The compatibility floor now rejects old peers before ownership or lane changes."""
     workers: list[Worker] = []
     with _workspace() as root:
         outcome, seals = _slice(
@@ -210,21 +207,18 @@ def test_a_two_device_serving_envelope_refuses_an_owner_below_minor_22() -> None
             owner_hook=_owner_below_lanes,
         )
     assert outcome.result is None
-    assert "device_lanes_unsupported" in outcome.error, outcome.error
-    assert "negotiated wire minor 21" in outcome.error, outcome.error
-    reasons = [fault["reason"] for fault in outcome.faults]
-    assert "device_lanes_unsupported" in reasons, reasons
+    assert "CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE" in outcome.error, outcome.error
     assert seals == [], f"an executor was spawned behind the fence: {seals}"
     (worker,) = workers
     assert worker.phase == pb.WorkerPhase.WORKER_PHASE_ONLINE
-    assert worker.latched == "device_lanes_unsupported"
-    assert worker.fence.wire_minor == lane_wire.LANES_WIRE_MINOR - 1
+    assert not worker.latched
+    assert worker.fence.control_stream_epoch == 0
     assert worker.supervision.spawns == 0
 
 
 @needs_executor
-def test_a_two_device_serving_envelope_serves_an_owner_at_minor_22_per_lane() -> None:
-    """The fence LIFTED. The same set from an owner at 22 is served: the weightless
+def test_a_two_device_serving_envelope_serves_a_supported_owner_per_lane() -> None:
+    """The same set from a compatible owner is served: the weightless
     placement lands on lane-0 (fewest placements), sealed to device 0 alone, and every
     observed state the owner read carries both lanes, the placement's `device_lane_id`,
     and a worker-level count that is the SUM over lanes."""

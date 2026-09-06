@@ -46,6 +46,7 @@ class ObjectStore:
     def __init__(self) -> None:
         self.body = b""
         self.headers: dict[str, str] = {}
+        self.raw_headers: list[tuple[str, str]] = []
         self.status = 200
 
 
@@ -54,7 +55,8 @@ def serving(store: ObjectStore) -> Iterator[str]:
     class Handler(BaseHTTPRequestHandler):
         def do_PUT(self) -> None:
             store.body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-            store.headers = {k.lower(): v for k, v in self.headers.items()}
+            store.raw_headers = list(self.headers.items())
+            store.headers = {k.lower(): v for k, v in store.raw_headers}
             self.send_response(store.status)
             self.send_header("ETag", '"stored"')
             self.send_header("Content-Length", "0")
@@ -139,6 +141,9 @@ def test_upload_streams_the_exact_object_under_the_grant(tmp_path: Path) -> None
     # to one object and to a first write.
     assert store.headers.get("x-amz-checksum-sha256") == CHECKSUM_HEADER
     assert store.headers.get("if-none-match") == "*"
+    # Collapsing names into a dict concealed duplicate headers on the real wire.
+    for name in ("if-none-match", "x-amz-checksum-sha256", "content-length"):
+        assert sum(key.lower() == name for key, _ in store.raw_headers) == 1, store.raw_headers
 
 
 def test_precondition_failure_is_already_present_not_failure(tmp_path: Path) -> None:

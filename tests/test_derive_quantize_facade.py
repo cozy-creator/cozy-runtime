@@ -174,6 +174,18 @@ class _Transaction:
         self.store = store
         self.declared = declared
         self.parts: dict[tuple[str, str, str], bytes] = {}
+        self.checkpoints: list[frozenset[tuple[str, str, str]]] = []
+
+    @property
+    def completed_parts(self) -> frozenset[tuple[str, str, str]]:
+        return frozenset(self.parts)
+
+    @property
+    def completed_configs(self) -> frozenset[str]:
+        return frozenset()
+
+    def checkpoint(self) -> None:
+        self.checkpoints.append(frozenset(self.parts))
 
     def source_read_into(
         self, source: str, component: str, key: str, role: str, offset: int, into: memoryview
@@ -509,7 +521,7 @@ def test_a_replayed_lane_reports_the_prior_receipt_and_writes_nothing(tmp_path: 
     assert again.weights_transaction_id == first.weights_transaction_id
     assert (again.source_bytes_read_this_run, again.new_bytes_written_this_run) == (0, 0)
     assert (again.encoded_keys, again.converted_keys, again.inherited_keys) == (2, 1, 4)
-    assert (again.kept_keys, again.normalization_worst_relative_frobenius) == (0, 0.0)
+    assert (again.kept_keys, again.normalization_worst_relative_frobenius) == (0, None)
     assert not again.canonical
 
 
