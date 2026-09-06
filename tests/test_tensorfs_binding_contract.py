@@ -87,6 +87,7 @@ CALLED: dict[str, str] = {
         "(self, /, transaction_id, writer_session_id, sources, targets, configs, order, "
         "max_new_bytes)"
     ),
+    "Store.derived_declaration": "(self, /, sources, targets, configs, order, max_new_bytes)",
     "Store.derived_lookup": "(self, /, transaction_id)",
     "Store.derived_fence": "(self, /, transaction_id, writer_session_id)",
     "Store.derived_abandon": "(self, /, transaction_id)",

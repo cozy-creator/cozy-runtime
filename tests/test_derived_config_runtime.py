@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -14,9 +15,12 @@ from cozy_runtime.author._services import Attempt
 from cozy_runtime.author._weights import (
     WeightsCommit,
     WeightsConfig,
+    WeightsPart,
     WeightsTarget,
+    WeightsTensor,
     WeightsTransaction,
 )
+from cozy_runtime.internal.encoding import SPEC_PLAIN
 from cozy_runtime.internal.weights_sink import WeightsTransactionHost
 from test_model_runtime_closure import _CONFIG, _snapshot
 
@@ -63,13 +67,26 @@ def test_add_and_derive_configs_land_as_inline_jcs(tmp_path: Path) -> None:
             length=len(_DERIVED_INPUT),
         ),
     }
-    targets = {"unet": WeightsTarget(source="source", source_component="unet")}
+    targets = {
+        "unet": WeightsTarget(
+            source="source",
+            source_component="unet",
+            add={
+                "bias": WeightsTensor(
+                    logical_dtype="f32",
+                    shape=(2,),
+                    encoding=SPEC_PLAIN,
+                    parts={"value": WeightsPart(dtype="f32", shape=(2,))},
+                )
+            },
+        )
+    }
     request = WeightsCommit(
         output_slot="result",
         sources={"source": manifest},
         targets=targets,
         configs=configs,
-        order=(("unet", "weight"),),
+        order=(("unet", "weight"), ("unet", "bias")),
         max_new_bytes=1 << 20,
     )
     host = WeightsTransactionHost(
@@ -97,6 +114,7 @@ def test_add_and_derive_configs_land_as_inline_jcs(tmp_path: Path) -> None:
 
     transaction.add_config("added", _ADDED_INPUT)
     transaction.add_config("derived", derived_stream)
+    transaction.add_part("unet", "bias", "value", struct.pack("<2f", 1.0, 2.0))
     receipt = transaction.commit()
 
     facts = json.loads(receipt.tensorfs_receipt)
