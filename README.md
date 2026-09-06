@@ -473,6 +473,33 @@ Real-GPU behaviour is verified by hand on a rented card. `corpus/` holds the adv
 derivation cases and the real-torch fixtures for those runs; they are driven from a corpus
 venv, not from CI.
 
+Plain transformer components larger than the assigned weight-residence ceiling use their
+existing `_no_split_modules` boundaries. Runtime retains common weights and fills one block
+through the verified TensorFS read plan and bounded pinned ring before its forward. The
+completion fence must fire before that block returns to meta. There is no CPU model copy;
+the planner reports nominal model bytes separately from the common-plus-largest-block
+working set. Parameters and persistent buffers remain immutable checkpoint destinations;
+nonpersistent rotary buffers retain their config-derived initialization.
+Paged blocks must expose live returned tensors through registered PyTrees. Returned weight
+views refuse without freeing storage; arbitrary hidden state retaining weight views is not
+qualified by the no-split declaration or this proof.
+
+With H3's locked dependencies and the candidate Runtime/TensorFS installed, run the actual
+package constructor and GPU parity/refusal proof for each transformer:
+
+```bash
+python tests/testdata/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof text_encoder
+python tests/testdata/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof fl2va_dit
+```
+
+The fixture preserves all 50 language/DiT layers while reducing widths. Its all-resident
+reference is discarded before paging; each paged forward must reproduce exact outputs and
+evict every visited block. It also checks undersized working-set and autograd refusals,
+and process poisoning after a failed block forward. This proves weight paging, not full-video
+activation capacity. H3's full BF16 text and DiT weight working sets are about 2.90 GB and
+1.42 GB respectively; video-VAE activation tiling and encoded-leaf eviction remain separate
+qualification gaps. No dtype or inference backend is substituted to make a model fit.
+
 Model-bound `cozy-runtime run` uses the same explicit source-checkout lane: package.toml (or its
 `--model` override) selects an exact ref, the local TensorFS Repository resolves its release/lane,
 and the normal worker/attempt kernel applies the host's real GPU checks. It never authors a

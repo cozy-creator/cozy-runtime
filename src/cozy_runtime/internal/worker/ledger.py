@@ -301,6 +301,8 @@ class Ledger:
     #: this is what a staged rung must raise; pricing the largest single component instead
     #: under-charged every multi-component scope (codex audit, adopted 2026-08-25).
     declared_scopes: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: Runtime-derived block working sets; nominal checkpoint bytes remain separate.
+    paging: dict[str, dict[str, int]] = field(default_factory=dict)
     #: every re-baselining and its size, so a moved line is visible rather than assumed
     baseline_notes: list[str] = field(default_factory=list)
     #: TRUE once the generation's first-call tax has been paid by something that is not a
@@ -382,6 +384,7 @@ class Ledger:
         self.evicted.clear()
         self.parked = ()
         self.declared_scopes.clear()
+        self.paging.clear()
         self.baseline_notes.clear()
         self.baseline_paid = False
         self.residency_delta = 0
@@ -406,6 +409,10 @@ class Ledger:
         self.declared_scopes = {
             str(method): tuple(str(name) for name in names)
             for method, names in (facts.get("declared_scopes") or {}).items()
+        }
+        self.paging = {
+            str(name): {str(key): int(value) for key, value in layout.items()}
+            for name, layout in (facts.get("paging") or {}).items()
         }
         self.device_free = int(facts.get("device_free_bytes", -1))
         self.device_total = int(facts.get("device_total_bytes", -1))

@@ -1431,7 +1431,8 @@ class Executor:
             "allocator_bytes": memory["allocated_bytes"],
             "reserved_bytes": memory["reserved_bytes"],
             "resident": dict(backend.vram_charge),
-            "parked": sorted(backend.parked),
+            "parked": sorted(set(backend.parked) | set(backend.paging)),
+            "paging": {name: layout.document() for name, layout in backend.paging.items()},
             # WITH THEIR SIZES, like the residency document's `evicted`: a parked component
             # is a component the next attempt may have to bring back, and a chooser that
             # sees its name and not its bytes prices that stage-in at nothing.
@@ -1600,6 +1601,11 @@ class Executor:
             for parameter, facts in facts_rows
             for method, components in (facts.get("declared_scopes") or {}).items()
         }
+        paging = {
+            f"{parameter}/{component}": layout
+            for parameter, facts in facts_rows
+            for component, layout in (facts.get("paging") or {}).items()
+        }
         pinned_rows = [facts.get("pinned") or {} for _, facts in facts_rows]
         routes: dict[str, int] = {}
         kernels: dict[str, int] = {}
@@ -1654,6 +1660,7 @@ class Executor:
             "resident": resident,
             "parked": parked,
             "evicted": evicted,
+            "paging": paging,
             "declared_scopes": scopes,
             "rss_bytes": max(int(facts.get("rss_bytes", 0)) for _, facts in facts_rows),
             "pinned": {

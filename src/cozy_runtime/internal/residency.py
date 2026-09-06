@@ -4,9 +4,9 @@ The package declares, per public model operation, the possible heavyweight compo
 may touch. It declares nothing else: no device, no movement, no offload, no pinning, no
 eviction, no backend. This module is what makes that declaration mean something at runtime.
 
-    admit(method, components)   BEFORE method entry: every declared component is resident,
-                                or the call refuses typed. Making room is demand-pull
-                                eviction of evictable components in LRU order.
+    admit(method, components)   BEFORE method entry: reserve the declared component working
+                                set, or refuse typed. Plain oversized transformers keep
+                                common weights plus one declared no-split block resident.
     release(method, components) AFTER the body returns: record the completion event and
                                 close the scope. Release makes bytes EVICTABLE. It does not
                                 evict, and it imposes no global scope sequence (§3.2).
@@ -48,12 +48,15 @@ reactive load of something the method did not declare.
 
 from __future__ import annotations
 
+import functools
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.fill import FillRefusal, StreamingFillBackend
+from cozy_runtime.internal.paging import PageUnit
 
 
 def _read_bytes() -> int:
@@ -149,6 +152,142 @@ class ComponentResidency:
     scope_baseline_bytes: int = -1
     attempt_activation_peaks: dict[str, int] = field(default_factory=dict)
     attempt_absolute_peak_bytes: int = 0
+    page_call: tuple[str, PageUnit] | None = None
+    page_weight_delta: int = 0
+    page_bytes: int = 0
+    attempt_page_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        for name, layout in self.backend.paging.items():
+            for unit in layout.blocks:
+                module = unit.owners[0][1]
+                self.backend.paging_hooks.extend(
+                    (
+                        module.register_forward_pre_hook(
+                            functools.partial(self._page_enter, name, unit)
+                        ),
+                        module.register_forward_hook(
+                            functools.partial(self._page_leave, name, unit), always_call=True
+                        ),
+                    )
+                )
+
+    def _paging_peak(self, weight_delta: int) -> None:
+        peak = accel.peak_allocated(self.torch, self.kind)
+        self.attempt_absolute_peak_bytes = max(self.attempt_absolute_peak_bytes, peak)
+        if self.active is not None and self.scope_baseline_bytes >= 0:
+            method = self.active[0]
+            self.attempt_activation_peaks[method] = max(
+                self.attempt_activation_peaks.get(method, 0),
+                max(peak - self.scope_baseline_bytes - weight_delta, 0),
+            )
+
+    def _page_enter(self, name: str, unit: PageUnit, module: Any, args: Any) -> None:
+        self._require_clean(unit.path)
+        if self.active is None or name not in self.active[1] or self.page_call is not None:
+            raise self._poison(
+                "paging_scope", "a paging block requires one declared, nonnested forward"
+            )
+        if self.torch.is_grad_enabled():
+            raise ResidencyRefusal(
+                "paging_autograd", "weight paging requires inference with gradients disabled"
+            )
+        self._paging_peak(0)
+        headroom = self.scope_headrooms.get(self.active[0], self.headroom)
+        remaining = max(headroom - max(self._allocated() - self.scope_baseline_bytes, 0), 0)
+        if not self._fits(unit.nbytes + remaining):
+            raise self._shortfall(
+                self.active[0],
+                name,
+                remaining,
+                "paging block does not fit before reservation",
+                needed_weight_bytes=unit.nbytes,
+            )
+        allocated = self._allocated()
+        started = time.perf_counter()
+        try:
+            self.backend.stage_page(name, unit)
+        except Exception as exc:
+            raise self._poison(
+                "paging_fill", f"{name}.{unit.path}: fill failed after reservation"
+            ) from exc
+        self.page_call = (name, unit)
+        self.page_weight_delta = self._allocated() - allocated
+        moved = sum(self.backend.plan[f"{name}.{key}"].stored_nbytes for key in unit.keys)
+        self.page_bytes += moved
+        self.attempt_page_bytes += moved
+        self.allocator_delta_bytes += self.page_weight_delta
+        self.stages += 1
+        self.attempt_stages += 1
+        elapsed = (time.perf_counter() - started) * 1000
+        self.staged_ms += elapsed
+        self.attempt_staged_ms += elapsed
+        self.attempt_absolute_peak_bytes = max(
+            self.attempt_absolute_peak_bytes, accel.peak_allocated(self.torch, self.kind)
+        )
+        accel.reset_peak(self.torch, self.kind)
+
+    def _page_leave(self, name: str, unit: PageUnit, module: Any, args: Any, output: Any) -> None:
+        if self.page_call != (name, unit):
+            return  # an always-call hook also runs after a pre-hook refusal
+        if output is None and sys.exception() is not None:
+            self.poisoned = f"paging forward failed in {name}.{unit.path}"
+            self.page_call = None
+            return  # the process, not an in-process unwind, owns failed computation
+        try:
+            storages = {
+                tensor.untyped_storage().data_ptr()
+                for _, owner in unit.owners
+                for tensor in (*owner.parameters(recurse=False), *owner.buffers(recurse=False))
+            } - {0}
+            leaves = self.torch.utils._pytree.tree_leaves(output)
+            opaque = any(
+                not isinstance(value, self.torch.Tensor)
+                and type(value) not in (bool, int, float, complex, str, bytes, type(None))
+                for value in leaves
+            )
+            aliases = any(
+                isinstance(value, self.torch.Tensor)
+                and value.untyped_storage().data_ptr() in storages
+                for value in leaves
+            )
+        except Exception as exc:
+            raise self._poison(
+                "paging_output_storage", "block output storage could not be verified"
+            ) from exc
+        if opaque:
+            raise self._poison(
+                "paging_output_schema", "block outputs must expose tensor leaves through a PyTree"
+            )
+        if aliases:
+            raise self._poison(
+                "paging_output_alias",
+                "block output retains a view of weights selected for eviction",
+            )
+        self._paging_peak(self.page_weight_delta)
+        allocated = self._allocated()
+        started = time.perf_counter()
+        try:
+            event = accel.completion_event(self.torch, self.kind)
+            # Conservative first path: finish all device work before freeing weights.
+            # There is no prefetch stream or second liveness authority.
+            accel.synchronize(self.torch, self.kind)
+            if event is not None and not event.query():
+                raise RuntimeError("block completion was not observed")
+            self.backend.evict_page(name, unit)
+        except Exception as exc:
+            raise self._poison(
+                "paging_eviction", f"{name}.{unit.path}: completion or eviction failed"
+            ) from exc
+        self.allocator_delta_bytes += self._allocated() - allocated
+        self.evictions += 1
+        self.attempt_evictions += 1
+        elapsed = (time.perf_counter() - started) * 1000
+        self.evicted_ms += elapsed
+        self.attempt_evicted_ms += elapsed
+        self.page_call = None
+        self.page_weight_delta = 0
+        accel.reset_peak(self.torch, self.kind)
 
     @property
     def kind(self) -> str:
@@ -182,6 +321,7 @@ class ComponentResidency:
         self.scope_baseline_bytes = -1
         self.attempt_activation_peaks.clear()
         self.attempt_absolute_peak_bytes = 0
+        self.attempt_page_bytes = 0
 
     def admit(self, method: str, components: tuple[str, ...]) -> None:
         """Make the declared set resident BEFORE the method body runs, or refuse typed.
@@ -214,6 +354,17 @@ class ComponentResidency:
         self._make_headroom(components)
         headroom = self.scope_headrooms.get(method, self.headroom)
         for name in components:
+            if name in self.backend.paging and self._size(name) > self.backend.resident_budget:
+                raise ResidencyRefusal(
+                    "device_shortfall",
+                    f"{name}: common weights and one block exceed the assigned ceiling",
+                    {
+                        "resource": "vram",
+                        "needed_bytes": self._size(name),
+                        "available_bytes": self.backend.resident_budget,
+                        "scope": method,
+                    },
+                )
             fence = self.fences.setdefault(name, Fence())
             self.clock += 1
             fence.last_used = self.clock
@@ -579,7 +730,7 @@ class ComponentResidency:
         rung this frees just enough for what is being admitted, and a component the CURRENT
         method declares is never a victim of its own admission.
         """
-        need = sum(row.nbytes for row in self.backend.plan.values() if row.component == wanted)
+        need = self._size(wanted)
         if self.placement == "all_resident":
             # The rung that promised everything fits does not free anything to keep the
             # promise. If a component is not resident under it, admission checks the room
@@ -614,6 +765,8 @@ class ComponentResidency:
         evicted still costs exactly this much to bring back, and a chooser that reads only
         the RESIDENT map cannot see that cost at all (cl-003's second-1024px defect).
         """
+        if name in self.backend.paging:
+            return self.backend.paging[name].working_bytes
         known = self.backend.component_bytes.get(name)
         if known:
             return known
@@ -629,8 +782,16 @@ class ComponentResidency:
         victims = self._victims(declared)
         return victims[0] if victims else None
 
-    def _shortfall(self, method: str, name: str, headroom: int, detail: str) -> ResidencyRefusal:
-        need = sum(row.nbytes for row in self.backend.plan.values() if row.component == name)
+    def _shortfall(
+        self,
+        method: str,
+        name: str,
+        headroom: int,
+        detail: str,
+        *,
+        needed_weight_bytes: int | None = None,
+    ) -> ResidencyRefusal:
+        need = self._size(name) if needed_weight_bytes is None else needed_weight_bytes
         rows = accel.allocation(self.torch, self.kind)
         free, total = rows["driver_free_bytes"], rows["driver_total_bytes"]
         allocatable = int(free) + max(int(rows["reserved_bytes"]) - int(rows["allocated_bytes"]), 0)
@@ -668,6 +829,9 @@ class ComponentResidency:
             "attempt_evictions": self.attempt_evictions,
             "attempt_staged_ms": round(self.attempt_staged_ms, 2),
             "attempt_evicted_ms": round(self.attempt_evicted_ms, 2),
+            "page_bytes": self.page_bytes,
+            "attempt_page_bytes": self.attempt_page_bytes,
+            "paging": {name: layout.document() for name, layout in self.backend.paging.items()},
             "attempt_activation_peak_bytes": max(self.attempt_activation_peaks.values(), default=0),
             "attempt_activation_peaks": dict(self.attempt_activation_peaks),
             "attempt_absolute_peak_bytes": self.attempt_absolute_peak_bytes,
