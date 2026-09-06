@@ -229,13 +229,14 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
         server.stop(grace=0)
 
 
-def _run_intent(rig: Rig) -> dict[str, Any]:
+def _run_intent(rig: Rig, attempt: Any = None) -> dict[str, Any]:
     result: dict[str, Any] = {}
+    attempt = _attempt() if attempt is None else attempt
 
     def call() -> None:
         try:
             result["value"] = rig.exchange.intent(
-                _attempt(),
+                attempt,
                 transaction_id=TRANSACTION,
                 output_slot=OUTPUT_SLOT,
                 declaration_digest=DECLARATION_DIGEST,
@@ -248,6 +249,91 @@ def _run_intent(rig: Rig) -> dict[str, Any]:
     thread = threading.Thread(target=call, daemon=True)
     thread.start()
     return {"thread": thread, "result": result}
+
+
+def _restore_request(rig: Rig) -> pb.CheckpointTransferRequest:
+    return pb.CheckpointTransferRequest(
+        record_owner_epoch=rig.fence.record_owner_epoch,
+        worker_boot_id=rig.fence.worker_boot_id,
+        subject=pb.CheckpointSubject(
+            weights=pb.WeightsCheckpointSubject(
+                request_id="req-1",
+                invocation_spec_digest=SPEC_DIGEST,
+                output_slot=OUTPUT_SLOT,
+                weights_transaction_id=TRANSACTION,
+                writer_epoch=8,
+                tensorfs_declaration_digest=DECLARATION_DIGEST,
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "changed", ["owner", "boot", "lane", "spec", "declaration", "slot", "transaction", "epoch"]
+)
+def test_checkpoint_restore_is_bound_to_current_pending_intent(rig: Rig, changed: str) -> None:
+    pending = _run_intent(rig)
+    assert rig.control.signal.wait(WAIT)
+    request = _restore_request(rig)
+    try:
+        with rig.exchange.restore_checkpoint(request) as scope:
+            assert scope == (TRANSACTION, 8)
+        if changed == "owner":
+            request.record_owner_epoch += 1
+        elif changed == "boot":
+            request.worker_boot_id = "other-boot"
+        elif changed == "lane":
+            request.control_stream_epoch = 1
+        elif changed == "spec":
+            request.subject.weights.invocation_spec_digest = b"x" * 32
+        elif changed == "declaration":
+            request.subject.weights.tensorfs_declaration_digest = b"x" * 32
+        elif changed == "slot":
+            request.subject.weights.output_slot = "other"
+        elif changed == "transaction":
+            request.subject.weights.weights_transaction_id = "sha256:" + "b" * 64
+        else:
+            request.subject.weights.writer_epoch = 0
+        with (
+            pytest.raises(weights.WeightsExchangeError, match="weights_checkpoint_scope"),
+            rig.exchange.restore_checkpoint(request),
+        ):
+            pytest.fail("a mismatched restore reached native transfer")
+    finally:
+        rig.exchange.stop.set()
+        pending["thread"].join(WAIT)
+    assert not pending["thread"].is_alive()
+
+
+def test_checkpoint_restore_rechecks_waiter_and_refuses_ambiguous_attempts(rig: Rig) -> None:
+    first = _run_intent(rig)
+    assert rig.control.signal.wait(WAIT)
+    request = _restore_request(rig)
+    second_attempt = _attempt()
+    second_attempt.attempt = 2
+    rig.control.signal.clear()
+    second = _run_intent(rig, second_attempt)
+    assert rig.control.signal.wait(WAIT)
+    try:
+        with (
+            pytest.raises(weights.WeightsExchangeError, match="no unique current intent"),
+            rig.exchange.restore_checkpoint(request),
+        ):
+            pytest.fail("an ambiguous restore reached native transfer")
+        second_attempt.canceling = True
+        second["thread"].join(WAIT)
+        with (
+            pytest.raises(weights.WeightsExchangeError, match="intent ended"),
+            rig.exchange.restore_checkpoint(request) as scope,
+        ):
+            assert scope == (TRANSACTION, 8)
+            rig.exchange.abandon(TRANSACTION)
+        assert not rig.exchange.writer_broker.bindings
+    finally:
+        rig.exchange.stop.set()
+        for pending in (first, second):
+            pending["thread"].join(WAIT)
+            assert not pending["thread"].is_alive()
 
 
 def test_open_exchange_selects_the_lane_and_the_ack_settles_after_a_barrier(rig: Rig) -> None:

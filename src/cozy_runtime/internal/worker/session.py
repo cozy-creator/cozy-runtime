@@ -1817,7 +1817,9 @@ class Worker:
         from . import checkpoint_transport
 
         return checkpoint_transport.transfer(
-            request, tensorfs_root=Path(self.options.tensorfs_root or "")
+            request,
+            tensorfs_root=Path(self.options.tensorfs_root or ""),
+            restore_scope=self.weights.restore_checkpoint,
         )
 
     def release_model_source(self, operation_id: str) -> None:

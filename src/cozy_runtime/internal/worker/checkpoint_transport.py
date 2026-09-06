@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import re
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +186,8 @@ def transfer(
     *,
     tensorfs_root: Path,
     allow_local: bool = False,
+    restore_scope: Callable[[pb.CheckpointTransferRequest], AbstractContextManager[tuple[str, int]]]
+    | None = None,
 ) -> pb.CheckpointTransferStatus:
     result = pb.CheckpointTransferStatus(
         **_subject(request),
@@ -229,17 +233,26 @@ def transfer(
                 request.download_url, weights_limits.MAX_MODEL_SOURCE_URL_BYTES, empty=False
             ):
                 raise ModelSourceRefusal("grant_invalid", "invalid checkpoint download capability")
-            receipt = store.checkpoint_fetch(
-                object_id,
-                request.object.ref.length,
-                request.object.manifest,
-                request.download_url,
-                allow_local=allow_local,
-            )
-            # A replacement Store can first fetch its authorized head. Its contents must
-            # bind the claimed operation/slot/plan before it can authorize any other object.
-            if restores_head:
-                _page(store, request, 0, 1)
+            scope: AbstractContextManager[tuple[str, int] | None] = nullcontext(None)
+            if request.subject.WhichOneof("kind") == "weights":
+                if restore_scope is None:
+                    raise ModelSourceRefusal(
+                        "restore_ungranted", "weights restore needs a current intent"
+                    )
+                scope = restore_scope(request)
+            with scope as derived_restore:
+                receipt = store.checkpoint_fetch(
+                    object_id,
+                    request.object.ref.length,
+                    request.object.manifest,
+                    request.download_url,
+                    allow_local=allow_local,
+                    **({"derived_restore": derived_restore} if derived_restore is not None else {}),
+                )
+                # A replacement Store can first fetch its authorized head. Its contents
+                # must bind the claimed operation/slot/plan before authorizing members.
+                if restores_head:
+                    _page(store, request, 0, 1)
             result.state = pb.WEIGHTS_TRANSFER_STATE_HELD
         else:
             raise ModelSourceRefusal("grant_absent", "checkpoint transfer has no decision")

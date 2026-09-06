@@ -41,6 +41,7 @@ import json
 import queue
 import threading
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -253,6 +254,83 @@ class WeightsExchange:
                 "the weights host refused checkpoint",
             )
 
+    def _checkpoint_pending(
+        self,
+        request: pb.WeightsIntentReadyRequest | pb.CheckpointTransferRequest,
+        subject: pb.WeightsCheckpointSubject,
+        *,
+        attempt_ordinal: int | None = None,
+        declaration: bytes | None = None,
+    ) -> tuple[tuple[str, int, str, int], _Pending]:
+        current = self.stamp(pb.WeightsIntentFrame())
+        if (
+            request.record_owner_epoch != current.record_owner_epoch
+            or request.worker_boot_id != current.worker_boot_id
+            or request.control_stream_epoch != 0
+            or subject.writer_epoch == 0
+        ):
+            raise WeightsExchangeError(
+                "weights_checkpoint_scope", "checkpoint scope is not current"
+            )
+        with self._lock:
+            matches = [
+                (key, pending)
+                for key, pending in self._pending.items()
+                if key[0] == subject.request_id
+                and key[2] == subject.output_slot
+                and key[3] == pb.WEIGHTS_HOST_STAGE_INTENT
+                and (attempt_ordinal is None or key[1] == attempt_ordinal)
+            ]
+            if len(matches) != 1:
+                raise WeightsExchangeError(
+                    "weights_checkpoint_scope", "no unique current intent awaits restore"
+                )
+            key, pending = matches[0]
+            self._checkpoint_still_pending(key, pending, subject.weights_transaction_id)
+            sent = pending.frame.weights_intent
+            if (
+                sent.weights_transaction_id != subject.weights_transaction_id
+                or sent.invocation_spec_digest != subject.invocation_spec_digest
+                or sent.tensorfs_declaration_digest != subject.tensorfs_declaration_digest
+                or (
+                    declaration is not None
+                    and sent.tensorfs_declaration_canonical_bytes != declaration
+                )
+            ):
+                raise WeightsExchangeError(
+                    "weights_checkpoint_scope", "checkpoint differs from current intent"
+                )
+            return key, pending
+
+    def _checkpoint_still_pending(
+        self, key: tuple[str, int, str, int], pending: _Pending, transaction_id: str
+    ) -> None:
+        """Check the same waiter while the caller holds `_lock`."""
+        if (
+            self._pending.get(key) is not pending
+            or pending.canceled()
+            or self.stop.is_set()
+            or transaction_id in self._abandoned
+        ):
+            raise WeightsExchangeError(
+                "weights_checkpoint_scope", "intent ended during checkpoint restore"
+            )
+
+    @contextmanager
+    def restore_checkpoint(
+        self, request: pb.CheckpointTransferRequest
+    ) -> Iterator[tuple[str, int]]:
+        """Bind download custody to the current intent without holding a lock over IO.
+
+        Native custody survives this waiter and process. Only native begin adopts it or
+        explicit owner abandonment releases it; finishing a transfer is neither action.
+        """
+        subject = request.subject.weights
+        key, pending = self._checkpoint_pending(request, subject)
+        yield subject.weights_transaction_id, subject.writer_epoch
+        with self._lock:
+            self._checkpoint_still_pending(key, pending, subject.weights_transaction_id)
+
     def validate_checkpoint(
         self, request: pb.ValidateWeightsCheckpointRequest
     ) -> pb.ValidateWeightsCheckpointResult:
@@ -262,47 +340,20 @@ class WeightsExchange:
         if intent.HasField("checkpoint"):
             result.checkpoint.CopyFrom(intent.checkpoint)
         try:
-            current = self.stamp(pb.WeightsIntentFrame())
             if (
-                intent.record_owner_epoch != current.record_owner_epoch
-                or intent.worker_boot_id != current.worker_boot_id
-                or intent.control_stream_epoch != 0
-                or request.ByteSize() > weights_limits.MAX_INLINE_CONTROL_BYTES
-                or subject.writer_epoch == 0
+                request.ByteSize() > weights_limits.MAX_INLINE_CONTROL_BYTES
                 or len(request.tensorfs_declaration_canonical_bytes)
                 > weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
             ):
                 raise WeightsExchangeError(
                     "weights_checkpoint_scope", "checkpoint scope is not current"
                 )
-            key = self._key(
-                subject.request_id,
-                intent.attempt_ordinal,
-                subject.output_slot,
-                pb.WEIGHTS_HOST_STAGE_INTENT,
+            key, pending = self._checkpoint_pending(
+                intent,
+                subject,
+                attempt_ordinal=intent.attempt_ordinal,
+                declaration=request.tensorfs_declaration_canonical_bytes,
             )
-            with self._lock:
-                pending = self._pending.get(key)
-                if (
-                    pending is None
-                    or pending.canceled()
-                    or self.stop.is_set()
-                    or subject.weights_transaction_id in self._abandoned
-                ):
-                    raise WeightsExchangeError(
-                        "weights_checkpoint_scope", "no current intent awaits restore"
-                    )
-                sent = pending.frame.weights_intent
-                if (
-                    sent.weights_transaction_id != subject.weights_transaction_id
-                    or sent.invocation_spec_digest != subject.invocation_spec_digest
-                    or sent.tensorfs_declaration_digest != subject.tensorfs_declaration_digest
-                    or sent.tensorfs_declaration_canonical_bytes
-                    != request.tensorfs_declaration_canonical_bytes
-                ):
-                    raise WeightsExchangeError(
-                        "weights_checkpoint_scope", "checkpoint differs from current intent"
-                    )
             if intent.HasField("checkpoint"):
                 checkpoint = intent.checkpoint
                 store = self._store()
@@ -328,15 +379,7 @@ class WeightsExchange:
                     plan_digest=documents.spell(checkpoint.plan_digest),
                 )
             with self._lock:
-                if (
-                    self._pending.get(key) is not pending
-                    or pending.canceled()
-                    or self.stop.is_set()
-                    or subject.weights_transaction_id in self._abandoned
-                ):
-                    raise WeightsExchangeError(
-                        "weights_checkpoint_scope", "intent ended during checkpoint validation"
-                    )
+                self._checkpoint_still_pending(key, pending, subject.weights_transaction_id)
             result.valid = True
         except Exception as exc:
             result.safe_code = str(getattr(exc, "code", "weights_checkpoint_invalid"))[:128]
