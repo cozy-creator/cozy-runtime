@@ -154,6 +154,7 @@ class ComponentResidency:
     attempt_absolute_peak_bytes: int = 0
     page_call: tuple[str, PageUnit] | None = None
     page_weight_delta: int = 0
+    page_autocast_cache: bool | None = None
     page_bytes: int = 0
     attempt_page_bytes: int = 0
 
@@ -211,6 +212,12 @@ class ComponentResidency:
             raise self._poison(
                 "paging_fill", f"{name}.{unit.path}: fill failed after reservation"
             ) from exc
+        # A surrounding autocast scope may span hundreds of tiles. Its ordinary
+        # weight cache would retain a fresh cast for every rematerialized Parameter,
+        # defeating eviction even though the original FP32 storage was released.
+        # Change only caching, never the caller's enabled state or compute dtype.
+        self.page_autocast_cache = self.torch.is_autocast_cache_enabled()
+        self.torch.set_autocast_cache_enabled(False)
         self.page_call = (name, unit)
         self.page_weight_delta = self._allocated() - allocated
         moved = sum(self.backend.plan[f"{name}.{key}"].stored_nbytes for key in unit.keys)
@@ -230,6 +237,14 @@ class ComponentResidency:
     def _page_leave(self, name: str, unit: PageUnit, module: Any, args: Any, output: Any) -> None:
         if self.page_call != (name, unit):
             return  # an always-call hook also runs after a pre-hook refusal
+        try:
+            self._finish_page(name, unit, output)
+        finally:
+            if self.page_autocast_cache is not None:
+                self.torch.set_autocast_cache_enabled(self.page_autocast_cache)
+                self.page_autocast_cache = None
+
+    def _finish_page(self, name: str, unit: PageUnit, output: Any) -> None:
         if output is None and sys.exception() is not None:
             self.poisoned = f"paging forward failed in {name}.{unit.path}"
             self.page_call = None
