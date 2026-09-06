@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from cozy_runtime.internal import base_observation, canonical, package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
+from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.session import Placement
 from cozy_runtime.protocol import documents
 
@@ -36,7 +38,7 @@ def _interface(entrypoints: list[Json]) -> dict[str, Json]:
 
 def _bindings(
     tmp_path: Path, body: dict[str, Json], selected: tuple[str, ...] = ()
-) -> tuple[object, int]:
+) -> tuple[Mapping[str, DeclaredBinding], int]:
     raw = canonical.write(body)
     digest = canonical.digest(body)
     cache = tmp_path / "cache"
