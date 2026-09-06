@@ -119,6 +119,7 @@ def _envelope(message: Any) -> Envelope:
 class _Pending:
     frame: pb.WorkerFrame
     event: threading.Event
+    canceled: Callable[[], bool]
     ack: pb.WeightsHostAck | None = None
     lane: Lane = ("", 0)
     envelope: Envelope = (0, 0, "")
@@ -274,17 +275,17 @@ class WeightsExchange:
                 raise WeightsExchangeError(
                     "weights_checkpoint_scope", "checkpoint scope is not current"
                 )
+            key = self._key(
+                subject.request_id,
+                intent.attempt_ordinal,
+                subject.output_slot,
+                pb.WEIGHTS_HOST_STAGE_INTENT,
+            )
             with self._lock:
-                pending = self._pending.get(
-                    self._key(
-                        subject.request_id,
-                        intent.attempt_ordinal,
-                        subject.output_slot,
-                        pb.WEIGHTS_HOST_STAGE_INTENT,
-                    )
-                )
+                pending = self._pending.get(key)
                 if (
                     pending is None
+                    or pending.canceled()
                     or self.stop.is_set()
                     or subject.weights_transaction_id in self._abandoned
                 ):
@@ -326,6 +327,16 @@ class WeightsExchange:
                     slot=subject.output_slot,
                     plan_digest=documents.spell(checkpoint.plan_digest),
                 )
+            with self._lock:
+                if (
+                    self._pending.get(key) is not pending
+                    or pending.canceled()
+                    or self.stop.is_set()
+                    or subject.weights_transaction_id in self._abandoned
+                ):
+                    raise WeightsExchangeError(
+                        "weights_checkpoint_scope", "intent ended during checkpoint validation"
+                    )
             result.valid = True
         except Exception as exc:
             result.safe_code = str(getattr(exc, "code", "weights_checkpoint_invalid"))[:128]
@@ -884,7 +895,7 @@ class WeightsExchange:
         *,
         canceled: Callable[[], bool],
     ) -> pb.WeightsHostAck:
-        pending = _Pending(frame=frame, event=threading.Event())
+        pending = _Pending(frame=frame, event=threading.Event(), canceled=canceled)
         with self._lock:
             existing = self._pending.get(key)
             if existing is not None:

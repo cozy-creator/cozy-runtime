@@ -403,8 +403,9 @@ def test_checkpoint_refusal_has_no_writer_authority() -> None:
     assert error.value.code == "weights_host_ack_invalid"
 
 
+@pytest.mark.parametrize("cancel_during_validation", [False, True])
 def test_restored_native_work_validates_under_pending_intent_without_importing_writer(
-    rig: Rig, tmp_path: Path
+    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_during_validation: bool
 ) -> None:
     original = tensorfs.Store.init(tmp_path / "original")
     restored = tensorfs.Store.init(rig.exchange.store_root)
@@ -455,16 +456,20 @@ def test_restored_native_work_validates_under_pending_intent_without_importing_w
     supervisor = StandInSupervisor(rig.stub)
     _await(rig.exchange.exchange_open, "exchange did not open")
     result: dict[str, Any] = {}
+    attempt = _attempt()
 
     def intent_call() -> None:
-        result["value"] = rig.exchange.intent(
-            _attempt(),
-            output_slot=OUTPUT_SLOT,
-            transaction_id=TRANSACTION,
-            declaration_digest=sha256(declaration).digest(),
-            declaration=declaration,
-            requested_writer_epoch=0,
-        )
+        try:
+            result["value"] = rig.exchange.intent(
+                attempt,
+                output_slot=OUTPUT_SLOT,
+                transaction_id=TRANSACTION,
+                declaration_digest=sha256(declaration).digest(),
+                declaration=declaration,
+                requested_writer_epoch=0,
+            )
+        except weights.WeightsExchangeError as error:
+            result["error"] = error.code
 
     pending = threading.Thread(target=intent_call, daemon=True)
     pending.start()
@@ -492,6 +497,37 @@ def test_restored_native_work_validates_under_pending_intent_without_importing_w
     request = pb.ValidateWeightsCheckpointRequest(
         intent=ready, tensorfs_declaration_canonical_bytes=declaration
     )
+    if cancel_during_validation:
+        validated, finish = threading.Event(), threading.Event()
+
+        class DelayedStore:
+            checkpoint_page = restored.checkpoint_page
+
+            def validate_derived_checkpoint(self, *args: Any, **kwargs: Any) -> None:
+                restored.validate_derived_checkpoint(*args, **kwargs)
+                validated.set()
+                assert finish.wait(WAIT), "validation did not finish"
+
+        monkeypatch.setattr(rig.exchange, "_store", DelayedStore)
+        verdict: dict[str, Any] = {}
+
+        def validate() -> None:
+            verdict["value"] = rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
+
+        validating = threading.Thread(target=validate, daemon=True)
+        validating.start()
+        assert validated.wait(WAIT), "native closure was not validated"
+        attempt.canceling = True
+        pending.join(WAIT)
+        finish.set()
+        validating.join(WAIT)
+        assert not pending.is_alive() and not validating.is_alive()
+        assert result == {"error": "weights_host_exchange_canceled"}
+        assert not verdict["value"].valid and verdict["value"].safe_code
+        assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
+        assert not rig.exchange.writer_broker.bindings
+        supervisor.close()
+        return
     accepted = rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
     assert accepted.valid and accepted.checkpoint == checkpoint
     assert pending.is_alive() and result == {}
