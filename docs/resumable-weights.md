@@ -1,6 +1,6 @@
 # Resumable weights
 
-Runtime 0.2.27 uses TensorFS 0.3.13 and the coordinated wire 38 checkpoint contract.
+Runtime 0.2.28 uses TensorFS 0.3.13 and the coordinated wire 38 checkpoint contract.
 Clients probe the actual Runtime compatibility range before Claim or preparation; wire 37
 cannot enter this changed layout. A local native commit or checkpoint ACK is not remote custody.
 
