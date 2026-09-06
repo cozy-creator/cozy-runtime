@@ -1305,12 +1305,12 @@ class Worker:
         bindings: Mapping[str, DeclaredBinding],
         supervision: ExecutorSupervision,
     ) -> bool:
-        """Assign one placement to a lane by MEASURED fit (cr-066 R2), or latch it typed.
+        """Assign one placement to a measured lane, or latch a typed lane refusal.
 
         The declared bytes are the placement's model weight bytes from its bindings' MCC
         census; the measured side is each lane's driver-reported free and total bytes, read
-        now. A placement that fits nowhere refuses `device_lane_infeasible` and leaves every
-        other placement where it is — never a silent over-commit onto some lane. The row
+        now. Full weight size ranks lanes, while the measured prepare ceiling and actual
+        construction/residency working set determine fit. Assignment grants no bytes. The row
         the lane keeps for it remembers `supervision`, the slot the lane asks to vacate
         when a co-tenant needs the card (cr-022).
         """

@@ -366,7 +366,8 @@ def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
     model-bearing placement takes a lane with room and no other model-bearing tenant; else
     a lane with measured headroom BESIDE its tenants (co-residency); else a lane whose
     measured TOTAL holds it alone (time-sliced sharing). A lane the driver cannot read is
-    never chosen; nothing fitting is a typed refusal that moves no other placement. On a
+    never chosen. Weights larger than VRAM proceed to bounded preparation, which retains
+    the working-set fit decision. Assignment itself authorizes no bytes. On a
     WIDE envelope the candidate lane is the placement's PIN (cr-068): the worker validates,
     it never chooses which paid card to idle."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
@@ -398,12 +399,14 @@ def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
     )
     assert shared.lane_id == "lane-0"
     lanes_.lanes[0].row("shared").model_bearing = True
-    with pytest.raises(lanes.LaneRefusal) as refused:
-        lanes_.assign(
-            "huge", model_bearing=True, declared_bytes=32 << 30, measured=measured, pin=(1,)
-        )
-    assert refused.value.code == "device_pin_infeasible"
-    assert "B total for 34359738368 B" in refused.value.detail
+    huge = lanes_.assign(
+        "huge", model_bearing=True, declared_bytes=32 << 30, measured=measured, pin=(1,)
+    )
+    assert huge.lane_id == "lane-1"
+    assert huge.outstanding_bytes() == 0
+    granted = huge.authorize("huge", measured[1].free_bytes)
+    assert granted == 16 << 30
+    huge.settle("huge")
     with pytest.raises(lanes.LaneRefusal) as refused:
         lanes_.assign(
             "blind", model_bearing=True, declared_bytes=1 << 20, measured=measured, pin=(2,)
@@ -415,7 +418,7 @@ def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
         lanes_.assign("unpinned", model_bearing=True, declared_bytes=1 << 20, measured=measured)
     assert refused.value.code == "device_group_unsupported"
     assert "carries no device pin on a 3-device envelope" in refused.value.detail
-    assert lanes_.lane_of("huge") is None and lanes_.lane_of("unpinned") is None
+    assert lanes_.lane_of("huge") is huge and lanes_.lane_of("unpinned") is None
     assert lanes_.lane_of("big") is lanes_.lanes[1] and lanes_.lane_of("small") is lanes_.lanes[0]
     # weightless placements spread over the lanes with the fewest tenants
     weightless = lanes_.assign("w1", model_bearing=False, declared_bytes=0, measured={})

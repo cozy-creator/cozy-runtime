@@ -458,7 +458,7 @@ class LaneSet:
         pin: tuple[int, ...] | None = None,
         degrees: tuple[int, ...] = (),
     ) -> DeviceLane:
-        """Choose the lane for a placement by MEASURED fit under its PIN, or refuse typed.
+        """Choose a measured lane under its PIN; preparation authorizes its working set.
 
         The worker never orders attempts (#475); it does own GPU allocation (#659), and this
         is the whole of it. `measured` is the driver's reading of every envelope device,
@@ -479,6 +479,10 @@ class LaneSet:
         3. a lane whose measured TOTAL covers the declared bytes — time-sliced sharing
            (cr-022's swap arm): the placement fits the card alone, and the lane's residency
            arbitration gives it the card when its attempts need it.
+        4. a readable lane for bounded preparation. Total weights can exceed VRAM when
+           component staging or block paging is available. Assignment reserves no bytes:
+           the measured prepare ceiling and actual construction/residency working set
+           still decide whether the model can run.
 
         A pin of K > 1 ordinals is a GROUP (cr-068): every named lane must be empty, the
         package must declare degree K, and every device's headroom must cover the declared
@@ -583,16 +587,15 @@ class LaneSet:
             (lane for lane, memory in readable if memory.total_bytes >= declared_bytes),
             key=lambda lane: (len(lane.model_bearing_slots()), lane.ordinals),
         )
-        for chosen_set in (alone, beside, shared):
+        bounded = sorted(
+            (lane for lane, _memory in readable),
+            key=lambda lane: (len(lane.model_bearing_slots()), lane.ordinals),
+        )
+        for chosen_set in (alone, beside, shared, bounded):
             if chosen_set:
                 chosen = chosen_set[0]
                 chosen.placements.add(placement_id)
                 return chosen
-        for lane, memory in readable:
-            shortfalls.append(
-                f"{lane.lane_id} has {headroom(lane, memory)} B measured headroom and "
-                f"{memory.total_bytes} B total for {declared_bytes} B of declared weights"
-            )
         raise LaneRefusal(
             "device_pin_infeasible" if pinned else "device_lane_infeasible",
             f"no lane fits placement {placement_id!r}: " + "; ".join(shortfalls),
