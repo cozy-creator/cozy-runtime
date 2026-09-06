@@ -321,12 +321,14 @@ def put_from(
         http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
     )
     headers = {
-        "Accept-Encoding": "identity",
-        "Content-Length": str(expected_length),
-        "Content-Type": media_type or "application/octet-stream",
-        "If-None-Match": "*",
+        "accept-encoding": "identity",
+        "content-length": str(expected_length),
+        "content-type": media_type or "application/octet-stream",
+        "if-none-match": "*",
     }
-    headers.update(required_headers or {})
+    # HTTP names are case-insensitive. A signed grant replaces the same default
+    # header, rather than adding a second differently-cased field on the wire.
+    headers.update((name.lower(), value) for name, value in (required_headers or {}).items())
     #: The one send that streamed the WHOLE body. Its digest is the object's, whatever the
     #: store then said; a 412 on a later re-send is that send having landed.
     complete: _MeasuredReader | None = None
