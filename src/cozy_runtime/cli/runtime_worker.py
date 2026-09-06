@@ -182,6 +182,7 @@ def _worker_options(
         worker_id=config.worker_id,
         instance_id=boot_id,
         worker_boot_id=boot_id,
+        ownership_required=host_paths.READINESS_ENVELOPE.exists(),
         accelerator_backend=accelerator_backend,
         devices=",".join(str(row["device_index"]) for row in gpus),
         grant_roots=(str(host_paths.MEDIA_ROOT),),
