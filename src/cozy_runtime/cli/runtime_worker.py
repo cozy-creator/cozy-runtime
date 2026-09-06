@@ -37,6 +37,7 @@ SUPERVISOR_STOP_FD = 3
 def main(argv: Sequence[str] | None = None) -> int:
     """Boot empty, host WorkerControl, prove both listeners, and publish readiness."""
 
+    raise RuntimeError("cozy-dev-wrapper-fixture: startup refused")
     opts = Options()
     try:
         if argv is None:
