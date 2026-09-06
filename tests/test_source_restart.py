@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +89,56 @@ def test_shared_local_store_does_not_release_other_source_operations(tmp_path: P
     worker.shutdown()
     assert store.model_source_operations() == before
     assert _heads(store, fixture) == pages
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_queued_preparation_observes_stop_after_acquiring_lock(
+    tmp_path: Path, restart: bool
+) -> None:
+    store, fixture = _fixture(tmp_path)
+    operations = store.model_source_operations()
+    pages = _heads(store, fixture)
+    worker = _worker(tmp_path, owns=True)
+    lock = worker.preparation_lock
+    entered = threading.Event()
+
+    class ObservedLock:
+        """Observe the real lock attempt; never replace native work or its answer."""
+
+        def __enter__(self) -> None:
+            entered.set()
+            lock.acquire()
+
+        def __exit__(self, *args: Any) -> None:
+            lock.release()
+
+    observed: Any = ObservedLock()
+    worker.preparation_lock = observed
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        lock.acquire()
+        try:
+            pending = executor.submit(
+                worker.prepare_model_source,
+                pb.PrepareModelSourceRequest(operation_id="queued-after-stop"),
+            )
+            assert entered.wait(5), "prepare handler did not reach the held lock"
+            assert not pending.done()
+            if restart:
+                worker.request_restart()
+            else:
+                worker.request_stop()
+        finally:
+            lock.release()
+        worker.shutdown()
+        result = pending.result(timeout=5)
+    assert result.outcome == pb.MODEL_SOURCE_PREPARE_OUTCOME_REFUSED
+    assert result.safe_code == "model_source_preparer_unavailable"
+    assert store.model_source_operations() == (operations if restart else [])
+    if restart:
+        assert _heads(store, fixture) == pages
+        replacement = _worker(tmp_path, owns=True, required=True)
+        replacement.shutdown()
+        assert store.model_source_operations() == []
 
 
 def test_refused_restart_history_keeps_source_operations(tmp_path: Path) -> None:
