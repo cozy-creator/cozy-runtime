@@ -257,6 +257,8 @@ class WorkerOptions:
     instance_id: str = ""
     worker_boot_id: str = ""
     """Externally provisioned boot id for fixed pods; local workers mint one in-process."""
+    ownership_required: bool = False
+    """A retained pod readiness envelope requires existing accepted control history."""
     #: PROVENANCE, and every one of these is EMPTY when the launch did not supply it (#494g).
     #: The defaults used to name a real SDXL release and a `sha256:00…00` artifact, which rode
     #: real ClaimAcks and real BootFailures as if they had been measured. Absent is absent: an
@@ -422,15 +424,15 @@ class OwnershipFence:
     narration lane and now sits on the worker.
 
     `record_owner_epoch` is authority-granter-minted; `control_stream_epoch` is
-    WORKER-minted, incremented for every accepted stream; `worker_boot_id` is minted at worker
-    boot and never reused. The caller owns recovery across worker processes. The executor
-    epoch is PLACEMENT truth (#454) and deliberately not here.
+    WORKER-minted, incremented for every accepted stream. Fixed pods retain both the boot
+    identity and accepted counters across process replacement; local workers mint a fresh
+    boot. The executor epoch is PLACEMENT truth (#454) and deliberately not here.
     """
 
     worker_boot_id: str = ""
     record_owner_epoch: int = 0
     record_owner_id: str = ""
-    #: TRUE once this process accepted a (record_owner_epoch, record_owner_id) pair.
+    #: TRUE once this pod boot accepted a (record_owner_epoch, record_owner_id) pair.
     record_owner_recorded: bool = False
     control_stream_epoch: int = 0  # worker-minted; 0 = never claimed
     snapshot_id: str = ""  # the snapshot the CURRENT stream must ack
@@ -1018,6 +1020,25 @@ class Worker:
             executor_gid=options.executor_gid,
             jit_pod_scope=self.fence.worker_boot_id,
         )
+        # ExecutorSupervision already holds the process-lifetime worker-root lease.
+        # Restore only under that lease so two processes cannot allocate one stream.
+        self.ownership_path = self.root / "ownership.json" if options.worker_boot_id else None
+        if self.ownership_path is not None:
+            from cozy_runtime.internal.worker import ownership
+
+            try:
+                owner, identity, stream = ownership.read(
+                    self.ownership_path,
+                    self.fence.worker_boot_id,
+                    required=options.ownership_required,
+                )
+            except Exception:
+                self.supervision.close()
+                raise
+            self.fence.record_owner_epoch = owner
+            self.fence.record_owner_id = identity
+            self.fence.control_stream_epoch = stream
+            self.fence.record_owner_recorded = stream != 0
         self.supervision.on_change = self.executor_changed
         # One accepted stream at a time may mutate control state. Claims take this through
         # their snapshot, so ownership cannot move in the middle of convergence and a frame
@@ -2303,17 +2324,17 @@ class Worker:
                 pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
                 "the bootstrap credential is absent or wrong",
             )
-        if not self.claim_ready.is_set():
-            return reject(
-                pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
-                "the worker listener is bound but the readiness barrier is not committed",
-            )
         if claim.worker_id and claim.worker_id != self.options.worker_id:
             return reject(
                 pb.ClaimRejection.CLAIM_REJECTION_WORKER_ID_MISMATCH,
                 f"this worker is {self.options.worker_id!r}",
             )
         with self.claim_lock:
+            if not self.claim_ready.is_set() or self.stop.is_set():
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
+                    "the worker listener is bound but the readiness barrier is not committed",
+                )
             # `record_owner_recorded`, not the epoch: the high-water authority this worker
             # accepted is DURABLE (#494e), so a restart still refuses the owner it superseded
             # before the restart instead of welcoming it back as the first claim of a fresh
@@ -2336,9 +2357,18 @@ class Worker:
                     pb.ClaimRejection.CLAIM_REJECTION_EPOCH_HELD,
                     "equal epoch, different RecordOwner: the epoch is held",
                 )
-            # RECORD BEFORE ACKNOWLEDGING so a reconnect to this process cannot race the
-            # ownership fence. The caller owns recovery across worker processes.
-            self.record_ownership(claim)
+            # The existing stream counter is synced before its ClaimAck. A failed
+            # write closes admission; a fresh process must read the stored authority.
+            try:
+                self.record_ownership(claim)
+            except (OSError, ValueError):
+                self.claim_ready.clear()
+                self.fence.dispatch_open = False
+                self.request_stop()
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
+                    "the next control stream could not be durably recorded",
+                )
             superseded = self.fence.control_stream_epoch
             self.fence.record_owner_epoch = claim.record_owner_epoch
             self.fence.record_owner_id = claim.record_owner_id
@@ -2370,8 +2400,18 @@ class Worker:
     def record_ownership(self, claim: pb.Claim) -> None:
         """Record the authority this claim carries before ClaimAck.
 
-        Called with `claim_lock` held so reconnects cannot race the in-process fence.
+        Called under `claim_lock` and the existing process-lifetime worker-root lease.
         """
+        if self.ownership_path is not None:
+            from cozy_runtime.internal.worker import ownership
+
+            ownership.write(
+                self.ownership_path,
+                self.fence.worker_boot_id,
+                claim.record_owner_epoch,
+                claim.record_owner_id,
+                self.fence.control_stream_epoch + 1,
+            )
         self.records.append(
             "ownership",
             {
@@ -5646,6 +5686,10 @@ class Worker:
         return self.exit_code
 
     def shutdown(self) -> None:
+        # Fence new claims before the existing worker-root lease can be released.
+        # Any claim already syncing its counter finishes under the same lock.
+        with self.claim_lock:
+            self.claim_ready.clear()
         supervisions = [self.supervision] + [hosted.supervision for hosted in self.hosted.values()]
         seam = [
             supervision.current.channel.accounting()
