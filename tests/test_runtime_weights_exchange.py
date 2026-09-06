@@ -36,7 +36,11 @@ import pytest
 import tensorfs
 
 from cozy_runtime.internal.worker import weights
-from cozy_runtime.internal.worker.control import _PreparationServicer, _RuntimeWeightsServicer
+from cozy_runtime.internal.worker.control import (
+    GrpcControlHost,
+    _PreparationServicer,
+    _RuntimeWeightsServicer,
+)
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
@@ -553,3 +557,28 @@ def test_restored_native_work_validates_under_pending_intent_without_importing_w
     assert result["value"]["checkpoint"] == (head["head"], head["head_length"])
     assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
     supervisor.close()
+
+
+def test_local_control_host_serves_probe_without_preparation_handlers(tmp_path: Path) -> None:
+    bound = threading.Event()
+    address = tmp_path / "worker.addr"
+    host = GrpcControlHost("127.0.0.1:0", address, on_bound=lambda _: bound.set())
+    plane: Any = SimpleNamespace()
+    thread = threading.Thread(target=host.serve, args=(plane,), daemon=True)
+    thread.start()
+    try:
+        assert bound.wait(WAIT)
+        with grpc.insecure_channel(address.read_text().strip()) as connection:
+            api = pb_grpc.RuntimePreparationStub(connection)
+            info = api.ProtocolInfo(pb.ProtocolInfoRequest(), timeout=WAIT)
+            assert (info.wire_minor, info.minimum_wire_minor) == (
+                WIRE_MINOR,
+                MIN_COMPATIBLE_WIRE_MINOR,
+            )
+            with pytest.raises(grpc.RpcError) as error:
+                api.ValidateWeightsCheckpoint(pb.ValidateWeightsCheckpointRequest(), timeout=WAIT)
+            assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
+        assert list(tmp_path.iterdir()) == [address]
+    finally:
+        host.stop()
+        thread.join(WAIT)

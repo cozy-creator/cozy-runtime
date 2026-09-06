@@ -214,20 +214,21 @@ class GrpcControlHost:
         )
         if loopback_services and not _loopback_preparation_listener(self.listen):
             raise RuntimeError("the loopback Runtime services can only bind a loopback listener")
-        if loopback_services:
-            pb_grpc.add_RuntimePreparationServicer_to_server(
-                _PreparationServicer(
-                    self.compatibility_checker,
-                    self.preparer,
-                    self.model_source_preparer,
-                    self.local_package_preparer,
-                    self.private_placement_preparer,
-                    self.checkpoint_pager,
-                    self.checkpoint_transfer,
-                    self.weights_checkpoint_validator,
-                ),
-                self.server,
-            )
+        # Every worker exposes the static protocol probe, including local workers
+        # without optional preparation handlers. Absent handlers still refuse calls.
+        pb_grpc.add_RuntimePreparationServicer_to_server(
+            _PreparationServicer(
+                self.compatibility_checker,
+                self.preparer,
+                self.model_source_preparer,
+                self.local_package_preparer,
+                self.private_placement_preparer,
+                self.checkpoint_pager,
+                self.checkpoint_transfer,
+                self.weights_checkpoint_validator,
+            ),
+            self.server,
+        )
         if self.weights is not None:
             # Loopback-only, exactly like RuntimePreparation: the supervisor dials it on the
             # same 127.0.0.1 listener and it is never reachable from the external leg.
