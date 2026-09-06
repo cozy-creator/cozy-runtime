@@ -870,22 +870,17 @@ def _installed_at(
     )
 
 
-def open_existing_environment(python: Path, content_digest: str) -> InstalledEnvironment:
-    """Open one ordinary local venv without installing or changing it."""
-
-    _require_digest(content_digest, "content_digest")
-    if not python.is_absolute() or python.parent.name != "bin" or not python.is_file():
+def _interpreter_layout(python: Path) -> dict[str, str]:
+    """Measure the selected interpreter's real prefix and import layout."""
+    if not python.is_absolute() or not python.is_file():
         raise EnvironmentRefusal("package_environment_python_invalid", str(python))
-    generation = python.parent.parent
-    if not (generation / "pyvenv.cfg").is_file():
-        raise EnvironmentRefusal("package_environment_venv_invalid", str(generation))
     result = subprocess.run(
         [
             str(python),
             "-I",
             "-c",
             "import json,sys,sysconfig; print(json.dumps({"
-            "'base_prefix':sys.base_prefix,'prefix':sys.prefix,"
+            "'base_prefix':sys.base_prefix,'prefix':sys.prefix,'executable':sys.executable,"
             "'purelib':sysconfig.get_path('purelib')},sort_keys=True,separators=(',',':')))",
         ],
         stdin=subprocess.DEVNULL,
@@ -900,11 +895,45 @@ def open_existing_environment(python: Path, content_digest: str) -> InstalledEnv
             "package_environment_venv_invalid",
             result.stderr.strip()[-1000:] or "venv probe returned invalid JSON",
         ) from exc
-    site = Path(str(observed.get("purelib", ""))) if isinstance(observed, dict) else Path()
+    fields = {"base_prefix", "prefix", "purelib", "executable"}
     if (
         result.returncode != 0
         or not isinstance(observed, dict)
-        or observed.get("prefix") != str(generation)
+        or set(observed) != fields
+        or any(
+            not isinstance(value, str) or not Path(value).is_absolute()
+            for value in observed.values()
+        )
+    ):
+        raise EnvironmentRefusal("package_environment_python_invalid", str(python))
+    try:
+        selected = Path(observed["executable"]).samefile(python)
+    except OSError:
+        selected = False
+    if not selected:
+        raise EnvironmentRefusal("package_environment_python_invalid", str(python))
+    return observed
+
+
+def is_base_interpreter(python: Path) -> bool:
+    """Only a base prefix provides its own site-packages to a child system-site venv."""
+    layout = _interpreter_layout(python)
+    return layout["prefix"] == layout["base_prefix"]
+
+
+def open_existing_environment(python: Path, content_digest: str) -> InstalledEnvironment:
+    """Open one ordinary local venv without installing or changing it."""
+
+    _require_digest(content_digest, "content_digest")
+    if not python.is_absolute() or python.parent.name != "bin" or not python.is_file():
+        raise EnvironmentRefusal("package_environment_python_invalid", str(python))
+    generation = python.parent.parent
+    if not (generation / "pyvenv.cfg").is_file():
+        raise EnvironmentRefusal("package_environment_venv_invalid", str(generation))
+    observed = _interpreter_layout(python)
+    site = Path(observed["purelib"])
+    if (
+        observed.get("prefix") != str(generation)
         or observed.get("base_prefix") == str(generation)
         or not site.is_absolute()
         or not site.is_relative_to(generation)

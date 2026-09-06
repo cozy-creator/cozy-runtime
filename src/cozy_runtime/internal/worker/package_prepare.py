@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -193,10 +194,14 @@ def _filtered_rows(
     release: str,
     locked: package_environment.LockedRequirements,
     inventory: image_inventory.Inventory,
+    platform_versions: Mapping[str, str],
 ) -> list[package_environment.LockedRow]:
-    """The export minus image-inventory-owned names (cr-070): an inventory-owned NAME is
-    served by the image's site-packages copy and never enters the venv from the lock. The
-    package's own pin must be present — it is what the org index install actually installs."""
+    """The export minus immutable image and physically inherited framework providers.
+
+    A development image can inventory only its frozen heavy base. Its actual inherited
+    Runtime/TensorFS pair still owns those names; a package lock cannot shadow them.
+    The package's own pin remains required and always installs.
+    """
 
     expected = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     projects = [row for row in locked.rows if row.name == expected]
@@ -205,20 +210,40 @@ def _filtered_rows(
             "package_prepare_project_pin_missing",
             f"the export must pin {expected}=={release} exactly once",
         )
+    provided = inventory.versions
+    for name in ("cozy-runtime", "tensorfs"):
+        if name in platform_versions:
+            provided.setdefault(name, platform_versions[name])
     install_rows: list[package_environment.LockedRow] = []
     served: dict[str, str] = {}
     for row in locked.rows:
-        if row.name != expected and row.name in inventory.versions:
+        if row.name != expected and row.name in provided:
             served[row.name] = row.version
             continue
         install_rows.append(row)
     if served:
         listed = ", ".join(
-            f"{name} (image {inventory.versions[name]} over lock {version})"
+            f"{name} (base {provided[name]} over lock {version})"
             for name, version in sorted(served.items())
         )
-        print(f"[package-prepare] image inventory serves {listed}", flush=True)
+        print(f"[package-prepare] worker base serves {listed}", flush=True)
     return install_rows
+
+
+def _refuse_platform_shadow(
+    installed: package_environment.InstalledEnvironment,
+    package_name: str,
+    platform_versions: Mapping[str, str],
+) -> None:
+    """An older cached venv must not silently keep app-local framework copies."""
+    project = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
+    for distribution in importlib.metadata.distributions(path=[str(installed.site_packages)]):
+        name = _DISTRIBUTION.sub("-", distribution.metadata.get("Name", "")).lower()
+        if name != project and name in {"cozy-runtime", "tensorfs"} and name in platform_versions:
+            raise PreparationRefusal(
+                "package_prepare_platform_shadowed",
+                f"cached application environment contains its own {name}; rebuild that environment",
+            )
 
 
 def _prepare_published(
@@ -265,10 +290,16 @@ def _prepare_published(
             observed_base = base or package_environment.observe_base(python)
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
+
         lie = image_inventory.disagreement(inventory, observed_base.distribution_versions)
         if lie is not None:
             raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
-        install_rows = _filtered_rows(package_name, release, locked, inventory)
+        platform = (
+            observed_base.distribution_versions
+            if package_environment.is_base_interpreter(python)
+            else {}
+        )
+        install_rows = _filtered_rows(package_name, release, locked, inventory, platform)
         try:
             installed = package_environment.materialize_locked(
                 locked,
@@ -280,6 +311,7 @@ def _prepare_published(
             )
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
+        _refuse_platform_shadow(installed, package_name, platform)
 
     expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     interface_raw = describe(installed, expected_distribution)
@@ -487,7 +519,10 @@ def _compatibility_environment(
     lie = image_inventory.disagreement(inventory, observed.distribution_versions)
     if lie is not None:
         raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
-    install_rows = _filtered_rows(package_name, release, locked, inventory)
+    platform = (
+        observed.distribution_versions if package_environment.is_base_interpreter(python) else {}
+    )
+    install_rows = _filtered_rows(package_name, release, locked, inventory, platform)
     environment = pb.Environment(
         locked_requirements=pb.Ref(digest=documents.raw(locked.digest), length=locked.length)
     )
@@ -497,7 +532,7 @@ def _compatibility_environment(
         )
     )
     try:
-        return package_environment.materialize_locked(
+        installed = package_environment.materialize_locked(
             locked,
             install_rows,
             install_root,
@@ -507,6 +542,8 @@ def _compatibility_environment(
         )
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
+    _refuse_platform_shadow(installed, package_name, platform)
+    return installed
 
 
 def _compatibility_models(
