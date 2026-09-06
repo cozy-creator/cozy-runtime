@@ -84,6 +84,13 @@ class TensorRequirements:
     components: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class SourceSlot:
+    """A declared job Model input; its attempt holds bytes without constructing them."""
+
+    slot: str
+
+
 def read_request(raw: bytes) -> DeriveRequest:
     try:
         value = msgspec.msgpack.decode(raw)
@@ -142,7 +149,7 @@ def read_request(raw: bytes) -> DeriveRequest:
     return DeriveRequest(tuple(slots), project=project, application=application)
 
 
-def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements, ...]:
+def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements | SourceSlot, ...]:
     """Construct in the package interpreter and return only transient in-memory rows."""
 
     child_env = sandbox.child_environment({})
@@ -199,11 +206,16 @@ def derive_in(python: Path, request: DeriveRequest) -> tuple[TensorRequirements,
 
 def read_response(
     response: Mapping[str, Any], request: DeriveRequest
-) -> tuple[TensorRequirements, ...]:
+) -> tuple[TensorRequirements | SourceSlot, ...]:
     if set(response) != {"requirements"} or not isinstance(response["requirements"], list):
         raise DeriveRefusal("derive_child_invalid", "requirements field")
-    out: list[TensorRequirements] = []
+    out: list[TensorRequirements | SourceSlot] = []
     for answer in response["requirements"]:
+        if isinstance(answer, dict) and set(answer) == {"slot", "source"}:
+            if not isinstance(answer["slot"], str) or answer["source"] is not True:
+                raise DeriveRefusal("derive_child_invalid", "source slot field value")
+            out.append(SourceSlot(answer["slot"]))
+            continue
         if not isinstance(answer, dict) or set(answer) != {"slot", "components", "tensors"}:
             raise DeriveRefusal("derive_child_invalid", "requirements row field set")
         components = answer["components"]
@@ -248,10 +260,12 @@ def read_response(
     return tuple(out)
 
 
-def _render(requirements: Sequence[TensorRequirements]) -> dict[str, Any]:
+def _render(requirements: Sequence[TensorRequirements | SourceSlot]) -> dict[str, Any]:
     return {
         "requirements": [
-            {
+            {"slot": answer.slot, "source": True}
+            if isinstance(answer, SourceSlot)
+            else {
                 "slot": answer.slot,
                 "components": list(answer.components),
                 "tensors": [
@@ -338,7 +352,13 @@ def main() -> int:
             if not surface.hidden
             for binding in surface.model_bindings
         }
-        requirements: list[TensorRequirements] = []
+        sources = {
+            binding.path
+            for surface in found.surfaces
+            if not surface.hidden and surface.kind == "job"
+            for binding in surface.model_bindings
+        }
+        requirements: list[TensorRequirements | SourceSlot] = []
         for row in request.slots:
             binding = bindings.get(row.slot)
             if binding is None:
@@ -350,7 +370,10 @@ def main() -> int:
             document = canonical.parse_canonical(row.config)
             if not isinstance(document, dict):
                 raise DeriveRefusal("derive_input_invalid", f"{row.slot}: config is not an object")
-            requirements.append(_derive_twice(binding, Config(document, "config"), row.assets))
+            if row.slot in sources:
+                requirements.append(SourceSlot(row.slot))
+            else:
+                requirements.append(_derive_twice(binding, Config(document, "config"), row.assets))
     except DeriveRefusal as err:
         _emit({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
