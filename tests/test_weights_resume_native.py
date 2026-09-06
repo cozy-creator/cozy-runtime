@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import tensorfs
 
-from cozy_runtime.author import WeightsPart, WeightsTarget, WeightsTensor
+from cozy_runtime.author import WeightsPart, WeightsReceipt, WeightsTarget, WeightsTensor
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._weights import WeightsCommit
 from cozy_runtime.internal.base_observation import Observation
@@ -18,7 +18,9 @@ from cozy_runtime.internal.hostfacts import HostFacts
 from cozy_runtime.internal.weights_sink import WeightsTransactionHost, work_fingerprint
 
 
-def _committed(tmp_path: Path):
+def _committed(
+    tmp_path: Path,
+) -> tuple[tensorfs.Store, WeightsTransactionHost, WeightsCommit, WeightsReceipt]:
     store = tensorfs.Store.init(tmp_path / "store")
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
     request = WeightsCommit(

@@ -361,6 +361,7 @@ def test_protocol_probe_is_static_and_does_not_open_a_store_or_change_fence(rig:
         rig.fence.control_stream_epoch,
         rig.fence.worker_boot_id,
     )
+    assert rig.exchange.store_root is not None
     assert not rig.exchange.store_root.exists()
     for _ in range(2):
         info = rig.preparation.ProtocolInfo(pb.ProtocolInfoRequest(), timeout=WAIT)
@@ -370,8 +371,36 @@ def test_protocol_probe_is_static_and_does_not_open_a_store_or_change_fence(rig:
         rig.fence.control_stream_epoch,
         rig.fence.worker_boot_id,
     )
+    assert rig.exchange.store_root is not None
     assert not rig.exchange.store_root.exists()
     assert not rig.exchange._pending and not rig.exchange.writer_broker.bindings
+
+
+def test_checkpoint_refusal_has_no_writer_authority() -> None:
+    sent = pb.WeightsCheckpointFrame(
+        request_id="request",
+        attempt_ordinal=1,
+        invocation_spec_digest=SPEC_DIGEST,
+        output_slot=OUTPUT_SLOT,
+        weights_transaction_id=TRANSACTION,
+        writer_epoch=9,
+        tensorfs_declaration_digest=DECLARATION_DIGEST,
+    )
+    refused = pb.WeightsHostAck(
+        request_id=sent.request_id,
+        attempt_ordinal=sent.attempt_ordinal,
+        invocation_spec_digest=sent.invocation_spec_digest,
+        output_slot=sent.output_slot,
+        tensorfs_declaration_digest=sent.tensorfs_declaration_digest,
+        stage=pb.WEIGHTS_HOST_STAGE_CHECKPOINT,
+        outcome=pb.WEIGHTS_HOST_OUTCOME_REFUSED,
+        refusal=pb.WEIGHTS_HOST_REFUSAL_STALE_WRITER,
+    )
+    weights.WeightsExchange._validate_ack(refused, sent, pb.WEIGHTS_HOST_STAGE_CHECKPOINT)
+    refused.writer_epoch = sent.writer_epoch
+    with pytest.raises(weights.WeightsExchangeError) as error:
+        weights.WeightsExchange._validate_ack(refused, sent, pb.WEIGHTS_HOST_STAGE_CHECKPOINT)
+    assert error.value.code == "weights_host_ack_invalid"
 
 
 def test_restored_native_work_validates_under_pending_intent_without_importing_writer(
@@ -404,13 +433,19 @@ def test_restored_native_work_validates_under_pending_intent_without_importing_w
     writer.add_part("model", "weight", "value", io.BytesIO(b"\x31" * 2048))
     head = writer.checkpoint("req-1", OUTPUT_SLOT)
     writer.fence()
-    tensorfs.transfer_object(original, restored, head["head"], head["head_length"])
+    head_id, head_length = head["head"], head["head_length"]
+    plan_digest, head_index, head_bytes = head["plan_digest"], head["index"], head["bytes"]
+    assert isinstance(head_id, str) and isinstance(head_length, int)
+    assert (
+        isinstance(plan_digest, str) and isinstance(head_index, int) and isinstance(head_bytes, int)
+    )
+    tensorfs.transfer_object(original, restored, head_id, head_length)
     page = original.checkpoint_page(
-        head["head"],
-        head["head_length"],
+        head_id,
+        head_length,
         operation_id="req-1",
         slot=OUTPUT_SLOT,
-        plan_digest=head["plan_digest"],
+        plan_digest=plan_digest,
     )
     assert page["previous"] is None
     for obj in page["objects"]:
@@ -435,10 +470,10 @@ def test_restored_native_work_validates_under_pending_intent_without_importing_w
     pending.start()
     sent = supervisor.next_intent()
     checkpoint = pb.CheckpointRef(
-        head=pb.Ref(digest=bytes.fromhex(head["head"][7:]), length=head["head_length"]),
-        plan_digest=bytes.fromhex(head["plan_digest"][7:]),
-        index=head["index"],
-        bytes=head["bytes"],
+        head=pb.Ref(digest=bytes.fromhex(head_id[7:]), length=head_length),
+        plan_digest=bytes.fromhex(plan_digest[7:]),
+        index=head_index,
+        bytes=head_bytes,
     )
     ready = pb.WeightsIntentReadyRequest(
         record_owner_epoch=rig.fence.record_owner_epoch,

@@ -138,15 +138,20 @@ class _Store:
         if self.replay:
             prior = self.committed[commit.output_slot]
             assert _projection(commit) == prior.declaration, "replay under a changed declaration"
-            return _Replayed(prior.receipt)
+            return _Replayed(prior)
         return _Transaction(self, commit)
 
 
 class _Replayed:
     replayed = True
 
-    def __init__(self, receipt: WeightsReceipt) -> None:
-        self.receipt: WeightsReceipt | None = receipt
+    def __init__(self, prior: _Committed) -> None:
+        self.receipt: WeightsReceipt | None = prior.receipt
+        self.completed_parts = frozenset(prior.parts)
+        self.completed_configs: frozenset[str] = frozenset()
+
+    def checkpoint(self) -> None:
+        pass
 
     def source_read_into(
         self, source: str, component: str, key: str, role: str, offset: int, into: memoryview
@@ -477,6 +482,8 @@ def test_both_doors_reach_the_same_tensors(tmp_path: Path) -> None:
     assert by_model.inherited_keys == 4
     assert by_model.kept_keys == 0
     assert not by_model.canonical
+    assert by_model.normalization_worst_relative_frobenius is not None
+    assert by_model.worst_relative_frobenius is not None
     assert 0.0 < by_model.normalization_worst_relative_frobenius <= 2.0**-8
     assert 0.0 < by_model.worst_relative_frobenius < 0.25
 
@@ -559,6 +566,7 @@ def test_a_real_fp32_safetensors_source_normalizes_to_bf16_with_recorded_stats(
     assert isinstance(result, QuantizeResult)
     assert result.canonical
     assert (result.converted_keys, result.kept_keys, result.encoded_keys) == (2, 0, 0)
+    assert result.normalization_worst_relative_frobenius is not None
     assert 0.0 < result.normalization_worst_relative_frobenius <= 2.0**-8
     committed = store.committed["model"]
     for key, values in (("blocks.0.attn.weight", attn), ("blocks.0.norm.weight", norm)):

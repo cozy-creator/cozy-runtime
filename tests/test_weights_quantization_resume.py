@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,7 @@ def native_quantization(
     )
 
 
-def _source(root: Path):
+def _source(root: Path) -> tuple[tensorfs.Store, str, str, int]:
     store = tensorfs.Store.init(root)
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
     values = (np.random.default_rng(812).standard_normal((128, 64)) * 0.05).astype("<f2")
@@ -93,7 +94,7 @@ class ObservedNativeTransaction:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.native, name)
 
-    def add_part(self, component: str, key: str, role: str, data: bytes) -> None:
+    def add_part(self, component: str, key: str, role: str, data: Any) -> None:
         if self.mode == "short-scale" and role == "scale":
             data = data[: len(data) // 2]
         self.native.add_part(component, key, role, data)
@@ -118,7 +119,7 @@ def _run(
     root: Path,
     *,
     threshold: float = 0.25,
-):
+) -> tuple[Callable[[], QuantizeResult], list[int], list[Any], list[Any]]:
     checkpoints: list[Any] = []
     host = WeightsTransactionHost(
         store=store,
@@ -134,13 +135,13 @@ def _run(
     reads: list[int] = []
     captured: list[Any] = []
 
-    def open_native(request: Any):
+    def open_native(request: Any) -> ObservedNativeTransaction:
         current = host.open(request)
         captured.append(current)
         return ObservedNativeTransaction(current, mode, reads)
 
-    def invoke():
-        return invoke_with_fakes(
+    def invoke() -> QuantizeResult:
+        result = invoke_with_fakes(
             app.get("native-quantization"),
             {"max_relative_frobenius": threshold},
             request_id="quantize",
@@ -149,6 +150,8 @@ def _run(
             weights=open_native,
             weights_source_structure=host.structure,
         ).result
+        assert isinstance(result, QuantizeResult)
+        return result
 
     return invoke, reads, captured, checkpoints
 

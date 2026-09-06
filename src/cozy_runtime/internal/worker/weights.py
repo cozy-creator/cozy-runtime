@@ -942,6 +942,7 @@ class WeightsExchange:
                 raise WeightsExchangeError(
                     "weights_host_ack_invalid", "refusal carries transaction authority"
                 )
+            return
         elif ack.refusal or not ack.weights_transaction_id or ack.writer_epoch <= 0:
             raise WeightsExchangeError(
                 "weights_host_ack_invalid", "recorded ACK lacks transaction authority"
