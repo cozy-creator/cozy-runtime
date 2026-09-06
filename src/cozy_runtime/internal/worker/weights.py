@@ -47,6 +47,7 @@ from typing import Any, BinaryIO, cast
 from urllib.parse import urlparse
 
 from cozy_runtime.internal import egress, fill
+from cozy_runtime.internal.weights_writer import WriterBroker
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -209,6 +210,7 @@ class WeightsExchange:
         #: presence IS the lane choice; nothing else configures it.
         self._stream: _ExchangeStream | None = None
         self._streams_opened = 0
+        self.writer_broker = WriterBroker(self._store)
 
     # ------------------------------------------------------------- the host's lanes
 
@@ -404,6 +406,9 @@ class WeightsExchange:
             raise WeightsExchangeError(
                 "weights_host_ack_mismatch", "transaction binding changed within one Runtime"
             )
+        self.writer_broker.authorize(
+            attempt, ack.weights_transaction_id, ack.writer_epoch, declaration_digest, output_slot
+        )
         receipt_digest = b""
         if ack.HasField("weights_receipt"):
             receipt_digest = self._receipt_ref(ack.weights_receipt)
@@ -565,6 +570,7 @@ class WeightsExchange:
 
     def close(self) -> None:
         """Release every live TensorFS read lease; durable facts remain with the host."""
+        self.writer_broker.close()
         with self._lock:
             held, self._held = list(self._held.values()), {}
             stream, self._stream = self._stream, None
@@ -575,6 +581,7 @@ class WeightsExchange:
 
     def abandon(self, transaction_id: str) -> None:
         """Stop late receipt/transfer registration and release this output's read lease."""
+        self.writer_broker.close(transaction_id)
         with self._lock:
             self._abandoned.add(transaction_id)
             held = self._held.pop(transaction_id, None)

@@ -1438,6 +1438,8 @@ class AttemptEngine:
                 "detail": "this worker has no WeightsSink host",
             }
         try:
+            if kind == "weights_writer":
+                return self.weights.writer_broker.handle(attempt, frame)
             output_slot = str(frame.get("output_slot", ""))
             if kind == "weights_intent":
                 length = int(frame.get("tensorfs_declaration_length", 0))
@@ -1583,6 +1585,9 @@ class AttemptEngine:
             # reach a granted destination.
             grants.abort_outputs(spool)
             return self.abandon(attempt, str(exc))
+        finally:
+            if self.weights is not None:
+                self.weights.writer_broker.close_attempt(attempt)
         return self.release(attempt, reply, spool, key)
 
     @staticmethod
