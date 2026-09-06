@@ -73,22 +73,32 @@ def test_locked_export_minus_inventory_names(capsys: pytest.CaptureFixture[str])
             _pin("some-helper", "2.0.0"),
         ]
     )
-    rows = _filtered_rows("paul/ranged-marco", "1.0.4", locked, _inventory({DEPENDENCY: "0.0.5"}))
+    rows = _filtered_rows(
+        "paul/ranged-marco", "1.0.4", locked, _inventory({DEPENDENCY: "0.0.5"}), {}
+    )
     assert [row.name for row in rows] == ["ranged-marco", "some-helper"]
     out = capsys.readouterr().out
-    assert "[package-prepare] image inventory serves" in out
-    assert f"{DEPENDENCY} (image 0.0.5 over lock 0.0.5)" in out
+    assert "[package-prepare] worker base serves" in out
+    assert f"{DEPENDENCY} (base 0.0.5 over lock 0.0.5)" in out
 
     # The package's own pin is what the org-index install actually installs; an export
     # without it — or with the wrong release — is not this release's export.
     with pytest.raises(PreparationRefusal) as absent:
         _filtered_rows(
-            "paul/ranged-marco", "1.0.4", _locked([_pin("some-helper", "2.0.0")]), _inventory({})
+            "paul/ranged-marco",
+            "1.0.4",
+            _locked([_pin("some-helper", "2.0.0")]),
+            _inventory({}),
+            {},
         )
     assert absent.value.code == "package_prepare_project_pin_missing"
     with pytest.raises(PreparationRefusal) as wrong:
         _filtered_rows(
-            "paul/ranged-marco", "1.0.4", _locked([_pin("ranged-marco", "1.0.5")]), _inventory({})
+            "paul/ranged-marco",
+            "1.0.4",
+            _locked([_pin("ranged-marco", "1.0.5")]),
+            _inventory({}),
+            {},
         )
     assert wrong.value.code == "package_prepare_project_pin_missing"
 
@@ -99,6 +109,7 @@ def test_locked_export_minus_inventory_names(capsys: pytest.CaptureFixture[str])
         "1.0.4",
         _locked([_pin("ranged-marco", "1.0.4")]),
         _inventory({"ranged-marco": "1.0.4"}),
+        {},
     )
     assert [row.name for row in kept] == ["ranged-marco"]
 
@@ -159,6 +170,34 @@ def test_lying_inventory_refuses_before_any_install() -> None:
         prepare(_image(observed, None), {DEPENDENCY: "0.0.5"})
     assert phantom.value.code == "package_prepare_image_inventory_disagrees"
     assert phantom.value.detail == f"distribution={DEPENDENCY} inventory=0.0.5 image=absent"
+
+
+def test_inherited_frameworks_do_not_shadow_other_locked_dependencies() -> None:
+    locked = _locked(
+        [
+            _pin("cozy-runtime", "0.2.24"),
+            _pin("ranged-marco", "1.0.4"),
+            _pin("some-helper", "2.0.0"),
+            _pin("tensorfs", "0.3.10"),
+        ]
+    )
+    rows = _filtered_rows(
+        "paul/ranged-marco",
+        "1.0.4",
+        locked,
+        _inventory({}),
+        {"cozy-runtime": "0.2.25", "tensorfs": "0.3.11", "some-helper": "99.0.0"},
+    )
+    assert rows == [row for row in locked.rows if row.name in {"ranged-marco", "some-helper"}]
+    # Importability in an unrelated parent venv is not inherited platform custody.
+    assert _filtered_rows("paul/ranged-marco", "1.0.4", locked, _inventory({}), {}) == list(
+        locked.rows
+    )
+
+
+def test_actual_interpreter_layout_distinguishes_managed_venv_from_base() -> None:
+    assert not package_environment.is_base_interpreter(Path(sys.executable))
+    assert package_environment.is_base_interpreter(Path(sys.base_prefix) / "bin/python3.12")
 
 
 def test_image_inventory_document_reader_is_the_exact_writer_rule() -> None:
