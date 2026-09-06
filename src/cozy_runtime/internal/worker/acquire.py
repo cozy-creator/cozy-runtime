@@ -728,9 +728,10 @@ class Acquirer:
                 ),
             )
         selected_entrypoints = {str(row["name"]) for row in placement.entrypoints}
-        if (development and not selected_entrypoints) or (
-            not development and set(visible) != selected_entrypoints
-        ):
+        # Preparation selects the entrypoints whose model slots were supplied. Each
+        # selected entrypoint and its complete slot set was checked above; the package
+        # may also declare other entrypoints that this placement does not bind.
+        if not selected_entrypoints and (development or visible):
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "binding_entrypoint_set_mismatch",

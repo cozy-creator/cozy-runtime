@@ -2189,8 +2189,10 @@ class Executor:
                         code=str(answer.get("code", "weights_host_refused")),
                     )
 
+            from cozy_runtime.internal.weights_writer import StoreProxy
+
             weights_host = weights_sink.WeightsTransactionHost(
-                store=store,
+                store=StoreProxy(store, spool, self._durable),
                 owner_scope=owner_scope,
                 request_id=weights_request_id,
                 invocation_spec_digest=invocation_spec_digest,
