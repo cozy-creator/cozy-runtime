@@ -480,6 +480,9 @@ completion fence must fire before that block returns to meta. There is no CPU mo
 the planner reports nominal model bytes separately from the common-plus-largest-block
 working set. Parameters and persistent buffers remain immutable checkpoint destinations;
 nonpersistent rotary buffers retain their config-derived initialization.
+Paged blocks must expose live returned tensors through registered PyTrees. Returned weight
+views refuse without freeing storage; arbitrary hidden state retaining weight views is not
+qualified by the no-split declaration or this proof.
 
 With H3's locked dependencies and the candidate Runtime/TensorFS installed, run the actual
 package constructor and GPU parity/refusal proof for each transformer:
