@@ -11,6 +11,7 @@ import os
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,25 @@ def test_shared_local_store_does_not_release_other_source_operations(tmp_path: P
     worker.shutdown()
     assert store.model_source_operations() == before
     assert _heads(store, fixture) == pages
+
+
+def test_restart_intent_never_enters_worker_queues_or_stops_transport(tmp_path: Path) -> None:
+    worker = _worker(tmp_path, owns=False)
+    host = worker.host
+    assert isinstance(host, InMemoryControlHost)
+    queues: list[Any] = [worker.outbound, host.inbound]
+    queues.extend(queue for lane in worker.lanes for queue in (lane.work, lane.post))
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor, ExitStack() as held:
+            for queue in queues:
+                held.enter_context(queue.mutex)
+            # A signal may interrupt the thread while any queue mutex is held.
+            # Intent must return without trying to re-enter those real locks.
+            executor.submit(worker.request_restart).result(timeout=1)
+            assert worker.restart_requested and worker.stop.is_set()
+            assert not host.closed.is_set()
+    finally:
+        worker.shutdown()
 
 
 @pytest.mark.parametrize("restart", [False, True])

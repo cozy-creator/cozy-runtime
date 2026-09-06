@@ -2726,7 +2726,7 @@ class Worker:
         """A local operator requests process replacement while retaining source work."""
         if not self.stop.is_set():
             self.restart_requested = True
-            self.request_stop()
+            self.stop.set()
 
     def shutdown_from_stream(self) -> None:
         self.request_stop()
