@@ -1,0 +1,12 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+[project]
+name = "platform-provider-app"
+version = "1.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["cozy-runtime>=0.2,<1", "tensorfs>=0.3,<1", "platform-provider-helper==1.0.0"]
+[project.entry-points."cozy.application"]
+default = "platform_provider_app:app"
+[tool.uv.build-backend]
+module-root = ""

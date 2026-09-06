@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -229,6 +230,22 @@ def _filtered_rows(
     return install_rows
 
 
+def _refuse_platform_shadow(
+    installed: package_environment.InstalledEnvironment,
+    package_name: str,
+    platform_versions: Mapping[str, str],
+) -> None:
+    """An older cached venv must not silently keep app-local framework copies."""
+    project = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
+    for distribution in importlib.metadata.distributions(path=[str(installed.site_packages)]):
+        name = _DISTRIBUTION.sub("-", distribution.metadata.get("Name", "")).lower()
+        if name != project and name in {"cozy-runtime", "tensorfs"} and name in platform_versions:
+            raise PreparationRefusal(
+                "package_prepare_platform_shadowed",
+                f"cached application environment contains its own {name}; rebuild that environment",
+            )
+
+
 def _prepare_published(
     *,
     package_name: str,
@@ -273,6 +290,7 @@ def _prepare_published(
             observed_base = base or package_environment.observe_base(python)
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
+
         lie = image_inventory.disagreement(inventory, observed_base.distribution_versions)
         if lie is not None:
             raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
@@ -293,6 +311,7 @@ def _prepare_published(
             )
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
+        _refuse_platform_shadow(installed, package_name, platform)
 
     expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     interface_raw = describe(installed, expected_distribution)
@@ -513,7 +532,7 @@ def _compatibility_environment(
         )
     )
     try:
-        return package_environment.materialize_locked(
+        installed = package_environment.materialize_locked(
             locked,
             install_rows,
             install_root,
@@ -523,6 +542,8 @@ def _compatibility_environment(
         )
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
+    _refuse_platform_shadow(installed, package_name, platform)
+    return installed
 
 
 def _compatibility_models(
