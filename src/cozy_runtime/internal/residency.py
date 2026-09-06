@@ -234,6 +234,36 @@ class ComponentResidency:
             self.poisoned = f"paging forward failed in {name}.{unit.path}"
             self.page_call = None
             return  # the process, not an in-process unwind, owns failed computation
+        try:
+            storages = {
+                tensor.untyped_storage().data_ptr()
+                for _, owner in unit.owners
+                for tensor in (*owner.parameters(recurse=False), *owner.buffers(recurse=False))
+            } - {0}
+            leaves = self.torch.utils._pytree.tree_leaves(output)
+            opaque = any(
+                not isinstance(value, self.torch.Tensor)
+                and type(value) not in (bool, int, float, complex, str, bytes, type(None))
+                for value in leaves
+            )
+            aliases = any(
+                isinstance(value, self.torch.Tensor)
+                and value.untyped_storage().data_ptr() in storages
+                for value in leaves
+            )
+        except Exception as exc:
+            raise self._poison(
+                "paging_output_storage", "block output storage could not be verified"
+            ) from exc
+        if opaque:
+            raise self._poison(
+                "paging_output_schema", "block outputs must expose tensor leaves through a PyTree"
+            )
+        if aliases:
+            raise self._poison(
+                "paging_output_alias",
+                "block output retains a view of weights selected for eviction",
+            )
         self._paging_peak(self.page_weight_delta)
         allocated = self._allocated()
         started = time.perf_counter()

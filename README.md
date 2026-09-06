@@ -485,8 +485,8 @@ With H3's locked dependencies and the candidate Runtime/TensorFS installed, run 
 package constructor and GPU parity/refusal proof for each transformer:
 
 ```bash
-python corpus/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof text_encoder
-python corpus/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof fl2va_dit
+python tests/testdata/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof text_encoder
+python tests/testdata/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof fl2va_dit
 ```
 
 The fixture preserves all 50 language/DiT layers while reducing widths. Its all-resident

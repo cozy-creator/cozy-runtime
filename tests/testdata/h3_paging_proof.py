@@ -8,12 +8,14 @@ The all-resident reference is test data, discarded before the paging path begins
 import argparse
 import copy
 import gc
+import importlib
 import json
 import resource
 import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 
 def main() -> None:
@@ -21,6 +23,7 @@ def main() -> None:
     parser.add_argument("--packages-root", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("component", choices=["text_encoder", "fl2va_dit"])
+    parser.add_argument("--terminal-arm", choices=["failure", "alias", "opaque"], default="failure")
     arguments = parser.parse_args()
     arguments.work_dir.mkdir(parents=True, exist_ok=True)
     sys.path[:0] = [
@@ -29,8 +32,11 @@ def main() -> None:
     ]
     import tensorfs
     import torch
-    from conditioner import build_text_conditioner
-    from h3_tables.model_config import dual_full_config, parse_production_config
+
+    build_text_conditioner = importlib.import_module("conditioner").build_text_conditioner
+    config_module = importlib.import_module("h3_tables.model_config")
+    dual_full_config = config_module.dual_full_config
+    parse_production_config = config_module.parse_production_config
 
     from cozy_runtime.author import WeightsConfig, WeightsPart, WeightsTarget, WeightsTensor
     from cozy_runtime.author._loader import census
@@ -72,7 +78,7 @@ def main() -> None:
             deepstack_visual_indexes=[0, 1],
         )
 
-        def factory():
+        def factory() -> Any:
             return build_text_conditioner(copy.deepcopy(config))
 
         inputs = {
@@ -83,10 +89,11 @@ def main() -> None:
             "return_dict": True,
         }
 
-        def outputs(value):
+        def outputs(value: Any) -> tuple[Any, ...]:
             return (value.hidden_states[-1].cpu(),)
     else:
-        from official import _build_dit, _dit_spec
+        official = importlib.import_module("official")
+        _build_dit, _dit_spec = official._build_dit, official._dit_spec
 
         config, structure, plan = _dit_spec(config, "fl2va")
         config.update(
@@ -100,7 +107,7 @@ def main() -> None:
             freq_dim=128,
         )
 
-        def factory():
+        def factory() -> Any:
             return _build_dit(copy.deepcopy(config), structure, plan)
 
         inputs = {
@@ -116,7 +123,7 @@ def main() -> None:
             "audio_indices": torch.arange(7, 9, device="cuda"),
         }
 
-        def outputs(value):
+        def outputs(value: Any) -> tuple[Any, ...]:
             return (value.sample.cpu(), value.audio_sample.cpu())
 
     reference = factory()
@@ -195,7 +202,8 @@ def main() -> None:
         backend.resident_budget = layout.working_bytes + 4096
         walked = census(_Holder({component: model}))
         backend.expect({component: [d.key for d in walked.destinations]})
-        assert backend.fit(walked, encoded_leaves="refuse")["ok"]
+        fit = backend.fit(walked, encoded_leaves="refuse")
+        assert fit is not None and fit["ok"]
         live = backend.materialize(_Holder({component: model}), walked)
         for d in walked.destinations:
             backend.fill(d.key, d.spec, live[d.key])
@@ -277,24 +285,56 @@ def main() -> None:
                 )
             )
 
-            def fail_forward(*args):
-                raise RuntimeError("controlled block failure")
+            if arguments.terminal_arm == "failure":
 
-            failure_hook = executed.owners[0][1].register_forward_pre_hook(fail_forward)
-            with torch.no_grad():
-                residency.admit("forward", (component,))
-                try:
-                    model(**inputs)
-                except RuntimeError as exc:
-                    assert str(exc) == "controlled block failure"
-                else:
-                    raise AssertionError("controlled failure not reached")
-            failure_hook.remove()
-            assert residency.poisoned and backend.page_resident.get(component) is executed
+                def fail_forward(*args: Any) -> None:
+                    raise RuntimeError("controlled block failure")
+
+                failure_hook = executed.owners[0][1].register_forward_pre_hook(fail_forward)
+                with torch.no_grad():
+                    residency.admit("forward", (component,))
+                    try:
+                        model(**inputs)
+                    except RuntimeError as exc:
+                        assert str(exc) == "controlled block failure"
+                    else:
+                        raise AssertionError("controlled failure not reached")
+                failure_hook.remove()
+            else:
+                # A real returned view, with nested containers and nonzero offset. The
+                # module's usual inference is irrelevant to this storage-lifetime red arm.
+                block = executed.owners[0][1]
+                retained = []
+
+                def return_view(*args: Any, **kwargs: Any) -> Any:
+                    view = next(block.parameters()).flatten()[1:3]
+                    retained.append(view)
+                    if arguments.terminal_arm == "opaque":
+                        from types import SimpleNamespace
+
+                        return SimpleNamespace(hidden_weight=view)
+                    return {"nested": (None, [view])}
+
+                block.forward = return_view
+                with torch.no_grad():
+                    residency.admit("forward", (component,))
+                    try:
+                        model(**inputs)
+                    except ResidencyRefusal as exc:
+                        assert exc.code == (
+                            "paging_output_schema"
+                            if arguments.terminal_arm == "opaque"
+                            else "paging_output_alias"
+                        )
+                    else:
+                        raise AssertionError("returned weight view was freed")
+                assert retained and retained[0].untyped_storage().nbytes() > 0
+                assert torch.equal(retained[0], next(block.parameters()).flatten()[1:3])
+            assert bool(residency.poisoned) and backend.page_resident.get(component) is executed
             print(
                 json.dumps(
                     {
-                        "red": "failed_forward",
+                        "red": arguments.terminal_arm,
                         "generation_poisoned": True,
                         "failed_block_retained_until_process_exit": True,
                     }

@@ -29,7 +29,7 @@ dev = [
     "pytest>=8.4",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.3.11,<0.3.12",
+    "tensorfs>=0.3.12,<0.3.13",
     "types-protobuf>=6.30",
     "av>=18.1,<19",
     # `cozy_runtime.derive` is numpy code; the checking venv installs numpy so mypy checks
@@ -157,7 +157,7 @@ media = [
 # capability; base worker images provide TensorFS from the same PyPI range.
 # 0.3.11 owns source-operation inventory and idempotent source release. The
 # future writer-fingerprint hardcut still needs its separate Runtime caller update.
-model-execution = ["tensorfs>=0.3.11,<0.3.12"]
+model-execution = ["tensorfs>=0.3.12,<0.3.13"]
 
 [[tool.mypy.overrides]]
 # grpcio ships no type information; the stub module is generated.
