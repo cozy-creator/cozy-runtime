@@ -2097,7 +2097,8 @@ class AttemptEngine:
 
         Outputs bind to granted destinations by STABLE OUTPUT ID — the result's own field
         path (`image`, `pair.thumb`, `frames.0`) — with EXACT SET EQUALITY against the
-        grant. Never by list index: two outputs that arrive in a different order must still
+        media grant subset. Declared weights outputs finish through exact host-acknowledged
+        native receipts before they leave that subset. Never by list index: outputs must still
         land in their own destinations, and a position cannot express that. A produced
         output the RecordOwner did not grant, or a granted destination the attempt did not
         fill, refuses the tail WHOLE — an output transaction is not partially successful.

@@ -192,9 +192,13 @@ class WriterBroker:
         if operation == "config":
             if str(frame.get("name", "")) not in declaration["configs"]:
                 raise CapabilityError("undeclared config", code="weights_writer_ungranted")
-            # Native config admission owns the precise format cap; the protocol's bounded
-            # declaration cap also limits this existing config-document handoff.
-            return weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
+            from cozy_runtime.internal import fill
+
+            # Native Manifest and config admission share DOC_MAX_BYTES; use its
+            # published bound rather than narrowing configs to the intent-frame cap.
+            return min(
+                int(declaration["max_new_bytes"]), int(fill.tensorfs_module().manifest_max_bytes())
+            )
         if operation != "part":
             raise CapabilityError("unknown writer payload", code="weights_writer_ungranted")
         part = declaration["components"][str(frame["component"])]["add"][str(frame["key"])][
@@ -247,7 +251,7 @@ class WriterBroker:
                 outputs = {
                     row["output_id"]: row["max_bytes"] for row in attempt.spec.get("outputs", [])
                 }
-                if args[4] != outputs.get(binding[2]):
+                if type(args[4]) is not int or args[4] < 0 or args[4] != outputs.get(binding[2]):
                     raise CapabilityError(
                         "writer output exceeds invocation grant", code="weights_writer_ungranted"
                     )

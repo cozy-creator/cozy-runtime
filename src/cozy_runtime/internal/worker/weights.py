@@ -1,7 +1,7 @@
 """Stateless Runtime side of the WeightsSink host exchange.
 
 The supervisor is the durable authority. Runtime keeps only waiters and live TensorFS read
-leases and sends intent before the executor opens a writer; the worker and executor share only
+leases and native writer handles after host authorization; the worker and executor share only
 fixed files in the already-brokered attempt spool for declaration/receipt bytes too large for
 their control seam.
 
