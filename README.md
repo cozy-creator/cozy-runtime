@@ -476,7 +476,10 @@ venv, not from CI.
 Plain transformer components larger than the assigned weight-residence ceiling use their
 existing `_no_split_modules` boundaries. Runtime retains common weights and fills one block
 through the verified TensorFS read plan and bounded pinned ring before its forward. The
-completion fence must fire before that block returns to meta. There is no CPU model copy;
+completion fence must fire before that block returns to meta. During each paged forward,
+Runtime disables only autocast weight caching and restores the caller's cache setting on
+every exit. Autocast dtype/enabled state remain unchanged; rematerialized FP32 blocks
+must not accumulate FP16 cached copies across a multi-tile decode. There is no CPU model copy;
 the planner reports nominal model bytes separately from the common-plus-largest-block
 working set. Parameters and persistent buffers remain immutable checkpoint destinations;
 nonpersistent rotary buffers retain their config-derived initialization.
@@ -490,12 +493,15 @@ package constructor and GPU parity/refusal proof for each transformer:
 ```bash
 python tests/testdata/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof text_encoder
 python tests/testdata/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof fl2va_dit
+python tests/testdata/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof video_vae
 ```
 
 The fixture preserves all 50 language/DiT layers while reducing widths. Its all-resident
 reference is discarded before paging; each paged forward must reproduce exact outputs and
 evict every visited block. It also checks undersized working-set and autograd refusals,
-and process poisoning after a failed block forward. This proves weight paging, not full-video
+and process poisoning after a failed block forward. The VAE arm uses the actual modular
+decode and checks prior autocast-cache settings after normal and exceptional exits.
+This proves weight paging, not full-video
 activation capacity. H3's full BF16 text and DiT weight working sets are about 2.90 GB and
 1.42 GB respectively; video-VAE activation tiling and encoded-leaf eviction remain separate
 qualification gaps. No dtype or inference backend is substituted to make a model fit.
