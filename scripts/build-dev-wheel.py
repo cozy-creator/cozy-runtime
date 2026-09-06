@@ -127,9 +127,7 @@ def main() -> None:
         metadata.replace_header("Version", version)
         # Older supported Python metadata readers retain folding newlines in Version.
         # Standard email serialization can preserve one value on one header line.
-        (info / "METADATA").write_bytes(
-            metadata.as_bytes(policy=compat32.clone(max_line_length=0))
-        )
+        (info / "METADATA").write_bytes(metadata.as_bytes(policy=compat32.clone(max_line_length=0)))
         wheel = BytesParser().parsebytes((info / "WHEEL").read_bytes())
         wheel.replace_header("Root-Is-Purelib", "false")
         wheel.replace_header("Generator", "cozy-runtime dev (wheel pack)")
