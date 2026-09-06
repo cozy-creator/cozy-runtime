@@ -1155,12 +1155,14 @@ class WorkerSnapshotBody(_message.Message):
     def __init__(self, accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., journal_highwater: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., converged_revision: _Optional[int] = ..., admission_epoch: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ..., lanes: _Optional[_Iterable[_Union[DeviceLane, _Mapping]]] = ..., held_manifests: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class HostSnapshotBody(_message.Message):
-    __slots__ = ("held_outcomes", "weights_transactions")
+    __slots__ = ("held_outcomes", "weights_transactions", "retained_desired_revision")
     HELD_OUTCOMES_FIELD_NUMBER: _ClassVar[int]
     WEIGHTS_TRANSACTIONS_FIELD_NUMBER: _ClassVar[int]
+    RETAINED_DESIRED_REVISION_FIELD_NUMBER: _ClassVar[int]
     held_outcomes: _containers.RepeatedCompositeFieldContainer[HeldAttempt]
     weights_transactions: _containers.RepeatedCompositeFieldContainer[WeightsTransactionStatus]
-    def __init__(self, held_outcomes: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ...) -> None: ...
+    retained_desired_revision: int
+    def __init__(self, held_outcomes: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ..., retained_desired_revision: _Optional[int] = ...) -> None: ...
 
 class SnapshotAck(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "snapshot_id", "snapshot_digest", "host_snapshot_digest")

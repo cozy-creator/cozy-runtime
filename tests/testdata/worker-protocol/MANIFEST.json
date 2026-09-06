@@ -43,9 +43,9 @@
       "type": "cozy.worker.v1.DownloadDelegation"
     },
     "host_snapshot_body": {
-      "bytes": 915,
+      "bytes": 945,
       "document": "cozy.worker.v1.HostSnapshotBody/1",
-      "id": "sha256:3bff9898cc7a0a5371e0e5fac484685d26d5147f524cc56648075703498ee103",
+      "id": "sha256:1103880f3851a0b19c81ae46bbb3cb68ebeae4b9eb3f7eaf2ea927e45c4a1dbe",
       "type": "cozy.worker.v1.HostSnapshotBody"
     },
     "invocation_spec_job": {
@@ -529,7 +529,7 @@
     },
     "snapshot_ack": {
       "bytes": 94,
-      "sha256": "26978d22adbeeee6e8e9b1b336d857f324537db4ea8fa1db10bae05b313efa4a",
+      "sha256": "df0afa87c35a684cfb6ec2f762247c936cfd857aec54b332e829732035c78f3d",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
     "source_checkpoint_page_request": {
@@ -728,8 +728,8 @@
       "type": "cozy.worker.v1.WorkerFrame"
     },
     "worker_snapshot": {
-      "bytes": 5608,
-      "sha256": "00a2f6f1ee5085a19b21d6fcb7e3e72de19195a7a6dd6850de85595e019cdcdb",
+      "bytes": 5638,
+      "sha256": "72dd5650211f896c4017dede029296810be9bcb627e7b65c91d538d2360312fb",
       "type": "cozy.worker.v1.WorkerFrame"
     }
   },
