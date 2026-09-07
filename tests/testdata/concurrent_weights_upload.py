@@ -35,6 +35,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-native-uploads-") as directory:
         owner_scope="upload-owner",
         request_id="upload-request",
         invocation_spec_digest="sha256:" + "a" * 64,
+        work_fingerprint="sha256:" + "b" * 64,
         writer_session_id=1,
         allowed_sources={},
         output_bounds={"model": output_bound},
