@@ -5,9 +5,9 @@ privileged half: it validates the immutable invocation grant, opens the real tfs
 transaction before pulling bytes, streams directly into TensorFS, and returns exact receipt
 bytes suitable for Worker Protocol's ``WeightsReceipt`` wrapper.
 
-The worker supplies two callbacks for the pod lane: bind exact intent before TensorFS opens,
-then durably record the exact protocol receipt before commit returns to package code. Local
-execution omits them and retains the same TensorFS transaction implementation.
+Local and private workers supply the same workspace callbacks: bind exact intent before
+TensorFS opens, then durably record the exact native receipt before commit returns to package
+code. Standalone native tests can use the lower-level transaction without a worker transport.
 """
 
 from __future__ import annotations

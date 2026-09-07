@@ -124,12 +124,10 @@ class WeightsExchange:
         allow_private_egress: bool = False,
         workspace: Workspace | None = None,
     ) -> None:
-        #: The `WorkerControl` lane: stamps the frame's envelope and queues it on the live
-        #: control stream. Used only while no `Exchange` is open.
+        #: Native observations and outcomes share the ordered WorkerControl stream.
         self.send = send
-        #: The worker's envelope stamp, for events that leave on `Exchange` instead. The
-        #: identity default is for a test that exercises only the upload path, which never
-        #: stamps; the worker always passes its own fence stamp.
+        #: The current owner envelope qualifies restore and object transfer requests.
+        #: The identity default is used only by isolated native transport tests.
         self.stamp = stamp or (lambda message: message)
         self.stop = stop
         self.owner_scope = owner_scope
