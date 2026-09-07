@@ -1430,9 +1430,11 @@ def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str,
     plans: dict[str, str] = {}
     for record in records:
         descriptor_id = str(record["job_descriptor_id"])
-        (directory / f"{descriptor_id.split(':')[-1]}.json").write_text(
-            json.dumps(record, indent=2)
-        )
+        from cozy_runtime.internal import job_plan
+
+        target = job_plan.path(directory, str(record["build_id"]), descriptor_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(record, indent=2))
         plans[str(record["job"])] = descriptor_id
     return plans
 

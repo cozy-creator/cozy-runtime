@@ -3778,10 +3778,10 @@ class Worker:
             ):
                 raise ValueError("orchestration parent cannot be ordinary or nested")
             if parent is not None:
-                record = (
-                    self.config.cozy_home
-                    / "job-plans"
-                    / f"{parent.job_descriptor_id.removeprefix('sha256:')}.json"
+                from cozy_runtime.internal import job_plan
+
+                record = job_plan.path(
+                    self.config.cozy_home / "job-plans", parent.build_id, parent.job_descriptor_id
                 )
                 binding = JobBinding.read(json.loads(record.read_text()))
                 declaration = self.engine._job_declaration(binding, parent.job_descriptor_id)
@@ -3969,7 +3969,14 @@ class Worker:
         self._retire_hosted(set())
         self.set_job_ready(False)
         plans = self.config.cozy_home / "job-plans"
-        record = plans / f"{job.job_descriptor_id.split(':')[-1]}.json"
+        from cozy_runtime.internal import job_plan
+
+        try:
+            record = job_plan.path(plans, job.build_id, job.job_descriptor_id)
+        except ValueError:
+            self.latched = "job_plan_identity_invalid"
+            self._settle()
+            return
         if not record.is_file():
             self.engine.fault(
                 pb.Fault(
