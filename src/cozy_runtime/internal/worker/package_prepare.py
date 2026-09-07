@@ -466,6 +466,10 @@ def check_package_set_compatibility(
         raise PreparationRefusal(exc.code, exc.detail) from exc
     tensorfs = fill.tensorfs_module()
     for answer in answers:
+        if isinstance(answer, derive_child.SourceSlot):
+            # Discovery classified this exact path as a job's source view. Its
+            # header/slot checks above still apply; serving construction does not.
+            continue
         candidate = candidates[answer.slot]
         requirements = [
             tensorfs.TensorRequirement(
@@ -1073,6 +1077,10 @@ def _deriver(installed: package_environment.InstalledEnvironment, application: s
                 application=application,
             )
             (held,) = derive_child.derive_in(installed.python, request)
+            if isinstance(held, derive_child.SourceSlot):
+                raise derive_child.DeriveRefusal(
+                    "derive_slot_not_serving", f"{slot} is a job source, not a serving model"
+                )
             return held.components
         except derive_child.DeriveRefusal as exc:
             raise PreparationRefusal(
