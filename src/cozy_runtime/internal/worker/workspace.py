@@ -14,10 +14,11 @@ import hashlib
 import os
 import re
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
+from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill
@@ -264,7 +265,7 @@ class Workspace:
                 )
             ]
 
-    def projected_weights(self, owner: str, worker_boot: str) -> list[dict[str, object]]:
+    def projected_weights(self, owner: str, worker_boot: str) -> list[dict[str, Any]]:
         with self.locked(allow_frozen=True) as db:
             return [
                 dict(row)
@@ -373,7 +374,7 @@ class Workspace:
                 ),
             )
 
-    def begin_weights(self, owner: str, intent: pb.WeightsIntentFrame) -> dict[str, object]:
+    def begin_weights(self, owner: str, intent: pb.WeightsIntentFrame) -> dict[str, Any]:
         """Assign the epoch once, before native begin; the Host observes this decision."""
         self.owner(owner)
         declaration = intent.tensorfs_declaration_canonical_bytes
@@ -538,16 +539,20 @@ class Workspace:
                 ),
             )
 
-    def weights_row(self, owner: str, transaction: str) -> dict[str, object]:
+    def weights_row(self, owner: str, transaction: str) -> dict[str, Any]:
         with self.locked() as db:
             row = db.execute(
-                "SELECT * FROM weights WHERE owner=? AND id=?", (owner, transaction)
+                "SELECT w.*,a.fenced AS attempt_fenced,a.state AS attempt_state FROM weights w "
+                "JOIN attempts a ON a.owner=w.owner AND a.request=w.request "
+                "AND a.ordinal=w.ordinal "
+                "WHERE w.owner=? AND w.id=?",
+                (owner, transaction),
             ).fetchone()
             if row is None:
                 raise WorkspaceRefusal("workspace has no owned weights transaction")
             return dict(row)
 
-    def ready_weights(self, owner: str, request: pb.WeightsIntentReadyRequest) -> dict[str, object]:
+    def ready_weights(self, owner: str, request: pb.WeightsIntentReadyRequest) -> dict[str, Any]:
         subject = request.weights
         with self.locked() as db:
             row = db.execute(
@@ -565,6 +570,12 @@ class Workspace:
                 or row["state"] == "released"
             ):
                 raise WorkspaceRefusal("checkpoint readiness does not bind the current writer")
+            attempt = db.execute(
+                "SELECT state,fenced FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                (owner, row["request"], row["ordinal"]),
+            ).fetchone()
+            if attempt is None or attempt["fenced"]:
+                raise WorkspaceRefusal("checkpoint writer attempt was fenced")
             checkpoint = (
                 request.checkpoint.SerializeToString() if request.HasField("checkpoint") else b""
             )
@@ -572,6 +583,8 @@ class Workspace:
                 if checkpoint != row["restore_checkpoint"]:
                     raise WorkspaceRefusal("writer readiness already captured another checkpoint")
                 return dict(row)
+            if attempt["state"] not in ("accepted", "running"):
+                raise WorkspaceRefusal("checkpoint writer attempt has stopped")
             if checkpoint:
                 db.native(lambda: self._validate_checkpoint(row, request.checkpoint))
             current = db.execute(
@@ -621,7 +634,9 @@ class Workspace:
                 (frame.checkpoint.SerializeToString(), row["id"]),
             )
 
-    def _validate_checkpoint(self, row: sqlite3.Row, checkpoint: pb.CheckpointRef) -> None:
+    def _validate_checkpoint(
+        self, row: sqlite3.Row | Mapping[str, Any], checkpoint: pb.CheckpointRef
+    ) -> None:
         store = fill.tensorfs_module().Store.open(str(self.store_root))
         page = store.checkpoint_page(
             documents.spell(checkpoint.head.digest),
@@ -644,7 +659,7 @@ class Workspace:
         )
 
     @staticmethod
-    def status(row: dict[str, object]) -> pb.WeightsTransactionStatus:
+    def status(row: dict[str, Any]) -> pb.WeightsTransactionStatus:
         # SQLite rows have closed schema types; these are transport projections,
         # never another writer epoch or custody decision.
         from typing import Any, cast
@@ -668,15 +683,15 @@ class Workspace:
             status.checkpoint.CopyFrom(pb.CheckpointRef.FromString(value["checkpoint"]))
         return status
 
-    def _change_hold(
+    def reserve_hold(
         self,
         db: Journal,
         owner: str,
         request: pb.DerivedRetentionRequest,
         *,
-        release: bool,
-        cancel_lookup: bool = True,
-    ) -> pb.DerivedRetentionResult:
+        release: bool = False,
+    ) -> None:
+        self.owner(owner)
         if (
             _DIGEST.fullmatch(request.weights_transaction_id) is None
             or _DIGEST.fullmatch(request.retention_id) is None
@@ -701,12 +716,42 @@ class Workspace:
                 "AND native_digest=? AND state='held'",
                 subject,
             ).fetchone()
-            if original is None and retained is None:
+            pending_release = False
+            if release and original is None and retained is None:
+                # Durable memo/lookup intent authorizes cancellation of a root
+                # that may not have reached native creation before a crash.
+                # It never authorizes retaining bytes or creating a new root.
+                for table in ("operation_cache", "operation_lookups"):
+                    claim = db.execute(
+                        f"SELECT 1 FROM {table}, json_each(CAST(body AS TEXT),'$.holds') AS h "
+                        "WHERE owner=? AND json_extract(h.value,'$.retention_id')=? "
+                        "AND json_extract(h.value,'$.transaction_id')=? "
+                        "AND json_extract(h.value,'$.native_receipt_digest')=? LIMIT 1",
+                        (
+                            owner,
+                            request.retention_id,
+                            request.weights_transaction_id,
+                            documents.spell(request.tensorfs_receipt_digest),
+                        ),
+                    ).fetchone()
+                    pending_release |= claim is not None
+            if original is None and retained is None and not pending_release:
                 raise WorkspaceRefusal("native result has no receipt owned by this workspace owner")
             db.execute(
                 "INSERT INTO holds(id,owner,transaction_id,native_digest,state) VALUES(?,?,?,?,?)",
                 (request.retention_id, *subject, "releasing" if release else "retaining"),
             )
+
+    def _change_hold(
+        self,
+        db: Journal,
+        owner: str,
+        request: pb.DerivedRetentionRequest,
+        *,
+        release: bool,
+        cancel_lookup: bool = True,
+    ) -> pb.DerivedRetentionResult:
+        self.reserve_hold(db, owner, request, release=release)
         if release:
             db.execute("UPDATE holds SET state='releasing' WHERE id=?", (request.retention_id,))
         if release and cancel_lookup:
