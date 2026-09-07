@@ -113,24 +113,31 @@ def script_app(module: str) -> App:
     @app.job
     def main(ctx: Context, payload: _ScriptRequest, telemetry: Telemetry) -> _ScriptCompleted:
         ctx.raise_if_cancelled()
-        function = getattr(importlib.import_module(module), "main", None)
-        if not callable(function):
-            raise ConformanceError("script main is not callable", code="script_main_signature")
-        context = ScriptContext(ctx, telemetry)
-        if with_context:
-            result = function(ctx=context) if keyword_context else function(context)
-        else:
-            result = function()
-        if inspect.isgenerator(result) or inspect.isasyncgen(result):
-            raise ConformanceError(
-                "script main returned an unexecuted generator", code="script_main_signature"
-            )
-        if inspect.isawaitable(result):
+        try:
+            function = getattr(importlib.import_module(module), "main", None)
+            if not callable(function):
+                raise ConformanceError("script main is not callable", code="script_main_signature")
+            context = ScriptContext(ctx, telemetry)
+            if with_context:
+                result = function(ctx=context) if keyword_context else function(context)
+            else:
+                result = function()
+            if inspect.isgenerator(result) or inspect.isasyncgen(result):
+                raise ConformanceError(
+                    "script main returned an unexecuted generator", code="script_main_signature"
+                )
+            if inspect.isawaitable(result):
 
-            async def wait() -> None:
-                await result
+                async def wait() -> None:
+                    await result
 
-            asyncio.run(wait())
+                asyncio.run(wait())
+        except SystemExit as exc:
+            # A script's deliberate exit is its outcome, not a worker crash to retry.
+            if exc.code is not None and exc.code != 0:
+                raise ConformanceError(
+                    "script exited with a nonzero status", code="script_exit"
+                ) from exc
         ctx.raise_if_cancelled()
         return _ScriptCompleted()
 

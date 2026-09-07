@@ -92,6 +92,23 @@ def test_returned_generator_is_not_reported_as_completed_work(
     assert outcome.terminal == "failed"
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "expected"),
+    [(None, "succeeded"), (0, "succeeded"), (3, "failed"), ("quality gate", "failed")],
+)
+def test_script_exit_is_an_author_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: object, expected: str
+) -> None:
+    module = f"exit_script_{expected}_{type(exit_code).__name__}"
+    (tmp_path / (module + ".py")).write_text(f"def main():\n    raise SystemExit({exit_code!r})\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    app = script_app(module)
+    _, outcome, _ = attempt(
+        app.get("main"), {}, Invocation("exit", tmp_path / "out", time.monotonic() + 5)
+    )
+    assert outcome.terminal == expected
+
+
 def test_script_observes_cancellation_before_import(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
