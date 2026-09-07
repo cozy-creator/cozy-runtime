@@ -520,14 +520,16 @@ class ProtocolInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class WorkspaceImportBegin(_message.Message):
-    __slots__ = ("claim", "migration_id", "record_count")
+    __slots__ = ("claim", "migration_id", "record_count", "source_schema")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     MIGRATION_ID_FIELD_NUMBER: _ClassVar[int]
     RECORD_COUNT_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SCHEMA_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     migration_id: str
     record_count: int
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ..., record_count: _Optional[int] = ...) -> None: ...
+    source_schema: int
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ..., record_count: _Optional[int] = ..., source_schema: _Optional[int] = ...) -> None: ...
 
 class WorkspaceImportRecord(_message.Message):
     __slots__ = ("index", "kind", "length", "digest")
