@@ -2511,7 +2511,7 @@ class ResourceShortfall(_message.Message):
     def __init__(self, resource: _Optional[str] = ..., scope: _Optional[str] = ..., needed_bytes: _Optional[int] = ..., available_bytes: _Optional[int] = ..., request_shape: _Optional[str] = ..., evidence_class: _Optional[str] = ...) -> None: ...
 
 class AttemptOutcomeAck(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "outcome_id", "outcome_digest")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "outcome_id", "outcome_digest", "retain_work")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -2520,6 +2520,7 @@ class AttemptOutcomeAck(_message.Message):
     INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
     OUTCOME_ID_FIELD_NUMBER: _ClassVar[int]
     OUTCOME_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    RETAIN_WORK_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -2528,7 +2529,8 @@ class AttemptOutcomeAck(_message.Message):
     invocation_spec_digest: bytes
     outcome_id: str
     outcome_digest: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., outcome_id: _Optional[str] = ..., outcome_digest: _Optional[bytes] = ...) -> None: ...
+    retain_work: bool
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., outcome_id: _Optional[str] = ..., outcome_digest: _Optional[bytes] = ..., retain_work: bool = ...) -> None: ...
 
 class JobCheckpointRequest(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "operation_key", "logical_key", "content_digest", "seq", "artifact")
