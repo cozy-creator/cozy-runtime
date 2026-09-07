@@ -48,7 +48,9 @@ def _ref(raw: bytes) -> _ObjectRef:
     return {"length": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
-def _snapshot(tmp_path: Path, *, include_asset: bool) -> tuple[Path, str, int, Any]:
+def _snapshot(
+    tmp_path: Path, *, include_asset: bool, checkpoint_only: bool = False
+) -> tuple[Path, str, int, Any]:
     store_root = tmp_path / "store"
     store = tensorfs.Store.init(str(store_root))
 
@@ -74,6 +76,8 @@ def _snapshot(tmp_path: Path, *, include_asset: bool) -> tuple[Path, str, int, A
             {"blob": sample, "kind": "file", "path": "sample.png"},
         ]
     }
+    if checkpoint_only:
+        manifest["entries"] = [row for row in manifest["entries"] if row["kind"] == "cozytensors"]
     raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     manifest_id = "sha256:" + hashlib.sha256(raw).hexdigest()
     store.put_manifest(raw, manifest_id, len(raw))
@@ -283,7 +287,7 @@ def _checkpoint_selection(manifest: str, **fields: Any) -> dict[str, Any]:
 def test_exact_checkpoint_prepares_and_streams_without_any_release(
     tmp_path: Path, named_fields: dict[str, str]
 ) -> None:
-    root, manifest, length, store = _snapshot(tmp_path, include_asset=True)
+    root, manifest, length, store = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
     selection = _checkpoint_selection(manifest, **named_fields)
     original_objects = store.objects()
     for _ in range(2):
@@ -327,7 +331,7 @@ def test_exact_checkpoint_prepares_and_streams_without_any_release(
 def test_checkpoint_selection_refuses_partial_release_or_incomplete_model(
     tmp_path: Path, fields: dict[str, str]
 ) -> None:
-    root, manifest, _length, _store = _snapshot(tmp_path, include_asset=True)
+    root, manifest, _length, _store = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
     selection = _checkpoint_selection(manifest, **fields)
     with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
         _compatibility_models([selection], tensorfs_root=root)
@@ -336,7 +340,7 @@ def test_checkpoint_selection_refuses_partial_release_or_incomplete_model(
 
 
 def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path) -> None:
-    root, manifest, length, _store = _snapshot(tmp_path, include_asset=True)
+    root, manifest, length, _store = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
     selection = _checkpoint_selection(manifest, release="", lane="")
     for wrong_length in (-1, length + 1):
         with pytest.raises(PreparationRefusal, match="model_manifest_mismatch"):
@@ -364,7 +368,7 @@ def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path)
 
 
 def test_checkpoint_selection_refuses_corrupt_header(tmp_path: Path) -> None:
-    root, manifest, _length, _store = _snapshot(tmp_path, include_asset=True)
+    root, manifest, _length, _store = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
     # Locate the fixture object without encoding TensorFS's storage fanout rules.
     stored = next(root.rglob(hashlib.sha256(_HEADER).hexdigest()))
     stored.chmod(stored.stat().st_mode | 0o200)
