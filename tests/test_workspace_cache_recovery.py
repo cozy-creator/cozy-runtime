@@ -289,7 +289,13 @@ def test_all_output_holds_survive_interruption_or_late_acquisition(
 
 
 def scalar(
-    workspace: Workspace, request: str, value: int, key: bytes, *, evidence: str = ""
+    workspace: Workspace,
+    request: str,
+    value: int,
+    key: bytes,
+    *,
+    evidence: str = "",
+    owner: str = "owner",
 ) -> bool:
     raw = documents.canonical_bytes(
         pb.InvocationSpec(
@@ -300,7 +306,7 @@ def scalar(
     )
     spec = hashlib.sha256(raw).digest()
     workspace.accept(
-        "owner",
+        owner,
         pb.AttemptOffer(
             request_id=request,
             attempt_ordinal=1,
@@ -320,7 +326,7 @@ def scalar(
         )
     )
     workspace.outcome(
-        "owner",
+        owner,
         pb.AttemptOutcome(
             request_id=request,
             attempt_ordinal=1,
@@ -332,7 +338,7 @@ def scalar(
     )
     return workspace_memo.record(
         workspace,
-        "owner",
+        owner,
         pb.RecordOperationResultCall(
             request_id=request,
             attempt_ordinal=1,
@@ -396,7 +402,7 @@ def test_missing_old_recipient_does_not_clear_disabled_mapping(tmp_path: Path) -
         )
 
 
-def test_disabled_compaction_preserves_owned_terminal_replay(tmp_path: Path) -> None:
+def test_disabled_compaction_preserves_history_without_scalar_lookup_copies(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     key = b"\x79" * 32
     assert scalar(workspace, "original", 7, key, evidence="x" * 16384)
@@ -413,7 +419,13 @@ def test_disabled_compaction_preserves_owned_terminal_replay(tmp_path: Path) -> 
         assert payload["conflicting_source"]["request_id"] == "contradiction"
         assert "outcome_canonical_bytes" not in payload["source"]
         assert "outcome_canonical_bytes" not in payload["conflicting_source"]
-    assert workspace_memo.lookup(workspace, "owner", lookup) == before
+    # Scalar delivery has no native effect to replay. Creator owns any accepted
+    # result; a fresh query must obey the now-disabled mapping.
+    assert not workspace_memo.lookup(workspace, "owner", lookup).found
+    assert any(
+        item.outcome_canonical_bytes == before.source.outcome_canonical_bytes
+        for item in workspace.retained_outcomes("owner")
+    )
     assert not workspace_memo.lookup(
         workspace,
         "owner",

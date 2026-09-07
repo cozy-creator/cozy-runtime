@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import derived_retention, store_gc
-from cozy_runtime.internal.worker.workspace import Journal, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import _ID, Journal, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -20,6 +20,124 @@ if TYPE_CHECKING:
 
 # Enabled results only; compact contradiction identities must not be forgotten.
 MAX_ENTRIES = 128
+MAX_METADATA_BYTES = 64 << 20
+# Logical metadata accounting reserves bounded row overhead and enough space to
+# remember a future contradiction without rejecting that safety transition.
+_ROW_OVERHEAD = 128
+_CONTRADICTION_ALLOWANCE = 4096
+
+
+def metadata_bytes(db: Journal) -> int:
+    """Optional payloads and native hold markers across this physical workspace.
+
+    This is an admission budget, not a limit on the SQLite file or required
+    execution history. Required retention, terminal recording and cleanup never
+    consult it. Native tensor bytes and required attempt/weights bodies are not
+    charged here.
+    """
+    total = 0
+    for table, columns in (
+        ("operation_cache", ("id", "owner", "key", "body")),
+        ("operation_lookups", ("owner", "consumer", "key", "cache_id", "body")),
+        ("holds", ("id", "owner", "transaction_id", "native_digest", "manifest")),
+    ):
+        charge = "+".join(f"length(CAST({column} AS BLOB))" for column in columns)
+        extra = (
+            f"+CASE WHEN state<>'disabled' THEN {_CONTRADICTION_ALLOWANCE} ELSE 0 END"
+            if table == "operation_cache"
+            else ""
+        )
+        total += db.execute(
+            f"SELECT coalesce(sum({_ROW_OVERHEAD}+{charge}{extra}),0) FROM {table}"
+        ).fetchone()[0]
+    return total
+
+
+def _row_bytes(*values: str | bytes) -> int:
+    return _ROW_OVERHEAD + sum(
+        len(value.encode() if isinstance(value, str) else value) for value in values
+    )
+
+
+def _hold_growth(db: Journal, owner: str, holds: list[dict[str, Any]]) -> int:
+    return sum(
+        _row_bytes(owner, hold["retention_id"], hold["transaction_id"], bytes(32), bytes(32))
+        for hold in holds
+        if db.execute("SELECT 1 FROM holds WHERE id=?", (hold["retention_id"],)).fetchone() is None
+    )
+
+
+def _source_identity(source: dict[str, Any]) -> dict[str, Any]:
+    return {name: value for name, value in source.items() if name != "outcome_canonical_bytes"}
+
+
+def _compact_payload(payload: dict[str, Any]) -> bytes:
+    return canonical_json.encode(
+        {"source": _source_identity(payload["source"]), "holds": payload["holds"]}
+    )
+
+
+def delivered(workspace: Workspace, owner: str, consumer: str) -> None:
+    """Drop a delivered native lookup's outcome copy after the owner stores it.
+
+    The validated ChildCallResult transition owns when this may happen. Native
+    holds remain independent until their explicit release; this is metadata
+    compaction, not a finalization or an ownership release.
+    """
+    workspace.owner(owner)
+    with workspace.locked() as db:
+        row = db.execute(
+            "SELECT * FROM operation_lookups WHERE owner=? AND consumer=?", (owner, consumer)
+        ).fetchone()
+        if row is None or row["state"] in ("acknowledged", "released", "miss"):
+            return
+        if row["state"] != "ready":
+            raise WorkspaceRefusal("lookup delivery requires its completed native ownership")
+        payload = json.loads(row["body"])
+        if not payload["holds"]:
+            db.execute(
+                "DELETE FROM operation_lookups WHERE owner=? AND consumer=?", (owner, consumer)
+            )
+            return
+        db.execute(
+            "UPDATE operation_lookups SET state='acknowledged',body=? WHERE owner=? AND consumer=?",
+            (_compact_payload(payload), owner, consumer),
+        )
+
+
+def compact_released(db: Journal, owner: str) -> None:
+    """Compact settled lookup bodies only after every planned hold is released."""
+    db.execute(
+        "DELETE FROM operation_lookups WHERE owner=? "
+        "AND coalesce(json_array_length(CAST(body AS TEXT),'$.holds'),0)=0",
+        (owner,),
+    )
+    rows = db.execute(
+        "SELECT * FROM operation_lookups WHERE owner=? AND state IN ('released','miss') "
+        "AND json_type(CAST(body AS TEXT),'$.source.outcome_canonical_bytes') IS NOT NULL",
+        (owner,),
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["body"])
+        settled = True
+        for hold in payload["holds"]:
+            native = db.execute(
+                "SELECT * FROM holds WHERE id=?", (hold["retention_id"],)
+            ).fetchone()
+            if native is None or native["state"] != "released":
+                settled = False
+                break
+            if (native["owner"], native["transaction_id"], native["native_digest"]) != (
+                owner,
+                hold["transaction_id"],
+                documents.raw(hold["native_receipt_digest"]),
+            ):
+                raise WorkspaceRefusal("released lookup hold changed its exact native subject")
+        if settled:
+            db.execute(
+                "UPDATE operation_lookups SET body=? WHERE owner=? AND consumer=?",
+                (_compact_payload(payload), owner, row["consumer"]),
+            )
 
 
 class _Uncacheable(Exception):
@@ -249,12 +367,7 @@ def _drain(workspace: Workspace, db: Journal, owner: str) -> int:
             # need either full outcome or the result schema. Prior consumers
             # already own their exact terminal bytes in their lookup records.
             payload = {
-                name: {
-                    field: value
-                    for field, value in payload[name].items()
-                    if field != "outcome_canonical_bytes"
-                }
-                for name in ("source", "conflicting_source")
+                name: _source_identity(payload[name]) for name in ("source", "conflicting_source")
             } | {"holds": []}
             db.execute(
                 "UPDATE operation_cache SET body=? WHERE id=?",
@@ -262,6 +375,7 @@ def _drain(workspace: Workspace, db: Journal, owner: str) -> int:
             )
         else:
             db.execute("DELETE FROM operation_cache WHERE id=? AND state='evicting'", (row["id"],))
+    compact_released(db, owner)
     return sum(row["state"] == "evicting" for row in rows)
 
 
@@ -292,6 +406,7 @@ def _missing_cleanup(workspace: Workspace, db: Journal, owner: str, consumer: st
     )
     if completed.rowcount != 1:
         raise WorkspaceRefusal("memo recipient was released during missing-custody cleanup")
+    compact_released(db, owner)
 
 
 def _missing_native_result(
@@ -373,12 +488,20 @@ def record(
                 hold["retention_id"] = _hold_id(
                     "cache", owner, identity, call.computation_digest, hold["transaction_id"]
                 )
+            encoded = canonical_json.encode(payload)
+            growth = (
+                _row_bytes(identity, owner, call.computation_digest, encoded)
+                + _CONTRADICTION_ALLOWANCE
+                + _hold_growth(db, owner, payload["holds"])
+            )
+            if metadata_bytes(db) + growth > MAX_METADATA_BYTES:
+                return answer
             db.execute("BEGIN IMMEDIATE")
             try:
                 db.execute(
                     "INSERT INTO operation_cache(id,owner,key,body,state) "
                     "VALUES(?,?,?,?,'retaining')",
-                    (identity, owner, call.computation_digest, canonical_json.encode(payload)),
+                    (identity, owner, call.computation_digest, encoded),
                 )
                 _reserve_holds(workspace, db, owner, payload["holds"])
                 db.commit()
@@ -405,7 +528,11 @@ def record(
                 except _Uncacheable:
                     return answer
                 if not same:
-                    payload["conflicting_source"] = candidate["source"]
+                    payload = {
+                        "source": _source_identity(payload["source"]),
+                        "conflicting_source": _source_identity(candidate["source"]),
+                        "holds": payload["holds"],
+                    }
                     db.execute(
                         "UPDATE operation_cache SET state='disabled',body=? WHERE id=?",
                         (canonical_json.encode(payload), identity),
@@ -439,8 +566,8 @@ def lookup(
     workspace: Workspace, owner: str, call: pb.LookupOperationCall
 ) -> pb.LookupOperationResult:
     workspace.owner(owner)
-    if len(call.computation_digest) != 32 or not call.consumer_request_id:
-        raise WorkspaceRefusal("memo lookup requires a key and durable consumer identity")
+    if len(call.computation_digest) != 32 or _ID.fullmatch(call.consumer_request_id) is None:
+        raise WorkspaceRefusal("memo lookup requires an exact key and bounded consumer identity")
     answer = pb.LookupOperationResult(
         computation_digest=call.computation_digest, consumer_request_id=call.consumer_request_id
     )
@@ -453,6 +580,8 @@ def lookup(
         if row is not None:
             if row["key"] != call.computation_digest or row["state"] == "released":
                 raise WorkspaceRefusal("memo recipient was changed or released")
+            if row["state"] == "acknowledged":
+                raise WorkspaceRefusal("memo result was delivered; use the owner's recorded result")
             if row["state"] == "miss":
                 return answer
             if row["state"] == "missing":
@@ -472,13 +601,18 @@ def lookup(
                 (owner, call.computation_digest),
             ).fetchone()
             if cached is None:
-                db.execute(
-                    "INSERT INTO operation_lookups(owner,consumer,key,cache_id,body,state) "
-                    "VALUES(?,?,?,'',?,'miss')",
-                    (owner, call.consumer_request_id, call.computation_digest, b"{}"),
-                )
                 return answer
             payload = json.loads(cached["body"])
+            if not payload["holds"]:
+                # No native effect needs a recipient journal. Losing this reply
+                # may re-query the computation key or recompute after eviction;
+                # the owner's accepted call history stores any delivered value.
+                db.execute(
+                    "UPDATE operation_cache SET sequence="
+                    "(SELECT coalesce(max(sequence),0)+1 FROM operation_cache) WHERE id=?",
+                    (cached["id"],),
+                )
+                return _found(answer, payload, [])
             for hold in payload["holds"]:
                 hold["retention_id"] = _hold_id(
                     "consumer",
@@ -487,6 +621,12 @@ def lookup(
                     call.computation_digest,
                     hold["transaction_id"],
                 )
+            encoded = canonical_json.encode(payload)
+            growth = _row_bytes(
+                owner, call.consumer_request_id, call.computation_digest, cached["id"], encoded
+            ) + _hold_growth(db, owner, payload["holds"])
+            if metadata_bytes(db) + growth > MAX_METADATA_BYTES:
+                return answer
             db.execute("BEGIN IMMEDIATE")
             try:
                 db.execute(
@@ -497,7 +637,7 @@ def lookup(
                         call.consumer_request_id,
                         call.computation_digest,
                         cached["id"],
-                        canonical_json.encode(payload),
+                        encoded,
                     ),
                 )
                 db.execute(
@@ -528,22 +668,30 @@ def lookup(
         )
         if committed.rowcount != 1:
             raise WorkspaceRefusal("memo consumer stopped before result exposure")
-        source = payload["source"]
-        answer.source.CopyFrom(
-            pb.AttemptOutcome(
-                request_id=source["request_id"],
-                attempt_ordinal=source["attempt_ordinal"],
-                invocation_spec_digest=documents.raw(source["invocation_spec_digest"]),
-                outcome_id=source["outcome_id"],
-                outcome_digest=documents.raw(source["outcome_digest"]),
-                outcome_canonical_bytes=base64.b64decode(
-                    source["outcome_canonical_bytes"], validate=True
-                ),
-            )
+        return _found(answer, payload, retained)
+
+
+def _found(
+    answer: pb.LookupOperationResult,
+    payload: dict[str, Any],
+    retained: list[pb.DerivedRetentionResult],
+) -> pb.LookupOperationResult:
+    source = payload["source"]
+    answer.source.CopyFrom(
+        pb.AttemptOutcome(
+            request_id=source["request_id"],
+            attempt_ordinal=source["attempt_ordinal"],
+            invocation_spec_digest=documents.raw(source["invocation_spec_digest"]),
+            outcome_id=source["outcome_id"],
+            outcome_digest=documents.raw(source["outcome_digest"]),
+            outcome_canonical_bytes=base64.b64decode(
+                source["outcome_canonical_bytes"], validate=True
+            ),
         )
-        answer.retentions.extend(retained)
-        answer.found = True
-        return answer
+    )
+    answer.retentions.extend(retained)
+    answer.found = True
+    return answer
 
 
 def prune(workspace: Workspace, owner: str) -> pb.PruneOperationCacheResult:
