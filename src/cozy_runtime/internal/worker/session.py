@@ -2775,11 +2775,15 @@ class Worker:
         `available_attempt_slots` is the field that carries this, and it is recomputed on
         every tick.
         """
-        self.note("outcome", self.engine.close(acked))
+        closed = self.engine.history.get((acked.request_id, acked.attempt_ordinal))
+        job = closed.job if closed is not None else None
+        disposition = self.engine.close(acked)
+        self.note("outcome", disposition)
+        if disposition != "closed":
+            return
         self.calls.close(acked.request_id, acked.attempt_ordinal)
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
-        closed = self.engine.history.get((acked.request_id, acked.attempt_ordinal))
         # An acknowledged stopped attempt can leave retained work for another
         # attempt on this worker. The owner's per-outcome retention decision
         # overrides the job's ordinary one-shot process recycling policy.
@@ -2787,8 +2791,13 @@ class Worker:
             self.reclaim_on_terminal
             and not acked.retain_work
             and not self.engine.live
+            # Managed composition remains under the owner's lifetime, including
+            # independent native holds which Runtime does not own or enumerate.
+            and not self.job_slots
             and closed is not None
             and closed.kind == "job"
+            and job is not None
+            and self.jobs.get(job.job_descriptor_id) is job
         ):
             self.note(
                 "session",
