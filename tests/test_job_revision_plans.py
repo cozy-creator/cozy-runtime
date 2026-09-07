@@ -6,6 +6,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from cozy_runtime.internal import job_plan, package_environment, package_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.local import development_source_digest, stage_job_plans
@@ -86,3 +88,11 @@ def compute(payload:Input)->Output:
     )
     assert old.read_bytes() == old_bytes and new.read_bytes() == new_bytes
     assert not (root / (descriptor.removeprefix("sha256:") + ".json")).exists()
+    original = json.loads(old_bytes)
+    inode = old.stat().st_ino
+    job_plan.write(root, original)
+    assert old.stat().st_ino == inode
+    original["python"] = "/different/interpreter"
+    with pytest.raises(ValueError, match="conflicts with its immutable"):
+        job_plan.write(root, original)
+    assert old.read_bytes() == old_bytes

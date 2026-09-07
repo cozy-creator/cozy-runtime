@@ -6,7 +6,6 @@ import contextlib
 import copy
 import hashlib
 import importlib.metadata
-import json
 import os
 import re
 import stat
@@ -1261,12 +1260,7 @@ def _stage_job_plans(
             record["call_interfaces"] = call_interfaces
         from cozy_runtime.internal import job_plan
 
-        target = job_plan.path(root, build_id, descriptor_id)
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-        temporary = target.parent / f".stage-{uuid.uuid4().hex}"
-        temporary.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")))
-        temporary.chmod(0o444)
-        temporary.replace(target)
+        job_plan.write(root, record)
         staged.add(descriptor_id)
     return staged
 

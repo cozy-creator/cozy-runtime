@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import tempfile
 from pathlib import Path
+from typing import Any
 
 _DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
 
@@ -13,3 +17,28 @@ def path(root: Path, build_id: str, descriptor_id: str) -> Path:
     if build is None or descriptor is None:
         raise ValueError("job plan requires exact build and descriptor SHA-256 identities")
     return root / build.group(1) / (descriptor.group(1) + ".json")
+
+
+def write(root: Path, record: dict[str, Any]) -> Path:
+    """Publish a complete immutable plan; exact replay leaves the old file intact."""
+    target = path(root, record["build_id"], record["job_descriptor_id"])
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    content = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".stage-") as staged:
+        staged.write(content)
+        staged.flush()
+        os.fchmod(staged.fileno(), 0o444)
+        os.fsync(staged.fileno())
+        try:
+            os.link(staged.name, target)
+        except FileExistsError:
+            if target.is_symlink() or target.read_bytes() != content:
+                raise ValueError(
+                    "job plan conflicts with its immutable build and descriptor"
+                ) from None
+        directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    return target

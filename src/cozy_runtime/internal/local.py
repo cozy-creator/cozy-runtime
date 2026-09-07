@@ -34,7 +34,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import hashlib
-import json
 import os
 import shutil
 import threading
@@ -1432,9 +1431,7 @@ def stage_job_plans(cozy_home: Path, records: list[dict[str, Any]]) -> dict[str,
         descriptor_id = str(record["job_descriptor_id"])
         from cozy_runtime.internal import job_plan
 
-        target = job_plan.path(directory, str(record["build_id"]), descriptor_id)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(record, indent=2))
+        job_plan.write(directory, record)
         plans[str(record["job"])] = descriptor_id
     return plans
 
