@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from email.parser import BytesParser
+from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author import ConformanceError
@@ -85,3 +87,20 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
             "installed invocable export inventory exceeds its bound", code="child_interface"
         )
     return interfaces
+
+
+def for_job(python: str, content_digest: str) -> list[dict[str, Any]]:
+    """Read the explicitly selected venv; never run its interpreter or inherit imports."""
+    executable = Path(python)
+    generation = executable.parent.parent
+    if not executable.is_absolute() or not (generation / "pyvenv.cfg").is_file():
+        return []
+    # Runtime and every admitted implementation use the same CPython ABI. uv's
+    # venv layout is platform-defined; no package interpreter needs to run merely
+    # to locate immutable metadata on the preparation/control process.
+    site = generation / (
+        "Lib/site-packages"
+        if sys.platform == "win32"
+        else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    )
+    return read(InstalledEnvironment(generation, site, executable, b"", "", content_digest, True))

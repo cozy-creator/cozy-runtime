@@ -234,7 +234,19 @@ class JobBinding:
                 f"job plan record carries {', '.join(unknown)}: the record's key set is "
                 "closed, exactly like the documents it stands in for",
             )
-        return cls(**record)
+        from cozy_runtime.internal import installed_interfaces
+
+        observed = installed_interfaces.for_job(
+            str(record.get("python", "")), str(record.get("environment_content_digest", ""))
+        )
+        captured = dict(record)
+        supplied = captured.pop("call_interfaces", None)
+        if supplied is not None and tuple(supplied) != tuple(observed):
+            raise PlanRefusal(
+                "job_plan_child_interfaces_changed",
+                "the selected environment differs from its frozen interface inventory",
+            )
+        return cls(**captured, call_interfaces=tuple(observed))
 
 
 @dataclass(frozen=True, slots=True)
