@@ -2870,8 +2870,10 @@ class Worker:
         the previous set keeps serving.
         """
         mode = desired.WhichOneof("mode") or ""
-        if mode != "job" and self.job_slots and any(
-            self._job_lane_busy(slot.lane) for slot in self.job_slots.values()
+        if (
+            mode != "job"
+            and self.job_slots
+            and any(self._job_lane_busy(slot.lane) for slot in self.job_slots.values())
         ):
             self.engine.fault(
                 pb.Fault(

@@ -153,9 +153,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
             calls.append(disconnected)
             await_for(lambda: len(worker.watches.watchers) == 1, "client watch never opened")
         await_for(lambda: not worker.watches.watchers, "disconnected watch remains registered")
-        assert preparation.CheckpointPage(
-            p.CheckpointPageRequest(), timeout=3
-        ).safe_code
+        assert preparation.CheckpointPage(p.CheckpointPageRequest(), timeout=3).safe_code
         print(
             json.dumps(
                 {
