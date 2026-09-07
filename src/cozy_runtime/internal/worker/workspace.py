@@ -79,6 +79,7 @@ CREATE TABLE attempts (
  outcome BLOB NOT NULL DEFAULT x'', retain INTEGER NOT NULL DEFAULT 0,
  fenced INTEGER NOT NULL DEFAULT 0,
  worker_boot TEXT NOT NULL DEFAULT '', result_schema BLOB NOT NULL DEFAULT x'',
+ transport_owner TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(owner,request,ordinal)
 ) STRICT;
 CREATE TABLE weights (
@@ -188,7 +189,7 @@ class Workspace:
         *,
         result_schema: bytes = b"",
         worker_boot: str = "",
-    ) -> None:
+    ) -> pb.AttemptOutcome | None:
         self.owner(owner)
         if (
             _ID.fullmatch(offer.request_id) is None
@@ -201,18 +202,18 @@ class Workspace:
         documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
         with self.locked() as db:
             row = db.execute(
-                "SELECT spec,invocation,state FROM attempts "
-                "WHERE owner=? AND request=? AND ordinal=?",
+                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
                 (owner, offer.request_id, offer.attempt_ordinal),
             ).fetchone()
             if row is not None:
                 if (
                     row["spec"] != offer.invocation_spec_digest
                     or row["invocation"] != offer.invocation_spec_canonical_bytes
-                    or row["state"] == "released"
                 ):
                     raise WorkspaceRefusal("workspace attempt was changed or released")
-                return
+                if row["state"] in ("outcome", "released"):
+                    return self._outcome_frame(row)
+                return None
             db.execute(
                 "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state,"
                 "worker_boot,result_schema) VALUES(?,?,?,?,?,'accepted',?,?)",
@@ -226,6 +227,55 @@ class Workspace:
                     result_schema,
                 ),
             )
+
+        return None
+
+    @staticmethod
+    def _outcome_frame(row: sqlite3.Row) -> pb.AttemptOutcome:
+        return pb.AttemptOutcome(
+            request_id=row["request"],
+            attempt_ordinal=row["ordinal"],
+            invocation_spec_digest=row["spec"],
+            outcome_id=row["outcome_id"],
+            outcome_digest=row["outcome_digest"],
+            outcome_canonical_bytes=row["outcome"],
+        )
+
+    def contains(self, owner: str, request: str, ordinal: int) -> bool:
+        with self.locked() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
+                    "AND request=? AND ordinal=?",
+                    (owner, owner, request, ordinal),
+                ).fetchone()
+                is not None
+            )
+
+    def retained_outcomes(self, owner: str) -> list[pb.AttemptOutcome]:
+        with self.locked(allow_frozen=True) as db:
+            return [
+                self._outcome_frame(row)
+                for row in db.execute(
+                    "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
+                    "AND state='outcome' "
+                    "ORDER BY request,ordinal",
+                    (owner, owner),
+                )
+            ]
+
+    def projected_weights(self, owner: str, worker_boot: str) -> list[dict[str, object]]:
+        with self.locked(allow_frozen=True) as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT w.* FROM weights AS w JOIN attempts AS a ON "
+                    "a.owner=w.owner AND a.request=w.request AND a.ordinal=w.ordinal "
+                    "WHERE w.owner=? AND a.state<>'released' "
+                    "AND (a.state='outcome' OR a.worker_boot=?) ORDER BY w.id",
+                    (owner, worker_boot),
+                )
+            ]
 
     def retain(
         self, owner: str, request: pb.DerivedRetentionRequest, *, release: bool = False
@@ -299,8 +349,9 @@ class Workspace:
         self.owner(owner)
         with self.locked() as db:
             row = db.execute(
-                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
-                (owner, ack.request_id, ack.attempt_ordinal),
+                "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
+                "AND request=? AND ordinal=?",
+                (owner, owner, ack.request_id, ack.attempt_ordinal),
             ).fetchone()
             if (
                 row is None
@@ -316,7 +367,7 @@ class Workspace:
                 (
                     "outcome" if ack.retain_work else "released",
                     int(ack.retain_work),
-                    owner,
+                    row["owner"],
                     ack.request_id,
                     ack.attempt_ordinal,
                 ),
@@ -349,6 +400,7 @@ class Workspace:
                 attempt is None
                 or attempt["spec"] != intent.invocation_spec_digest
                 or attempt["state"] not in ("accepted", "running")
+                or attempt["fenced"]
             ):
                 raise WorkspaceRefusal("weights intent requires its live accepted invocation")
             row = db.execute(
