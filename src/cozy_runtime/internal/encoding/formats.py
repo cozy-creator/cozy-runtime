@@ -343,6 +343,8 @@ class LeafProvider(Protocol):
 
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float: ...
 
+    def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int: ...
+
 
 def _rank2(shape: Sequence[int]) -> str:
     """The one geometry law every fp8/mx GEMM route shares: two outer dimensions."""

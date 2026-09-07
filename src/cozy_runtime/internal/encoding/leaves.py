@@ -168,6 +168,10 @@ def quantize_activation_mx(torch: Any, x: Any) -> tuple[Any, Any]:
     return quant, byte.to(torch.uint8)
 
 
+def _blocked_shape(rows: int, cols: int) -> tuple[int, int]:
+    return -(-rows // 128) * 128, -(-cols // 4) * 4
+
+
 def to_blocked(torch: Any, scales: Any) -> Any:
     """`[rows, cols]` E8M0 bytes -> cuBLASLt's 128x4 blocked ("swizzled") scale layout.
 
@@ -178,9 +182,9 @@ def to_blocked(torch: Any, scales: Any) -> Any:
     positions. Nothing raises. The probe oracle is what catches a builder who skips this.
     """
     rows, cols = int(scales.shape[0]), int(scales.shape[1])
-    row_blocks = -(-rows // 128)
-    col_blocks = -(-cols // 4)
-    padded = torch.zeros(row_blocks * 128, col_blocks * 4, dtype=scales.dtype, device=scales.device)
+    padded_rows, padded_cols = _blocked_shape(rows, cols)
+    row_blocks, col_blocks = padded_rows // 128, padded_cols // 4
+    padded = torch.zeros(padded_rows, padded_cols, dtype=scales.dtype, device=scales.device)
     padded[:rows, :cols] = scales
     tiles = padded.view(row_blocks, 128, col_blocks, 4).permute(0, 2, 1, 3)
     return tiles.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).contiguous()
@@ -357,6 +361,9 @@ class RowwiseNativeLeaf:
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
         return 8.0 * sum(p.nbytes for p in parts.values()) / max(numel, 1)
 
+    def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
+        return 0
+
     @staticmethod
     def _forward(leaf: Any, x: Any) -> Any:
         import torch
@@ -496,7 +503,15 @@ class MicroScaledNativeLeaf:
         )
 
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
-        return 8.0 * sum(p.nbytes for p in parts.values()) / max(numel, 1)
+        rows, cols = _blocked_shape(*parts["scale"].shape)
+        return 8.0 * (parts["data"].nbytes + rows * cols) / max(numel, 1)
+
+    def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
+        # to_blocked can overlap the padded grid, reshape copy, and final blocked copy.
+        # The source grid is already part of the fill payload. Charging all three for
+        # each pending leaf also bounds outputs retained until the component fence.
+        rows, cols = _blocked_shape(*parts["scale"].shape)
+        return 3 * rows * cols
 
     @staticmethod
     def _forward(leaf: Any, x: Any) -> Any:
