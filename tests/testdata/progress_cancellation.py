@@ -136,11 +136,32 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
             == []
         )
         assert not worker.watches.watchers
+        # Both deadline expiration and closing the client's connection take the same
+        # cancellation path, without another progress frame or a new control Claim.
+        opened = p.ProgressOpen(
+            record_owner_epoch=1,
+            control_stream_epoch=ack.control_stream_epoch,
+            worker_boot_id="same-boot",
+        )
+        expired = control.WatchProgress(opened, timeout=2)
+        calls.append(expired)
+        await_for(lambda: len(worker.watches.watchers) == 1, "deadline watch never opened")
+        assert expired.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+        await_for(lambda: not worker.watches.watchers, "expired watch remains registered")
+        with grpc.insecure_channel((root / "control.addr").read_text().strip()) as detached:
+            disconnected = g.WorkerControlStub(detached).WatchProgress(opened, timeout=15)
+            calls.append(disconnected)
+            await_for(lambda: len(worker.watches.watchers) == 1, "client watch never opened")
+        await_for(lambda: not worker.watches.watchers, "disconnected watch remains registered")
+        assert preparation.SourceCheckpointPage(
+            p.SourceCheckpointPageRequest(), timeout=3
+        ).safe_code
         print(
             json.dumps(
                 {
                     "phase": "fixed",
                     "canceled_watchers": 6,
+                    "deadline_and_disconnect": True,
                     "remaining": len(worker.watches.watchers),
                     "unary_safe_code": result.safe_code,
                 }
