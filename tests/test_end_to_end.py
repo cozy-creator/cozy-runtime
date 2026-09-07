@@ -35,7 +35,11 @@ import pytest
 
 from conftest import image_python
 from cozy_runtime.internal import base_observation, package_environment
-from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package
+from cozy_runtime.internal.worker.package_prepare import (
+    PreparationRefusal,
+    prepare_local_package,
+    prepare_package,
+)
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -321,7 +325,7 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
         _write_pure_project(impostor, "cozy-runtime", "9.9.9", "cozy_runtime_impostor")
         artifact_cache = root / "artifacts"
         artifact_cache.mkdir()
-        wheel_set = root / "environments" / ".stage-editable-revision-proof" / "wheels"
+        wheel_set = root / "environments" / ".stage" / "editable-revision-proof" / "wheels"
         wheel_set.mkdir(parents=True)
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(PACKAGE))
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency))
@@ -346,19 +350,19 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
         def prepare(
             wheels: list[Path], revision_digest: bytes | None
         ) -> pb.PreparePackageSetResult:
-            return prepare_package(
-                package_name="paul/marco-polo",
-                release="1.0.4",
-                wheels=_wheel_rows(wheels),
-                wheel_root=wheel_set,
-                placement_seed=b"editable-revision-proof",
+            return prepare_local_package(
+                pb.PrepareLocalPackageRequest(
+                    operation_id="editable-revision-proof",
+                    package=_development("paul/marco-polo", "1.0.4", revision_digest),
+                    wheels=_wheel_rows(wheels),
+                    install_root=str(environment),
+                ),
                 artifact_cache=artifact_cache,
                 install_root=environment,
                 python=python,
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,
                 base=observed,
-                development=_development("paul/marco-polo", "1.0.4", revision_digest),
             )
 
         # Creator's revision digest is exact; the first measurement supplies it here.
@@ -416,7 +420,7 @@ def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> 
         )
         (project / "vendor" / "notes.txt").write_text("no module lives here\n")
         artifact_cache = root / "artifacts"
-        wheel_set = root / "environment" / ".stage-empty-project-proof" / "wheels"
+        wheel_set = root / "environment" / ".stage" / "empty-project-proof" / "wheels"
         wheel_set.mkdir(parents=True)
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(project))
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(ROOT))
@@ -700,7 +704,7 @@ def test_native_dependency_wheel_installs_like_any_other_wheel() -> None:
 
         artifact_cache = root / "artifacts"
         artifact_cache.mkdir()
-        wheel_set = root / "environments" / ".stage-native-dependency-admission" / "wheels"
+        wheel_set = root / "environments" / ".stage" / "native-dependency-admission" / "wheels"
         wheel_set.mkdir(parents=True)
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(PACKAGE))
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency))

@@ -370,6 +370,7 @@ class AttemptRecord:
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
     #: Host-ACKed WeightsReceipt/1 refs, one per interface-declared output slot.
     weights_receipts: dict[str, pb.WeightsReceiptRef] = dataclasses_field(default_factory=dict)
+    weights_work_fingerprint: str = ""
     job_models: dict[str, JobModel] = dataclasses_field(default_factory=dict)
     model_leases: list[Any] = dataclasses_field(default_factory=list)
 
@@ -428,6 +429,7 @@ class AttemptRecord:
         self.residency = {}
         self.publication = {}
         self.weights_receipts = {}
+        self.weights_work_fingerprint = ""
         self.job_models = {}
         self.model_leases = []
 
@@ -468,6 +470,7 @@ class AttemptEngine:
         weights: WeightsExchange | None = None,
         owner_scope: Callable[[], str] = lambda: "",
         tensorfs_root: Path | None = None,
+        work_fingerprint: Callable[[AttemptRecord], str] | None = None,
     ) -> None:
         self.records = records
         self.authorizer = authorizer
@@ -495,6 +498,7 @@ class AttemptEngine:
         self.weights = weights
         self.owner_scope = owner_scope
         self.tensorfs_root = tensorfs_root
+        self.work_fingerprint = work_fingerprint
         #: binding digests whose boot warm pass FAILED. Every attempt served under one
         #: carries a per-request confession: the first-call tax was never paid for it.
         self.degraded: dict[str, str] = {}
@@ -1641,6 +1645,8 @@ class AttemptEngine:
             for input_id, granted in attempt.inputs.items()
         }
         if attempt.job is not None:
+            if not attempt.weights_work_fingerprint and self.work_fingerprint is not None:
+                attempt.weights_work_fingerprint = self.work_fingerprint(attempt)
             return {
                 "cmd": "run_job",
                 "request_id": key,
@@ -1666,6 +1672,7 @@ class AttemptEngine:
                 "weights_owner_scope": self.owner_scope(),
                 "weights_request_id": attempt.request_id,
                 "invocation_spec_digest": documents.spell(attempt.digest),
+                "weights_work_fingerprint": attempt.weights_work_fingerprint,
                 "budget": {
                     "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
                     "gpu_count": self.job_device_count,

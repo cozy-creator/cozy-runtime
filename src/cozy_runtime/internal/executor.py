@@ -2167,6 +2167,7 @@ class Executor:
                     weights_receipt_digest=(
                         documents.raw(receipt_digest) if receipt_digest else b""
                     ),
+                    checkpoint=(tuple(answer["checkpoint"]) if answer.get("checkpoint") else None),
                 )
 
             def record_receipt(receipt: Any) -> None:
@@ -2204,6 +2205,7 @@ class Executor:
                 request_id=weights_request_id,
                 invocation_spec_digest=invocation_spec_digest,
                 writer_session_id=1,
+                work_fingerprint=str(command.get("weights_work_fingerprint", "")),
                 allowed_sources=allowed_sources,
                 output_bounds={
                     output.name: output.max_new_bytes for output in surface.weights_outputs

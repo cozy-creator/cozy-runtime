@@ -59,10 +59,10 @@ from cozy_runtime.internal import (
     hostfacts,
     package_environment,
     proctree,
+    weights_sink,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import (
     acquire,
     activity,
@@ -118,7 +118,7 @@ from cozy_runtime.internal.worker.plan import (
     shape_cell,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
@@ -1129,6 +1129,12 @@ class Worker:
             weights=self.weights,
             owner_scope=lambda: self.fence.record_owner_id,
             tensorfs_root=options.tensorfs_root,
+            work_fingerprint=lambda attempt: weights_sink.work_fingerprint(
+                attempt.spec,
+                attempt.job.environment_content_digest if attempt.job else "",
+                self.base,
+                hostfacts.measure(options.accelerator_backend),
+            ),
         )
         self.engine.boot_id = self.fence.worker_boot_id
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
@@ -1797,22 +1803,22 @@ class Worker:
                 self.model_source_operations.add(request.operation_id)
             return result
 
-    def source_checkpoint_page(
-        self, request: pb.SourceCheckpointPageRequest
-    ) -> pb.SourceCheckpointPageResult:
-        from . import model_source_checkpoint
+    def checkpoint_page(self, request: pb.CheckpointPageRequest) -> pb.CheckpointPageResult:
+        from . import checkpoint_transport
 
-        return model_source_checkpoint.page(
+        return checkpoint_transport.page(
             request, tensorfs_root=Path(self.options.tensorfs_root or "")
         )
 
-    def source_checkpoint_transfer(
-        self, request: pb.SourceCheckpointTransferRequest
-    ) -> pb.SourceCheckpointTransferStatus:
-        from . import model_source_checkpoint
+    def checkpoint_transfer(
+        self, request: pb.CheckpointTransferRequest
+    ) -> pb.CheckpointTransferStatus:
+        from . import checkpoint_transport
 
-        return model_source_checkpoint.transfer(
-            request, tensorfs_root=Path(self.options.tensorfs_root or "")
+        return checkpoint_transport.transfer(
+            request,
+            tensorfs_root=Path(self.options.tensorfs_root or ""),
+            restore_scope=self.weights.restore_checkpoint,
         )
 
     def release_model_source(self, operation_id: str) -> None:
@@ -2344,6 +2350,11 @@ class Worker:
                 pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
                 "the bootstrap credential is absent or wrong",
             )
+        if claim.wire_minor < MIN_COMPATIBLE_WIRE_MINOR:
+            return reject(
+                pb.ClaimRejection.CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE,
+                "peer is below the supported wire compatibility floor",
+            )
         if claim.worker_id and claim.worker_id != self.options.worker_id:
             return reject(
                 pb.ClaimRejection.CLAIM_REJECTION_WORKER_ID_MISMATCH,
@@ -2705,7 +2716,15 @@ class Worker:
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
         closed = self.engine.history.get((acked.request_id, acked.attempt_ordinal))
-        if self.reclaim_on_terminal and closed is not None and closed.kind == "job":
+        # An acknowledged stopped attempt can leave retained work for another
+        # attempt on this worker. The owner's per-outcome retention decision
+        # overrides the job's ordinary one-shot process recycling policy.
+        if (
+            self.reclaim_on_terminal
+            and not acked.retain_work
+            and closed is not None
+            and closed.kind == "job"
+        ):
             self.note(
                 "session",
                 f"job attempt {acked.request_id}#{acked.attempt_ordinal} is acknowledged and "
@@ -5734,30 +5753,13 @@ class Worker:
         self.convergences.put(None)
         self.watches.end_all()
         self.host.stop()
-        # Drain an in-flight preparation before releasing process ownership. New
-        # preparations observe stop under the same lock and cannot recreate cleanup.
-        operations: list[str] = []
+        # Source custody belongs to the RecordOwner, not this disposable process.
+        # A normal recycle can happen while another request is paused or blocked;
+        # sweeping the Store here would destroy its expensive retained work.
+        # Drain entered preparation, but release a source only through the explicit
+        # owner-authorized release operation after its last dependency is gone.
         with self.preparation_lock:
-            if not self.restart_requested:
-                try:
-                    operations = (
-                        model_source_prepare.source_operations(
-                            tensorfs_root=Path(self.options.tensorfs_root or "")
-                        )
-                        if self.options.owns_tensorfs_store
-                        else sorted(self.model_source_operations)
-                    )
-                except LaunchRefusal as exc:
-                    self.exit_code = int(Exit.internal)
-                    self.note("shutdown", f"source operation cleanup unavailable: {exc.code}")
-        for operation_id in operations:
-            try:
-                self.release_model_source(operation_id)
-            except Exception as exc:
-                self.note(
-                    "shutdown",
-                    f"model source cleanup {operation_id} failed: {type(exc).__name__}",
-                )
+            pass
         for supervision in supervisions:
             try:
                 supervision.close()

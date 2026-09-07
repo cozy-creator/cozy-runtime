@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as p
 from cozy_runtime.protocol import worker_pb2_grpc as g
 
@@ -59,7 +59,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
         host,
     )
     host.weights = worker.weights
-    host.source_checkpoint_pager = worker.source_checkpoint_page
+    host.checkpoint_pager = worker.checkpoint_page
     server = threading.Thread(target=host.serve, args=(worker,), daemon=True)
     server.start()
     assert bound.wait(5)
@@ -72,7 +72,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
         record_owner_id="owner",
         worker_id="test-worker",
         worker_boot_id="same-boot",
-        wire_minor=37,
+        wire_minor=WIRE_MINOR,
     )
     claim.proof = key.sign(
         documents.canonical_bytes(
@@ -119,7 +119,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
             await_for(lambda: len(worker.watches.watchers) == len(watchers), "watch never opened")
         for watch in watchers:
             watch.cancel()
-        result = preparation.SourceCheckpointPage(p.SourceCheckpointPageRequest(), timeout=3)
+        result = preparation.CheckpointPage(p.CheckpointPageRequest(), timeout=3)
         assert result.safe_code
         await_for(lambda: not worker.watches.watchers, "canceled watchers remain registered")
         assert (
@@ -153,9 +153,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
             calls.append(disconnected)
             await_for(lambda: len(worker.watches.watchers) == 1, "client watch never opened")
         await_for(lambda: not worker.watches.watchers, "disconnected watch remains registered")
-        assert preparation.SourceCheckpointPage(
-            p.SourceCheckpointPageRequest(), timeout=3
-        ).safe_code
+        assert preparation.CheckpointPage(p.CheckpointPageRequest(), timeout=3).safe_code
         print(
             json.dumps(
                 {
@@ -174,7 +172,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
         await_for(lambda: not worker.weights.exchange_open(), "old exchange did not end")
         fresh, new_control, new_exchange = connect()
         assert fresh.control_stream_epoch == ack.control_stream_epoch + 1
-        result = preparation.SourceCheckpointPage(p.SourceCheckpointPageRequest(), timeout=3)
+        result = preparation.CheckpointPage(p.CheckpointPageRequest(), timeout=3)
         assert result.safe_code
         assert all(w.ended.is_set() for w in worker.watches.watchers)
         print(

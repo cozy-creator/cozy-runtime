@@ -138,15 +138,20 @@ class _Store:
         if self.replay:
             prior = self.committed[commit.output_slot]
             assert _projection(commit) == prior.declaration, "replay under a changed declaration"
-            return _Replayed(prior.receipt)
+            return _Replayed(prior)
         return _Transaction(self, commit)
 
 
 class _Replayed:
     replayed = True
 
-    def __init__(self, receipt: WeightsReceipt) -> None:
-        self.receipt: WeightsReceipt | None = receipt
+    def __init__(self, prior: _Committed) -> None:
+        self.receipt: WeightsReceipt | None = prior.receipt
+        self.completed_parts = frozenset(prior.parts)
+        self.completed_configs: frozenset[str] = frozenset()
+
+    def checkpoint(self) -> None:
+        pass
 
     def source_read_into(
         self, source: str, component: str, key: str, role: str, offset: int, into: memoryview
@@ -174,6 +179,18 @@ class _Transaction:
         self.store = store
         self.declared = declared
         self.parts: dict[tuple[str, str, str], bytes] = {}
+        self.checkpoints: list[frozenset[tuple[str, str, str]]] = []
+
+    @property
+    def completed_parts(self) -> frozenset[tuple[str, str, str]]:
+        return frozenset(self.parts)
+
+    @property
+    def completed_configs(self) -> frozenset[str]:
+        return frozenset()
+
+    def checkpoint(self) -> None:
+        self.checkpoints.append(frozenset(self.parts))
 
     def source_read_into(
         self, source: str, component: str, key: str, role: str, offset: int, into: memoryview
@@ -465,6 +482,8 @@ def test_both_doors_reach_the_same_tensors(tmp_path: Path) -> None:
     assert by_model.inherited_keys == 4
     assert by_model.kept_keys == 0
     assert not by_model.canonical
+    assert by_model.normalization_worst_relative_frobenius is not None
+    assert by_model.worst_relative_frobenius is not None
     assert 0.0 < by_model.normalization_worst_relative_frobenius <= 2.0**-8
     assert 0.0 < by_model.worst_relative_frobenius < 0.25
 
@@ -509,7 +528,7 @@ def test_a_replayed_lane_reports_the_prior_receipt_and_writes_nothing(tmp_path: 
     assert again.weights_transaction_id == first.weights_transaction_id
     assert (again.source_bytes_read_this_run, again.new_bytes_written_this_run) == (0, 0)
     assert (again.encoded_keys, again.converted_keys, again.inherited_keys) == (2, 1, 4)
-    assert (again.kept_keys, again.normalization_worst_relative_frobenius) == (0, 0.0)
+    assert (again.kept_keys, again.normalization_worst_relative_frobenius) == (0, None)
     assert not again.canonical
 
 
@@ -547,6 +566,7 @@ def test_a_real_fp32_safetensors_source_normalizes_to_bf16_with_recorded_stats(
     assert isinstance(result, QuantizeResult)
     assert result.canonical
     assert (result.converted_keys, result.kept_keys, result.encoded_keys) == (2, 0, 0)
+    assert result.normalization_worst_relative_frobenius is not None
     assert 0.0 < result.normalization_worst_relative_frobenius <= 2.0**-8
     committed = store.committed["model"]
     for key, values in (("blocks.0.attn.weight", attn), ("blocks.0.norm.weight", norm)):

@@ -94,6 +94,7 @@ def test_add_and_derive_configs_land_as_inline_jcs(tmp_path: Path) -> None:
         owner_scope="derived-config-test",
         request_id="request-1",
         invocation_spec_digest="sha256:" + "11" * 32,
+        work_fingerprint="sha256:" + "22" * 32,
         writer_session_id=1,
         allowed_sources={manifest: manifest_length},
         output_bounds={"result": 1 << 20},
