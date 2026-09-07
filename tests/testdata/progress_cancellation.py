@@ -116,9 +116,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
             )
             watchers.append(watch)
             calls.append(watch)
-            await_for(
-                lambda: len(worker.watches.watchers) == len(watchers), "watch never opened"
-            )
+            await_for(lambda: len(worker.watches.watchers) == len(watchers), "watch never opened")
         for watch in watchers:
             watch.cancel()
         result = preparation.SourceCheckpointPage(p.SourceCheckpointPageRequest(), timeout=3)
