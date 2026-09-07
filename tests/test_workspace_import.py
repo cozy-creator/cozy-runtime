@@ -428,6 +428,22 @@ def test_running_writer_is_fenced_and_its_partial_checkpoint_resumes(tmp_path: P
         pb.WorkspaceActivationCall(claim=auth.claim, migration_id=reply.migration_id),
         auth,
     )
+    with workspace.locked() as db:
+        historical = dict(db.execute("SELECT * FROM attempts").fetchone())
+    recovered = documents.read(historical["outcome"], pb.AttemptOutcomeBody)
+    assert historical["state"] == "outcome" and historical["fenced"] == 1
+    assert recovered["status"] == pb.OUTCOME_STATUS_ABANDONED
+    assert recovered["cause"]["code"] == pb.CAUSE_CODE_EXECUTOR_INVALIDATED
+    assert recovered["cause"]["origin"] == pb.CAUSE_ORIGIN_WORKER
+    assert recovered["execution_started"] is True
+    assert recovered["attempt_ordinal"] == 7
+    activate(
+        workspace,
+        pb.WorkspaceActivationCall(claim=auth.claim, migration_id=reply.migration_id),
+        auth,
+    )
+    with workspace.locked() as db:
+        assert dict(db.execute("SELECT * FROM attempts").fetchone()) == historical
     workspace.accept(
         "owner",
         pb.AttemptOffer(
@@ -473,6 +489,68 @@ def test_unqualified_legacy_scalar_history_does_not_invent_owner(tmp_path: Path)
     with workspace.locked() as db:
         assert db.execute("SELECT owner FROM attempts").fetchone()[0] == ""
         assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("state,started", [("received", False), ("running", True)])
+def test_activation_recovers_unqualified_interrupted_history_once(
+    tmp_path: Path, state: str, started: bool
+) -> None:
+    _, workspace, records = native_export(tmp_path)
+    auth = Authority()
+    attempt = dict(
+        records[0][1],
+        owner_scope="",
+        state=state,
+        outcome_id="",
+        outcome_digest="",
+        outcome_canonical_bytes="",
+    )
+    reply = receive(workspace, frames([("attempt", attempt)], auth), auth)
+    call = pb.WorkspaceActivationCall(claim=auth.claim, migration_id=reply.migration_id)
+    activate(workspace, call, auth)
+    with workspace.locked() as db:
+        row = dict(db.execute("SELECT * FROM attempts").fetchone())
+    body = documents.read(row["outcome"], pb.AttemptOutcomeBody)
+    assert row["owner"] == ""
+    assert row["outcome_id"] == "out-" + hashlib.sha256(row["outcome"]).hexdigest()[:24]
+    assert body["request_id"] == attempt["request_id"]
+    assert body["invocation_spec_digest"] == attempt["invocation_spec_digest"]
+    assert body["status"] == pb.OUTCOME_STATUS_ABANDONED
+    assert body.get("execution_started", False) is started
+    # Repeat the entire stream/activation after a new process opens the journal.
+    resumed = Workspace(workspace.store_root)
+    receive(resumed, frames([("attempt", attempt)], auth), auth)
+    activate(resumed, call, auth)
+    with resumed.locked() as db:
+        assert dict(db.execute("SELECT * FROM attempts").fetchone()) == row
+        assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 0
+
+
+def test_recovery_terminal_preserves_committed_slots_without_claiming_success(
+    tmp_path: Path,
+) -> None:
+    _, workspace, records = native_export(tmp_path)
+    auth = Authority()
+    previous_terminal = records[0][1]["outcome_canonical_bytes"]
+    attempt = dict(
+        records[0][1],
+        state="running",
+        outcome_id="",
+        outcome_digest="",
+        outcome_canonical_bytes="",
+    )
+    reply = receive(workspace, frames([("attempt", attempt), records[1], records[2]], auth), auth)
+    activate(
+        workspace,
+        pb.WorkspaceActivationCall(claim=auth.claim, migration_id=reply.migration_id),
+        auth,
+    )
+    with workspace.locked() as db:
+        row = dict(db.execute("SELECT * FROM attempts").fetchone())
+    recovered = documents.read(row["outcome"], pb.AttemptOutcomeBody)
+    previous = documents.read(base64.b64decode(previous_terminal), pb.AttemptOutcomeBody)
+    assert recovered["status"] == pb.OUTCOME_STATUS_ABANDONED
+    assert recovered["weights_receipts"] == previous["weights_receipts"]
 
 
 def test_import_never_overwrites_an_existing_workspace(tmp_path: Path) -> None:
