@@ -358,8 +358,11 @@ class RowwiseNativeLeaf:
             "destination — see LeafProvider.leaf"
         )
 
+    def resident_bytes(self, parts: Mapping[str, RolePart]) -> int:
+        return sum(p.nbytes for p in parts.values())
+
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
-        return 8.0 * sum(p.nbytes for p in parts.values()) / max(numel, 1)
+        return 8.0 * self.resident_bytes(parts) / max(numel, 1)
 
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         return 0
@@ -502,9 +505,12 @@ class MicroScaledNativeLeaf:
             "destination — see LeafProvider.leaf"
         )
 
-    def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
+    def resident_bytes(self, parts: Mapping[str, RolePart]) -> int:
         rows, cols = _blocked_shape(*parts["scale"].shape)
-        return 8.0 * (parts["data"].nbytes + rows * cols) / max(numel, 1)
+        return parts["data"].nbytes + rows * cols
+
+    def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
+        return 8.0 * self.resident_bytes(parts) / max(numel, 1)
 
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         # to_blocked can overlap the padded grid, reshape copy, and final blocked copy.

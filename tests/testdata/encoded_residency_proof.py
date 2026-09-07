@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import tensorfs
@@ -15,7 +16,7 @@ from cozy_runtime.author._loader import census
 from cozy_runtime.author._weights import WeightsCommit
 from cozy_runtime.derive.microscale import encode_fp8_rowwise
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE
-from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, _Holder
+from cozy_runtime.internal.fill import Checkpoint, FillRefusal, StreamingFillBackend, _Holder
 from cozy_runtime.internal.residency import ComponentResidency, ResidencyRefusal
 from cozy_runtime.internal.weights_sink import WeightsTransactionHost
 
@@ -102,7 +103,7 @@ def main(root: Path) -> None:
         flush=True,
     )
 
-    def model() -> torch.nn.Module:
+    def model() -> Any:
         module = torch.nn.Module()
         module.linear = torch.nn.Linear(1024, 1024, device="meta", dtype=torch.bfloat16)
         module.linear.bias = torch.nn.Parameter(
@@ -169,6 +170,13 @@ def main(root: Path) -> None:
     # would misleadingly report zero staging overhead.
     residency.vacate()
     torch.cuda.synchronize()
+    restored = residency.restore()
+    assert set(restored["restored"]) == {"a", "b"}, restored
+    with torch.no_grad():
+        assert torch.equal(models["a"].linear(x).cpu(), expected)
+        assert torch.equal(models["b"].linear(x).cpu(), expected)
+    residency.vacate()
+    torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
     backend.stage("a")
@@ -184,7 +192,7 @@ def main(root: Path) -> None:
     try:
         residency.admit("short", ("b",))
     except ResidencyRefusal as exc:
-        assert exc.code == "device_shortfall" and not residency.poisoned
+        assert exc.code == "device_shortfall" and not bool(residency.poisoned)
         assert original["b"].weight.is_meta
         assert torch.cuda.memory_allocated() == before
     else:
@@ -195,7 +203,7 @@ def main(root: Path) -> None:
     try:
         residency.admit("broken", ("b",))
     except ResidencyRefusal as exc:
-        assert exc.code == "leaf_schema" and residency.poisoned, str(exc)
+        assert exc.code == "leaf_schema" and bool(residency.poisoned), str(exc)
     else:
         raise AssertionError("invalid logical topology was served")
     try:
@@ -207,6 +215,35 @@ def main(root: Path) -> None:
     backend.poison(tuple(backend.enqueued))
     backend.close()
     assert not backend.leases.held and not backend.scratch
+    tied = StreamingFillBackend(
+        checkpoint,
+        rows,
+        plan=backend.execution,
+        qualified=(backend.capabilities, backend.probe),
+        release="encoded-proof/1",
+        window_bytes=1 << 20,
+        slots=3,
+        readers=2,
+        inflight=2,
+    )
+    tied_models = {name: model() for name in ("a", "b")}
+    tied_holder = _Holder(tied_models)
+    walked = census(tied_holder)
+    tied.expect(
+        {name: [d.key for d in walked.destinations if d.component == name] for name in tied_models}
+    )
+    tied.materialize(tied_holder, walked, encoded_leaves="accept")
+    tied_models["b"].linear.weight = tied_models["a"].linear.weight
+    fresh = census(tied_holder)
+    try:
+        for destination in fresh.destinations:
+            tied.fill(destination.key, destination.spec, fresh.live[destination.key])
+    except FillRefusal as exc:
+        assert exc.code == "leaf_schema" and "shares storage" in str(exc)
+    else:
+        raise AssertionError("shared native weight admitted twice")
+    tied.poison(tuple(tied.enqueued))
+    tied.close()
     print(
         json.dumps(
             {

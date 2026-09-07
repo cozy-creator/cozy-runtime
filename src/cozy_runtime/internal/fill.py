@@ -56,7 +56,6 @@ import collections
 import contextlib
 import ctypes
 import hashlib
-import math
 import os
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -1624,55 +1623,20 @@ class StreamingFillBackend:
         return self.component_memory[name].admission(headroom)
 
     def device_envelope(self) -> dict[str, Any]:
-        """What this fill WILL hold on the card, priced from the header and the PLAN's routes.
-
-        THE STORED SIZE IS NOT THE RESIDENT SIZE. An fp8-stored tensor served through the
-        decode floor occupies its LOGICAL bytes on the device — bf16 destinations of fp8
-        rows EXPAND, by exactly the ratio the header already states — so an envelope priced
-        at the artifact's stored bytes under-prices the fill by that ratio and the budget
-        check it feeds cannot refuse anything real. Measured on H3: 92.42 GiB stored against
-        128.31 GiB logical, and the number the RecordOwner declared was the first one.
-
-        The composition, per class and per component, because a single total is exactly what
-        made the 53.6 GiB gap unattributable:
-
-          destinations  logical bytes of every row, which is what `to_empty` reserves;
-          native        the STORED payload of every `encoded_gemm` row, which becomes the
-                        resident weight and is live BESIDE its float destination until the
-                        leaf is installed — the rung's real peak, not its settled size;
-          decode        the rolling scratch envelope, `min(total, budget + largest)`, live
-                        for ONE component at a time and released at its stream's end, so
-                        the fill's peak carries the LARGEST of them and not their sum.
-
-        The census may exceed `destinations`: a module tree holds derived buffers no row
-        supplies. This is therefore a FLOOR under the true envelope, and it says so.
-        """
-        return price_envelope(
-            [
-                (
-                    row.component,
-                    int(row.nbytes),
-                    int(row.stored_nbytes),
-                    self.resolved[row.key].route,
-                    int(
-                        self.selected[row.key].provider.resident_bits_per_element(
-                            {part.role: part for part in row.encoded.parts}, math.prod(row.shape)
-                        )
-                        * (math.prod(row.shape))
-                        / 8
-                    )
-                    if self.resolved[row.key].route == "encoded_gemm"
-                    else 0,
-                    self.selected[row.key].provider.fill_scratch_bytes(
-                        {part.role: part for part in row.encoded.parts}
-                    )
-                    if self.resolved[row.key].route == "encoded_gemm"
-                    else 0,
-                )
-                for row in self.plan.values()
-            ],
-            self.decode_scratch_bytes,
-        )
+        """Header costs for the selected implementation; the module census adds derived buffers."""
+        rows = []
+        for row in self.plan.values():
+            route = self.resolved[row.key].route
+            resident = scratch = 0
+            if route == "encoded_gemm":
+                provider = self.selected[row.key].provider
+                parts = {part.role: part for part in row.encoded.parts}
+                resident = provider.resident_bytes(parts)
+                scratch = provider.fill_scratch_bytes(parts)
+            rows.append(
+                (row.component, int(row.nbytes), int(row.stored_nbytes), route, resident, scratch)
+            )
+        return price_envelope(rows, self.decode_scratch_bytes)
 
     # -- the Backend protocol ----------------------------------------------------
 
@@ -2124,6 +2088,7 @@ class StreamingFillBackend:
                 missing[:6],
             )
         self._commit_enqueued()
+        self.state = "ready"
         ended = time.perf_counter_ns()
         took = (ended - started) // 1_000_000
         # THE SAME SPLIT `prepare` REPORTS (cr-100): `ms` is the whole stage, `stream_ms`
@@ -2143,7 +2108,7 @@ class StreamingFillBackend:
         row = {
             "component": name,
             "action": "stage",
-            "bytes": want,
+            "bytes": memory.settled,
             "ms": took,
             "stream_ms": int(self.stats.get("stream_ms", 0)),
             "reserve_ms": (reserved - started) // 1_000_000,

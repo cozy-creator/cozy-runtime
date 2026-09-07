@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
 from cozy_runtime.internal.executor import residence_ceiling
 from cozy_runtime.internal.fill import ComponentMemory, complete_device_envelope, price_envelope
 
@@ -76,3 +83,38 @@ def test_expanding_native_roles_and_swizzle_temporaries_are_charged() -> None:
     assert memory.base == 24 and memory.peak == 40
     assert memory.overhead == 16
     assert memory.admission(0) == 40
+
+
+def test_native_tensorfs_encoded_component_lifecycle(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("actual native FP8 component lifecycle requires CUDA")
+    child = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).parent / "testdata/encoded_residency_proof.py"),
+            str(tmp_path / "encoded"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    result = json.loads(child.stdout.splitlines()[-1])
+    assert result["phase"] == "passed", child.stdout + child.stderr
+    assert result["staging_peak_bytes"] == result["staging_bound_bytes"]
+    assert result["failure"] == "poisoned"
+
+
+def test_mxfp8_padded_scale_storage_has_one_provider_price() -> None:
+    from cozy_runtime.internal.encoding import SPEC_MXFP8, RolePart
+    from cozy_runtime.internal.encoding.leaves import MicroScaledNativeLeaf
+
+    provider = MicroScaledNativeLeaf(SPEC_MXFP8)
+    parts = {
+        "data": RolePart("data", "f8_e4m3fn", (2, 1056), 2112),
+        "scale": RolePart("scale", "u8", (2, 33), 66),
+    }
+    # cuBLAS scales occupy complete128x4 tiles: 2x33 becomes128x36.
+    assert provider.resident_bytes(parts) == 2112 + 128 * 36
+    assert provider.fill_scratch_bytes(parts) == 3 * 128 * 36
+    assert provider.resident_bits_per_element(parts, 2112) == 8 * (2112 + 128 * 36) / 2112

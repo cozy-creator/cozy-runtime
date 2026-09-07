@@ -607,7 +607,7 @@ class ComponentResidency:
                 held[name] = "this generation has no checkpoint for it"
                 continue
             size = self._size(name)
-            if not self._fits(size):
+            if not self._fits(self.backend.stage_bytes(name)):
                 # Measured, before a byte moves, against the SAME meter admission uses.
                 held[name] = "the device has no room for it without evicting a neighbour"
                 continue
@@ -818,8 +818,9 @@ class ComponentResidency:
         resident = {n: self.backend.vram_charge.get(n, 0) for n in self.backend.components}
         return ResidencyRefusal(
             "device_shortfall",
-            f"{method}() declares component {name!r} needing {need} B plus "
-            f"{headroom} B of scope headroom; {allocatable} B are allocatable "
+            f"{method}() declares component {name!r} requiring {required} B at admission "
+            f"({need} B of weights, {headroom} B of forward headroom, including overlapping "
+            f"fill storage); {allocatable} B are allocatable "
             f"({free} B driver-free of {total} B) with {sorted(resident)} resident, short by "
             f"{max(required - allocatable, 0)} B. Every evictable component was already freed, so "
             "this is a capacity fact, not an allocation to retry - the ladder chooses a "
