@@ -1330,6 +1330,10 @@ def _derive_components(
             project=Path(project).resolve(),
         )
         (held,) = derive_child.derive_in(Path(sys.executable), request)
+        if isinstance(held, derive_child.SourceSlot):
+            raise derive_child.DeriveRefusal(
+                "derive_slot_not_serving", f"{slot} is a job source, not a serving model"
+            )
         return held.components
     except derive_child.DeriveRefusal as exc:
         raise RuntimeError(
