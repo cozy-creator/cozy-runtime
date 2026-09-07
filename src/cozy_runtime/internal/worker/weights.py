@@ -398,14 +398,18 @@ class WeightsExchange:
                 pb.WeightsHostRefusal.Name(ack.refusal).lower(), "the weights host refused intent"
             )
         with self._lock:
-            known = self._bindings.setdefault(
-                ack.weights_transaction_id,
-                (ack.writer_epoch, declaration_digest),
-            )
-        if known != (ack.writer_epoch, declaration_digest):
-            raise WeightsExchangeError(
-                "weights_host_ack_mismatch", "transaction binding changed within one Runtime"
-            )
+            known = self._bindings.get(ack.weights_transaction_id)
+            if known is not None and (
+                ack.writer_epoch < known[0] or declaration_digest != known[1]
+            ):
+                raise WeightsExchangeError(
+                    "weights_host_ack_mismatch",
+                    "transaction intent changed or writer epoch regressed",
+                )
+            # The host may advance a retained transaction's writer epoch for a resumed
+            # attempt without restarting this Runtime. Native writers enforce that fence;
+            # the declaration stays immutable and an old ACK cannot lower the epoch.
+            self._bindings[ack.weights_transaction_id] = (ack.writer_epoch, declaration_digest)
         self.writer_broker.authorize(
             attempt, ack.weights_transaction_id, ack.writer_epoch, declaration_digest, output_slot
         )

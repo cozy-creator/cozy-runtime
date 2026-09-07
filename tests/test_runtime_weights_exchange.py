@@ -208,13 +208,13 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
         server.stop(grace=0)
 
 
-def _run_intent(rig: Rig) -> dict[str, Any]:
+def _run_intent(rig: Rig, attempt: SimpleNamespace | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {}
 
     def call() -> None:
         try:
             result["value"] = rig.exchange.intent(
-                _attempt(),
+                _attempt() if attempt is None else attempt,
                 transaction_id=TRANSACTION,
                 output_slot=OUTPUT_SLOT,
                 declaration_digest=DECLARATION_DIGEST,
@@ -256,6 +256,50 @@ def test_open_exchange_selects_the_lane_and_the_ack_settles_after_a_barrier(rig:
     assert not pending["thread"].is_alive(), "the intent never settled on its host ACK"
     assert pending["result"]["value"]["writer_epoch"] == 4
     assert pending["result"]["value"]["weights_transaction_id"] == TRANSACTION
+    supervisor.close()
+
+
+def test_resumed_attempt_accepts_a_higher_writer_epoch_on_the_same_worker(rig: Rig) -> None:
+    """A retained transaction outlives the attempt whose writer was drained."""
+    supervisor = StandInSupervisor(rig.stub)
+    _await(rig.exchange.exchange_open, "the Exchange did not register as open")
+    first = _attempt()
+    pending = _run_intent(rig, first)
+    intent = supervisor.next_intent()
+    supervisor.ack(_recorded_ack(intent, writer_epoch=4, envelope=rig.fence))
+    pending["thread"].join(WAIT)
+    assert pending["result"]["value"]["writer_epoch"] == 4
+
+    first.canceling = "drain"
+    rig.exchange.writer_broker.close_attempt(first)
+    assert not rig.exchange.writer_broker.bindings
+    assert not rig.exchange.writer_broker.writers
+
+    resumed = _attempt()
+    resumed.attempt += 1
+    pending = _run_intent(rig, resumed)
+    intent = supervisor.next_intent()
+    assert intent.request_id == first.request_id
+    assert intent.attempt_ordinal == first.attempt + 1
+    assert intent.weights_transaction_id == TRANSACTION
+    assert intent.invocation_spec_digest == SPEC_DIGEST
+    supervisor.ack(_recorded_ack(intent, writer_epoch=5, envelope=rig.fence))
+    pending["thread"].join(WAIT)
+    assert "error" not in pending["result"], pending["result"]
+    assert pending["result"]["value"]["writer_epoch"] == 5
+    assert rig.exchange._writer_epoch(TRANSACTION) == 5
+
+    # Even a current-envelope response cannot roll a retained writer fence backward.
+    rig.exchange.writer_broker.close_attempt(resumed)
+    older = _attempt()
+    older.attempt += 2
+    pending = _run_intent(rig, older)
+    intent = supervisor.next_intent()
+    supervisor.ack(_recorded_ack(intent, writer_epoch=4, envelope=rig.fence))
+    pending["thread"].join(WAIT)
+    assert pending["result"]["error"].code == "weights_host_ack_mismatch"
+    assert rig.exchange._writer_epoch(TRANSACTION) == 5
+    assert not rig.exchange.writer_broker.bindings
     supervisor.close()
 
 
