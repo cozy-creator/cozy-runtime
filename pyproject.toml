@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.3.1"
+version = "0.4.0"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
@@ -13,6 +13,7 @@ requires-python = ">=3.12,<3.13"
 # what `worker-protocol/scripts/vendored-diff.sh` checks (#536d), and it is why the copy no
 # longer carries the old import rewrite.
 dependencies = [
+    "tensorfs>=0.3.20,<0.3.21",
     "cryptography>=45",
     "grpcio>=1.76",
     "msgspec>=0.19",
@@ -29,7 +30,7 @@ dev = [
     "pytest>=8.4",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.3.18,<0.3.21",
+    "tensorfs>=0.3.20,<0.3.21",
     "types-protobuf>=6.30",
     "av>=18.1,<19",
     # `cozy_runtime.derive` is numpy code; the checking venv installs numpy so mypy checks
@@ -156,7 +157,7 @@ media = [
 # Runtime owns the model byte plane. Local package environments select this complete
 # capability; base worker images provide TensorFS from the same PyPI range.
 # 0.3.18 provides derived recovery, source adoption and independent result custody.
-model-execution = ["tensorfs>=0.3.18,<0.3.21"]
+model-execution = ["tensorfs>=0.3.20,<0.3.21"]
 
 [[tool.mypy.overrides]]
 # grpcio ships no type information; the stub module is generated.

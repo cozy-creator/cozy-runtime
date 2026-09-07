@@ -33,6 +33,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Protocol
 
+from cozy_runtime.internal.worker.workspace_rpc import Service as WorkspaceService
+from cozy_runtime.internal.worker.workspace_rpc import WorkspaceRPC
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
@@ -108,14 +110,7 @@ class _Servicer:
 
 
 class RuntimeWeightsHost(Protocol):
-    """The Runtime-hosted weights seam (proto-025) the loopback pod-supervisor dials. The
-    supervisor opens `Exchange` per accepted control session — intents and receipts go out on
-    it, host ACKs come back — and calls `Upload` once per granted object. The bodies are the
-    worker's `WeightsExchange`; this is only how they reach the loopback listener."""
-
-    def serve_exchange(
-        self, acks: Iterator[pb.WeightsHostAck]
-    ) -> Iterator[pb.WeightsHostEvent]: ...
+    """A bounded native object upload; custody observations use WorkerControl."""
 
     def upload(self, request: pb.WeightsUploadRequest) -> pb.WorkerFrame: ...
 
@@ -126,7 +121,11 @@ class _RuntimeWeightsServicer:
         self.weights = weights
 
     def Exchange(self, request_iterator: Any, context: Any) -> Any:
-        yield from self.weights.serve_exchange(request_iterator)
+        import grpc
+
+        return context.abort(
+            grpc.StatusCode.UNIMPLEMENTED, "Host writer acknowledgments were retired in wire 41"
+        )
 
     def Upload(self, request: pb.WeightsUploadRequest, context: Any) -> Any:
         # `upload` answers as a WorkerFrame for the pre-21 control lane; the unary RPC wants
@@ -186,6 +185,7 @@ class GrpcControlHost:
         numerical_environment: Callable[[], bytes] | None = None,
         store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
         weights: RuntimeWeightsHost | None = None,
+        workspace_service: WorkspaceService | None = None,
     ) -> None:
         self.listen = listen
         self.addr_file = addr_file
@@ -200,6 +200,7 @@ class GrpcControlHost:
         self.derived_result_releaser = derived_result_releaser
         self.numerical_environment = numerical_environment
         self.store_collector = store_collector
+        self.workspace_service = workspace_service
         self.checkpoint_pager = checkpoint_pager
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
@@ -221,7 +222,8 @@ class GrpcControlHost:
         self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
         pb_grpc.add_WorkerControlServicer_to_server(_Servicer(plane), self.server)
         loopback_services = (
-            self.compatibility_checker is not None
+            self.workspace_service is not None
+            or self.compatibility_checker is not None
             or self.preparer is not None
             or self.model_source_preparer is not None
             or self.model_source_releaser is not None
@@ -255,6 +257,7 @@ class GrpcControlHost:
                 self.derived_result_releaser,
                 self.numerical_environment,
                 self.store_collector,
+                self.workspace_service,
             ),
             self.server,
         )
@@ -341,7 +344,7 @@ def _refuse(context: Any, exc: BaseException) -> Any:
     return context.abort(grpc.StatusCode.INTERNAL, f"{type(exc).__name__}: {exc}"[:1024])
 
 
-class _PreparationServicer:
+class _PreparationServicer(WorkspaceRPC):
     def __init__(
         self,
         compatibility_handler: (
@@ -378,6 +381,7 @@ class _PreparationServicer:
         | None = None,
         numerical_environment: Callable[[], bytes] | None = None,
         store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
+        workspace_service: WorkspaceService | None = None,
     ) -> None:
         self.compatibility_handler = compatibility_handler
         self.package_handler = package_handler
@@ -392,6 +396,7 @@ class _PreparationServicer:
         self.derived_result_releaser = derived_result_releaser
         self.numerical_environment = numerical_environment
         self.store_collector = store_collector
+        self.workspace_service = workspace_service
 
     def ProtocolInfo(
         self, _request: pb.ProtocolInfoRequest, _context: Any

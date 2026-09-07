@@ -7,6 +7,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any, cast
 
 import msgspec
 import pytest
@@ -21,7 +22,7 @@ from cozy_runtime.author import (
     describe,
     invocable,
 )
-from cozy_runtime.internal import interface_wheel, package_interface
+from cozy_runtime.internal import canonical, interface_wheel, package_interface
 from cozy_runtime.internal.discovery import Discovered
 
 
@@ -38,7 +39,7 @@ class Empty(msgspec.Struct):
     pass
 
 
-@invocable(reusable=True)
+@invocable(memoize=True)
 async def transform(ctx: Context, *, text: str, count: int = 2) -> Result:
     ctx.raise_if_cancelled()
     return Result(text * count, Detail(len(text) * count))
@@ -80,8 +81,19 @@ def test_invocable_dispatch_uses_private_body_and_export_requires_owner(tmp_path
     assert result is not None and result.result == Result("hihi", Detail(4))
     descriptor = package_interface.read_bytes(raw)["jobs"][0]
     assert descriptor["invocable"]["defaults"] == {"request/count": 2}
-    assert descriptor["invocable"]["reusable"] is True
+    assert descriptor["invocable"]["memoize"] is True
     assert descriptor["invocable"]["type_names"]["result/detail"] == "Detail"
+
+
+def test_legacy_memo_declaration_refuses_instead_of_silently_disabling_cache() -> None:
+    with pytest.raises(TypeError, match="reusable"):
+        cast(Any, invocable)(reusable=True)
+    _, raw = described()
+    document = canonical.parse_canonical(raw)
+    declaration = document["jobs"][0]["invocable"]
+    declaration["reusable"] = declaration.pop("memoize")
+    with pytest.raises(ConformanceError, match="invocable_interface"):
+        package_interface.read_bytes(canonical.write(document))
 
 
 @pytest.mark.parametrize("fn", [invalid_positional, invalid_bytes, invalid_default])

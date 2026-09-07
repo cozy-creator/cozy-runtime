@@ -519,6 +519,78 @@ class ProtocolInfoRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
 
+class WorkspaceImportBegin(_message.Message):
+    __slots__ = ("claim", "migration_id", "record_count", "source_schema")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    MIGRATION_ID_FIELD_NUMBER: _ClassVar[int]
+    RECORD_COUNT_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SCHEMA_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    migration_id: str
+    record_count: int
+    source_schema: int
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ..., record_count: _Optional[int] = ..., source_schema: _Optional[int] = ...) -> None: ...
+
+class WorkspaceImportRecord(_message.Message):
+    __slots__ = ("index", "kind", "length", "digest")
+    INDEX_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    LENGTH_FIELD_NUMBER: _ClassVar[int]
+    DIGEST_FIELD_NUMBER: _ClassVar[int]
+    index: int
+    kind: str
+    length: int
+    digest: bytes
+    def __init__(self, index: _Optional[int] = ..., kind: _Optional[str] = ..., length: _Optional[int] = ..., digest: _Optional[bytes] = ...) -> None: ...
+
+class WorkspaceImportChunk(_message.Message):
+    __slots__ = ("index", "offset", "data")
+    INDEX_FIELD_NUMBER: _ClassVar[int]
+    OFFSET_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    index: int
+    offset: int
+    data: bytes
+    def __init__(self, index: _Optional[int] = ..., offset: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
+
+class WorkspaceImportCommit(_message.Message):
+    __slots__ = ("digest", "record_count")
+    DIGEST_FIELD_NUMBER: _ClassVar[int]
+    RECORD_COUNT_FIELD_NUMBER: _ClassVar[int]
+    digest: bytes
+    record_count: int
+    def __init__(self, digest: _Optional[bytes] = ..., record_count: _Optional[int] = ...) -> None: ...
+
+class WorkspaceImportFrame(_message.Message):
+    __slots__ = ("begin", "record", "chunk", "commit")
+    BEGIN_FIELD_NUMBER: _ClassVar[int]
+    RECORD_FIELD_NUMBER: _ClassVar[int]
+    CHUNK_FIELD_NUMBER: _ClassVar[int]
+    COMMIT_FIELD_NUMBER: _ClassVar[int]
+    begin: WorkspaceImportBegin
+    record: WorkspaceImportRecord
+    chunk: WorkspaceImportChunk
+    commit: WorkspaceImportCommit
+    def __init__(self, begin: _Optional[_Union[WorkspaceImportBegin, _Mapping]] = ..., record: _Optional[_Union[WorkspaceImportRecord, _Mapping]] = ..., chunk: _Optional[_Union[WorkspaceImportChunk, _Mapping]] = ..., commit: _Optional[_Union[WorkspaceImportCommit, _Mapping]] = ...) -> None: ...
+
+class WorkspaceImportResult(_message.Message):
+    __slots__ = ("migration_id", "record_count", "imported")
+    MIGRATION_ID_FIELD_NUMBER: _ClassVar[int]
+    RECORD_COUNT_FIELD_NUMBER: _ClassVar[int]
+    IMPORTED_FIELD_NUMBER: _ClassVar[int]
+    migration_id: str
+    record_count: int
+    imported: bool
+    def __init__(self, migration_id: _Optional[str] = ..., record_count: _Optional[int] = ..., imported: bool = ...) -> None: ...
+
+class WorkspaceActivationCall(_message.Message):
+    __slots__ = ("claim", "migration_id")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    MIGRATION_ID_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    migration_id: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ...) -> None: ...
+
 class ProtocolInfoResult(_message.Message):
     __slots__ = ("wire_minor", "minimum_wire_minor")
     WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]

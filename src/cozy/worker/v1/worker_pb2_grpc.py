@@ -178,6 +178,51 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
                 _registered_method=True)
+        self.RecordOperationResult = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/RecordOperationResult',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultResult.FromString,
+                _registered_method=True)
+        self.LookupOperation = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/LookupOperation',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationResult.FromString,
+                _registered_method=True)
+        self.PruneOperationCache = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/PruneOperationCache',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheResult.FromString,
+                _registered_method=True)
+        self.WorkspaceRetainDerivedResult = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/WorkspaceRetainDerivedResult',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+                _registered_method=True)
+        self.WorkspaceReleaseDerivedRetention = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseDerivedRetention',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+                _registered_method=True)
+        self.WorkspaceReleaseDerivedResult = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseDerivedResult',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
+                _registered_method=True)
+        self.WorkspaceWeightsIntentReady = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
+                _registered_method=True)
+        self.ImportWorkspace = channel.stream_unary(
+                '/cozy.worker.v1.RuntimePreparation/ImportWorkspace',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportFrame.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.FromString,
+                _registered_method=True)
+        self.ActivateWorkspaceImport = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/ActivateWorkspaceImport',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceActivationCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.FromString,
+                _registered_method=True)
         self.CheckPackageSetCompatibility = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
@@ -262,6 +307,64 @@ class RuntimePreparationServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def NumericalEnvironment(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RecordOperationResult(self, request, context):
+        """The same authenticated workspace custody service is used by the local owner
+        and the remote Host. Identity/custody is independent of a worker's job root.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def LookupOperation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PruneOperationCache(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def WorkspaceRetainDerivedResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def WorkspaceReleaseDerivedRetention(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def WorkspaceReleaseDerivedResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def WorkspaceWeightsIntentReady(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ImportWorkspace(self, request_iterator, context):
+        """One-time authority transfer from a quiesced legacy Host journal. This is
+        never forwarded from PodHost or exposed as an author-controlled cache write.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ActivateWorkspaceImport(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -357,6 +460,51 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.NumericalEnvironment,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.SerializeToString,
+            ),
+            'RecordOperationResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.RecordOperationResult,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultResult.SerializeToString,
+            ),
+            'LookupOperation': grpc.unary_unary_rpc_method_handler(
+                    servicer.LookupOperation,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationResult.SerializeToString,
+            ),
+            'PruneOperationCache': grpc.unary_unary_rpc_method_handler(
+                    servicer.PruneOperationCache,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheResult.SerializeToString,
+            ),
+            'WorkspaceRetainDerivedResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.WorkspaceRetainDerivedResult,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.SerializeToString,
+            ),
+            'WorkspaceReleaseDerivedRetention': grpc.unary_unary_rpc_method_handler(
+                    servicer.WorkspaceReleaseDerivedRetention,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.SerializeToString,
+            ),
+            'WorkspaceReleaseDerivedResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.WorkspaceReleaseDerivedResult,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.SerializeToString,
+            ),
+            'WorkspaceWeightsIntentReady': grpc.unary_unary_rpc_method_handler(
+                    servicer.WorkspaceWeightsIntentReady,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.SerializeToString,
+            ),
+            'ImportWorkspace': grpc.stream_unary_rpc_method_handler(
+                    servicer.ImportWorkspace,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportFrame.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.SerializeToString,
+            ),
+            'ActivateWorkspaceImport': grpc.unary_unary_rpc_method_handler(
+                    servicer.ActivateWorkspaceImport,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceActivationCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.SerializeToString,
             ),
             'CheckPackageSetCompatibility': grpc.unary_unary_rpc_method_handler(
                     servicer.CheckPackageSetCompatibility,
@@ -485,6 +633,249 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/NumericalEnvironment',
             cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentRequest.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RecordOperationResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/RecordOperationResult',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def LookupOperation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/LookupOperation',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PruneOperationCache(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/PruneOperationCache',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WorkspaceRetainDerivedResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/WorkspaceRetainDerivedResult',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WorkspaceReleaseDerivedRetention(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseDerivedRetention',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WorkspaceReleaseDerivedResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseDerivedResult',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WorkspaceWeightsIntentReady(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsHostAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ImportWorkspace(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/ImportWorkspace',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportFrame.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ActivateWorkspaceImport(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/ActivateWorkspaceImport',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceActivationCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -880,10 +1271,9 @@ class RuntimeWeightsServicer(object):
     """
 
     def Exchange(self, request_iterator, context):
-        """Runtime -> host intents and receipts, host -> Runtime acks, on ONE stream the supervisor
-        opens per accepted control session. The host commits its ledger before each ack, and
-        forwards a recorded receipt to the RecordOwner on WorkerControl BEFORE acking it, so the
-        owner sees the receipt ahead of the attempt outcome the Runtime can only send after.
+        """Retired at minor 41; implementations refuse this legacy custody stream. Runtime
+        commits its common workspace journal and sends custody observations and outcomes
+        on the same ordered WorkerControl stream. The Host never grants native authority.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

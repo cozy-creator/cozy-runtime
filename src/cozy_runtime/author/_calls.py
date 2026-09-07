@@ -35,18 +35,18 @@ class _Export:
     implementation: Callable[..., object]
     module: str
     name: str
-    reusable: bool = False
+    memoize: bool = False
 
 
 @overload
 def invocable[**P, R](
-    fn: Callable[Concatenate[Context, P], Awaitable[R]], /, *, reusable: bool = False
+    fn: Callable[Concatenate[Context, P], Awaitable[R]], /, *, memoize: bool = False
 ) -> Callable[P, Awaitable[R]]: ...
 
 
 @overload
 def invocable[**P, R](
-    *, reusable: bool = False
+    *, memoize: bool = False
 ) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, Awaitable[R]]]: ...
 
 
@@ -54,7 +54,7 @@ def invocable[**P, R](
     fn: Callable[Concatenate[Context, P], Awaitable[R]] | None = None,
     /,
     *,
-    reusable: bool = False,
+    memoize: bool = False,
 ) -> (
     Callable[P, Awaitable[R]]
     | Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, Awaitable[R]]]
@@ -65,17 +65,17 @@ def invocable[**P, R](
     the implementation privately for ordinary admitted dispatch; importing a module
     never registers it or resolves a package/environment.
     """
-    if type(reusable) is not bool:
+    if type(memoize) is not bool:
         raise ConformanceError(
-            "invocable reuse declaration must be a boolean", code="invocable_reusable"
+            "invocable memoization declaration must be a boolean", code="invocable_memoize"
         )
     if fn is None:
-        return lambda target: invocable(target, reusable=reusable)
+        return lambda target: invocable(target, memoize=memoize)
     if not inspect.iscoroutinefunction(fn) or "<locals>" in fn.__qualname__:
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
-    export = _Export(fn, fn.__module__, fn.__name__, reusable)
+    export = _Export(fn, fn.__module__, fn.__name__, memoize)
 
     def proxy(*args: P.args, **kwargs: P.kwargs) -> Awaitable[R]:
         if args:
