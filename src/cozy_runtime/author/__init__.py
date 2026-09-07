@@ -106,6 +106,7 @@ from cozy_runtime.author._model import (
     uses_components,
 )
 from cozy_runtime.author._probe import probe_activations
+from cozy_runtime.author._script import ScriptContext, script_app
 from cozy_runtime.author._services import (
     JOB_ONLY,
     SERVING_ONLY,
@@ -233,6 +234,7 @@ __all__ = [
     "Scheduler",
     "ScopeCall",
     "Scratch",
+    "ScriptContext",
     "Secrets",
     "Settings",
     "Shape",
@@ -265,6 +267,7 @@ __all__ = [
     "probe_activations",
     "register_adapter",
     "registered_adapters",
+    "script_app",
     "sequence_parallel",
     "uses_components",
 ]
