@@ -47,6 +47,18 @@ def prepare_model_source(
         profiles, roster, landed, checkpoints = _request(request)
         tensorfs = fill.tensorfs_module()
         store = tensorfs.Store.ensure(str(tensorfs_root))
+        adoption: dict[str, str] = {}
+        if request.adopt_from_operation_id:
+            if (
+                _IDENTIFIER.fullmatch(request.adopt_from_operation_id) is None
+                or request.adopt_from_operation_id == request.operation_id
+                or landed
+            ):
+                raise ModelSourceRefusal(
+                    "model_source_adoption_invalid",
+                    "adoption requires an old operation and no active source conversion",
+                )
+            adoption["adopt_from_operation_id"] = request.adopt_from_operation_id
         prepared = store.prepare_model_source(
             request.operation_id,
             documents.spell(bytes(request.source_selection_digest)),
@@ -54,6 +66,7 @@ def prepare_model_source(
             roster,
             landed,
             checkpoints=checkpoints,
+            **adoption,
         )
         return _result(request, prepared)
     except ModelSourceRefusal as exc:

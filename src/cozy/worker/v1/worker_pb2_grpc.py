@@ -188,6 +188,11 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceResult.FromString,
                 _registered_method=True)
+        self.ReleaseModelSource = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/ReleaseModelSource',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.FromString,
+                _registered_method=True)
         self.ValidateWeightsCheckpoint = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/ValidateWeightsCheckpoint',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ValidateWeightsCheckpointRequest.SerializeToString,
@@ -249,6 +254,12 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReleaseModelSource(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ValidateWeightsCheckpoint(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -301,6 +312,11 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.PrepareModelSource,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceResult.SerializeToString,
+            ),
+            'ReleaseModelSource': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseModelSource,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.SerializeToString,
             ),
             'ValidateWeightsCheckpoint': grpc.unary_unary_rpc_method_handler(
                     servicer.ValidateWeightsCheckpoint,
@@ -443,6 +459,33 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/PrepareModelSource',
             cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceRequest.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareModelSourceResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseModelSource(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/ReleaseModelSource',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -785,6 +828,11 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
                 _registered_method=True)
+        self.ModelSourceRelease = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ModelSourceRelease',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceReleaseCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.FromString,
+                _registered_method=True)
         self.ModelSourceAdopt = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/ModelSourceAdopt',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceAdoptCall.SerializeToString,
@@ -893,6 +941,12 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ModelSourceRelease(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ModelSourceAdopt(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -973,6 +1027,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.ModelSourcePrepare,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.SerializeToString,
+            ),
+            'ModelSourceRelease': grpc.unary_unary_rpc_method_handler(
+                    servicer.ModelSourceRelease,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceReleaseCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.SerializeToString,
             ),
             'ModelSourceAdopt': grpc.unary_unary_rpc_method_handler(
                     servicer.ModelSourceAdopt,
@@ -1202,6 +1261,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/ModelSourcePrepare',
             cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ModelSourceRelease(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ModelSourceRelease',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceReleaseCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.FromString,
             options,
             channel_credentials,
             insecure,

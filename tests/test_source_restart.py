@@ -19,9 +19,10 @@ import pytest
 
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
-from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.control import InMemoryControlHost, _PreparationServicer
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import worker_pb2 as pb
+from cozy_runtime.protocol import worker_pb2_grpc as rpc
 
 
 def _fixture(root: Path) -> tuple[Any, dict[str, Any]]:
@@ -64,7 +65,9 @@ def _heads(store: Any, fixture: dict[str, Any]) -> list[Any]:
     ]
 
 
-def test_restart_preserves_native_sources_and_normal_stop_releases_them(tmp_path: Path) -> None:
+def test_restart_and_normal_recycle_preserve_sources_until_explicit_owner_release(
+    tmp_path: Path,
+) -> None:
     store, fixture = _fixture(tmp_path)
     expected = sorted([fixture["operation"], fixture["open_operation"]])
     before = _heads(store, fixture)
@@ -79,6 +82,14 @@ def test_restart_preserves_native_sources_and_normal_stop_releases_them(tmp_path
     replacement = _worker(tmp_path, owns=True, required=True)
     assert sorted(replacement.model_source_operations) == expected
     replacement.shutdown()  # no source prepare was replayed in this process
+    assert store.model_source_operations() == expected
+    assert _heads(store, fixture) == before
+    owner = _worker(tmp_path, owns=True, required=True)
+    owner.release_model_source(fixture["open_operation"])
+    assert store.model_source_operations() == [fixture["operation"]]
+    assert _heads(store, fixture) == before
+    owner.release_model_source(fixture["operation"])
+    owner.shutdown()
     assert store.model_source_operations() == []
 
 
@@ -90,6 +101,42 @@ def test_shared_local_store_does_not_release_other_source_operations(tmp_path: P
     worker.shutdown()
     assert store.model_source_operations() == before
     assert _heads(store, fixture) == pages
+
+
+def test_loopback_release_settles_only_the_named_native_operation(tmp_path: Path) -> None:
+    import grpc
+
+    store, fixture = _fixture(tmp_path)
+    pages = _heads(store, fixture)
+    worker = _worker(tmp_path, owns=True)
+    server = grpc.server(ThreadPoolExecutor(max_workers=1))
+    rpc.add_RuntimePreparationServicer_to_server(
+        _PreparationServicer(
+            None, None, None, None, None, model_source_releaser=worker.release_model_source
+        ),
+        server,
+    )
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    try:
+        with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
+            client = rpc.RuntimePreparationStub(channel)
+            request = pb.ReleaseModelSourceRequest(operation_id=fixture["open_operation"])
+            for _ in range(2):
+                answer = client.ReleaseModelSource(request, timeout=5)
+                assert answer.released and answer.operation_id == request.operation_id
+            assert store.model_source_operations() == [fixture["operation"]]
+            assert _heads(store, fixture) == pages
+            with pytest.raises(grpc.RpcError) as refused:
+                client.ReleaseModelSource(
+                    pb.ReleaseModelSourceRequest(operation_id="../other"), timeout=5
+                )
+            assert refused.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+            assert "../other" not in refused.value.details()
+            assert _heads(store, fixture) == pages
+    finally:
+        server.stop(0).wait()
+        worker.shutdown()
 
 
 def test_restart_intent_never_enters_worker_queues_or_stops_transport(tmp_path: Path) -> None:
@@ -153,12 +200,11 @@ def test_queued_preparation_observes_stop_after_acquiring_lock(
         result = pending.result(timeout=5)
     assert result.outcome == pb.MODEL_SOURCE_PREPARE_OUTCOME_REFUSED
     assert result.safe_code == "model_source_preparer_unavailable"
-    assert store.model_source_operations() == (operations if restart else [])
-    if restart:
-        assert _heads(store, fixture) == pages
-        replacement = _worker(tmp_path, owns=True, required=True)
-        replacement.shutdown()
-        assert store.model_source_operations() == []
+    assert store.model_source_operations() == operations
+    assert _heads(store, fixture) == pages
+    replacement = _worker(tmp_path, owns=True, required=True)
+    replacement.shutdown()
+    assert store.model_source_operations() == operations
 
 
 def test_refused_restart_history_keeps_source_operations(tmp_path: Path) -> None:

@@ -109,6 +109,7 @@ def _run(config: WorkerHostConfig) -> int:
     host.compatibility_checker = worker.check_package_set_compatibility
     host.preparer = worker.prepare_package_set
     host.model_source_preparer = worker.prepare_model_source
+    host.model_source_releaser = worker.release_model_source
     host.checkpoint_pager = worker.checkpoint_page
     host.checkpoint_transfer = worker.checkpoint_transfer
     host.weights_checkpoint_validator = worker.weights.validate_checkpoint

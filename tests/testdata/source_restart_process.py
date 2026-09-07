@@ -281,17 +281,18 @@ try:
             )
             == expected
         )
-    # No prepare is replayed in this replacement; native inventory supplies cleanup.
+    # A normal process stop is not the owner's source disposition. A blocked
+    # transaction's source survives even when no prepare was replayed here.
     started = time.monotonic()
     second.send_signal(signal.SIGTERM)
     second.wait(timeout=15)
     assert second.returncode == 0, log.read_text()
-    assert tensorfs.Store.open(str(store_root)).model_source_operations() == []
+    assert tensorfs.Store.open(str(store_root)).model_source_operations() == before
     proof.append(
         {
             "phase": "SIGTERM",
             "seconds": round(time.monotonic() - started, 3),
-            "operations": [],
+            "operations": before,
             "same_envelope": True,
             "media_pending_observed": pending,
         }
@@ -310,10 +311,14 @@ for state in ["absent", "corrupt"]:
         history.write_bytes(b"{}")
     refused = subprocess.run([binary], env=dict(base), capture_output=True, timeout=15)
     assert refused.returncode != 0 and b"worker_ownership_" in refused.stderr, refused.stderr
-    assert tensorfs.Store.open(str(store_root)).model_source_operations() == []
+    assert tensorfs.Store.open(str(store_root)).model_source_operations() == before
     assert root.joinpath("readiness-envelope.json").read_bytes() == original
     proof.append({"history": state, "refused": True})
 history.write_bytes(held)
+for operation in before:
+    tensorfs.Store.open(str(store_root)).release_model_source(operation)
+assert tensorfs.Store.open(str(store_root)).model_source_operations() == []
+proof.append({"phase": "explicit owner release", "operations": []})
 print(
     json.dumps(
         {

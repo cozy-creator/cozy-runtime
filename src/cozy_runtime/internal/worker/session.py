@@ -63,7 +63,6 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import (
     acquire,
     activity,
@@ -5990,30 +5989,13 @@ class Worker:
         self.convergences.put(None)
         self.watches.end_all()
         self.host.stop()
-        # Drain an in-flight preparation before releasing process ownership. New
-        # preparations observe stop under the same lock and cannot recreate cleanup.
-        operations: list[str] = []
+        # Source custody belongs to the RecordOwner, not this disposable process.
+        # A normal recycle can happen while another request is paused or blocked;
+        # sweeping the Store here would destroy its expensive retained work.
+        # Drain entered preparation, but release a source only through the explicit
+        # owner-authorized release operation after its last dependency is gone.
         with self.preparation_lock:
-            if not self.restart_requested:
-                try:
-                    operations = (
-                        model_source_prepare.source_operations(
-                            tensorfs_root=Path(self.options.tensorfs_root or "")
-                        )
-                        if self.options.owns_tensorfs_store
-                        else sorted(self.model_source_operations)
-                    )
-                except LaunchRefusal as exc:
-                    self.exit_code = int(Exit.internal)
-                    self.note("shutdown", f"source operation cleanup unavailable: {exc.code}")
-        for operation_id in operations:
-            try:
-                self.release_model_source(operation_id)
-            except Exception as exc:
-                self.note(
-                    "shutdown",
-                    f"model source cleanup {operation_id} failed: {type(exc).__name__}",
-                )
+            pass
         for supervision in supervisions:
             try:
                 supervision.close()
