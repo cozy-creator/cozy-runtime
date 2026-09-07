@@ -171,7 +171,19 @@ def quantize_artifact(
     Measurements and receipt provenance remain on the original execution. The result
     contains no per-attempt counters, so memoized operations can retain it unchanged.
     """
-    return _quantize(source, plan, sink=sink, ctx=ctx, tel=tel, output=output)[1].artifact
+    result, receipt = _quantize(source, plan, sink=sink, ctx=ctx, tel=tel, output=output)
+    tel.log(
+        "quantization measurement",
+        output=output,
+        encoded_keys=result.encoded_keys,
+        reused_keys=result.reused_keys,
+        source_bytes_read_this_run=result.source_bytes_read_this_run,
+        new_bytes_written_this_run=result.new_bytes_written_this_run,
+        saturated_elements_this_run=result.saturated_elements_this_run,
+        worst_relative_frobenius=result.worst_relative_frobenius,
+        normalization_worst_relative_frobenius=result.normalization_worst_relative_frobenius,
+    )
+    return receipt.artifact
 
 
 def _quantize(
