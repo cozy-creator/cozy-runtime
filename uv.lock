@@ -160,7 +160,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.2.32"
+version = "0.2.33"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -208,7 +208,7 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "pillow", specifier = ">=12,<13" },
     { name = "protobuf", specifier = ">=6.31" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.18,<0.3.19" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.18,<0.3.20" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
@@ -222,7 +222,7 @@ dev = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=8.4" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.3.18,<0.3.19" },
+    { name = "tensorfs", specifier = ">=0.3.18,<0.3.20" },
     { name = "types-protobuf", specifier = ">=6.30" },
 ]
 
