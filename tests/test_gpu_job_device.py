@@ -1,134 +1,46 @@
-"""Admitted job devices do not depend on constructing an inference model."""
+"""Fresh-process job device proofs; CUDA arms require an actual allocated GPU."""
 
 from __future__ import annotations
 
-import builtins
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from cozy_runtime.internal import executor
-from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
+PROBE = Path(__file__).parent / "testdata" / "gpu_job_device.py"
+REAL_GPU = os.environ.get("COZY_TEST_GPU_JOB_DEVICE") == "1"
 
 
-class CUDA:
-    def __init__(self, *, initialized: bool = False) -> None:
-        self.initialized = initialized
-        self.events: list[str] = []
-
-    def is_initialized(self) -> bool:
-        return self.initialized
-
-    def init(self) -> None:
-        self.events.append("init")
-        self.initialized = True
-
-    def reset_peak_memory_stats(self) -> None:
-        self.events.append("reset")
-
-    def synchronize(self) -> None:
-        self.events.append("synchronize")
-
-    def max_memory_allocated(self) -> int:
-        return 2048
-
-    def current_stream(self) -> CUDA:
-        return self
-
-    def default_stream(self) -> CUDA:
-        return self
-
-    def query(self) -> bool:
-        self.events.append("query")
-        return "synchronize" in self.events
-
-
-def job(tmp_path: Path) -> tuple[executor.Executor, dict[str, Any]]:
-    (tmp_path / "device_job.py").write_text("""
-import msgspec
-from cozy_runtime.author import App, Context
-app = App()
-class Request(msgspec.Struct):
-    pass
-class Result(msgspec.Struct):
-    device: str
-@app.job
-def compute(payload: Request, ctx: Context) -> Result:
-    if ctx.device.type == "cuda":
-        import torch
-        assert torch.cuda.is_initialized(), "Runtime must initialize before the handler"
-    return Result(str(ctx.device))
-""")
-    (tmp_path / "package.toml").write_text('[application]\nobject="device_job:app"\n')
-    found = discover(tmp_path)
-    process = executor.Executor(
-        cast(Channel, SimpleNamespace(send=lambda _message: None)), tmp_path
+def probe(mode: str, root: Path) -> dict[str, Any]:
+    run = subprocess.run(
+        [sys.executable, str(PROBE), mode, str(root)], text=True, capture_output=True, timeout=90
     )
-    process.device_kind = "cuda"
-    process.discovered = found
-    process.surface_names = {surface.name: surface for surface in found.surfaces}
-    return process, {
-        "job": "compute",
-        "request_id": "job-device",
-        "payload": {},
-        "deadline_s": 30,
-        "spool": str(tmp_path / "spool"),
-        "budget": {"gpu_count": 1},
-    }
+    assert run.returncode == 0, run.stdout + run.stderr
+    return cast(dict[str, Any], json.loads(run.stdout))
 
 
-def install_torch(monkeypatch: pytest.MonkeyPatch, cuda: CUDA) -> None:
-    torch = ModuleType("torch")
-    torch.cuda = cuda  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "torch", torch)
+def test_cpu_parent_never_imports_torch_or_opens_cuda(tmp_path: Path) -> None:
+    result = probe("cpu", tmp_path)
+    assert result["result"] == {"device": "cpu", "values": []}
+    assert not result["torch_imported"] and not result["device_initialized"]
+    assert result["quiescent"] and result["gpu_count"] == 0
 
 
-def test_gpu_job_initializes_before_handler_and_proves_completion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    process, command = job(tmp_path)
-    cuda = CUDA()
-    install_torch(monkeypatch, cuda)
-    result = process.run_job(command)
-    assert result["outcome"]["terminal"] == "succeeded", result
-    observed = json.loads((Path(command["spool"]) / RESULT_DOCUMENT).read_bytes())
-    assert observed == {"device": "cuda:0"}
-    assert cuda.events[0] == "init"
-    assert cuda.events.index("synchronize") < cuda.events.index("query")
-    assert result["quiescent"] and result["metrics"]["peak_vram_bytes"] == 2048
+@pytest.mark.skipif(not REAL_GPU, reason="set COZY_TEST_GPU_JOB_DEVICE=1 on a real CUDA worker")
+def test_gpu_job_initializes_before_handler_and_proves_completion(tmp_path: Path) -> None:
+    result = probe("gpu", tmp_path)
+    assert result["result"] == {"device": "cuda:0", "values": [14.0] * 512}
+    assert result["torch_imported"] and result["device_initialized"]
+    assert result["quiescent"] and result["gpu_count"] == 1
+    assert result["peak_vram_bytes"] >= 4096
 
 
-def test_cpu_parent_never_imports_torch_or_opens_cuda(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    process, command = job(tmp_path)
-    command["budget"]["gpu_count"] = 0
-    original = builtins.__import__
-
-    def guarded(name: str, *args: Any, **kwargs: Any) -> Any:
-        assert name != "torch" and not name.startswith("torch."), "CPU parent imported Torch"
-        return original(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", guarded)
-    result = process.run_job(command)
-    assert result["outcome"]["terminal"] == "succeeded", result
-    observed = json.loads((Path(command["spool"]) / RESULT_DOCUMENT).read_bytes())
-    assert observed == {"device": "cpu"}
-    assert process.torch is None and not process._device_ready
-    assert result["metrics"]["gpu_count"] == 0 and result["quiescent"]
-
-
-def test_gpu_job_refuses_cuda_initialized_outside_runtime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    process, command = job(tmp_path)
-    cuda = CUDA(initialized=True)
-    install_torch(monkeypatch, cuda)
-    result = process.run_job(command)
-    assert result["ok"] is False and result["code"] == "cuda_initialized_before_runtime"
-    assert process.attempts == 0 and cuda.events == []
+@pytest.mark.skipif(not REAL_GPU, reason="set COZY_TEST_GPU_JOB_DEVICE=1 on a real CUDA worker")
+def test_gpu_job_refuses_cuda_initialized_outside_runtime(tmp_path: Path) -> None:
+    result = probe("early", tmp_path)
+    assert result["code"] == "cuda_initialized_before_runtime"
+    assert result["executions"] == 0 and not result["result_written"]
