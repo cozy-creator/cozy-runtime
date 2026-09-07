@@ -2056,10 +2056,10 @@ class Executor:
         is not a second runtime, it is the one attempt kernel with a different service set
         and no serving loop underneath it. The three differences from `invoke`, out loud:
 
-        1. **No prepared generation is required.** A job with no Model parameter never
-           imports torch in this process at all — a CPU-class conversion job pays no CUDA
-           init and holds no device. A job Model is a typed, derive-only exact Manifest
-           capability: no Loader construction, component state, or serving residency exists.
+        1. **No prepared generation is required.** The admitted slot's device count
+           determines accelerator initialization. A CPU job imports no Torch and opens no
+           CUDA context; a GPU transform can use its device without constructing an
+           inference model. A job Model remains a derive-only Manifest capability.
         2. **Job services are injected**: a resumable Scratch tree keyed on the RUN, the
            durable checkpoint exchange, and the typed budget facts.
         3. **Quiescence is proven by what exists.** A torch-free job has no stream that
@@ -2067,6 +2067,14 @@ class Executor:
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        budget = command.get("budget") or {}
+        if int(budget.get("gpu_count", 0)) > 0:
+            import torch
+
+            self.torch = torch
+            refused = self._initialize_device(torch)
+            if refused is not None:
+                return refused
         if self.discovered is None:
             try:
                 self._discover_provisioned(
@@ -2269,7 +2277,6 @@ class Executor:
                 replayed=bool(answer.get("replayed", False)),
             )
 
-        budget = command.get("budget") or {}
         started = time.perf_counter()
         started_wall = time.time()
         if self.torch is not None:
