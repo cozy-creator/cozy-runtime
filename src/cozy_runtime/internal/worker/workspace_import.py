@@ -549,6 +549,10 @@ def _native(workspace: Workspace, kind: str, row: dict[str, Any]) -> dict[str, A
                 _refuse("native writer advanced beyond frozen Host epoch")
             store.derived_fence(transaction, writer)
         if row["state"] == "intent":
+            if state == "committed" and canonical_json.encode(
+                found["receipt"]["declaration"]
+            ) != _bytes(row["declaration_canonical_bytes"]):
+                _refuse("committed native declaration differs from frozen writer intent")
             for name in ("restore_checkpoint", "checkpoint"):
                 if data := _bytes(row[name]):
                     checkpoint = pb.CheckpointRef.FromString(data)
