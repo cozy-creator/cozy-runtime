@@ -1135,10 +1135,13 @@ class Executor:
         # bytes; the APPLIED value is what the generation's digest carries. A staging
         # generation re-reads the store after construction, so its GC-safe hold must
         # outlive the first commit; that is `hold_lease`.
-        destinations = max(int(envelope["destination_bytes"]), declared)
+        destinations = int(envelope["base_bytes"])
+        overhead = int(envelope["fill_overhead_bytes"])
         admissible = min(authorized, int(allocatable))
         resident_budget = residence_ceiling(
-            destinations=destinations, authorized=authorized, allocatable=int(allocatable)
+            destinations=destinations,
+            authorized=authorized - overhead,
+            allocatable=int(allocatable) - overhead,
         )
         if resident_budget <= 0:
             self.poisoned = "fill refused: device_shortfall"
@@ -1165,11 +1168,7 @@ class Executor:
         resident_destinations = (
             min(destinations, resident_budget) if resident_budget else destinations
         )
-        required = (
-            resident_destinations
-            + int(envelope["native_bytes"])
-            + int(envelope["decode_peak_bytes"])
-        )
+        required = resident_destinations + overhead
         envelope = {
             **envelope,
             "resident_destination_bytes": resident_destinations,
@@ -1189,9 +1188,8 @@ class Executor:
                     f"{envelope['destination_bytes']} B of logical destinations, "
                     f"{envelope['derived_destination_bytes']} B of additional MCC-derived "
                     "destinations, "
-                    f"{envelope['native_bytes']} B of native encoded leaves, "
-                    f"{envelope['decode_peak_bytes']} B of decode scratch at its widest "
-                    f"component) against {authorized} B authorized and {allocatable} B "
+                    f"{overhead} B of overlapping fill storage at its widest component) "
+                    f"against {authorized} B authorized and {allocatable} B "
                     "allocatable - refused on the arithmetic, before a byte moved. The "
                     f"binding's MCC priced {declared} B of logical plus derived "
                     "destinations; the header independently prices stored encoding overhead"

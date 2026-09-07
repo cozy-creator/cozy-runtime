@@ -189,44 +189,71 @@ def _refuse(code: str, message: str, fields: Sequence[str] = ()) -> FillRefusal:
 # ------------------------------------------------------------------- admission arithmetic
 
 
+@dataclass(slots=True)
+class ComponentMemory:
+    """One component's construction, settled residency, and overlapping fill storage."""
+
+    destinations: int = 0
+    native_destinations: int = 0
+    native: int = 0
+    native_resident: int = 0
+    native_scratch: int = 0
+    decode: int = 0
+    resident: int | None = None
+
+    @property
+    def settled(self) -> int:
+        if self.resident is not None:
+            return self.resident
+        return self.destinations - self.native_destinations + self.native_resident
+
+    @property
+    def base(self) -> int:
+        # Both the initial float tree and its final encoded tree must fit the ceiling.
+        return max(self.destinations, self.settled)
+
+    @property
+    def peak(self) -> int:
+        # _stream installs native leaves at component boundaries. Until then the entire
+        # component's encoded payload coexists with its original logical destinations.
+        return self.destinations + self.native + self.native_scratch + self.decode
+
+    @property
+    def overhead(self) -> int:
+        return max(self.peak - self.base, 0)
+
+    def admission(self, headroom: int) -> int:
+        # Fill scratch and forward scratch are different phases. Already-live input
+        # activations are accounted by the caller's measured allocator free space.
+        return max(self.peak, self.settled + headroom)
+
+
 def price_envelope(
-    rows: Sequence[tuple[str, int, int, str]], decode_scratch_bytes: int
+    rows: Sequence[tuple[str, int, int, str, int, int]], decode_scratch_bytes: int
 ) -> dict[str, Any]:
-    """The device envelope of one fill: (component, logical, stored, route) rows in, bytes out.
-
-    Pure arithmetic over header numbers, deliberately: it is the half of the fix that can be
-    RED-ARMED without a card, against the real stored-vs-logical sizes of a real artifact.
-
-    THE STORED SIZE IS NOT THE RESIDENT SIZE. A bf16 destination of an fp8-stored row occupies
-    its LOGICAL bytes, by exactly the ratio the header already states, so an envelope priced
-    at an artifact's stored bytes under-prices the fill by that ratio — and the budget check
-    it feeds can then refuse nothing real. Measured on H3: 92.42 GiB stored against 128.31 GiB
-    logical, and the number the record declared was the first one.
-
-    The composition, per class and per component, because a single total is exactly what made
-    a 53.6 GiB gap unattributable:
-
-      destinations  logical bytes of every row, which is what `to_empty` reserves;
-      native        the STORED payload of every `encoded_gemm` row, which becomes the resident
-                    weight and is live BESIDE its float destination until the leaf is
-                    installed — the rung's real peak, not its settled size;
-      decode        the rolling scratch envelope, `min(total, budget + largest)`, live for ONE
-                    component at a time and released at that component's stream end, so the
-                    fill's peak carries the LARGEST of them and never their sum.
-
-    A census may exceed `destinations`: a module tree holds derived buffers no row supplies.
-    This is therefore a FLOOR under the true envelope, and it says so.
-    """
+    """Price component-boundary fill peaks, retaining logical and settled bytes separately."""
     per: dict[str, dict[str, int]] = {}
-    for component, logical, stored, route in rows:
+    for component, logical, stored, route, native_resident, native_scratch in rows:
         cell = per.setdefault(
             component,
-            {"destinations": 0, "native": 0, "decode_total": 0, "decode_largest": 0, "rows": 0},
+            {
+                "destinations": 0,
+                "native_destinations": 0,
+                "native": 0,
+                "native_resident": 0,
+                "native_scratch": 0,
+                "decode_total": 0,
+                "decode_largest": 0,
+                "rows": 0,
+            },
         )
         cell["rows"] += 1
         cell["destinations"] += logical
         if route == "encoded_gemm":
             cell["native"] += stored
+            cell["native_destinations"] += logical
+            cell["native_resident"] += native_resident
+            cell["native_scratch"] += native_scratch
         elif route == "decoded_float":
             cell["decode_total"] += stored
             cell["decode_largest"] = max(cell["decode_largest"], stored)
@@ -236,42 +263,46 @@ def price_envelope(
             if cell["decode_total"]
             else 0
         )
-    destinations = sum(cell["destinations"] for cell in per.values())
-    native = sum(cell["native"] for cell in per.values())
-    decode = max((cell["decode_envelope"] for cell in per.values()), default=0)
+    memory = [_component_memory(cell) for cell in per.values()]
+    destinations = sum(cell.destinations for cell in memory)
+    base = sum(cell.base for cell in memory)
+    overhead = max((cell.overhead for cell in memory), default=0)
     return {
         "components": per,
         "destination_bytes": destinations,
-        "native_bytes": native,
-        "decode_peak_bytes": decode,
-        "required_bytes": destinations + native + decode,
-        "basis": "header logical bytes + selected routes; a FLOOR — a module tree's derived "
-        "buffers are not rows and are not counted here",
+        "native_bytes": sum(cell.native for cell in memory),
+        "decode_peak_bytes": max((cell.decode for cell in memory), default=0),
+        "base_bytes": base,
+        "fill_overhead_bytes": overhead,
+        "required_bytes": base + overhead,
+        "basis": "component construction/settled maximum + widest component fill overhead; "
+        "header floor excluding derived buffers",
     }
+
+
+def _component_memory(cell: Mapping[str, int]) -> ComponentMemory:
+    return ComponentMemory(
+        destinations=cell["destinations"],
+        native_destinations=cell["native_destinations"],
+        native=cell["native"],
+        native_resident=cell["native_resident"],
+        native_scratch=cell["native_scratch"],
+        decode=cell["decode_envelope"],
+    )
 
 
 def complete_device_envelope(
     header: Mapping[str, Any], construction_destination_bytes: int
 ) -> dict[str, Any]:
-    """Join the header's route costs to the MCC's complete destination residency.
-
-    Header rows price the logical destinations and encoding overhead, but cannot see
-    non-persistent derived buffers.  The MCC is the independent deep census that includes
-    both.  The larger destination census stays live beside native payloads and decode
-    scratch, so those two costs are additive rather than alternatives.
-    """
-
-    logical = int(header["destination_bytes"])
-    native = int(header["native_bytes"])
-    decode = int(header["decode_peak_bytes"])
-    destinations = max(logical, construction_destination_bytes)
+    """Include the MCC's derived buffers without charging parked native components."""
+    derived = max(construction_destination_bytes - int(header["destination_bytes"]), 0)
+    base = int(header["base_bytes"]) + derived
     return {
         **header,
         "construction_destination_bytes": construction_destination_bytes,
-        "derived_destination_bytes": max(construction_destination_bytes - logical, 0),
-        "required_bytes": destinations + native + decode,
-        "basis": "max(header logical destinations, MCC logical + derived destinations) "
-        "+ selected-route native payload + decode scratch",
+        "derived_destination_bytes": derived,
+        "base_bytes": base,
+        "required_bytes": base + int(header["fill_overhead_bytes"]),
     }
 
 
@@ -748,6 +779,9 @@ class LeafReplacement:
     role_keys: tuple[str, ...]
     """The census keys the leaf's own buffers present, fully qualified."""
     stored_bytes: int
+    original: Any
+    owner: Any
+    attribute: str
     freed_bytes: int
     """Device bytes the float destination gave back. The other half of the VRAM claim: a
     replacement that freed nothing bought nothing, whatever the payload cost."""
@@ -1041,11 +1075,9 @@ class StreamingFillBackend:
         #: back from a host tier that does not exist (§3.2: eviction FREES).
         self.parked: dict[str, Any] = {}
         self.vram_charge: dict[str, int] = {}
-        #: ONE number per component: the device bytes its module holds when resident,
-        #: measured at construction over the module's own tensors, derived buffers included.
-        #: Every later grant, charge, release and price reads THIS, resident or parked — two
-        #: meters made a generation's reserved weights move between attempts (cr-008b).
-        self.component_bytes: dict[str, int] = {}
+        #: One accounting authority keeps the float construction peak distinct from the
+        #: settled encoded tree. Eviction never overwrites the bytes needed to restore it.
+        self.component_memory: dict[str, ComponentMemory] = {}
         #: cr-008b: a STAGED plan re-reads the store after construction, so the GC-safe hold
         #: must outlive the first commit. It is released by `close()` with the generation.
         self.hold_lease = False
@@ -1453,13 +1485,27 @@ class StreamingFillBackend:
             "materialize_begin", walked_components=list(walked.components), roots=sorted(roots)
         )
         held = 0
+        header_memory = self.device_envelope()["components"]
         with placing():
             for name in walked.components:
                 member = roots.get(name)
                 if member is None or not hasattr(member, "to_empty"):
                     continue
                 size = sum(t.numel() * t.element_size() for _, t in _tensors(member))
-                self.component_bytes[name] = size
+                memory = self.component_memory[name] = _component_memory(
+                    header_memory.get(
+                        name,
+                        {
+                            "destinations": 0,
+                            "native_destinations": 0,
+                            "native": 0,
+                            "native_resident": 0,
+                            "native_scratch": 0,
+                            "decode_envelope": 0,
+                        },
+                    )
+                )
+                memory.destinations = size
                 # Captured BEFORE the park decision: a parked component is staged in later
                 # and its derived tables have to survive to be restored, which they cannot
                 # if the capture happens only on the resident branch.
@@ -1481,20 +1527,7 @@ class StreamingFillBackend:
                     if layout is not None:
                         self.paging[name] = layout
                         self.hold_lease = True
-                if self.resident_budget and held + size > self.resident_budget:
-                    if any(key.startswith(f"{name}.") for key in native):
-                        raise _refuse(
-                            "leaf_schema",
-                            f"the placement plan would PARK {name!r}, and this component "
-                            "serves through encoded leaves. A parked component is staged in "
-                            "later by re-filling the checkpoint's own keys, which stop being "
-                            "this module's keys the moment a leaf replaces a linear op — so "
-                            "the two plans are incompatible in this build. Raise the resident "
-                            "budget or state an objective whose qualified route is the decode "
-                            "floor; the staged-plus-encoded-leaf combination is a named next "
-                            "increment and is not silently half-served here",
-                            [name],
-                        )
+                if self.resident_budget and held + memory.base > self.resident_budget:
                     # PARKED, not dropped. Its tensor schema is built and its destinations are
                     # known; what it does not have is device bytes, and `stage()` supplies
                     # those on first declared use. A construction that silently skipped it
@@ -1502,7 +1535,7 @@ class StreamingFillBackend:
                     self.parked[name] = member
                     self.stage_log.append({"component": name, "action": "park", "bytes": size})
                     continue
-                held += size
+                held += memory.base
                 want = size
                 self.vram_charge[name] = want
                 # A `to_empty` that runs out of device memory halfway leaves the half it
@@ -1580,42 +1613,30 @@ class StreamingFillBackend:
 
     # -- the arithmetic, before a byte moves -------------------------------------
 
+    @property
+    def component_bytes(self) -> dict[str, int]:
+        return {name: memory.settled for name, memory in self.component_memory.items()}
+
+    def stage_bytes(self, name: str, headroom: int = 0) -> int:
+        if name in self.paging:
+            return self.paging[name].working_bytes + headroom
+        return self.component_memory[name].admission(headroom)
+
     def device_envelope(self) -> dict[str, Any]:
-        """What this fill WILL hold on the card, priced from the header and the PLAN's routes.
-
-        THE STORED SIZE IS NOT THE RESIDENT SIZE. An fp8-stored tensor served through the
-        decode floor occupies its LOGICAL bytes on the device — bf16 destinations of fp8
-        rows EXPAND, by exactly the ratio the header already states — so an envelope priced
-        at the artifact's stored bytes under-prices the fill by that ratio and the budget
-        check it feeds cannot refuse anything real. Measured on H3: 92.42 GiB stored against
-        128.31 GiB logical, and the number the RecordOwner declared was the first one.
-
-        The composition, per class and per component, because a single total is exactly what
-        made the 53.6 GiB gap unattributable:
-
-          destinations  logical bytes of every row, which is what `to_empty` reserves;
-          native        the STORED payload of every `encoded_gemm` row, which becomes the
-                        resident weight and is live BESIDE its float destination until the
-                        leaf is installed — the rung's real peak, not its settled size;
-          decode        the rolling scratch envelope, `min(total, budget + largest)`, live
-                        for ONE component at a time and released at its stream's end, so
-                        the fill's peak carries the LARGEST of them and not their sum.
-
-        The census may exceed `destinations`: a module tree holds derived buffers no row
-        supplies. This is therefore a FLOOR under the true envelope, and it says so.
-        """
-        return price_envelope(
-            [
-                (
-                    row.component,
-                    int(row.nbytes),
-                    int(row.stored_nbytes),
-                    self.resolved[row.key].route,
-                )
-                for row in self.plan.values()
-            ],
-            self.decode_scratch_bytes,
-        )
+        """Header costs for the selected implementation; the module census adds derived buffers."""
+        rows = []
+        for row in self.plan.values():
+            route = self.resolved[row.key].route
+            resident = scratch = 0
+            if route == "encoded_gemm":
+                provider = self.selected[row.key].provider
+                parts = {part.role: part for part in row.encoded.parts}
+                resident = provider.resident_bytes(parts)
+                scratch = provider.fill_scratch_bytes(parts)
+            rows.append(
+                (row.component, int(row.nbytes), int(row.stored_nbytes), route, resident, scratch)
+            )
+        return price_envelope(rows, self.decode_scratch_bytes)
 
     # -- the Backend protocol ----------------------------------------------------
 
@@ -1872,6 +1893,9 @@ class StreamingFillBackend:
         self.stats["fill_ms"] = self.stats["stream_ms"] + self.stats.get("materialize_ms", 0)
         self.stats["decode"] = dict(self.decoded)
         self._reconcile_leaves()
+        # Logical destination addresses are retired after replacement. Keeping them
+        # across commits would mistake allocator address reuse for a new tied weight.
+        self.leaf_sites.clear()
         self.enqueued.clear()
         self._mark("fill_end", decoded=dict(self.decoded))
         if self.forensics is not None:
@@ -1918,7 +1942,7 @@ class StreamingFillBackend:
             after = sum(int(t.numel() * t.element_size()) for _, t in _tensors(member))
             charged = self.vram_charge.get(name, 0)
             self.vram_charge[name] = after
-            self.component_bytes[name] = after
+            self.component_memory[name].resident = after
             self.stage_log.append(
                 {
                     "component": name,
@@ -1970,20 +1994,6 @@ class StreamingFillBackend:
             self._park_page(self.paging[name].common)
             self.parked[name] = self.components.pop(name)
             return self.vram_charge.pop(name, 0)
-        if any(key.startswith(f"{name}.") for key in self.replaced):
-            raise _refuse(
-                "leaf_schema",
-                f"{name!r} holds replaced ENCODED LEAVES and cannot be evicted by this "
-                "build. Eviction parks the module on `meta` and `stage` RE-FILLS it against "
-                "the checkpoint's own keys — but this component's keys are no longer the "
-                "checkpoint's: `…qkv_proj.weight` is now `…qkv_proj.data` and "
-                "`…qkv_proj.scale`, so the re-fill would walk destinations the header does "
-                "not supply. Staging an encoded-leaf component needs the substitution map "
-                "to drive the re-fill as well as to check it, which is a coherent next "
-                "increment and is NOT half-built here: refusing beats a stage that enqueues "
-                "nothing and commits an allocation full of whatever was in that memory",
-                [name],
-            )
         member = self.components.pop(name, None)
         if member is None:
             return 0
@@ -1993,6 +2003,19 @@ class StreamingFillBackend:
         with placing():
             self._free_storages(t for _, t in _tensors(member))
             member.to_empty(device=self.torch.device("meta"), recurse=True)
+            rows = [r for r in self.replaced.values() if r.contract_key.startswith(f"{name}.")]
+            for row in rows:
+                # The original weight storage was retired by _decode; bias may alias the
+                # encoded leaf, whose storage was just freed. Keep topology, never bytes.
+                row.original.to_empty(device=self.torch.device("meta"), recurse=True)
+                setattr(row.owner, row.attribute, row.original)
+                self.replaced.pop(row.contract_key)
+                self.leaf_sites.pop(row.contract_key, None)
+            if rows:
+                self.census_keys[name] = frozenset(
+                    (self.census_keys[name] - {key for row in rows for key in row.role_keys})
+                    | {row.contract_key for row in rows}
+                )
         self.parked[name] = member
         self.stage_log.append({"component": name, "action": "evict", "bytes": charged})
         del self.stage_log[:-64]
@@ -2026,12 +2049,8 @@ class StreamingFillBackend:
         from cozy_runtime.internal.derive import placing
 
         started = time.perf_counter_ns()
-        # The ONE number (see `component_bytes`): what this module holds when it is resident,
-        # derived buffers included, measured once at construction. Granting the read plan's
-        # sum instead left the derived tensors `_restore_derived` puts back uncharged.
-        want = self.component_bytes.get(name) or sum(
-            row.nbytes for row in self.plan.values() if row.component == name
-        )
+        memory = self.component_memory[name]
+        want = memory.destinations
         # NO UNWIND PAST THIS LINE. A stage that fails after reserving, or after the first
         # batch lands, raises; the residency plane poisons the generation and the process
         # is replaced (#613). Freeing the half that arrived would be an in-process rollback
@@ -2052,6 +2071,9 @@ class StreamingFillBackend:
         # wrong. Measured exactly that — a black image from a "successful" 43 ms stage of
         # 4.78 GiB, a rate no disk can produce.
         self.parked.pop(name, None)
+        # Own the tree before _leaf_site validates replacements. It is not observable
+        # until the scope admission commits; a failure poisons the executor generation.
+        self.components[name] = member
         for destination in fresh.destinations:
             self.fill(destination.key, destination.spec, fresh.live[destination.key])
         enqueued = time.perf_counter_ns()
@@ -2066,7 +2088,7 @@ class StreamingFillBackend:
                 missing[:6],
             )
         self._commit_enqueued()
-        self.components[name] = member
+        self.state = "ready"
         ended = time.perf_counter_ns()
         took = (ended - started) // 1_000_000
         # THE SAME SPLIT `prepare` REPORTS (cr-100): `ms` is the whole stage, `stream_ms`
@@ -2086,7 +2108,7 @@ class StreamingFillBackend:
         row = {
             "component": name,
             "action": "stage",
-            "bytes": want,
+            "bytes": memory.settled,
             "ms": took,
             "stream_ms": int(self.stats.get("stream_ms", 0)),
             "reserve_ms": (reserved - started) // 1_000_000,
@@ -2316,10 +2338,17 @@ class StreamingFillBackend:
             module_path=module_path,
             was=type(replaced).__name__,
             now=type(leaf).__name__,
+            original=replaced,
+            owner=owner,
+            attribute=attribute,
             role_keys=tuple(sorted(f"{module_path}.{role}" for role in leaf.roles())),
             stored_bytes=row.stored_nbytes,
             freed_bytes=int(destination.numel() * destination.element_size()),
         )
+        from cozy_runtime.internal.derive import placing
+
+        with placing():
+            replaced.to_empty(device=self.torch.device("meta"), recurse=True)
         return retired
 
     def _drop_scratch(self) -> int:
