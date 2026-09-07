@@ -410,8 +410,9 @@ def test_restore_rechecks_workspace_after_io(rig: Rig) -> None:
     assert not rig.exchange.writer_broker.bindings
 
 
+@pytest.mark.parametrize("cancel_during_validation", [False, True])
 def test_restored_native_checkpoint_is_validated_before_writer_adoption(
-    rig: Rig, tmp_path: Path
+    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_during_validation: bool
 ) -> None:
     rig.begin()
     original = tensorfs.Store.init(tmp_path / "original")
@@ -447,6 +448,35 @@ def test_restored_native_checkpoint_is_validated_before_writer_adoption(
     request = pb.ValidateWeightsCheckpointRequest(
         intent=ready(rig, checkpoint), tensorfs_declaration_canonical_bytes=rig.declaration
     )
+    if cancel_during_validation:
+        entered, finish = threading.Event(), threading.Event()
+        validate_native = rig.workspace._validate_checkpoint
+        answers: list[pb.ValidateWeightsCheckpointResult] = []
+
+        def delayed(row: Any, checkpoint: pb.CheckpointRef) -> None:
+            validate_native(row, checkpoint)
+            entered.set()
+            assert finish.wait(WAIT), "native validation test was not released"
+
+        monkeypatch.setattr(rig.workspace, "_validate_checkpoint", delayed)
+        validating = threading.Thread(
+            target=lambda: answers.append(
+                rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
+            )
+        )
+        validating.start()
+        try:
+            assert entered.wait(WAIT), "native checkpoint was not validated"
+            # This transition must not be blocked by a global lock held over IO.
+            terminal(rig, rig.accept())
+        finally:
+            finish.set()
+            validating.join(WAIT)
+        assert not validating.is_alive()
+        assert len(answers) == 1 and not answers[0].valid and answers[0].safe_code
+        assert rig.store.derived_lookup(TRANSACTION)["state"] == "absent"
+        assert not rig.exchange.writer_broker.bindings
+        return
     verdict = rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
     assert verdict.valid and verdict.checkpoint == checkpoint
     assert rig.store.derived_lookup(TRANSACTION)["state"] == "absent"
@@ -491,3 +521,11 @@ def test_local_control_host_serves_probe_without_preparation_handlers(tmp_path: 
     finally:
         host.stop()
         thread.join(WAIT)
+
+
+def test_retired_exchange_cannot_grant_custody(rig: Rig) -> None:
+    with pytest.raises(grpc.RpcError) as error:
+        next(rig.legacy.Exchange(iter(()), timeout=WAIT))
+    assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    assert not rig.exchange.writer_broker.bindings
+    assert not rig.control.frames
