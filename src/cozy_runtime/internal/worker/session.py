@@ -2006,16 +2006,18 @@ class Worker:
         another's sender.
         """
         inner = getattr(frame, frame.WhichOneof("msg"))
-        if frame.HasField("attempt_outcome") and self.workspace is not None:
+        if (
+            frame.HasField("attempt_outcome")
+            and self.workspace is not None
+            and self.workspace.contains(
+                self.fence.record_owner_id,
+                frame.attempt_outcome.request_id,
+                frame.attempt_outcome.attempt_ordinal,
+            )
+        ):
             # Outcome forwarding follows the same workspace commit that observes
             # native receipts. A transport projection is never the authority.
-            try:
-                self.workspace.outcome(self.fence.record_owner_id, frame.attempt_outcome)
-            except ValueError:
-                # A refused malformed offer never acquired a workspace binding.
-                # The existing attempt engine still delivers its refusal.
-                if frame.attempt_outcome.request_id in self.engine.live:
-                    raise
+            self.workspace.outcome(self.fence.record_owner_id, frame.attempt_outcome)
         with self.claim_lock:
             if frame.WhichOneof("msg") != "weights_transaction":
                 self.stamp(inner)
@@ -5361,7 +5363,7 @@ class Worker:
             )
             self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
             return
-        if self.workspace is not None:
+        if self.workspace is not None and "job" in attempt.spec:
             result_schema = b""
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
             for slot in self.job_slots.values():

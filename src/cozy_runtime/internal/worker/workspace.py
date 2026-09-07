@@ -110,7 +110,8 @@ CREATE TABLE operation_cache (
 CREATE TABLE operation_lookups (
  owner TEXT NOT NULL, consumer TEXT NOT NULL, key BLOB NOT NULL,
  cache_id TEXT NOT NULL, body BLOB NOT NULL,
- state TEXT NOT NULL CHECK(state IN ('retaining','ready','missing','miss','released')),
+ state TEXT NOT NULL CHECK(state IN
+ ('retaining','ready','missing','miss','released','acknowledged')),
  PRIMARY KEY(owner,consumer)
 ) STRICT;
 """
@@ -322,8 +323,9 @@ class Workspace:
             raise WorkspaceRefusal("outcome body differs from its execution identity")
         with self.locked() as db:
             row = db.execute(
-                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
-                (owner, outcome.request_id, outcome.attempt_ordinal),
+                "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
+                "AND request=? AND ordinal=?",
+                (owner, owner, outcome.request_id, outcome.attempt_ordinal),
             ).fetchone()
             if (
                 row is None
@@ -340,7 +342,7 @@ class Workspace:
                     outcome.outcome_id,
                     outcome.outcome_digest,
                     raw,
-                    owner,
+                    row["owner"],
                     outcome.request_id,
                     outcome.attempt_ordinal,
                 ),
@@ -354,6 +356,8 @@ class Workspace:
                 "AND request=? AND ordinal=?",
                 (owner, owner, ack.request_id, ack.attempt_ordinal),
             ).fetchone()
+            if row is None and not ack.retain_work:
+                return
             if (
                 row is None
                 or row["state"] not in ("outcome", "released")
@@ -373,6 +377,29 @@ class Workspace:
                     ack.attempt_ordinal,
                 ),
             )
+            if not ack.retain_work:
+                active = db.execute(
+                    "SELECT 1 FROM weights WHERE owner=? AND request=? AND ordinal=? "
+                    "AND state<>'released' LIMIT 1",
+                    (row["owner"], ack.request_id, ack.attempt_ordinal),
+                ).fetchone()
+                if active is None:
+                    db.execute(
+                        "DELETE FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                        (row["owner"], ack.request_id, ack.attempt_ordinal),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE attempts SET invocation=x'',outcome=x'',result_schema=x'' "
+                        "WHERE owner=? AND request=? AND ordinal=?",
+                        (row["owner"], ack.request_id, ack.attempt_ordinal),
+                    )
+                db.execute(
+                    "UPDATE weights SET declaration=x'',checkpoint=x'',restore_checkpoint=x'',"
+                    "receipt=x'',objects=x'5b5d' WHERE owner=? AND request=? AND ordinal=? "
+                    "AND state='released'",
+                    (row["owner"], ack.request_id, ack.attempt_ordinal),
+                )
 
     def begin_weights(self, owner: str, intent: pb.WeightsIntentFrame) -> dict[str, Any]:
         """Assign the epoch once, before native begin; the Host observes this decision."""
