@@ -7,7 +7,7 @@ import inspect
 from collections.abc import Awaitable, Callable, Generator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, ParamSpec, TypeVar, cast, overload
+from typing import Any, Concatenate, ParamSpec, TypeVar, cast, overload
 
 import msgspec
 
@@ -40,19 +40,25 @@ class _Export:
 
 @overload
 def invocable[**P, R](
-    fn: Callable[P, Awaitable[R]], /, *, reusable: bool = False
+    fn: Callable[Concatenate[Context, P], Awaitable[R]], /, *, reusable: bool = False
 ) -> Callable[P, Awaitable[R]]: ...
 
 
 @overload
 def invocable[**P, R](
     *, reusable: bool = False
-) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]: ...
+) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, Awaitable[R]]]: ...
 
 
 def invocable[**P, R](
-    fn: Callable[P, Awaitable[R]] | None = None, /, *, reusable: bool = False
-) -> Callable[P, Awaitable[R]] | Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    fn: Callable[Concatenate[Context, P], Awaitable[R]] | None = None,
+    /,
+    *,
+    reusable: bool = False,
+) -> (
+    Callable[P, Awaitable[R]]
+    | Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, Awaitable[R]]]
+):
     """Mark an asynchronous implementation; explicitly register it on the package App.
 
     Calling this exported name always reserves a managed call. App registration keeps
@@ -72,9 +78,9 @@ def invocable[**P, R](
     export = _Export(fn, fn.__module__, fn.__name__, reusable)
 
     def proxy(*args: P.args, **kwargs: P.kwargs) -> Awaitable[R]:
-        if len(args) != 1 or not isinstance(args[0], Context):
+        if args:
             raise ConformanceError(
-                "an invocable takes Context followed by named arguments",
+                "an invocable takes only named operation arguments",
                 code="invocable_signature",
             )
         broker = _current.get()
@@ -82,7 +88,7 @@ def invocable[**P, R](
             raise CapabilityError(
                 "package call has no admitted attempt", code="child_broker_absent"
             )
-        return cast(Awaitable[R], broker.reserve(args[0], "", export.module, export.name, kwargs))
+        return cast(Awaitable[R], broker.reserve("", export.module, export.name, kwargs))
 
     proxy.__name__ = fn.__name__
     proxy.__qualname__ = fn.__qualname__
@@ -91,7 +97,11 @@ def invocable[**P, R](
     proxy.__annotations__ = dict(fn.__annotations__)
     # No __wrapped__ / raw / local bypass is exposed by the public callable.
     metadata = cast(Any, proxy)
-    metadata.__signature__ = inspect.signature(fn)
+    signature = inspect.signature(fn)
+    parameters = list(signature.parameters.values())
+    metadata.__signature__ = signature.replace(parameters=parameters[1:])
+    if parameters:
+        proxy.__annotations__.pop(parameters[0].name, None)
     metadata._cozy_export = export
     return proxy
 
@@ -137,16 +147,22 @@ class _Broker:
         self.calls: list[_Call[Any]] = []
         self.closed = False
         self.activated: set[int] = set()
+        self.context: Context | None = None
+
+    def bind(self, ctx: Context) -> None:
+        if self.closed or self.context is not None or ctx.request_id != self.request_id:
+            raise CapabilityError("package broker escaped its attempt", code="escaped_handle")
+        self.context = ctx
 
     def reserve(
         self,
-        ctx: Context,
         interface_digest: str,
         module: str,
         export: str,
         arguments: Mapping[str, object],
     ) -> _Call[Any]:
-        if self.closed or ctx.request_id != self.request_id:
+        ctx = self.context
+        if self.closed or ctx is None or ctx.request_id != self.request_id:
             raise CapabilityError("package call escaped its attempt", code="escaped_handle")
         ctx.raise_if_cancelled()
         if ctx.boot_warmup:
@@ -243,9 +259,9 @@ _current: ContextVar[_Broker | None] = ContextVar("cozy_package_call_attempt", d
 
 
 def _invoke_proxy(
-    ctx: Context, interface_digest: str, module: str, export: str, arguments: Mapping[str, object]
+    interface_digest: str, module: str, export: str, arguments: Mapping[str, object]
 ) -> Awaitable[Any]:
     broker = _current.get()
     if broker is None:
         raise CapabilityError("package call has no admitted attempt", code="child_broker_absent")
-    return broker.reserve(ctx, interface_digest, module, export, arguments)
+    return broker.reserve(interface_digest, module, export, arguments)

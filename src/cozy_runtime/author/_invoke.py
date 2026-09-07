@@ -235,6 +235,8 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)
 
     attempt.entered = True
+    if inv.calls is not None:
+        inv.calls.bind(ctx)
     token = _current.set(inv.calls)
     try:
         result = _call(surface, kwargs)

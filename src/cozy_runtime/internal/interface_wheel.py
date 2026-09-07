@@ -17,7 +17,7 @@ from packaging.version import Version
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical, invocable_interface, package_interface
 
-GENERATOR_ABI = "cozy.interface-generator/1"
+GENERATOR_ABI = "cozy.interface-generator/2"
 _DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -63,7 +63,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         "from enum import Enum",
         "import msgspec",
         "from cozy_runtime.author import "
-        "Context, AssetBound, ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
+        "AssetBound, ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
         "from cozy_runtime.author import ModelArtifact",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
         "",
@@ -185,13 +185,13 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
 
         request_name = expression(entry["request"], "request")
         result_name = expression(entry["result"], "result")
-        export, context = metadata["export"], metadata["context"]
+        export = metadata["export"]
         if export in exports or export in declarations:
             raise ConformanceError(
                 "interface repeats a Python export", code="interface_name_conflict"
             )
         exports.add(export)
-        parameters = [f"{context}: Context", "/"]
+        parameters: list[str] = []
         if metadata["parameters"]:
             parameters.append("*")
         fields = {field["name"]: field for field in entry["request"]["fields"]}
@@ -208,7 +208,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         functions.append(
             f"def {export}({', '.join(parameters)}) -> Awaitable[{result_name}]:\n"
             f"    return cast(Awaitable[{result_name}], "
-            f"_invoke_proxy({context}, {digest!r}, {module!r}, {export!r}, {arguments}))\n"
+            f"_invoke_proxy({digest!r}, {module!r}, {export!r}, {arguments}))\n"
         )
         bindings.append(
             f"    {export!r}: _CallType({digest!r}, {module!r}, {export!r}, "
