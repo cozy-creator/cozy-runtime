@@ -467,6 +467,8 @@ def activate(
             or state["migration_id"] != call.migration_id
         ):
             _refuse("activation has no exact committed import")
+        if authorize(call.claim) != owner:
+            _refuse("activation owner changed while waiting for workspace authority")
         db.execute("BEGIN IMMEDIATE")
         try:
             db.execute("UPDATE workspace_state SET state='active' WHERE singleton=1")
@@ -625,8 +627,33 @@ def _validate_links(db: Journal, identity: str, owner: str, *, native: bool) -> 
                 if row["holds"]:
                     _refuse("empty lookup source carries native holds")
                 continue
+            source = row["source"]
+            history = db.execute(
+                "SELECT body FROM workspace_import_records WHERE migration_id=? AND kind='attempt' "
+                "AND json_extract(CAST(body AS TEXT),'$.request_id')=? "
+                "AND json_extract(CAST(body AS TEXT),'$.attempt_ordinal')=?",
+                (identity, source["request_id"], source["attempt_ordinal"]),
+            ).fetchall()
+            if history:
+                if len(history) != 1:
+                    _refuse("memo source has ambiguous imported attempt history")
+                accepted = json.loads(history[0][0])
+                if (
+                    accepted["owner_scope"] != owner
+                    or accepted["state"] != "outcome"
+                    or any(
+                        accepted[field] != source[field]
+                        for field in (
+                            "invocation_spec_digest",
+                            "outcome_id",
+                            "outcome_digest",
+                            "outcome_canonical_bytes",
+                        )
+                    )
+                ):
+                    _refuse("memo source differs from its qualified imported attempt")
             outcome = documents.read(
-                _bytes(row["source"]["outcome_canonical_bytes"]), pb.AttemptOutcomeBody
+                _bytes(source["outcome_canonical_bytes"]), pb.AttemptOutcomeBody
             )
             receipts: dict[str, tuple[str, dict[str, Any]]] = {}
             for reference in outcome.get("weights_receipts", []):

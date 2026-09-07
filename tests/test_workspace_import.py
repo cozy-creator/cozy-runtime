@@ -482,3 +482,28 @@ def test_import_never_overwrites_an_existing_workspace(tmp_path: Path) -> None:
         receive(workspace, frames([], auth), auth)
     with workspace.locked() as db:
         assert db.execute("SELECT count(*) FROM weights").fetchone()[0] == 1
+
+
+def test_unqualified_attempt_cannot_supply_a_memo_mapping(tmp_path: Path) -> None:
+    _, workspace, records = native_export(tmp_path)
+    auth = Authority()
+    source = dict(records[0][1], owner_scope="")
+    memo = dict(records[3][1], holds=[])
+    # A self-consistent scalar terminal remains historical when its prior owner
+    # is unknown; a new mapping cannot assign that authority retroactively.
+    body = pb.AttemptOutcomeBody(
+        request_id="producer",
+        attempt_ordinal=1,
+        invocation_spec_digest=source["invocation_spec_digest"],
+        status=pb.OUTCOME_STATUS_SUCCEEDED,
+    )
+    raw = documents.canonical_bytes(body)
+    source.update(
+        outcome_canonical_bytes=b64(raw),
+        outcome_digest=documents.spell(hashlib.sha256(raw).digest()),
+    )
+    memo["source"] = {key: source[key] for key in memo["source"]}
+    with pytest.raises(WorkspaceRefusal, match="qualified imported attempt"):
+        receive(workspace, frames([("attempt", source), ("cache", memo)], auth), auth)
+    with workspace.locked(allow_frozen=True) as db:
+        assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 0
