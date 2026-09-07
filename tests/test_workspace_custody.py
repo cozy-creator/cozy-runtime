@@ -32,6 +32,9 @@ def produced(tmp_path: Path) -> tuple[tensorfs.Store, Workspace, WeightsReceipt]
             Path(__file__).parent / "testdata/worker-protocol/canonical/invocation_spec_job.json"
         ).read_text()
     )
+    for outputs in (value["outputs"], value["job"]["publication_contract"]["outputs"]):
+        for output in outputs:
+            output["mime_type"] = "application/vnd.cozy.model-manifest"
     invocation = canonical.write(value)
     spec = hashlib.sha256(invocation).digest()
     workspace.accept(
