@@ -68,6 +68,7 @@ CREATE TABLE workspace_imports (
 ) STRICT;
 CREATE TABLE workspace_import_records (
  migration_id TEXT NOT NULL, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, body BLOB NOT NULL,
+ verified BLOB NOT NULL DEFAULT x'',
  PRIMARY KEY(migration_id,ordinal)
 ) STRICT;
 CREATE TABLE attempts (
@@ -77,6 +78,7 @@ CREATE TABLE attempts (
  outcome_id TEXT NOT NULL DEFAULT '', outcome_digest BLOB NOT NULL DEFAULT x'',
  outcome BLOB NOT NULL DEFAULT x'', retain INTEGER NOT NULL DEFAULT 0,
  fenced INTEGER NOT NULL DEFAULT 0,
+ worker_boot TEXT NOT NULL DEFAULT '', result_schema BLOB NOT NULL DEFAULT x'',
  PRIMARY KEY(owner,request,ordinal)
 ) STRICT;
 CREATE TABLE weights (
@@ -88,6 +90,7 @@ CREATE TABLE weights (
  checkpoint BLOB NOT NULL DEFAULT x'', receipt BLOB NOT NULL DEFAULT x'',
  receipt_digest BLOB NOT NULL DEFAULT x'', native_digest BLOB NOT NULL DEFAULT x'',
  manifest BLOB NOT NULL DEFAULT x'', manifest_length INTEGER NOT NULL DEFAULT 0,
+ objects BLOB NOT NULL DEFAULT x'5b5d',
  UNIQUE(owner,request,spec,slot)
 ) STRICT;
 CREATE TABLE holds (
@@ -178,7 +181,14 @@ class Workspace:
         if _OWNER.fullmatch(value) is None:
             raise WorkspaceRefusal("workspace owner is not a bounded authenticated identity")
 
-    def accept(self, owner: str, offer: pb.AttemptOffer) -> None:
+    def accept(
+        self,
+        owner: str,
+        offer: pb.AttemptOffer,
+        *,
+        result_schema: bytes = b"",
+        worker_boot: str = "",
+    ) -> None:
         self.owner(owner)
         if (
             _ID.fullmatch(offer.request_id) is None
@@ -204,14 +214,16 @@ class Workspace:
                     raise WorkspaceRefusal("workspace attempt was changed or released")
                 return
             db.execute(
-                "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state) "
-                "VALUES(?,?,?,?,?,'accepted')",
+                "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state,"
+                "worker_boot,result_schema) VALUES(?,?,?,?,?,'accepted',?,?)",
                 (
                     owner,
                     offer.request_id,
                     offer.attempt_ordinal,
                     offer.invocation_spec_digest,
                     offer.invocation_spec_canonical_bytes,
+                    worker_boot,
+                    result_schema,
                 ),
             )
 
@@ -453,16 +465,156 @@ class Workspace:
                 raise WorkspaceRefusal("writer was released during native receipt validation")
             db.execute(
                 "UPDATE weights SET state='receipt',receipt=?,receipt_digest=?,native_digest=?,"
-                "manifest=?,manifest_length=? WHERE id=?",
+                "manifest=?,manifest_length=?,objects=? WHERE id=?",
                 (
                     raw,
                     digest,
                     native_digest,
                     frame.manifest.digest,
                     frame.manifest.length,
+                    canonical_json.encode(
+                        [
+                            {
+                                "object_id": value.object_id,
+                                "length": value.length,
+                                "source_ref": value.source_ref,
+                            }
+                            for value in frame.objects
+                        ]
+                    ),
                     frame.weights_transaction_id,
                 ),
             )
+
+    def weights_row(self, owner: str, transaction: str) -> dict[str, object]:
+        with self.locked() as db:
+            row = db.execute(
+                "SELECT * FROM weights WHERE owner=? AND id=?", (owner, transaction)
+            ).fetchone()
+            if row is None:
+                raise WorkspaceRefusal("workspace has no owned weights transaction")
+            return dict(row)
+
+    def ready_weights(self, owner: str, request: pb.WeightsIntentReadyRequest) -> dict[str, object]:
+        subject = request.weights
+        with self.locked() as db:
+            row = db.execute(
+                "SELECT * FROM weights WHERE owner=? AND id=?",
+                (owner, subject.weights_transaction_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["request"] != subject.request_id
+                or row["ordinal"] != request.attempt_ordinal
+                or row["epoch"] != subject.writer_epoch
+                or row["slot"] != subject.output_slot
+                or row["spec"] != subject.invocation_spec_digest
+                or row["declaration_digest"] != subject.tensorfs_declaration_digest
+                or row["state"] == "released"
+            ):
+                raise WorkspaceRefusal("checkpoint readiness does not bind the current writer")
+            checkpoint = (
+                request.checkpoint.SerializeToString() if request.HasField("checkpoint") else b""
+            )
+            if row["ready"]:
+                if checkpoint != row["restore_checkpoint"]:
+                    raise WorkspaceRefusal("writer readiness already captured another checkpoint")
+                return dict(row)
+            if checkpoint:
+                db.native(lambda: self._validate_checkpoint(row, request.checkpoint))
+            current = db.execute(
+                "SELECT state,epoch FROM weights WHERE id=?", (row["id"],)
+            ).fetchone()
+            if current["state"] == "released" or current["epoch"] != row["epoch"]:
+                raise WorkspaceRefusal("writer changed during checkpoint validation")
+            db.execute(
+                "UPDATE weights SET ready=1,restore_checkpoint=? WHERE id=?",
+                (checkpoint, row["id"]),
+            )
+            return dict(db.execute("SELECT * FROM weights WHERE id=?", (row["id"],)).fetchone())
+
+    def checkpoint(self, owner: str, frame: pb.WeightsCheckpointFrame) -> None:
+        with self.locked() as db:
+            row = db.execute(
+                "SELECT * FROM weights WHERE owner=? AND id=?",
+                (owner, frame.weights_transaction_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["request"] != frame.request_id
+                or row["ordinal"] != frame.attempt_ordinal
+                or row["epoch"] != frame.writer_epoch
+                or row["spec"] != frame.invocation_spec_digest
+                or row["slot"] != frame.output_slot
+                or row["declaration_digest"] != frame.tensorfs_declaration_digest
+                or row["state"] != "intent"
+            ):
+                raise WorkspaceRefusal("checkpoint does not belong to the current native writer")
+            if row["checkpoint"]:
+                prior = pb.CheckpointRef.FromString(row["checkpoint"])
+                if (
+                    frame.checkpoint.plan_digest != prior.plan_digest
+                    or frame.checkpoint.index < prior.index
+                    or (frame.checkpoint.index == prior.index and frame.checkpoint != prior)
+                ):
+                    raise WorkspaceRefusal("checkpoint changed or regressed its native chain")
+            db.native(lambda: self._validate_checkpoint(row, frame.checkpoint))
+            current = db.execute(
+                "SELECT state,epoch FROM weights WHERE id=?", (row["id"],)
+            ).fetchone()
+            if current["state"] != "intent" or current["epoch"] != frame.writer_epoch:
+                raise WorkspaceRefusal("writer changed during checkpoint recording")
+            db.execute(
+                "UPDATE weights SET checkpoint=? WHERE id=?",
+                (frame.checkpoint.SerializeToString(), row["id"]),
+            )
+
+    def _validate_checkpoint(self, row: sqlite3.Row, checkpoint: pb.CheckpointRef) -> None:
+        store = fill.tensorfs_module().Store.open(str(self.store_root))
+        page = store.checkpoint_page(
+            documents.spell(checkpoint.head.digest),
+            checkpoint.head.length,
+            operation_id=row["request"],
+            slot=row["slot"],
+            plan_digest=documents.spell(checkpoint.plan_digest),
+            limit=1,
+        )
+        if page["index"] != checkpoint.index or page["bytes"] != checkpoint.bytes:
+            raise WorkspaceRefusal("checkpoint counters differ from native closure")
+        store.validate_derived_checkpoint(
+            row["id"],
+            row["declaration"],
+            documents.spell(checkpoint.head.digest),
+            checkpoint.head.length,
+            operation_id=row["request"],
+            slot=row["slot"],
+            plan_digest=documents.spell(checkpoint.plan_digest),
+        )
+
+    @staticmethod
+    def status(row: dict[str, object]) -> pb.WeightsTransactionStatus:
+        # SQLite rows have closed schema types; these are transport projections,
+        # never another writer epoch or custody decision.
+        from typing import Any, cast
+
+        value = cast(dict[str, Any], row)
+        status = pb.WeightsTransactionStatus(
+            weights_transaction_id=value["id"],
+            request_id=value["request"],
+            attempt_ordinal=value["ordinal"],
+            invocation_spec_digest=documents.spell(value["spec"]),
+            output_slot=value["slot"],
+            writer_epoch=value["epoch"],
+            state=pb.WEIGHTS_TRANSACTION_STATE_RECEIPT
+            if value["receipt"]
+            else pb.WEIGHTS_TRANSACTION_STATE_INTENT,
+            tensorfs_declaration_digest=value["declaration_digest"],
+            weights_receipt_digest=value["receipt_digest"],
+            intent_ready=bool(value["ready"]),
+        )
+        if value["checkpoint"]:
+            status.checkpoint.CopyFrom(pb.CheckpointRef.FromString(value["checkpoint"]))
+        return status
 
     def _change_hold(
         self,
