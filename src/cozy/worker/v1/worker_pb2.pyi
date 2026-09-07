@@ -576,6 +576,16 @@ class ModelSourcePrepareCall(_message.Message):
     request: ModelSourcePrepareRequest
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ...) -> None: ...
 
+class ModelSourceAdoptCall(_message.Message):
+    __slots__ = ("claim", "from_operation_id", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    FROM_OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    from_operation_id: str
+    request: ModelSourcePrepareRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., from_operation_id: _Optional[str] = ..., request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ...) -> None: ...
+
 class CheckpointPageCall(_message.Message):
     __slots__ = ("claim", "request")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
@@ -599,6 +609,34 @@ class LocalPackageFetchCall(_message.Message):
     claim: Claim
     request: LocalPackageFetchRequest
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[LocalPackageFetchRequest, _Mapping]] = ...) -> None: ...
+
+class LocalPackageUploadFrame(_message.Message):
+    __slots__ = ("header", "chunk")
+    HEADER_FIELD_NUMBER: _ClassVar[int]
+    CHUNK_FIELD_NUMBER: _ClassVar[int]
+    header: LocalPackageUploadHeader
+    chunk: LocalPackageUploadChunk
+    def __init__(self, header: _Optional[_Union[LocalPackageUploadHeader, _Mapping]] = ..., chunk: _Optional[_Union[LocalPackageUploadChunk, _Mapping]] = ...) -> None: ...
+
+class LocalPackageUploadHeader(_message.Message):
+    __slots__ = ("claim", "operation_id", "source_digest", "file")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    FILE_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    operation_id: str
+    source_digest: bytes
+    file: LocalPackageFileRef
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., file: _Optional[_Union[LocalPackageFileRef, _Mapping]] = ...) -> None: ...
+
+class LocalPackageUploadChunk(_message.Message):
+    __slots__ = ("offset", "data")
+    OFFSET_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    offset: int
+    data: bytes
+    def __init__(self, offset: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
 
 class LocalPackageAbortCall(_message.Message):
     __slots__ = ("claim", "request")
@@ -907,7 +945,7 @@ class CheckpointTransferStatus(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., subject: _Optional[_Union[CheckpointSubject, _Mapping]] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., object: _Optional[_Union[CheckpointObject, _Mapping]] = ..., transfer_id: _Optional[str] = ..., grant_revision: _Optional[int] = ..., state: _Optional[_Union[WeightsTransferState, str]] = ..., transferred_bytes: _Optional[int] = ..., http_status: _Optional[int] = ..., checksum_sha256: _Optional[str] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class PrepareModelSourceRequest(_message.Message):
-    __slots__ = ("operation_id", "source_selection_digest", "profiles", "files", "source_uri", "declared_license", "checkpoints")
+    __slots__ = ("operation_id", "source_selection_digest", "profiles", "files", "source_uri", "declared_license", "checkpoints", "adopt_from_operation_id")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PROFILES_FIELD_NUMBER: _ClassVar[int]
@@ -915,6 +953,7 @@ class PrepareModelSourceRequest(_message.Message):
     SOURCE_URI_FIELD_NUMBER: _ClassVar[int]
     DECLARED_LICENSE_FIELD_NUMBER: _ClassVar[int]
     CHECKPOINTS_FIELD_NUMBER: _ClassVar[int]
+    ADOPT_FROM_OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     source_selection_digest: bytes
     profiles: _containers.RepeatedCompositeFieldContainer[ModelSourceProfile]
@@ -922,7 +961,8 @@ class PrepareModelSourceRequest(_message.Message):
     source_uri: str
     declared_license: str
     checkpoints: _containers.RepeatedCompositeFieldContainer[ModelSourceCheckpoint]
-    def __init__(self, operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., files: _Optional[_Iterable[_Union[LocalModelSourceFile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ...) -> None: ...
+    adopt_from_operation_id: str
+    def __init__(self, operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., files: _Optional[_Iterable[_Union[LocalModelSourceFile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ..., adopt_from_operation_id: _Optional[str] = ...) -> None: ...
 
 class PrepareModelSourceResult(_message.Message):
     __slots__ = ("outcome", "sources", "safe_code", "safe_detail", "checkpoints", "spent_members")
