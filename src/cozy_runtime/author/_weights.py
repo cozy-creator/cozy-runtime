@@ -409,6 +409,11 @@ class WeightsTransaction:
                 f"weights part {component}/{key}#{role} is undeclared",
                 code="weights_part_ungranted",
             )
+        if tensor.parts[role].source is not None:
+            self._fail(
+                f"weights part {component}/{key}#{role} inherits a source and cannot accept bytes",
+                code="weights_part_source",
+            )
         self._call(lambda: self._host.add_part(component, key, role, data), "weights part")
 
     def add_config(self, name: str, data: WeightsBytes) -> None:
