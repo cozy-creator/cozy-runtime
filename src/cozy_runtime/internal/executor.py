@@ -865,6 +865,10 @@ class Executor:
         from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
         from cozy_runtime.internal.fill import (
+            INFLIGHT,
+            READERS,
+            RING_SLOTS,
+            WINDOW_BYTES,
             Checkpoint,
             FillRefusal,
             StreamingFillBackend,
@@ -1106,10 +1110,10 @@ class Executor:
             rows,
             plan=plan,
             on_position=position,
-            window_bytes=binding.get("window_bytes", 4 << 20),
-            slots=binding.get("slots", 16),
-            readers=binding.get("readers", 16),
-            inflight=binding.get("inflight", 8),
+            window_bytes=binding.get("window_bytes", WINDOW_BYTES),
+            slots=binding.get("slots", RING_SLOTS),
+            readers=binding.get("readers", READERS),
+            inflight=binding.get("inflight", INFLIGHT),
             release=binding["release"],
             # The suite already ran, above, to resolve the plan. Running it a second time
             # here would re-measure a device fact that has not changed.
@@ -1318,7 +1322,12 @@ class Executor:
             return reply
         self.backend = backend
         self.registry = registry
-        self.models = {binding["model_parameter_name"]: model}
+        # ONE generation under EVERY parameter name the placement's bindings spell
+        # (h3a-018): two entrypoints over one construction share the object.
+        self.models = {
+            str(name): model
+            for name in (binding.get("model_parameter_names") or [binding["model_parameter_name"]])
+        }
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY, installed on the constructed
         # generation. From here on, entering a declared scope admits and materializes its
         # set before the body runs; the package cannot observe that it happened.
@@ -1551,14 +1560,14 @@ class Executor:
         self.torch = children[-1][1].torch
         self.models = {}
         for parameter, child, _ in children:
-            if set(child.models) != {parameter} or parameter in self.models:
+            if parameter not in child.models or set(child.models) & set(self.models):
                 self.poisoned = "model binding parameter mismatch"
                 return {
                     "ok": False,
                     "code": "model_binding_set_invalid",
                     "detail": f"prepared model object did not bind parameter {parameter!r}",
                 }
-            self.models[parameter] = child.models[parameter]
+            self.models.update(child.models)
         residencies = {
             parameter: child.residency
             for parameter, child, _ in children

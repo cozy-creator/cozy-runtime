@@ -400,6 +400,38 @@ def store_refusals(what: str) -> Iterator[None]:
         ) from exc
 
 
+#: The staging geometry tfs-007 measured: 4 MiB store windows into 16 MiB pinned slots,
+#: sixteen of them, sixteen readers, eight copies in flight. The executor's fill and the
+#: worker's page warm (h3a-018) read the store with the same shape.
+WINDOW_BYTES = 4 << 20
+RING_SLOTS = 16
+READERS = 16
+INFLIGHT = 8
+
+
+def slot_bytes(window_bytes: int) -> int:
+    """This plane's staging unit over the store's planning unit (tfs-007)."""
+    return max(int(window_bytes) * 4, 16 << 20)
+
+
+def block_read_bytes() -> int:
+    """Bytes THIS process has actually pulled from the block layer, or -1 (cr-100).
+
+    The one cheap way to tell a warm page-cache read from a cold one: page faults on the
+    mapped CAS objects are charged here, cache hits are not. Observation only, and it is
+    allowed to be unavailable -- every non-Linux host reports -1 rather than a zero that
+    would read as "warm".
+    """
+    try:
+        with open("/proc/self/io", "rb") as rows:
+            for row in rows:
+                if row.startswith(b"read_bytes:"):
+                    return int(row.split(b":")[1])
+    except (OSError, ValueError):
+        return -1
+    return -1
+
+
 @dataclass(frozen=True, slots=True)
 class PlanRow:
     """One checkpoint header row: what the store holds for one logical tensor.
@@ -1051,7 +1083,7 @@ class StreamingFillBackend:
         # The window is the store's PLANNING unit and the slot is this plane's staging unit;
         # tfs-007 measured 4 MiB windows into 16 MiB slots as the shape that works.
         self.window_bytes = int(window_bytes)
-        self.slot_bytes = max(int(window_bytes) * 4, 16 << 20)
+        self.slot_bytes = slot_bytes(window_bytes)
         self.slots = int(slots)
         self.readers = int(readers)
         self.inflight = int(inflight)

@@ -9,7 +9,8 @@ the header — the package names no shape of its own.
 
 One entrypoint, `touch`, opens one component-use scope over EVERY component: the scope's
 demand is the whole model, which is exactly the demand a lane must arbitrate between two
-tenants that do not both fit.
+tenants that do not both fit. A second, `retouch`, binds the SAME model under the same
+parameter name: two entrypoints of one construction, which one executor serves (h3a-018).
 """
 
 from __future__ import annotations
@@ -134,6 +135,15 @@ class TenantModel(Model[TenantPipeline]):
 
 @app.entrypoint
 def touch(ctx: Context, payload: TouchInput, model: TenantModel, tel: Telemetry) -> TouchOutput:
+    view = model.for_request(ctx, seed=payload.seed)
+    checksum = model.touch(view._seed)
+    tel.metric("checksum", checksum)
+    return TouchOutput(checksum=checksum, components=sorted(model.pipe.components))
+
+
+@app.entrypoint
+def retouch(ctx: Context, payload: TouchInput, model: TenantModel, tel: Telemetry) -> TouchOutput:
+    """The same model through a second entrypoint: one construction, two bindings."""
     view = model.for_request(ctx, seed=payload.seed)
     checksum = model.touch(view._seed)
     tel.metric("checksum", checksum)
