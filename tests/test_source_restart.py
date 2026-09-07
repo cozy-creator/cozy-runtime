@@ -53,7 +53,7 @@ def _worker(root: Path, *, owns: bool, required: bool = False) -> Worker:
 
 def _heads(store: Any, fixture: dict[str, Any]) -> list[Any]:
     return [
-        store.source_checkpoint_page(
+        store.checkpoint_page(
             row["head_id"],
             row["head_length"],
             operation_id=fixture["operation"],

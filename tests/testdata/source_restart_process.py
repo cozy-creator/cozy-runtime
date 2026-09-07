@@ -232,7 +232,7 @@ try:
     stored_pages = []
     for row in fixture["heads"]:
         stored_pages.append(
-            tensorfs.Store.open(str(store_root)).source_checkpoint_page(
+            tensorfs.Store.open(str(store_root)).checkpoint_page(
                 row["head_id"],
                 row["head_length"],
                 operation_id=row.get("operation", fixture["operation"]),
@@ -272,7 +272,7 @@ try:
     assert tensorfs.Store.open(str(store_root)).model_source_operations() == before
     for row, expected in zip(fixture["heads"], stored_pages, strict=True):
         assert (
-            tensorfs.Store.open(str(store_root)).source_checkpoint_page(
+            tensorfs.Store.open(str(store_root)).checkpoint_page(
                 row["head_id"],
                 row["head_length"],
                 operation_id=row.get("operation", fixture["operation"]),

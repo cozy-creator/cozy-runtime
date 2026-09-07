@@ -67,16 +67,17 @@ class QuantizeResult(msgspec.Struct):
     tensorfs_receipt_digest: str
     replayed: bool
     encoded_keys: int
+    reused_keys: int
     converted_keys: int
     inherited_keys: int
     source_bytes_read_this_run: int
     new_bytes_written_this_run: int
     saturated_elements_this_run: int
-    worst_relative_frobenius: float
+    worst_relative_frobenius: float | None
     #: f32 tensors held at source precision by the plan's keep list (#695).
     kept_keys: int
     #: worst per-tensor relative Frobenius of the fp32→bf16 cut — the recorded stat.
-    normalization_worst_relative_frobenius: float
+    normalization_worst_relative_frobenius: float | None
     #: True on the plain lane: the ingest record marks the canonical bf16 lane (#695).
     canonical: bool
 
@@ -196,14 +197,15 @@ def quantize(
                 tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
                 replayed=True,
                 encoded_keys=encoded,
+                reused_keys=encoded + len(converted),
                 converted_keys=len(converted),
                 inherited_keys=inherited,
                 source_bytes_read_this_run=0,
                 new_bytes_written_this_run=0,
                 saturated_elements_this_run=0,
-                worst_relative_frobenius=0.0,
+                worst_relative_frobenius=None,
                 kept_keys=len(bf16.kept),
-                normalization_worst_relative_frobenius=0.0,
+                normalization_worst_relative_frobenius=None,
                 canonical=canonical,
             )
         normalization = write_bf16(
@@ -212,7 +214,8 @@ def quantize(
         read = normalization.source_bytes_read
         written = normalization.new_bytes_written
         saturated = 0
-        worst = 0.0
+        worst: float | None = 0.0
+        reused = 0
         if artifact is not None and plan.encoding is not None:
             payload = ArtifactQuantizationRequest(
                 max_relative_frobenius=plan.max_relative_frobenius
@@ -233,7 +236,12 @@ def quantize(
                 read += stats.source_bytes_read
                 written += stats.new_bytes_written
                 saturated += stats.saturated_elements
-                worst = max(worst, stats.worst_relative_frobenius)
+                reused += stats.reused_keys
+                worst = (
+                    max(worst, stats.worst_relative_frobenius)
+                    if worst is not None and stats.worst_relative_frobenius is not None
+                    else None
+                )
         receipt = transaction.commit()
     return QuantizeResult(
         output=output,
@@ -241,6 +249,7 @@ def quantize(
         tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
         replayed=False,
         encoded_keys=encoded,
+        reused_keys=reused,
         converted_keys=len(converted),
         inherited_keys=inherited,
         source_bytes_read_this_run=read,

@@ -184,6 +184,7 @@ def main() -> None:
             owner_scope="paging-proof",
             request_id="paging-proof",
             invocation_spec_digest="sha256:" + "1" * 64,
+            work_fingerprint="sha256:" + "b" * 64,
             writer_session_id=1,
             allowed_sources={},
             output_bounds={"model": total + 4096},

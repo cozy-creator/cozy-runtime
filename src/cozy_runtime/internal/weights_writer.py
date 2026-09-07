@@ -15,6 +15,7 @@ import re
 import stat
 import threading
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
@@ -81,10 +82,21 @@ class StoreProxy:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.store, name)
 
-    def begin_derived(self, transaction: str, epoch: int, *args: Any) -> Any:
+    def begin_derived(
+        self,
+        transaction: str,
+        epoch: int,
+        *args: Any,
+        work_fingerprint: str,
+        checkpoint: tuple[str, int] | None = None,
+    ) -> Any:
         import io
 
-        data = json.dumps(args, separators=(",", ":"), sort_keys=True).encode()
+        data = json.dumps(
+            {"args": args, "work_fingerprint": work_fingerprint, "checkpoint": checkpoint},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
         length = _write(
             _path(self.spool, transaction, "request"),
             io.BytesIO(data),
@@ -154,26 +166,51 @@ class WriterProxy:
         self._add("config", source, name=name)
 
     def commit(self) -> Any:
-        result = self.call("commit")
+        return self._json("commit", weights_limits.MAX_WEIGHTS_RECEIPT_BYTES)
+
+    def _json(self, operation: str, maximum: int) -> Any:
+        result = self.call(operation)
         path = _path(self.store.spool, self.transaction, "output")
         try:
-            with _read(
-                path, int(result["length"]), weights_limits.MAX_WEIGHTS_RECEIPT_BYTES
-            ) as stream:
+            with _read(path, int(result["length"]), maximum) as stream:
                 return json.load(stream)
         finally:
             path.unlink(missing_ok=True)
+
+    def completed_parts(self) -> Any:
+        return self._json("completed_parts", weights_limits.MAX_WEIGHTS_DECLARATION_BYTES)
+
+    def completed_configs(self) -> Any:
+        return self._json("completed_configs", weights_limits.MAX_WEIGHTS_DECLARATION_BYTES)
+
+    def checkpoint(self, operation_id: str, slot: str, *, previous: Any = None) -> Any:
+        return self.call("checkpoint", operation_id=operation_id, slot=slot, previous=previous)[
+            "checkpoint"
+        ]
 
     def fence(self) -> None:
         self.call("fence")
 
 
+@dataclass(frozen=True)
+class _Binding:
+    epoch: int
+    declaration_digest: bytes
+    slot: str
+    checkpoint: tuple[str, int] | None
+
+
 class WriterBroker:
     """Live attempt-scoped handles only; native TensorFS owns every durable fact."""
 
-    def __init__(self, store: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        store: Callable[[], Any],
+        checkpoint: Callable[[Any, str, _Binding, dict[str, Any]], None] | None = None,
+    ) -> None:
         self.store = store
-        self.bindings: dict[tuple[str, int, str], tuple[int, bytes, str]] = {}
+        self.record_checkpoint = checkpoint
+        self.bindings: dict[tuple[str, int, str], _Binding] = {}
         self.lock = threading.RLock()
         self.writers: dict[tuple[str, int, str], tuple[Any, dict[str, Any]]] = {}
 
@@ -182,10 +219,18 @@ class WriterBroker:
         return attempt.request_id, attempt.attempt, transaction
 
     def authorize(
-        self, attempt: Any, transaction: str, epoch: int, declaration: bytes, slot: str
+        self,
+        attempt: Any,
+        transaction: str,
+        epoch: int,
+        declaration: bytes,
+        slot: str,
+        checkpoint: tuple[str, int] | None = None,
     ) -> None:
         with self.lock:
-            self.bindings[self.key(attempt, transaction)] = (epoch, declaration, slot)
+            self.bindings[self.key(attempt, transaction)] = _Binding(
+                epoch, declaration, slot, checkpoint
+            )
 
     def bound(self, declaration: dict[str, Any], frame: Mapping[str, Any]) -> int:
         operation = frame.get("target_operation", frame.get("operation"))
@@ -221,7 +266,7 @@ class WriterBroker:
             if attempt.canceling or attempt.state != "running" or attempt.spool is None:
                 raise CapabilityError("writer attempt is not running", code="weights_writer_closed")
             binding = self.bindings.get(key)
-            if binding is None or binding[0] != frame.get("writer_epoch"):
+            if binding is None or binding.epoch != frame.get("writer_epoch"):
                 raise CapabilityError(
                     "writer has no current host binding", code="weights_writer_ungranted"
                 )
@@ -236,8 +281,25 @@ class WriterBroker:
                     int(frame["length"]),
                     weights_limits.MAX_WEIGHTS_DECLARATION_BYTES,
                 ) as source:
-                    args = json.load(source)
-                if not isinstance(args, list) or len(args) != 5:
+                    request = json.load(source)
+                if not isinstance(request, dict) or set(request) != {
+                    "args",
+                    "work_fingerprint",
+                    "checkpoint",
+                }:
+                    raise CapabilityError(
+                        "invalid writer request", code="weights_writer_declaration"
+                    )
+                args = request["args"]
+                fingerprint = request["work_fingerprint"]
+                checkpoint = request["checkpoint"]
+                if (
+                    not isinstance(args, list)
+                    or len(args) != 5
+                    or not fingerprint
+                    or fingerprint != attempt.weights_work_fingerprint
+                    or checkpoint != (list(binding.checkpoint) if binding.checkpoint else None)
+                ):
                     raise CapabilityError(
                         "invalid writer declaration", code="weights_writer_declaration"
                     )
@@ -251,7 +313,7 @@ class WriterBroker:
                 outputs = {
                     row["output_id"]: row["max_bytes"] for row in attempt.spec.get("outputs", [])
                 }
-                if type(args[4]) is not int or args[4] < 0 or args[4] != outputs.get(binding[2]):
+                if type(args[4]) is not int or args[4] < 0 or args[4] != outputs.get(binding.slot):
                     raise CapabilityError(
                         "writer output exceeds invocation grant", code="weights_writer_ungranted"
                     )
@@ -263,12 +325,18 @@ class WriterBroker:
                         "writer source is outside invocation grant", code="weights_writer_ungranted"
                     )
                 args[3] = [tuple(row) for row in args[3]]
-                declaration = store.derived_declaration(*args)
-                if hashlib.sha256(declaration).digest() != binding[1]:
+                declaration = store.derived_declaration(*args, work_fingerprint=fingerprint)
+                if hashlib.sha256(declaration).digest() != binding.declaration_digest:
                     raise CapabilityError(
                         "writer declaration changed after intent", code="weights_writer_declaration"
                     )
-                writer = store.begin_derived(transaction, binding[0], *args)
+                writer = store.begin_derived(
+                    transaction,
+                    binding.epoch,
+                    *args,
+                    work_fingerprint=fingerprint,
+                    checkpoint=binding.checkpoint,
+                )
                 self.writers[key] = writer, json.loads(declaration)
                 return {"ok": True}
             held = self.writers.get(key)
@@ -305,16 +373,36 @@ class WriterBroker:
                         )
                     else:
                         writer.add_config(str(frame["name"]), source)
-            elif operation == "commit":
-                facts = writer.commit()
-                del self.writers[key]
+            elif operation in {"commit", "completed_parts", "completed_configs"}:
+                facts = getattr(writer, operation)()
+                if operation == "commit":
+                    del self.writers[key]
                 raw = json.dumps(facts, separators=(",", ":"), sort_keys=True).encode()
                 length = _write(
                     _path(spool, transaction, "output"),
                     io.BytesIO(raw),
-                    weights_limits.MAX_WEIGHTS_RECEIPT_BYTES,
+                    weights_limits.MAX_WEIGHTS_RECEIPT_BYTES
+                    if operation == "commit"
+                    else weights_limits.MAX_WEIGHTS_DECLARATION_BYTES,
                 )
                 return {"ok": True, "length": length}
+            elif operation == "checkpoint":
+                if (
+                    frame.get("operation_id") != attempt.request_id
+                    or frame.get("slot") != binding.slot
+                ):
+                    raise CapabilityError(
+                        "checkpoint differs from writer scope", code="weights_writer_ungranted"
+                    )
+                previous = frame.get("previous")
+                facts = writer.checkpoint(
+                    attempt.request_id,
+                    binding.slot,
+                    previous=tuple(previous) if previous is not None else None,
+                )
+                if facts.get("head") is not None and self.record_checkpoint is not None:
+                    self.record_checkpoint(attempt, transaction, binding, facts)
+                return {"ok": True, "checkpoint": facts}
             elif operation == "fence":
                 writer.fence()
                 del self.writers[key]

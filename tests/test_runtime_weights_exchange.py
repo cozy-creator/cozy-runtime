@@ -21,6 +21,7 @@ What they hold the Runtime to:
 
 from __future__ import annotations
 
+import io
 import threading
 from collections.abc import Iterator
 from concurrent import futures
@@ -32,9 +33,15 @@ from typing import Any
 
 import grpc
 import pytest
+import tensorfs
 
 from cozy_runtime.internal.worker import weights
-from cozy_runtime.internal.worker.control import _RuntimeWeightsServicer
+from cozy_runtime.internal.worker.control import (
+    GrpcControlHost,
+    _PreparationServicer,
+    _RuntimeWeightsServicer,
+)
+from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
@@ -181,6 +188,7 @@ class Rig:
     control: ControlLane
     stub: Any
     server: Any
+    preparation: Any
 
 
 @pytest.fixture()
@@ -188,7 +196,7 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
     fence = Fence()
     control = ControlLane(fence)
     exchange = weights.WeightsExchange(
-        store_root=tmp_path,
+        store_root=tmp_path / "store",
         send=control.send,
         stamp=fence.stamp,
         stop=threading.Event(),
@@ -196,25 +204,39 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
     )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
     pb_grpc.add_RuntimeWeightsServicer_to_server(_RuntimeWeightsServicer(exchange), server)
+    pb_grpc.add_RuntimePreparationServicer_to_server(
+        _PreparationServicer(
+            None, None, None, None, None, weights_checkpoint_validator=exchange.validate_checkpoint
+        ),
+        server,
+    )
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     channel = grpc.insecure_channel(f"127.0.0.1:{port}")
     stub = pb_grpc.RuntimeWeightsStub(channel)
     try:
-        yield Rig(exchange=exchange, fence=fence, control=control, stub=stub, server=server)
+        yield Rig(
+            exchange=exchange,
+            fence=fence,
+            control=control,
+            stub=stub,
+            server=server,
+            preparation=pb_grpc.RuntimePreparationStub(channel),
+        )
     finally:
         exchange.close()
         channel.close()
         server.stop(grace=0)
 
 
-def _run_intent(rig: Rig, attempt: SimpleNamespace | None = None) -> dict[str, Any]:
+def _run_intent(rig: Rig, attempt: Any = None) -> dict[str, Any]:
     result: dict[str, Any] = {}
+    attempt = _attempt() if attempt is None else attempt
 
     def call() -> None:
         try:
             result["value"] = rig.exchange.intent(
-                _attempt() if attempt is None else attempt,
+                attempt,
                 transaction_id=TRANSACTION,
                 output_slot=OUTPUT_SLOT,
                 declaration_digest=DECLARATION_DIGEST,
@@ -227,6 +249,91 @@ def _run_intent(rig: Rig, attempt: SimpleNamespace | None = None) -> dict[str, A
     thread = threading.Thread(target=call, daemon=True)
     thread.start()
     return {"thread": thread, "result": result}
+
+
+def _restore_request(rig: Rig) -> pb.CheckpointTransferRequest:
+    return pb.CheckpointTransferRequest(
+        record_owner_epoch=rig.fence.record_owner_epoch,
+        worker_boot_id=rig.fence.worker_boot_id,
+        subject=pb.CheckpointSubject(
+            weights=pb.WeightsCheckpointSubject(
+                request_id="req-1",
+                invocation_spec_digest=SPEC_DIGEST,
+                output_slot=OUTPUT_SLOT,
+                weights_transaction_id=TRANSACTION,
+                writer_epoch=8,
+                tensorfs_declaration_digest=DECLARATION_DIGEST,
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "changed", ["owner", "boot", "lane", "spec", "declaration", "slot", "transaction", "epoch"]
+)
+def test_checkpoint_restore_is_bound_to_current_pending_intent(rig: Rig, changed: str) -> None:
+    pending = _run_intent(rig)
+    assert rig.control.signal.wait(WAIT)
+    request = _restore_request(rig)
+    try:
+        with rig.exchange.restore_checkpoint(request) as scope:
+            assert scope == (TRANSACTION, 8)
+        if changed == "owner":
+            request.record_owner_epoch += 1
+        elif changed == "boot":
+            request.worker_boot_id = "other-boot"
+        elif changed == "lane":
+            request.control_stream_epoch = 1
+        elif changed == "spec":
+            request.subject.weights.invocation_spec_digest = b"x" * 32
+        elif changed == "declaration":
+            request.subject.weights.tensorfs_declaration_digest = b"x" * 32
+        elif changed == "slot":
+            request.subject.weights.output_slot = "other"
+        elif changed == "transaction":
+            request.subject.weights.weights_transaction_id = "sha256:" + "b" * 64
+        else:
+            request.subject.weights.writer_epoch = 0
+        with (
+            pytest.raises(weights.WeightsExchangeError, match="weights_checkpoint_scope"),
+            rig.exchange.restore_checkpoint(request),
+        ):
+            pytest.fail("a mismatched restore reached native transfer")
+    finally:
+        rig.exchange.stop.set()
+        pending["thread"].join(WAIT)
+    assert not pending["thread"].is_alive()
+
+
+def test_checkpoint_restore_rechecks_waiter_and_refuses_ambiguous_attempts(rig: Rig) -> None:
+    first = _run_intent(rig)
+    assert rig.control.signal.wait(WAIT)
+    request = _restore_request(rig)
+    second_attempt = _attempt()
+    second_attempt.attempt = 2
+    rig.control.signal.clear()
+    second = _run_intent(rig, second_attempt)
+    assert rig.control.signal.wait(WAIT)
+    try:
+        with (
+            pytest.raises(weights.WeightsExchangeError, match="no unique current intent"),
+            rig.exchange.restore_checkpoint(request),
+        ):
+            pytest.fail("an ambiguous restore reached native transfer")
+        second_attempt.canceling = True
+        second["thread"].join(WAIT)
+        with (
+            pytest.raises(weights.WeightsExchangeError, match="intent ended"),
+            rig.exchange.restore_checkpoint(request) as scope,
+        ):
+            assert scope == (TRANSACTION, 8)
+            rig.exchange.abandon(TRANSACTION)
+        assert not rig.exchange.writer_broker.bindings
+    finally:
+        rig.exchange.stop.set()
+        for pending in (first, second):
+            pending["thread"].join(WAIT)
+            assert not pending["thread"].is_alive()
 
 
 def test_open_exchange_selects_the_lane_and_the_ack_settles_after_a_barrier(rig: Rig) -> None:
@@ -380,3 +487,228 @@ def test_host_cannot_replace_the_runtime_supplied_transaction_id(rig: Rig) -> No
     assert "value" not in pending["result"]
     assert pending["result"]["error"].code == "weights_host_ack_mismatch"
     supervisor.close()
+
+
+def test_protocol_probe_is_static_and_does_not_open_a_store_or_change_fence(rig: Rig) -> None:
+    before = (
+        rig.fence.record_owner_epoch,
+        rig.fence.control_stream_epoch,
+        rig.fence.worker_boot_id,
+    )
+    assert rig.exchange.store_root is not None
+    assert not rig.exchange.store_root.exists()
+    for _ in range(2):
+        info = rig.preparation.ProtocolInfo(pb.ProtocolInfoRequest(), timeout=WAIT)
+        assert (info.minimum_wire_minor, info.wire_minor) == (MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR)
+    assert before == (
+        rig.fence.record_owner_epoch,
+        rig.fence.control_stream_epoch,
+        rig.fence.worker_boot_id,
+    )
+    assert rig.exchange.store_root is not None
+    assert not rig.exchange.store_root.exists()
+    assert not rig.exchange._pending and not rig.exchange.writer_broker.bindings
+
+
+def test_checkpoint_refusal_has_no_writer_authority() -> None:
+    sent = pb.WeightsCheckpointFrame(
+        request_id="request",
+        attempt_ordinal=1,
+        invocation_spec_digest=SPEC_DIGEST,
+        output_slot=OUTPUT_SLOT,
+        weights_transaction_id=TRANSACTION,
+        writer_epoch=9,
+        tensorfs_declaration_digest=DECLARATION_DIGEST,
+    )
+    refused = pb.WeightsHostAck(
+        request_id=sent.request_id,
+        attempt_ordinal=sent.attempt_ordinal,
+        invocation_spec_digest=sent.invocation_spec_digest,
+        output_slot=sent.output_slot,
+        tensorfs_declaration_digest=sent.tensorfs_declaration_digest,
+        stage=pb.WEIGHTS_HOST_STAGE_CHECKPOINT,
+        outcome=pb.WEIGHTS_HOST_OUTCOME_REFUSED,
+        refusal=pb.WEIGHTS_HOST_REFUSAL_STALE_WRITER,
+    )
+    weights.WeightsExchange._validate_ack(refused, sent, pb.WEIGHTS_HOST_STAGE_CHECKPOINT)
+    refused.writer_epoch = sent.writer_epoch
+    with pytest.raises(weights.WeightsExchangeError) as error:
+        weights.WeightsExchange._validate_ack(refused, sent, pb.WEIGHTS_HOST_STAGE_CHECKPOINT)
+    assert error.value.code == "weights_host_ack_invalid"
+
+
+@pytest.mark.parametrize("cancel_during_validation", [False, True])
+def test_restored_native_work_validates_under_pending_intent_without_importing_writer(
+    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_during_validation: bool
+) -> None:
+    original = tensorfs.Store.init(tmp_path / "original")
+    restored = tensorfs.Store.init(rig.exchange.store_root)
+    plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
+    targets = {
+        "model": {
+            "drop": [],
+            "add": {
+                "weight": {
+                    "logical_dtype": "f32",
+                    "shape": [512],
+                    "encoding": plain,
+                    "parts": {"value": {"dtype": "f32", "shape": [512]}},
+                }
+            },
+        }
+    }
+    order = [("model", "weight")]
+    fingerprint = "sha256:" + "65" * 32
+    declaration = original.derived_declaration(
+        {}, targets, {}, order, 2048, work_fingerprint=fingerprint
+    )
+    writer = original.begin_derived(
+        TRANSACTION, 7, {}, targets, {}, order, 2048, work_fingerprint=fingerprint
+    )
+    writer.add_part("model", "weight", "value", io.BytesIO(b"\x31" * 2048))
+    head = writer.checkpoint("req-1", OUTPUT_SLOT)
+    writer.fence()
+    head_id, head_length = head["head"], head["head_length"]
+    plan_digest, head_index, head_bytes = head["plan_digest"], head["index"], head["bytes"]
+    assert isinstance(head_id, str) and isinstance(head_length, int)
+    assert (
+        isinstance(plan_digest, str) and isinstance(head_index, int) and isinstance(head_bytes, int)
+    )
+    tensorfs.transfer_object(original, restored, head_id, head_length)
+    page = original.checkpoint_page(
+        head_id,
+        head_length,
+        operation_id="req-1",
+        slot=OUTPUT_SLOT,
+        plan_digest=plan_digest,
+    )
+    assert page["previous"] is None
+    for obj in page["objects"]:
+        tensorfs.transfer_object(original, restored, obj["object_id"], obj["length"])
+    assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
+
+    supervisor = StandInSupervisor(rig.stub)
+    _await(rig.exchange.exchange_open, "exchange did not open")
+    result: dict[str, Any] = {}
+    attempt = _attempt()
+
+    def intent_call() -> None:
+        try:
+            result["value"] = rig.exchange.intent(
+                attempt,
+                output_slot=OUTPUT_SLOT,
+                transaction_id=TRANSACTION,
+                declaration_digest=sha256(declaration).digest(),
+                declaration=declaration,
+                requested_writer_epoch=0,
+            )
+        except weights.WeightsExchangeError as error:
+            result["error"] = error.code
+
+    pending = threading.Thread(target=intent_call, daemon=True)
+    pending.start()
+    sent = supervisor.next_intent()
+    checkpoint = pb.CheckpointRef(
+        head=pb.Ref(digest=bytes.fromhex(head_id[7:]), length=head_length),
+        plan_digest=bytes.fromhex(plan_digest[7:]),
+        index=head_index,
+        bytes=head_bytes,
+    )
+    ready = pb.WeightsIntentReadyRequest(
+        record_owner_epoch=rig.fence.record_owner_epoch,
+        worker_boot_id=rig.fence.worker_boot_id,
+        attempt_ordinal=sent.attempt_ordinal,
+        weights=pb.WeightsCheckpointSubject(
+            request_id=sent.request_id,
+            invocation_spec_digest=sent.invocation_spec_digest,
+            output_slot=sent.output_slot,
+            weights_transaction_id=sent.weights_transaction_id,
+            writer_epoch=8,
+            tensorfs_declaration_digest=sent.tensorfs_declaration_digest,
+        ),
+        checkpoint=checkpoint,
+    )
+    request = pb.ValidateWeightsCheckpointRequest(
+        intent=ready, tensorfs_declaration_canonical_bytes=declaration
+    )
+    if cancel_during_validation:
+        validated, finish = threading.Event(), threading.Event()
+
+        class DelayedStore:
+            checkpoint_page = restored.checkpoint_page
+
+            def validate_derived_checkpoint(self, *args: Any, **kwargs: Any) -> None:
+                restored.validate_derived_checkpoint(*args, **kwargs)
+                validated.set()
+                assert finish.wait(WAIT), "validation did not finish"
+
+        monkeypatch.setattr(rig.exchange, "_store", DelayedStore)
+        verdict: dict[str, Any] = {}
+
+        def validate() -> None:
+            verdict["value"] = rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
+
+        validating = threading.Thread(target=validate, daemon=True)
+        validating.start()
+        assert validated.wait(WAIT), "native closure was not validated"
+        attempt.canceling = True
+        pending.join(WAIT)
+        finish.set()
+        validating.join(WAIT)
+        assert not pending.is_alive() and not validating.is_alive()
+        assert result == {"error": "weights_host_exchange_canceled"}
+        assert not verdict["value"].valid and verdict["value"].safe_code
+        assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
+        assert not rig.exchange.writer_broker.bindings
+        supervisor.close()
+        return
+    accepted = rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
+    assert accepted.valid and accepted.checkpoint == checkpoint
+    assert pending.is_alive() and result == {}
+    assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
+    assert not rig.exchange.writer_broker.bindings
+    assert supervisor.event_count() == 0  # no periodic intent resend while Ready is delayed
+    for mutation in ("counter", "declaration", "scope"):
+        wrong = pb.ValidateWeightsCheckpointRequest()
+        wrong.CopyFrom(request)
+        if mutation == "counter":
+            wrong.intent.checkpoint.bytes += 1
+        elif mutation == "declaration":
+            wrong.tensorfs_declaration_canonical_bytes += b" "
+        else:
+            wrong.intent.weights.output_slot = "other"
+        refused = rig.preparation.ValidateWeightsCheckpoint(wrong, timeout=WAIT)
+        assert not refused.valid and refused.safe_code
+    ack = _recorded_ack(sent, writer_epoch=8, envelope=rig.fence)
+    ack.checkpoint.CopyFrom(checkpoint)
+    supervisor.ack(ack)
+    pending.join(WAIT)
+    assert not pending.is_alive()
+    assert result["value"]["checkpoint"] == (head["head"], head["head_length"])
+    assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
+    supervisor.close()
+
+
+def test_local_control_host_serves_probe_without_preparation_handlers(tmp_path: Path) -> None:
+    bound = threading.Event()
+    address = tmp_path / "worker.addr"
+    host = GrpcControlHost("127.0.0.1:0", address, on_bound=lambda _: bound.set())
+    plane: Any = SimpleNamespace()
+    thread = threading.Thread(target=host.serve, args=(plane,), daemon=True)
+    thread.start()
+    try:
+        assert bound.wait(WAIT)
+        with grpc.insecure_channel(address.read_text().strip()) as connection:
+            api = pb_grpc.RuntimePreparationStub(connection)
+            info = api.ProtocolInfo(pb.ProtocolInfoRequest(), timeout=WAIT)
+            assert (info.wire_minor, info.minimum_wire_minor) == (
+                WIRE_MINOR,
+                MIN_COMPATIBLE_WIRE_MINOR,
+            )
+            with pytest.raises(grpc.RpcError) as error:
+                api.ValidateWeightsCheckpoint(pb.ValidateWeightsCheckpointRequest(), timeout=WAIT)
+            assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
+        assert list(tmp_path.iterdir()) == [address]
+    finally:
+        host.stop()
+        thread.join(WAIT)

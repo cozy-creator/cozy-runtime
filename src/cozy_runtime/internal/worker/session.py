@@ -59,6 +59,7 @@ from cozy_runtime.internal import (
     hostfacts,
     package_environment,
     proctree,
+    weights_sink,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
@@ -118,7 +119,7 @@ from cozy_runtime.internal.worker.plan import (
     shape_cell,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
@@ -1129,6 +1130,12 @@ class Worker:
             weights=self.weights,
             owner_scope=lambda: self.fence.record_owner_id,
             tensorfs_root=options.tensorfs_root,
+            work_fingerprint=lambda attempt: weights_sink.work_fingerprint(
+                attempt.spec,
+                attempt.job.environment_content_digest if attempt.job else "",
+                self.base,
+                hostfacts.measure(options.accelerator_backend),
+            ),
         )
         self.engine.boot_id = self.fence.worker_boot_id
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
@@ -1797,22 +1804,22 @@ class Worker:
                 self.model_source_operations.add(request.operation_id)
             return result
 
-    def source_checkpoint_page(
-        self, request: pb.SourceCheckpointPageRequest
-    ) -> pb.SourceCheckpointPageResult:
-        from . import model_source_checkpoint
+    def checkpoint_page(self, request: pb.CheckpointPageRequest) -> pb.CheckpointPageResult:
+        from . import checkpoint_transport
 
-        return model_source_checkpoint.page(
+        return checkpoint_transport.page(
             request, tensorfs_root=Path(self.options.tensorfs_root or "")
         )
 
-    def source_checkpoint_transfer(
-        self, request: pb.SourceCheckpointTransferRequest
-    ) -> pb.SourceCheckpointTransferStatus:
-        from . import model_source_checkpoint
+    def checkpoint_transfer(
+        self, request: pb.CheckpointTransferRequest
+    ) -> pb.CheckpointTransferStatus:
+        from . import checkpoint_transport
 
-        return model_source_checkpoint.transfer(
-            request, tensorfs_root=Path(self.options.tensorfs_root or "")
+        return checkpoint_transport.transfer(
+            request,
+            tensorfs_root=Path(self.options.tensorfs_root or ""),
+            restore_scope=self.weights.restore_checkpoint,
         )
 
     def release_model_source(self, operation_id: str) -> None:
@@ -2343,6 +2350,11 @@ class Worker:
             return reject(
                 pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
                 "the bootstrap credential is absent or wrong",
+            )
+        if claim.wire_minor < MIN_COMPATIBLE_WIRE_MINOR:
+            return reject(
+                pb.ClaimRejection.CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE,
+                "peer is below the supported wire compatibility floor",
             )
         if claim.worker_id and claim.worker_id != self.options.worker_id:
             return reject(

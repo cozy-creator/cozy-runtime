@@ -84,9 +84,17 @@ CALLED: dict[str, str] = {
     "Store.complete_cozytensors_manifests": "(self, /)",
     "Store.begin_derived": (
         "(self, /, transaction_id, writer_session_id, sources, targets, configs, order, "
-        "max_new_bytes)"
+        "max_new_bytes, *, work_fingerprint, checkpoint=None)"
     ),
-    "Store.derived_declaration": "(self, /, sources, targets, configs, order, max_new_bytes)",
+    "Store.derived_declaration": (
+        "(self, /, sources, targets, configs, order, max_new_bytes, *, work_fingerprint)"
+    ),
+    "Store.inspect_derived_source": "(self, /, manifest, manifest_length, components, configs)",
+    "Store.validate_derived_checkpoint": (
+        "(self, /, transaction_id, declaration, head_id, head_length, *, "
+        "operation_id, slot, plan_digest)"
+    ),
+    "Store.model_source_operations": "(self, /)",
     "Store.derived_lookup": "(self, /, transaction_id)",
     "Store.derived_fence": "(self, /, transaction_id, writer_session_id)",
     "Store.derived_abandon": "(self, /, transaction_id)",
@@ -98,15 +106,13 @@ CALLED: dict[str, str] = {
         "*, checkpoints=Ellipsis)"
     ),
     "Store.release_model_source": "(self, /, operation_id)",
-    "Store.source_checkpoint_page": (
+    "Store.checkpoint_page": (
         "(self, /, head_id, head_length, *, operation_id, slot, plan_digest, offset=0, limit=128)"
     ),
-    "Store.source_checkpoint_push": (
+    "Store.checkpoint_push": (
         "(self, /, object_id, length, manifest, grant, *, allow_local=False)"
     ),
-    "Store.source_checkpoint_fetch": (
-        "(self, /, object_id, length, manifest, url, *, allow_local=False)"
-    ),
+    "Store.checkpoint_fetch": ("(self, /, object_id, length, manifest, url, *, allow_local=False)"),
     "ReadLease.stream": "(self, /, plan, slots, on_batch, readers=4)",
     "ReadLease.read_into": "(self, /, object, object_length, off, length, into)",
     "ReadLease.read_asset": "(self, /, header, name, max_bytes=67108864)",
@@ -114,6 +120,9 @@ CALLED: dict[str, str] = {
     "DerivedWriter.add_part": "(self, /, component, key, role, reader)",
     "DerivedWriter.add_config": "(self, /, name, reader)",
     "DerivedWriter.commit": "(self, /)",
+    "DerivedWriter.completed_parts": "(self, /)",
+    "DerivedWriter.completed_configs": "(self, /)",
+    "DerivedWriter.checkpoint": "(self, /, operation_id, slot, *, previous=None)",
     "DerivedWriter.fence": "(self, /)",
     "DerivedWriter.source_read_into": "(self, /, source, component, key, role, off, into)",
     "Batch.release": "(self, /)",

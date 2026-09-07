@@ -20,7 +20,7 @@ from cozy_runtime.internal.config import RuntimeConfig, Credentials
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-from cozy_runtime.protocol import documents, worker_pb2 as pb
+from cozy_runtime.protocol import WIRE_MINOR, documents, worker_pb2 as pb
 root=Path(sys.argv[1]); mode=sys.argv[2]; epoch=int(sys.argv[3]); owner=sys.argv[4]
 key=Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
 boot='different-boot' if mode=='wrong-boot' else 'same-pod-boot'
@@ -35,7 +35,7 @@ except LaunchRefusal as exc:
     sys.exit(0)
 try:
     claim=pb.Claim(record_owner_epoch=epoch,record_owner_id=owner,worker_id='fence-proof',
-        worker_boot_id=boot,wire_minor=37)
+        worker_boot_id=boot,wire_minor=37 if mode=='legacy' else WIRE_MINOR)
     transcript=documents.canonical_bytes(pb.ClaimProof(record_owner_epoch=epoch,
         worker_boot_id=boot,worker_id='fence-proof',worker_tls_certificate_digest=b'\xaa'*32))
     claim.proof=key.sign(transcript) if mode!='forged' else bytes(64)
@@ -81,6 +81,7 @@ def test_claim_authority_survives_worker_process_replacement(tmp_path: Path) -> 
         ("stale", 7, "owner-A", "STALE_RECORD_OWNER_EPOCH"),
         ("other", 8, "owner-B", "EPOCH_HELD"),
         ("forged", 99, "owner-C", "UNAUTHENTICATED"),
+        ("legacy", 99, "owner-A", "PROTOCOL_INCOMPATIBLE"),
     ]:
         result = _run(tmp_path, mode, epoch, identity)
         assert not result["accepted"] and result["rejection"] == "CLAIM_REJECTION_" + refusal

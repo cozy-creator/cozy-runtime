@@ -86,6 +86,7 @@ def _writer(store: Any, request: pb.WeightsFinalizeRequest, manifest: str, lengt
         {},
         [("unet", "weight")],
         1 << 20,
+        work_fingerprint="sha256:" + "54" * 32,
     )
 
 
