@@ -1893,6 +1893,11 @@ class Worker:
         self.weights.abandon(request.weights_transaction_id)
         return result
 
+    def collect_store_garbage(self) -> pb.CollectStoreGarbageResult:
+        from . import store_gc
+
+        return store_gc.collect(Path(self.options.tensorfs_root or ""))
+
     def note(self, kind: str, step: str) -> None:
         """The NON-ATTEMPT activity lane: typed, sequence-bearing, on the DURABLE Report —
         never overloaded onto the lossy progress stream."""

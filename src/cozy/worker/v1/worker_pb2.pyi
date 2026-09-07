@@ -757,6 +757,34 @@ class LookupOperationResult(_message.Message):
     consumer_request_id: str
     def __init__(self, computation_digest: _Optional[bytes] = ..., found: bool = ..., source: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., retentions: _Optional[_Iterable[_Union[DerivedRetentionResult, _Mapping]]] = ..., consumer_request_id: _Optional[str] = ...) -> None: ...
 
+class PruneOperationCacheCall(_message.Message):
+    __slots__ = ("claim",)
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
+
+class PruneOperationCacheResult(_message.Message):
+    __slots__ = ("removed_entries", "reclaimed_bytes", "store_busy")
+    REMOVED_ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    RECLAIMED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    STORE_BUSY_FIELD_NUMBER: _ClassVar[int]
+    removed_entries: int
+    reclaimed_bytes: int
+    store_busy: bool
+    def __init__(self, removed_entries: _Optional[int] = ..., reclaimed_bytes: _Optional[int] = ..., store_busy: bool = ...) -> None: ...
+
+class CollectStoreGarbageRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class CollectStoreGarbageResult(_message.Message):
+    __slots__ = ("reclaimed_bytes", "store_busy")
+    RECLAIMED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    STORE_BUSY_FIELD_NUMBER: _ClassVar[int]
+    reclaimed_bytes: int
+    store_busy: bool
+    def __init__(self, reclaimed_bytes: _Optional[int] = ..., store_busy: bool = ...) -> None: ...
+
 class ReleaseModelSourceResult(_message.Message):
     __slots__ = ("operation_id", "released")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]

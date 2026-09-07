@@ -184,6 +184,7 @@ class GrpcControlHost:
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
         ) = None,
         numerical_environment: Callable[[], bytes] | None = None,
+        store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
         weights: RuntimeWeightsHost | None = None,
     ) -> None:
         self.listen = listen
@@ -198,6 +199,7 @@ class GrpcControlHost:
         self.derived_retainer = derived_retainer
         self.derived_result_releaser = derived_result_releaser
         self.numerical_environment = numerical_environment
+        self.store_collector = store_collector
         self.checkpoint_pager = checkpoint_pager
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
@@ -226,6 +228,7 @@ class GrpcControlHost:
             or self.derived_retainer is not None
             or self.derived_result_releaser is not None
             or self.numerical_environment is not None
+            or self.store_collector is not None
             or self.checkpoint_pager is not None
             or self.checkpoint_transfer is not None
             or self.local_package_preparer is not None
@@ -251,6 +254,7 @@ class GrpcControlHost:
                 self.derived_retainer,
                 self.derived_result_releaser,
                 self.numerical_environment,
+                self.store_collector,
             ),
             self.server,
         )
@@ -373,6 +377,7 @@ class _PreparationServicer:
         ]
         | None = None,
         numerical_environment: Callable[[], bytes] | None = None,
+        store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
     ) -> None:
         self.compatibility_handler = compatibility_handler
         self.package_handler = package_handler
@@ -386,6 +391,7 @@ class _PreparationServicer:
         self.derived_retainer = derived_retainer
         self.derived_result_releaser = derived_result_releaser
         self.numerical_environment = numerical_environment
+        self.store_collector = store_collector
 
     def ProtocolInfo(
         self, _request: pb.ProtocolInfoRequest, _context: Any
@@ -495,6 +501,18 @@ class _PreparationServicer:
 
     def RetainDerivedResult(self, request: pb.DerivedRetentionRequest, context: Any) -> Any:
         return self._derived_retention(request, context, False)
+
+    def CollectStoreGarbage(self, _request: pb.CollectStoreGarbageRequest, context: Any) -> Any:
+        import grpc
+
+        if self.store_collector is None:
+            return context.abort(grpc.StatusCode.UNIMPLEMENTED, "store collection is unavailable")
+        try:
+            return self.store_collector()
+        except Exception:
+            return context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "store collection was refused"
+            )
 
     def ReleaseDerivedResult(self, request: pb.DerivedResultReleaseRequest, context: Any) -> Any:
         import grpc
