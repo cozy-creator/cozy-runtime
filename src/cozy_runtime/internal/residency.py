@@ -391,7 +391,7 @@ class ComponentResidency:
             # headroom, the answer is a typed shortfall with nothing to undo — the executor
             # stays Ready and the ladder chooses a deeper rung. Past this line, a failure is
             # a surprise the arithmetic did not predict, and surprises poison.
-            if not self._fits(self._size(name) + headroom):
+            if not self._fits(self.backend.stage_bytes(name, headroom)):
                 refusal = self._shortfall(
                     method,
                     name,
@@ -490,8 +490,8 @@ class ComponentResidency:
         that promise — while this is the worker's decision, between attempts, about whose
         weights hold the card; the seat guarantees no scope is active here. Two things do
         not bend for it: the completion fence (a component a kernel may still be reading
-        stays, and is reported as held) and the encoded-leaf refusal (a component this
-        build cannot re-stage is never freed, for the reason `evict` gives). Eviction
+        stays, and is reported as held) and the original module topology needed for
+        checkpoint refill after encoded-leaf eviction. Eviction
         FREES — weights are immutable, there is no copy-out — and the next admission on
         this generation re-stages from the store like any other.
         """
@@ -607,7 +607,7 @@ class ComponentResidency:
                 held[name] = "this generation has no checkpoint for it"
                 continue
             size = self._size(name)
-            if not self._fits(size):
+            if not self._fits(self.backend.stage_bytes(name)):
                 # Measured, before a byte moves, against the SAME meter admission uses.
                 held[name] = "the device has no room for it without evicting a neighbour"
                 continue
@@ -745,13 +745,13 @@ class ComponentResidency:
         rung this frees just enough for what is being admitted, and a component the CURRENT
         method declares is never a victim of its own admission.
         """
-        need = self._size(wanted)
+        need = self.backend.stage_bytes(wanted, headroom)
         if self.placement == "all_resident":
             # The rung that promised everything fits does not free anything to keep the
             # promise. If a component is not resident under it, admission checks the room
             # that is actually there and a shortage is a typed refusal with numbers.
             return
-        while not self._fits(need + headroom):
+        while not self._fits(need):
             victim = self._victim(declared)
             if victim is None:
                 return  # nothing left to give; the pre-mutation check refuses with numbers
@@ -810,12 +810,17 @@ class ComponentResidency:
         rows = accel.allocation(self.torch, self.kind)
         free, total = rows["driver_free_bytes"], rows["driver_total_bytes"]
         allocatable = int(free) + max(int(rows["reserved_bytes"]) - int(rows["allocated_bytes"]), 0)
-        required = int(need) + headroom
+        required = (
+            self.backend.stage_bytes(name, headroom)
+            if needed_weight_bytes is None
+            else int(need) + headroom
+        )
         resident = {n: self.backend.vram_charge.get(n, 0) for n in self.backend.components}
         return ResidencyRefusal(
             "device_shortfall",
-            f"{method}() declares component {name!r} needing {need} B plus "
-            f"{headroom} B of scope headroom; {allocatable} B are allocatable "
+            f"{method}() declares component {name!r} requiring {required} B at admission "
+            f"({need} B of weights, {headroom} B of forward headroom, including overlapping "
+            f"fill storage); {allocatable} B are allocatable "
             f"({free} B driver-free of {total} B) with {sorted(resident)} resident, short by "
             f"{max(required - allocatable, 0)} B. Every evictable component was already freed, so "
             "this is a capacity fact, not an allocation to retry - the ladder chooses a "
