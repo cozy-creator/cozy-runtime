@@ -2021,6 +2021,20 @@ class Executor:
                     f"job Model parameter {parameter!r} has a noncanonical Manifest ref",
                     code="job_model_manifest_invalid",
                 )
+            if (
+                surface.invocable
+                and (artifact := command.get("payload", {}).get(parameter)) is not None
+            ):
+                expected = artifact.get("manifest") if isinstance(artifact, Mapping) else None
+                if (
+                    not isinstance(expected, Mapping)
+                    or expected.get("digest") != manifest
+                    or expected.get("length") != length
+                ):
+                    raise CapabilityError(
+                        "model call artifact differs from its admitted native input",
+                        code="model_artifact_binding",
+                    )
             try:
                 held = store.manifest(manifest)
                 if len(bytes(held["manifest"])) != length:
@@ -2040,10 +2054,10 @@ class Executor:
         is not a second runtime, it is the one attempt kernel with a different service set
         and no serving loop underneath it. The three differences from `invoke`, out loud:
 
-        1. **No prepared generation is required.** A job with no Model parameter never
-           imports torch in this process at all — a CPU-class conversion job pays no CUDA
-           init and holds no device. A job Model is a typed, derive-only exact Manifest
-           capability: no Loader construction, component state, or serving residency exists.
+        1. **No prepared generation is required.** The admitted slot's device count
+           determines accelerator initialization. A CPU job imports no Torch and opens no
+           CUDA context; a GPU transform can use its device without constructing an
+           inference model. A job Model remains a derive-only Manifest capability.
         2. **Job services are injected**: a resumable Scratch tree keyed on the RUN, the
            durable checkpoint exchange, and the typed budget facts.
         3. **Quiescence is proven by what exists.** A torch-free job has no stream that
@@ -2051,6 +2065,14 @@ class Executor:
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        budget = command.get("budget") or {}
+        if int(budget.get("gpu_count", 0)) > 0:
+            import torch
+
+            self.torch = torch
+            refused = self._initialize_device(torch)
+            if refused is not None:
+                return refused
         if self.discovered is None:
             try:
                 self._discover_provisioned(
@@ -2253,7 +2275,6 @@ class Executor:
                 replayed=bool(answer.get("replayed", False)),
             )
 
-        budget = command.get("budget") or {}
         started = time.perf_counter()
         started_wall = time.time()
         if self.torch is not None:
@@ -2265,6 +2286,7 @@ class Executor:
                 request_id=command["request_id"],
                 spool=spool,
                 deadline=_deadline(command["deadline_s"]),
+                calls=self._call_broker(command),
                 device=self._device() if self.torch is not None else Device(),
                 cancel=lambda: _cancelled(self.root, command["request_id"]),
                 models=job_models,
@@ -2335,6 +2357,55 @@ class Executor:
                 "gpu_count": 1 if self.torch is not None else 0,
             },
         }
+
+    def _call_broker(self, command: Mapping[str, Any]) -> Any:
+        from cozy_runtime.author._calls import _Broker, _CallType
+
+        rows = command.get("call_interfaces") or []
+        if not rows:
+            return None
+        if not isinstance(rows, list) or len(rows) > 256:
+            raise CapabilityError(
+                "call interface inventory exceeds its bound", code="child_interface"
+            )
+        bindings: dict[tuple[str, str, str], _CallType] = {}
+        for row in rows:
+            interface, module, export = row["interface_digest"], row["module"], row["export"]
+            if row.get("self"):
+                assert self.discovered is not None
+                surface = next(
+                    (
+                        surface
+                        for surface in self.discovered.surfaces
+                        if surface.invocable
+                        and surface.fn.__module__ == module
+                        and surface.fn.__name__ == export
+                    ),
+                    None,
+                )
+                if surface is None:
+                    raise CapabilityError(
+                        "self call is not a registered App export", code="child_interface"
+                    )
+                binding = _CallType(
+                    interface, module, export, surface.payload_type, surface.result_type
+                )
+                bindings[("", module, export)] = binding
+            else:
+                imported = importlib.import_module(module)
+                candidate = getattr(imported, "__cozy_bindings__", {}).get(export)
+                if not isinstance(candidate, _CallType) or (
+                    candidate.interface_digest,
+                    candidate.module,
+                    candidate.export,
+                ) != (interface, module, export):
+                    raise CapabilityError(
+                        "imported interface differs from the admitted closure",
+                        code="child_interface",
+                    )
+                binding = candidate
+            bindings[(interface, module, export)] = binding
+        return _Broker(str(command["request_id"]), bindings, self._durable)
 
     def _durable(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
         """One DURABLE mid-attempt exchange. Blocks until the worker answers.

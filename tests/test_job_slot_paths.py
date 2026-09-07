@@ -199,7 +199,7 @@ def test_a_job_shaped_selection_prepares(
     assert placement["entrypoints"] == []
     assert [row["repo"] for row in placement["models"]] == [PACKAGE]
     # The job plan the JobDirective will resolve against exists.
-    assert len(list((tmp_path / "job-plans").glob("*.json"))) == 1
+    assert len(list((tmp_path / "job-plans").glob("*/*.json"))) == 1
 
 
 def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(

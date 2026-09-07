@@ -96,7 +96,7 @@ def _committed(tmp_path: Path) -> tuple[pb.WeightsFinalizeRequest, Path, Any]:
     request = _request()
     facts = _writer(store, request, manifest, length).commit()
     receipt = weights_sink.WeightsTransactionHost._wrap(
-        "model", _transaction(request), facts, replayed=True
+        "model", _transaction(request), facts, replayed=True, request_id=request.request_id
     )
     _ref, _bytes, digest = weights_sink.protocol_receipt(
         receipt,
@@ -224,7 +224,7 @@ def test_abandon_drops_upload_lease_and_late_receipt_cannot_reopen_it(tmp_path: 
     request, root, store = _committed(tmp_path)
     facts = store.derived_lookup(_transaction(request))["receipt"]
     receipt = weights_sink.WeightsTransactionHost._wrap(
-        "model", _transaction(request), facts, replayed=True
+        "model", _transaction(request), facts, replayed=True, request_id=request.request_id
     )
     reference, _raw, _digest = weights_sink.protocol_receipt(
         receipt,

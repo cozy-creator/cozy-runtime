@@ -150,7 +150,7 @@ def _separation(surface: Surface) -> None:
             "Outputs/publishes path",
             code="mixed_weights_outputs",
         )
-    if surface.weights_outputs and not surface.model_bindings:
+    if surface.weights_outputs and not surface.model_bindings and not surface.invocable:
         raise ConformanceError(
             f"{surface.name}: WeightsSink derives from exact typed model inputs, but this job "
             "declares none",
@@ -162,6 +162,11 @@ def check(surface: Surface) -> Surface:
     """Every build-time refusal that needs the WHOLE surface, not just one signature."""
     assert_declaration_shape(surface.payload_type)
     assert_declaration_shape(surface.result_type)
+    if surface.reusable and surface.capabilities & {"egress", "secrets"}:
+        raise ConformanceError(
+            "a reusable invocable cannot depend on external egress or unrecorded secrets",
+            code="invocable_reusable_effect",
+        )
     specs = feature_specs(surface.payload_type)
     _grantable(surface)
     _separation(surface)

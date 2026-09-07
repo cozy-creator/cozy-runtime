@@ -14,6 +14,7 @@ fakes live in `cozy_runtime.author.fakes`.
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._app import App, Registration, RegistrationError
+from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._assets import (
     Asset,
     AudioAsset,
@@ -22,6 +23,7 @@ from cozy_runtime.author._assets import (
     Tree,
     VideoAsset,
 )
+from cozy_runtime.author._calls import ChildCallError, invocable
 from cozy_runtime.author._context import (
     AdapterRef,
     Context,
@@ -104,6 +106,7 @@ from cozy_runtime.author._model import (
     uses_components,
 )
 from cozy_runtime.author._probe import probe_activations
+from cozy_runtime.author._script import ScriptContext, script_app
 from cozy_runtime.author._services import (
     JOB_ONLY,
     SERVING_ONLY,
@@ -169,6 +172,7 @@ __all__ = [
     "CheckpointSave",
     "CheckpointSinkUnbuilt",
     "Checkpoints",
+    "ChildCallError",
     "Clamp",
     "Config",
     "ConformanceError",
@@ -204,6 +208,7 @@ __all__ = [
     "MediaDecodeError",
     "MediaDecoder",
     "Model",
+    "ModelArtifact",
     "ModelAssets",
     "ModelBinding",
     "ModelDefault",
@@ -211,6 +216,7 @@ __all__ = [
     "ModelRegistry",
     "ModelTestHarness",
     "ModuleLike",
+    "ObjectRef",
     "Outcome",
     "OutputError",
     "Outputs",
@@ -228,6 +234,7 @@ __all__ = [
     "Scheduler",
     "ScopeCall",
     "Scratch",
+    "ScriptContext",
     "Secrets",
     "Settings",
     "Shape",
@@ -254,11 +261,13 @@ __all__ = [
     "classify",
     "decode_request",
     "describe",
+    "invocable",
     "invoke",
     "prepare",
     "probe_activations",
     "register_adapter",
     "registered_adapters",
+    "script_app",
     "sequence_parallel",
     "uses_components",
 ]

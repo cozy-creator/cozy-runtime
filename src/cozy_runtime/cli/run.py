@@ -17,7 +17,7 @@ import json
 import shutil
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -276,7 +276,10 @@ def run(
     # serving imports its wheel from the provisioned environment and never enters this path.
     with contextlib.chdir(project), contextlib.redirect_stdout(sys.stderr):
         outcome = run_slice(
-            config,
+            # This worker and its executable plans belong to this one output
+            # workspace. Another CLI invocation may use a different interpreter
+            # or metadata path for the same source revision.
+            replace(config, cozy_home=workspace / "home"),
             request,
             job_records=job_records,
             workspace=workspace,

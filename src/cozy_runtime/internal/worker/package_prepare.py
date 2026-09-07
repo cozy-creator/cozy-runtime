@@ -6,7 +6,6 @@ import contextlib
 import copy
 import hashlib
 import importlib.metadata
-import json
 import os
 import re
 import stat
@@ -963,7 +962,7 @@ def prepare_package(
     _stage_job_plans(
         interface_body,
         root=job_plan_root,
-        build_id=project.digest,
+        build_id=documents.spell(development.local_revision_digest),
         interface_path=artifact_cache / interface_ref[0].removeprefix("sha256:"),
         installed=installed,
     )
@@ -1236,6 +1235,9 @@ def _stage_job_plans(
     if root.is_symlink() or not root.is_dir():
         raise PreparationRefusal("package_prepare_job_plan_root_invalid", str(root))
     application = str(body.get("application", ""))
+    from cozy_runtime.internal import installed_interfaces
+
+    call_interfaces = installed_interfaces.read(installed)
     staged: set[str] = set()
     for row in selected:
         name = str(row.get("name", ""))
@@ -1254,11 +1256,11 @@ def _stage_job_plans(
             "cap_micro_usd": 0,
             "reclaim_on_terminal": True,
         }
-        target = root / f"{descriptor_id.removeprefix('sha256:')}.json"
-        temporary = root / f".stage-{uuid.uuid4().hex}"
-        temporary.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")))
-        temporary.chmod(0o444)
-        temporary.replace(target)
+        if call_interfaces:
+            record["call_interfaces"] = call_interfaces
+        from cozy_runtime.internal import job_plan
+
+        job_plan.write(root, record)
         staged.add(descriptor_id)
     return staged
 

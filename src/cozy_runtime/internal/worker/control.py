@@ -161,6 +161,12 @@ class GrpcControlHost:
             Callable[[pb.PrepareModelSourceRequest], pb.PrepareModelSourceResult] | None
         ) = None,
         model_source_releaser: Callable[[str], None] | None = None,
+        derived_retainer: Callable[[pb.DerivedRetentionRequest, bool], pb.DerivedRetentionResult]
+        | None = None,
+        derived_result_releaser: Callable[
+            [pb.DerivedResultReleaseRequest], pb.DerivedResultReleaseResult
+        ]
+        | None = None,
         checkpoint_pager: (
             Callable[[pb.CheckpointPageRequest], pb.CheckpointPageResult] | None
         ) = None,
@@ -177,6 +183,8 @@ class GrpcControlHost:
         private_placement_preparer: (
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
         ) = None,
+        numerical_environment: Callable[[], bytes] | None = None,
+        store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
         weights: RuntimeWeightsHost | None = None,
     ) -> None:
         self.listen = listen
@@ -188,6 +196,10 @@ class GrpcControlHost:
         self.preparer = preparer
         self.model_source_preparer = model_source_preparer
         self.model_source_releaser = model_source_releaser
+        self.derived_retainer = derived_retainer
+        self.derived_result_releaser = derived_result_releaser
+        self.numerical_environment = numerical_environment
+        self.store_collector = store_collector
         self.checkpoint_pager = checkpoint_pager
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
@@ -213,6 +225,10 @@ class GrpcControlHost:
             or self.preparer is not None
             or self.model_source_preparer is not None
             or self.model_source_releaser is not None
+            or self.derived_retainer is not None
+            or self.derived_result_releaser is not None
+            or self.numerical_environment is not None
+            or self.store_collector is not None
             or self.checkpoint_pager is not None
             or self.checkpoint_transfer is not None
             or self.local_package_preparer is not None
@@ -235,6 +251,10 @@ class GrpcControlHost:
                 self.checkpoint_transfer,
                 self.weights_checkpoint_validator,
                 self.model_source_releaser,
+                self.derived_retainer,
+                self.derived_result_releaser,
+                self.numerical_environment,
+                self.store_collector,
             ),
             self.server,
         )
@@ -350,6 +370,14 @@ class _PreparationServicer:
             | None
         ) = None,
         model_source_releaser: Callable[[str], None] | None = None,
+        derived_retainer: Callable[[pb.DerivedRetentionRequest, bool], pb.DerivedRetentionResult]
+        | None = None,
+        derived_result_releaser: Callable[
+            [pb.DerivedResultReleaseRequest], pb.DerivedResultReleaseResult
+        ]
+        | None = None,
+        numerical_environment: Callable[[], bytes] | None = None,
+        store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
     ) -> None:
         self.compatibility_handler = compatibility_handler
         self.package_handler = package_handler
@@ -360,6 +388,10 @@ class _PreparationServicer:
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
         self.model_source_releaser = model_source_releaser
+        self.derived_retainer = derived_retainer
+        self.derived_result_releaser = derived_result_releaser
+        self.numerical_environment = numerical_environment
+        self.store_collector = store_collector
 
     def ProtocolInfo(
         self, _request: pb.ProtocolInfoRequest, _context: Any
@@ -368,6 +400,23 @@ class _PreparationServicer:
             wire_minor=WIRE_MINOR,
             minimum_wire_minor=MIN_COMPATIBLE_WIRE_MINOR,
         )
+
+    def NumericalEnvironment(self, _request: pb.NumericalEnvironmentRequest, context: Any) -> Any:
+        import grpc
+
+        if self.numerical_environment is None:
+            return context.abort(
+                grpc.StatusCode.UNIMPLEMENTED, "numerical environment is unavailable"
+            )
+        try:
+            digest = self.numerical_environment()
+            if len(digest) != 32:
+                raise ValueError("invalid numerical identity")
+            return pb.NumericalEnvironmentResult(digest=digest)
+        except Exception:
+            return context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "numerical environment identity is unproven"
+            )
 
     def ValidateWeightsCheckpoint(
         self, request: pb.ValidateWeightsCheckpointRequest, context: Any
@@ -449,6 +498,52 @@ class _PreparationServicer:
         except Exception:
             return context.abort(grpc.StatusCode.FAILED_PRECONDITION, "source release was refused")
         return pb.ReleaseModelSourceResult(operation_id=request.operation_id, released=True)
+
+    def RetainDerivedResult(self, request: pb.DerivedRetentionRequest, context: Any) -> Any:
+        return self._derived_retention(request, context, False)
+
+    def CollectStoreGarbage(self, _request: pb.CollectStoreGarbageRequest, context: Any) -> Any:
+        import grpc
+
+        if self.store_collector is None:
+            return context.abort(grpc.StatusCode.UNIMPLEMENTED, "store collection is unavailable")
+        try:
+            return self.store_collector()
+        except Exception:
+            return context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "store collection was refused"
+            )
+
+    def ReleaseDerivedResult(self, request: pb.DerivedResultReleaseRequest, context: Any) -> Any:
+        import grpc
+
+        if self.derived_result_releaser is None:
+            return context.abort(
+                grpc.StatusCode.UNIMPLEMENTED, "derived result release is unavailable"
+            )
+        try:
+            return self.derived_result_releaser(request)
+        except Exception:
+            return context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "derived result release was refused"
+            )
+
+    def ReleaseDerivedRetention(self, request: pb.DerivedRetentionRequest, context: Any) -> Any:
+        return self._derived_retention(request, context, True)
+
+    def _derived_retention(
+        self, request: pb.DerivedRetentionRequest, context: Any, release: bool
+    ) -> Any:
+        import grpc
+
+        if self.derived_retainer is None:
+            return context.abort(grpc.StatusCode.UNIMPLEMENTED, "derived retention is unavailable")
+        try:
+            return self.derived_retainer(request, release)
+        except Exception:
+            return context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "derived retention was refused"
+            )
 
     def PrepareLocalPackage(self, request: pb.PrepareLocalPackageRequest, context: Any) -> Any:
         handler = self.local_package_handler

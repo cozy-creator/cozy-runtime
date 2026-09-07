@@ -173,6 +173,11 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
                 _registered_method=True)
+        self.NumericalEnvironment = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/NumericalEnvironment',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
+                _registered_method=True)
         self.CheckPackageSetCompatibility = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
@@ -192,6 +197,26 @@ class RuntimePreparationStub(object):
                 '/cozy.worker.v1.RuntimePreparation/ReleaseModelSource',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.FromString,
+                _registered_method=True)
+        self.RetainDerivedResult = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/RetainDerivedResult',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+                _registered_method=True)
+        self.ReleaseDerivedRetention = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/ReleaseDerivedRetention',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+                _registered_method=True)
+        self.ReleaseDerivedResult = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/ReleaseDerivedResult',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
+                _registered_method=True)
+        self.CollectStoreGarbage = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/CollectStoreGarbage',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CollectStoreGarbageRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CollectStoreGarbageResult.FromString,
                 _registered_method=True)
         self.ValidateWeightsCheckpoint = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/ValidateWeightsCheckpoint',
@@ -236,6 +261,12 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def NumericalEnvironment(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def CheckPackageSetCompatibility(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -255,6 +286,30 @@ class RuntimePreparationServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ReleaseModelSource(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RetainDerivedResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseDerivedRetention(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseDerivedResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CollectStoreGarbage(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -298,6 +353,11 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.SerializeToString,
             ),
+            'NumericalEnvironment': grpc.unary_unary_rpc_method_handler(
+                    servicer.NumericalEnvironment,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.SerializeToString,
+            ),
             'CheckPackageSetCompatibility': grpc.unary_unary_rpc_method_handler(
                     servicer.CheckPackageSetCompatibility,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.FromString,
@@ -317,6 +377,26 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.ReleaseModelSource,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.SerializeToString,
+            ),
+            'RetainDerivedResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.RetainDerivedResult,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.SerializeToString,
+            ),
+            'ReleaseDerivedRetention': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseDerivedRetention,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.SerializeToString,
+            ),
+            'ReleaseDerivedResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseDerivedResult,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.SerializeToString,
+            ),
+            'CollectStoreGarbage': grpc.unary_unary_rpc_method_handler(
+                    servicer.CollectStoreGarbage,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CollectStoreGarbageRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CollectStoreGarbageResult.SerializeToString,
             ),
             'ValidateWeightsCheckpoint': grpc.unary_unary_rpc_method_handler(
                     servicer.ValidateWeightsCheckpoint,
@@ -378,6 +458,33 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/ProtocolInfo',
             cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def NumericalEnvironment(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/NumericalEnvironment',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -486,6 +593,114 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/ReleaseModelSource',
             cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceRequest.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RetainDerivedResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/RetainDerivedResult',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseDerivedRetention(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/ReleaseDerivedRetention',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseDerivedResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/ReleaseDerivedResult',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CollectStoreGarbage(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/CollectStoreGarbage',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CollectStoreGarbageRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CollectStoreGarbageResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -803,6 +1018,11 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
                 _registered_method=True)
+        self.NumericalEnvironment = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/NumericalEnvironment',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
+                _registered_method=True)
         self.PreparePackageSet = channel.unary_stream(
                 '/cozy.worker.v1.PodHost/PreparePackageSet',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.SerializeToString,
@@ -832,6 +1052,41 @@ class PodHostStub(object):
                 '/cozy.worker.v1.PodHost/ModelSourceRelease',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceReleaseCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.FromString,
+                _registered_method=True)
+        self.ModelSourceControl = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ModelSourceControl',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlResult.FromString,
+                _registered_method=True)
+        self.RetainDerivedResult = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/RetainDerivedResult',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+                _registered_method=True)
+        self.ReleaseDerivedRetention = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ReleaseDerivedRetention',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+                _registered_method=True)
+        self.ReleaseDerivedResult = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ReleaseDerivedResult',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
+                _registered_method=True)
+        self.RecordOperationResult = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/RecordOperationResult',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultResult.FromString,
+                _registered_method=True)
+        self.LookupOperation = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/LookupOperation',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationResult.FromString,
+                _registered_method=True)
+        self.PruneOperationCache = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/PruneOperationCache',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheResult.FromString,
                 _registered_method=True)
         self.ModelSourceAdopt = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/ModelSourceAdopt',
@@ -911,6 +1166,12 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def NumericalEnvironment(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def PreparePackageSet(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -942,6 +1203,48 @@ class PodHostServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ModelSourceRelease(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ModelSourceControl(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RetainDerivedResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseDerivedRetention(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseDerivedResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RecordOperationResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def LookupOperation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PruneOperationCache(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -1003,6 +1306,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.SerializeToString,
             ),
+            'NumericalEnvironment': grpc.unary_unary_rpc_method_handler(
+                    servicer.NumericalEnvironment,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.SerializeToString,
+            ),
             'PreparePackageSet': grpc.unary_stream_rpc_method_handler(
                     servicer.PreparePackageSet,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.FromString,
@@ -1032,6 +1340,41 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.ModelSourceRelease,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceReleaseCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.SerializeToString,
+            ),
+            'ModelSourceControl': grpc.unary_unary_rpc_method_handler(
+                    servicer.ModelSourceControl,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlResult.SerializeToString,
+            ),
+            'RetainDerivedResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.RetainDerivedResult,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.SerializeToString,
+            ),
+            'ReleaseDerivedRetention': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseDerivedRetention,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.SerializeToString,
+            ),
+            'ReleaseDerivedResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseDerivedResult,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.SerializeToString,
+            ),
+            'RecordOperationResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.RecordOperationResult,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultResult.SerializeToString,
+            ),
+            'LookupOperation': grpc.unary_unary_rpc_method_handler(
+                    servicer.LookupOperation,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationResult.SerializeToString,
+            ),
+            'PruneOperationCache': grpc.unary_unary_rpc_method_handler(
+                    servicer.PruneOperationCache,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheResult.SerializeToString,
             ),
             'ModelSourceAdopt': grpc.unary_unary_rpc_method_handler(
                     servicer.ModelSourceAdopt,
@@ -1126,6 +1469,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/ProtocolInfo',
             cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def NumericalEnvironment(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/NumericalEnvironment',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1288,6 +1658,195 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/ModelSourceRelease',
             cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceReleaseCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ModelSourceControl(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ModelSourceControl',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RetainDerivedResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/RetainDerivedResult',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseDerivedRetention(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ReleaseDerivedRetention',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseDerivedResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ReleaseDerivedResult',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RecordOperationResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/RecordOperationResult',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def LookupOperation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/LookupOperation',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PruneOperationCache(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/PruneOperationCache',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PruneOperationCacheResult.FromString,
             options,
             channel_credentials,
             insecure,

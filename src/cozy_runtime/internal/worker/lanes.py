@@ -324,6 +324,7 @@ class LaneSet:
     entries: tuple[str, ...]
     lanes: tuple[DeviceLane, ...]
     envelope: DeviceLane
+    orchestration: DeviceLane
     worker_pid: int
     by_id: dict[str, DeviceLane] = field(default_factory=dict)
     #: moves on every fuse and split: the seat set changed meaning (`admission_epoch`)
@@ -339,13 +340,19 @@ class LaneSet:
         envelope = DeviceLane(
             ENVELOPE_LANE, tuple(range(len(entries))), ",".join(entries), worker_pid=worker_pid
         )
-        by_id = {lane.lane_id: lane for lane in (*lanes, envelope)}
+        orchestration = DeviceLane("orchestration", (), "", worker_pid=worker_pid)
+        by_id = {lane.lane_id: lane for lane in (*lanes, envelope, orchestration)}
         return cls(
-            entries=entries, lanes=lanes, envelope=envelope, worker_pid=worker_pid, by_id=by_id
+            entries=entries,
+            lanes=lanes,
+            envelope=envelope,
+            orchestration=orchestration,
+            worker_pid=worker_pid,
+            by_id=by_id,
         )
 
     def __iter__(self) -> Iterator[DeviceLane]:
-        return iter((*self.lanes, self.envelope))
+        return iter((*self.lanes, self.envelope, self.orchestration))
 
     def __len__(self) -> int:
         return len(self.lanes)

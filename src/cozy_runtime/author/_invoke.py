@@ -32,7 +32,9 @@ from typing import Any, get_args, get_type_hints
 import msgspec
 
 from cozy_runtime.author._app import Registration
+from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import Asset, GrantedInput, Tree, bind, bind_tree
+from cozy_runtime.author._calls import _Broker, _current
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import MediaDecoder
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
@@ -129,6 +131,7 @@ class Invocation:
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
     observations alike. Best-effort, never authoritative."""
+    calls: _Broker | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,7 +235,17 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)
 
     attempt.entered = True
-    result = _call(surface, kwargs)
+    if inv.calls is not None:
+        inv.calls.bind(ctx)
+    token = _current.set(inv.calls)
+    try:
+        result = _call(surface, kwargs)
+        if inv.calls is not None:
+            inv.calls.finish()
+    finally:
+        if inv.calls is not None:
+            inv.calls.closed = True
+        _current.reset(token)
 
     _validate_result(surface, result, attempt)
     attempt.closed = True
@@ -607,10 +620,23 @@ def _inject(
             kwargs[param.name] = ctx
         elif param.role == "payload":
             kwargs[param.name] = overlay.payload
+        elif param.role == "wire":
+            kwargs[param.name] = getattr(overlay.payload, param.name)
         elif param.role == "preflight":
             kwargs[param.name] = facts
         elif param.role == "model":
-            kwargs[param.name] = _model(param, inv)
+            model = _model(param, inv)
+            artifact = getattr(overlay.payload, param.name, None) if surface.invocable else None
+            if artifact is not None and (
+                not isinstance(artifact, ModelArtifact)
+                or getattr(model, "checkpoint_ref", "") != artifact.manifest.digest
+            ):
+                raise InvalidRequest(
+                    "bound model differs from the exact call artifact",
+                    code="model_artifact_binding",
+                    fields=[param.name],
+                )
+            kwargs[param.name] = model
         else:
             kwargs[param.name] = _service(param, attempt, ctx, inv, surface)
     return kwargs
@@ -699,6 +725,13 @@ def _call(surface: Surface, kwargs: Mapping[str, object]) -> object:
         assert asyncio.iscoroutine(coroutine)
         return loop.run_until_complete(coroutine)
     finally:
+        if (broker := _current.get()) is not None:
+            broker.closed = True
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
 
 
