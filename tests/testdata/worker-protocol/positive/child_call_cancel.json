@@ -1,0 +1,11 @@
+{
+  "child_call_cancel": {
+    "control_stream_epoch": "7",
+    "intent_digest": "Bl1XJaQGEecTq9OH92grHme+Q3c/J8bFcT/oj4MsR+I=",
+    "parent_attempt_ordinal": "2",
+    "parent_invocation_spec_digest": "4YF+AkSRDFHA+5U0oMZuqECkdlOQQ+5nhJ7+UuKBEM8=",
+    "parent_request_id": "private-parent",
+    "record_owner_epoch": "41",
+    "worker_boot_id": "boot-9f21"
+  }
+}

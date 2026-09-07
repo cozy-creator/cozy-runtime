@@ -1,0 +1,38 @@
+{
+  "claim": {
+    "proof": "vmk8UxWZPLMWKYRxYpNpUTXPtw4XnOimNzOdIGtzEp1Q52hCl8/nvnLMA76sQZ54/j2eCPIgsOVi8OgtANovXg==",
+    "record_owner_epoch": "41",
+    "record_owner_id": "rec-owner-local-1",
+    "wire_minor": 41,
+    "worker_boot_id": "boot-9f21",
+    "worker_id": "wrk-4070"
+  },
+  "request": {
+    "attempt_ordinal": "1",
+    "grant_revision": "1",
+    "invocation_spec_digest": "KsHXfr+62asi7rDyRNsqmmd58dGR6zc1symZivYwhBQ=",
+    "operation_id": "publish-job-01HQX-model-834db85608fd",
+    "output_slot": "model",
+    "record_owner_epoch": "41",
+    "request_id": "job-01HQX",
+    "upload_grant": {
+      "expires_at_unix": "2100000000",
+      "length": "22",
+      "object_id": "sha256:834db85608fd190bc37154aaa7cda1a5663f30f5af07a402ed0a15472d72574f",
+      "required_headers": [
+        {
+          "name": "if-none-match",
+          "value": "*"
+        },
+        {
+          "name": "x-amz-checksum-sha256",
+          "value": "g024Vgj9GQvDcVSqp82hpWY/MPWvB6QC7QoVRy1yV08="
+        }
+      ],
+      "url": "https://objects.example/repo-cas/834db85608fd190bc37154aaa7cda1a5663f30f5af07a402ed0a15472d72574f?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=fixture%2F20260830%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260830T120000Z&X-Amz-Expires=900&X-Amz-Signature=1111111111111111111111111111111111111111111111111111111111111111&X-Amz-SignedHeaders=host%3Bif-none-match%3Bx-amz-checksum-sha256"
+    },
+    "weights_receipt_digest": "2vX5RCvRzyKzvB+UhLf/QLP5HAkEnYGu1LG5smNN6Gk=",
+    "weights_transaction_id": "sha256:e5f8e5571ae52f071dd1b586ad320e82f73afbb03302ac9b65273bccaa7407fb",
+    "worker_boot_id": "boot-9f21"
+  }
+}

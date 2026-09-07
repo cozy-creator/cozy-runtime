@@ -1,0 +1,35 @@
+{
+  "bytes": "4294967296",
+  "control_stream_epoch": "7",
+  "head": {
+    "digest": "NZ6MhIo5nkD6kuoOR280PAt4ZbwY++0sDktcFjNI/CE=",
+    "length": "2048"
+  },
+  "index": "1",
+  "objects": [
+    {
+      "ref": {
+        "digest": "8D2OIwbZdoF3ctoosFAkZkBvGDMKGfihX7dA07/XVxs=",
+        "length": "4096"
+      }
+    }
+  ],
+  "plan_digest": "0jCaLD2LJnE5mljVEowFHgLuF9xi2FNSVfUy0qPaB3I=",
+  "previous": {
+    "digest": "oCvrt3R3gj28GQ/PP65Bzb9Rdl6B13hgE8KBa2JZuT8=",
+    "length": "1024"
+  },
+  "progress": {
+    "digest": "/cccajdnl4Xv2Q6S842Y9D6ct78x7P4RxgwRvosJMOY=",
+    "length": "2048"
+  },
+  "record_owner_epoch": "41",
+  "subject": {
+    "source": {
+      "operation_id": "modelpub-minimax-h3-1-0-0",
+      "slot": "dits",
+      "source_selection_digest": "LlYr0gtRJWcsINarClTeW+FWh0NPBYiEOUQQyn/o76M="
+    }
+  },
+  "worker_boot_id": "boot-9f21"
+}

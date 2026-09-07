@@ -1,0 +1,12 @@
+{
+  "model_source_prepared": {
+    "control_stream_epoch": "7",
+    "operation_id": "modelpub-minimax-h3-1-0-0",
+    "outcome": "MODEL_SOURCE_PREPARE_OUTCOME_REFUSED",
+    "record_owner_epoch": "41",
+    "safe_code": "model_source_profile_refused",
+    "safe_detail": "downloaded headers match no reviewed source profile",
+    "source_selection_digest": "LlYr0gtRJWcsINarClTeW+FWh0NPBYiEOUQQyn/o76M=",
+    "worker_boot_id": "boot-9f21"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "claim": {
+    "proof": "vmk8UxWZPLMWKYRxYpNpUTXPtw4XnOimNzOdIGtzEp1Q52hCl8/nvnLMA76sQZ54/j2eCPIgsOVi8OgtANovXg==",
+    "record_owner_epoch": "41",
+    "record_owner_id": "rec-owner-local-1",
+    "wire_minor": 41,
+    "worker_boot_id": "boot-9f21",
+    "worker_id": "wrk-4070"
+  },
+  "request": {
+    "local_revision_digest": "k5fu0eHA3TSSuwWzaGANJm5/gUFR7hQ+d+M5p9OV5Mc=",
+    "operation_id": "local-package-request-01",
+    "record_owner_epoch": "41",
+    "source_digest": "VbocdXc4t+spdHHrA8gpTM8jmv4ORapynJtSNjsOK+0=",
+    "worker_boot_id": "boot-9f21"
+  }
+}

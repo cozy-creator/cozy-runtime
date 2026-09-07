@@ -1,0 +1,14 @@
+{
+  "checkpoint_receipt": {
+    "attempt_ordinal": "1",
+    "content_digest": "xoL635SZEl8BynvsgGb8Ax/AjoKBT0k3DyfpBFaD+nQ=",
+    "control_stream_epoch": "7",
+    "logical_key": "step-4000",
+    "operation_key": "op-77f2",
+    "outcome": "CHECKPOINT_OUTCOME_RECORDED",
+    "receipt_id": "rcpt-3301",
+    "record_owner_epoch": "41",
+    "request_id": "job-01HQX",
+    "worker_boot_id": "boot-9f21"
+  }
+}

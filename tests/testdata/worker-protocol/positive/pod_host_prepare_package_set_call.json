@@ -1,0 +1,35 @@
+{
+  "application": "h3",
+  "claim": {
+    "proof": "vmk8UxWZPLMWKYRxYpNpUTXPtw4XnOimNzOdIGtzEp1Q52hCl8/nvnLMA76sQZ54/j2eCPIgsOVi8OgtANovXg==",
+    "record_owner_epoch": "41",
+    "record_owner_id": "rec-owner-local-1",
+    "wire_minor": 41,
+    "worker_boot_id": "boot-9f21",
+    "worker_id": "wrk-4070"
+  },
+  "image_inventory": {
+    "distributions": [
+      {
+        "distribution": "torch",
+        "version": "2.13.0"
+      },
+      {
+        "distribution": "torchvision",
+        "version": "0.28.0"
+      }
+    ],
+    "profile": "h3-cu130",
+    "python": "3.12.8"
+  },
+  "locked_requirements": "aDMtcGFja2FnZT09MS4wLjcgLS1oYXNoPXNoYTI1Njo0NGZjMGU3YzU2YzBlNTg1NzBlODA2YzhlN2RkMTY1YTQzYmI2NmYxNzgxOTZjMWE4MDBhNTdlMDBlM2QzOTdkCmZsYXNoLWF0dG49PTIuOC4zIC0taGFzaD1zaGEyNTY6ZDQyMmFkZGRjYzlkMzZmMmVmZDBmY2EwNGMxMDM0ZGViYjg0NmFjOWJiZmU1ZmE4MzFiY2ZkNzhlODhhYjIwOQpzYWZldGVuc29ycz09MC42LjIgLS1oYXNoPXNoYTI1Njo0ZGY3YjdiOGUyZGE2MmQxNmY3ZWE5Y2E4OThjZjU5MjUxM2MwNjY1OGM4NTEzOGFkZTczODMwODBhYjFlYThlCg==",
+  "model_slot_paths": [
+    "generate.models.model",
+    "generate.models.upscaler",
+    "upscale.models.upscaler"
+  ],
+  "package_set": {
+    "download_delegation": "eyJleHBpcmVzX2F0X3VuaXgiOjIwMDAwMDAwMDAsImZvcm1hdCI6ImNvenkud29ya2VyLnYxLkRvd25sb2FkRGVsZWdhdGlvbi8xIiwibW9kZWxzIjpbeyJsYW5lIjoiYmYxNiIsIm1hbmlmZXN0Ijoic2hhMjU2OmNhNDQ0MjNmNDUwY2QwMWFiMzMxMTBjNTk1NjAzNjliYTkxOGI3ZWI1NmMzZDczM2Y0YzRlOTY0YzNiNDk5ZTIiLCJtb2RlbCI6ImNvenkvaDMiLCJwYWNrYWdlIjoiY296eS9oMy1wYWNrYWdlIiwicmVsZWFzZSI6ImgzLXIxIiwic2xvdCI6ImdlbmVyYXRlLm1vZGVscy5tb2RlbCJ9XSwicGFja2FnZXMiOlt7InBhY2thZ2UiOiJjb3p5L2gzLXBhY2thZ2UiLCJyZWxlYXNlIjoiMS4wLjcifSx7InBhY2thZ2UiOiJjb3p5L21hcmNvLXBvbG8iLCJyZWxlYXNlIjoiMS4wLjAifV0sInJlbnRhbF9pZCI6InByLTAxMjM0NTY3ODlhYmNkZWYwMTIzIiwid29ya2VyX2Jvb3RfaWQiOiJib290LTlmMjEiLCJ3b3JrZXJfaWQiOiJ3cmstNDA3MCIsIndvcmtlcl90bHNfY2VydGlmaWNhdGVfZGlnZXN0Ijoic2hhMjU2OjRjNWI1Njk5ZjJkOTllYmY5MTk1YzFlNTE4ZDEzYzk0NTM5YmJkNGJhNjcwYTQ2MTk5ZjZkNzlkNThkMTU3MjEifQ==",
+    "download_delegation_signature": "Q3H2kznd9t8cumWi6uci4/wSwkBtJyLtQHh1JZFOCKfuACbsAcpMDVWj7lHfkZmtzXBUKdgQALTwKbKyM/3mRg=="
+  }
+}

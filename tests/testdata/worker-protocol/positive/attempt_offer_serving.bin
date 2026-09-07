@@ -1,0 +1,6 @@
+:Ç	)	boot-9f21*	req-01J8Z0: á~D‘QÀû•4 Æn¨@¤vSCîg„şRâÏBò
+ á~D‘QÀû•4 Æn¨@¤vSCîg„şRâÏ;
+https://hub.cozy.art	k-2026-08 ØáÔ*RŸ¶àëBËéù¸https://files.cozy.art/t/abc ØáÔ*#
+payload.prompt/in/1/prompt.json*-
+payload.adapters[0]/in/1/lora.cozytensors2
+video/out/1/video.mp4J{"deadline_unix_ms":1787000000000,"environment_digest":"sha256:a4e9366235880cd7317b4287001294572bfcf7c5fe7bcb802fb1989490c4ebf5","format":"cozy.worker.v1.InvocationSpec/1","inputs":[{"digest":"sha256:9a4e1ba5ef31b6fdba84ffc848f36dee076732aa909007a30af8c615b0a72722","input_id":"payload.prompt","kind_mime":"application/json","length":412},{"digest":"sha256:574635944ec713b73a4e1e180ab4f286b7625bbc8ac848bb769ead6ac4e435cf","input_id":"payload.adapters[0]","kind_mime":"application/x-cozytensors","length":134217728}],"outputs":[{"max_bytes":268435456,"mime_type":"video/mp4","output_id":"video"}],"payload_digest":"sha256:6d1f99c9d8ac370eec5a7d7518b7e20eabce19cda2d19cb1d8c969fd3aaf2d8d","serving":{"attempt_binding_id":"sha256:5726a45011fd1dad5bdb2b726d535d214cf012392e1ca1b47e85a367ddcf559e","entrypoint_binding_digest":"sha256:383b27cf1cf9550781544929dba2b32db7b187658a760a7b18bab6cf042e2daf"}}Rplc-h3-t2v-1`

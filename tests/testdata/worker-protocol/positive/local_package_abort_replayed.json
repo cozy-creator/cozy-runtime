@@ -1,0 +1,11 @@
+{
+  "local_package_abort_status": {
+    "control_stream_epoch": "7",
+    "local_revision_digest": "k5fu0eHA3TSSuwWzaGANJm5/gUFR7hQ+d+M5p9OV5Mc=",
+    "operation_id": "local-package-request-01",
+    "outcome": "LOCAL_PACKAGE_ABORT_OUTCOME_REPLAYED",
+    "record_owner_epoch": "41",
+    "source_digest": "VbocdXc4t+spdHHrA8gpTM8jmv4ORapynJtSNjsOK+0=",
+    "worker_boot_id": "boot-9f21"
+  }
+}

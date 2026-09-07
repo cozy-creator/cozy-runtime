@@ -1,0 +1,28 @@
+{
+  "checksum_sha256": "sha256:f03d8e2306d976817772da28b0502466406f18330a19f8a15fb740d3bfd7571b",
+  "control_stream_epoch": "7",
+  "grant_revision": "1",
+  "head": {
+    "digest": "NZ6MhIo5nkD6kuoOR280PAt4ZbwY++0sDktcFjNI/CE=",
+    "length": "2048"
+  },
+  "object": {
+    "ref": {
+      "digest": "8D2OIwbZdoF3ctoosFAkZkBvGDMKGfihX7dA07/XVxs=",
+      "length": "4096"
+    }
+  },
+  "plan_digest": "0jCaLD2LJnE5mljVEowFHgLuF9xi2FNSVfUy0qPaB3I=",
+  "record_owner_epoch": "41",
+  "state": "WEIGHTS_TRANSFER_STATE_HELD",
+  "subject": {
+    "source": {
+      "operation_id": "modelpub-minimax-h3-1-0-0",
+      "slot": "dits",
+      "source_selection_digest": "LlYr0gtRJWcsINarClTeW+FWh0NPBYiEOUQQyn/o76M="
+    }
+  },
+  "transfer_id": "source-transfer-1",
+  "transferred_bytes": "4096",
+  "worker_boot_id": "boot-9f21"
+}

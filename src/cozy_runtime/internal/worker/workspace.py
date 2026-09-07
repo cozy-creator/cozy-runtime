@@ -14,7 +14,7 @@ import hashlib
 import os
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -28,6 +28,20 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 class WorkspaceRefusal(ValueError):
     """A stable workspace identity or custody invariant refused the operation."""
+
+
+class Journal(sqlite3.Connection):
+    lock_fd: int
+
+    def native[T](self, operation: Callable[[], T]) -> T:
+        """Native owns object/GC locking; no workspace transaction spans its IO."""
+        if self.in_transaction:
+            raise RuntimeError("native work cannot run inside a workspace SQL transaction")
+        fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+        try:
+            return operation()
+        finally:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
 
 
 _OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
@@ -60,6 +74,18 @@ CREATE TABLE holds (
  state TEXT NOT NULL CHECK(state IN ('retaining','held','releasing','released')),
  manifest BLOB NOT NULL DEFAULT x'', manifest_length INTEGER NOT NULL DEFAULT 0
 ) STRICT;
+CREATE TABLE operation_cache (
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+ owner TEXT NOT NULL, key BLOB NOT NULL, body BLOB NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('retaining','ready','evicting')),
+ UNIQUE(owner,key)
+) STRICT;
+CREATE TABLE operation_lookups (
+ owner TEXT NOT NULL, consumer TEXT NOT NULL, key BLOB NOT NULL,
+ cache_id TEXT NOT NULL, body BLOB NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('retaining','ready','missing','miss','released')),
+ PRIMARY KEY(owner,consumer)
+) STRICT;
 """
 
 
@@ -68,6 +94,7 @@ class Workspace:
         if not store_root.is_absolute() or store_root == Path("/"):
             raise WorkspaceRefusal("workspace requires the configured absolute store root")
         self.store_root = store_root.resolve()
+        fill.tensorfs_module().Store.ensure(str(self.store_root))
         self.directory = self.store_root / ".cozy-workspace"
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.directory.is_symlink() or not self.directory.is_dir():
@@ -75,17 +102,24 @@ class Workspace:
         if self.directory.stat().st_uid != os.geteuid():
             raise WorkspaceRefusal("workspace journal belongs to another operating-system owner")
         os.chmod(self.directory, 0o700)
+        for directory in (self.store_root, self.directory):
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
     @contextmanager
-    def locked(self) -> Iterator[sqlite3.Connection]:
+    def locked(self) -> Iterator[Journal]:
         lock = os.open(self.directory / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        db: sqlite3.Connection | None = None
+        db: Journal | None = None
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
             path = self.directory / "journal.sqlite3"
             if path.is_symlink():
                 raise WorkspaceRefusal("workspace journal cannot be a symlink")
-            db = sqlite3.connect(path, isolation_level=None)
+            db = sqlite3.connect(path, isolation_level=None, factory=Journal)
+            db.lock_fd = lock
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA synchronous=FULL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -167,7 +201,9 @@ class Workspace:
             db.execute(
                 "UPDATE weights SET state='released' WHERE id=?", (request.weights_transaction_id,)
             )
-            return derived_retention.release_result(request, tensorfs_root=self.store_root)
+            return db.native(
+                lambda: derived_retention.release_result(request, tensorfs_root=self.store_root)
+            )
 
     def outcome(self, owner: str, outcome: pb.AttemptOutcome) -> None:
         self.owner(owner)
@@ -190,6 +226,7 @@ class Workspace:
                 row is None
                 or row["spec"] != outcome.invocation_spec_digest
                 or row["outcome"] not in (b"", raw)
+                or row["outcome_id"] not in ("", outcome.outcome_id)
                 or row["state"] == "released"
             ):
                 raise WorkspaceRefusal("outcome has no unchanged accepted execution")
@@ -203,6 +240,33 @@ class Workspace:
                     owner,
                     outcome.request_id,
                     outcome.attempt_ordinal,
+                ),
+            )
+
+    def acknowledge(self, owner: str, ack: pb.AttemptOutcomeAck) -> None:
+        self.owner(owner)
+        with self.locked() as db:
+            row = db.execute(
+                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                (owner, ack.request_id, ack.attempt_ordinal),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] not in ("outcome", "released")
+                or row["spec"] != ack.invocation_spec_digest
+                or row["outcome_id"] != ack.outcome_id
+                or row["outcome_digest"] != ack.outcome_digest
+                or (row["state"] == "released" and ack.retain_work)
+            ):
+                raise WorkspaceRefusal("outcome acknowledgment changed or revoked its subject")
+            db.execute(
+                "UPDATE attempts SET state=?,retain=? WHERE owner=? AND request=? AND ordinal=?",
+                (
+                    "outcome" if ack.retain_work else "released",
+                    int(ack.retain_work),
+                    owner,
+                    ack.request_id,
+                    ack.attempt_ordinal,
                 ),
             )
 
@@ -322,8 +386,13 @@ class Workspace:
                 or row["receipt"] not in (b"", raw)
             ):
                 raise WorkspaceRefusal("receipt writer is stale or its previous receipt changed")
-            store = fill.tensorfs_module().Store.open(str(self.store_root))
-            observed = store.derived_lookup(frame.weights_transaction_id)
+            observed = db.native(
+                lambda: (
+                    fill.tensorfs_module()
+                    .Store.open(str(self.store_root))
+                    .derived_lookup(frame.weights_transaction_id)
+                )
+            )
             if (
                 observed.get("state") != "committed"
                 or observed.get("disposition", {}).get("kind") == "released"
@@ -336,6 +405,11 @@ class Workspace:
                 or frame.manifest.length != manifest["length"]
             ):
                 raise WorkspaceRefusal("receipt manifest differs from native result")
+            current = db.execute(
+                "SELECT state,epoch FROM weights WHERE id=?", (frame.weights_transaction_id,)
+            ).fetchone()
+            if current["state"] == "released" or current["epoch"] != frame.writer_epoch:
+                raise WorkspaceRefusal("writer was released during native receipt validation")
             db.execute(
                 "UPDATE weights SET state='receipt',receipt=?,receipt_digest=?,native_digest=?,"
                 "manifest=?,manifest_length=? WHERE id=?",
@@ -351,11 +425,12 @@ class Workspace:
 
     def _change_hold(
         self,
-        db: sqlite3.Connection,
+        db: Journal,
         owner: str,
         request: pb.DerivedRetentionRequest,
         *,
         release: bool,
+        cancel_lookup: bool = True,
     ) -> pb.DerivedRetentionResult:
         if (
             _DIGEST.fullmatch(request.weights_transaction_id) is None
@@ -389,9 +464,30 @@ class Workspace:
             )
         if release:
             db.execute("UPDATE holds SET state='releasing' WHERE id=?", (request.retention_id,))
+        if release and cancel_lookup:
+            db.execute(
+                "UPDATE operation_lookups SET state='released' WHERE owner=? AND EXISTS "
+                "(SELECT 1 FROM json_each(CAST(body AS TEXT),'$.holds') AS h "
+                "WHERE json_extract(h.value,'$.retention_id')=?)",
+                (owner, request.retention_id),
+            )
         # The intent above is durable before entering native code. A crash on
         # either side of this call leaves the same idempotent intent to replay.
-        result = derived_retention.change(request, tensorfs_root=self.store_root, release=release)
+        result = db.native(
+            lambda: derived_retention.change(
+                request, tensorfs_root=self.store_root, release=release
+            )
+        )
+        current = db.execute(
+            "SELECT state FROM holds WHERE id=?", (request.retention_id,)
+        ).fetchone()
+        if not release and current["state"] in ("releasing", "released"):
+            db.native(
+                lambda: derived_retention.change(
+                    request, tensorfs_root=self.store_root, release=True
+                )
+            )
+            raise WorkspaceRefusal("retention was released during native acquisition")
         manifest = result.manifest if result.HasField("manifest") else None
         db.execute(
             "UPDATE holds SET state=?,manifest=?,manifest_length=? WHERE id=?",

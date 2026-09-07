@@ -1,0 +1,22 @@
+{
+  "model_source_prepared": {
+    "checkpoints": [
+      {
+        "bytes": "4294967296",
+        "head": {
+          "digest": "NZ6MhIo5nkD6kuoOR280PAt4ZbwY++0sDktcFjNI/CE=",
+          "length": "2048"
+        },
+        "index": "1",
+        "plan_digest": "0jCaLD2LJnE5mljVEowFHgLuF9xi2FNSVfUy0qPaB3I=",
+        "slot": "dits"
+      }
+    ],
+    "control_stream_epoch": "7",
+    "operation_id": "modelpub-minimax-h3-1-0-0",
+    "outcome": "MODEL_SOURCE_PREPARE_OUTCOME_INCOMPLETE",
+    "record_owner_epoch": "41",
+    "source_selection_digest": "LlYr0gtRJWcsINarClTeW+FWh0NPBYiEOUQQyn/o76M=",
+    "worker_boot_id": "boot-9f21"
+  }
+}
