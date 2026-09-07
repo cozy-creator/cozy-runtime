@@ -25,6 +25,8 @@ from cozy_runtime.author import (
     invocable,
 )
 from cozy_runtime.author._model import _derive_model
+from cozy_runtime.cli import describe as describe_cli
+from cozy_runtime.cli.io import Options
 from cozy_runtime.internal import interface_wheel, package_interface
 from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.worker import derived_retention
@@ -68,6 +70,18 @@ def test_model_proxy_is_an_exact_artifact_and_dispatch_checks_bound_model(tmp_pa
     assert next(row for row in metadata["jobs"] if row["name"] == "echo")["result"] == {
         "input": "model"
     }
+    interface_path = tmp_path / "package-interface.json"
+    interface_path.write_bytes(raw)
+    assert (
+        describe_cli.run(
+            None, Options(json=True, package_interface=str(interface_path))
+        ).canonical_json
+        == raw
+    )
+    assert (
+        describe_cli.run("echo", Options(json=True, package_interface=str(interface_path))).document
+        is not None
+    )
     for name, body in interface_wheel.generate(raw).items():
         if name.endswith(".py"):
             compile(body, name, "exec")

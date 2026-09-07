@@ -96,7 +96,9 @@ def _one_line(doc: Mapping[str, Json], kind: str) -> str:
     parts = [
         kind,
         f"{len(_as_list(request['fields']))} request fields",
-        f"{len(_as_list(result['fields']))} result fields",
+        "model artifact result"
+        if result.get("input") == "model"
+        else f"{len(_as_list(result['fields']))} result fields",
     ]
     if slots:
         parts.append(f"{len(slots)} model binding{'s' if len(slots) != 1 else ''}")
@@ -157,6 +159,8 @@ def _as_list(value: Json) -> Sequence[Json]:
 
 def _fields(struct: Json) -> list[str]:
     assert isinstance(struct, dict)
+    if struct.get("input") == "model":
+        return ["    ModelArtifact: exact retained native model result"]
     out = []
     for field in _as_list(struct["fields"]):
         assert isinstance(field, dict)

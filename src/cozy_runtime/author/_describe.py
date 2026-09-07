@@ -150,7 +150,7 @@ def _separation(surface: Surface) -> None:
             "Outputs/publishes path",
             code="mixed_weights_outputs",
         )
-    if surface.weights_outputs and not surface.model_bindings:
+    if surface.weights_outputs and not surface.model_bindings and not surface.invocable:
         raise ConformanceError(
             f"{surface.name}: WeightsSink derives from exact typed model inputs, but this job "
             "declares none",
