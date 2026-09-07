@@ -24,18 +24,26 @@ def write(root: Path, record: dict[str, Any]) -> Path:
     target = path(root, record["build_id"], record["job_descriptor_id"])
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
     content = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
-    with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".stage-") as staged:
-        staged.write(content)
-        staged.flush()
-        os.fchmod(staged.fileno(), 0o444)
-        os.fsync(staged.fileno())
+    descriptor, name = tempfile.mkstemp(dir=target.parent, prefix=".stage-")
+    staged = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
         try:
-            os.link(staged.name, target)
+            os.link(staged, target)
         except FileExistsError:
             if target.is_symlink() or target.read_bytes() != content:
                 raise ValueError(
                     "job plan conflicts with its immutable build and descriptor"
                 ) from None
+    finally:
+        staged.unlink(missing_ok=True)
+    # Close and remove the staging name before marking the shared inode readonly:
+    # Windows refuses unlinking an open or readonly staging file.
+    target.chmod(0o444)
+    if os.name == "posix":
         directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
