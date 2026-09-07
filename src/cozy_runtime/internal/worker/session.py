@@ -98,6 +98,7 @@ from cozy_runtime.internal.worker.control import (
     ControlHost,
     GrpcControlHost,
     WatchFanout,
+    _loopback_preparation_listener,
 )
 from cozy_runtime.internal.worker.lanes import (
     LANE_RELEASED,
@@ -1810,6 +1811,17 @@ class Worker:
             base=self.base,
         )
 
+    def numerical_environment(self) -> bytes:
+        from cozy_runtime.internal.numerical_environment import fingerprint
+
+        return fingerprint(
+            self.base,
+            hostfacts.measure(self.options.accelerator_backend),
+            threads=self.options.threads,
+            alloc_conf=self.options.alloc_conf,
+            inherited=dict(self.config.child_base_env),
+        )
+
     def prepare_model_source(
         self, request: pb.PrepareModelSourceRequest
     ) -> pb.PrepareModelSourceResult:
@@ -2806,13 +2818,20 @@ class Worker:
         self.watches.end_all()
         self.host.stop()
 
-    def watch(self, opened: pb.ProgressOpen) -> Iterator[pb.AttemptProgress]:
+    def watch(
+        self,
+        opened: pb.ProgressOpen,
+        *,
+        on_cancel: Callable[[Callable[[], None]], bool] | None = None,
+    ) -> Iterator[pb.AttemptProgress]:
         """One WatchProgress call: bound to the fenced control-stream epoch (#436)."""
         if self.fenced(opened):
             return iter(())
-        return self.watches.open(opened.request_id, opened.control_stream_epoch).frames(
-            self.watches
-        )
+        watch = self.watches.open(opened.request_id, opened.control_stream_epoch)
+        if on_cancel is not None and not on_cancel(watch.end):
+            # gRPC declines registration if cancellation already won the race.
+            watch.end()
+        return watch.frames(self.watches)
 
     # ------------------------------------------------------------- the desired state
 
@@ -6221,6 +6240,8 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         listen, Path(args.root) / "control.addr", tls_cert=tls_cert, tls_key=tls_key
     )
     worker = Worker(config, options, host)
+    if _loopback_preparation_listener(listen):
+        host.numerical_environment = worker.numerical_environment
 
     def terminate(signum: int, frame: object) -> None:
         worker.request_stop()

@@ -173,6 +173,11 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
                 _registered_method=True)
+        self.NumericalEnvironment = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/NumericalEnvironment',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
+                _registered_method=True)
         self.CheckPackageSetCompatibility = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
@@ -246,6 +251,12 @@ class RuntimePreparationServicer(object):
     """
 
     def ProtocolInfo(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def NumericalEnvironment(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -330,6 +341,11 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.ProtocolInfo,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.SerializeToString,
+            ),
+            'NumericalEnvironment': grpc.unary_unary_rpc_method_handler(
+                    servicer.NumericalEnvironment,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.SerializeToString,
             ),
             'CheckPackageSetCompatibility': grpc.unary_unary_rpc_method_handler(
                     servicer.CheckPackageSetCompatibility,
@@ -426,6 +442,33 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/ProtocolInfo',
             cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def NumericalEnvironment(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/NumericalEnvironment',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -932,6 +975,11 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
                 _registered_method=True)
+        self.NumericalEnvironment = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/NumericalEnvironment',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
+                _registered_method=True)
         self.PreparePackageSet = channel.unary_stream(
                 '/cozy.worker.v1.PodHost/PreparePackageSet',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.SerializeToString,
@@ -1055,6 +1103,12 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def NumericalEnvironment(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def PreparePackageSet(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -1164,6 +1218,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.ProtocolInfo,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.SerializeToString,
+            ),
+            'NumericalEnvironment': grpc.unary_unary_rpc_method_handler(
+                    servicer.NumericalEnvironment,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.SerializeToString,
             ),
             'PreparePackageSet': grpc.unary_stream_rpc_method_handler(
                     servicer.PreparePackageSet,
@@ -1303,6 +1362,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/ProtocolInfo',
             cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoRequest.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.ProtocolInfoResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def NumericalEnvironment(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/NumericalEnvironment',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
             options,
             channel_credentials,
             insecure,

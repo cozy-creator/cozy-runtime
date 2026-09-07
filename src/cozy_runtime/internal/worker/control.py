@@ -48,7 +48,12 @@ class ControlPlane(Protocol):
     ) -> None:
         """Run one control stream to its end. Returns when the stream closes or is fenced."""
 
-    def watch(self, opened: pb.ProgressOpen) -> Iterator[pb.AttemptProgress]:
+    def watch(
+        self,
+        opened: pb.ProgressOpen,
+        *,
+        on_cancel: Callable[[Callable[[], None]], bool] | None = None,
+    ) -> Iterator[pb.AttemptProgress]:
         """The lossy lane for one WatchProgress call. Ends when the stream is fenced."""
 
 
@@ -99,7 +104,7 @@ class _Servicer:
             yield frame
 
     def WatchProgress(self, request: pb.ProgressOpen, context: Any) -> Any:
-        yield from self.plane.watch(request)
+        yield from self.plane.watch(request, on_cancel=context.add_callback)
 
 
 class RuntimeWeightsHost(Protocol):
@@ -178,6 +183,7 @@ class GrpcControlHost:
         private_placement_preparer: (
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
         ) = None,
+        numerical_environment: Callable[[], bytes] | None = None,
         weights: RuntimeWeightsHost | None = None,
     ) -> None:
         self.listen = listen
@@ -191,6 +197,7 @@ class GrpcControlHost:
         self.model_source_releaser = model_source_releaser
         self.derived_retainer = derived_retainer
         self.derived_result_releaser = derived_result_releaser
+        self.numerical_environment = numerical_environment
         self.checkpoint_pager = checkpoint_pager
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
@@ -218,6 +225,7 @@ class GrpcControlHost:
             or self.model_source_releaser is not None
             or self.derived_retainer is not None
             or self.derived_result_releaser is not None
+            or self.numerical_environment is not None
             or self.checkpoint_pager is not None
             or self.checkpoint_transfer is not None
             or self.local_package_preparer is not None
@@ -242,6 +250,7 @@ class GrpcControlHost:
                 self.model_source_releaser,
                 self.derived_retainer,
                 self.derived_result_releaser,
+                self.numerical_environment,
             ),
             self.server,
         )
@@ -363,6 +372,7 @@ class _PreparationServicer:
             [pb.DerivedResultReleaseRequest], pb.DerivedResultReleaseResult
         ]
         | None = None,
+        numerical_environment: Callable[[], bytes] | None = None,
     ) -> None:
         self.compatibility_handler = compatibility_handler
         self.package_handler = package_handler
@@ -375,6 +385,7 @@ class _PreparationServicer:
         self.model_source_releaser = model_source_releaser
         self.derived_retainer = derived_retainer
         self.derived_result_releaser = derived_result_releaser
+        self.numerical_environment = numerical_environment
 
     def ProtocolInfo(
         self, _request: pb.ProtocolInfoRequest, _context: Any
@@ -383,6 +394,23 @@ class _PreparationServicer:
             wire_minor=WIRE_MINOR,
             minimum_wire_minor=MIN_COMPATIBLE_WIRE_MINOR,
         )
+
+    def NumericalEnvironment(self, _request: pb.NumericalEnvironmentRequest, context: Any) -> Any:
+        import grpc
+
+        if self.numerical_environment is None:
+            return context.abort(
+                grpc.StatusCode.UNIMPLEMENTED, "numerical environment is unavailable"
+            )
+        try:
+            digest = self.numerical_environment()
+            if len(digest) != 32:
+                raise ValueError("invalid numerical identity")
+            return pb.NumericalEnvironmentResult(digest=digest)
+        except Exception:
+            return context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "numerical environment identity is unproven"
+            )
 
     def ValidateWeightsCheckpoint(
         self, request: pb.ValidateWeightsCheckpointRequest, context: Any
@@ -635,6 +663,12 @@ class WatchFanout:
             self.watchers.append(watch)
         return watch
 
+    def close(self, watch: _Watch) -> None:
+        watch.end()
+        with self.lock:
+            if watch in self.watchers:
+                self.watchers.remove(watch)
+
     def end_epoch(self, epoch: int) -> None:
         """Fence: every watch bound to a superseded control stream ends."""
         with self.lock:
@@ -662,15 +696,18 @@ class _Watch:
             self.cond.notify_all()
 
     def frames(self, counted: WatchFanout) -> Iterator[pb.AttemptProgress]:
-        while True:
-            with self.cond:
-                while not self.ring and not self.ended.is_set():
-                    self.cond.wait()
-                if self.ring:
-                    frame = self.ring.popleft()
-                elif self.ended.is_set():
-                    return
-                else:  # pragma: no cover - the loop above re-checks
-                    continue
-            counted.sent += 1
-            yield frame
+        try:
+            while True:
+                with self.cond:
+                    while not self.ring and not self.ended.is_set():
+                        self.cond.wait()
+                    if self.ring:
+                        frame = self.ring.popleft()
+                    elif self.ended.is_set():
+                        return
+                    else:  # pragma: no cover - the loop above re-checks
+                        continue
+                counted.sent += 1
+                yield frame
+        finally:
+            counted.close(self)

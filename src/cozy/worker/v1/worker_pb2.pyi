@@ -607,6 +607,22 @@ class ReleaseModelSourceRequest(_message.Message):
     operation_id: str
     def __init__(self, operation_id: _Optional[str] = ...) -> None: ...
 
+class NumericalEnvironmentRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class NumericalEnvironmentCall(_message.Message):
+    __slots__ = ("claim",)
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
+
+class NumericalEnvironmentResult(_message.Message):
+    __slots__ = ("digest",)
+    DIGEST_FIELD_NUMBER: _ClassVar[int]
+    digest: bytes
+    def __init__(self, digest: _Optional[bytes] = ...) -> None: ...
+
 class DerivedRetentionCall(_message.Message):
     __slots__ = ("claim", "request")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
