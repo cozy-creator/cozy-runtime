@@ -288,7 +288,9 @@ def test_all_output_holds_survive_interruption_or_late_acquisition(
                 pipe.close()
 
 
-def scalar(workspace: Workspace, request: str, value: int, key: bytes) -> bool:
+def scalar(
+    workspace: Workspace, request: str, value: int, key: bytes, *, evidence: str = ""
+) -> bool:
     raw = documents.canonical_bytes(
         pb.InvocationSpec(
             job=pb.JobInvocationSpec(
@@ -312,7 +314,9 @@ def scalar(workspace: Workspace, request: str, value: int, key: bytes) -> bool:
             attempt_ordinal=1,
             invocation_spec_digest=documents.spell(spec),
             status=pb.OUTCOME_STATUS_SUCCEEDED,
-            result=pb.ResultEnvelope(inline_result=canonical_json.encode({"value": value})),
+            result=pb.ResultEnvelope(
+                inline_result=canonical_json.encode({"value": value, "evidence": evidence})
+            ),
         )
     )
     workspace.outcome(
@@ -390,3 +394,28 @@ def test_missing_old_recipient_does_not_clear_disabled_mapping(tmp_path: Path) -
             ).fetchone()[0]
             == "disabled"
         )
+
+
+def test_disabled_compaction_preserves_owned_terminal_replay(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    key = b"\x79" * 32
+    assert scalar(workspace, "original", 7, key, evidence="x" * 16384)
+    lookup = pb.LookupOperationCall(computation_digest=key, consumer_request_id="owned-result")
+    before = workspace_memo.lookup(workspace, "owner", lookup)
+    assert before.found and len(before.source.outcome_canonical_bytes) > 16384
+    assert not scalar(workspace, "contradiction", 8, key, evidence="y" * 16384)
+    with workspace.locked() as db:
+        row = db.execute("SELECT * FROM operation_cache WHERE key=?", (key,)).fetchone()
+        assert row["state"] == "disabled" and len(row["body"]) < 1024
+        payload = json.loads(row["body"])
+        assert payload["holds"] == []
+        assert payload["source"]["outcome_digest"] == documents.spell(before.source.outcome_digest)
+        assert payload["conflicting_source"]["request_id"] == "contradiction"
+        assert "outcome_canonical_bytes" not in payload["source"]
+        assert "outcome_canonical_bytes" not in payload["conflicting_source"]
+    assert workspace_memo.lookup(workspace, "owner", lookup) == before
+    assert not workspace_memo.lookup(
+        workspace,
+        "owner",
+        pb.LookupOperationCall(computation_digest=key, consumer_request_id="fresh-result"),
+    ).found

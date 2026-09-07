@@ -18,6 +18,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 if TYPE_CHECKING:
     from cozy_runtime.internal.worker.workspace import Workspace
 
+# Enabled results only; compact contradiction identities must not be forgotten.
 MAX_ENTRIES = 128
 
 
@@ -244,7 +245,17 @@ def _drain(workspace: Workspace, db: Journal, owner: str) -> int:
         for hold in payload["holds"]:
             workspace._change_hold(db, owner, _request(hold), release=True)
         if row["state"] == "disabled":
-            payload["holds"] = []
+            # The negative identity survives capacity pressure, but it does not
+            # need either full outcome or the result schema. Prior consumers
+            # already own their exact terminal bytes in their lookup records.
+            payload = {
+                name: {
+                    field: value
+                    for field, value in payload[name].items()
+                    if field != "outcome_canonical_bytes"
+                }
+                for name in ("source", "conflicting_source")
+            } | {"holds": []}
             db.execute(
                 "UPDATE operation_cache SET body=? WHERE id=?",
                 (canonical_json.encode(payload), row["id"]),
