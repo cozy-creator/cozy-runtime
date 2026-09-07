@@ -363,6 +363,7 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,
                 base=observed,
+                job_plan_root=root / "job-plans",
             )
 
         # Creator's revision digest is exact; the first measurement supplies it here.
@@ -390,6 +391,31 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
         assert shadowed.value.code == "package_environment_base_distribution_import_roots_conflict"
         assert "cozy-runtime 9.9.9" in shadowed.value.detail
         assert "cannot be replaced" in shadowed.value.detail
+
+        # A dependency edit changes the executable closure even when the project
+        # wheel and callable interface are identical. Both plans remain resumable.
+        first_plans = {path: path.read_bytes() for path in (root / "job-plans").glob("*/*.json")}
+        assert first_plans
+        assert all(
+            json.loads(raw)["build_id"] == "sha256:" + revision.hex()
+            for raw in first_plans.values()
+        )
+        original_dependency = dependency_wheel.read_bytes()
+        original_project = project_wheel.read_bytes()
+        (dependency / "src/annotated_doc/__init__.py").write_text("VALUE = 'edited'\n")
+        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency))
+        assert project_wheel.read_bytes() == original_project
+        assert dependency_wheel.read_bytes() != original_dependency
+        with pytest.raises(PreparationRefusal) as changed:
+            prepare([project_wheel, dependency_wheel], revision)
+        edited_revision = _measured_revision(changed.value)
+        assert edited_revision != revision
+        prepare([project_wheel, dependency_wheel], edited_revision)
+        assert (root / "job-plans" / edited_revision.hex()).is_dir()
+        assert all(path.read_bytes() == raw for path, raw in first_plans.items())
+        dependency_wheel.write_bytes(original_dependency)
+        prepare([project_wheel, dependency_wheel], revision)
+        assert all(path.read_bytes() == raw for path, raw in first_plans.items())
 
 
 def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> None:
@@ -601,7 +627,9 @@ def test_a_refusal_terminates_the_process(installed_cli: str) -> None:
     the assertion.
     """
     with _containment_unavailable() as enter_scope:
-        for verb, function in (("run", "marco"), ("job", "marco_job")):
+        # The second job gets another output workspace and must not conflict
+        # with the first invocation's immutable executable plan.
+        for verb, function in (("run", "marco"), ("job", "marco_job"), ("job", "marco_job")):
             with tempfile.TemporaryDirectory(prefix="cz.", dir="/tmp") as out:
                 refused = subprocess.run(
                     (

@@ -962,7 +962,7 @@ def prepare_package(
     _stage_job_plans(
         interface_body,
         root=job_plan_root,
-        build_id=project.digest,
+        build_id=documents.spell(development.local_revision_digest),
         interface_path=artifact_cache / interface_ref[0].removeprefix("sha256:"),
         installed=installed,
     )
