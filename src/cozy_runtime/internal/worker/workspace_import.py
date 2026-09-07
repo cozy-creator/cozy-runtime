@@ -497,44 +497,10 @@ def _recover_interrupted(db: Journal) -> None:
         "SELECT * FROM attempts WHERE fenced=1 AND state IN ('accepted','running') "
         "AND outcome=x'' ORDER BY owner,request,ordinal"
     ).fetchall():
-        weights = db.execute(
-            "SELECT * FROM weights WHERE owner=? AND request=? AND ordinal=? "
-            "AND spec=? ORDER BY slot",
-            (attempt["owner"], attempt["request"], attempt["ordinal"], attempt["spec"]),
-        ).fetchall()
-        body = pb.AttemptOutcomeBody(
-            request_id=attempt["request"],
-            attempt_ordinal=attempt["ordinal"],
-            invocation_spec_digest=documents.spell(attempt["spec"]),
-            status=pb.OUTCOME_STATUS_ABANDONED,
-            safe_message="Previous Runtime execution context was lost during workspace migration.",
-            cause=pb.OutcomeCause(
-                code=pb.CAUSE_CODE_EXECUTOR_INVALIDATED,
-                origin=pb.CAUSE_ORIGIN_WORKER,
-                detail="Previous Runtime execution context was lost during workspace migration.",
-            ),
-            execution_started=attempt["state"] == "running" or bool(weights),
-        )
-        for weights_row in weights:
-            if weights_row["state"] == "receipt":
-                body.weights_receipts.append(
-                    pb.WeightsReceiptRef(
-                        weights_receipt_digest=weights_row["receipt_digest"],
-                        weights_receipt_canonical_bytes=weights_row["receipt"],
-                    )
-                )
-        raw, digest = documents.identity(body)
-        db.execute(
-            "UPDATE attempts SET state='outcome',outcome_id=?,outcome_digest=?,outcome=? "
-            "WHERE owner=? AND request=? AND ordinal=?",
-            (
-                "out-" + digest.hex()[:24],
-                digest,
-                raw,
-                attempt["owner"],
-                attempt["request"],
-                attempt["ordinal"],
-            ),
+        from .workspace_recovery import terminal
+
+        terminal(
+            db, attempt, "Previous Runtime execution context was lost during workspace migration."
         )
 
 

@@ -2006,6 +2006,8 @@ class Worker:
         another's sender.
         """
         inner = getattr(frame, frame.WhichOneof("msg"))
+        if frame.HasField("attempt_accepted") and self.workspace is not None:
+            self.workspace.mark_running(self.fence.record_owner_id, frame.attempt_accepted)
         if (
             frame.HasField("attempt_outcome")
             and self.workspace is not None

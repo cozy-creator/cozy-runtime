@@ -17,6 +17,7 @@ import sqlite3
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,7 @@ CREATE TABLE attempts (
  outcome BLOB NOT NULL DEFAULT x'', retain INTEGER NOT NULL DEFAULT 0,
  fenced INTEGER NOT NULL DEFAULT 0,
  worker_boot TEXT NOT NULL DEFAULT '', result_schema BLOB NOT NULL DEFAULT x'',
+ process_owner BLOB NOT NULL DEFAULT x'',
  transport_owner TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(owner,request,ordinal)
 ) STRICT;
@@ -155,8 +157,13 @@ class Workspace:
             db.execute("PRAGMA synchronous=FULL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
-                db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=1;COMMIT;")
-            elif version != 1:
+                db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=2;COMMIT;")
+            elif version == 1:
+                db.executescript(
+                    "BEGIN IMMEDIATE; ALTER TABLE attempts ADD COLUMN "
+                    "process_owner BLOB NOT NULL DEFAULT x''; PRAGMA user_version=2; COMMIT;"
+                )
+            elif version != 2:
                 raise WorkspaceRefusal("workspace journal schema is not supported")
             if (
                 not allow_frozen
@@ -193,6 +200,10 @@ class Workspace:
         worker_boot: str = "",
     ) -> pb.AttemptOutcome | None:
         self.owner(owner)
+        self.recover(owner)
+        from .workspace_recovery import process_identity
+
+        process_owner = process_identity()
         if (
             _ID.fullmatch(offer.request_id) is None
             or not 0 < offer.attempt_ordinal < 1 << 63
@@ -218,7 +229,7 @@ class Workspace:
                 return None
             db.execute(
                 "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state,"
-                "worker_boot,result_schema) VALUES(?,?,?,?,?,'accepted',?,?)",
+                "worker_boot,result_schema,process_owner) VALUES(?,?,?,?,?,'accepted',?,?,?)",
                 (
                     owner,
                     offer.request_id,
@@ -227,10 +238,74 @@ class Workspace:
                     offer.invocation_spec_canonical_bytes,
                     worker_boot,
                     result_schema,
+                    process_owner,
                 ),
             )
 
         return None
+
+    def mark_running(self, owner: str, accepted: pb.AttemptAccepted) -> None:
+        with self.locked() as db:
+            db.execute(
+                "UPDATE attempts SET state='running' WHERE owner=? AND request=? "
+                "AND ordinal=? AND spec=? AND state='accepted' AND fenced=0",
+                (
+                    owner,
+                    accepted.request_id,
+                    accepted.attempt_ordinal,
+                    accepted.invocation_spec_digest,
+                ),
+            )
+
+    def recover(self, owner: str) -> None:
+        """Recover dead process births without disturbing another live local worker."""
+        from . import workspace_recovery
+
+        self.owner(owner)
+        with self.locked(allow_frozen=True) as db:
+            if (
+                db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
+                != "active"
+            ):
+                return
+            rows = db.execute(
+                "SELECT * FROM attempts WHERE owner=? AND state IN ('accepted','running') "
+                "AND process_owner<>x'' ORDER BY request,ordinal",
+                (owner,),
+            ).fetchall()
+            for attempt in rows:
+                if not workspace_recovery.process_ended(attempt["process_owner"]):
+                    continue
+                weights = db.execute(
+                    "SELECT * FROM weights WHERE owner=? AND request=? AND ordinal=?",
+                    (owner, attempt["request"], attempt["ordinal"]),
+                ).fetchall()
+                for weight in weights:
+                    try:
+                        receipt = db.native(
+                            partial(workspace_recovery.native_result, self, dict(weight))
+                        )
+                        if receipt is not None:
+                            db.native(partial(self.record_receipt, owner, receipt))
+                    except Exception:
+                        db.guard()
+                        settled = db.execute(
+                            "SELECT state FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                            (owner, attempt["request"], attempt["ordinal"]),
+                        ).fetchone()
+                        if settled is None or settled["state"] not in ("accepted", "running"):
+                            break  # another recovery completed and may have admitted a successor
+                        raise
+                current = db.execute(
+                    "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                    (owner, attempt["request"], attempt["ordinal"]),
+                ).fetchone()
+                if current is not None and current["state"] in ("accepted", "running"):
+                    workspace_recovery.terminal(
+                        db,
+                        current,
+                        "Previous Runtime execution process ended before recording its outcome.",
+                    )
 
     @staticmethod
     def _outcome_frame(row: sqlite3.Row) -> pb.AttemptOutcome:
@@ -255,6 +330,7 @@ class Workspace:
             )
 
     def retained_outcomes(self, owner: str) -> list[pb.AttemptOutcome]:
+        self.recover(owner)
         with self.locked(allow_frozen=True) as db:
             return [
                 self._outcome_frame(row)
