@@ -2870,6 +2870,18 @@ class Worker:
         the previous set keeps serving.
         """
         mode = desired.WhichOneof("mode") or ""
+        if mode != "job" and self.job_slots and any(
+            self._job_lane_busy(slot.lane) for slot in self.job_slots.values()
+        ):
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FAULT_KIND_CONFIG_REFUSED,
+                    subject=f"revision {desired.revision}",
+                    reason="job_set_busy",
+                    detail="stop private attempts before replacing their job set",
+                )
+            )
+            return
         placements: list[dict[str, Any]] = []
         if mode == "placement_set":
             try:
@@ -2938,6 +2950,14 @@ class Worker:
         if self.accepted.mode == "job" and mode != "job":
             self.lanes.envelope.forget("")  # the job generation's row leaves with the job
         self.accepted.mode = "serving" if mode == "placement_set" else mode
+        if mode != "job" and self.job_slots:
+            cpu = self.job_slots.get("orchestration")
+            if cpu is not None:
+                cpu.supervision.close()
+                self.lanes.orchestration.forget("")
+            self.job_slots.clear()
+            self.jobs.clear()
+            self.engine.jobs = self.jobs
         self.latched = ""  # a NEW revision un-latches: the latch is per desired revision
         if mode == "job":
             self.apply_job_directive(desired.job)
