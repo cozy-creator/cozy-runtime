@@ -47,7 +47,12 @@ class ControlPlane(Protocol):
     ) -> None:
         """Run one control stream to its end. Returns when the stream closes or is fenced."""
 
-    def watch(self, opened: pb.ProgressOpen) -> Iterator[pb.AttemptProgress]:
+    def watch(
+        self,
+        opened: pb.ProgressOpen,
+        *,
+        on_cancel: Callable[[Callable[[], None]], bool] | None = None,
+    ) -> Iterator[pb.AttemptProgress]:
         """The lossy lane for one WatchProgress call. Ends when the stream is fenced."""
 
 
@@ -98,7 +103,7 @@ class _Servicer:
             yield frame
 
     def WatchProgress(self, request: pb.ProgressOpen, context: Any) -> Any:
-        yield from self.plane.watch(request)
+        yield from self.plane.watch(request, on_cancel=context.add_callback)
 
 
 class RuntimeWeightsHost(Protocol):
@@ -541,6 +546,12 @@ class WatchFanout:
             self.watchers.append(watch)
         return watch
 
+    def close(self, watch: _Watch) -> None:
+        watch.end()
+        with self.lock:
+            if watch in self.watchers:
+                self.watchers.remove(watch)
+
     def end_epoch(self, epoch: int) -> None:
         """Fence: every watch bound to a superseded control stream ends."""
         with self.lock:
@@ -568,15 +579,18 @@ class _Watch:
             self.cond.notify_all()
 
     def frames(self, counted: WatchFanout) -> Iterator[pb.AttemptProgress]:
-        while True:
-            with self.cond:
-                while not self.ring and not self.ended.is_set():
-                    self.cond.wait()
-                if self.ring:
-                    frame = self.ring.popleft()
-                elif self.ended.is_set():
-                    return
-                else:  # pragma: no cover - the loop above re-checks
-                    continue
-            counted.sent += 1
-            yield frame
+        try:
+            while True:
+                with self.cond:
+                    while not self.ring and not self.ended.is_set():
+                        self.cond.wait()
+                    if self.ring:
+                        frame = self.ring.popleft()
+                    elif self.ended.is_set():
+                        return
+                    else:  # pragma: no cover - the loop above re-checks
+                        continue
+                counted.sent += 1
+                yield frame
+        finally:
+            counted.close(self)
