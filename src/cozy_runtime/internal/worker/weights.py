@@ -1,34 +1,10 @@
-"""Stateless Runtime side of the WeightsSink host exchange.
+"""Privileged native weights and ordered workspace observations.
 
-The supervisor is the durable authority. Runtime keeps only waiters and live TensorFS read
-leases and native writer handles after host authorization; the worker and executor share only
-fixed files in the already-brokered attempt spool for declaration/receipt bytes too large for
-their control seam.
-
-Runtime holds the produced bytes, so Runtime is what streams them. When the supervisor has
-bound a transfer to its durable receipt it hands over the presigned PUT it was given, and
-`upload` spends it through the one egress boundary (`internal/egress.py`) exactly as
-`write_output` already spends a `DeliveryGrant` output URL. The grant names ONE object, ONE
-method and ONE short expiry and is pinned to the object's own digest by its signed checksum
-header, so holding it authorizes nothing else. The alternative -- posting the object back to
-the supervisor 4 MiB at a time so IT could send the same request -- was 2,048 sequential round
-trips for an 8 GiB object and bought no authority the grant did not already carry.
-
-`read` stays: it is the authenticated owner read-back lane, a bounded range of one object the
-owner explicitly asked for, which is a different thing from moving a whole object.
-
-TWO LANES TO THE HOST, ONE PREFERRED (proto-025, minor 21). The host's own seam is
-`RuntimeWeights`, a loopback service this Runtime serves: the supervisor opens `Exchange`
-per control session, intents and receipts go out on it as server events, acks come back as
-client messages, and `Upload` is unary. The pre-21 form -- the same messages as
-direction-annotated `WorkerControl` frames -- stays wired until the retirement minor. Which
-lane an exchange takes is an OBSERVED FACT, not a flag: a live `Exchange` stream selects
-itself; with none open the frame goes on `WorkerControl`. Every pending exchange remembers
-the lane and the exact envelope it last went out under, and is re-issued only when that
-lane is gone (the control stream superseded at the snapshot barrier, or a newer `Exchange`
-opened). An ack settles the exchange it answers exactly once, by echoing that envelope: an
-ack to a send this Runtime has since re-issued cannot bind a writer epoch the host has
-already fenced past.
+Workspace is the shared durable authority on local and private workers. The
+executor exchanges bounded writer operations with its parent; intent, checkpoint
+and receipt observations leave on WorkerControl before the final outcome.
+RuntimeWeights retains its bounded Read/Upload operations, but its old Host-ACK
+Exchange no longer grants writer authority.
 """
 
 from __future__ import annotations
@@ -38,7 +14,6 @@ import binascii
 import hashlib
 import io
 import json
-import queue
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -107,57 +82,6 @@ class WeightsExchangeError(Exception):
         self.detail = detail
 
 
-#: Where a pending exchange last went out: `("control", control_stream_epoch)` or
-#: `("exchange", stream id)`. The lane is live while that stream is; a send on a lane that
-#: is gone is what a replay re-issues.
-Lane = tuple[str, int]
-#: The three-field envelope a send was stamped with; the ack echoes it exactly.
-Envelope = tuple[int, int, str]
-
-_EVENT_FIELD = {
-    "weights_intent": "intent",
-    "weights_receipt": "receipt",
-    "weights_checkpoint": "checkpoint",
-}
-
-
-def _envelope(message: Any) -> Envelope:
-    return message.record_owner_epoch, message.control_stream_epoch, message.worker_boot_id
-
-
-@dataclass(slots=True)
-class _Pending:
-    frame: pb.WorkerFrame
-    event: threading.Event
-    canceled: Callable[[], bool]
-    ack: pb.WeightsHostAck | None = None
-    lane: Lane = ("", 0)
-    envelope: Envelope = (0, 0, "")
-
-
-class _ExchangeStream:
-    """ONE open `RuntimeWeights.Exchange` call: the events this Runtime pushes to the
-    supervisor, and the fact of whether the call is still open."""
-
-    __slots__ = ("ended", "id", "out", "superseded")
-
-    def __init__(self, stream_id: int) -> None:
-        self.id = stream_id
-        self.out: queue.Queue[pb.WeightsHostEvent | None] = queue.Queue()
-        self.ended = threading.Event()
-        self.superseded = False
-
-    def live(self) -> bool:
-        return not self.ended.is_set()
-
-    def end(self, *, superseded: bool = False) -> None:
-        if superseded:
-            self.superseded = True
-        if not self.ended.is_set():
-            self.ended.set()
-            self.out.put(None)
-
-
 @dataclass(slots=True)
 class _Held:
     transaction_id: str
@@ -186,7 +110,7 @@ _UPLOAD_REFUSALS: dict[str, pb.WeightsUploadRefusal] = {
 
 
 class WeightsExchange:
-    """One Runtime process's memory-only bridge to its durable host."""
+    """One process's native handles and ordered workspace observations."""
 
     def __init__(
         self,
@@ -218,14 +142,9 @@ class WeightsExchange:
         self.allow_private_egress = allow_private_egress
         self.store: Any = None
         self._lock = threading.Lock()
-        self._pending: dict[tuple[str, int, str, int], _Pending] = {}
         self._bindings: dict[str, tuple[int, bytes]] = {}
         self._held: dict[str, _Held] = {}
         self._abandoned: set[str] = set()
-        #: The live `RuntimeWeights.Exchange` call, if a supervisor has one open. Its
-        #: presence IS the lane choice; nothing else configures it.
-        self._stream: _ExchangeStream | None = None
-        self._streams_opened = 0
         self.writer_broker = WriterBroker(self._store, checkpoint=self.record_checkpoint)
 
     def record_checkpoint(
@@ -275,262 +194,90 @@ class WeightsExchange:
         *,
         attempt_ordinal: int | None = None,
         declaration: bytes | None = None,
-    ) -> tuple[tuple[str, int, str, int], _Pending]:
+    ) -> dict[str, Any]:
         current = self.stamp(pb.WeightsIntentFrame())
         if (
             request.record_owner_epoch != current.record_owner_epoch
             or request.worker_boot_id != current.worker_boot_id
             or request.control_stream_epoch != 0
-            or subject.writer_epoch == 0
+            or self.workspace is None
         ):
             raise WeightsExchangeError(
-                "weights_checkpoint_scope", "checkpoint scope is not current"
+                "weights_checkpoint_scope", "checkpoint owner is not current"
             )
-        with self._lock:
-            matches = [
-                (key, pending)
-                for key, pending in self._pending.items()
-                if key[0] == subject.request_id
-                and key[2] == subject.output_slot
-                and key[3] == pb.WEIGHTS_HOST_STAGE_INTENT
-                and (attempt_ordinal is None or key[1] == attempt_ordinal)
-            ]
-            if len(matches) != 1:
-                raise WeightsExchangeError(
-                    "weights_checkpoint_scope", "no unique current intent awaits restore"
-                )
-            key, pending = matches[0]
-            self._checkpoint_still_pending(key, pending, subject.weights_transaction_id)
-            sent = pending.frame.weights_intent
-            if (
-                sent.weights_transaction_id != subject.weights_transaction_id
-                or sent.invocation_spec_digest != subject.invocation_spec_digest
-                or sent.tensorfs_declaration_digest != subject.tensorfs_declaration_digest
-                or (
-                    declaration is not None
-                    and sent.tensorfs_declaration_canonical_bytes != declaration
-                )
-            ):
-                raise WeightsExchangeError(
-                    "weights_checkpoint_scope", "checkpoint differs from current intent"
-                )
-            return key, pending
-
-    def _checkpoint_still_pending(
-        self, key: tuple[str, int, str, int], pending: _Pending, transaction_id: str
-    ) -> None:
-        """Check the same waiter while the caller holds `_lock`."""
+        try:
+            row = cast(
+                dict[str, Any],
+                self.workspace.weights_row(self.owner_scope(), subject.weights_transaction_id),
+            )
+        except ValueError as exc:
+            raise WeightsExchangeError(
+                "weights_checkpoint_scope", "checkpoint has no owned intent"
+            ) from exc
         if (
-            self._pending.get(key) is not pending
-            or pending.canceled()
+            row["request"] != subject.request_id
+            or row["epoch"] != subject.writer_epoch
+            or row["spec"] != subject.invocation_spec_digest
+            or row["slot"] != subject.output_slot
+            or row["declaration_digest"] != subject.tensorfs_declaration_digest
+            or row["state"] != "intent"
+            or row["ready"]
+            or row["attempt_fenced"]
+            or row["attempt_state"] not in ("accepted", "running")
             or self.stop.is_set()
-            or transaction_id in self._abandoned
+            or (attempt_ordinal is not None and row["ordinal"] != attempt_ordinal)
+            or (declaration is not None and row["declaration"] != declaration)
         ):
             raise WeightsExchangeError(
-                "weights_checkpoint_scope", "intent ended during checkpoint restore"
+                "weights_checkpoint_scope", "checkpoint differs from pending intent"
             )
+        return row
 
     @contextmanager
     def restore_checkpoint(
         self, request: pb.CheckpointTransferRequest
     ) -> Iterator[tuple[str, int]]:
-        """Bind download custody to the current intent without holding a lock over IO.
-
-        Native custody survives this waiter and process. Only native begin adopts it or
-        explicit owner abandonment releases it; finishing a transfer is neither action.
-        """
         subject = request.subject.weights
-        key, pending = self._checkpoint_pending(request, subject)
+        row = self._checkpoint_pending(request, subject)
         yield subject.weights_transaction_id, subject.writer_epoch
-        with self._lock:
-            self._checkpoint_still_pending(key, pending, subject.weights_transaction_id)
+        current = self._checkpoint_pending(request, subject)
+        if current["ordinal"] != row["ordinal"]:
+            raise WeightsExchangeError(
+                "weights_checkpoint_scope", "writer changed during restoration"
+            )
 
     def validate_checkpoint(
         self, request: pb.ValidateWeightsCheckpointRequest
     ) -> pb.ValidateWeightsCheckpointResult:
-        """Validate restored work while the current intent still awaits its writer ACK."""
         intent, subject = request.intent, request.intent.weights
         result = pb.ValidateWeightsCheckpointResult(weights=subject)
         if intent.HasField("checkpoint"):
             result.checkpoint.CopyFrom(intent.checkpoint)
         try:
-            if (
-                request.ByteSize() > weights_limits.MAX_INLINE_CONTROL_BYTES
-                or len(request.tensorfs_declaration_canonical_bytes)
-                > weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
-            ):
+            if request.ByteSize() > weights_limits.MAX_INLINE_CONTROL_BYTES:
                 raise WeightsExchangeError(
-                    "weights_checkpoint_scope", "checkpoint scope is not current"
+                    "weights_checkpoint_scope", "checkpoint validation exceeds its bound"
                 )
-            key, pending = self._checkpoint_pending(
+            row = self._checkpoint_pending(
                 intent,
                 subject,
                 attempt_ordinal=intent.attempt_ordinal,
                 declaration=request.tensorfs_declaration_canonical_bytes,
             )
             if intent.HasField("checkpoint"):
-                checkpoint = intent.checkpoint
-                store = self._store()
-                page = store.checkpoint_page(
-                    documents.spell(checkpoint.head.digest),
-                    checkpoint.head.length,
-                    operation_id=subject.request_id,
-                    slot=subject.output_slot,
-                    plan_digest=documents.spell(checkpoint.plan_digest),
-                    limit=1,
-                )
-                if page["index"] != checkpoint.index or page["bytes"] != checkpoint.bytes:
-                    raise WeightsExchangeError(
-                        "weights_checkpoint_scope", "checkpoint counters differ from native Link"
-                    )
-                store.validate_derived_checkpoint(
-                    subject.weights_transaction_id,
-                    request.tensorfs_declaration_canonical_bytes,
-                    documents.spell(checkpoint.head.digest),
-                    checkpoint.head.length,
-                    operation_id=subject.request_id,
-                    slot=subject.output_slot,
-                    plan_digest=documents.spell(checkpoint.plan_digest),
-                )
-            with self._lock:
-                self._checkpoint_still_pending(key, pending, subject.weights_transaction_id)
+                assert self.workspace is not None
+                self.workspace._validate_checkpoint(row, intent.checkpoint)
+            self._checkpoint_pending(
+                intent,
+                subject,
+                attempt_ordinal=intent.attempt_ordinal,
+                declaration=request.tensorfs_declaration_canonical_bytes,
+            )
             result.valid = True
         except Exception as exc:
             result.safe_code = str(getattr(exc, "code", "weights_checkpoint_invalid"))[:128]
             result.safe_detail = f"checkpoint validation refused ({type(exc).__name__})"
         return result
-
-    # ------------------------------------------------------------- the host's lanes
-
-    def exchange_open(self) -> bool:
-        """The observed fact that selects the lane: a supervisor holds `Exchange` open."""
-        with self._lock:
-            return self._stream is not None and self._stream.live()
-
-    def open_exchange_id(self) -> int:
-        """The generation of the live `Exchange`, or 0 if none is open. Observability only:
-        each accepted supervisor stream is one higher than the last."""
-        with self._lock:
-            if self._stream is not None and self._stream.live():
-                return self._stream.id
-            return 0
-
-    def serve_exchange(self, acks: Iterator[pb.WeightsHostAck]) -> Iterator[pb.WeightsHostEvent]:
-        """The server side of `RuntimeWeights.Exchange`, for one supervisor session.
-
-        A newer `Exchange` supersedes this one exactly as a newer control stream supersedes
-        its predecessor; the superseded call ends and its late acks are refused, so one
-        exchange can never bind two writer epochs. A pending exchange stranded when this call
-        ends is re-issued at the next snapshot barrier (`replay_pending`) under the fence that
-        is current then, never restamped here where the fence may be mid-transition.
-        """
-        stream = self._open(acks)
-        try:
-            while True:
-                event = stream.out.get()
-                if event is None:
-                    break
-                yield event
-        finally:
-            self._close(stream)
-        if stream.superseded:
-            raise WeightsExchangeError(
-                "weights_exchange_superseded", "a newer RuntimeWeights.Exchange replaced this one"
-            )
-
-    def _open(self, acks: Iterator[pb.WeightsHostAck]) -> _ExchangeStream:
-        with self._lock:
-            self._streams_opened += 1
-            stream = _ExchangeStream(self._streams_opened)
-            previous, self._stream = self._stream, stream
-            if previous is not None:
-                previous.end(superseded=True)
-            if self.stop.is_set():
-                stream.end()
-                return stream
-        # The stream's own thread reads acks; the server thread yields events. Both end with
-        # the call, and the call ends when either side says so.
-        self.note("artifact", f"RuntimeWeights.Exchange {stream.id} open")
-        threading.Thread(
-            target=self._read_acks,
-            args=(stream, acks),
-            daemon=True,
-            name=f"weights-exchange-{stream.id}",
-        ).start()
-        return stream
-
-    def _close(self, stream: _ExchangeStream) -> None:
-        stream.end()
-        with self._lock:
-            if self._stream is stream:
-                self._stream = None
-        self.note("artifact", f"RuntimeWeights.Exchange {stream.id} ended")
-
-    def _read_acks(self, stream: _ExchangeStream, acks: Iterator[pb.WeightsHostAck]) -> None:
-        """The stream's client half: every ack the supervisor sends, until it half-closes,
-        cancels, or this Runtime supersedes the call. Ending the read ends the call."""
-        try:
-            for ack in acks:
-                if not stream.live():
-                    return
-                try:
-                    self.absorb_ack(ack, lane=("exchange", stream.id))
-                except WeightsExchangeError as exc:
-                    self.note("artifact", f"dropped host ACK on Exchange: {exc.code}: {exc.detail}")
-        except Exception as exc:
-            # The supervisor cancelled or its connection went: the call is over either way,
-            # and what it carried stays pending for the next lane.
-            self.note("artifact", f"Exchange {stream.id} ack reader ended: {type(exc).__name__}")
-        finally:
-            stream.end()
-
-    def _dispatch(self, pending: _Pending) -> None:
-        """Send (or re-send) one exchange on the lane that is open right now. `_lock` held."""
-        stream = self._stream
-        if stream is not None and stream.live():
-            self._send_on_exchange(pending, stream)
-        else:
-            self._send_on_control(pending)
-
-    def _send_on_exchange(self, pending: _Pending, stream: _ExchangeStream) -> None:
-        # A fresh copy per send: `pending.frame` stays the unstamped template so a re-issue
-        # under a later fence starts from the same bytes.
-        frame = pb.WorkerFrame()
-        frame.CopyFrom(pending.frame)
-        kind = frame.WhichOneof("msg")
-        assert kind is not None
-        inner = self.stamp(getattr(frame, kind))
-        event = pb.WeightsHostEvent()
-        getattr(event, _EVENT_FIELD[kind]).CopyFrom(inner)
-        pending.lane = ("exchange", stream.id)
-        pending.envelope = _envelope(inner)
-        stream.out.put(event)
-
-    def _send_on_control(self, pending: _Pending) -> None:
-        # A fresh copy per send: the control sender serializes what it was handed, and a
-        # later re-issue must not restamp bytes a superseded sender may still be reading.
-        frame = pb.WorkerFrame()
-        frame.CopyFrom(pending.frame)
-        self.send(frame)  # worker.send stamps the live fence under the claim lock
-        kind = frame.WhichOneof("msg")
-        assert kind is not None
-        inner = getattr(frame, kind)
-        pending.lane = ("control", inner.control_stream_epoch)
-        pending.envelope = _envelope(inner)
-
-    def _lane_live(self, lane: Lane, control_stream_epoch: int) -> bool:
-        if lane[0] == "control":
-            return lane[1] == control_stream_epoch
-        stream = self._stream
-        return (
-            lane[0] == "exchange" and stream is not None and stream.live() and stream.id == lane[1]
-        )
-
-    @staticmethod
-    def _key(
-        request_id: str, attempt: int, output_slot: str, stage: int
-    ) -> tuple[str, int, str, int]:
-        return request_id, attempt, output_slot, stage
 
     def intent(
         self,
@@ -703,54 +450,11 @@ class WeightsExchange:
             "weights_receipt_digest": documents.spell(receipt_digest),
         }
 
-    def absorb_ack(self, ack: pb.WeightsHostAck, *, lane: Lane) -> None:
-        """One ack settles the one exchange it answers, ONCE.
-
-        `lane` is where the ack arrived. It must be where the exchange last went out, and
-        the ack must echo the envelope of that send: after a re-issue the host may have
-        fenced a new writer epoch for the same transaction, and an ack to the earlier send
-        would bind this Runtime to an epoch the host has already moved past.
-        """
-        key = self._key(ack.request_id, ack.attempt_ordinal, ack.output_slot, ack.stage)
-        with self._lock:
-            pending = self._pending.get(key)
-            if pending is None or pending.ack is not None:
-                raise WeightsExchangeError(
-                    "weights_host_ack_unexpected", "no exact host exchange awaits this ACK"
-                )
-            if pending.lane != lane or pending.envelope != _envelope(ack):
-                raise WeightsExchangeError(
-                    "weights_host_ack_superseded",
-                    "the ACK answers a send this exchange has since re-issued",
-                )
-            pending.ack = ack
-            pending.event.set()
-
-    def replay_pending(self, control_stream_epoch: int) -> None:
-        """The snapshot barrier: re-issue what the SUPERSEDED lanes still owe.
-
-        A pending exchange whose lane is live keeps waiting there -- an open `Exchange`
-        survives an owner reconnect, and its ack, when it comes, still names the send it
-        answers. Only a send on a control stream that is not this one, or on an `Exchange`
-        that has ended, is re-issued, on whichever lane is open now.
-        """
-        with self._lock:
-            stranded = [
-                pending
-                for pending in self._pending.values()
-                if pending.ack is None and not self._lane_live(pending.lane, control_stream_epoch)
-            ]
-            for pending in stranded:
-                self._dispatch(pending)
-
     def close(self) -> None:
         """Forget receipt metadata; active transports release their own read leases."""
         self.writer_broker.close()
         with self._lock:
             self._held = {}
-            stream, self._stream = self._stream, None
-        if stream is not None:
-            stream.end()
 
     def abandon(self, transaction_id: str) -> None:
         """Stop late receipt/transfer registration; native disposition owns the roots."""
@@ -928,118 +632,6 @@ class WeightsExchange:
             ) from exc
         return _LeaseReader(lease, row.object_id, row.length), row.length
 
-    def _exchange(
-        self,
-        key: tuple[str, int, str, int],
-        frame: pb.WorkerFrame,
-        *,
-        canceled: Callable[[], bool],
-    ) -> pb.WeightsHostAck:
-        pending = _Pending(frame=frame, event=threading.Event(), canceled=canceled)
-        with self._lock:
-            existing = self._pending.get(key)
-            if existing is not None:
-                raise WeightsExchangeError(
-                    "weights_host_exchange_conflict", "another exchange holds this output stage"
-                )
-            self._pending[key] = pending
-            # Send on whichever lane is open right now, stamped with the current fence, and
-            # remember both so the one ack that answers this send is the one that settles it.
-            self._dispatch(pending)
-        try:
-            while not pending.event.wait(0.1):
-                if canceled() or self.stop.is_set():
-                    raise WeightsExchangeError(
-                        "weights_host_exchange_canceled", "attempt ended before host ACK"
-                    )
-            assert pending.ack is not None
-            if canceled() or self.stop.is_set():
-                raise WeightsExchangeError(
-                    "weights_host_exchange_canceled", "attempt ended before host ACK"
-                )
-            return pending.ack
-        finally:
-            with self._lock:
-                self._pending.pop(key, None)
-
-    @staticmethod
-    def _validate_ack(ack: pb.WeightsHostAck, sent: Any, stage: int) -> None:
-        if (
-            ack.request_id != sent.request_id
-            or ack.attempt_ordinal != sent.attempt_ordinal
-            or ack.invocation_spec_digest != sent.invocation_spec_digest
-            or ack.output_slot != sent.output_slot
-            or ack.stage != stage
-            or ack.tensorfs_declaration_digest != sent.tensorfs_declaration_digest
-            or ack.outcome
-            not in (
-                pb.WEIGHTS_HOST_OUTCOME_RECORDED,
-                pb.WEIGHTS_HOST_OUTCOME_REPLAYED,
-                pb.WEIGHTS_HOST_OUTCOME_REFUSED,
-            )
-        ):
-            raise WeightsExchangeError(
-                "weights_host_ack_mismatch", "host ACK does not echo the exact exchange"
-            )
-        if ack.outcome == pb.WEIGHTS_HOST_OUTCOME_REFUSED:
-            if (
-                not ack.refusal
-                or ack.weights_transaction_id
-                or ack.writer_epoch
-                or ack.HasField("weights_receipt")
-                or ack.HasField("manifest")
-                or ack.HasField("checkpoint")
-            ):
-                raise WeightsExchangeError(
-                    "weights_host_ack_invalid", "refusal carries transaction authority"
-                )
-            return
-        elif ack.refusal or not ack.weights_transaction_id or ack.writer_epoch <= 0:
-            raise WeightsExchangeError(
-                "weights_host_ack_invalid", "recorded ACK lacks transaction authority"
-            )
-        elif ack.weights_transaction_id != sent.weights_transaction_id:
-            raise WeightsExchangeError(
-                "weights_host_ack_mismatch", "host ACK changed Runtime's supplied transaction id"
-            )
-        if ack.HasField("weights_receipt") != ack.HasField("manifest"):
-            raise WeightsExchangeError(
-                "weights_host_ack_invalid", "receipt and produced Manifest appear together"
-            )
-        if ack.HasField("checkpoint") and (
-            len(ack.checkpoint.head.digest) != 32
-            or ack.checkpoint.head.length == 0
-            or len(ack.checkpoint.plan_digest) != 32
-        ):
-            raise WeightsExchangeError(
-                "weights_host_ack_invalid", "checkpoint ACK has invalid refs"
-            )
-        if stage == pb.WEIGHTS_HOST_STAGE_CHECKPOINT:
-            if (
-                ack.writer_epoch != sent.writer_epoch
-                or ack.checkpoint != sent.checkpoint
-                or ack.HasField("weights_receipt")
-                or ack.HasField("manifest")
-            ):
-                raise WeightsExchangeError(
-                    "weights_host_ack_mismatch", "checkpoint ACK changed native observation"
-                )
-        elif stage == pb.WEIGHTS_HOST_STAGE_RECEIPT:
-            if (
-                ack.weights_transaction_id != sent.weights_transaction_id
-                or ack.writer_epoch != sent.writer_epoch
-                or not ack.HasField("weights_receipt")
-                or ack.manifest != sent.manifest
-                or ack.HasField("checkpoint")
-            ):
-                raise WeightsExchangeError(
-                    "weights_host_ack_mismatch", "receipt ACK changed transaction identity"
-                )
-        elif ack.HasField("weights_receipt") and ack.outcome != pb.WEIGHTS_HOST_OUTCOME_REPLAYED:
-            raise WeightsExchangeError(
-                "weights_host_ack_invalid", "a newly recorded intent cannot carry a receipt"
-            )
-
     @staticmethod
     def _receipt_ref(reference: pb.WeightsReceiptRef) -> bytes:
         raw = reference.weights_receipt_canonical_bytes
@@ -1061,6 +653,7 @@ class WeightsExchange:
         writer_epoch: int,
         reference: pb.WeightsReceiptRef,
     ) -> _Held:
+        self._receipt_ref(reference)
         store = self._store()
         lifecycle = store.derived_lookup(transaction_id)
         if lifecycle.get("state") != "committed":

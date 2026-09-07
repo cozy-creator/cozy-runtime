@@ -1,22 +1,7 @@
-"""The Runtime's `RuntimeWeights` seam and its two lanes, over real loopback gRPC.
+"""Native custody is committed by Runtime before ordered control observations.
 
-proto-025 gives the host's weights lane its own service: the supervisor opens
-`RuntimeWeights.Exchange` per control session, the Runtime pushes intents and receipts as
-server events, and the host ACKs come back on the same stream. Until the supervisor speaks
-it, the same intents ride `WorkerControl` frames. These tests drive the REAL
-`WeightsExchange` behind the REAL `_RuntimeWeightsServicer` on a REAL loopback gRPC server,
-with a stand-in supervisor that opens the bidi stream — nothing is mocked.
-
-What they hold the Runtime to:
-
-* the lane is chosen by an OBSERVED FACT — a live `Exchange` — not a flag: with the stream
-  open an intent leaves on it and NOT on `WorkerControl`; with none open it falls back to
-  the frame;
-* an intent is NOT settled until the host ACK arrives (the receipt-before-ack invariant on
-  the Runtime's side), and it TOLERATES the ACK arriving after a snapshot barrier;
-* it settles ONCE, by the exact send the ACK answers: after a reconnect re-issues the
-  intent under a new envelope, an ACK echoing the stale one is refused and only the ACK on
-  the live lane settles it — the writer epoch a superseded send would have bound never binds.
+The loopback preparation RPC checks exact restored checkpoint identity. There is
+no supervisor ACK authority and no fallback execution lane.
 """
 
 from __future__ import annotations
@@ -35,34 +20,47 @@ import grpc
 import pytest
 import tensorfs
 
+from cozy_runtime.author import WeightsPart, WeightsTarget, WeightsTensor
+from cozy_runtime.author._weights import WeightsCommit
+from cozy_runtime.internal.weights_sink import (
+    WeightsHostBinding,
+    WeightsTransactionHost,
+    protocol_receipt,
+    weights_transaction_id,
+)
 from cozy_runtime.internal.worker import weights
 from cozy_runtime.internal.worker.control import (
     GrpcControlHost,
     _PreparationServicer,
     _RuntimeWeightsServicer,
 )
-from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
+from cozy_runtime.internal.worker.workspace import Workspace
+from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
-DECLARATION = b"tensorfs-declaration-canonical-bytes"
-DECLARATION_DIGEST = sha256(DECLARATION).digest()
-SPEC_DIGEST = sha256(b"invocation-spec").digest()
-OUTPUT_SLOT = "primary"
-TRANSACTION = "sha256:" + "a" * 64
-WAIT = 5.0  # a failsafe only: every assertion is on an observed event, never on elapsed time
+OWNER = "owner-scope"
+OUTPUT_SLOT = "model"
+INVOCATION = (
+    (Path(__file__).parent / "testdata/worker-protocol/canonical/invocation_spec_job.json")
+    .read_bytes()
+    .strip()
+)
+TRANSACTION = weights_transaction_id(
+    OWNER, "req-1", documents.spell(sha256(INVOCATION).digest()), OUTPUT_SLOT
+)
+WAIT = 5.0
 
 
 @dataclass
 class Fence:
-    """The three envelope fields a send is stamped with. Mutable so a test can bump the
-    control-stream epoch exactly as an accepted reconnect does."""
-
     record_owner_epoch: int = 7
     control_stream_epoch: int = 1
     worker_boot_id: str = "boot-under-test"
 
     def stamp(self, message: Any) -> Any:
+        if not hasattr(message, "record_owner_epoch"):
+            return message
         message.record_owner_epoch = self.record_owner_epoch
         message.control_stream_epoch = self.control_stream_epoch
         message.worker_boot_id = self.worker_boot_id
@@ -71,478 +69,93 @@ class Fence:
 
 @dataclass
 class ControlLane:
-    """The `WorkerControl` sender the exchange falls back to: it stamps the inner frame with
-    the live fence, exactly as `Worker.send` does, and records what left."""
-
     fence: Fence
+    workspace: Workspace
     frames: list[pb.WorkerFrame] = field(default_factory=list)
-    signal: threading.Event = field(default_factory=threading.Event)
 
     def send(self, frame: pb.WorkerFrame) -> None:
         kind = frame.WhichOneof("msg")
         assert kind is not None
         self.fence.stamp(getattr(frame, kind))
+        if kind == "weights_intent":
+            observed = frame.weights_intent
+            row = self.workspace.weights_row(OWNER, observed.weights_transaction_id)
+            assert row["epoch"] == observed.requested_writer_epoch > 0
+        if kind == "weights_receipt":
+            observed = frame.weights_receipt
+            row = self.workspace.weights_row(OWNER, observed.weights_transaction_id)
+            assert row["receipt"] == observed.weights_receipt.weights_receipt_canonical_bytes
         self.frames.append(frame)
-        self.signal.set()
-
-
-def _await(predicate: Any, why: str) -> None:
-    """Spin on an OBSERVED fact until it holds. `WAIT` is only the failsafe that turns a
-    hang into a named failure; the loop returns the instant the fact is true."""
-    for _ in range(int(WAIT * 200)):
-        if predicate():
-            return
-        threading.Event().wait(0.005)
-    raise AssertionError(why)
-
-
-def _attempt() -> SimpleNamespace:
-    return SimpleNamespace(
-        request_id="req-1", attempt=3, digest=SPEC_DIGEST, canceling="", weights_receipts={}
-    )
-
-
-def _recorded_ack(
-    intent: pb.WeightsIntentFrame, *, writer_epoch: int, envelope: Fence
-) -> pb.WeightsHostAck:
-    """What a host returns for a freshly recorded intent, echoing the send's envelope."""
-    return pb.WeightsHostAck(
-        record_owner_epoch=envelope.record_owner_epoch,
-        control_stream_epoch=envelope.control_stream_epoch,
-        worker_boot_id=envelope.worker_boot_id,
-        request_id=intent.request_id,
-        attempt_ordinal=intent.attempt_ordinal,
-        invocation_spec_digest=intent.invocation_spec_digest,
-        output_slot=intent.output_slot,
-        weights_transaction_id=TRANSACTION,
-        writer_epoch=writer_epoch,
-        tensorfs_declaration_digest=intent.tensorfs_declaration_digest,
-        stage=pb.WEIGHTS_HOST_STAGE_INTENT,
-        outcome=pb.WEIGHTS_HOST_OUTCOME_RECORDED,
-    )
-
-
-class StandInSupervisor:
-    """One `RuntimeWeights.Exchange` call the supervisor opens, driven by hand. It reads the
-    Runtime's events on the server-stream half and sends host ACKs on the client-stream half,
-    when the test says to — that is how an ACK is 'delayed past a barrier': it is simply not
-    sent until then."""
-
-    def __init__(self, stub: Any) -> None:
-        self._acks: list[pb.WeightsHostAck] = []
-        self._ack_ready = threading.Condition()
-        self._closed = False
-        self.events: list[pb.WeightsHostEvent] = []
-        self._event_ready = threading.Condition()
-        self.call = stub.Exchange(self._ack_stream())
-        self._reader = threading.Thread(target=self._read_events, daemon=True)
-        self._reader.start()
-
-    def _ack_stream(self) -> Iterator[pb.WeightsHostAck]:
-        while True:
-            with self._ack_ready:
-                while not self._acks and not self._closed:
-                    self._ack_ready.wait()
-                if self._acks:
-                    yield self._acks.pop(0)
-                    continue
-                return
-
-    def _read_events(self) -> None:
-        try:
-            for event in self.call:
-                with self._event_ready:
-                    self.events.append(event)
-                    self._event_ready.notify_all()
-        except grpc.RpcError:
-            return
-
-    def next_intent(self) -> pb.WeightsIntentFrame:
-        with self._event_ready:
-            while not self.events:
-                assert self._event_ready.wait(WAIT), "no Exchange event arrived"
-            event = self.events.pop(0)
-        assert event.WhichOneof("event") == "intent", event
-        return event.intent
-
-    def event_count(self) -> int:
-        with self._event_ready:
-            return len(self.events)
-
-    def ack(self, ack: pb.WeightsHostAck) -> None:
-        with self._ack_ready:
-            self._acks.append(ack)
-            self._ack_ready.notify_all()
-
-    def close(self) -> None:
-        with self._ack_ready:
-            self._closed = True
-            self._ack_ready.notify_all()
-        self.call.cancel()
 
 
 @dataclass
 class Rig:
     exchange: weights.WeightsExchange
+    workspace: Workspace
+    store: Any
     fence: Fence
     control: ControlLane
-    stub: Any
-    server: Any
     preparation: Any
+    legacy: Any
+    invocation: bytes
+    declaration: bytes
+    targets: Any
+
+    def accept(self, ordinal: int = 1) -> Any:
+        digest = sha256(self.invocation).digest()
+        self.workspace.accept(
+            OWNER,
+            pb.AttemptOffer(
+                request_id="req-1",
+                attempt_ordinal=ordinal,
+                invocation_spec_digest=digest,
+                invocation_spec_canonical_bytes=self.invocation,
+            ),
+        )
+        return SimpleNamespace(
+            request_id="req-1", attempt=ordinal, digest=digest, canceling="", weights_receipts={}
+        )
+
+    def begin(self, attempt: Any = None) -> dict[str, Any]:
+        attempt = self.accept() if attempt is None else attempt
+        return self.workspace.begin_weights(
+            OWNER,
+            pb.WeightsIntentFrame(
+                request_id=attempt.request_id,
+                attempt_ordinal=attempt.attempt,
+                invocation_spec_digest=attempt.digest,
+                output_slot=OUTPUT_SLOT,
+                weights_transaction_id=TRANSACTION,
+                tensorfs_declaration_digest=sha256(self.declaration).digest(),
+                tensorfs_declaration_canonical_bytes=self.declaration,
+            ),
+        )
+
+    def intent(self, attempt: Any, *, transaction: str = TRANSACTION, requested: int = 0) -> Any:
+        return self.exchange.intent(
+            attempt,
+            transaction_id=transaction,
+            output_slot=OUTPUT_SLOT,
+            declaration_digest=sha256(self.declaration).digest(),
+            declaration=self.declaration,
+            requested_writer_epoch=requested,
+        )
 
 
 @pytest.fixture()
 def rig(tmp_path: Path) -> Iterator[Rig]:
+    store = tensorfs.Store.init(tmp_path / "store")
+    workspace = Workspace(Path(store.root))
     fence = Fence()
-    control = ControlLane(fence)
+    control = ControlLane(fence, workspace)
     exchange = weights.WeightsExchange(
-        store_root=tmp_path / "store",
+        store_root=Path(store.root),
+        workspace=workspace,
         send=control.send,
         stamp=fence.stamp,
         stop=threading.Event(),
-        owner_scope=lambda: "owner-scope",
+        owner_scope=lambda: OWNER,
     )
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
-    pb_grpc.add_RuntimeWeightsServicer_to_server(_RuntimeWeightsServicer(exchange), server)
-    pb_grpc.add_RuntimePreparationServicer_to_server(
-        _PreparationServicer(
-            None, None, None, None, None, weights_checkpoint_validator=exchange.validate_checkpoint
-        ),
-        server,
-    )
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
-    stub = pb_grpc.RuntimeWeightsStub(channel)
-    try:
-        yield Rig(
-            exchange=exchange,
-            fence=fence,
-            control=control,
-            stub=stub,
-            server=server,
-            preparation=pb_grpc.RuntimePreparationStub(channel),
-        )
-    finally:
-        exchange.close()
-        channel.close()
-        server.stop(grace=0)
-
-
-def _run_intent(rig: Rig, attempt: Any = None) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    attempt = _attempt() if attempt is None else attempt
-
-    def call() -> None:
-        try:
-            result["value"] = rig.exchange.intent(
-                attempt,
-                transaction_id=TRANSACTION,
-                output_slot=OUTPUT_SLOT,
-                declaration_digest=DECLARATION_DIGEST,
-                declaration=DECLARATION,
-                requested_writer_epoch=0,
-            )
-        except weights.WeightsExchangeError as exc:
-            result["error"] = exc
-
-    thread = threading.Thread(target=call, daemon=True)
-    thread.start()
-    return {"thread": thread, "result": result}
-
-
-def _restore_request(rig: Rig) -> pb.CheckpointTransferRequest:
-    return pb.CheckpointTransferRequest(
-        record_owner_epoch=rig.fence.record_owner_epoch,
-        worker_boot_id=rig.fence.worker_boot_id,
-        subject=pb.CheckpointSubject(
-            weights=pb.WeightsCheckpointSubject(
-                request_id="req-1",
-                invocation_spec_digest=SPEC_DIGEST,
-                output_slot=OUTPUT_SLOT,
-                weights_transaction_id=TRANSACTION,
-                writer_epoch=8,
-                tensorfs_declaration_digest=DECLARATION_DIGEST,
-            )
-        ),
-    )
-
-
-@pytest.mark.parametrize(
-    "changed", ["owner", "boot", "lane", "spec", "declaration", "slot", "transaction", "epoch"]
-)
-def test_checkpoint_restore_is_bound_to_current_pending_intent(rig: Rig, changed: str) -> None:
-    pending = _run_intent(rig)
-    assert rig.control.signal.wait(WAIT)
-    request = _restore_request(rig)
-    try:
-        with rig.exchange.restore_checkpoint(request) as scope:
-            assert scope == (TRANSACTION, 8)
-        if changed == "owner":
-            request.record_owner_epoch += 1
-        elif changed == "boot":
-            request.worker_boot_id = "other-boot"
-        elif changed == "lane":
-            request.control_stream_epoch = 1
-        elif changed == "spec":
-            request.subject.weights.invocation_spec_digest = b"x" * 32
-        elif changed == "declaration":
-            request.subject.weights.tensorfs_declaration_digest = b"x" * 32
-        elif changed == "slot":
-            request.subject.weights.output_slot = "other"
-        elif changed == "transaction":
-            request.subject.weights.weights_transaction_id = "sha256:" + "b" * 64
-        else:
-            request.subject.weights.writer_epoch = 0
-        with (
-            pytest.raises(weights.WeightsExchangeError, match="weights_checkpoint_scope"),
-            rig.exchange.restore_checkpoint(request),
-        ):
-            pytest.fail("a mismatched restore reached native transfer")
-    finally:
-        rig.exchange.stop.set()
-        pending["thread"].join(WAIT)
-    assert not pending["thread"].is_alive()
-
-
-def test_checkpoint_restore_rechecks_waiter_and_refuses_ambiguous_attempts(rig: Rig) -> None:
-    first = _run_intent(rig)
-    assert rig.control.signal.wait(WAIT)
-    request = _restore_request(rig)
-    second_attempt = _attempt()
-    second_attempt.attempt = 2
-    rig.control.signal.clear()
-    second = _run_intent(rig, second_attempt)
-    assert rig.control.signal.wait(WAIT)
-    try:
-        with (
-            pytest.raises(weights.WeightsExchangeError, match="no unique current intent"),
-            rig.exchange.restore_checkpoint(request),
-        ):
-            pytest.fail("an ambiguous restore reached native transfer")
-        second_attempt.canceling = True
-        second["thread"].join(WAIT)
-        with (
-            pytest.raises(weights.WeightsExchangeError, match="intent ended"),
-            rig.exchange.restore_checkpoint(request) as scope,
-        ):
-            assert scope == (TRANSACTION, 8)
-            rig.exchange.abandon(TRANSACTION)
-        assert not rig.exchange.writer_broker.bindings
-    finally:
-        rig.exchange.stop.set()
-        for pending in (first, second):
-            pending["thread"].join(WAIT)
-            assert not pending["thread"].is_alive()
-
-
-def test_open_exchange_selects_the_lane_and_the_ack_settles_after_a_barrier(rig: Rig) -> None:
-    """The observed fact — a live Exchange — takes the intent, not WorkerControl. The ack is
-    withheld until AFTER a snapshot barrier; the Runtime keeps waiting and settles on it."""
-    supervisor = StandInSupervisor(rig.stub)
-    # The stream reaches the exchange's server handler: the observed fact is now true.
-    _await(rig.exchange.exchange_open, "the Exchange did not register as open")
-
-    pending = _run_intent(rig)
-    intent = supervisor.next_intent()
-    assert intent.record_owner_epoch == rig.fence.record_owner_epoch
-    assert intent.control_stream_epoch == rig.fence.control_stream_epoch
-    assert intent.tensorfs_declaration_canonical_bytes == DECLARATION
-    assert intent.weights_transaction_id == TRANSACTION
-    # The intent went out ON the Exchange and NOT as a WorkerControl frame.
-    assert rig.control.frames == []
-
-    # A snapshot barrier for the SAME session: replay must not duplicate an exchange whose
-    # lane is still live, and the still-blocked intent must not have settled.
-    rig.exchange.replay_pending(rig.fence.control_stream_epoch)
-    assert supervisor.event_count() == 0, "the barrier re-issued a live-lane intent"
-    assert not pending["result"], "the intent settled before any host ACK"
-
-    supervisor.ack(_recorded_ack(intent, writer_epoch=4, envelope=rig.fence))
-    pending["thread"].join(WAIT)
-    assert not pending["thread"].is_alive(), "the intent never settled on its host ACK"
-    assert pending["result"]["value"]["writer_epoch"] == 4
-    assert pending["result"]["value"]["weights_transaction_id"] == TRANSACTION
-    supervisor.close()
-
-
-def test_resumed_attempt_accepts_a_higher_writer_epoch_on_the_same_worker(rig: Rig) -> None:
-    """A retained transaction outlives the attempt whose writer was drained."""
-    supervisor = StandInSupervisor(rig.stub)
-    _await(rig.exchange.exchange_open, "the Exchange did not register as open")
-    first = _attempt()
-    pending = _run_intent(rig, first)
-    intent = supervisor.next_intent()
-    supervisor.ack(_recorded_ack(intent, writer_epoch=4, envelope=rig.fence))
-    pending["thread"].join(WAIT)
-    assert pending["result"]["value"]["writer_epoch"] == 4
-
-    first.canceling = "drain"
-    rig.exchange.writer_broker.close_attempt(first)
-    assert not rig.exchange.writer_broker.bindings
-    assert not rig.exchange.writer_broker.writers
-
-    resumed = _attempt()
-    resumed.attempt += 1
-    pending = _run_intent(rig, resumed)
-    intent = supervisor.next_intent()
-    assert intent.request_id == first.request_id
-    assert intent.attempt_ordinal == first.attempt + 1
-    assert intent.weights_transaction_id == TRANSACTION
-    assert intent.invocation_spec_digest == SPEC_DIGEST
-    supervisor.ack(_recorded_ack(intent, writer_epoch=5, envelope=rig.fence))
-    pending["thread"].join(WAIT)
-    assert "error" not in pending["result"], pending["result"]
-    assert pending["result"]["value"]["writer_epoch"] == 5
-    assert rig.exchange._writer_epoch(TRANSACTION) == 5
-
-    # Even a current-envelope response cannot roll a retained writer fence backward.
-    rig.exchange.writer_broker.close_attempt(resumed)
-    older = _attempt()
-    older.attempt += 2
-    pending = _run_intent(rig, older)
-    intent = supervisor.next_intent()
-    supervisor.ack(_recorded_ack(intent, writer_epoch=4, envelope=rig.fence))
-    pending["thread"].join(WAIT)
-    assert pending["result"]["error"].code == "weights_host_ack_mismatch"
-    assert rig.exchange._writer_epoch(TRANSACTION) == 5
-    assert not rig.exchange.writer_broker.bindings
-    supervisor.close()
-
-
-def test_reconnect_reissues_under_the_new_envelope_and_a_stale_ack_is_refused(rig: Rig) -> None:
-    """The intent is sent on one session's Exchange, the owner reconnects (a new
-    control-stream epoch and a fresh Exchange), and the barrier re-issues it. An ACK echoing
-    the SUPERSEDED send is refused; only the ACK on the live lane settles the intent, once,
-    with the writer epoch that send bound."""
-    first = StandInSupervisor(rig.stub)
-    _await(rig.exchange.exchange_open, "the first Exchange did not register as open")
-
-    pending = _run_intent(rig)
-    stale_intent = first.next_intent()
-    assert stale_intent.control_stream_epoch == 1
-
-    # Reconnect: a new accepted stream mints the next control-stream epoch, and the
-    # supervisor opens a fresh Exchange, which supersedes the first.
-    rig.fence.control_stream_epoch = 2
-    second = StandInSupervisor(rig.stub)
-    _await(lambda: rig.exchange.open_exchange_id() == 2, "the second Exchange did not supersede")
-
-    # The snapshot barrier of the new session re-issues the still-unsettled intent on the
-    # new lane, under the new envelope.
-    rig.exchange.replay_pending(rig.fence.control_stream_epoch)
-    fresh_intent = second.next_intent()
-    assert fresh_intent.control_stream_epoch == 2
-
-    # An ACK that answers the superseded send (envelope epoch 1) must not settle it: the
-    # exchange has since re-issued and would otherwise bind a stale writer epoch.
-    stale_ack = _recorded_ack(fresh_intent, writer_epoch=99, envelope=Fence(control_stream_epoch=1))
-    second.ack(stale_ack)
-    pending["thread"].join(0.5)
-    assert pending["thread"].is_alive(), "a stale-envelope ACK settled the intent"
-    assert not pending["result"]
-
-    # The ACK on the live lane, echoing the live envelope, settles it — exactly once.
-    second.ack(_recorded_ack(fresh_intent, writer_epoch=5, envelope=rig.fence))
-    pending["thread"].join(WAIT)
-    assert not pending["thread"].is_alive(), "the live-lane ACK did not settle the intent"
-    assert pending["result"]["value"]["writer_epoch"] == 5
-    first.close()
-    second.close()
-
-
-def test_without_an_exchange_the_intent_rides_worker_control(rig: Rig) -> None:
-    """The pre-PR2 supervisor never opens Exchange: the observed fact is false, so the same
-    intent leaves as a `WorkerControl` frame and its host ACK on that lane settles it."""
-    assert not rig.exchange.exchange_open()
-
-    pending = _run_intent(rig)
-    assert rig.control.signal.wait(WAIT), "no WorkerControl frame carried the intent"
-    (frame,) = rig.control.frames
-    assert frame.WhichOneof("msg") == "weights_intent"
-    intent = frame.weights_intent
-    assert intent.tensorfs_declaration_canonical_bytes == DECLARATION
-
-    # The host answers on WorkerControl, exactly as the current supervisor does.
-    rig.exchange.absorb_ack(
-        _recorded_ack(intent, writer_epoch=2, envelope=rig.fence),
-        lane=("control", rig.fence.control_stream_epoch),
-    )
-    pending["thread"].join(WAIT)
-    assert not pending["thread"].is_alive(), "the control-lane ACK did not settle the intent"
-    assert pending["result"]["value"]["writer_epoch"] == 2
-
-
-def test_host_cannot_replace_the_runtime_supplied_transaction_id(rig: Rig) -> None:
-    supervisor = StandInSupervisor(rig.stub)
-    _await(rig.exchange.exchange_open, "the Exchange did not register as open")
-    pending = _run_intent(rig)
-    intent = supervisor.next_intent()
-    assert intent.weights_transaction_id == TRANSACTION
-    answer = _recorded_ack(intent, writer_epoch=1, envelope=rig.fence)
-    answer.weights_transaction_id = "sha256:" + "b" * 64
-    supervisor.ack(answer)
-    pending["thread"].join(WAIT)
-    assert not pending["thread"].is_alive()
-    assert "value" not in pending["result"]
-    assert pending["result"]["error"].code == "weights_host_ack_mismatch"
-    supervisor.close()
-
-
-def test_protocol_probe_is_static_and_does_not_open_a_store_or_change_fence(rig: Rig) -> None:
-    before = (
-        rig.fence.record_owner_epoch,
-        rig.fence.control_stream_epoch,
-        rig.fence.worker_boot_id,
-    )
-    assert rig.exchange.store_root is not None
-    assert not rig.exchange.store_root.exists()
-    for _ in range(2):
-        info = rig.preparation.ProtocolInfo(pb.ProtocolInfoRequest(), timeout=WAIT)
-        assert (info.minimum_wire_minor, info.wire_minor) == (MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR)
-    assert before == (
-        rig.fence.record_owner_epoch,
-        rig.fence.control_stream_epoch,
-        rig.fence.worker_boot_id,
-    )
-    assert rig.exchange.store_root is not None
-    assert not rig.exchange.store_root.exists()
-    assert not rig.exchange._pending and not rig.exchange.writer_broker.bindings
-
-
-def test_checkpoint_refusal_has_no_writer_authority() -> None:
-    sent = pb.WeightsCheckpointFrame(
-        request_id="request",
-        attempt_ordinal=1,
-        invocation_spec_digest=SPEC_DIGEST,
-        output_slot=OUTPUT_SLOT,
-        weights_transaction_id=TRANSACTION,
-        writer_epoch=9,
-        tensorfs_declaration_digest=DECLARATION_DIGEST,
-    )
-    refused = pb.WeightsHostAck(
-        request_id=sent.request_id,
-        attempt_ordinal=sent.attempt_ordinal,
-        invocation_spec_digest=sent.invocation_spec_digest,
-        output_slot=sent.output_slot,
-        tensorfs_declaration_digest=sent.tensorfs_declaration_digest,
-        stage=pb.WEIGHTS_HOST_STAGE_CHECKPOINT,
-        outcome=pb.WEIGHTS_HOST_OUTCOME_REFUSED,
-        refusal=pb.WEIGHTS_HOST_REFUSAL_STALE_WRITER,
-    )
-    weights.WeightsExchange._validate_ack(refused, sent, pb.WEIGHTS_HOST_STAGE_CHECKPOINT)
-    refused.writer_epoch = sent.writer_epoch
-    with pytest.raises(weights.WeightsExchangeError) as error:
-        weights.WeightsExchange._validate_ack(refused, sent, pb.WEIGHTS_HOST_STAGE_CHECKPOINT)
-    assert error.value.code == "weights_host_ack_invalid"
-
-
-@pytest.mark.parametrize("cancel_during_validation", [False, True])
-def test_restored_native_work_validates_under_pending_intent_without_importing_writer(
-    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_during_validation: bool
-) -> None:
-    original = tensorfs.Store.init(tmp_path / "original")
-    restored = tensorfs.Store.init(rig.exchange.store_root)
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
     targets = {
         "model": {
@@ -557,117 +170,317 @@ def test_restored_native_work_validates_under_pending_intent_without_importing_w
             },
         }
     }
-    order = [("model", "weight")]
-    fingerprint = "sha256:" + "65" * 32
-    declaration = original.derived_declaration(
-        {}, targets, {}, order, 2048, work_fingerprint=fingerprint
+    declaration = store.derived_declaration(
+        {}, targets, {}, [("model", "weight")], 2048, work_fingerprint="sha256:" + "65" * 32
     )
+    invocation = (
+        (Path(__file__).parent / "testdata/worker-protocol/canonical/invocation_spec_job.json")
+        .read_bytes()
+        .strip()
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    pb_grpc.add_RuntimePreparationServicer_to_server(
+        _PreparationServicer(
+            None, None, None, None, None, weights_checkpoint_validator=exchange.validate_checkpoint
+        ),
+        server,
+    )
+    pb_grpc.add_RuntimeWeightsServicer_to_server(_RuntimeWeightsServicer(exchange), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    try:
+        yield Rig(
+            exchange,
+            workspace,
+            store,
+            fence,
+            control,
+            pb_grpc.RuntimePreparationStub(channel),
+            pb_grpc.RuntimeWeightsStub(channel),
+            invocation,
+            declaration,
+            targets,
+        )
+    finally:
+        exchange.close()
+        channel.close()
+        server.stop(grace=0).wait()
+
+
+def terminal(rig: Rig, attempt: Any) -> None:
+    raw, digest = documents.identity(
+        pb.AttemptOutcomeBody(
+            request_id=attempt.request_id,
+            attempt_ordinal=attempt.attempt,
+            invocation_spec_digest=documents.spell(attempt.digest),
+            status=pb.OUTCOME_STATUS_ABANDONED,
+            execution_started=True,
+        )
+    )
+    rig.workspace.outcome(
+        OWNER,
+        pb.AttemptOutcome(
+            request_id=attempt.request_id,
+            attempt_ordinal=attempt.attempt,
+            invocation_spec_digest=attempt.digest,
+            outcome_id="out-" + str(attempt.attempt),
+            outcome_digest=digest,
+            outcome_canonical_bytes=raw,
+        ),
+    )
+
+
+def ready(rig: Rig, checkpoint: pb.CheckpointRef | None = None) -> pb.WeightsIntentReadyRequest:
+    row = rig.workspace.weights_row(OWNER, TRANSACTION)
+    value = pb.WeightsIntentReadyRequest(
+        record_owner_epoch=rig.fence.record_owner_epoch,
+        worker_boot_id=rig.fence.worker_boot_id,
+        attempt_ordinal=row["ordinal"],
+        weights=pb.WeightsCheckpointSubject(
+            request_id="req-1",
+            invocation_spec_digest=row["spec"],
+            output_slot=OUTPUT_SLOT,
+            weights_transaction_id=TRANSACTION,
+            writer_epoch=row["epoch"],
+            tensorfs_declaration_digest=row["declaration_digest"],
+        ),
+    )
+    if checkpoint is not None:
+        value.checkpoint.CopyFrom(checkpoint)
+    return value
+
+
+def test_intent_uses_durable_epoch_and_ordered_control_without_host_ack(rig: Rig) -> None:
+    attempt = rig.accept()
+    first = rig.intent(attempt)
+    assert first["writer_epoch"] == 1
+    assert [frame.WhichOneof("msg") for frame in rig.control.frames] == [
+        "weights_intent",
+        "weights_transaction",
+    ]
+    assert rig.control.frames[-1].weights_transaction.intent_ready
+    # Stream reconnection cannot allocate or grant a new native writer epoch.
+    rig.fence.control_stream_epoch += 1
+    second = rig.intent(attempt)
+    assert second == first
+    assert rig.control.frames[-2].weights_intent.control_stream_epoch == 2
+    assert Workspace(Path(rig.store.root)).weights_row(OWNER, TRANSACTION)["epoch"] == 1
+
+
+def test_new_attempt_fences_prior_epoch_and_cannot_change_transaction(rig: Rig) -> None:
+    first = rig.accept()
+    rig.intent(first)
+    with pytest.raises(weights.WeightsExchangeError):
+        rig.intent(first, transaction="sha256:" + "b" * 64)
+    terminal(rig, first)
+    rig.exchange.writer_broker.close_attempt(first)
+    resumed = rig.accept(2)
+    assert rig.intent(resumed)["writer_epoch"] == 2
+    with pytest.raises(weights.WeightsExchangeError):
+        rig.intent(first)
+    assert rig.workspace.weights_row(OWNER, TRANSACTION)["epoch"] == 2
+
+
+def test_native_receipt_is_durable_before_control_observation(rig: Rig) -> None:
+    attempt = rig.accept()
+    plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
+    commit = WeightsCommit(
+        OUTPUT_SLOT,
+        {},
+        {
+            "model": WeightsTarget(
+                add={
+                    "weight": WeightsTensor(
+                        "f32", (512,), plain, {"value": WeightsPart("f32", (512,))}
+                    )
+                }
+            )
+        },
+        {},
+        (("model", "weight"),),
+        2048,
+    )
+
+    def bind(slot: str, transaction: str, digest: bytes, declaration: bytes) -> WeightsHostBinding:
+        result = rig.exchange.intent(
+            attempt,
+            output_slot=slot,
+            transaction_id=transaction,
+            declaration_digest=digest,
+            declaration=declaration,
+            requested_writer_epoch=0,
+        )
+        return WeightsHostBinding(result["weights_transaction_id"], result["writer_epoch"])
+
+    def record(receipt: Any) -> None:
+        _, raw, digest = protocol_receipt(
+            receipt,
+            owner_scope=OWNER,
+            request_id=attempt.request_id,
+            invocation_spec_digest=documents.spell(attempt.digest),
+        )
+        rig.exchange.receipt(
+            attempt,
+            output_slot=OUTPUT_SLOT,
+            transaction_id=receipt.weights_transaction_id,
+            receipt_digest=digest,
+            canonical_receipt=raw,
+        )
+
+    producer = WeightsTransactionHost(
+        store=rig.store,
+        owner_scope=OWNER,
+        request_id=attempt.request_id,
+        invocation_spec_digest=documents.spell(attempt.digest),
+        work_fingerprint="sha256:" + "65" * 32,
+        writer_session_id=1,
+        allowed_sources={},
+        output_bounds={OUTPUT_SLOT: 2048},
+        bind_intent=bind,
+        record_receipt=record,
+    )
+    writer = producer.open(commit)
+    writer.add_part("model", "weight", "value", b"\x31" * 2048)
+    receipt = writer.commit()
+    assert [f.WhichOneof("msg") for f in rig.control.frames] == [
+        "weights_intent",
+        "weights_transaction",
+        "weights_receipt",
+        "weights_transaction",
+    ]
+    row = rig.workspace.weights_row(OWNER, receipt.weights_transaction_id)
+    assert row["state"] == "receipt"
+    assert rig.store.derived_lookup(receipt.weights_transaction_id)["state"] == "committed"
+    observed = rig.control.frames[2].weights_receipt
+    with pytest.raises(weights.WeightsExchangeError):
+        rig.exchange.receipt(
+            attempt,
+            output_slot=OUTPUT_SLOT,
+            transaction_id=receipt.weights_transaction_id,
+            receipt_digest=observed.weights_receipt.weights_receipt_digest,
+            canonical_receipt=observed.weights_receipt.weights_receipt_canonical_bytes + b" ",
+        )
+    assert len(rig.control.frames) == 4
+
+
+@pytest.mark.parametrize(
+    "changed", ["owner", "boot", "lane", "spec", "declaration", "slot", "transaction", "epoch"]
+)
+def test_checkpoint_restore_is_bound_to_current_workspace_intent(rig: Rig, changed: str) -> None:
+    rig.begin()
+    request = pb.CheckpointTransferRequest(
+        record_owner_epoch=rig.fence.record_owner_epoch,
+        worker_boot_id=rig.fence.worker_boot_id,
+        subject=pb.CheckpointSubject(weights=ready(rig).weights),
+    )
+    with rig.exchange.restore_checkpoint(request) as scope:
+        assert scope == (TRANSACTION, 1)
+    if changed == "owner":
+        request.record_owner_epoch += 1
+    elif changed == "boot":
+        request.worker_boot_id = "other-boot"
+    elif changed == "lane":
+        request.control_stream_epoch = 1
+    elif changed == "spec":
+        request.subject.weights.invocation_spec_digest = b"x" * 32
+    elif changed == "declaration":
+        request.subject.weights.tensorfs_declaration_digest = b"x" * 32
+    elif changed == "slot":
+        request.subject.weights.output_slot = "other"
+    elif changed == "transaction":
+        request.subject.weights.weights_transaction_id = "sha256:" + "b" * 64
+    else:
+        request.subject.weights.writer_epoch += 1
+    with pytest.raises(weights.WeightsExchangeError), rig.exchange.restore_checkpoint(request):
+        pytest.fail("mismatched restore reached native transfer")
+
+
+def test_restore_rechecks_workspace_after_io(rig: Rig) -> None:
+    attempt = rig.accept()
+    rig.begin(attempt)
+    request = pb.CheckpointTransferRequest(
+        record_owner_epoch=rig.fence.record_owner_epoch,
+        worker_boot_id=rig.fence.worker_boot_id,
+        subject=pb.CheckpointSubject(weights=ready(rig).weights),
+    )
+    with pytest.raises(weights.WeightsExchangeError), rig.exchange.restore_checkpoint(request):
+        terminal(rig, attempt)
+        rig.begin(rig.accept(2))
+    assert not rig.exchange.writer_broker.bindings
+
+
+@pytest.mark.parametrize("cancel_during_validation", [False, True])
+def test_restored_native_checkpoint_is_validated_before_writer_adoption(
+    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_during_validation: bool
+) -> None:
+    rig.begin()
+    original = tensorfs.Store.init(tmp_path / "original")
     writer = original.begin_derived(
-        TRANSACTION, 7, {}, targets, {}, order, 2048, work_fingerprint=fingerprint
+        TRANSACTION,
+        7,
+        {},
+        rig.targets,
+        {},
+        [("model", "weight")],
+        2048,
+        work_fingerprint="sha256:" + "65" * 32,
     )
     writer.add_part("model", "weight", "value", io.BytesIO(b"\x31" * 2048))
     head = writer.checkpoint("req-1", OUTPUT_SLOT)
     writer.fence()
-    head_id, head_length = head["head"], head["head_length"]
-    plan_digest, head_index, head_bytes = head["plan_digest"], head["index"], head["bytes"]
-    assert isinstance(head_id, str) and isinstance(head_length, int)
-    assert (
-        isinstance(plan_digest, str) and isinstance(head_index, int) and isinstance(head_bytes, int)
-    )
-    tensorfs.transfer_object(original, restored, head_id, head_length)
+    tensorfs.transfer_object(original, rig.store, head["head"], head["head_length"])
     page = original.checkpoint_page(
-        head_id,
-        head_length,
+        head["head"],
+        head["head_length"],
         operation_id="req-1",
         slot=OUTPUT_SLOT,
-        plan_digest=plan_digest,
+        plan_digest=head["plan_digest"],
     )
-    assert page["previous"] is None
     for obj in page["objects"]:
-        tensorfs.transfer_object(original, restored, obj["object_id"], obj["length"])
-    assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
-
-    supervisor = StandInSupervisor(rig.stub)
-    _await(rig.exchange.exchange_open, "exchange did not open")
-    result: dict[str, Any] = {}
-    attempt = _attempt()
-
-    def intent_call() -> None:
-        try:
-            result["value"] = rig.exchange.intent(
-                attempt,
-                output_slot=OUTPUT_SLOT,
-                transaction_id=TRANSACTION,
-                declaration_digest=sha256(declaration).digest(),
-                declaration=declaration,
-                requested_writer_epoch=0,
-            )
-        except weights.WeightsExchangeError as error:
-            result["error"] = error.code
-
-    pending = threading.Thread(target=intent_call, daemon=True)
-    pending.start()
-    sent = supervisor.next_intent()
+        tensorfs.transfer_object(original, rig.store, obj["object_id"], obj["length"])
     checkpoint = pb.CheckpointRef(
-        head=pb.Ref(digest=bytes.fromhex(head_id[7:]), length=head_length),
-        plan_digest=bytes.fromhex(plan_digest[7:]),
-        index=head_index,
-        bytes=head_bytes,
-    )
-    ready = pb.WeightsIntentReadyRequest(
-        record_owner_epoch=rig.fence.record_owner_epoch,
-        worker_boot_id=rig.fence.worker_boot_id,
-        attempt_ordinal=sent.attempt_ordinal,
-        weights=pb.WeightsCheckpointSubject(
-            request_id=sent.request_id,
-            invocation_spec_digest=sent.invocation_spec_digest,
-            output_slot=sent.output_slot,
-            weights_transaction_id=sent.weights_transaction_id,
-            writer_epoch=8,
-            tensorfs_declaration_digest=sent.tensorfs_declaration_digest,
-        ),
-        checkpoint=checkpoint,
+        head=pb.Ref(digest=documents.raw(head["head"]), length=head["head_length"]),
+        plan_digest=documents.raw(head["plan_digest"]),
+        index=head["index"],
+        bytes=head["bytes"],
     )
     request = pb.ValidateWeightsCheckpointRequest(
-        intent=ready, tensorfs_declaration_canonical_bytes=declaration
+        intent=ready(rig, checkpoint), tensorfs_declaration_canonical_bytes=rig.declaration
     )
     if cancel_during_validation:
-        validated, finish = threading.Event(), threading.Event()
+        entered, finish = threading.Event(), threading.Event()
+        validate_native = rig.workspace._validate_checkpoint
+        answers: list[pb.ValidateWeightsCheckpointResult] = []
 
-        class DelayedStore:
-            checkpoint_page = restored.checkpoint_page
+        def delayed(row: Any, checkpoint: pb.CheckpointRef) -> None:
+            validate_native(row, checkpoint)
+            entered.set()
+            assert finish.wait(WAIT), "native validation test was not released"
 
-            def validate_derived_checkpoint(self, *args: Any, **kwargs: Any) -> None:
-                restored.validate_derived_checkpoint(*args, **kwargs)
-                validated.set()
-                assert finish.wait(WAIT), "validation did not finish"
-
-        monkeypatch.setattr(rig.exchange, "_store", DelayedStore)
-        verdict: dict[str, Any] = {}
-
-        def validate() -> None:
-            verdict["value"] = rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
-
-        validating = threading.Thread(target=validate, daemon=True)
+        monkeypatch.setattr(rig.workspace, "_validate_checkpoint", delayed)
+        validating = threading.Thread(
+            target=lambda: answers.append(
+                rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
+            )
+        )
         validating.start()
-        assert validated.wait(WAIT), "native closure was not validated"
-        attempt.canceling = True
-        pending.join(WAIT)
-        finish.set()
-        validating.join(WAIT)
-        assert not pending.is_alive() and not validating.is_alive()
-        assert result == {"error": "weights_host_exchange_canceled"}
-        assert not verdict["value"].valid and verdict["value"].safe_code
-        assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
+        try:
+            assert entered.wait(WAIT), "native checkpoint was not validated"
+            # This transition must not be blocked by a global lock held over IO.
+            terminal(rig, rig.accept())
+        finally:
+            finish.set()
+            validating.join(WAIT)
+        assert not validating.is_alive()
+        assert len(answers) == 1 and not answers[0].valid and answers[0].safe_code
+        assert rig.store.derived_lookup(TRANSACTION)["state"] == "absent"
         assert not rig.exchange.writer_broker.bindings
-        supervisor.close()
         return
-    accepted = rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
-    assert accepted.valid and accepted.checkpoint == checkpoint
-    assert pending.is_alive() and result == {}
-    assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
+    verdict = rig.preparation.ValidateWeightsCheckpoint(request, timeout=WAIT)
+    assert verdict.valid and verdict.checkpoint == checkpoint
+    assert rig.store.derived_lookup(TRANSACTION)["state"] == "absent"
     assert not rig.exchange.writer_broker.bindings
-    assert supervisor.event_count() == 0  # no periodic intent resend while Ready is delayed
     for mutation in ("counter", "declaration", "scope"):
         wrong = pb.ValidateWeightsCheckpointRequest()
         wrong.CopyFrom(request)
@@ -679,14 +492,10 @@ def test_restored_native_work_validates_under_pending_intent_without_importing_w
             wrong.intent.weights.output_slot = "other"
         refused = rig.preparation.ValidateWeightsCheckpoint(wrong, timeout=WAIT)
         assert not refused.valid and refused.safe_code
-    ack = _recorded_ack(sent, writer_epoch=8, envelope=rig.fence)
-    ack.checkpoint.CopyFrom(checkpoint)
-    supervisor.ack(ack)
-    pending.join(WAIT)
-    assert not pending.is_alive()
-    assert result["value"]["checkpoint"] == (head["head"], head["head_length"])
-    assert restored.derived_lookup(TRANSACTION)["state"] == "absent"
-    supervisor.close()
+    row = rig.workspace.ready_weights(OWNER, request.intent)
+    assert row["ready"]
+    # Validation/Ready records the exact checkpoint without importing a native writer.
+    assert rig.store.derived_lookup(TRANSACTION)["state"] == "absent"
 
 
 def test_local_control_host_serves_probe_without_preparation_handlers(tmp_path: Path) -> None:
@@ -712,3 +521,11 @@ def test_local_control_host_serves_probe_without_preparation_handlers(tmp_path: 
     finally:
         host.stop()
         thread.join(WAIT)
+
+
+def test_retired_exchange_cannot_grant_custody(rig: Rig) -> None:
+    with pytest.raises(grpc.RpcError) as error:
+        next(rig.legacy.Exchange(iter(()), timeout=WAIT))
+    assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    assert not rig.exchange.writer_broker.bindings
+    assert not rig.control.frames
