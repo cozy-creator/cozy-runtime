@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import grpc
 import pytest
@@ -82,9 +82,11 @@ class ControlLane:
             row = self.workspace.weights_row(OWNER, observed.weights_transaction_id)
             assert row["epoch"] == observed.requested_writer_epoch > 0
         if kind == "weights_receipt":
-            observed = frame.weights_receipt
-            row = self.workspace.weights_row(OWNER, observed.weights_transaction_id)
-            assert row["receipt"] == observed.weights_receipt.weights_receipt_canonical_bytes
+            observed_receipt = frame.weights_receipt
+            row = self.workspace.weights_row(OWNER, observed_receipt.weights_transaction_id)
+            assert (
+                row["receipt"] == observed_receipt.weights_receipt.weights_receipt_canonical_bytes
+            )
         self.frames.append(frame)
 
 
@@ -427,7 +429,7 @@ def test_restored_native_checkpoint_is_validated_before_writer_adoption(
         work_fingerprint="sha256:" + "65" * 32,
     )
     writer.add_part("model", "weight", "value", io.BytesIO(b"\x31" * 2048))
-    head = writer.checkpoint("req-1", OUTPUT_SLOT)
+    head = cast(dict[str, Any], writer.checkpoint("req-1", OUTPUT_SLOT))
     writer.fence()
     tensorfs.transfer_object(original, rig.store, head["head"], head["head_length"])
     page = original.checkpoint_page(

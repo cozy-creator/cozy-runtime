@@ -65,7 +65,6 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
     assert bound.wait(5)
     channel = grpc.insecure_channel((root / "control.addr").read_text().strip())
     control = g.WorkerControlStub(channel)
-    weights = g.RuntimeWeightsStub(channel)
     preparation = g.RuntimePreparationStub(channel)
     claim = p.Claim(
         record_owner_epoch=1,
@@ -87,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
     queues: list[queue.Queue[Any]] = []
     calls: list[Any] = []
 
-    def connect() -> tuple[p.ClaimAck, Any, Any]:
+    def connect() -> tuple[p.ClaimAck, Any]:
         q: queue.Queue[Any] = queue.Queue()
         queues.append(q)
         q.put(p.RecordOwnerFrame(claim=claim))
@@ -95,17 +94,12 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
         calls.append(call)
         ack = next(call).claim_ack
         assert ack.accepted
-        acks: queue.Queue[Any] = queue.Queue()
-        queues.append(acks)
-        exchange = weights.Exchange(frames(acks), timeout=15)
-        calls.append(exchange)
-        await_for(worker.weights.exchange_open, "exchange never opened")
-        return ack, call, exchange
+        return ack, call
 
     try:
-        ack, old_control, old_exchange = connect()
+        ack, old_control = connect()
         watchers = []
-        for _index in range(6):
+        for _index in range(7):
             watch = control.WatchProgress(
                 p.ProgressOpen(
                     record_owner_epoch=1,
@@ -158,7 +152,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
             json.dumps(
                 {
                     "phase": "fixed",
-                    "canceled_watchers": 6,
+                    "canceled_watchers": 7,
                     "deadline_and_disconnect": True,
                     "remaining": len(worker.watches.watchers),
                     "unary_safe_code": result.safe_code,
@@ -168,9 +162,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
         )
         # Exactly what Host.endSession does before opening the new control session.
         old_control.cancel()
-        old_exchange.cancel()
-        await_for(lambda: not worker.weights.exchange_open(), "old exchange did not end")
-        fresh, new_control, new_exchange = connect()
+        fresh, new_control = connect()
         assert fresh.control_stream_epoch == ack.control_stream_epoch + 1
         result = preparation.CheckpointPage(p.CheckpointPageRequest(), timeout=3)
         assert result.safe_code

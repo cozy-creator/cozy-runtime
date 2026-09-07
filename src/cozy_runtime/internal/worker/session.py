@@ -49,7 +49,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from cozy_runtime.internal import (
     accel,
@@ -1880,7 +1880,7 @@ class Worker:
         if self.workspace is None:
             raise WorkspaceRefusal("worker has no workspace")
         value = self.workspace.ready_weights(owner, call.request)
-        row = cast(dict[str, Any], value)
+        row = value
         self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(value)))
         ack = pb.WeightsHostAck(
             request_id=row["request"],
@@ -2812,7 +2812,7 @@ class Worker:
                 for value in self.workspace.projected_weights(
                     self.fence.record_owner_id, self.fence.worker_boot_id
                 ):
-                    row = cast(dict[str, Any], value)
+                    row = value
                     if row["receipt"]:
                         self.send(
                             pb.WorkerFrame(

@@ -712,9 +712,7 @@ class Workspace:
     def status(row: dict[str, Any]) -> pb.WeightsTransactionStatus:
         # SQLite rows have closed schema types; these are transport projections,
         # never another writer epoch or custody decision.
-        from typing import Any, cast
-
-        value = cast(dict[str, Any], row)
+        value = row
         status = pb.WeightsTransactionStatus(
             weights_transaction_id=value["id"],
             request_id=value["request"],

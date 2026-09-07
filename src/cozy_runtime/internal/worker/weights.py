@@ -206,10 +206,7 @@ class WeightsExchange:
                 "weights_checkpoint_scope", "checkpoint owner is not current"
             )
         try:
-            row = cast(
-                dict[str, Any],
-                self.workspace.weights_row(self.owner_scope(), subject.weights_transaction_id),
-            )
+            row = self.workspace.weights_row(self.owner_scope(), subject.weights_transaction_id)
         except ValueError as exc:
             raise WeightsExchangeError(
                 "weights_checkpoint_scope", "checkpoint has no owned intent"
@@ -301,7 +298,7 @@ class WeightsExchange:
             tensorfs_declaration_canonical_bytes=declaration,
         )
         try:
-            row = cast(dict[str, Any], self.workspace.begin_weights(self.owner_scope(), intent))
+            row = self.workspace.begin_weights(self.owner_scope(), intent)
             epoch = int(row["epoch"])
             intent.requested_writer_epoch = epoch
             # One FIFO carries the projection and its eventual outcome. The
@@ -321,7 +318,7 @@ class WeightsExchange:
             if row["checkpoint"]:
                 ready.checkpoint.CopyFrom(pb.CheckpointRef.FromString(row["checkpoint"]))
             try:
-                row = cast(dict[str, Any], self.workspace.ready_weights(self.owner_scope(), ready))
+                row = self.workspace.ready_weights(self.owner_scope(), ready)
             except Exception as exc:
                 if not ready.HasField("checkpoint") or getattr(exc, "code", None) not in {
                     "ROOT_ABSENT",
@@ -336,10 +333,7 @@ class WeightsExchange:
                         raise WeightsExchangeError(
                             "weights_canceled", "writer restoration stopped"
                         ) from exc
-                    row = cast(
-                        dict[str, Any],
-                        self.workspace.weights_row(self.owner_scope(), transaction_id),
-                    )
+                    row = self.workspace.weights_row(self.owner_scope(), transaction_id)
             self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(row)))
             with self._lock:
                 self._bindings[transaction_id] = (epoch, declaration_digest)

@@ -64,7 +64,7 @@ def produced(
                 tensorfs_declaration_canonical_bytes=declaration,
             ),
         )
-        epoch = int(row["epoch"])  # type: ignore[call-overload]
+        epoch = int(row["epoch"])
         return WeightsHostBinding(transaction, epoch)
 
     def record(receipt: WeightsReceipt) -> None:
