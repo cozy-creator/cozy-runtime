@@ -838,4 +838,15 @@ class Workspace:
                 request.retention_id,
             ),
         )
+        if release:
+            from cozy_runtime.internal.worker import workspace_memo
+
+            try:
+                workspace_memo.compact_released(db, owner)
+            except Exception:
+                # Native release and its tombstone are already durable. Keep
+                # the larger lookup body for the next prune/cleanup to compact.
+                import logging
+
+                logging.getLogger(__name__).warning("workspace release compaction deferred")
         return result

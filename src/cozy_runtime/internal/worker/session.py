@@ -2881,6 +2881,17 @@ class Worker:
         elif kind == "child_call_result":
             if not self.calls.absorb(inner):
                 self.note("child", "dropped stale or invalid child-call result")
+            elif inner.state == pb.CHILD_CALL_STATE_SUCCEEDED and self.workspace is not None:
+                from . import workspace_memo
+
+                try:
+                    workspace_memo.delivered(
+                        self.workspace, self.fence.record_owner_id, inner.child_request_id
+                    )
+                except Exception as exc:
+                    # The owner already committed this result. Optional metadata
+                    # compaction cannot turn its successful computation into a failure.
+                    self.note("workspace", f"result compaction deferred ({type(exc).__name__})")
         elif kind == "weights_read_request":
             self.send(self.weights.read(inner))
         elif kind == "weights_upload_request":
