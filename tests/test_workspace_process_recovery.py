@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 import tensorfs
@@ -205,7 +206,7 @@ def test_slow_recovery_cannot_disrupt_an_already_admitted_successor(
         errors: list[Exception] = []
         native = workspace_recovery.native_result
 
-        def delayed(workspace, row):
+        def delayed(workspace: Workspace, row: dict[str, Any]) -> pb.WeightsReceiptFrame | None:
             if threading.current_thread().name == "slow-recovery":
                 entered.set()
                 assert finish.wait(5)
@@ -213,7 +214,7 @@ def test_slow_recovery_cannot_disrupt_an_already_admitted_successor(
 
         monkeypatch.setattr(workspace_recovery, "native_result", delayed)
 
-        def recover():
+        def recover() -> None:
             try:
                 Workspace(root).retained_outcomes("owner")
             except Exception as exc:
