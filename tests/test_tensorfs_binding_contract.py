@@ -57,6 +57,7 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "cozy_runtime"
 #: written for. Transcribed from the installed extension, not from the Rust source: the
 #: wheel is what a pod runs. A diff here is a seam change and wants a human, not a re-freeze.
 CALLED: dict[str, str] = {
+    "gc": "(root, dry_run=False)",
     "fit": (
         "(requirements: 'Sequence[TensorRequirement]', header: 'bytes', *, custody: 'str', "
         "encoded_leaves: 'bool', device: 'str | None' = None, "
