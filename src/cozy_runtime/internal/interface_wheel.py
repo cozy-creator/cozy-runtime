@@ -247,7 +247,7 @@ def build(
     files[dist + "/package-interface.json"] = interface
     files[dist + "/METADATA"] = (
         "Metadata-Version: 2.4\n" + f"Name: {distribution}\nVersion: {version}\n"
-        "Requires-Python: >=3.12,<3.13\nRequires-Dist: cozy-runtime>=0.2.31\n"
+        "Requires-Python: >=3.12,<3.13\nRequires-Dist: cozy-runtime>=0.2.33\n"
         f"Cozy-Interface-Generator: {GENERATOR_ABI}\n"
         f"Cozy-Implementation-Digest: {implementation_digest}\n\n"
     ).encode()
