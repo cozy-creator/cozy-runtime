@@ -2717,7 +2717,15 @@ class Worker:
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
         closed = self.engine.history.get((acked.request_id, acked.attempt_ordinal))
-        if self.reclaim_on_terminal and closed is not None and closed.kind == "job":
+        # An acknowledged stopped attempt can leave retained work for another
+        # attempt on this worker. The owner's per-outcome retention decision
+        # overrides the job's ordinary one-shot process recycling policy.
+        if (
+            self.reclaim_on_terminal
+            and not acked.retain_work
+            and closed is not None
+            and closed.kind == "job"
+        ):
             self.note(
                 "session",
                 f"job attempt {acked.request_id}#{acked.attempt_ordinal} is acknowledged and "
