@@ -2167,6 +2167,7 @@ class Executor:
                     weights_receipt_digest=(
                         documents.raw(receipt_digest) if receipt_digest else b""
                     ),
+                    checkpoint=(tuple(answer["checkpoint"]) if answer.get("checkpoint") else None),
                 )
 
             def record_receipt(receipt: Any) -> None:
@@ -2204,6 +2205,7 @@ class Executor:
                 request_id=weights_request_id,
                 invocation_spec_digest=invocation_spec_digest,
                 writer_session_id=1,
+                work_fingerprint=str(command.get("weights_work_fingerprint", "")),
                 allowed_sources=allowed_sources,
                 output_bounds={
                     output.name: output.max_new_bytes for output in surface.weights_outputs
@@ -2265,6 +2267,7 @@ class Executor:
                 request_id=command["request_id"],
                 spool=spool,
                 deadline=_deadline(command["deadline_s"]),
+                calls=self._call_broker(command),
                 device=self._device() if self.torch is not None else Device(),
                 cancel=lambda: _cancelled(self.root, command["request_id"]),
                 models=job_models,
@@ -2335,6 +2338,55 @@ class Executor:
                 "gpu_count": 1 if self.torch is not None else 0,
             },
         }
+
+    def _call_broker(self, command: Mapping[str, Any]) -> Any:
+        from cozy_runtime.author._calls import _Broker, _CallType
+
+        rows = command.get("call_interfaces") or []
+        if not rows:
+            return None
+        if not isinstance(rows, list) or len(rows) > 256:
+            raise CapabilityError(
+                "call interface inventory exceeds its bound", code="child_interface"
+            )
+        bindings: dict[tuple[str, str, str], _CallType] = {}
+        for row in rows:
+            interface, module, export = row["interface_digest"], row["module"], row["export"]
+            if row.get("self"):
+                assert self.discovered is not None
+                surface = next(
+                    (
+                        surface
+                        for surface in self.discovered.surfaces
+                        if surface.invocable
+                        and surface.fn.__module__ == module
+                        and surface.fn.__name__ == export
+                    ),
+                    None,
+                )
+                if surface is None:
+                    raise CapabilityError(
+                        "self call is not a registered App export", code="child_interface"
+                    )
+                binding = _CallType(
+                    interface, module, export, surface.payload_type, surface.result_type
+                )
+                bindings[("", module, export)] = binding
+            else:
+                imported = importlib.import_module(module)
+                candidate = getattr(imported, "__cozy_bindings__", {}).get(export)
+                if not isinstance(candidate, _CallType) or (
+                    candidate.interface_digest,
+                    candidate.module,
+                    candidate.export,
+                ) != (interface, module, export):
+                    raise CapabilityError(
+                        "imported interface differs from the admitted closure",
+                        code="child_interface",
+                    )
+                binding = candidate
+            bindings[(interface, module, export)] = binding
+        return _Broker(str(command["request_id"]), bindings, self._durable)
 
     def _durable(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
         """One DURABLE mid-attempt exchange. Blocks until the worker answers.

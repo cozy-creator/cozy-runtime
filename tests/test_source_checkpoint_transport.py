@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 import tensorfs
 
-from cozy_runtime.internal.worker import model_source_checkpoint as checkpoint
+from cozy_runtime.internal.worker import checkpoint_transport as checkpoint
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
@@ -24,7 +24,7 @@ def _ref(raw: bytes) -> pb.Ref:
     return pb.Ref(digest=hashlib.sha256(raw).digest(), length=len(raw))
 
 
-def _link(store: Any) -> tuple[pb.SourceCheckpointPageRequest, dict[str, bytes]]:
+def _link(store: Any) -> tuple[pb.CheckpointPageRequest, dict[str, bytes]]:
     payloads = [b"first tensor" * 341, b"second tensor" * 257]
     progress = b'{"converter":"opaque-to-transport"}'
     refs = sorted((_ref(raw) for raw in payloads), key=lambda row: row.digest)
@@ -42,10 +42,14 @@ def _link(store: Any) -> tuple[pb.SourceCheckpointPageRequest, dict[str, bytes]]
     objects = {_ref(body).digest.hex(): body for body in [*payloads, progress, raw]}
     for body in objects.values():
         store.put_reader(io.BytesIO(body), _ref(body).digest.hex(), len(body))
-    return pb.SourceCheckpointPageRequest(
-        operation_id="op-resume",
-        source_selection_digest=b"s" * 32,
-        slot="dit",
+    return pb.CheckpointPageRequest(
+        subject=pb.CheckpointSubject(
+            source=pb.SourceCheckpointSubject(
+                operation_id="op-resume",
+                source_selection_digest=b"s" * 32,
+                slot="dit",
+            )
+        ),
         plan_digest=b"\xbb" * 32,
         head=_ref(raw),
         limit=1,
@@ -96,16 +100,12 @@ def _origin() -> Iterator[tuple[str, dict[str, bytes], list[tuple[str, str]]]]:
         thread.join()
 
 
-def _transfer(
-    subject: pb.SourceCheckpointPageRequest, ref: pb.Ref
-) -> pb.SourceCheckpointTransferRequest:
-    return pb.SourceCheckpointTransferRequest(
-        operation_id=subject.operation_id,
-        source_selection_digest=subject.source_selection_digest,
-        slot=subject.slot,
+def _transfer(subject: pb.CheckpointPageRequest, ref: pb.Ref) -> pb.CheckpointTransferRequest:
+    return pb.CheckpointTransferRequest(
+        subject=subject.subject,
         plan_digest=subject.plan_digest,
         head=subject.head,
-        object=pb.SourceCheckpointObject(ref=ref),
+        object=pb.CheckpointObject(ref=ref),
         transfer_id="transfer-" + ref.digest.hex(),
         grant_revision=1,
     )
@@ -124,9 +124,9 @@ def test_pages_refuse_cross_subject_and_restore_exact_objects_to_a_new_store(
     last = checkpoint.page(subject, tensorfs_root=root)
     assert len(last.objects) == 1 and not last.has_more
     subject.offset = 0
-    wrong = pb.SourceCheckpointPageRequest()
+    wrong = pb.CheckpointPageRequest()
     wrong.CopyFrom(subject)
-    wrong.slot = "other"
+    wrong.subject.source.slot = "other"
     assert "cross_subject" in checkpoint.page(wrong, tensorfs_root=root).safe_code
 
     with _origin() as (base, remote, requests):

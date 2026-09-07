@@ -59,10 +59,10 @@ from cozy_runtime.internal import (
     hostfacts,
     package_environment,
     proctree,
+    weights_sink,
 )
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import (
     acquire,
     activity,
@@ -118,7 +118,7 @@ from cozy_runtime.internal.worker.plan import (
     shape_cell,
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
-from cozy_runtime.protocol import WIRE_MINOR, documents
+from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
@@ -1074,6 +1074,9 @@ class Worker:
         self.failed_bindings: dict[str, str] = {}
         self.prepared_models: dict[str, PreparedModel] = {}
         self.jobs: dict[str, JobBinding] = {}
+        from cozy_runtime.internal.worker.job_slots import JobSlot
+
+        self.job_slots: dict[str, JobSlot] = {}
         self.placement: Placement | None = None
         #: The INCOMING placement being staged while `placement` keeps serving (#474). It is
         #: a separate field precisely because one field cannot hold both, which is the same
@@ -1129,8 +1132,20 @@ class Worker:
             weights=self.weights,
             owner_scope=lambda: self.fence.record_owner_id,
             tensorfs_root=options.tensorfs_root,
+            work_fingerprint=lambda attempt: weights_sink.work_fingerprint(
+                attempt.spec,
+                attempt.job.environment_content_digest if attempt.job else "",
+                self.base,
+                hostfacts.measure(options.accelerator_backend),
+            ),
         )
         self.engine.boot_id = self.fence.worker_boot_id
+        from cozy_runtime.internal.worker.calls import Calls
+
+        self.calls = Calls(
+            self.send, lambda: self.fence.control_stream_epoch, lambda: self.fence.wire_minor
+        )
+        self.engine.calls = self.calls
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
         #: claim installs a FRESH queue under `claim_lock`, so the superseded stream's sender
         #: keeps draining its own (now unread) queue and can never consume a frame authored
@@ -1391,9 +1406,19 @@ class Worker:
         ledger row is the placement's own on its lane; switching between two placements
         wipes nothing (cr-066's red arm: it used to `begin_generation` the one ledger).
         """
+        selected_job = None
         if attempt.spec.get("job") is not None or self.accepted.mode == "job":
-            lane = self.lanes.envelope
-            supervision = self.supervision
+            descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
+            selected_job = next(
+                (
+                    slot
+                    for slot in self.job_slots.values()
+                    if slot.binding.job_descriptor_id == descriptor
+                ),
+                None,
+            )
+            lane = selected_job.lane if selected_job is not None else self.lanes.envelope
+            supervision = selected_job.supervision if selected_job is not None else self.supervision
             row = lane.row("")
             bindings: Mapping[str, DeclaredBinding] = {}
             prepared: Mapping[str, PreparedModel] = {}
@@ -1437,6 +1462,14 @@ class Worker:
             failed_bindings=failed,
             lane_id=lane.lane_id,
             devices=lane.devices,
+            job_device_count=(
+                selected_job.directive.device_count
+                if selected_job is not None
+                else self.engine.job_device_count
+            )
+            if attempt.spec.get("job") is not None
+            else 0,
+            orchestration=lane is self.lanes.orchestration,
         )
         attempt.slot = slot
         attempt.lane_id = lane.lane_id
@@ -1463,7 +1496,10 @@ class Worker:
     def _lane_dispatchable(self, lane: DeviceLane) -> bool:
         """Whether THIS lane has a placement that takes offers (job mode: the envelope)."""
         if self.accepted.mode == "job":
-            return lane is self.lanes.envelope and self.job_ready
+            slot = self.job_slots.get(lane.lane_id)
+            return (
+                slot.ready() if slot is not None else lane is self.lanes.envelope and self.job_ready
+            )
         return any(self._placement_dispatchable(placement_id) for placement_id in lane.placements)
 
     def _lane_slots(self, lane: DeviceLane) -> int:
@@ -1797,22 +1833,22 @@ class Worker:
                 self.model_source_operations.add(request.operation_id)
             return result
 
-    def source_checkpoint_page(
-        self, request: pb.SourceCheckpointPageRequest
-    ) -> pb.SourceCheckpointPageResult:
-        from . import model_source_checkpoint
+    def checkpoint_page(self, request: pb.CheckpointPageRequest) -> pb.CheckpointPageResult:
+        from . import checkpoint_transport
 
-        return model_source_checkpoint.page(
+        return checkpoint_transport.page(
             request, tensorfs_root=Path(self.options.tensorfs_root or "")
         )
 
-    def source_checkpoint_transfer(
-        self, request: pb.SourceCheckpointTransferRequest
-    ) -> pb.SourceCheckpointTransferStatus:
-        from . import model_source_checkpoint
+    def checkpoint_transfer(
+        self, request: pb.CheckpointTransferRequest
+    ) -> pb.CheckpointTransferStatus:
+        from . import checkpoint_transport
 
-        return model_source_checkpoint.transfer(
-            request, tensorfs_root=Path(self.options.tensorfs_root or "")
+        return checkpoint_transport.transfer(
+            request,
+            tensorfs_root=Path(self.options.tensorfs_root or ""),
+            restore_scope=self.weights.restore_checkpoint,
         )
 
     def release_model_source(self, operation_id: str) -> None:
@@ -2344,6 +2380,11 @@ class Worker:
                 pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
                 "the bootstrap credential is absent or wrong",
             )
+        if claim.wire_minor < MIN_COMPATIBLE_WIRE_MINOR:
+            return reject(
+                pb.ClaimRejection.CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE,
+                "peer is below the supported wire compatibility floor",
+            )
         if claim.worker_id and claim.worker_id != self.options.worker_id:
             return reject(
                 pb.ClaimRejection.CLAIM_REJECTION_WORKER_ID_MISMATCH,
@@ -2662,6 +2703,9 @@ class Worker:
                 self.weights.absorb_ack(inner, lane=("control", self.fence.control_stream_epoch))
             except weights.WeightsExchangeError as exc:
                 self.note("artifact", f"dropped host ACK: {exc.code}: {exc.detail}")
+        elif kind == "child_call_result":
+            if not self.calls.absorb(inner):
+                self.note("child", "dropped stale or invalid child-call result")
         elif kind == "weights_read_request":
             self.send(self.weights.read(inner))
         elif kind == "weights_upload_request":
@@ -2702,10 +2746,20 @@ class Worker:
         every tick.
         """
         self.note("outcome", self.engine.close(acked))
+        self.calls.close(acked.request_id, acked.attempt_ordinal)
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
         closed = self.engine.history.get((acked.request_id, acked.attempt_ordinal))
-        if self.reclaim_on_terminal and closed is not None and closed.kind == "job":
+        # An acknowledged stopped attempt can leave retained work for another
+        # attempt on this worker. The owner's per-outcome retention decision
+        # overrides the job's ordinary one-shot process recycling policy.
+        if (
+            self.reclaim_on_terminal
+            and not acked.retain_work
+            and not self.engine.live
+            and closed is not None
+            and closed.kind == "job"
+        ):
             self.note(
                 "session",
                 f"job attempt {acked.request_id}#{acked.attempt_ordinal} is acknowledged and "
@@ -3656,6 +3710,184 @@ class Worker:
         self._settle()
 
     def apply_job_directive(self, job: pb.JobDirective) -> None:
+        """Apply a complete ordinary-job plus optional CPU-parent admission set."""
+        from cozy_runtime.internal.worker.job_slots import JobSlot
+
+        has_parent = job.HasField("orchestration_parent")
+        if not job.orchestration and not has_parent and not self.job_slots:
+            self._apply_ordinary_job_directive(job)
+            return
+        try:
+            if self.fence.wire_minor < 40 or (job.orchestration and has_parent):
+                raise ValueError("orchestration requires wire40 and one CPU parent")
+            parent = job if job.orchestration else job.orchestration_parent if has_parent else None
+            if parent is not None and (
+                not parent.orchestration or parent.HasField("orchestration_parent")
+            ):
+                raise ValueError("orchestration parent cannot be ordinary or nested")
+            if parent is not None:
+                record = (
+                    self.config.cozy_home
+                    / "job-plans"
+                    / f"{parent.job_descriptor_id.removeprefix('sha256:')}.json"
+                )
+                binding = JobBinding.read(json.loads(record.read_text()))
+                declaration = self.engine._job_declaration(binding, parent.job_descriptor_id)
+                if (
+                    binding.build_id != parent.build_id
+                    or binding.job_descriptor_id != parent.job_descriptor_id
+                    or not parent.reclaim_on_terminal
+                ):
+                    raise ValueError("orchestration directive differs from its prepared job")
+                if (
+                    parent.device_count
+                    or parent.resource_caps.device_required
+                    or parent.resource_caps.max_device_memory_bytes
+                    or declaration.get("models")
+                    or declaration.get("weights_outputs")
+                    or not binding.call_interfaces
+                ):
+                    raise ValueError(
+                        "orchestration requires frozen child interfaces "
+                        "and no Model, weights, or GPU grant"
+                    )
+                if not job.orchestration and parent.job_descriptor_id == job.job_descriptor_id:
+                    raise ValueError("one job cannot occupy the parent and ordinary slots together")
+            old_cpu = self.job_slots.get("orchestration")
+            cpu_same = bool(
+                parent is not None and old_cpu is not None and old_cpu.directive == parent
+            )
+            old_gpu = self.job_slots.get("envelope")
+            ordinary = pb.JobDirective()
+            ordinary.CopyFrom(job)
+            ordinary.ClearField("orchestration_parent")
+            gpu_same = bool(
+                not job.orchestration
+                and old_gpu is not None
+                and old_gpu.directive == ordinary
+                and old_gpu.ready()
+            )
+            if not cpu_same and self._job_lane_busy(self.lanes.orchestration):
+                raise ValueError("stop the active CPU parent before replacing or removing it")
+            if not gpu_same and self._job_lane_busy(self.lanes.envelope):
+                raise ValueError("stop the active ordinary job before replacing or removing it")
+            if any(
+                attempt.kind != "job" and attempt.state in self.engine.ON_DEVICE
+                for attempt in self.engine.history.values()
+            ):
+                raise ValueError("stop active serving attempts before entering the private job set")
+
+            if not cpu_same and old_cpu is not None:
+                old_cpu.supervision.close()
+                self.job_slots.pop("orchestration", None)
+                self.lanes.orchestration.forget("")
+            if parent is not None and not cpu_same:
+                supervision = self._new_orchestration_supervision()
+                supervision.use_environment(binding.python, binding.environment_content_digest)
+                copied = pb.JobDirective()
+                copied.CopyFrom(parent)
+                self.job_slots["orchestration"] = JobSlot(
+                    copied, binding, supervision, self.lanes.orchestration
+                )
+                executor = supervision.spawn(imposed=self.imposed(self.lanes.orchestration))
+                executor.reserved_for_job = True
+            if not job.orchestration:
+                if not gpu_same:
+                    self._apply_ordinary_job_directive(ordinary)
+                    selected = self.jobs.get(ordinary.job_descriptor_id)
+                    if selected is not None:
+                        self.job_slots["envelope"] = JobSlot(
+                            ordinary, selected, self.supervision, self.lanes.envelope
+                        )
+            else:
+                ordinary_executor = self.supervision.current
+                if ordinary_executor is not None:
+                    self.supervision.retire_current(
+                        ordinary_executor, "CPU orchestration holds no ordinary job executor"
+                    )
+                self.job_slots.pop("envelope", None)
+                self.bindings = {}
+                self.prepared_models = {}
+                if self.placement is not None:
+                    self._release_lane(self.placement.placement_id)
+                self.placement = None
+                self.pending = None
+                self._retire_hosted(set())
+                self.reclaim_on_terminal = (
+                    parent.reclaim_on_terminal if parent is not None else True
+                )
+            self.jobs = {
+                slot.binding.job_descriptor_id: slot.binding for slot in self.job_slots.values()
+            }
+            self.engine.jobs = self.jobs
+            self.set_job_ready(
+                bool(self.job_slots)
+                and all(slot.ready() for slot in self.job_slots.values())
+                and not self.latched
+            )
+            self._settle()
+        except (OSError, ValueError, ExecutorGone) as exc:
+            self.latched = "job_set_refused: " + safe(str(exc))
+            self.engine.fault(
+                pb.Fault(
+                    kind=pb.FAULT_KIND_CONFIG_REFUSED,
+                    subject=job.job_descriptor_id,
+                    reason="job_set_refused",
+                    detail=safe(str(exc)),
+                )
+            )
+            self._settle()
+
+    def _job_lane_busy(self, lane: DeviceLane) -> bool:
+        return any(
+            attempt.lane_id == lane.lane_id and attempt.state in self.engine.ON_DEVICE
+            for attempt in self.engine.history.values()
+        )
+
+    def _new_orchestration_supervision(self) -> ExecutorSupervision:
+        supervision = ExecutorSupervision(
+            root=self.root / "placements" / "orchestration",
+            python=self.options.python or sys.executable,
+            base_env=self.config.child_base_env,
+            cozy_home=self.config.cozy_home,
+            executor_uid=self._slot_executor_uid("orchestration"),
+            executor_gid=self.options.executor_gid,
+            jit_pod_scope=f"{self.fence.worker_boot_id}-orchestration",
+        )
+        supervision.on_change = lambda executor: self.lanes.orchestration.row(
+            ""
+        ).ledger.begin_generation(executor.pid if executor else 0)
+        supervision.on_invalidate = lambda why: self._orchestration_unavailable(why)
+        supervision.on_exit = lambda executor: self.lanes.orchestration.work.put(
+            ExecutorDeath(executor, "")
+        )
+        supervision.on_lane_failure = self.fail_machine
+        supervision.sweep_orphans()
+        return supervision
+
+    def _orchestration_unavailable(self, why: str) -> None:
+        self.set_job_ready(False)
+        self.note("orchestration", "capacity withdrawn: " + safe(why))
+        self._settle()
+
+    def _rebuild_orchestration(self) -> None:
+        with self.control_lock:
+            slot = self.job_slots.get("orchestration")
+            if slot is None or slot.ready() or self.stop.is_set():
+                return
+            try:
+                if slot.supervision.current is not None:
+                    slot.supervision.retire_current(
+                        slot.supervision.current, "rebuild stopped CPU parent"
+                    )
+                executor = slot.supervision.spawn(imposed=self.imposed(slot.lane))
+                executor.reserved_for_job = True
+                self.set_job_ready(all(value.ready() for value in self.job_slots.values()))
+            except ExecutorGone as exc:
+                self.latched = "orchestration_executor_absent: " + safe(str(exc))
+            self._settle()
+
+    def _apply_ordinary_job_directive(self, job: pb.JobDirective) -> None:
         """The JOB lane: resolve the descriptor, spawn a fresh executor, become dispatchable.
 
         Job mode carries no placement, so its dispatchability edge is `job_ready` and its
@@ -4939,7 +5171,7 @@ class Worker:
         # spell, absent from the snapshot and from the held-attempt set. A refusal the
         # RecordOwner can read and re-dispatch is strictly more informative than a hold it
         # cannot see. An attempt for placement P may take P's lane's seat and no other.
-        lane = self._offer_lane(offered.placement_id)
+        lane = self._offer_lane(offered.placement_id, attempt)
         if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN or (
             self._lane_slots(lane) < 1
         ):
@@ -4974,11 +5206,16 @@ class Worker:
         self.engine.hold(attempt)
         lane.work.put(attempt)
 
-    def _offer_lane(self, placement_id: str) -> DeviceLane:
+    def _offer_lane(self, placement_id: str, attempt: AttemptRecord | None = None) -> DeviceLane:
         """The lane an offer draws its seat from: the placement's, or the envelope for a job.
         Called after the placement is known to be hosted, so an unassigned placement here
         is one that is not dispatchable, and its lane is whichever its slot would take."""
         if self.accepted.mode == "job":
+            if attempt is not None:
+                descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
+                for slot in self.job_slots.values():
+                    if slot.binding.job_descriptor_id == descriptor:
+                        return slot.lane
             return self.lanes.envelope
         if placement_id in self.hosted:
             return self.lanes.lane_of(placement_id) or self.lanes.lanes[0]
@@ -5071,7 +5308,10 @@ class Worker:
             if item is None:
                 return
             if isinstance(item, ExecutorDeath):
-                self.rebuild_exited(item.executor, item.placement_id)
+                if lane is self.lanes.orchestration:
+                    self._rebuild_orchestration()
+                else:
+                    self.rebuild_exited(item.executor, item.placement_id)
                 continue
             attempt = item
             self.await_settled(attempt)
@@ -5084,7 +5324,10 @@ class Worker:
                     self.execute(attempt, lane)
             # Rebuild on REFUSALS too (#458): a poisoned generation refuses every attempt,
             # so a rebuild gated on admission could never run again.
-            self.rebuild_if_needed(attempt.placement_id)
+            if lane is self.lanes.orchestration:
+                self._rebuild_orchestration()
+            else:
+                self.rebuild_if_needed(attempt.placement_id)
 
     def post_lane(self, lane: DeviceLane) -> None:
         """THE POST PHASE, one thread per lane (cr-079 D4): encode, bound, write under the
@@ -5589,11 +5832,28 @@ class Worker:
 
     def job_capacity(self) -> pb.JobCapacity:
         """How many JOB attempts this worker can take right now (cr-009)."""
-        in_flight = sum(1 for a in self.engine.live.values() if a.job is not None)
+        in_flight = sum(
+            1
+            for a in self.engine.live.values()
+            if a.job is not None and a.lane_id != "orchestration"
+        )
+        orchestrations = sum(
+            1
+            for a in self.engine.live.values()
+            if a.job is not None and a.lane_id == "orchestration"
+        )
         ready = bool(self.jobs) and self.job_ready
+        cpu = self.job_slots.get("orchestration")
+        ordinary = self.job_slots.get("envelope")
         return pb.JobCapacity(
             jobs_in_flight=in_flight,
-            jobs_available=max(0, (1 if ready else 0) - in_flight),
+            jobs_available=max(
+                0, (1 if ready and (ordinary is not None or not self.job_slots) else 0) - in_flight
+            ),
+            orchestration_in_flight=orchestrations,
+            orchestration_available=max(
+                0, (1 if ready and cpu is not None and cpu.ready() else 0) - orchestrations
+            ),
         )
 
     # ------------------------------------------------------------------ identity
@@ -5724,6 +5984,8 @@ class Worker:
         with self.claim_lock:
             self.claim_ready.clear()
         supervisions = [self.supervision] + [hosted.supervision for hosted in self.hosted.values()]
+        if (cpu := self.job_slots.get("orchestration")) is not None:
+            supervisions.append(cpu.supervision)
         seam = [
             supervision.current.channel.accounting()
             for supervision in supervisions
@@ -5734,30 +5996,13 @@ class Worker:
         self.convergences.put(None)
         self.watches.end_all()
         self.host.stop()
-        # Drain an in-flight preparation before releasing process ownership. New
-        # preparations observe stop under the same lock and cannot recreate cleanup.
-        operations: list[str] = []
+        # Source custody belongs to the RecordOwner, not this disposable process.
+        # A normal recycle can happen while another request is paused or blocked;
+        # sweeping the Store here would destroy its expensive retained work.
+        # Drain entered preparation, but release a source only through the explicit
+        # owner-authorized release operation after its last dependency is gone.
         with self.preparation_lock:
-            if not self.restart_requested:
-                try:
-                    operations = (
-                        model_source_prepare.source_operations(
-                            tensorfs_root=Path(self.options.tensorfs_root or "")
-                        )
-                        if self.options.owns_tensorfs_store
-                        else sorted(self.model_source_operations)
-                    )
-                except LaunchRefusal as exc:
-                    self.exit_code = int(Exit.internal)
-                    self.note("shutdown", f"source operation cleanup unavailable: {exc.code}")
-        for operation_id in operations:
-            try:
-                self.release_model_source(operation_id)
-            except Exception as exc:
-                self.note(
-                    "shutdown",
-                    f"model source cleanup {operation_id} failed: {type(exc).__name__}",
-                )
+            pass
         for supervision in supervisions:
             try:
                 supervision.close()

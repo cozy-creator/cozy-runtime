@@ -33,6 +33,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Protocol
 
+from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
@@ -159,11 +160,16 @@ class GrpcControlHost:
         model_source_preparer: (
             Callable[[pb.PrepareModelSourceRequest], pb.PrepareModelSourceResult] | None
         ) = None,
-        source_checkpoint_pager: (
-            Callable[[pb.SourceCheckpointPageRequest], pb.SourceCheckpointPageResult] | None
+        model_source_releaser: Callable[[str], None] | None = None,
+        checkpoint_pager: (
+            Callable[[pb.CheckpointPageRequest], pb.CheckpointPageResult] | None
         ) = None,
-        source_checkpoint_transfer: (
-            Callable[[pb.SourceCheckpointTransferRequest], pb.SourceCheckpointTransferStatus] | None
+        checkpoint_transfer: (
+            Callable[[pb.CheckpointTransferRequest], pb.CheckpointTransferStatus] | None
+        ) = None,
+        weights_checkpoint_validator: (
+            Callable[[pb.ValidateWeightsCheckpointRequest], pb.ValidateWeightsCheckpointResult]
+            | None
         ) = None,
         local_package_preparer: (
             Callable[[pb.PrepareLocalPackageRequest], pb.PreparePackageSetResult] | None
@@ -181,8 +187,10 @@ class GrpcControlHost:
         self.compatibility_checker = compatibility_checker
         self.preparer = preparer
         self.model_source_preparer = model_source_preparer
-        self.source_checkpoint_pager = source_checkpoint_pager
-        self.source_checkpoint_transfer = source_checkpoint_transfer
+        self.model_source_releaser = model_source_releaser
+        self.checkpoint_pager = checkpoint_pager
+        self.checkpoint_transfer = checkpoint_transfer
+        self.weights_checkpoint_validator = weights_checkpoint_validator
         self.local_package_preparer = local_package_preparer
         self.private_placement_preparer = private_placement_preparer
         #: The loopback weights seam (proto-025), served only when a pod supervisor is the
@@ -204,35 +212,32 @@ class GrpcControlHost:
             self.compatibility_checker is not None
             or self.preparer is not None
             or self.model_source_preparer is not None
-            or self.source_checkpoint_pager is not None
-            or self.source_checkpoint_transfer is not None
+            or self.model_source_releaser is not None
+            or self.checkpoint_pager is not None
+            or self.checkpoint_transfer is not None
             or self.local_package_preparer is not None
             or self.private_placement_preparer is not None
             or self.weights is not None
+            or self.weights_checkpoint_validator is not None
         )
         if loopback_services and not _loopback_preparation_listener(self.listen):
             raise RuntimeError("the loopback Runtime services can only bind a loopback listener")
-        if (
-            self.compatibility_checker is not None
-            or self.preparer is not None
-            or self.model_source_preparer is not None
-            or self.source_checkpoint_pager is not None
-            or self.source_checkpoint_transfer is not None
-            or self.local_package_preparer is not None
-            or self.private_placement_preparer is not None
-        ):
-            pb_grpc.add_RuntimePreparationServicer_to_server(
-                _PreparationServicer(
-                    self.compatibility_checker,
-                    self.preparer,
-                    self.model_source_preparer,
-                    self.local_package_preparer,
-                    self.private_placement_preparer,
-                    self.source_checkpoint_pager,
-                    self.source_checkpoint_transfer,
-                ),
-                self.server,
-            )
+        # Every worker exposes the static protocol probe, including local workers
+        # without optional preparation handlers. Absent handlers still refuse calls.
+        pb_grpc.add_RuntimePreparationServicer_to_server(
+            _PreparationServicer(
+                self.compatibility_checker,
+                self.preparer,
+                self.model_source_preparer,
+                self.local_package_preparer,
+                self.private_placement_preparer,
+                self.checkpoint_pager,
+                self.checkpoint_transfer,
+                self.weights_checkpoint_validator,
+                self.model_source_releaser,
+            ),
+            self.server,
+        )
         if self.weights is not None:
             # Loopback-only, exactly like RuntimePreparation: the supervisor dials it on the
             # same 127.0.0.1 listener and it is never reachable from the external leg.
@@ -334,40 +339,64 @@ class _PreparationServicer:
         private_placement_handler: (
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
         ),
-        source_checkpoint_pager: (
-            Callable[[pb.SourceCheckpointPageRequest], pb.SourceCheckpointPageResult] | None
+        checkpoint_pager: (
+            Callable[[pb.CheckpointPageRequest], pb.CheckpointPageResult] | None
         ) = None,
-        source_checkpoint_transfer: (
-            Callable[[pb.SourceCheckpointTransferRequest], pb.SourceCheckpointTransferStatus] | None
+        checkpoint_transfer: (
+            Callable[[pb.CheckpointTransferRequest], pb.CheckpointTransferStatus] | None
         ) = None,
+        weights_checkpoint_validator: (
+            Callable[[pb.ValidateWeightsCheckpointRequest], pb.ValidateWeightsCheckpointResult]
+            | None
+        ) = None,
+        model_source_releaser: Callable[[str], None] | None = None,
     ) -> None:
         self.compatibility_handler = compatibility_handler
         self.package_handler = package_handler
         self.model_source_handler = model_source_handler
         self.local_package_handler = local_package_handler
         self.private_placement_handler = private_placement_handler
-        self.source_checkpoint_pager = source_checkpoint_pager
-        self.source_checkpoint_transfer = source_checkpoint_transfer
+        self.checkpoint_pager = checkpoint_pager
+        self.checkpoint_transfer = checkpoint_transfer
+        self.weights_checkpoint_validator = weights_checkpoint_validator
+        self.model_source_releaser = model_source_releaser
 
-    def SourceCheckpointPage(self, request: pb.SourceCheckpointPageRequest, context: Any) -> Any:
-        if self.source_checkpoint_pager is None:
+    def ProtocolInfo(
+        self, _request: pb.ProtocolInfoRequest, _context: Any
+    ) -> pb.ProtocolInfoResult:
+        return pb.ProtocolInfoResult(
+            wire_minor=WIRE_MINOR,
+            minimum_wire_minor=MIN_COMPATIBLE_WIRE_MINOR,
+        )
+
+    def ValidateWeightsCheckpoint(
+        self, request: pb.ValidateWeightsCheckpointRequest, context: Any
+    ) -> Any:
+        if self.weights_checkpoint_validator is None:
+            import grpc
+
+            return context.abort(
+                grpc.StatusCode.UNIMPLEMENTED, "weights checkpoint validation unavailable"
+            )
+        return self.weights_checkpoint_validator(request)
+
+    def CheckpointPage(self, request: pb.CheckpointPageRequest, context: Any) -> Any:
+        if self.checkpoint_pager is None:
             import grpc
 
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "source checkpoint page unavailable"
             )
-        return self.source_checkpoint_pager(request)
+        return self.checkpoint_pager(request)
 
-    def SourceCheckpointTransfer(
-        self, request: pb.SourceCheckpointTransferRequest, context: Any
-    ) -> Any:
-        if self.source_checkpoint_transfer is None:
+    def CheckpointTransfer(self, request: pb.CheckpointTransferRequest, context: Any) -> Any:
+        if self.checkpoint_transfer is None:
             import grpc
 
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "source checkpoint transfer unavailable"
             )
-        return self.source_checkpoint_transfer(request)
+        return self.checkpoint_transfer(request)
 
     def CheckPackageSetCompatibility(
         self, request: pb.PreparePackageSetRequest, context: Any
@@ -409,6 +438,17 @@ class _PreparationServicer:
             return handler(request)
         except Exception as exc:
             return _refuse(context, exc)
+
+    def ReleaseModelSource(self, request: pb.ReleaseModelSourceRequest, context: Any) -> Any:
+        import grpc
+
+        if self.model_source_releaser is None:
+            return context.abort(grpc.StatusCode.UNIMPLEMENTED, "source release is unavailable")
+        try:
+            self.model_source_releaser(request.operation_id)
+        except Exception:
+            return context.abort(grpc.StatusCode.FAILED_PRECONDITION, "source release was refused")
+        return pb.ReleaseModelSourceResult(operation_id=request.operation_id, released=True)
 
     def PrepareLocalPackage(self, request: pb.PrepareLocalPackageRequest, context: Any) -> Any:
         handler = self.local_package_handler

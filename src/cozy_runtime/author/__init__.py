@@ -22,6 +22,7 @@ from cozy_runtime.author._assets import (
     Tree,
     VideoAsset,
 )
+from cozy_runtime.author._calls import ChildCallError, invocable
 from cozy_runtime.author._context import (
     AdapterRef,
     Context,
@@ -169,6 +170,7 @@ __all__ = [
     "CheckpointSave",
     "CheckpointSinkUnbuilt",
     "Checkpoints",
+    "ChildCallError",
     "Clamp",
     "Config",
     "ConformanceError",
@@ -254,6 +256,7 @@ __all__ = [
     "classify",
     "decode_request",
     "describe",
+    "invocable",
     "invoke",
     "prepare",
     "probe_activations",

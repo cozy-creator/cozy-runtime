@@ -7,6 +7,15 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
+class ChildCallState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    CHILD_CALL_STATE_UNSPECIFIED: _ClassVar[ChildCallState]
+    CHILD_CALL_STATE_PENDING: _ClassVar[ChildCallState]
+    CHILD_CALL_STATE_SUCCEEDED: _ClassVar[ChildCallState]
+    CHILD_CALL_STATE_REFUSED: _ClassVar[ChildCallState]
+    CHILD_CALL_STATE_FAILED: _ClassVar[ChildCallState]
+    CHILD_CALL_STATE_CANCELED: _ClassVar[ChildCallState]
+
 class Posture(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     POSTURE_UNSPECIFIED: _ClassVar[Posture]
@@ -120,6 +129,7 @@ class ClaimRejection(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CLAIM_REJECTION_WORKER_ID_MISMATCH: _ClassVar[ClaimRejection]
     CLAIM_REJECTION_RELEASE_ID_MISMATCH: _ClassVar[ClaimRejection]
     CLAIM_REJECTION_UNDURABLE: _ClassVar[ClaimRejection]
+    CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE: _ClassVar[ClaimRejection]
 
 class FaultKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -179,6 +189,7 @@ class WeightsHostStage(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     WEIGHTS_HOST_STAGE_UNSPECIFIED: _ClassVar[WeightsHostStage]
     WEIGHTS_HOST_STAGE_INTENT: _ClassVar[WeightsHostStage]
     WEIGHTS_HOST_STAGE_RECEIPT: _ClassVar[WeightsHostStage]
+    WEIGHTS_HOST_STAGE_CHECKPOINT: _ClassVar[WeightsHostStage]
 
 class WeightsHostOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -295,6 +306,12 @@ class WeightsFinalizeOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     WEIGHTS_FINALIZE_OUTCOME_UNSPECIFIED: _ClassVar[WeightsFinalizeOutcome]
     WEIGHTS_FINALIZE_OUTCOME_ADOPTED: _ClassVar[WeightsFinalizeOutcome]
     WEIGHTS_FINALIZE_OUTCOME_ABANDONED: _ClassVar[WeightsFinalizeOutcome]
+CHILD_CALL_STATE_UNSPECIFIED: ChildCallState
+CHILD_CALL_STATE_PENDING: ChildCallState
+CHILD_CALL_STATE_SUCCEEDED: ChildCallState
+CHILD_CALL_STATE_REFUSED: ChildCallState
+CHILD_CALL_STATE_FAILED: ChildCallState
+CHILD_CALL_STATE_CANCELED: ChildCallState
 POSTURE_UNSPECIFIED: Posture
 POSTURE_ACCEPTING: Posture
 POSTURE_DRAINING: Posture
@@ -373,6 +390,7 @@ CLAIM_REJECTION_EPOCH_HELD: ClaimRejection
 CLAIM_REJECTION_WORKER_ID_MISMATCH: ClaimRejection
 CLAIM_REJECTION_RELEASE_ID_MISMATCH: ClaimRejection
 CLAIM_REJECTION_UNDURABLE: ClaimRejection
+CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE: ClaimRejection
 FAULT_KIND_UNSPECIFIED: FaultKind
 FAULT_KIND_BINDING_UNAVAILABLE: FaultKind
 FAULT_KIND_BINDING_DEGRADED: FaultKind
@@ -414,6 +432,7 @@ PREPARE_STAGE_REFUSED: PrepareStage
 WEIGHTS_HOST_STAGE_UNSPECIFIED: WeightsHostStage
 WEIGHTS_HOST_STAGE_INTENT: WeightsHostStage
 WEIGHTS_HOST_STAGE_RECEIPT: WeightsHostStage
+WEIGHTS_HOST_STAGE_CHECKPOINT: WeightsHostStage
 WEIGHTS_HOST_OUTCOME_UNSPECIFIED: WeightsHostOutcome
 WEIGHTS_HOST_OUTCOME_RECORDED: WeightsHostOutcome
 WEIGHTS_HOST_OUTCOME_REPLAYED: WeightsHostOutcome
@@ -487,12 +506,26 @@ WEIGHTS_FINALIZE_OUTCOME_ADOPTED: WeightsFinalizeOutcome
 WEIGHTS_FINALIZE_OUTCOME_ABANDONED: WeightsFinalizeOutcome
 
 class WeightsHostEvent(_message.Message):
-    __slots__ = ("intent", "receipt")
+    __slots__ = ("intent", "receipt", "checkpoint")
     INTENT_FIELD_NUMBER: _ClassVar[int]
     RECEIPT_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_FIELD_NUMBER: _ClassVar[int]
     intent: WeightsIntentFrame
     receipt: WeightsReceiptFrame
-    def __init__(self, intent: _Optional[_Union[WeightsIntentFrame, _Mapping]] = ..., receipt: _Optional[_Union[WeightsReceiptFrame, _Mapping]] = ...) -> None: ...
+    checkpoint: WeightsCheckpointFrame
+    def __init__(self, intent: _Optional[_Union[WeightsIntentFrame, _Mapping]] = ..., receipt: _Optional[_Union[WeightsReceiptFrame, _Mapping]] = ..., checkpoint: _Optional[_Union[WeightsCheckpointFrame, _Mapping]] = ...) -> None: ...
+
+class ProtocolInfoRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class ProtocolInfoResult(_message.Message):
+    __slots__ = ("wire_minor", "minimum_wire_minor")
+    WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
+    MINIMUM_WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
+    wire_minor: int
+    minimum_wire_minor: int
+    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
     __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements")
@@ -558,21 +591,55 @@ class ModelSourcePrepareCall(_message.Message):
     request: ModelSourcePrepareRequest
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ...) -> None: ...
 
-class SourceCheckpointPageCall(_message.Message):
-    __slots__ = ("claim", "request")
+class ModelSourceReleaseCall(_message.Message):
+    __slots__ = ("claim", "operation_id", "source_selection_digest")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
-    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
-    request: SourceCheckpointPageRequest
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[SourceCheckpointPageRequest, _Mapping]] = ...) -> None: ...
+    operation_id: str
+    source_selection_digest: bytes
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ...) -> None: ...
 
-class SourceCheckpointTransferCall(_message.Message):
+class ReleaseModelSourceRequest(_message.Message):
+    __slots__ = ("operation_id",)
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    operation_id: str
+    def __init__(self, operation_id: _Optional[str] = ...) -> None: ...
+
+class ReleaseModelSourceResult(_message.Message):
+    __slots__ = ("operation_id", "released")
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    RELEASED_FIELD_NUMBER: _ClassVar[int]
+    operation_id: str
+    released: bool
+    def __init__(self, operation_id: _Optional[str] = ..., released: bool = ...) -> None: ...
+
+class ModelSourceAdoptCall(_message.Message):
+    __slots__ = ("claim", "from_operation_id", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    FROM_OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    from_operation_id: str
+    request: ModelSourcePrepareRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., from_operation_id: _Optional[str] = ..., request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ...) -> None: ...
+
+class CheckpointPageCall(_message.Message):
     __slots__ = ("claim", "request")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     REQUEST_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
-    request: SourceCheckpointTransferRequest
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[SourceCheckpointTransferRequest, _Mapping]] = ...) -> None: ...
+    request: CheckpointPageRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[CheckpointPageRequest, _Mapping]] = ...) -> None: ...
+
+class CheckpointTransferCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: CheckpointTransferRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[CheckpointTransferRequest, _Mapping]] = ...) -> None: ...
 
 class LocalPackageFetchCall(_message.Message):
     __slots__ = ("claim", "request")
@@ -581,6 +648,34 @@ class LocalPackageFetchCall(_message.Message):
     claim: Claim
     request: LocalPackageFetchRequest
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[LocalPackageFetchRequest, _Mapping]] = ...) -> None: ...
+
+class LocalPackageUploadFrame(_message.Message):
+    __slots__ = ("header", "chunk")
+    HEADER_FIELD_NUMBER: _ClassVar[int]
+    CHUNK_FIELD_NUMBER: _ClassVar[int]
+    header: LocalPackageUploadHeader
+    chunk: LocalPackageUploadChunk
+    def __init__(self, header: _Optional[_Union[LocalPackageUploadHeader, _Mapping]] = ..., chunk: _Optional[_Union[LocalPackageUploadChunk, _Mapping]] = ...) -> None: ...
+
+class LocalPackageUploadHeader(_message.Message):
+    __slots__ = ("claim", "operation_id", "source_digest", "file")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    FILE_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    operation_id: str
+    source_digest: bytes
+    file: LocalPackageFileRef
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., file: _Optional[_Union[LocalPackageFileRef, _Mapping]] = ...) -> None: ...
+
+class LocalPackageUploadChunk(_message.Message):
+    __slots__ = ("offset", "data")
+    OFFSET_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    offset: int
+    data: bytes
+    def __init__(self, offset: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
 
 class LocalPackageAbortCall(_message.Message):
     __slots__ = ("claim", "request")
@@ -732,7 +827,41 @@ class ModelSourceCheckpoint(_message.Message):
     bytes: int
     def __init__(self, slot: _Optional[str] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., plan_digest: _Optional[bytes] = ..., index: _Optional[int] = ..., bytes: _Optional[int] = ...) -> None: ...
 
-class SourceCheckpointObject(_message.Message):
+class SourceCheckpointSubject(_message.Message):
+    __slots__ = ("operation_id", "source_selection_digest", "slot")
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    SLOT_FIELD_NUMBER: _ClassVar[int]
+    operation_id: str
+    source_selection_digest: bytes
+    slot: str
+    def __init__(self, operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., slot: _Optional[str] = ...) -> None: ...
+
+class WeightsCheckpointSubject(_message.Message):
+    __slots__ = ("request_id", "invocation_spec_digest", "output_slot", "weights_transaction_id", "writer_epoch", "tensorfs_declaration_digest")
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_SLOT_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
+    WRITER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_DECLARATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    request_id: str
+    invocation_spec_digest: bytes
+    output_slot: str
+    weights_transaction_id: str
+    writer_epoch: int
+    tensorfs_declaration_digest: bytes
+    def __init__(self, request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., weights_transaction_id: _Optional[str] = ..., writer_epoch: _Optional[int] = ..., tensorfs_declaration_digest: _Optional[bytes] = ...) -> None: ...
+
+class CheckpointSubject(_message.Message):
+    __slots__ = ("source", "weights")
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_FIELD_NUMBER: _ClassVar[int]
+    source: SourceCheckpointSubject
+    weights: WeightsCheckpointSubject
+    def __init__(self, source: _Optional[_Union[SourceCheckpointSubject, _Mapping]] = ..., weights: _Optional[_Union[WeightsCheckpointSubject, _Mapping]] = ...) -> None: ...
+
+class CheckpointObject(_message.Message):
     __slots__ = ("ref", "manifest")
     REF_FIELD_NUMBER: _ClassVar[int]
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
@@ -740,14 +869,12 @@ class SourceCheckpointObject(_message.Message):
     manifest: bool
     def __init__(self, ref: _Optional[_Union[Ref, _Mapping]] = ..., manifest: bool = ...) -> None: ...
 
-class SourceCheckpointPageRequest(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "slot", "plan_digest", "head", "offset", "limit")
+class CheckpointPageRequest(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "subject", "plan_digest", "head", "offset", "limit")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
-    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    SLOT_FIELD_NUMBER: _ClassVar[int]
+    SUBJECT_FIELD_NUMBER: _ClassVar[int]
     PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
     HEAD_FIELD_NUMBER: _ClassVar[int]
     OFFSET_FIELD_NUMBER: _ClassVar[int]
@@ -755,23 +882,19 @@ class SourceCheckpointPageRequest(_message.Message):
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
-    operation_id: str
-    source_selection_digest: bytes
-    slot: str
+    subject: CheckpointSubject
     plan_digest: bytes
     head: Ref
     offset: int
     limit: int
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., slot: _Optional[str] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., offset: _Optional[int] = ..., limit: _Optional[int] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., subject: _Optional[_Union[CheckpointSubject, _Mapping]] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., offset: _Optional[int] = ..., limit: _Optional[int] = ...) -> None: ...
 
-class SourceCheckpointPageResult(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "slot", "plan_digest", "head", "index", "bytes", "previous", "progress", "objects", "next_offset", "has_more", "safe_code", "safe_detail")
+class CheckpointPageResult(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "subject", "plan_digest", "head", "index", "bytes", "previous", "progress", "objects", "next_offset", "has_more", "safe_code", "safe_detail")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
-    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    SLOT_FIELD_NUMBER: _ClassVar[int]
+    SUBJECT_FIELD_NUMBER: _ClassVar[int]
     PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
     HEAD_FIELD_NUMBER: _ClassVar[int]
     INDEX_FIELD_NUMBER: _ClassVar[int]
@@ -786,30 +909,26 @@ class SourceCheckpointPageResult(_message.Message):
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
-    operation_id: str
-    source_selection_digest: bytes
-    slot: str
+    subject: CheckpointSubject
     plan_digest: bytes
     head: Ref
     index: int
     bytes: int
     previous: Ref
     progress: Ref
-    objects: _containers.RepeatedCompositeFieldContainer[SourceCheckpointObject]
+    objects: _containers.RepeatedCompositeFieldContainer[CheckpointObject]
     next_offset: int
     has_more: bool
     safe_code: str
     safe_detail: str
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., slot: _Optional[str] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., index: _Optional[int] = ..., bytes: _Optional[int] = ..., previous: _Optional[_Union[Ref, _Mapping]] = ..., progress: _Optional[_Union[Ref, _Mapping]] = ..., objects: _Optional[_Iterable[_Union[SourceCheckpointObject, _Mapping]]] = ..., next_offset: _Optional[int] = ..., has_more: bool = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., subject: _Optional[_Union[CheckpointSubject, _Mapping]] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., index: _Optional[int] = ..., bytes: _Optional[int] = ..., previous: _Optional[_Union[Ref, _Mapping]] = ..., progress: _Optional[_Union[Ref, _Mapping]] = ..., objects: _Optional[_Iterable[_Union[CheckpointObject, _Mapping]]] = ..., next_offset: _Optional[int] = ..., has_more: bool = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
-class SourceCheckpointTransferRequest(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "slot", "plan_digest", "head", "object", "transfer_id", "grant_revision", "upload_grant", "download_url")
+class CheckpointTransferRequest(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "subject", "plan_digest", "head", "object", "transfer_id", "grant_revision", "upload_grant", "download_url")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
-    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    SLOT_FIELD_NUMBER: _ClassVar[int]
+    SUBJECT_FIELD_NUMBER: _ClassVar[int]
     PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
     HEAD_FIELD_NUMBER: _ClassVar[int]
     OBJECT_FIELD_NUMBER: _ClassVar[int]
@@ -820,26 +939,22 @@ class SourceCheckpointTransferRequest(_message.Message):
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
-    operation_id: str
-    source_selection_digest: bytes
-    slot: str
+    subject: CheckpointSubject
     plan_digest: bytes
     head: Ref
-    object: SourceCheckpointObject
+    object: CheckpointObject
     transfer_id: str
     grant_revision: int
     upload_grant: WeightsUploadGrant
     download_url: str
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., slot: _Optional[str] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., object: _Optional[_Union[SourceCheckpointObject, _Mapping]] = ..., transfer_id: _Optional[str] = ..., grant_revision: _Optional[int] = ..., upload_grant: _Optional[_Union[WeightsUploadGrant, _Mapping]] = ..., download_url: _Optional[str] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., subject: _Optional[_Union[CheckpointSubject, _Mapping]] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., object: _Optional[_Union[CheckpointObject, _Mapping]] = ..., transfer_id: _Optional[str] = ..., grant_revision: _Optional[int] = ..., upload_grant: _Optional[_Union[WeightsUploadGrant, _Mapping]] = ..., download_url: _Optional[str] = ...) -> None: ...
 
-class SourceCheckpointTransferStatus(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_selection_digest", "slot", "plan_digest", "head", "object", "transfer_id", "grant_revision", "state", "transferred_bytes", "http_status", "checksum_sha256", "safe_code", "safe_detail")
+class CheckpointTransferStatus(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "subject", "plan_digest", "head", "object", "transfer_id", "grant_revision", "state", "transferred_bytes", "http_status", "checksum_sha256", "safe_code", "safe_detail")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
-    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    SLOT_FIELD_NUMBER: _ClassVar[int]
+    SUBJECT_FIELD_NUMBER: _ClassVar[int]
     PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
     HEAD_FIELD_NUMBER: _ClassVar[int]
     OBJECT_FIELD_NUMBER: _ClassVar[int]
@@ -854,12 +969,10 @@ class SourceCheckpointTransferStatus(_message.Message):
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
-    operation_id: str
-    source_selection_digest: bytes
-    slot: str
+    subject: CheckpointSubject
     plan_digest: bytes
     head: Ref
-    object: SourceCheckpointObject
+    object: CheckpointObject
     transfer_id: str
     grant_revision: int
     state: WeightsTransferState
@@ -868,10 +981,10 @@ class SourceCheckpointTransferStatus(_message.Message):
     checksum_sha256: str
     safe_code: str
     safe_detail: str
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., slot: _Optional[str] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., object: _Optional[_Union[SourceCheckpointObject, _Mapping]] = ..., transfer_id: _Optional[str] = ..., grant_revision: _Optional[int] = ..., state: _Optional[_Union[WeightsTransferState, str]] = ..., transferred_bytes: _Optional[int] = ..., http_status: _Optional[int] = ..., checksum_sha256: _Optional[str] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., subject: _Optional[_Union[CheckpointSubject, _Mapping]] = ..., plan_digest: _Optional[bytes] = ..., head: _Optional[_Union[Ref, _Mapping]] = ..., object: _Optional[_Union[CheckpointObject, _Mapping]] = ..., transfer_id: _Optional[str] = ..., grant_revision: _Optional[int] = ..., state: _Optional[_Union[WeightsTransferState, str]] = ..., transferred_bytes: _Optional[int] = ..., http_status: _Optional[int] = ..., checksum_sha256: _Optional[str] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class PrepareModelSourceRequest(_message.Message):
-    __slots__ = ("operation_id", "source_selection_digest", "profiles", "files", "source_uri", "declared_license", "checkpoints")
+    __slots__ = ("operation_id", "source_selection_digest", "profiles", "files", "source_uri", "declared_license", "checkpoints", "adopt_from_operation_id")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PROFILES_FIELD_NUMBER: _ClassVar[int]
@@ -879,6 +992,7 @@ class PrepareModelSourceRequest(_message.Message):
     SOURCE_URI_FIELD_NUMBER: _ClassVar[int]
     DECLARED_LICENSE_FIELD_NUMBER: _ClassVar[int]
     CHECKPOINTS_FIELD_NUMBER: _ClassVar[int]
+    ADOPT_FROM_OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     source_selection_digest: bytes
     profiles: _containers.RepeatedCompositeFieldContainer[ModelSourceProfile]
@@ -886,7 +1000,8 @@ class PrepareModelSourceRequest(_message.Message):
     source_uri: str
     declared_license: str
     checkpoints: _containers.RepeatedCompositeFieldContainer[ModelSourceCheckpoint]
-    def __init__(self, operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., files: _Optional[_Iterable[_Union[LocalModelSourceFile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ...) -> None: ...
+    adopt_from_operation_id: str
+    def __init__(self, operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ..., profiles: _Optional[_Iterable[_Union[ModelSourceProfile, _Mapping]]] = ..., files: _Optional[_Iterable[_Union[LocalModelSourceFile, _Mapping]]] = ..., source_uri: _Optional[str] = ..., declared_license: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ..., adopt_from_operation_id: _Optional[str] = ...) -> None: ...
 
 class PrepareModelSourceResult(_message.Message):
     __slots__ = ("outcome", "sources", "safe_code", "safe_detail", "checkpoints", "spent_members")
@@ -905,7 +1020,7 @@ class PrepareModelSourceResult(_message.Message):
     def __init__(self, outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ..., spent_members: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class RecordOwnerFrame(_message.Message):
-    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "weights_finalize_request", "weights_host_ack", "weights_transfer_request", "weights_read_request", "model_source_file_request", "model_source_prepare_request", "local_package_abort", "weights_upload_request", "local_package_fetch_request")
+    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "weights_finalize_request", "weights_host_ack", "weights_transfer_request", "weights_read_request", "model_source_file_request", "model_source_prepare_request", "local_package_abort", "weights_upload_request", "local_package_fetch_request", "child_call_result")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     DESIRED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_OFFER_FIELD_NUMBER: _ClassVar[int]
@@ -922,6 +1037,7 @@ class RecordOwnerFrame(_message.Message):
     LOCAL_PACKAGE_ABORT_FIELD_NUMBER: _ClassVar[int]
     WEIGHTS_UPLOAD_REQUEST_FIELD_NUMBER: _ClassVar[int]
     LOCAL_PACKAGE_FETCH_REQUEST_FIELD_NUMBER: _ClassVar[int]
+    CHILD_CALL_RESULT_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     desired_state: DesiredWorkerState
     attempt_offer: AttemptOffer
@@ -938,10 +1054,11 @@ class RecordOwnerFrame(_message.Message):
     local_package_abort: LocalPackageAbort
     weights_upload_request: WeightsUploadRequest
     local_package_fetch_request: LocalPackageFetchRequest
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., weights_finalize_request: _Optional[_Union[WeightsFinalizeRequest, _Mapping]] = ..., weights_host_ack: _Optional[_Union[WeightsHostAck, _Mapping]] = ..., weights_transfer_request: _Optional[_Union[WeightsTransferRequest, _Mapping]] = ..., weights_read_request: _Optional[_Union[WeightsReadRequest, _Mapping]] = ..., model_source_file_request: _Optional[_Union[ModelSourceFileRequest, _Mapping]] = ..., model_source_prepare_request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ..., local_package_abort: _Optional[_Union[LocalPackageAbort, _Mapping]] = ..., weights_upload_request: _Optional[_Union[WeightsUploadRequest, _Mapping]] = ..., local_package_fetch_request: _Optional[_Union[LocalPackageFetchRequest, _Mapping]] = ...) -> None: ...
+    child_call_result: ChildCallResult
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., weights_finalize_request: _Optional[_Union[WeightsFinalizeRequest, _Mapping]] = ..., weights_host_ack: _Optional[_Union[WeightsHostAck, _Mapping]] = ..., weights_transfer_request: _Optional[_Union[WeightsTransferRequest, _Mapping]] = ..., weights_read_request: _Optional[_Union[WeightsReadRequest, _Mapping]] = ..., model_source_file_request: _Optional[_Union[ModelSourceFileRequest, _Mapping]] = ..., model_source_prepare_request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ..., local_package_abort: _Optional[_Union[LocalPackageAbort, _Mapping]] = ..., weights_upload_request: _Optional[_Union[WeightsUploadRequest, _Mapping]] = ..., local_package_fetch_request: _Optional[_Union[LocalPackageFetchRequest, _Mapping]] = ..., child_call_result: _Optional[_Union[ChildCallResult, _Mapping]] = ...) -> None: ...
 
 class WorkerFrame(_message.Message):
-    __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "weights_finalize_result", "weights_intent", "weights_receipt", "weights_read_result", "weights_transfer_status", "model_source_file_status", "model_source_prepared", "local_package_file_status", "local_package_abort_status", "weights_upload_result")
+    __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "weights_finalize_result", "weights_intent", "weights_receipt", "weights_read_result", "weights_transfer_status", "model_source_file_status", "model_source_prepared", "local_package_file_status", "local_package_abort_status", "weights_upload_result", "weights_checkpoint", "weights_transaction", "child_call_request", "child_call_cancel")
     CLAIM_ACK_FIELD_NUMBER: _ClassVar[int]
     OBSERVED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ACCEPTED_FIELD_NUMBER: _ClassVar[int]
@@ -960,6 +1077,10 @@ class WorkerFrame(_message.Message):
     LOCAL_PACKAGE_FILE_STATUS_FIELD_NUMBER: _ClassVar[int]
     LOCAL_PACKAGE_ABORT_STATUS_FIELD_NUMBER: _ClassVar[int]
     WEIGHTS_UPLOAD_RESULT_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_CHECKPOINT_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_TRANSACTION_FIELD_NUMBER: _ClassVar[int]
+    CHILD_CALL_REQUEST_FIELD_NUMBER: _ClassVar[int]
+    CHILD_CALL_CANCEL_FIELD_NUMBER: _ClassVar[int]
     claim_ack: ClaimAck
     observed_state: ObservedWorkerState
     attempt_accepted: AttemptAccepted
@@ -978,7 +1099,89 @@ class WorkerFrame(_message.Message):
     local_package_file_status: LocalPackageFileStatus
     local_package_abort_status: LocalPackageAbortStatus
     weights_upload_result: WeightsUploadResult
-    def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., weights_finalize_result: _Optional[_Union[WeightsFinalizeResult, _Mapping]] = ..., weights_intent: _Optional[_Union[WeightsIntentFrame, _Mapping]] = ..., weights_receipt: _Optional[_Union[WeightsReceiptFrame, _Mapping]] = ..., weights_read_result: _Optional[_Union[WeightsReadResult, _Mapping]] = ..., weights_transfer_status: _Optional[_Union[WeightsTransferStatus, _Mapping]] = ..., model_source_file_status: _Optional[_Union[ModelSourceFileStatus, _Mapping]] = ..., model_source_prepared: _Optional[_Union[ModelSourcePrepared, _Mapping]] = ..., local_package_file_status: _Optional[_Union[LocalPackageFileStatus, _Mapping]] = ..., local_package_abort_status: _Optional[_Union[LocalPackageAbortStatus, _Mapping]] = ..., weights_upload_result: _Optional[_Union[WeightsUploadResult, _Mapping]] = ...) -> None: ...
+    weights_checkpoint: WeightsCheckpointFrame
+    weights_transaction: WeightsTransactionStatus
+    child_call_request: ChildCallRequest
+    child_call_cancel: ChildCallCancel
+    def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., weights_finalize_result: _Optional[_Union[WeightsFinalizeResult, _Mapping]] = ..., weights_intent: _Optional[_Union[WeightsIntentFrame, _Mapping]] = ..., weights_receipt: _Optional[_Union[WeightsReceiptFrame, _Mapping]] = ..., weights_read_result: _Optional[_Union[WeightsReadResult, _Mapping]] = ..., weights_transfer_status: _Optional[_Union[WeightsTransferStatus, _Mapping]] = ..., model_source_file_status: _Optional[_Union[ModelSourceFileStatus, _Mapping]] = ..., model_source_prepared: _Optional[_Union[ModelSourcePrepared, _Mapping]] = ..., local_package_file_status: _Optional[_Union[LocalPackageFileStatus, _Mapping]] = ..., local_package_abort_status: _Optional[_Union[LocalPackageAbortStatus, _Mapping]] = ..., weights_upload_result: _Optional[_Union[WeightsUploadResult, _Mapping]] = ..., weights_checkpoint: _Optional[_Union[WeightsCheckpointFrame, _Mapping]] = ..., weights_transaction: _Optional[_Union[WeightsTransactionStatus, _Mapping]] = ..., child_call_request: _Optional[_Union[ChildCallRequest, _Mapping]] = ..., child_call_cancel: _Optional[_Union[ChildCallCancel, _Mapping]] = ...) -> None: ...
+
+class ChildCallRequest(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_request_id", "parent_attempt_ordinal", "parent_invocation_spec_digest", "call_index", "interface_digest", "module", "export", "request_canonical_bytes", "intent_digest")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    PARENT_INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CALL_INDEX_FIELD_NUMBER: _ClassVar[int]
+    INTERFACE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    EXPORT_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    INTENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    parent_request_id: str
+    parent_attempt_ordinal: int
+    parent_invocation_spec_digest: bytes
+    call_index: int
+    interface_digest: bytes
+    module: str
+    export: str
+    request_canonical_bytes: bytes
+    intent_digest: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_request_id: _Optional[str] = ..., parent_attempt_ordinal: _Optional[int] = ..., parent_invocation_spec_digest: _Optional[bytes] = ..., call_index: _Optional[int] = ..., interface_digest: _Optional[bytes] = ..., module: _Optional[str] = ..., export: _Optional[str] = ..., request_canonical_bytes: _Optional[bytes] = ..., intent_digest: _Optional[bytes] = ...) -> None: ...
+
+class ChildCallCancel(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_request_id", "parent_attempt_ordinal", "parent_invocation_spec_digest", "call_index", "intent_digest")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    PARENT_INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CALL_INDEX_FIELD_NUMBER: _ClassVar[int]
+    INTENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    parent_request_id: str
+    parent_attempt_ordinal: int
+    parent_invocation_spec_digest: bytes
+    call_index: int
+    intent_digest: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_request_id: _Optional[str] = ..., parent_attempt_ordinal: _Optional[int] = ..., parent_invocation_spec_digest: _Optional[bytes] = ..., call_index: _Optional[int] = ..., intent_digest: _Optional[bytes] = ...) -> None: ...
+
+class ChildCallResult(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_request_id", "parent_attempt_ordinal", "parent_invocation_spec_digest", "call_index", "intent_digest", "child_request_id", "state", "result_canonical_bytes", "safe_code", "safe_detail")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    PARENT_INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CALL_INDEX_FIELD_NUMBER: _ClassVar[int]
+    INTENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CHILD_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    RESULT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    parent_request_id: str
+    parent_attempt_ordinal: int
+    parent_invocation_spec_digest: bytes
+    call_index: int
+    intent_digest: bytes
+    child_request_id: str
+    state: ChildCallState
+    result_canonical_bytes: bytes
+    safe_code: str
+    safe_detail: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_request_id: _Optional[str] = ..., parent_attempt_ordinal: _Optional[int] = ..., parent_invocation_spec_digest: _Optional[bytes] = ..., call_index: _Optional[int] = ..., intent_digest: _Optional[bytes] = ..., child_request_id: _Optional[str] = ..., state: _Optional[_Union[ChildCallState, str]] = ..., result_canonical_bytes: _Optional[bytes] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class Claim(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "record_owner_id", "worker_id", "wire_minor", "proof")
@@ -1115,12 +1318,14 @@ class WorkerSnapshotBody(_message.Message):
     def __init__(self, accepted_desired_state_revision: _Optional[int] = ..., accepted_placement_set_digest: _Optional[bytes] = ..., journal_highwater: _Optional[int] = ..., worker_phase: _Optional[_Union[WorkerPhase, str]] = ..., placements: _Optional[_Iterable[_Union[PlacementStatus, _Mapping]]] = ..., converged_revision: _Optional[int] = ..., admission_epoch: _Optional[int] = ..., admission_state: _Optional[_Union[AdmissionState, str]] = ..., available_attempt_slots: _Optional[int] = ..., held_attempts: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ..., lanes: _Optional[_Iterable[_Union[DeviceLane, _Mapping]]] = ..., held_manifests: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class HostSnapshotBody(_message.Message):
-    __slots__ = ("held_outcomes", "weights_transactions")
+    __slots__ = ("held_outcomes", "weights_transactions", "retained_desired_revision")
     HELD_OUTCOMES_FIELD_NUMBER: _ClassVar[int]
     WEIGHTS_TRANSACTIONS_FIELD_NUMBER: _ClassVar[int]
+    RETAINED_DESIRED_REVISION_FIELD_NUMBER: _ClassVar[int]
     held_outcomes: _containers.RepeatedCompositeFieldContainer[HeldAttempt]
     weights_transactions: _containers.RepeatedCompositeFieldContainer[WeightsTransactionStatus]
-    def __init__(self, held_outcomes: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ...) -> None: ...
+    retained_desired_revision: int
+    def __init__(self, held_outcomes: _Optional[_Iterable[_Union[HeldAttempt, _Mapping]]] = ..., weights_transactions: _Optional[_Iterable[_Union[WeightsTransactionStatus, _Mapping]]] = ..., retained_desired_revision: _Optional[int] = ...) -> None: ...
 
 class SnapshotAck(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "snapshot_id", "snapshot_digest", "host_snapshot_digest")
@@ -1419,20 +1624,24 @@ class Stamp(_message.Message):
     def __init__(self, component: _Optional[str] = ..., key: _Optional[str] = ..., values: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class JobDirective(_message.Message):
-    __slots__ = ("build_id", "job_descriptor_id", "resource_caps", "publication_contract", "reclaim_on_terminal", "device_count")
+    __slots__ = ("build_id", "job_descriptor_id", "resource_caps", "publication_contract", "reclaim_on_terminal", "device_count", "orchestration", "orchestration_parent")
     BUILD_ID_FIELD_NUMBER: _ClassVar[int]
     JOB_DESCRIPTOR_ID_FIELD_NUMBER: _ClassVar[int]
     RESOURCE_CAPS_FIELD_NUMBER: _ClassVar[int]
     PUBLICATION_CONTRACT_FIELD_NUMBER: _ClassVar[int]
     RECLAIM_ON_TERMINAL_FIELD_NUMBER: _ClassVar[int]
     DEVICE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    ORCHESTRATION_FIELD_NUMBER: _ClassVar[int]
+    ORCHESTRATION_PARENT_FIELD_NUMBER: _ClassVar[int]
     build_id: str
     job_descriptor_id: str
     resource_caps: ResourceCaps
     publication_contract: PublicationContract
     reclaim_on_terminal: bool
     device_count: int
-    def __init__(self, build_id: _Optional[str] = ..., job_descriptor_id: _Optional[str] = ..., resource_caps: _Optional[_Union[ResourceCaps, _Mapping]] = ..., publication_contract: _Optional[_Union[PublicationContract, _Mapping]] = ..., reclaim_on_terminal: bool = ..., device_count: _Optional[int] = ...) -> None: ...
+    orchestration: bool
+    orchestration_parent: JobDirective
+    def __init__(self, build_id: _Optional[str] = ..., job_descriptor_id: _Optional[str] = ..., resource_caps: _Optional[_Union[ResourceCaps, _Mapping]] = ..., publication_contract: _Optional[_Union[PublicationContract, _Mapping]] = ..., reclaim_on_terminal: bool = ..., device_count: _Optional[int] = ..., orchestration: bool = ..., orchestration_parent: _Optional[_Union[JobDirective, _Mapping]] = ...) -> None: ...
 
 class ObservedWorkerState(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "applied_wire_minor", "held_attempts", "faults", "activity", "job_capacity", "placements", "admission_epoch", "admission_state", "available_attempt_slots", "accepted_desired_state_revision", "accepted_placement_set_digest", "converged_revision", "worker_phase", "lanes", "held_manifests")
@@ -1767,7 +1976,7 @@ class WeightsIntentFrame(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., requested_writer_epoch: _Optional[int] = ..., tensorfs_declaration_canonical_bytes: _Optional[bytes] = ..., weights_transaction_id: _Optional[str] = ...) -> None: ...
 
 class WeightsHostAck(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "weights_transaction_id", "writer_epoch", "tensorfs_declaration_digest", "stage", "outcome", "refusal", "weights_receipt", "manifest")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "weights_transaction_id", "writer_epoch", "tensorfs_declaration_digest", "stage", "outcome", "refusal", "weights_receipt", "manifest", "checkpoint")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1783,6 +1992,7 @@ class WeightsHostAck(_message.Message):
     REFUSAL_FIELD_NUMBER: _ClassVar[int]
     WEIGHTS_RECEIPT_FIELD_NUMBER: _ClassVar[int]
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -1798,7 +2008,92 @@ class WeightsHostAck(_message.Message):
     refusal: WeightsHostRefusal
     weights_receipt: WeightsReceiptRef
     manifest: Ref
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., weights_transaction_id: _Optional[str] = ..., writer_epoch: _Optional[int] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., stage: _Optional[_Union[WeightsHostStage, str]] = ..., outcome: _Optional[_Union[WeightsHostOutcome, str]] = ..., refusal: _Optional[_Union[WeightsHostRefusal, str]] = ..., weights_receipt: _Optional[_Union[WeightsReceiptRef, _Mapping]] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
+    checkpoint: CheckpointRef
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., weights_transaction_id: _Optional[str] = ..., writer_epoch: _Optional[int] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., stage: _Optional[_Union[WeightsHostStage, str]] = ..., outcome: _Optional[_Union[WeightsHostOutcome, str]] = ..., refusal: _Optional[_Union[WeightsHostRefusal, str]] = ..., weights_receipt: _Optional[_Union[WeightsReceiptRef, _Mapping]] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., checkpoint: _Optional[_Union[CheckpointRef, _Mapping]] = ...) -> None: ...
+
+class CheckpointRef(_message.Message):
+    __slots__ = ("head", "plan_digest", "index", "bytes")
+    HEAD_FIELD_NUMBER: _ClassVar[int]
+    PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    INDEX_FIELD_NUMBER: _ClassVar[int]
+    BYTES_FIELD_NUMBER: _ClassVar[int]
+    head: Ref
+    plan_digest: bytes
+    index: int
+    bytes: int
+    def __init__(self, head: _Optional[_Union[Ref, _Mapping]] = ..., plan_digest: _Optional[bytes] = ..., index: _Optional[int] = ..., bytes: _Optional[int] = ...) -> None: ...
+
+class WeightsCheckpointFrame(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "weights_transaction_id", "writer_epoch", "tensorfs_declaration_digest", "checkpoint")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_SLOT_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
+    WRITER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_DECLARATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    request_id: str
+    attempt_ordinal: int
+    invocation_spec_digest: bytes
+    output_slot: str
+    weights_transaction_id: str
+    writer_epoch: int
+    tensorfs_declaration_digest: bytes
+    checkpoint: CheckpointRef
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., weights_transaction_id: _Optional[str] = ..., writer_epoch: _Optional[int] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., checkpoint: _Optional[_Union[CheckpointRef, _Mapping]] = ...) -> None: ...
+
+class WeightsIntentReadyRequest(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "weights", "attempt_ordinal", "checkpoint")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    weights: WeightsCheckpointSubject
+    attempt_ordinal: int
+    checkpoint: CheckpointRef
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., weights: _Optional[_Union[WeightsCheckpointSubject, _Mapping]] = ..., attempt_ordinal: _Optional[int] = ..., checkpoint: _Optional[_Union[CheckpointRef, _Mapping]] = ...) -> None: ...
+
+class WeightsIntentReadyCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: WeightsIntentReadyRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[WeightsIntentReadyRequest, _Mapping]] = ...) -> None: ...
+
+class ValidateWeightsCheckpointRequest(_message.Message):
+    __slots__ = ("intent", "tensorfs_declaration_canonical_bytes")
+    INTENT_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_DECLARATION_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    intent: WeightsIntentReadyRequest
+    tensorfs_declaration_canonical_bytes: bytes
+    def __init__(self, intent: _Optional[_Union[WeightsIntentReadyRequest, _Mapping]] = ..., tensorfs_declaration_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+
+class ValidateWeightsCheckpointResult(_message.Message):
+    __slots__ = ("weights", "checkpoint", "valid", "safe_code", "safe_detail")
+    WEIGHTS_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_FIELD_NUMBER: _ClassVar[int]
+    VALID_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    weights: WeightsCheckpointSubject
+    checkpoint: CheckpointRef
+    valid: bool
+    safe_code: str
+    safe_detail: str
+    def __init__(self, weights: _Optional[_Union[WeightsCheckpointSubject, _Mapping]] = ..., checkpoint: _Optional[_Union[CheckpointRef, _Mapping]] = ..., valid: bool = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class WeightsReceiptFrame(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "weights_transaction_id", "writer_epoch", "tensorfs_declaration_digest", "weights_receipt", "objects", "manifest")
@@ -1831,7 +2126,7 @@ class WeightsReceiptFrame(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., weights_transaction_id: _Optional[str] = ..., writer_epoch: _Optional[int] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., weights_receipt: _Optional[_Union[WeightsReceiptRef, _Mapping]] = ..., objects: _Optional[_Iterable[_Union[WeightsObjectSource, _Mapping]]] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
 class WeightsTransactionStatus(_message.Message):
-    __slots__ = ("weights_transaction_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "writer_epoch", "state", "tensorfs_declaration_digest", "weights_receipt_digest")
+    __slots__ = ("weights_transaction_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "writer_epoch", "state", "tensorfs_declaration_digest", "weights_receipt_digest", "checkpoint", "intent_ready")
     WEIGHTS_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
@@ -1841,6 +2136,8 @@ class WeightsTransactionStatus(_message.Message):
     STATE_FIELD_NUMBER: _ClassVar[int]
     TENSORFS_DECLARATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     WEIGHTS_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_FIELD_NUMBER: _ClassVar[int]
+    INTENT_READY_FIELD_NUMBER: _ClassVar[int]
     weights_transaction_id: str
     request_id: str
     attempt_ordinal: int
@@ -1850,7 +2147,9 @@ class WeightsTransactionStatus(_message.Message):
     state: WeightsTransactionState
     tensorfs_declaration_digest: bytes
     weights_receipt_digest: bytes
-    def __init__(self, weights_transaction_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[str] = ..., output_slot: _Optional[str] = ..., writer_epoch: _Optional[int] = ..., state: _Optional[_Union[WeightsTransactionState, str]] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., weights_receipt_digest: _Optional[bytes] = ...) -> None: ...
+    checkpoint: CheckpointRef
+    intent_ready: bool
+    def __init__(self, weights_transaction_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[str] = ..., output_slot: _Optional[str] = ..., writer_epoch: _Optional[int] = ..., state: _Optional[_Union[WeightsTransactionState, str]] = ..., tensorfs_declaration_digest: _Optional[bytes] = ..., weights_receipt_digest: _Optional[bytes] = ..., checkpoint: _Optional[_Union[CheckpointRef, _Mapping]] = ..., intent_ready: bool = ...) -> None: ...
 
 class WeightsReadRequest(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "weights_transaction_id", "writer_epoch", "object_id", "source_ref", "read_id", "offset", "max_bytes")
@@ -2379,7 +2678,7 @@ class ResourceShortfall(_message.Message):
     def __init__(self, resource: _Optional[str] = ..., scope: _Optional[str] = ..., needed_bytes: _Optional[int] = ..., available_bytes: _Optional[int] = ..., request_shape: _Optional[str] = ..., evidence_class: _Optional[str] = ...) -> None: ...
 
 class AttemptOutcomeAck(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "outcome_id", "outcome_digest")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "outcome_id", "outcome_digest", "retain_work")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -2388,6 +2687,7 @@ class AttemptOutcomeAck(_message.Message):
     INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
     OUTCOME_ID_FIELD_NUMBER: _ClassVar[int]
     OUTCOME_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    RETAIN_WORK_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -2396,7 +2696,8 @@ class AttemptOutcomeAck(_message.Message):
     invocation_spec_digest: bytes
     outcome_id: str
     outcome_digest: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., outcome_id: _Optional[str] = ..., outcome_digest: _Optional[bytes] = ...) -> None: ...
+    retain_work: bool
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., outcome_id: _Optional[str] = ..., outcome_digest: _Optional[bytes] = ..., retain_work: bool = ...) -> None: ...
 
 class JobCheckpointRequest(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "operation_key", "logical_key", "content_digest", "seq", "artifact")
@@ -2675,14 +2976,18 @@ class WorkerResources(_message.Message):
     def __init__(self, platform: _Optional[str] = ..., backend: _Optional[str] = ..., memory_model: _Optional[str] = ..., device_count: _Optional[int] = ..., device_name: _Optional[str] = ..., device_memory_total_bytes: _Optional[int] = ..., driver_version: _Optional[str] = ..., backend_version: _Optional[str] = ..., host_ram_total_bytes: _Optional[int] = ..., vcpu_count: _Optional[int] = ..., disk_total_bytes: _Optional[int] = ..., power_cap_watts: _Optional[int] = ..., partition_profile: _Optional[str] = ..., interconnect: _Optional[str] = ..., peer_access: bool = ..., unreadable: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class JobCapacity(_message.Message):
-    __slots__ = ("jobs_in_flight", "jobs_available", "free_disk_bytes")
+    __slots__ = ("jobs_in_flight", "jobs_available", "free_disk_bytes", "orchestration_in_flight", "orchestration_available")
     JOBS_IN_FLIGHT_FIELD_NUMBER: _ClassVar[int]
     JOBS_AVAILABLE_FIELD_NUMBER: _ClassVar[int]
     FREE_DISK_BYTES_FIELD_NUMBER: _ClassVar[int]
+    ORCHESTRATION_IN_FLIGHT_FIELD_NUMBER: _ClassVar[int]
+    ORCHESTRATION_AVAILABLE_FIELD_NUMBER: _ClassVar[int]
     jobs_in_flight: int
     jobs_available: int
     free_disk_bytes: int
-    def __init__(self, jobs_in_flight: _Optional[int] = ..., jobs_available: _Optional[int] = ..., free_disk_bytes: _Optional[int] = ...) -> None: ...
+    orchestration_in_flight: int
+    orchestration_available: int
+    def __init__(self, jobs_in_flight: _Optional[int] = ..., jobs_available: _Optional[int] = ..., free_disk_bytes: _Optional[int] = ..., orchestration_in_flight: _Optional[int] = ..., orchestration_available: _Optional[int] = ...) -> None: ...
 
 class HeldAttempt(_message.Message):
     __slots__ = ("request_id", "attempt_ordinal", "kind", "state", "invocation_spec_digest", "placement_id", "executor_epoch", "outcome_id", "outcome_digest", "lane_id", "queue_position", "overtaken", "overtake_budget", "plan_digest")

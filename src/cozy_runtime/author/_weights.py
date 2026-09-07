@@ -231,6 +231,14 @@ class WeightsHostTransaction(Protocol):
     replayed: bool
     receipt: WeightsReceipt | None
 
+    @property
+    def completed_parts(self) -> frozenset[tuple[str, str, str]]: ...
+
+    @property
+    def completed_configs(self) -> frozenset[str]: ...
+
+    def checkpoint(self) -> None: ...
+
     def source_read_into(
         self,
         source: str,
@@ -292,6 +300,23 @@ class WeightsTransaction:
     def receipt(self) -> WeightsReceipt | None:
         """The prior receipt on replay; absent for a newly opened writer."""
         return self._host.receipt
+
+    @property
+    def completed_parts(self) -> frozenset[tuple[str, str, str]]:
+        """Verified added roles available for reuse, as ``(component, key, role)``."""
+        self._check("WeightsTransaction.completed_parts")
+        return self._host.completed_parts
+
+    @property
+    def completed_configs(self) -> frozenset[str]:
+        """Verified added configurations available for reuse."""
+        self._check("WeightsTransaction.completed_configs")
+        return self._host.completed_configs
+
+    def checkpoint(self) -> None:
+        """Record a completed semantic unit for the owner's recovery pipeline."""
+        self._check("WeightsTransaction.checkpoint")
+        self._call(self._host.checkpoint, "weights checkpoint")
 
     def source_read_into(
         self,

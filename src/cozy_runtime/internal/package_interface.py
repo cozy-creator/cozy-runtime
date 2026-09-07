@@ -73,6 +73,10 @@ def _callable(surface: Surface) -> dict[str, Json]:
         "request": schema.render(surface.payload_type),
         "result": schema.render(surface.result_type),
     }
+    if surface.invocable:
+        from cozy_runtime.internal import invocable_interface
+
+        doc["invocable"] = invocable_interface.metadata(surface)
     models = [_model(binding) for binding in surface.model_bindings]
     if models:
         doc["models"] = models
@@ -326,7 +330,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
         for index, row in enumerate(rows):
             path = f"{collection}[{index}]"
             required = {"name", "request", "result"}
-            optional = {"models"}
+            optional = {"models", "invocable"}
             if kind == "job":
                 required.add("publishes")
                 optional.add("weights_outputs")
@@ -337,6 +341,10 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
             names.add(name)
             _schema(item["request"], source, f"{path}.request")
             _schema(item["result"], source, f"{path}.result")
+            if "invocable" in item:
+                from cozy_runtime.internal import invocable_interface
+
+                invocable_interface.validate(item["invocable"], item["request"], item["result"])
             models = item.get("models", [])
             if not isinstance(models, list) or len(models) > 16:
                 _invalid(source, f"{path}.models", "must be an array of at most 16 slots")

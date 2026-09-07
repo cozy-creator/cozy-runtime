@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._errors import CapabilityError
@@ -38,8 +38,63 @@ from cozy_runtime.author._weights import (
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+if TYPE_CHECKING:
+    from cozy_runtime.internal.base_observation import Observation
+    from cozy_runtime.internal.hostfacts import HostFacts
+
 _OUTPUT_SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 _EXCHANGE_KINDS = frozenset({"declaration", "receipt"})
+
+
+def work_fingerprint(
+    spec: Mapping[str, Any],
+    environment_content_digest: str,
+    base: Observation,
+    device: HostFacts,
+) -> str:
+    """Parent-authored numerical work identity, independent of attempt/custody clocks.
+
+    The original exact InvocationSpec still scopes the transaction. Its deadline and
+    publication grant are authority, not inputs to arithmetic. CUDA architecture/driver
+    deliberately participate: AdaLN tables computed on another architecture are not
+    presumed bit-identical. Device UUID, memory, paths and boot facts never participate.
+    """
+    from cozy_runtime.internal.base_observation import protected_distribution
+
+    job = spec.get("job")
+    if not isinstance(job, Mapping) or not environment_content_digest:
+        raise CapabilityError(
+            "weights work has no selected job environment", code="weights_work_identity"
+        )
+    if device.backend == "cuda" and (device.gpu_sm <= 0 or not device.driver_version):
+        raise CapabilityError(
+            "CUDA work has no measured architecture/driver", code="weights_work_identity"
+        )
+    facts = {
+        "job": {key: job[key] for key in ("build_id", "job_descriptor_id")},
+        "environment_digest": spec.get("environment_digest", ""),
+        "environment_content_digest": environment_content_digest,
+        "payload_digest": spec["payload_digest"],
+        "inputs": spec.get("inputs", []),
+        "outputs": spec.get("outputs", []),
+        "interpreter": base.interpreter_identity,
+        "distributions": {
+            name: version for name, version in base.distributions if protected_distribution(name)
+        },
+        "torch_build": base.accelerator_build,
+        "cuda_runtime": base.cuda_version,
+        "device": {
+            "backend": device.backend or "cpu",
+            "architecture": device.gpu_sm,
+            "driver": device.driver_version,
+        },
+    }
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            b"cozy.runtime.derived-work/1\0" + canonical_json.encode(facts)
+        ).hexdigest()
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +104,22 @@ class WeightsHostBinding:
     transaction_id: str
     writer_epoch: int
     weights_receipt_digest: bytes = b""
+    checkpoint: tuple[str, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WeightsCheckpoint:
+    """Mechanical TensorFS progress observed under one already-bound weights intent."""
+
+    output_slot: str
+    weights_transaction_id: str
+    writer_epoch: int
+    declaration_digest: str
+    head: str
+    head_length: int
+    plan_digest: str
+    index: int
+    bytes: int
 
 
 class _ExactReader:
@@ -120,16 +191,19 @@ class WeightsTransactionHost:
         owner_scope: str,
         request_id: str,
         invocation_spec_digest: str,
+        work_fingerprint: str,
         writer_session_id: int,
         allowed_sources: Mapping[str, int],
         output_bounds: Mapping[str, int],
         bind_intent: Callable[[str, str, bytes, bytes], WeightsHostBinding] | None = None,
         record_receipt: Callable[[WeightsReceipt], None] | None = None,
+        record_checkpoint: Callable[[WeightsCheckpoint], None] | None = None,
     ) -> None:
         if (
             not owner_scope
             or not request_id
             or not invocation_spec_digest.startswith("sha256:")
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", work_fingerprint) is None
             or writer_session_id <= 0
         ):
             raise CapabilityError(
@@ -139,11 +213,13 @@ class WeightsTransactionHost:
         self.owner_scope = owner_scope
         self.request_id = request_id
         self.invocation_spec_digest = invocation_spec_digest
+        self.work_fingerprint = work_fingerprint
         self.writer_session_id = writer_session_id
         self.allowed_sources = dict(allowed_sources)
         self.output_bounds = dict(output_bounds)
         self.bind_intent = bind_intent
         self.record_receipt = record_receipt
+        self.record_checkpoint = record_checkpoint
 
     def open(self, request: WeightsCommit) -> WeightsHostTransaction:
         """Lock one tfs-019 declaration before exposing any source reader or writer."""
@@ -166,11 +242,13 @@ class WeightsTransactionHost:
         targets = {name: self._target(target) for name, target in request.targets.items()}
         configs = {name: self._config(config) for name, config in request.configs.items()}
         try:
-            # TensorFS owns this declaration schema and its canonical bytes. Runtime
-            # carries those exact bytes into the host intent; it does not reconstruct
-            # the native receipt spelling from the Python facade's input spelling.
             declaration = self.store.derived_declaration(
-                sources, targets, configs, list(request.order), request.max_new_bytes
+                sources,
+                targets,
+                configs,
+                list(request.order),
+                request.max_new_bytes,
+                work_fingerprint=self.work_fingerprint,
             )
             if not isinstance(declaration, bytes) or not declaration:
                 raise ValueError("native declaration has no canonical bytes")
@@ -194,7 +272,31 @@ class WeightsTransactionHost:
         self.writer_session_id = binding.writer_epoch
         existing = self.store.derived_lookup(transaction_id)
         if existing.get("state") == "committed":
+            disposition = existing.get("disposition")
+            if not isinstance(disposition, dict) or disposition.get("kind") not in {
+                "pending",
+                "adopted",
+            }:
+                raise CapabilityError(
+                    "weights receipt no longer has a retained transaction",
+                    code="weights_transaction_closed",
+                )
             facts = self._receipt(existing.get("receipt"), transaction_id, expected_declaration)
+            try:
+                manifest = facts["manifest"]
+                # Native retention and verified closure, not receipt metadata, establish
+                # that this completed result is reusable. This never reads payload bytes.
+                self.store.inspect_derived_source(
+                    "sha256:" + manifest["sha256"],
+                    manifest["length"],
+                    list(request.targets),
+                    list(request.configs),
+                )
+            except Exception as exc:
+                raise CapabilityError(
+                    f"TensorFS completed result is not retained and complete: {exc}",
+                    code="weights_receipt_unavailable",
+                ) from exc
             receipt = self._wrap(request.output_slot, transaction_id, facts, replayed=True)
             _, _, protocol_digest = protocol_receipt(
                 receipt,
@@ -216,8 +318,11 @@ class WeightsTransactionHost:
                 request=request,
                 transaction_id=transaction_id,
                 declaration=expected_declaration,
+                declaration_digest=documents.spell(declaration_digest),
                 writer=None,
                 receipt=receipt,
+                writer_epoch=binding.writer_epoch,
+                checkpoint=binding.checkpoint,
             )
         if binding.weights_receipt_digest:
             raise CapabilityError(
@@ -238,6 +343,8 @@ class WeightsTransactionHost:
                 configs,
                 list(request.order),
                 request.max_new_bytes,
+                work_fingerprint=self.work_fingerprint,
+                checkpoint=binding.checkpoint,
             )
         except Exception as exc:
             raise CapabilityError(
@@ -249,8 +356,11 @@ class WeightsTransactionHost:
             request=request,
             transaction_id=transaction_id,
             declaration=expected_declaration,
+            declaration_digest=documents.spell(declaration_digest),
             writer=writer,
             receipt=None,
+            writer_epoch=binding.writer_epoch,
+            checkpoint=binding.checkpoint,
         )
 
     def structure(self, manifest: str) -> WeightsSource:
@@ -439,17 +549,99 @@ class OpenedWeightsTransaction:
         request: WeightsCommit,
         transaction_id: str,
         declaration: object,
+        declaration_digest: str,
         writer: Any,
         receipt: WeightsReceipt | None,
+        writer_epoch: int,
+        checkpoint: tuple[str, int] | None,
     ) -> None:
         self.host = host
         self.request = request
         self.transaction_id = transaction_id
         self.declaration = declaration
+        self.declaration_digest = declaration_digest
         self.writer = writer
         self.receipt = receipt
         self.replayed = receipt is not None
         self.closed = self.replayed
+        self.writer_epoch = writer_epoch
+        self.checkpoint_head = checkpoint
+
+    @property
+    def completed_parts(self) -> frozenset[tuple[str, str, str]]:
+        declared = frozenset(
+            (component, key, role)
+            for component, target in self.request.targets.items()
+            for key, tensor in target.add.items()
+            for role in tensor.parts
+        )
+        if self.replayed:
+            return declared
+        try:
+            completed = frozenset(
+                tuple(row) for row in self._writer("completed parts").completed_parts()
+            )
+            if not completed <= declared:
+                raise ValueError("completed parts are outside the locked declaration")
+            return completed
+        except Exception as exc:
+            self._fence_after(exc, "completed parts")
+
+    @property
+    def completed_configs(self) -> frozenset[str]:
+        declared = frozenset(
+            name for name, config in self.request.configs.items() if config.data is not None
+        )
+        if self.replayed:
+            return declared
+        try:
+            completed = frozenset(self._writer("completed configs").completed_configs())
+            if not completed <= declared:
+                raise ValueError("completed configs are outside the locked declaration")
+            return completed
+        except Exception as exc:
+            self._fence_after(exc, "completed configs")
+
+    def checkpoint(self) -> None:
+        if self.replayed:
+            return
+        try:
+            facts = self._writer("checkpoint").checkpoint(
+                self.host.request_id, self.request.output_slot, previous=self.checkpoint_head
+            )
+            if not isinstance(facts, dict):
+                raise ValueError("checkpoint has no exact TensorFS facts")
+            if facts.get("head") is None:
+                return
+            for field in ("head", "plan_digest"):
+                if (
+                    not isinstance(facts.get(field), str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", facts[field]) is None
+                ):
+                    raise ValueError("checkpoint has an invalid object identity")
+            for field in ("head_length", "index", "bytes"):
+                if type(facts.get(field)) is not int or not 0 <= facts[field] < 1 << 64:
+                    raise ValueError("checkpoint has an invalid counter")
+            if facts["head_length"] == 0:
+                raise ValueError("checkpoint head is empty")
+            head = (facts["head"], facts["head_length"])
+            if head != self.checkpoint_head and self.host.record_checkpoint is not None:
+                self.host.record_checkpoint(
+                    WeightsCheckpoint(
+                        output_slot=self.request.output_slot,
+                        weights_transaction_id=self.transaction_id,
+                        writer_epoch=self.writer_epoch,
+                        declaration_digest=self.declaration_digest,
+                        head=head[0],
+                        head_length=head[1],
+                        plan_digest=facts["plan_digest"],
+                        index=facts["index"],
+                        bytes=facts["bytes"],
+                    )
+                )
+            self.checkpoint_head = head
+        except Exception as exc:
+            self._fence_after(exc, "checkpoint")
 
     def source_read_into(
         self,
@@ -516,7 +708,7 @@ class OpenedWeightsTransaction:
         except Exception as exc:
             self._fence_after(exc, what)
 
-    def _fence_after(self, cause: Exception, what: str) -> None:
+    def _fence_after(self, cause: Exception, what: str) -> NoReturn:
         fence_error = ""
         try:
             if self.writer is not None:

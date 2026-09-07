@@ -50,6 +50,7 @@ from cozy_runtime.internal import canonical, fill, package_interface, seam
 from cozy_runtime.internal import weights_sink as weights_bridge
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
+from cozy_runtime.internal.worker.calls import Calls
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
@@ -268,6 +269,8 @@ class AttemptSlot:
     lane_id: str
     #: what the executor on this slot was sealed to see (`CUDA_VISIBLE_DEVICES`)
     devices: str = ""
+    job_device_count: int = 0
+    orchestration: bool = False
 
 
 @dataclass(slots=True)
@@ -370,6 +373,7 @@ class AttemptRecord:
     publication: dict[str, Any] = dataclasses_field(default_factory=dict)
     #: Host-ACKed WeightsReceipt/1 refs, one per interface-declared output slot.
     weights_receipts: dict[str, pb.WeightsReceiptRef] = dataclasses_field(default_factory=dict)
+    weights_work_fingerprint: str = ""
     job_models: dict[str, JobModel] = dataclasses_field(default_factory=dict)
     model_leases: list[Any] = dataclasses_field(default_factory=list)
 
@@ -428,6 +432,7 @@ class AttemptRecord:
         self.residency = {}
         self.publication = {}
         self.weights_receipts = {}
+        self.weights_work_fingerprint = ""
         self.job_models = {}
         self.model_leases = []
 
@@ -468,10 +473,12 @@ class AttemptEngine:
         weights: WeightsExchange | None = None,
         owner_scope: Callable[[], str] = lambda: "",
         tensorfs_root: Path | None = None,
+        work_fingerprint: Callable[[AttemptRecord], str] | None = None,
     ) -> None:
         self.records = records
         self.authorizer = authorizer
         self.jobs = dict(jobs)
+        self.calls: Calls | None = None
         self.job_device_count = 0
         self.spool_root = spool_root
         self.instance_id = instance_id
@@ -495,6 +502,7 @@ class AttemptEngine:
         self.weights = weights
         self.owner_scope = owner_scope
         self.tensorfs_root = tensorfs_root
+        self.work_fingerprint = work_fingerprint
         #: binding digests whose boot warm pass FAILED. Every attempt served under one
         #: carries a per-request confession: the first-call tax was never paid for it.
         self.degraded: dict[str, str] = {}
@@ -1025,7 +1033,7 @@ class AttemptEngine:
                 "rss": int(caps.get("max_rss_bytes", 0)),
                 "disk": int(caps.get("max_disk_bytes", 0)),
             },
-            device_count=self.job_device_count,
+            device_count=slot.job_device_count,
         )
         attempt.plan = plan
         # A job's scratch is the RUN's, granted by the owner as `tmp/<request-id>/` and
@@ -1441,6 +1449,14 @@ class AttemptEngine:
     def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Dispatch the existing executor control request lane by typed operation."""
         kind = str(frame.get("kind", ""))
+        if kind in ("child_call", "child_poll", "child_cancel"):
+            if self.calls is None:
+                return {
+                    "ok": False,
+                    "code": "child_broker_absent",
+                    "detail": "no RecordOwner call lane",
+                }
+            return self.calls.handle(attempt, frame)
         if kind == "checkpoint":
             return self.checkpoint_exchange(attempt, frame)
         if self.weights is None or attempt.spool is None:
@@ -1641,12 +1657,15 @@ class AttemptEngine:
             for input_id, granted in attempt.inputs.items()
         }
         if attempt.job is not None:
+            if not attempt.weights_work_fingerprint and self.work_fingerprint is not None:
+                attempt.weights_work_fingerprint = self.work_fingerprint(attempt)
             return {
                 "cmd": "run_job",
                 "request_id": key,
                 "application": attempt.job.application,
                 "package_interface": attempt.job.package_interface,
                 "job": attempt.job.job,
+                "call_interfaces": self.calls.bindings(attempt) if self.calls is not None else [],
                 "payload": attempt.payload,
                 "deadline_s": seconds,
                 "spool": str(spool),
@@ -1666,9 +1685,10 @@ class AttemptEngine:
                 "weights_owner_scope": self.owner_scope(),
                 "weights_request_id": attempt.request_id,
                 "invocation_spec_digest": documents.spell(attempt.digest),
+                "weights_work_fingerprint": attempt.weights_work_fingerprint,
                 "budget": {
                     "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
-                    "gpu_count": self.job_device_count,
+                    "gpu_count": self.slot_of(attempt).job_device_count,
                     "cap_micro_usd": attempt.job.cap_micro_usd,
                 },
             }

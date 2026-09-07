@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from cozy_runtime.cli import describe as describe_verb
 from cozy_runtime.cli import host as host_verbs
 from cozy_runtime.cli import hostfacts as hostfacts_verb
+from cozy_runtime.cli import interface_wheel as interface_wheel_verb
 from cozy_runtime.cli import new as new_verb
 from cozy_runtime.cli import package_prepare as package_prepare_verbs
 from cozy_runtime.cli import probe as probe_verb
@@ -33,7 +34,7 @@ BUILT = (
     "new",
     "version",
 )
-PRIVATE = ("development-placement", "prepare-package")
+PRIVATE = ("development-placement", "prepare-package", "interface-wheel")
 HELP = """cozy-runtime — everything a single package venv can do alone
 
 usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args]
@@ -200,6 +201,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return host_verbs.development_placement(config, args, opts)
     if verb == "prepare-package":
         return package_prepare_verbs.prepare_local_package(config, args, opts)
+    if verb == "interface-wheel":
+        return interface_wheel_verb.run(args)
     if verb == "hostfacts":
         return hostfacts_verb.run(args, opts, config)
     if verb == "probe":

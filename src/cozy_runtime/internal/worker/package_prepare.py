@@ -1236,6 +1236,9 @@ def _stage_job_plans(
     if root.is_symlink() or not root.is_dir():
         raise PreparationRefusal("package_prepare_job_plan_root_invalid", str(root))
     application = str(body.get("application", ""))
+    from cozy_runtime.internal import installed_interfaces
+
+    call_interfaces = installed_interfaces.read(installed)
     staged: set[str] = set()
     for row in selected:
         name = str(row.get("name", ""))
@@ -1254,6 +1257,8 @@ def _stage_job_plans(
             "cap_micro_usd": 0,
             "reclaim_on_terminal": True,
         }
+        if call_interfaces:
+            record["call_interfaces"] = call_interfaces
         target = root / f"{descriptor_id.removeprefix('sha256:')}.json"
         temporary = root / f".stage-{uuid.uuid4().hex}"
         temporary.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")))
