@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._weights import (
     Readable,
@@ -521,8 +522,8 @@ class WeightsTransactionHost:
             )
         return value
 
-    @staticmethod
     def _wrap(
+        self,
         output_slot: str,
         transaction_id: str,
         facts: dict[str, Any],
@@ -530,12 +531,19 @@ class WeightsTransactionHost:
         replayed: bool,
     ) -> WeightsReceipt:
         raw = canonical_json.encode(facts)
+        receipt_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
         return WeightsReceipt(
             output_slot=output_slot,
             weights_transaction_id=transaction_id,
-            tensorfs_receipt_digest="sha256:" + hashlib.sha256(raw).hexdigest(),
+            tensorfs_receipt_digest=receipt_digest,
             tensorfs_receipt=raw,
             replayed=replayed,
+            _artifact=ModelArtifact(
+                self.request_id,
+                output_slot,
+                ObjectRef("sha256:" + facts["manifest"]["sha256"], facts["manifest"]["length"]),
+                receipt_digest,
+            ),
         )
 
 

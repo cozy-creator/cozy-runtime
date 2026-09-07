@@ -14,6 +14,7 @@ from collections.abc import Buffer, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, NoReturn, Protocol, runtime_checkable
 
+from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._errors import Cancelled, CapabilityError, ConformanceError
 from cozy_runtime.author._model import Model
 
@@ -190,6 +191,16 @@ class WeightsReceipt:
     tensorfs_receipt_digest: str
     tensorfs_receipt: bytes
     replayed: bool = False
+    _artifact: ModelArtifact | None = None
+
+    @property
+    def artifact(self) -> ModelArtifact:
+        """The verified retained model reference produced by this exact receipt."""
+        if self._artifact is None:
+            raise CapabilityError(
+                "weights receipt has no verified model artifact", code="weights_receipt_artifact"
+            )
+        return self._artifact
 
 
 @dataclass(frozen=True, slots=True)

@@ -1861,6 +1861,24 @@ class Worker:
             )
             self.model_source_operations.discard(operation_id)
 
+    def retain_derived_result(
+        self, request: pb.DerivedRetentionRequest, release: bool
+    ) -> pb.DerivedRetentionResult:
+        from . import derived_retention
+
+        return derived_retention.change(
+            request, tensorfs_root=Path(self.options.tensorfs_root or ""), release=release
+        )
+
+    def release_derived_result(
+        self, request: pb.DerivedResultReleaseRequest
+    ) -> pb.DerivedResultReleaseResult:
+        from . import derived_retention
+
+        return derived_retention.release_result(
+            request, tensorfs_root=Path(self.options.tensorfs_root or "")
+        )
+
     def note(self, kind: str, step: str) -> None:
         """The NON-ATTEMPT activity lane: typed, sequence-bearing, on the DURABLE Report —
         never overloaded onto the lossy progress stream."""

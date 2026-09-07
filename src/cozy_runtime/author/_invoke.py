@@ -32,6 +32,7 @@ from typing import Any, get_args, get_type_hints
 import msgspec
 
 from cozy_runtime.author._app import Registration
+from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import Asset, GrantedInput, Tree, bind, bind_tree
 from cozy_runtime.author._calls import _Broker, _current
 from cozy_runtime.author._context import AdapterRef, Context, Device
@@ -622,7 +623,18 @@ def _inject(
         elif param.role == "preflight":
             kwargs[param.name] = facts
         elif param.role == "model":
-            kwargs[param.name] = _model(param, inv)
+            model = _model(param, inv)
+            artifact = getattr(overlay.payload, param.name, None) if surface.invocable else None
+            if artifact is not None and (
+                not isinstance(artifact, ModelArtifact)
+                or getattr(model, "checkpoint_ref", "") != artifact.manifest.digest
+            ):
+                raise InvalidRequest(
+                    "bound model differs from the exact call artifact",
+                    code="model_artifact_binding",
+                    fields=[param.name],
+                )
+            kwargs[param.name] = model
         else:
             kwargs[param.name] = _service(param, attempt, ctx, inv, surface)
     return kwargs

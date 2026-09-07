@@ -64,6 +64,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         "import msgspec",
         "from cozy_runtime.author import "
         "Context, AssetBound, ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
+        "from cozy_runtime.author import ModelArtifact",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
         "",
     ]
@@ -164,6 +165,8 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                 }[node["asset"]]
             if node.get("input") == "tree":
                 return "Tree"
+            if node.get("input") == "model":
+                return "ModelArtifact"
             raise ConformanceError(
                 "interface schema has no portable Python type", code="interface_type"
             )

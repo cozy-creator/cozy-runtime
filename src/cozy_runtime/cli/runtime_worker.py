@@ -110,6 +110,8 @@ def _run(config: WorkerHostConfig) -> int:
     host.preparer = worker.prepare_package_set
     host.model_source_preparer = worker.prepare_model_source
     host.model_source_releaser = worker.release_model_source
+    host.derived_retainer = worker.retain_derived_result
+    host.derived_result_releaser = worker.release_derived_result
     host.checkpoint_pager = worker.checkpoint_page
     host.checkpoint_transfer = worker.checkpoint_transfer
     host.weights_checkpoint_validator = worker.weights.validate_checkpoint
