@@ -332,9 +332,11 @@ class Workspace:
                 or row["spec"] != outcome.invocation_spec_digest
                 or row["outcome"] not in (b"", raw)
                 or row["outcome_id"] not in ("", outcome.outcome_id)
-                or row["state"] == "released"
+                or row["outcome_digest"] not in (b"", outcome.outcome_digest)
             ):
                 raise WorkspaceRefusal("outcome has no unchanged accepted execution")
+            if row["state"] == "released":
+                return
             db.execute(
                 "UPDATE attempts SET state='outcome',outcome_id=?,outcome_digest=?,outcome=? "
                 "WHERE owner=? AND request=? AND ordinal=?",

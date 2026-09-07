@@ -5363,7 +5363,11 @@ class Worker:
             )
             self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
             return
-        if self.workspace is not None and "job" in attempt.spec:
+        if (
+            self.workspace is not None
+            and "job" in attempt.spec
+            and attempt.state not in ("outcome", "closed")
+        ):
             result_schema = b""
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
             for slot in self.job_slots.values():
