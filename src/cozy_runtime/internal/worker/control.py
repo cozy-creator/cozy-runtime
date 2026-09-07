@@ -155,6 +155,7 @@ class GrpcControlHost:
         model_source_preparer: (
             Callable[[pb.PrepareModelSourceRequest], pb.PrepareModelSourceResult] | None
         ) = None,
+        model_source_releaser: Callable[[str], None] | None = None,
         checkpoint_pager: (
             Callable[[pb.CheckpointPageRequest], pb.CheckpointPageResult] | None
         ) = None,
@@ -181,6 +182,7 @@ class GrpcControlHost:
         self.compatibility_checker = compatibility_checker
         self.preparer = preparer
         self.model_source_preparer = model_source_preparer
+        self.model_source_releaser = model_source_releaser
         self.checkpoint_pager = checkpoint_pager
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
@@ -205,6 +207,7 @@ class GrpcControlHost:
             self.compatibility_checker is not None
             or self.preparer is not None
             or self.model_source_preparer is not None
+            or self.model_source_releaser is not None
             or self.checkpoint_pager is not None
             or self.checkpoint_transfer is not None
             or self.local_package_preparer is not None
@@ -226,6 +229,7 @@ class GrpcControlHost:
                 self.checkpoint_pager,
                 self.checkpoint_transfer,
                 self.weights_checkpoint_validator,
+                self.model_source_releaser,
             ),
             self.server,
         )
@@ -340,6 +344,7 @@ class _PreparationServicer:
             Callable[[pb.ValidateWeightsCheckpointRequest], pb.ValidateWeightsCheckpointResult]
             | None
         ) = None,
+        model_source_releaser: Callable[[str], None] | None = None,
     ) -> None:
         self.compatibility_handler = compatibility_handler
         self.package_handler = package_handler
@@ -349,6 +354,7 @@ class _PreparationServicer:
         self.checkpoint_pager = checkpoint_pager
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
+        self.model_source_releaser = model_source_releaser
 
     def ProtocolInfo(
         self, _request: pb.ProtocolInfoRequest, _context: Any
@@ -427,6 +433,17 @@ class _PreparationServicer:
             return handler(request)
         except Exception as exc:
             return _refuse(context, exc)
+
+    def ReleaseModelSource(self, request: pb.ReleaseModelSourceRequest, context: Any) -> Any:
+        import grpc
+
+        if self.model_source_releaser is None:
+            return context.abort(grpc.StatusCode.UNIMPLEMENTED, "source release is unavailable")
+        try:
+            self.model_source_releaser(request.operation_id)
+        except Exception:
+            return context.abort(grpc.StatusCode.FAILED_PRECONDITION, "source release was refused")
+        return pb.ReleaseModelSourceResult(operation_id=request.operation_id, released=True)
 
     def PrepareLocalPackage(self, request: pb.PrepareLocalPackageRequest, context: Any) -> Any:
         handler = self.local_package_handler

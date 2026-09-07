@@ -576,6 +576,30 @@ class ModelSourcePrepareCall(_message.Message):
     request: ModelSourcePrepareRequest
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ...) -> None: ...
 
+class ModelSourceReleaseCall(_message.Message):
+    __slots__ = ("claim", "operation_id", "source_selection_digest")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    operation_id: str
+    source_selection_digest: bytes
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., operation_id: _Optional[str] = ..., source_selection_digest: _Optional[bytes] = ...) -> None: ...
+
+class ReleaseModelSourceRequest(_message.Message):
+    __slots__ = ("operation_id",)
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    operation_id: str
+    def __init__(self, operation_id: _Optional[str] = ...) -> None: ...
+
+class ReleaseModelSourceResult(_message.Message):
+    __slots__ = ("operation_id", "released")
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    RELEASED_FIELD_NUMBER: _ClassVar[int]
+    operation_id: str
+    released: bool
+    def __init__(self, operation_id: _Optional[str] = ..., released: bool = ...) -> None: ...
+
 class ModelSourceAdoptCall(_message.Message):
     __slots__ = ("claim", "from_operation_id", "request")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
