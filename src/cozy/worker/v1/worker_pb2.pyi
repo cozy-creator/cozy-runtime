@@ -707,6 +707,56 @@ class DerivedResultReleaseResult(_message.Message):
     released: bool
     def __init__(self, weights_transaction_id: _Optional[str] = ..., tensorfs_receipt_digest: _Optional[bytes] = ..., released: bool = ...) -> None: ...
 
+class RecordOperationResultCall(_message.Message):
+    __slots__ = ("claim", "computation_digest", "request_id", "attempt_ordinal", "invocation_spec_digest", "outcome_id", "outcome_digest")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    COMPUTATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_ID_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    computation_digest: bytes
+    request_id: str
+    attempt_ordinal: int
+    invocation_spec_digest: bytes
+    outcome_id: str
+    outcome_digest: bytes
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., computation_digest: _Optional[bytes] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., outcome_id: _Optional[str] = ..., outcome_digest: _Optional[bytes] = ...) -> None: ...
+
+class RecordOperationResultResult(_message.Message):
+    __slots__ = ("computation_digest", "recorded")
+    COMPUTATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    RECORDED_FIELD_NUMBER: _ClassVar[int]
+    computation_digest: bytes
+    recorded: bool
+    def __init__(self, computation_digest: _Optional[bytes] = ..., recorded: bool = ...) -> None: ...
+
+class LookupOperationCall(_message.Message):
+    __slots__ = ("claim", "computation_digest", "consumer_request_id")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    COMPUTATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CONSUMER_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    computation_digest: bytes
+    consumer_request_id: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., computation_digest: _Optional[bytes] = ..., consumer_request_id: _Optional[str] = ...) -> None: ...
+
+class LookupOperationResult(_message.Message):
+    __slots__ = ("computation_digest", "found", "source", "retentions", "consumer_request_id")
+    COMPUTATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    FOUND_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    RETENTIONS_FIELD_NUMBER: _ClassVar[int]
+    CONSUMER_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    computation_digest: bytes
+    found: bool
+    source: AttemptOutcome
+    retentions: _containers.RepeatedCompositeFieldContainer[DerivedRetentionResult]
+    consumer_request_id: str
+    def __init__(self, computation_digest: _Optional[bytes] = ..., found: bool = ..., source: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., retentions: _Optional[_Iterable[_Union[DerivedRetentionResult, _Mapping]]] = ..., consumer_request_id: _Optional[str] = ...) -> None: ...
+
 class ReleaseModelSourceResult(_message.Message):
     __slots__ = ("operation_id", "released")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]

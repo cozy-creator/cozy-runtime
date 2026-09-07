@@ -1030,6 +1030,16 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
                 _registered_method=True)
+        self.RecordOperationResult = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/RecordOperationResult',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultResult.FromString,
+                _registered_method=True)
+        self.LookupOperation = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/LookupOperation',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationResult.FromString,
+                _registered_method=True)
         self.ModelSourceAdopt = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/ModelSourceAdopt',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceAdoptCall.SerializeToString,
@@ -1174,6 +1184,18 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RecordOperationResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def LookupOperation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ModelSourceAdopt(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -1284,6 +1306,16 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.ReleaseDerivedResult,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.SerializeToString,
+            ),
+            'RecordOperationResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.RecordOperationResult,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultResult.SerializeToString,
+            ),
+            'LookupOperation': grpc.unary_unary_rpc_method_handler(
+                    servicer.LookupOperation,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationResult.SerializeToString,
             ),
             'ModelSourceAdopt': grpc.unary_unary_rpc_method_handler(
                     servicer.ModelSourceAdopt,
@@ -1675,6 +1707,60 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/ReleaseDerivedResult',
             cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RecordOperationResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/RecordOperationResult',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def LookupOperation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/LookupOperation',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LookupOperationResult.FromString,
             options,
             channel_credentials,
             insecure,
