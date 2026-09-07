@@ -65,12 +65,40 @@ class WeightsOutput:
 
 
 @dataclass(frozen=True, slots=True)
+class WeightsPartSource:
+    """Inherit one exact encoded role from a declared source without moving bytes."""
+
+    source: str
+    component: str
+    tensor: str
+    role: str
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str) or not value
+            for value in (self.source, self.component, self.tensor, self.role)
+        ):
+            raise CapabilityError(
+                "a weights part source names source, component, tensor and role",
+                code="weights_part_source",
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class WeightsPart:
     dtype: str
     shape: tuple[int, ...]
     data: WeightsBytes | None = None
+    source: WeightsPartSource | None = None
 
     def __post_init__(self) -> None:
+        if self.source is not None and (
+            not isinstance(self.source, WeightsPartSource) or self.data is not None
+        ):
+            raise CapabilityError(
+                "a weights part inherits a declared source or accepts bytes, never both",
+                code="weights_part_source",
+            )
         if not self.dtype or any(dimension <= 0 for dimension in self.shape):
             raise CapabilityError(
                 "a weights part needs a dtype and positive dimensions",
@@ -671,6 +699,8 @@ class WeightsSink:
             for component, target in sorted(targets.items()):
                 for key, tensor in sorted(target.add.items()):
                     for role, part in sorted(tensor.parts.items()):
+                        if part.source is not None:
+                            continue
                         if part.data is None:
                             transaction.fence()
                             raise CapabilityError(
