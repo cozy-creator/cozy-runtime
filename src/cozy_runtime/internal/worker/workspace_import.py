@@ -773,12 +773,14 @@ def _validate_links(db: Journal, identity: str, owner: str, *, native: bool) -> 
                     _refuse("ready memo has no verified live native hold")
 
 
-def _insert(db: Journal, kind: str, row: dict[str, Any], verified: dict[str, Any]) -> None:
+def _insert(
+    db: Journal, kind: str, row: dict[str, Any], verified: dict[str, Any], import_owner: str
+) -> None:
     if kind == "attempt":
         db.execute(
             "INSERT INTO "
-            "attempts(owner,request,ordinal,spec,invocation,state,outcome_id,outcome_digest,outcome,retain,fenced)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "attempts(owner,request,ordinal,spec,invocation,state,outcome_id,outcome_digest,outcome,retain,fenced,transport_owner)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 row["owner_scope"],
                 row["request_id"],
@@ -791,6 +793,7 @@ def _insert(db: Journal, kind: str, row: dict[str, Any], verified: dict[str, Any
                 _bytes(row["outcome_canonical_bytes"]),
                 row["retain_work"],
                 row["state"] in ("received", "running"),
+                import_owner if row["owner_scope"] == "" else "",
             ),
         )
     elif kind == "weights":
@@ -908,7 +911,7 @@ def _import(
                     "ordinal=?",
                     (identity, index),
                 ).fetchone()[0]
-                _insert(db, kind, json.loads(raw), json.loads(verified))
+                _insert(db, kind, json.loads(raw), json.loads(verified), owner)
             db.execute("UPDATE workspace_imports SET state='imported' WHERE id=?", (identity,))
             db.execute(
                 "UPDATE workspace_state SET state='imported' WHERE singleton=1 AND migration_id=?",

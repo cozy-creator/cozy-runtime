@@ -512,6 +512,10 @@ def test_activation_recovers_unqualified_interrupted_history_once(
         row = dict(db.execute("SELECT * FROM attempts").fetchone())
     body = documents.read(row["outcome"], pb.AttemptOutcomeBody)
     assert row["owner"] == ""
+    assert row["transport_owner"] == "owner"
+    terminals = workspace.retained_outcomes("owner")
+    assert len(terminals) == 1 and terminals[0].outcome_canonical_bytes == row["outcome"]
+    assert workspace.retained_outcomes("foreign") == []
     assert row["outcome_id"] == "out-" + hashlib.sha256(row["outcome"]).hexdigest()[:24]
     assert body["request_id"] == attempt["request_id"]
     assert body["invocation_spec_digest"] == attempt["invocation_spec_digest"]
@@ -524,6 +528,21 @@ def test_activation_recovers_unqualified_interrupted_history_once(
     with resumed.locked() as db:
         assert dict(db.execute("SELECT * FROM attempts").fetchone()) == row
         assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 0
+
+    resumed.acknowledge(
+        "owner",
+        pb.AttemptOutcomeAck(
+            request_id=row["request"],
+            attempt_ordinal=row["ordinal"],
+            invocation_spec_digest=row["spec"],
+            outcome_id=row["outcome_id"],
+            outcome_digest=row["outcome_digest"],
+            retain_work=True,
+        ),
+    )
+    with resumed.locked() as db:
+        acknowledged = dict(db.execute("SELECT * FROM attempts").fetchone())
+        assert acknowledged["owner"] == "" and acknowledged["retain"] == 1
 
 
 def test_recovery_terminal_preserves_committed_slots_without_claiming_success(
