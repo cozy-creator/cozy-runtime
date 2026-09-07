@@ -103,7 +103,7 @@ CALLED: dict[str, str] = {
     # The incremental roster/landed seam replaces the full-file barrier in xs-025.
     "Store.prepare_model_source": (
         "(self, /, operation_id, source_selection_digest, profiles, roster, landed, "
-        "*, checkpoints=Ellipsis)"
+        "*, checkpoints=Ellipsis, adopt_from_operation_id=None)"
     ),
     "Store.release_model_source": "(self, /, operation_id)",
     "Store.checkpoint_page": (
@@ -112,7 +112,9 @@ CALLED: dict[str, str] = {
     "Store.checkpoint_push": (
         "(self, /, object_id, length, manifest, grant, *, allow_local=False)"
     ),
-    "Store.checkpoint_fetch": ("(self, /, object_id, length, manifest, url, *, allow_local=False)"),
+    "Store.checkpoint_fetch": (
+        "(self, /, object_id, length, manifest, url, *, allow_local=False, derived_restore=None)"
+    ),
     "ReadLease.stream": "(self, /, plan, slots, on_batch, readers=4)",
     "ReadLease.read_into": "(self, /, object, object_length, off, length, into)",
     "ReadLease.read_asset": "(self, /, header, name, max_bytes=67108864)",
