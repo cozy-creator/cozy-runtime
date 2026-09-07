@@ -16,6 +16,7 @@ import re
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from cozy_runtime import canonical_json
@@ -30,8 +31,12 @@ class WorkspaceRefusal(ValueError):
     """A stable workspace identity or custody invariant refused the operation."""
 
 
+_authority: ContextVar[Callable[[], None]] = ContextVar("workspace_authority", default=lambda: None)
+
+
 class Journal(sqlite3.Connection):
     lock_fd: int
+    guard: Callable[[], None]
 
     def native[T](self, operation: Callable[[], T]) -> T:
         """Native owns object/GC locking; no workspace transaction spans its IO."""
@@ -42,6 +47,7 @@ class Journal(sqlite3.Connection):
             return operation()
         finally:
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+            self.guard()
 
 
 _OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
@@ -49,12 +55,28 @@ _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 _SCHEMA = """
+CREATE TABLE workspace_state (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ state TEXT NOT NULL CHECK(state IN ('active','frozen','imported')),
+ migration_id TEXT NOT NULL DEFAULT ''
+) STRICT;
+INSERT INTO workspace_state(singleton,state) VALUES(1,'active');
+CREATE TABLE workspace_imports (
+ id TEXT PRIMARY KEY, record_count INTEGER NOT NULL, digest BLOB NOT NULL,
+ owner TEXT NOT NULL, source_schema INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('receiving','imported','active'))
+) STRICT;
+CREATE TABLE workspace_import_records (
+ migration_id TEXT NOT NULL, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, body BLOB NOT NULL,
+ PRIMARY KEY(migration_id,ordinal)
+) STRICT;
 CREATE TABLE attempts (
  owner TEXT NOT NULL, request TEXT NOT NULL, ordinal INTEGER NOT NULL,
  spec BLOB NOT NULL, invocation BLOB NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('accepted','running','outcome','released')),
  outcome_id TEXT NOT NULL DEFAULT '', outcome_digest BLOB NOT NULL DEFAULT x'',
  outcome BLOB NOT NULL DEFAULT x'', retain INTEGER NOT NULL DEFAULT 0,
+ fenced INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(owner,request,ordinal)
 ) STRICT;
 CREATE TABLE weights (
@@ -110,16 +132,19 @@ class Workspace:
                 os.close(fd)
 
     @contextmanager
-    def locked(self) -> Iterator[Journal]:
+    def locked(self, *, allow_frozen: bool = False) -> Iterator[Journal]:
         lock = os.open(self.directory / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         db: Journal | None = None
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            guard = _authority.get()
+            guard()
             path = self.directory / "journal.sqlite3"
             if path.is_symlink():
                 raise WorkspaceRefusal("workspace journal cannot be a symlink")
             db = sqlite3.connect(path, isolation_level=None, factory=Journal)
             db.lock_fd = lock
+            db.guard = guard
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA synchronous=FULL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -127,11 +152,26 @@ class Workspace:
                 db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=1;COMMIT;")
             elif version != 1:
                 raise WorkspaceRefusal("workspace journal schema is not supported")
+            if (
+                not allow_frozen
+                and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
+                != "active"
+            ):
+                raise WorkspaceRefusal("workspace authority transfer is not active")
             yield db
         finally:
             if db is not None:
                 db.close()
             os.close(lock)
+
+    @contextmanager
+    def authorized(self, guard: Callable[[], None]) -> Iterator[None]:
+        token = _authority.set(guard)
+        try:
+            guard()
+            yield
+        finally:
+            _authority.reset(token)
 
     @staticmethod
     def owner(value: str) -> None:
@@ -314,13 +354,14 @@ class Workspace:
                     raise WorkspaceRefusal("weights transaction was changed or released")
                 if row["ordinal"] != intent.attempt_ordinal:
                     prior = db.execute(
-                        "SELECT state FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                        "SELECT state,fenced FROM attempts WHERE owner=? AND request=? "
+                        "AND ordinal=?",
                         (owner, row["request"], row["ordinal"]),
                     ).fetchone()
                     if (
                         intent.attempt_ordinal <= row["ordinal"]
                         or prior is None
-                        or prior["state"] not in ("outcome", "released")
+                        or (prior["state"] not in ("outcome", "released") and not prior["fenced"])
                     ):
                         raise WorkspaceRefusal("previous writer attempt has not stopped")
                     db.execute(
