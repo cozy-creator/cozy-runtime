@@ -249,6 +249,7 @@ class WeightsSourceTensor:
     logical_dtype: str
     shape: tuple[int, ...]
     parts: tuple[WeightsSourcePart, ...]
+    encoding: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +505,7 @@ class WeightsSink:
         "_models",
         "_open",
         "_outputs",
+        "_source_config",
         "_source_structure",
         "_spent",
     )
@@ -516,8 +518,10 @@ class WeightsSink:
         open_transaction: Callable[[WeightsCommit], WeightsHostTransaction] | None,
         source_structure: Callable[[str], WeightsSource] | None = None,
         cancel: Callable[[], bool] = lambda: False,
+        source_config: Callable[[str, str], bytes] | None = None,
     ) -> None:
         self._attempt = attempt
+        self._source_config = source_config
         self._models = dict(models)
         self._outputs = dict(outputs)
         self._open = open_transaction
@@ -530,6 +534,37 @@ class WeightsSink:
         """This job's granted model inputs by parameter name — the exact objects
         `structure` and `open` accept as sources (read-only copy)."""
         return dict(self._models)
+
+    def config(self, source: Model[object], name: str) -> bytes:
+        """Read one bounded inline config from an exact model input granted to this job."""
+        from cozy_runtime.author._services import Attempt
+
+        attempt = self._attempt
+        assert isinstance(attempt, Attempt)
+        attempt.check_open("WeightsSink.config")
+        if not any(source is model for model in self._models.values()):
+            raise CapabilityError(
+                "weights config source is not a granted model input",
+                code="weights_source_ungranted",
+            )
+        if not source.checkpoint_ref.startswith("sha256:") or not isinstance(name, str) or not name:
+            raise CapabilityError(
+                "weights config requires an exact manifest and config name",
+                code="weights_source_identity",
+            )
+        if self._cancel():
+            raise Cancelled("weights config read was canceled")
+        if self._source_config is None:
+            raise CapabilityError(
+                "this attempt has no weights config reader",
+                code="weights_source_config_unavailable",
+            )
+        data = self._source_config(source.checkpoint_ref, name)
+        if not isinstance(data, bytes) or not 0 < len(data) <= MAX_WEIGHTS_SOURCE_READ:
+            raise CapabilityError(
+                "weights config exceeds its byte bound", code="weights_source_config_invalid"
+            )
+        return data
 
     def structure(self, source: Model[object]) -> WeightsSource:
         """Return bounded tensor geometry for one exact source already granted to this job."""

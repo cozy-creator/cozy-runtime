@@ -125,6 +125,7 @@ class Invocation:
     """Cost-governor facts from the typed config channel. Never read from environment."""
     weights: Callable[[WeightsCommit], WeightsHostTransaction] | None = None
     """The Runtime/host weights transaction. Author code receives only WeightsSink."""
+    weights_source_config: Callable[[str, str], bytes] | None = None
     weights_source_structure: Callable[[str], WeightsSource] | None = None
     """Bounded structure reader for exact Manifest inputs already granted to this attempt."""
     max_output_bytes: int = MAX_OUTPUT_BYTES
@@ -683,6 +684,7 @@ def _service(
                 outputs={output.name: output.max_new_bytes for output in surface.weights_outputs},
                 open_transaction=inv.weights,
                 source_structure=inv.weights_source_structure,
+                source_config=inv.weights_source_config,
                 cancel=inv.cancel,
             )
         case "media_decode":

@@ -25,6 +25,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._weights import (
+    MAX_WEIGHTS_SOURCE_READ,
     Readable,
     WeightsBytes,
     WeightsCommit,
@@ -370,6 +371,41 @@ class WeightsTransactionHost:
             checkpoint=binding.checkpoint,
         )
 
+    def config(self, manifest: str, name: str) -> bytes:
+        """Read selected inline config bytes through the native retained-source validator."""
+        length = self.allowed_sources.get(manifest)
+        if length is None:
+            raise CapabilityError(
+                "weights config source is outside the immutable grant",
+                code="weights_source_ungranted",
+            )
+        try:
+            structure = self.structure(manifest)
+            if name not in structure.configs:
+                raise CapabilityError(
+                    "weights source has no declared config with this name",
+                    code="weights_config_ungranted",
+                )
+            inspected = self.store.inspect_derived_source(
+                manifest,
+                length,
+                list(dict.fromkeys(tensor.component for tensor in structure.tensors)),
+                [name],
+            )
+            configs = inspected["configs"]
+            if len(configs) != 1 or configs[0]["name"] != name:
+                raise ValueError("native config selection changed")
+            data = configs[0]["data"]
+            if not isinstance(data, bytes) or not 0 < len(data) <= MAX_WEIGHTS_SOURCE_READ:
+                raise ValueError("native config exceeds the source read bound")
+            return data
+        except CapabilityError:
+            raise
+        except Exception as exc:
+            raise CapabilityError(
+                f"TensorFS source config refused: {exc}", code="weights_source_refused"
+            ) from exc
+
     def structure(self, manifest: str) -> WeightsSource:
         """Project one granted Manifest to author-safe structural facts only."""
         if manifest not in self.allowed_sources:
@@ -402,6 +438,7 @@ class WeightsTransactionHost:
                             component=str(component),
                             key=str(key),
                             logical_dtype=str(logical["logical_dtype"]),
+                            encoding=str(entry["encoding"]),
                             shape=tuple(int(value) for value in logical["shape"]),
                             parts=tuple(
                                 WeightsSourcePart(
