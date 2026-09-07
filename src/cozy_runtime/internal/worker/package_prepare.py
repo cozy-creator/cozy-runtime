@@ -574,9 +574,9 @@ def _compatibility_models(
             not slot
             or slot in selections
             or not manifest
-            or not release
-            or not lane
+            or bool(release) != bool(lane)
             or len(model.split("/")) != 2
+            or not all(model.split("/"))
         ):
             raise PreparationRefusal("package_prepare_model_selection_mismatch", slot or model)
         wanted_manifests.add(manifest)
@@ -1134,7 +1134,7 @@ def _entrypoints(
         pb.Model(
             id=model_ids[slot],
             repo=str(value["selection"]["model"]),
-            version=str(value["selection"]["release"]),
+            version=str(value["selection"].get("release", "")),
             lane=str(value["selection"].get("lane", "")),
             manifest=pb.Ref(
                 digest=documents.raw(str(value["selection"]["manifest"])),
@@ -1304,9 +1304,10 @@ def _selected_models(
     """Resolve each selected model from the local TensorFS Store (wire 30).
 
     The privileged host and TensorFS admitted every model byte before preparation ran; this
-    plane resolves the exact release rows, proves each selected manifest's runtime closure
-    complete with the store's own verified walk, and reads config plus assets through it. No
-    model file rides the request and nothing here writes to the store.
+    plane cross-checks release rows when selected, or reads an exact admitted checkpoint
+    without a release alias. It proves the runtime closure complete with the store's own
+    verified walk and reads config plus assets through it. Hub/Host owns repository
+    membership; no model file rides this request and nothing here writes to the store.
     """
 
     selected: dict[str, dict[str, Any]] = {}
@@ -1347,16 +1348,20 @@ def _selected_models(
             release = str(selection.get("release", ""))
             lane = str(selection.get("lane", ""))
             parts = model.split("/")
-            if len(parts) != 2 or not all(parts) or not release or not lane:
+            if len(parts) != 2 or not all(parts) or bool(release) != bool(lane):
                 raise PreparationRefusal("package_prepare_model_selection_mismatch", model)
-            length = _resolved_manifest_length(
-                store.resolve_release(parts[0], parts[1], release, lane),
-                digest,
-                declared,
-                f"{model}@{release}/{lane}",
-            )
+            length = declared
+            if release:
+                length = _resolved_manifest_length(
+                    store.resolve_release(parts[0], parts[1], release, lane),
+                    digest,
+                    declared,
+                    f"{model}@{release}/{lane}",
+                )
             held = store.manifest(digest)
             raw = bytes(held["manifest"])
+            if not release and not declared:
+                length = len(raw)
             if (
                 length <= 0
                 or len(raw) != length

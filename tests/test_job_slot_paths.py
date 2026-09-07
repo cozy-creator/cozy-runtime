@@ -165,8 +165,12 @@ def test_the_release_declares_both_collections_slots(interface: dict[str, Any]) 
     assert _slot_paths(interface, "jobs") == {JOB_SLOT}
 
 
+@pytest.mark.parametrize("checkpoint_only", [False, True])
 def test_a_job_shaped_selection_prepares(
-    interface: dict[str, Any], released: tuple[Path, str, int], tmp_path: Path
+    interface: dict[str, Any],
+    released: tuple[Path, str, int],
+    tmp_path: Path,
+    checkpoint_only: bool,
 ) -> None:
     """THE H3 BLOCKER, end to end. The download set binds the job's slot and nothing else;
     the release declares both. Preparation authors the placement, carries the model row,
@@ -174,6 +178,10 @@ def test_a_job_shaped_selection_prepares(
 
     store_root, manifest, _length = released
     raw = package_interface.canonical_bytes(interface)
+    selection = _selection(JOB_SLOT, manifest)
+    if checkpoint_only:
+        selection.pop("release")
+        selection.pop("lane")
     result = _prepare_published(
         package_name=PACKAGE,
         release=RELEASE,
@@ -183,7 +191,7 @@ def test_a_job_shaped_selection_prepares(
         locked=package_environment.read_locked_requirements(
             b"--index-url https://pypi.org/simple\ntenant==1 --hash=sha256:" + b"a" * 64 + b"\n"
         ),
-        models=[_selection(JOB_SLOT, manifest)],
+        models=[selection],
         placement_seed=b"job-shaped",
         artifact_cache=tmp_path / "artifacts",
         tensorfs_root=store_root,
@@ -198,6 +206,8 @@ def test_a_job_shaped_selection_prepares(
     placement = json.loads(result.placement_set.placement_set_canonical_bytes)["placements"][0]
     assert placement["entrypoints"] == []
     assert [row["repo"] for row in placement["models"]] == [PACKAGE]
+    assert placement["models"][0].get("version", "") == ("" if checkpoint_only else RELEASE)
+    assert placement["models"][0].get("lane", "") == ("" if checkpoint_only else LANE)
     # The job plan the JobDirective will resolve against exists.
     assert len(list((tmp_path / "job-plans").glob("*/*.json"))) == 1
 

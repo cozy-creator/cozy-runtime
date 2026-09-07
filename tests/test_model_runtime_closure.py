@@ -5,12 +5,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypedDict
 
 import pytest
 import tensorfs
+from tensorfs.errors import RepositoryAbsent
 
 from cozy_runtime.author import Artifact, CapabilityError, Config, Loader
 from cozy_runtime.author._loader import loading
@@ -20,6 +22,7 @@ from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal, H
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     _compatibility_models,
+    _selected_models,
 )
 
 # Canonical CozyTensors header produced by TensorFS itself. It contains one inline JCS config, one
@@ -264,3 +267,110 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
     }
     assert model.reference_snapshot == manifest_id
     assert documents_count == 1  # PackageInterface only; config is not a downloaded document.
+
+
+def _checkpoint_selection(manifest: str, **fields: Any) -> dict[str, Any]:
+    return {
+        "package": "example/package",
+        "slot": "generate.models.model",
+        "model": "example/model",
+        "manifest": manifest,
+        **fields,
+    }
+
+
+@pytest.mark.parametrize("named_fields", [{}, {"release": "", "lane": ""}])
+def test_exact_checkpoint_prepares_and_streams_without_any_release(
+    tmp_path: Path, named_fields: dict[str, str]
+) -> None:
+    root, manifest, length, store = _snapshot(tmp_path, include_asset=True)
+    selection = _checkpoint_selection(manifest, **named_fields)
+    original_objects = store.objects()
+    for _ in range(2):
+        # Uploaded checkpoints have no release aliases; preparing one must not
+        # invent such an alias, even when all bytes are already warm locally.
+        with pytest.raises(RepositoryAbsent):
+            store.resolve_release("example", "model", "1", "main")
+        compatible = _compatibility_models([selection], tensorfs_root=root)
+        assert compatible[selection["slot"]]["config"] == _CONFIG
+        prepared = _selected_models("example/package", [selection], root, lambda *_args: None)
+        assert prepared[selection["slot"]]["manifest_length"] == length
+        assert prepared[selection["slot"]]["config_bytes"] == _CONFIG
+        assert prepared[selection["slot"]]["assets"] == {"tokenizer/vocab.txt": _ASSET}
+        checkpoint = fill.Checkpoint(root, manifest)
+        plan = checkpoint.read_plan([("unet", "weight")], 64, ["unet"])
+        slot = bytearray(b"\xa5" * 64)
+        with checkpoint.acquire() as lease:
+
+            def consume(batch: Any) -> None:
+                assert batch.nbytes == 4
+                assert batch.release()
+
+            stats = lease.stream(plan, [slot], consume, readers=1)
+        assert stats["items"] == 1 and stats["bytes"] == 4
+        assert struct.unpack("<f", slot[:4]) == (0.0,)
+        assert slot[4:] == b"\xa5" * 60
+        assert store.objects() == original_objects
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"release": "1"},
+        {"lane": "bf16"},
+        {"release": "1", "lane": ""},
+        {"release": "", "lane": "bf16"},
+        {"model": "/model"},
+        {"model": "example/"},
+    ],
+)
+def test_checkpoint_selection_refuses_partial_release_or_incomplete_model(
+    tmp_path: Path, fields: dict[str, str]
+) -> None:
+    root, manifest, _length, _store = _snapshot(tmp_path, include_asset=True)
+    selection = _checkpoint_selection(manifest, **fields)
+    with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
+        _compatibility_models([selection], tensorfs_root=root)
+    with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
+        _selected_models("example/package", [selection], root, lambda *_args: None)
+
+
+def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path) -> None:
+    root, manifest, length, _store = _snapshot(tmp_path, include_asset=True)
+    selection = _checkpoint_selection(manifest, release="", lane="")
+    for wrong_length in (-1, length + 1):
+        with pytest.raises(PreparationRefusal, match="model_manifest_mismatch"):
+            _selected_models(
+                "example/package",
+                [dict(selection, manifest_length=wrong_length)],
+                root,
+                lambda *_args: None,
+            )
+    with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
+        _selected_models("other/package", [selection], root, lambda *_args: None)
+    missing = dict(selection, manifest="sha256:" + "f" * 64)
+    with pytest.raises(PreparationRefusal):
+        _compatibility_models([missing], tensorfs_root=root)
+    with pytest.raises(PreparationRefusal):
+        _selected_models("example/package", [missing], root, lambda *_args: None)
+    candidate = _compatibility_models([selection], tensorfs_root=root)[selection["slot"]]
+    mismatch = tensorfs.fit(
+        [tensorfs.TensorRequirement("unet", "weight", [2], "f32")],
+        candidate["header"],
+        custody="canonical",
+        encoded_leaves=False,
+    )
+    assert not mismatch["ok"] and mismatch["code"] == "shape_mismatch"
+
+
+def test_checkpoint_selection_refuses_corrupt_header(tmp_path: Path) -> None:
+    root, manifest, _length, _store = _snapshot(tmp_path, include_asset=True)
+    # Locate the fixture object without encoding TensorFS's storage fanout rules.
+    stored = next(root.rglob(hashlib.sha256(_HEADER).hexdigest()))
+    stored.chmod(stored.stat().st_mode | 0o200)
+    stored.write_bytes(b"x" * len(_HEADER))
+    selection = _checkpoint_selection(manifest, release="", lane="")
+    with pytest.raises(PreparationRefusal):
+        _compatibility_models([selection], tensorfs_root=root)
+    with pytest.raises(PreparationRefusal):
+        _selected_models("example/package", [selection], root, lambda *_args: None)
