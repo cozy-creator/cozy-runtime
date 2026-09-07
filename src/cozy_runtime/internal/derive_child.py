@@ -8,6 +8,7 @@ names, hashes, or retains a TensorRequirements document.
 from __future__ import annotations
 
 import base64
+import importlib.util
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -319,6 +320,8 @@ def _derive_twice(
 def _warm_torch() -> None:
     """Warm torch's lazy imports before rlimits, never package code or a GPU."""
 
+    if importlib.util.find_spec("torch") is None:
+        return  # Job SourceSlots inspect declarations without constructing Torch models.
     __import__("torch")
     for name in ("torch._dynamo", "torch._refs"):
         try:
