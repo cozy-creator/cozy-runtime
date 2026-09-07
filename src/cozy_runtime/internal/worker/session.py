@@ -2017,7 +2017,8 @@ class Worker:
                 if frame.attempt_outcome.request_id in self.engine.live:
                     raise
         with self.claim_lock:
-            self.stamp(inner)
+            if frame.WhichOneof("msg") != "weights_transaction":
+                self.stamp(inner)
             self.outbound.put(frame)
 
     def set_serving(self, state: pb.ServingState, why: str = "") -> None:
@@ -2655,6 +2656,27 @@ class Worker:
         if self.placement is not None:
             body.placements.append(self.placement_status())
         body.held_attempts.extend(self.engine.snapshot_entries())
+        if self.workspace is not None:
+            known = {(entry.request_id, entry.attempt_ordinal) for entry in body.held_attempts}
+            for outcome in self.workspace.retained_outcomes(self.fence.record_owner_id):
+                if (outcome.request_id, outcome.attempt_ordinal) not in known:
+                    body.held_attempts.append(
+                        pb.HeldAttempt(
+                            request_id=outcome.request_id,
+                            attempt_ordinal=outcome.attempt_ordinal,
+                            kind=pb.ATTEMPT_KIND_JOB,
+                            state=pb.ATTEMPT_STATE_OUTCOME_PENDING_ACK,
+                            invocation_spec_digest=outcome.invocation_spec_digest,
+                            outcome_id=outcome.outcome_id,
+                            outcome_digest=outcome.outcome_digest,
+                        )
+                    )
+            body.weights_transactions.extend(
+                self.workspace.status(row)
+                for row in self.workspace.projected_weights(
+                    self.fence.record_owner_id, self.fence.worker_boot_id
+                )
+            )
         if self.accepted.mode == "serving":
             lane_wire.emit_lanes(body, self.lane_documents())
         lane_wire.emit_held_manifests(body, self.held_manifests.digests())
@@ -2783,6 +2805,41 @@ class Worker:
                     f"{attempt.attempt} in a fresh envelope ({attempt.outcome_id})",
                 )
                 self.send(pb.WorkerFrame(attempt_outcome=self.engine.wrap(attempt)))
+            if self.workspace is not None:
+                # Completed historical work may belong to an executor that no
+                # longer exists. Never project another worker's live attempt.
+                for value in self.workspace.projected_weights(
+                    self.fence.record_owner_id, self.fence.worker_boot_id
+                ):
+                    row = cast(dict[str, Any], value)
+                    if row["receipt"]:
+                        self.send(
+                            pb.WorkerFrame(
+                                weights_receipt=pb.WeightsReceiptFrame(
+                                    request_id=row["request"],
+                                    attempt_ordinal=row["ordinal"],
+                                    invocation_spec_digest=row["spec"],
+                                    output_slot=row["slot"],
+                                    weights_transaction_id=row["id"],
+                                    writer_epoch=row["epoch"],
+                                    tensorfs_declaration_digest=row["declaration_digest"],
+                                    weights_receipt=pb.WeightsReceiptRef(
+                                        weights_receipt_digest=row["receipt_digest"],
+                                        weights_receipt_canonical_bytes=row["receipt"],
+                                    ),
+                                    manifest=pb.Ref(
+                                        digest=row["manifest"], length=row["manifest_length"]
+                                    ),
+                                    objects=[
+                                        pb.WeightsObjectSource(**obj)
+                                        for obj in json.loads(row["objects"])
+                                    ],
+                                )
+                            )
+                        )
+                    self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(value)))
+                for outcome in self.workspace.retained_outcomes(self.fence.record_owner_id):
+                    self.send(pb.WorkerFrame(attempt_outcome=outcome))
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
             return
         if kind == "desired_state":

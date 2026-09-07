@@ -212,7 +212,7 @@ class Workspace:
                     raise WorkspaceRefusal("workspace attempt was changed or released")
                 if row["state"] in ("outcome", "released"):
                     return self._outcome_frame(row)
-                return
+                return None
             db.execute(
                 "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state,"
                 "worker_boot,result_schema) VALUES(?,?,?,?,?,'accepted',?,?)",
@@ -226,6 +226,8 @@ class Workspace:
                     result_schema,
                 ),
             )
+
+        return None
 
     @staticmethod
     def _outcome_frame(row: sqlite3.Row) -> pb.AttemptOutcome:
@@ -249,12 +251,26 @@ class Workspace:
             )
 
     def retained_outcomes(self, owner: str) -> list[pb.AttemptOutcome]:
-        with self.locked() as db:
+        with self.locked(allow_frozen=True) as db:
             return [
                 self._outcome_frame(row)
                 for row in db.execute(
-                    "SELECT * FROM attempts WHERE owner=? AND state='outcome' ORDER BY request,ordinal",
+                    "SELECT * FROM attempts WHERE owner=? AND state='outcome' "
+                    "ORDER BY request,ordinal",
                     (owner,),
+                )
+            ]
+
+    def projected_weights(self, owner: str, worker_boot: str) -> list[dict[str, object]]:
+        with self.locked(allow_frozen=True) as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT w.* FROM weights AS w JOIN attempts AS a ON "
+                    "a.owner=w.owner AND a.request=w.request AND a.ordinal=w.ordinal "
+                    "WHERE w.owner=? AND a.state<>'released' "
+                    "AND (a.state='outcome' OR a.worker_boot=?) ORDER BY w.id",
+                    (owner, worker_boot),
                 )
             ]
 
@@ -380,6 +396,7 @@ class Workspace:
                 attempt is None
                 or attempt["spec"] != intent.invocation_spec_digest
                 or attempt["state"] not in ("accepted", "running")
+                or attempt["fenced"]
             ):
                 raise WorkspaceRefusal("weights intent requires its live accepted invocation")
             row = db.execute(
