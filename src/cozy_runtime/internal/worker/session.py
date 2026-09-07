@@ -2734,13 +2734,20 @@ class Worker:
         self.watches.end_all()
         self.host.stop()
 
-    def watch(self, opened: pb.ProgressOpen) -> Iterator[pb.AttemptProgress]:
+    def watch(
+        self,
+        opened: pb.ProgressOpen,
+        *,
+        on_cancel: Callable[[Callable[[], None]], bool] | None = None,
+    ) -> Iterator[pb.AttemptProgress]:
         """One WatchProgress call: bound to the fenced control-stream epoch (#436)."""
         if self.fenced(opened):
             return iter(())
-        return self.watches.open(opened.request_id, opened.control_stream_epoch).frames(
-            self.watches
-        )
+        watch = self.watches.open(opened.request_id, opened.control_stream_epoch)
+        if on_cancel is not None and not on_cancel(watch.end):
+            # gRPC declines registration if cancellation already won the race.
+            watch.end()
+        return watch.frames(self.watches)
 
     # ------------------------------------------------------------- the desired state
 
