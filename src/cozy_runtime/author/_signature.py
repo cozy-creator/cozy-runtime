@@ -23,7 +23,7 @@ from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.author._weights import WeightsOutput
 
-Role = Literal["context", "payload", "preflight", "model", "service"]
+Role = Literal["context", "payload", "wire", "preflight", "model", "service"]
 Kind = Literal["entrypoint", "job"]
 
 _PARAMETERIZED = {"settings": Settings, "secrets": Secrets}
@@ -96,6 +96,7 @@ class Surface:
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d). Hidden callables stay in the local registry but
     are absent from the package interface, so no binding is staged and no request reaches them."""
+    invocable: bool = False
 
     @property
     def model_params(self) -> tuple[str, ...]:
@@ -191,12 +192,14 @@ def analyze(
     demand_bound: Bound | None = None,
     preflight: Callable[..., object] | None = None,
     hidden: bool = False,
+    invocable: bool = False,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal."""
     where = f"{fn.__module__}:{fn.__qualname__}"
     signature = inspect.signature(fn)
     hints = _hints(fn)
     params: list[Param] = []
+    wire_fields: list[Any] = []
     for parameter in signature.parameters.values():
         if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
             raise ConformanceError(
@@ -204,7 +207,7 @@ def analyze(
                 "surface; everything injected is named and typed",
                 fields=[parameter.name],
             )
-        if parameter.default is not parameter.empty:
+        if parameter.default is not parameter.empty and not invocable:
             raise ConformanceError(
                 f"{where}: parameter {parameter.name} carries a default "
                 f"({parameter.default!r}) — every parameter here is INJECTED by the runtime, "
@@ -220,14 +223,73 @@ def analyze(
                 "the contract",
                 fields=[parameter.name],
             )
-        params.append(_classify(parameter.name, hints[parameter.name], where))
+        annotation = hints[parameter.name]
+        if invocable:
+            base, _ = strip(annotation)
+            injected = (
+                base is Context
+                or (
+                    isinstance(base, type)
+                    and (
+                        issubclass(base, Model)
+                        or any(issubclass(base, service) for service in SERVICES.values())
+                    )
+                )
+                or get_origin(base) in (Settings, Secrets)
+            )
+            if not injected:
+                if parameter.kind is not parameter.KEYWORD_ONLY:
+                    raise ConformanceError(
+                        "invocable arguments must be keyword-only", code="invocable_signature"
+                    )
+                _wire_type(annotation)
+                params.append(Param(parameter.name, "wire", annotation))
+                if parameter.default is parameter.empty:
+                    wire_fields.append((parameter.name, annotation))
+                else:
+                    _wire_default(parameter.default)
+                    try:
+                        msgspec.convert(parameter.default, type=annotation, strict=True)
+                    except (TypeError, ValueError, msgspec.ValidationError) as exc:
+                        raise ConformanceError(
+                            "invocable default differs from its type", code="invocable_default"
+                        ) from exc
+                    wire_fields.append((parameter.name, annotation, parameter.default))
+                continue
+            if parameter.default is not parameter.empty:
+                raise ConformanceError(
+                    "injected invocable parameters cannot have defaults", code="injected_default"
+                )
+        params.append(_classify(parameter.name, annotation, where))
 
     payloads = [p for p in params if p.role == "payload"]
-    if len(payloads) != 1:
+    if invocable:
+        declared = list(signature.parameters.values())
+        if (
+            not inspect.iscoroutinefunction(fn)
+            or not declared
+            or params[0].role != "context"
+            or declared[0].kind
+            not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ):
+            raise ConformanceError(
+                "an invocable must be async with Context first", code="invocable_signature"
+            )
+        payload_type: object = msgspec.defstruct(
+            f"{fn.__name__}Request",
+            wire_fields,
+            module=fn.__module__,
+            kw_only=True,
+            frozen=True,
+            forbid_unknown_fields=True,
+        )
+    elif len(payloads) != 1:
         raise ConformanceError(
             f"{where}: exactly one typed request struct is required, found {len(payloads)}",
             code="payload_arity",
         )
+    else:
+        payload_type = payloads[0].annotation
     contexts = [p for p in params if p.role == "context"]
     if len(contexts) > 1:
         raise ConformanceError(f"{where}: Context is injected at most once", code="context_arity")
@@ -247,6 +309,8 @@ def analyze(
             f"(got {result!r}) — the result transaction validates against it exactly",
             code="result_schema",
         )
+    if invocable:
+        _wire_type(result)
 
     spec: PreflightSpec | None = None
     if preflight is not None:
@@ -258,7 +322,7 @@ def analyze(
         fn=fn,
         is_async=inspect.iscoroutinefunction(fn),
         params=tuple(params),
-        payload_type=payloads[0].annotation,
+        payload_type=payload_type,
         result_type=strip(result)[0],
         capabilities=frozenset(p.capability for p in params if p.capability),
         publishes=publishes,
@@ -267,6 +331,66 @@ def analyze(
         demand_bound=demand_bound,
         preflight=spec,
         hidden=hidden,
+        invocable=invocable,
+    )
+
+
+def _wire_default(value: object) -> None:
+    """Only immutable canonical values can change omission into an exact intent."""
+    if value is None or type(value) in (str, bool, int):
+        return
+    if type(value) is float:
+        import math
+
+        if math.isfinite(value):
+            return
+    raise ConformanceError(
+        "invocable defaults must be immutable canonical scalars", code="invocable_default"
+    )
+
+
+def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
+    """Refuse interpreter-local values before an interface is generated."""
+    import enum
+    import types
+
+    from cozy_runtime.author._assets import Asset, Tree
+
+    base, _ = strip(annotation)
+    if base in (str, int, float, bool, type(None)):
+        return
+    origin = get_origin(base)
+    if origin is Literal:
+        for value in get_args(base):
+            _wire_default(value)
+        return
+    if origin in (typing.Union, types.UnionType, list):
+        args = get_args(base)
+        if not args:
+            raise ConformanceError(
+                "invocable collections must have element types", code="invocable_wire_type"
+            )
+        for arg in args:
+            _wire_type(arg, seen)
+        return
+    if isinstance(base, type):
+        if issubclass(base, (Asset, Tree)):
+            return
+        if issubclass(base, enum.Enum):
+            for member in base:
+                _wire_default(member.value)
+            return
+        if is_struct(base) and base not in seen:
+            for field in msgspec.structs.fields(typing.cast(type[msgspec.Struct], base)):
+                if field.default_factory is not msgspec.NODEFAULT:
+                    raise ConformanceError(
+                        "invocable types cannot have default factories", code="invocable_default"
+                    )
+                _wire_type(field.type, seen | {base})
+            return
+    raise ConformanceError(
+        "invocable type is recursive or has no portable wire representation",
+        code="invocable_wire_type",
     )
 
 

@@ -21,6 +21,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import ParamSpec, TypeVar, overload
 
+from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
 from cozy_runtime.author._signature import Kind, Surface, analyze
@@ -60,6 +61,7 @@ class Registration:
     name: str
     kind: Kind
     fn: Callable[..., object]
+    invocable: bool = False
     publishes: bool = False
     emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
@@ -93,6 +95,7 @@ class Registration:
                 demand_bound=self.demand_bound,
                 preflight=self.preflight,
                 hidden=self.hidden,
+                invocable=self.invocable,
             )
         return self._surface
 
@@ -229,7 +232,8 @@ class App:
             self._registry[registered] = Registration(
                 name=registered,
                 kind=kind,
-                fn=target,
+                fn=export.implementation if (export := _export(target)) else target,
+                invocable=export is not None,
                 publishes=publishes,
                 emits_media=emits_media,
                 weights_outputs=weights_outputs,

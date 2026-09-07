@@ -607,6 +607,8 @@ def _inject(
             kwargs[param.name] = ctx
         elif param.role == "payload":
             kwargs[param.name] = overlay.payload
+        elif param.role == "wire":
+            kwargs[param.name] = getattr(overlay.payload, param.name)
         elif param.role == "preflight":
             kwargs[param.name] = facts
         elif param.role == "model":
