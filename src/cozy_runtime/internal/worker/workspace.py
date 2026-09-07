@@ -103,7 +103,7 @@ CREATE TABLE holds (
 CREATE TABLE operation_cache (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
  owner TEXT NOT NULL, key BLOB NOT NULL, body BLOB NOT NULL,
- state TEXT NOT NULL CHECK(state IN ('retaining','ready','evicting')),
+ state TEXT NOT NULL CHECK(state IN ('retaining','ready','evicting','disabled')),
  UNIQUE(owner,key)
 ) STRICT;
 CREATE TABLE operation_lookups (

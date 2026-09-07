@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import msgspec
 import pytest
 import tensorfs
 
@@ -14,31 +15,34 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from test_workspace_custody import produced
 
 
-def completed(workspace: Workspace, receipt: WeightsReceipt) -> pb.RecordOperationResultCall:
+def completed(
+    workspace: Workspace, receipt: WeightsReceipt, *, result: bytes = b'{"value":7}'
+) -> pb.RecordOperationResultCall:
     with workspace.locked() as db:
         row = db.execute(
             "SELECT * FROM weights WHERE id=?", (receipt.weights_transaction_id,)
         ).fetchone()
         spec = row["spec"]
+        request_id = row["request"]
         reference = pb.WeightsReceiptRef(
             weights_receipt_digest=row["receipt_digest"],
             weights_receipt_canonical_bytes=row["receipt"],
         )
     raw, digest = documents.identity(
         pb.AttemptOutcomeBody(
-            request_id="producer",
+            request_id=request_id,
             attempt_ordinal=1,
             invocation_spec_digest=documents.spell(spec),
             status=pb.OUTCOME_STATUS_SUCCEEDED,
             execution_started=True,
-            result=pb.ResultEnvelope(inline_result=b'{"value":7}'),
+            result=pb.ResultEnvelope(inline_result=result),
             weights_receipts=[reference],
         )
     )
     workspace.outcome(
         "owner",
         pb.AttemptOutcome(
-            request_id="producer",
+            request_id=request_id,
             attempt_ordinal=1,
             invocation_spec_digest=spec,
             outcome_id="outcome",
@@ -48,7 +52,7 @@ def completed(workspace: Workspace, receipt: WeightsReceipt) -> pb.RecordOperati
     )
     return pb.RecordOperationResultCall(
         computation_digest=b"\x71" * 32,
-        request_id="producer",
+        request_id=request_id,
         attempt_ordinal=1,
         invocation_spec_digest=spec,
         outcome_id="outcome",
@@ -174,3 +178,75 @@ def test_native_cache_removal_becomes_a_replayable_miss(tmp_path: Path) -> None:
     )
     assert not workspace_memo.lookup(workspace, "owner", lookup).found
     assert not workspace_memo.lookup(workspace, "owner", lookup).found
+
+
+@pytest.mark.parametrize(
+    "first_value,second_value",
+    [
+        (b'{"value":7}', b'{"value":8}'),
+        (
+            b'{"producer_request_id":"first","value":7}',
+            b'{"producer_request_id":"second","value":7}',
+        ),
+    ],
+)
+def test_contradictory_results_disable_mapping_without_rewriting_history(
+    tmp_path: Path,
+    first_value: bytes,
+    second_value: bytes,
+) -> None:
+    _, workspace, first = produced(tmp_path)
+    original = completed(workspace, first, result=first_value)
+    assert workspace_memo.record(workspace, "owner", original).recorded
+    prior = workspace_memo.lookup(
+        workspace,
+        "owner",
+        pb.LookupOperationCall(
+            computation_digest=original.computation_digest, consumer_request_id="already-adopted"
+        ),
+    )
+    _, _, second = produced(tmp_path, request_id="other-producer")
+    conflicting = completed(workspace, second, result=second_value)
+    assert not workspace_memo.record(workspace, "owner", conflicting).recorded
+    miss = workspace_memo.lookup(
+        workspace,
+        "owner",
+        pb.LookupOperationCall(
+            computation_digest=original.computation_digest, consumer_request_id="after-conflict"
+        ),
+    )
+    assert not miss.found
+    assert (
+        workspace_memo.lookup(
+            workspace,
+            "owner",
+            pb.LookupOperationCall(
+                computation_digest=original.computation_digest,
+                consumer_request_id="already-adopted",
+            ),
+        )
+        == prior
+    )
+    with workspace.locked() as db:
+        assert db.execute("SELECT count(*) FROM attempts WHERE state='outcome'").fetchone()[0] == 2
+        assert db.execute("SELECT state FROM operation_cache").fetchone()[0] == "disabled"
+
+
+def test_typed_model_provenance_is_not_a_content_contradiction(tmp_path: Path) -> None:
+    schema = b'{"input":"model"}'
+    _, workspace, first = produced(tmp_path, result_schema=schema)
+    original = completed(workspace, first, result=msgspec.json.encode(first.artifact))
+    assert workspace_memo.record(workspace, "owner", original).recorded
+    _, _, second = produced(tmp_path, request_id="another-producer", result_schema=schema)
+    equivalent = completed(workspace, second, result=msgspec.json.encode(second.artifact))
+    assert first.tensorfs_receipt_digest != second.tensorfs_receipt_digest
+    assert first.artifact.manifest == second.artifact.manifest
+    assert workspace_memo.record(workspace, "owner", equivalent).recorded
+    hit = workspace_memo.lookup(
+        workspace,
+        "owner",
+        pb.LookupOperationCall(
+            computation_digest=original.computation_digest, consumer_request_id="new-consumer"
+        ),
+    )
+    assert hit.found and hit.source.request_id == "producer"

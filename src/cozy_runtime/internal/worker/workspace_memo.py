@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import secrets
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
@@ -18,6 +19,90 @@ if TYPE_CHECKING:
     from cozy_runtime.internal.worker.workspace import Workspace
 
 MAX_ENTRIES = 128
+
+
+class _Uncacheable(Exception):
+    pass
+
+
+def _typed_result(
+    value: Any, schema: Any, producer: str, receipts: dict[str, dict[str, Any]]
+) -> Any:
+    if not isinstance(schema, dict):
+        return value
+    if schema.get("input") == "model":
+        if not isinstance(value, dict) or value.get("producer_request_id") != producer:
+            raise _Uncacheable("borrowed model result requires independent provenance support")
+        slot = value.get("output_slot")
+        receipt = receipts.get(slot) if isinstance(slot, str) else None
+        if (
+            receipt is None
+            or value.get("tensorfs_receipt_digest") != receipt["native_digest"]
+            or value.get("manifest") != receipt["manifest"]
+        ):
+            raise WorkspaceRefusal("typed model result differs from its native receipt")
+        return {"manifest": receipt["manifest"]}
+    if "union" in schema:
+        branches = schema["union"]
+        if value is None and "null" in branches:
+            return None
+        selected = [branch for branch in branches if branch != "null"]
+        if tag := schema.get("tag_field"):
+            selected = [
+                branch
+                for branch in branches
+                if isinstance(branch, dict)
+                and isinstance(value, dict)
+                and branch.get("tag") == value.get(tag)
+            ]
+        if len(selected) == 1:
+            return _typed_result(value, selected[0], producer, receipts)
+        # Untagged alternatives must not guess which user fields are provenance.
+        if any(isinstance(branch, dict) for branch in selected):
+            raise _Uncacheable("ambiguous structured result union")
+        return value
+    if "fields" in schema and isinstance(value, dict):
+        result = dict(value)
+        for field in schema["fields"]:
+            if field["name"] in result:
+                result[field["name"]] = _typed_result(
+                    result[field["name"]], field["type"], producer, receipts
+                )
+        return result
+    if "list" in schema and isinstance(value, list):
+        return [_typed_result(item, schema["list"], producer, receipts) for item in value]
+    return value
+
+
+def _comparison(payload: dict[str, Any], schema: Any) -> bytes:
+    source = payload["source"]
+    body = documents.read(
+        base64.b64decode(source["outcome_canonical_bytes"], validate=True), pb.AttemptOutcomeBody
+    )
+    receipts = {}
+    for reference in body.get("weights_receipts", []):
+        receipt = documents.read(
+            base64.b64decode(reference["weights_receipt_canonical_bytes"], validate=True),
+            pb.WeightsReceipt,
+        )
+        native = canonical_json.decode(
+            base64.b64decode(receipt["tensorfs_receipt_canonical_bytes"], validate=True)
+        )
+        receipts[receipt["output_slot"]] = {
+            "native_digest": receipt["tensorfs_receipt_digest"],
+            "manifest": {
+                "digest": "sha256:" + native["manifest"]["sha256"],
+                "length": native["manifest"]["length"],
+            },
+        }
+    raw = base64.b64decode(body.get("result", {}).get("inline_result", ""), validate=True)
+    result = canonical_json.decode(raw or b"{}")
+    return canonical_json.encode(
+        {
+            "result": _typed_result(result, schema, source["request_id"], receipts),
+            "outputs": {slot: receipt["manifest"] for slot, receipt in receipts.items()},
+        }
+    )
 
 
 def _hold_id(kind: str, owner: str, recipient: str, key: bytes, transaction: str) -> str:
@@ -93,7 +178,7 @@ def _source(db: Journal, owner: str, call: pb.RecordOperationResultCall) -> dict
             and output["length"] == hold["manifest_length"]
             for hold in holds
         ):
-            raise WorkspaceRefusal("memo output has no independently retainable native custody")
+            raise _Uncacheable("memo output has no independently retainable native custody")
     return {
         "source": {
             "request_id": call.request_id,
@@ -104,6 +189,7 @@ def _source(db: Journal, owner: str, call: pb.RecordOperationResultCall) -> dict
             "outcome_canonical_bytes": base64.b64encode(row["outcome"]).decode(),
         },
         "holds": holds,
+        "schema": json.loads(row["result_schema"]) if row["result_schema"] else {},
     }
 
 
@@ -136,13 +222,21 @@ def _retain(
 
 def _drain(workspace: Workspace, db: Journal, owner: str) -> int:
     rows = db.execute(
-        "SELECT * FROM operation_cache WHERE owner=? AND state='evicting'", (owner,)
+        "SELECT * FROM operation_cache WHERE owner=? AND state IN ('evicting','disabled')", (owner,)
     ).fetchall()
     for row in rows:
-        for hold in json.loads(row["body"])["holds"]:
+        payload = json.loads(row["body"])
+        for hold in payload["holds"]:
             workspace._change_hold(db, owner, _request(hold), release=True)
-        db.execute("DELETE FROM operation_cache WHERE id=? AND state='evicting'", (row["id"],))
-    return len(rows)
+        if row["state"] == "disabled":
+            payload["holds"] = []
+            db.execute(
+                "UPDATE operation_cache SET body=? WHERE id=?",
+                (canonical_json.encode(payload), row["id"]),
+            )
+        else:
+            db.execute("DELETE FROM operation_cache WHERE id=? AND state='evicting'", (row["id"],))
+    return sum(row["state"] == "evicting" for row in rows)
 
 
 def _missing_cleanup(workspace: Workspace, db: Journal, owner: str, consumer: str) -> None:
@@ -197,9 +291,13 @@ def _missing_native_result(
         try:
             # Verify the ORIGINAL cache hold, never another consumer ID. This
             # separates an evicted source from a released recipient.
+            request = _request(hold)
             db.native(
-                lambda request=_request(hold): derived_retention.change(
-                    request, tensorfs_root=workspace.store_root, release=False
+                partial(
+                    derived_retention.change,
+                    request,
+                    tensorfs_root=workspace.store_root,
+                    release=False,
                 )
             )
         except Exception as exc:
@@ -223,7 +321,11 @@ def record(
             (owner, call.computation_digest),
         ).fetchone()
         if row is None:
-            payload = _source(db, owner, call)
+            try:
+                payload = _source(db, owner, call)
+                _comparison(payload, payload["schema"])
+            except _Uncacheable:
+                return answer
             count = db.execute(
                 "SELECT count(*) FROM operation_cache WHERE owner=?", (owner,)
             ).fetchone()[0]
@@ -248,6 +350,8 @@ def record(
                 (identity, owner, call.computation_digest, canonical_json.encode(payload)),
             )
         else:
+            if row["state"] == "disabled":
+                return answer
             payload, identity = json.loads(row["body"]), row["id"]
             # Replays after the original ACK remain valid, but a different
             # producer must still prove its own exact successful terminal.
@@ -257,7 +361,21 @@ def record(
                 call.attempt_ordinal,
                 call.outcome_id,
             ):
-                _source(db, owner, call)
+                try:
+                    candidate = _source(db, owner, call)
+                    same = _comparison(payload, candidate["schema"]) == _comparison(
+                        candidate, candidate["schema"]
+                    )
+                except _Uncacheable:
+                    return answer
+                if not same:
+                    payload["conflicting_source"] = candidate["source"]
+                    db.execute(
+                        "UPDATE operation_cache SET state='disabled',body=? WHERE id=?",
+                        (canonical_json.encode(payload), identity),
+                    )
+                    _drain(workspace, db, owner)
+                    return answer
             elif source["invocation_spec_digest"] != documents.spell(
                 call.invocation_spec_digest
             ) or source["outcome_digest"] != documents.spell(call.outcome_digest):

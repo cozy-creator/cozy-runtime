@@ -24,8 +24,10 @@ from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
-def produced(tmp_path: Path) -> tuple[tensorfs.Store, Workspace, WeightsReceipt]:
-    store = tensorfs.Store.init(tmp_path / "store")
+def produced(
+    tmp_path: Path, *, request_id: str = "producer", result_schema: bytes = b""
+) -> tuple[tensorfs.Store, Workspace, WeightsReceipt]:
+    store = tensorfs.Store.ensure(tmp_path / "store")
     workspace = Workspace(Path(store.root))
     value = json.loads(
         (
@@ -37,11 +39,12 @@ def produced(tmp_path: Path) -> tuple[tensorfs.Store, Workspace, WeightsReceipt]
     workspace.accept(
         "owner",
         pb.AttemptOffer(
-            request_id="producer",
+            request_id=request_id,
             attempt_ordinal=1,
             invocation_spec_digest=spec,
             invocation_spec_canonical_bytes=invocation,
         ),
+        result_schema=result_schema,
     )
     declaration_digest = b""
     epoch = 0
@@ -52,7 +55,7 @@ def produced(tmp_path: Path) -> tuple[tensorfs.Store, Workspace, WeightsReceipt]
         row = workspace.begin_weights(
             "owner",
             pb.WeightsIntentFrame(
-                request_id="producer",
+                request_id=request_id,
                 attempt_ordinal=1,
                 invocation_spec_digest=spec,
                 output_slot=slot,
@@ -68,14 +71,14 @@ def produced(tmp_path: Path) -> tuple[tensorfs.Store, Workspace, WeightsReceipt]
         reference, _, _ = protocol_receipt(
             receipt,
             owner_scope="owner",
-            request_id="producer",
+            request_id=request_id,
             invocation_spec_digest=documents.spell(spec),
         )
         manifest = json.loads(receipt.tensorfs_receipt)["manifest"]
         workspace.record_receipt(
             "owner",
             pb.WeightsReceiptFrame(
-                request_id="producer",
+                request_id=request_id,
                 attempt_ordinal=1,
                 invocation_spec_digest=spec,
                 output_slot="model",
@@ -112,7 +115,7 @@ def produced(tmp_path: Path) -> tuple[tensorfs.Store, Workspace, WeightsReceipt]
     producer = WeightsTransactionHost(
         store=store,
         owner_scope="owner",
-        request_id="producer",
+        request_id=request_id,
         invocation_spec_digest=documents.spell(spec),
         work_fingerprint="sha256:" + "42" * 32,
         writer_session_id=1,

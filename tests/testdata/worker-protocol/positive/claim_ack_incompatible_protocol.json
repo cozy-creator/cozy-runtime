@@ -1,6 +1,0 @@
-{
-  "claim_ack": {
-    "rejection": "CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE",
-    "wire_minor": 41
-  }
-}

@@ -1271,10 +1271,9 @@ class RuntimeWeightsServicer(object):
     """
 
     def Exchange(self, request_iterator, context):
-        """Runtime -> host intents and receipts, host -> Runtime acks, on ONE stream the supervisor
-        opens per accepted control session. The host commits its ledger before each ack, and
-        forwards a recorded receipt to the RecordOwner on WorkerControl BEFORE acking it, so the
-        owner sees the receipt ahead of the attempt outcome the Runtime can only send after.
+        """Retired at minor 41; implementations refuse this legacy custody stream. Runtime
+        commits its common workspace journal and sends custody observations and outcomes
+        on the same ordered WorkerControl stream. The Host never grants native authority.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
