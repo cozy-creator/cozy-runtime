@@ -220,6 +220,21 @@ def _retain(
     return results
 
 
+def _reserve_holds(
+    workspace: Workspace, db: Journal, owner: str, holds: list[dict[str, Any]]
+) -> None:
+    """Reserve every planned output before a single native call unlocks the journal.
+
+    The caller commits these intents with the cache/lookup record. A crash or
+    cancellation between native acquisitions can then release every planned ID,
+    including outputs whose original producer has already been disposed.
+    """
+    if not db.in_transaction:
+        raise RuntimeError("memo hold reservations require their journal transaction")
+    for hold in holds:
+        workspace.reserve_hold(db, owner, _request(hold), release=False)
+
+
 def _drain(workspace: Workspace, db: Journal, owner: str) -> int:
     rows = db.execute(
         "SELECT * FROM operation_cache WHERE owner=? AND state IN ('evicting','disabled')", (owner,)
@@ -252,7 +267,8 @@ def _missing_cleanup(workspace: Workspace, db: Journal, owner: str, consumer: st
     # Generation fencing keeps an old missing lookup from evicting a later
     # successful execution of this computation.
     db.execute(
-        "UPDATE operation_cache SET state='evicting' WHERE owner=? AND id=? AND key=?",
+        "UPDATE operation_cache SET state='evicting' WHERE owner=? AND id=? AND key=? "
+        "AND state<>'disabled'",
         (owner, row["cache_id"], row["key"]),
     )
     for hold in json.loads(row["body"])["holds"]:
@@ -327,11 +343,12 @@ def record(
             except _Uncacheable:
                 return answer
             count = db.execute(
-                "SELECT count(*) FROM operation_cache WHERE owner=?", (owner,)
+                "SELECT count(*) FROM operation_cache WHERE owner=? AND state<>'disabled'", (owner,)
             ).fetchone()[0]
             if count >= MAX_ENTRIES:
                 victim = db.execute(
-                    "SELECT id FROM operation_cache AS c WHERE owner=? AND NOT EXISTS "
+                    "SELECT id FROM operation_cache AS c WHERE owner=? AND state<>'disabled' "
+                    "AND NOT EXISTS "
                     "(SELECT 1 FROM operation_lookups AS l WHERE l.cache_id=c.id "
                     "AND l.state='retaining') ORDER BY sequence LIMIT 1",
                     (owner,),
@@ -345,10 +362,18 @@ def record(
                 hold["retention_id"] = _hold_id(
                     "cache", owner, identity, call.computation_digest, hold["transaction_id"]
                 )
-            db.execute(
-                "INSERT INTO operation_cache(id,owner,key,body,state) VALUES(?,?,?,?,'retaining')",
-                (identity, owner, call.computation_digest, canonical_json.encode(payload)),
-            )
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute(
+                    "INSERT INTO operation_cache(id,owner,key,body,state) "
+                    "VALUES(?,?,?,?,'retaining')",
+                    (identity, owner, call.computation_digest, canonical_json.encode(payload)),
+                )
+                _reserve_holds(workspace, db, owner, payload["holds"])
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
         else:
             if row["state"] == "disabled":
                 return answer
@@ -380,6 +405,13 @@ def record(
                 call.invocation_spec_digest
             ) or source["outcome_digest"] != documents.spell(call.outcome_digest):
                 raise WorkspaceRefusal("memo recording replay changed its original terminal")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                _reserve_holds(workspace, db, owner, payload["holds"])
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
         _retain(workspace, db, owner, payload["holds"])
         committed = db.execute(
             "UPDATE operation_cache SET state='ready' WHERE id=? "
@@ -416,6 +448,13 @@ def lookup(
                 _missing_cleanup(workspace, db, owner, call.consumer_request_id)
                 return answer
             payload = json.loads(row["body"])
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                _reserve_holds(workspace, db, owner, payload["holds"])
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
         else:
             cached = db.execute(
                 "SELECT * FROM operation_cache WHERE owner=? AND key=? AND state='ready'",
@@ -455,6 +494,7 @@ def lookup(
                     "(SELECT coalesce(max(sequence),0)+1 FROM operation_cache) WHERE id=?",
                     (cached["id"],),
                 )
+                _reserve_holds(workspace, db, owner, payload["holds"])
                 db.execute("COMMIT")
             except BaseException:
                 db.execute("ROLLBACK")
