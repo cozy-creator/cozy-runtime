@@ -1010,6 +1010,11 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceReleaseCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.FromString,
                 _registered_method=True)
+        self.ModelSourceControl = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ModelSourceControl',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlResult.FromString,
+                _registered_method=True)
         self.RetainDerivedResult = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/RetainDerivedResult',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedRetentionCall.SerializeToString,
@@ -1145,6 +1150,12 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ModelSourceControl(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def RetainDerivedResult(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -1253,6 +1264,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.ModelSourceRelease,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceReleaseCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.SerializeToString,
+            ),
+            'ModelSourceControl': grpc.unary_unary_rpc_method_handler(
+                    servicer.ModelSourceControl,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlResult.SerializeToString,
             ),
             'RetainDerivedResult': grpc.unary_unary_rpc_method_handler(
                     servicer.RetainDerivedResult,
@@ -1551,6 +1567,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/ModelSourceRelease',
             cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceReleaseCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.ReleaseModelSourceResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ModelSourceControl(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ModelSourceControl',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceControlResult.FromString,
             options,
             channel_credentials,
             insecure,
