@@ -718,7 +718,7 @@ def prepare_local_package(
         release=package.release,
         wheels=request.wheels,
         # proto-031: editable wheels stage beside the install namespace that owns them.
-        wheel_root=install_root / f".stage-{request.operation_id}" / "wheels",
+        wheel_root=install_root / ".stage" / request.operation_id / "wheels",
         placement_seed=(request.operation_id.encode("ascii") + package.local_revision_digest),
         artifact_cache=artifact_cache,
         install_root=install_root,
@@ -841,7 +841,7 @@ def prepare_package(
 
     This is the ONE preparation that still receives files: an editable revision's wheels
     exist on no index, so their exact bytes are the install input (xs-017). Every row
-    sits directly in `wheel_root` — `<install_root>/.stage-<operation>/wheels` per
+    sits directly in `wheel_root` — `<install_root>/.stage/<operation>/wheels` per
     proto-031 — beside the install namespace that owns it. The project wheel is the row
     that MEASURES as the package's own distribution and release — no kind row travels.
 
