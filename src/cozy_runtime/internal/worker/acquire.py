@@ -55,17 +55,23 @@ class _Leg:
 
 
 class AcquisitionObservation:
-    """Observation-only acquisition clocks and byte counters."""
+    """Acquisition-relative monotonic clocks and byte counters.
+
+    Both legs share this observation's origin. Absolute host nanoseconds exceed
+    canonical JSON's integer bound after 104 days of uptime; they also carry no
+    useful meaning for another machine reading this placement's progress.
+    """
 
     def __init__(self, callback: Any = None) -> None:
         self._lock = Lock()
+        self._origin_ns = time.monotonic_ns()
         self._legs = {"package": _Leg(), "model": _Leg()}
         self._callback = callback
 
     def start(self, leg: LegName) -> None:
         with self._lock:
             row = self._legs[leg]
-            row.started = max(1, time.monotonic_ns())
+            row.started = max(1, time.monotonic_ns() - self._origin_ns)
             row.ended = row.downloaded = row.reused = 0
             snapshot = self._snapshot_locked()
         self._publish(snapshot)
@@ -85,7 +91,7 @@ class AcquisitionObservation:
             row = self._legs[leg]
             if row.started == 0:
                 return
-            row.ended = max(row.started, time.monotonic_ns())
+            row.ended = max(row.started, time.monotonic_ns() - self._origin_ns)
             snapshot = self._snapshot_locked()
         self._publish(snapshot)
 
