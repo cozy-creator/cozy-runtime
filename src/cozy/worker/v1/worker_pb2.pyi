@@ -607,6 +607,64 @@ class ReleaseModelSourceRequest(_message.Message):
     operation_id: str
     def __init__(self, operation_id: _Optional[str] = ...) -> None: ...
 
+class DerivedRetentionCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: DerivedRetentionRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[DerivedRetentionRequest, _Mapping]] = ...) -> None: ...
+
+class DerivedRetentionRequest(_message.Message):
+    __slots__ = ("weights_transaction_id", "tensorfs_receipt_digest", "retention_id")
+    WEIGHTS_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    RETENTION_ID_FIELD_NUMBER: _ClassVar[int]
+    weights_transaction_id: str
+    tensorfs_receipt_digest: bytes
+    retention_id: str
+    def __init__(self, weights_transaction_id: _Optional[str] = ..., tensorfs_receipt_digest: _Optional[bytes] = ..., retention_id: _Optional[str] = ...) -> None: ...
+
+class DerivedRetentionResult(_message.Message):
+    __slots__ = ("weights_transaction_id", "tensorfs_receipt_digest", "retention_id", "manifest", "released")
+    WEIGHTS_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    RETENTION_ID_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    RELEASED_FIELD_NUMBER: _ClassVar[int]
+    weights_transaction_id: str
+    tensorfs_receipt_digest: bytes
+    retention_id: str
+    manifest: Ref
+    released: bool
+    def __init__(self, weights_transaction_id: _Optional[str] = ..., tensorfs_receipt_digest: _Optional[bytes] = ..., retention_id: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., released: bool = ...) -> None: ...
+
+class DerivedResultReleaseCall(_message.Message):
+    __slots__ = ("claim", "request")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request: DerivedResultReleaseRequest
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[DerivedResultReleaseRequest, _Mapping]] = ...) -> None: ...
+
+class DerivedResultReleaseRequest(_message.Message):
+    __slots__ = ("weights_transaction_id", "tensorfs_receipt_digest")
+    WEIGHTS_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    weights_transaction_id: str
+    tensorfs_receipt_digest: bytes
+    def __init__(self, weights_transaction_id: _Optional[str] = ..., tensorfs_receipt_digest: _Optional[bytes] = ...) -> None: ...
+
+class DerivedResultReleaseResult(_message.Message):
+    __slots__ = ("weights_transaction_id", "tensorfs_receipt_digest", "released")
+    WEIGHTS_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
+    TENSORFS_RECEIPT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    RELEASED_FIELD_NUMBER: _ClassVar[int]
+    weights_transaction_id: str
+    tensorfs_receipt_digest: bytes
+    released: bool
+    def __init__(self, weights_transaction_id: _Optional[str] = ..., tensorfs_receipt_digest: _Optional[bytes] = ..., released: bool = ...) -> None: ...
+
 class ReleaseModelSourceResult(_message.Message):
     __slots__ = ("operation_id", "released")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]

@@ -15,6 +15,7 @@ from typing import Any, Literal, get_args, get_origin
 
 import msgspec
 
+from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound, _PreflightMarker
@@ -262,6 +263,11 @@ def analyze(
                 raise ConformanceError(
                     "injected invocable parameters cannot have defaults", code="injected_default"
                 )
+            if isinstance(base, type) and issubclass(base, Model):
+                # Ordinary top-level invocation may use the owner's frozen model
+                # binding. A managed caller may supply an exact produced artifact
+                # override, which the owner also binds through that same model lane.
+                wire_fields.append((parameter.name, ModelArtifact | None, None))
         params.append(_classify(parameter.name, annotation, where))
 
     payloads = [p for p in params if p.role == "payload"]

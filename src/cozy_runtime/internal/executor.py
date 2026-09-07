@@ -2023,6 +2023,20 @@ class Executor:
                     f"job Model parameter {parameter!r} has a noncanonical Manifest ref",
                     code="job_model_manifest_invalid",
                 )
+            if (
+                surface.invocable
+                and (artifact := command.get("payload", {}).get(parameter)) is not None
+            ):
+                expected = artifact.get("manifest") if isinstance(artifact, Mapping) else None
+                if (
+                    not isinstance(expected, Mapping)
+                    or expected.get("digest") != manifest
+                    or expected.get("length") != length
+                ):
+                    raise CapabilityError(
+                        "model call artifact differs from its admitted native input",
+                        code="model_artifact_binding",
+                    )
             try:
                 held = store.manifest(manifest)
                 if len(bytes(held["manifest"])) != length:

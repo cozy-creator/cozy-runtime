@@ -12,6 +12,7 @@ from typing import Any, get_args, get_origin
 import msgspec
 
 from cozy_runtime.author import ConformanceError, Surface
+from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.internal import canonical, schema
 
@@ -23,6 +24,8 @@ def metadata(surface: Surface) -> dict[str, Any]:
 
     def walk(annotation: object, path: str) -> None:
         base, _ = strip(annotation)
+        if base is ModelArtifact:
+            return
         origin = get_origin(base)
         if isinstance(base, type) and is_struct(base):
             names[path] = base.__name__
@@ -50,7 +53,9 @@ def metadata(surface: Surface) -> dict[str, Any]:
 
     walk(surface.payload_type, "request")
     walk(surface.result_type, "result")
-    parameters = [parameter.name for parameter in surface.params if parameter.role == "wire"]
+    parameters = [
+        parameter.name for parameter in surface.params if parameter.role in ("wire", "model")
+    ]
     signature = inspect.signature(surface.fn)
     for name in parameters:
         default = signature.parameters[name].default
@@ -133,7 +138,7 @@ def validate(value: object, request: Any, result: Any) -> dict[str, Any]:
         not isinstance(request, dict)
         or not isinstance(result, dict)
         or not isinstance(request.get("fields"), list)
-        or not isinstance(result.get("fields"), list)
+        or (not isinstance(result.get("fields"), list) and result != {"input": "model"})
     ):
         raise ConformanceError(
             "invocable request and result must be closed structs", code="invocable_interface"
