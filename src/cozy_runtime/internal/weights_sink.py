@@ -482,7 +482,22 @@ class WeightsTransactionHost:
                     "shape": list(tensor.shape),
                     "encoding": tensor.encoding,
                     "parts": {
-                        role: {"dtype": part.dtype, "shape": list(part.shape)}
+                        role: {
+                            "dtype": part.dtype,
+                            "shape": list(part.shape),
+                            **(
+                                {
+                                    "source": {
+                                        "source": part.source.source,
+                                        "component": part.source.component,
+                                        "tensor": part.source.tensor,
+                                        "role": part.source.role,
+                                    }
+                                }
+                                if part.source is not None
+                                else {}
+                            ),
+                        }
                         for role, part in sorted(tensor.parts.items())
                     },
                 }
