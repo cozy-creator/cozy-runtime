@@ -2143,6 +2143,7 @@ class Executor:
 
         weights_open = None
         weights_source_structure = None
+        weights_source_config = None
         if surface.weights_outputs:
             from cozy_runtime.internal import weights_sink
 
@@ -2235,6 +2236,7 @@ class Executor:
             )
             weights_open = weights_host.open
             weights_source_structure = weights_host.structure
+            weights_source_config = weights_host.config
 
         from cozy_runtime.author._services import (
             BudgetFacts,
@@ -2300,6 +2302,7 @@ class Executor:
                 checkpoints=durable_checkpoint,
                 weights=weights_open,
                 weights_source_structure=weights_source_structure,
+                weights_source_config=weights_source_config,
                 budget=BudgetFacts(
                     gpu_rate_usd_per_hour=int(budget.get("gpu_rate_micro_usd_per_hour", 0)) / 1e6,
                     gpu_count=int(budget.get("gpu_count", 0)),
