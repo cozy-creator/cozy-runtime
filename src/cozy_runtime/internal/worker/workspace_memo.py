@@ -9,7 +9,7 @@ import secrets
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal.worker import store_gc
+from cozy_runtime.internal.worker import derived_retention, store_gc
 from cozy_runtime.internal.worker.workspace import Journal, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -173,6 +173,42 @@ def _missing_cleanup(workspace: Workspace, db: Journal, owner: str, consumer: st
         raise WorkspaceRefusal("memo recipient was released during missing-custody cleanup")
 
 
+def _missing_native_result(
+    workspace: Workspace, db: Journal, owner: str, consumer: str, error: Exception
+) -> bool:
+    code = getattr(error, "code", None)
+    if code in {"ROOT_ABSENT", "OBJECT_ABSENT"}:
+        return True
+    if code != "TRANSACTION_CLOSED":
+        return False
+    lookup = db.execute(
+        "SELECT * FROM operation_lookups WHERE owner=? AND consumer=?", (owner, consumer)
+    ).fetchone()
+    # A completed consumer's native tombstone is authoritative. Only a fresh
+    # acquisition can discover that the source cache itself was removed.
+    if lookup is None or lookup["state"] != "retaining":
+        return False
+    cached = db.execute(
+        "SELECT body FROM operation_cache WHERE owner=? AND id=?", (owner, lookup["cache_id"])
+    ).fetchone()
+    if cached is None:
+        return False
+    for hold in json.loads(cached["body"])["holds"]:
+        try:
+            # Verify the ORIGINAL cache hold, never another consumer ID. This
+            # separates an evicted source from a released recipient.
+            db.native(
+                lambda request=_request(hold): derived_retention.change(
+                    request, tensorfs_root=workspace.store_root, release=False
+                )
+            )
+        except Exception as exc:
+            if getattr(exc, "code", None) in {"ROOT_ABSENT", "OBJECT_ABSENT", "TRANSACTION_CLOSED"}:
+                return True
+            raise
+    return False
+
+
 def record(
     workspace: Workspace, owner: str, call: pb.RecordOperationResultCall
 ) -> pb.RecordOperationResultResult:
@@ -312,7 +348,7 @@ def lookup(
         except Exception as exc:
             # Missing payloads can be recomputed. Integrity failures, I/O errors
             # and native release tombstones are distinct typed refusals.
-            if getattr(exc, "code", None) not in {"ROOT_ABSENT", "OBJECT_ABSENT"}:
+            if not _missing_native_result(workspace, db, owner, call.consumer_request_id, exc):
                 raise
             _missing_cleanup(workspace, db, owner, call.consumer_request_id)
             return answer

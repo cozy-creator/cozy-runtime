@@ -79,6 +79,7 @@ CREATE TABLE attempts (
  outcome BLOB NOT NULL DEFAULT x'', retain INTEGER NOT NULL DEFAULT 0,
  fenced INTEGER NOT NULL DEFAULT 0,
  worker_boot TEXT NOT NULL DEFAULT '', result_schema BLOB NOT NULL DEFAULT x'',
+ transport_owner TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(owner,request,ordinal)
 ) STRICT;
 CREATE TABLE weights (
@@ -244,8 +245,9 @@ class Workspace:
         with self.locked() as db:
             return (
                 db.execute(
-                    "SELECT 1 FROM attempts WHERE owner=? AND request=? AND ordinal=?",
-                    (owner, request, ordinal),
+                    "SELECT 1 FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
+                    "AND request=? AND ordinal=?",
+                    (owner, owner, request, ordinal),
                 ).fetchone()
                 is not None
             )
@@ -255,9 +257,10 @@ class Workspace:
             return [
                 self._outcome_frame(row)
                 for row in db.execute(
-                    "SELECT * FROM attempts WHERE owner=? AND state='outcome' "
+                    "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
+                    "AND state='outcome' "
                     "ORDER BY request,ordinal",
-                    (owner,),
+                    (owner, owner),
                 )
             ]
 
@@ -346,8 +349,9 @@ class Workspace:
         self.owner(owner)
         with self.locked() as db:
             row = db.execute(
-                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
-                (owner, ack.request_id, ack.attempt_ordinal),
+                "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
+                "AND request=? AND ordinal=?",
+                (owner, owner, ack.request_id, ack.attempt_ordinal),
             ).fetchone()
             if (
                 row is None
@@ -363,7 +367,7 @@ class Workspace:
                 (
                     "outcome" if ack.retain_work else "released",
                     int(ack.retain_work),
-                    owner,
+                    row["owner"],
                     ack.request_id,
                     ack.attempt_ordinal,
                 ),

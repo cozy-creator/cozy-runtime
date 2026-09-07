@@ -225,7 +225,8 @@ class GrpcControlHost:
         self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
         pb_grpc.add_WorkerControlServicer_to_server(_Servicer(plane), self.server)
         loopback_services = (
-            self.compatibility_checker is not None
+            self.workspace_service is not None
+            or self.compatibility_checker is not None
             or self.preparer is not None
             or self.model_source_preparer is not None
             or self.model_source_releaser is not None

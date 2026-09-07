@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -155,3 +156,21 @@ def test_operation_identity_and_original_outcome_cannot_be_rewritten(tmp_path: P
     original.computation_digest = b"\x72" * 32
     with pytest.raises(WorkspaceRefusal, match="changed"):
         workspace_memo.lookup(workspace, "owner", original)
+
+
+def test_native_cache_removal_becomes_a_replayable_miss(tmp_path: Path) -> None:
+    store, workspace, receipt = produced(tmp_path)
+    call = completed(workspace, receipt)
+    assert workspace_memo.record(workspace, "owner", call).recorded
+    release_original(workspace, call, receipt)
+    with workspace.locked() as db:
+        cache = json.loads(db.execute("SELECT body FROM operation_cache").fetchone()[0])
+    held = cache["holds"][0]
+    store.release_derived_retention(
+        held["transaction_id"], held["native_receipt_digest"], held["retention_id"]
+    )
+    lookup = pb.LookupOperationCall(
+        computation_digest=call.computation_digest, consumer_request_id="missing-native-cache"
+    )
+    assert not workspace_memo.lookup(workspace, "owner", lookup).found
+    assert not workspace_memo.lookup(workspace, "owner", lookup).found
