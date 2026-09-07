@@ -61,15 +61,18 @@ class _LeaseReader:
     an HTTP body reader accepts and which keeps an 8 GiB PUT to thousands of reads, not millions.
     """
 
-    __slots__ = ("lease", "length", "object_id", "offset")
+    __slots__ = ("closed", "lease", "length", "object_id", "offset")
 
     def __init__(self, lease: Any, object_id: str, length: int) -> None:
         self.lease = lease
         self.object_id = object_id
         self.length = length
         self.offset = 0
+        self.closed = False
 
     def read(self, size: int = -1) -> bytes:
+        if self.closed:
+            raise ValueError("weights reader is closed")
         remaining = self.length - self.offset
         if remaining <= 0:
             return b""
@@ -89,6 +92,11 @@ class _LeaseReader:
             raise ValueError("a lease reader rewinds to its start only")
         self.offset = 0
         return 0
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.lease.release()
 
 
 class WeightsExchangeError(Exception):
@@ -158,7 +166,6 @@ class _Held:
     manifest_id: str
     manifest_bytes: bytes
     manifest: pb.Ref
-    lease: Any
 
 
 #: Typed refusals this exchange can report, mapped from the code that raised them. An egress
@@ -755,24 +762,20 @@ class WeightsExchange:
                 self._dispatch(pending)
 
     def close(self) -> None:
-        """Release every live TensorFS read lease; durable facts remain with the host."""
+        """Forget receipt metadata; active transports release their own read leases."""
         self.writer_broker.close()
         with self._lock:
-            held, self._held = list(self._held.values()), {}
+            self._held = {}
             stream, self._stream = self._stream, None
         if stream is not None:
             stream.end()
-        for transaction in held:
-            transaction.lease.release()
 
     def abandon(self, transaction_id: str) -> None:
-        """Stop late receipt/transfer registration and release this output's read lease."""
+        """Stop late receipt/transfer registration; native disposition owns the roots."""
         self.writer_broker.close(transaction_id)
         with self._lock:
             self._abandoned.add(transaction_id)
-            held = self._held.pop(transaction_id, None)
-        if held is not None:
-            held.lease.release()
+            self._held.pop(transaction_id, None)
 
     def read(self, request: pb.WeightsReadRequest) -> pb.WorkerFrame:
         refusal = pb.WEIGHTS_READ_REFUSAL_UNSPECIFIED
@@ -817,13 +820,17 @@ class WeightsExchange:
                     data = held.manifest_bytes[request.offset : request.offset + request.max_bytes]
                 else:
                     target = bytearray(request.max_bytes)
-                    held.lease.read_into(
-                        row.object_id,
-                        row.length,
-                        request.offset,
-                        request.max_bytes,
-                        target,
-                    )
+                    lease = self._store().acquire(held.manifest_id, [(row.object_id, row.length)])
+                    try:
+                        lease.read_into(
+                            row.object_id,
+                            row.length,
+                            request.offset,
+                            request.max_bytes,
+                            target,
+                        )
+                    finally:
+                        lease.release()
                     data = bytes(target)
             except Exception as exc:
                 refusal, detail = (
@@ -890,6 +897,8 @@ class WeightsExchange:
             )
             result.safe_detail = exc.detail[:4096]
             return pb.WorkerFrame(weights_upload_result=result)
+        finally:
+            source.close()
         result.transferred_bytes = receipt.length
         result.http_status = receipt.http_status
         result.etag = receipt.etag
@@ -929,7 +938,13 @@ class WeightsExchange:
             raise WeightsExchangeError("source_ref_mismatch", "the grant names a different object")
         if row.source_ref.startswith("tensorfs-manifest:"):
             return io.BytesIO(held.manifest_bytes), row.length
-        return _LeaseReader(held.lease, row.object_id, row.length), row.length
+        try:
+            lease = self._store().acquire(held.manifest_id, [(row.object_id, row.length)])
+        except Exception as exc:
+            raise WeightsExchangeError(
+                "source_unavailable", f"TensorFS source unavailable: {type(exc).__name__}"
+            ) from exc
+        return _LeaseReader(lease, row.object_id, row.length), row.length
 
     def _exchange(
         self,
@@ -1118,7 +1133,6 @@ class WeightsExchange:
                 source_ref=f"tensorfs-manifest:{manifest_id}",
             )
         }
-        blobs: list[tuple[str, int]] = []
         for raw in store.walk(manifest_id):
             object_id, length = str(raw["id"]), int(raw["length"])
             previous = rows.get(object_id)
@@ -1131,7 +1145,6 @@ class WeightsExchange:
                 length=length,
                 source_ref=f"tensorfs-object:{object_id}",
             )
-            blobs.append((object_id, length))
         if not rows or len(rows) > weights_limits.MAX_WEIGHTS_OBJECTS:
             raise WeightsExchangeError(
                 "weights_inventory_bound", "weights object count is outside protocol bounds"
@@ -1152,25 +1165,20 @@ class WeightsExchange:
                 digest=bytes.fromhex(manifest_id[7:]),
                 length=manifest_length,
             ),
-            lease=store.acquire(manifest_id, sorted(set(blobs))),
         )
         with self._lock:
             abandoned = transaction_id in self._abandoned
             raced = None if abandoned else self._held.setdefault(transaction_id, held)
         if abandoned:
-            held.lease.release()
             raise WeightsExchangeError("weights_transaction_abandoned", "output was abandoned")
         if raced is not held:
-            held.lease.release()
             assert raced is not None
             return raced
         return held
 
     def _drop(self, transaction_id: str) -> None:
         with self._lock:
-            held = self._held.pop(transaction_id, None)
-        if held is not None:
-            held.lease.release()
+            self._held.pop(transaction_id, None)
 
     def _store(self) -> Any:
         if self.store is None:

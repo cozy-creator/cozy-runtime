@@ -8,13 +8,8 @@ signed headers arrive verbatim, that HTTP 412 reads as already-present rather th
 that a request which does not bind the held object refuses typed, and that a grant naming an
 address this runtime may not reach is refused by the one address predicate.
 
-WHAT IS NOT COVERED HERE, AND WHY. `_LeaseReader`, the streaming view over a live TensorFS
-lease, needs a real checkpoint, and TensorFS is an optional extra (`model-execution`) that
-`uv sync` does not install. So these tests drive the OTHER production source — the produced
-Manifest, which is itself one row in the receipt inventory and is uploaded by exactly this
-code path. Nothing is stubbed to make that work: the manifest source needs no lease, so the
-held row carries none. The lease adapter's own arithmetic is unproven in CI, and saying so
-is better than a fake lease that would agree with whatever the adapter did.
+Both cached manifest bytes and a real native output object are covered. Native roots own
+idle output retention; an active object transfer alone holds a read lease against GC.
 """
 
 from __future__ import annotations
@@ -24,13 +19,17 @@ import contextlib
 import hashlib
 import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+import tensorfs
 
+from cozy_runtime.internal.weights_sink import protocol_receipt
 from cozy_runtime.internal.worker import weights
 from cozy_runtime.protocol import worker_pb2 as pb
+from test_weights_resume_native import _committed
 
 TRANSACTION = "sha256:" + "a" * 64
 WRITER_EPOCH = 9
@@ -48,6 +47,8 @@ class ObjectStore:
         self.headers: dict[str, str] = {}
         self.raw_headers: list[tuple[str, str]] = []
         self.status = 200
+        self.received = threading.Event()
+        self.response_gate: threading.Event | None = None
 
 
 @contextlib.contextmanager
@@ -57,6 +58,9 @@ def serving(store: ObjectStore) -> Iterator[str]:
             store.body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             store.raw_headers = list(self.headers.items())
             store.headers = {k.lower(): v for k, v in store.raw_headers}
+            store.received.set()
+            if store.response_gate is not None:
+                store.response_gate.wait(10)
             self.send_response(store.status)
             self.send_header("ETag", '"stored"')
             self.send_header("Content-Length", "0")
@@ -97,7 +101,6 @@ def exchange(tmp_path: Path, *, allow_private: bool) -> weights.WeightsExchange:
         manifest_id=OBJECT_ID,
         manifest_bytes=OBJECT,
         manifest=pb.Ref(digest=hashlib.sha256(OBJECT).digest(), length=len(OBJECT)),
-        lease=None,  # the manifest source needs none, and this path never reaches for one
     )
     return made
 
@@ -205,3 +208,68 @@ def test_a_grant_naming_an_unreachable_address_is_refused(tmp_path: Path) -> Non
 
     assert result.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
     assert result.refusal == pb.WEIGHTS_UPLOAD_REFUSAL_GRANT_REFUSED
+
+
+def test_native_output_leases_belong_only_to_active_transfers(tmp_path: Path) -> None:
+    native, _, _, receipt = _committed(tmp_path)
+    _, raw, digest = protocol_receipt(
+        receipt,
+        owner_scope="resume-proof",
+        request_id="request",
+        invocation_spec_digest="sha256:" + "41" * 32,
+    )
+    exchange = weights.WeightsExchange(
+        store_root=tmp_path / "store",
+        send=lambda _: None,
+        stop=threading.Event(),
+        owner_scope=lambda: "resume-proof",
+        allow_private_egress=True,
+    )
+    held = exchange._hold(
+        receipt.weights_transaction_id,
+        1,
+        pb.WeightsReceiptRef(weights_receipt_canonical_bytes=raw, weights_receipt_digest=digest),
+    )
+    row = next(value for value in held.objects.values() if value.length == 2048)
+    assert row.source_ref.startswith("tensorfs-object:")
+    tensorfs.gc(str(native.root))  # idle metadata is not a second retention authority
+    backend = ObjectStore()
+    backend.response_gate = threading.Event()
+    with serving(backend) as base, ThreadPoolExecutor(max_workers=1) as pool:
+        upload = pb.WeightsUploadRequest(
+            weights_transaction_id=receipt.weights_transaction_id,
+            writer_epoch=1,
+            object_id=row.object_id,
+            source_ref=row.source_ref,
+            length=row.length,
+            operation_id="native-transfer",
+            grant_revision=1,
+            grant=pb.WeightsUploadGrant(
+                object_id=row.object_id, length=row.length, url=base + "/object"
+            ),
+        )
+        pending = pool.submit(exchange.upload, upload)
+        try:
+            assert backend.received.wait(5)
+            with pytest.raises(Exception, match="STORE_BUSY"):
+                tensorfs.gc(str(native.root), dry_run=True)
+        finally:
+            backend.response_gate.set()
+        result = pending.result(timeout=5).weights_upload_result
+    assert result.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_UPLOADED, result.safe_detail
+    assert backend.body == b"\x31" * 2048
+    tensorfs.gc(str(native.root))
+    read = exchange.read(
+        pb.WeightsReadRequest(
+            weights_transaction_id=receipt.weights_transaction_id,
+            writer_epoch=1,
+            object_id=row.object_id,
+            source_ref=row.source_ref,
+            read_id="native-read",
+            max_bytes=row.length,
+        )
+    ).weights_read_result
+    assert read.outcome == pb.WEIGHTS_READ_OUTCOME_DATA and read.data == backend.body
+    tensorfs.gc(str(native.root))
+    assert native.manifest(held.manifest_id)
+    exchange.close()

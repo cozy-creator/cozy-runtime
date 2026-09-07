@@ -1887,9 +1887,11 @@ class Worker:
     ) -> pb.DerivedResultReleaseResult:
         from . import derived_retention
 
-        return derived_retention.release_result(
+        result = derived_retention.release_result(
             request, tensorfs_root=Path(self.options.tensorfs_root or "")
         )
+        self.weights.abandon(request.weights_transaction_id)
+        return result
 
     def note(self, kind: str, step: str) -> None:
         """The NON-ATTEMPT activity lane: typed, sequence-bearing, on the DURABLE Report —
