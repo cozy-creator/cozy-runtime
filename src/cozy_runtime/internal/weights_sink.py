@@ -298,7 +298,13 @@ class WeightsTransactionHost:
                     f"TensorFS completed result is not retained and complete: {exc}",
                     code="weights_receipt_unavailable",
                 ) from exc
-            receipt = self._wrap(request.output_slot, transaction_id, facts, replayed=True)
+            receipt = self._wrap(
+                request.output_slot,
+                transaction_id,
+                facts,
+                replayed=True,
+                request_id=self.request_id,
+            )
             _, _, protocol_digest = protocol_receipt(
                 receipt,
                 owner_scope=self.owner_scope,
@@ -449,7 +455,9 @@ class WeightsTransactionHost:
                 "TensorFS returned a committed abandonment without a receipt",
                 code="weights_receipt_absent",
             )
-        return self._wrap(output_slot, transaction_id, facts, replayed=True)
+        return self._wrap(
+            output_slot, transaction_id, facts, replayed=True, request_id=self.request_id
+        )
 
     def release(self, output_slot: str) -> WeightsReceipt:
         """Release a committed transaction root after publication or rejection."""
@@ -460,7 +468,9 @@ class WeightsTransactionHost:
             raise CapabilityError(
                 "TensorFS disposition returned no receipt", code="weights_receipt_absent"
             )
-        return self._wrap(output_slot, transaction_id, facts, replayed=True)
+        return self._wrap(
+            output_slot, transaction_id, facts, replayed=True, request_id=self.request_id
+        )
 
     @staticmethod
     def _target(target: WeightsTarget) -> dict[str, Any]:
@@ -522,13 +532,14 @@ class WeightsTransactionHost:
             )
         return value
 
+    @staticmethod
     def _wrap(
-        self,
         output_slot: str,
         transaction_id: str,
         facts: dict[str, Any],
         *,
         replayed: bool,
+        request_id: str,
     ) -> WeightsReceipt:
         raw = canonical_json.encode(facts)
         receipt_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -539,7 +550,7 @@ class WeightsTransactionHost:
             tensorfs_receipt=raw,
             replayed=replayed,
             _artifact=ModelArtifact(
-                self.request_id,
+                request_id,
                 output_slot,
                 ObjectRef("sha256:" + facts["manifest"]["sha256"], facts["manifest"]["length"]),
                 receipt_digest,
@@ -687,7 +698,11 @@ class OpenedWeightsTransaction:
             self._fence_after(exc, "commit")
         self.closed = True
         self.receipt = self.host._wrap(
-            self.request.output_slot, self.transaction_id, facts, replayed=False
+            self.request.output_slot,
+            self.transaction_id,
+            facts,
+            replayed=False,
+            request_id=self.host.request_id,
         )
         self.host.acknowledge(self.receipt)
         return self.receipt
