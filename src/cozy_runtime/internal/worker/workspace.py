@@ -188,7 +188,7 @@ class Workspace:
         *,
         result_schema: bytes = b"",
         worker_boot: str = "",
-    ) -> None:
+    ) -> pb.AttemptOutcome | None:
         self.owner(owner)
         if (
             _ID.fullmatch(offer.request_id) is None
@@ -201,17 +201,17 @@ class Workspace:
         documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
         with self.locked() as db:
             row = db.execute(
-                "SELECT spec,invocation,state FROM attempts "
-                "WHERE owner=? AND request=? AND ordinal=?",
+                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
                 (owner, offer.request_id, offer.attempt_ordinal),
             ).fetchone()
             if row is not None:
                 if (
                     row["spec"] != offer.invocation_spec_digest
                     or row["invocation"] != offer.invocation_spec_canonical_bytes
-                    or row["state"] == "released"
                 ):
                     raise WorkspaceRefusal("workspace attempt was changed or released")
+                if row["state"] in ("outcome", "released"):
+                    return self._outcome_frame(row)
                 return
             db.execute(
                 "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state,"
@@ -226,6 +226,37 @@ class Workspace:
                     result_schema,
                 ),
             )
+
+    @staticmethod
+    def _outcome_frame(row: sqlite3.Row) -> pb.AttemptOutcome:
+        return pb.AttemptOutcome(
+            request_id=row["request"],
+            attempt_ordinal=row["ordinal"],
+            invocation_spec_digest=row["spec"],
+            outcome_id=row["outcome_id"],
+            outcome_digest=row["outcome_digest"],
+            outcome_canonical_bytes=row["outcome"],
+        )
+
+    def contains(self, owner: str, request: str, ordinal: int) -> bool:
+        with self.locked() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                    (owner, request, ordinal),
+                ).fetchone()
+                is not None
+            )
+
+    def retained_outcomes(self, owner: str) -> list[pb.AttemptOutcome]:
+        with self.locked() as db:
+            return [
+                self._outcome_frame(row)
+                for row in db.execute(
+                    "SELECT * FROM attempts WHERE owner=? AND state='outcome' ORDER BY request,ordinal",
+                    (owner,),
+                )
+            ]
 
     def retain(
         self, owner: str, request: pb.DerivedRetentionRequest, *, release: bool = False

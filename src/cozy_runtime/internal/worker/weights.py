@@ -49,6 +49,7 @@ from urllib.parse import urlparse
 
 from cozy_runtime.internal import egress, fill
 from cozy_runtime.internal.weights_writer import WriterBroker
+from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -197,6 +198,7 @@ class WeightsExchange:
         stamp: Callable[[Any], Any] | None = None,
         note: Callable[[str, str], None] | None = None,
         allow_private_egress: bool = False,
+        workspace: Workspace | None = None,
     ) -> None:
         #: The `WorkerControl` lane: stamps the frame's envelope and queues it on the live
         #: control stream. Used only while no `Exchange` is open.
@@ -209,6 +211,7 @@ class WeightsExchange:
         self.owner_scope = owner_scope
         self.note = note or (lambda _kind, _step: None)
         self.store_root = store_root
+        self.workspace = workspace
         # Local proof only; production leaves this false, exactly as the supervisor's own
         # `allowPrivateWeightsUploads` does. It widens nothing but the address classes an
         # upload may reach, and only for a caller that constructed this object saying so.
@@ -247,19 +250,23 @@ class WeightsExchange:
                 checkpoint=checkpoint,
             )
         )
-        ack = self._exchange(
-            self._key(
-                attempt.request_id, attempt.attempt, binding.slot, pb.WEIGHTS_HOST_STAGE_CHECKPOINT
-            ),
-            frame,
-            canceled=lambda: bool(attempt.canceling),
-        )
-        self._validate_ack(ack, frame.weights_checkpoint, pb.WEIGHTS_HOST_STAGE_CHECKPOINT)
-        if ack.outcome == pb.WEIGHTS_HOST_OUTCOME_REFUSED:
+        if self.workspace is None:
+            raise WeightsExchangeError("workspace_unavailable", "worker has no workspace custody")
+        try:
+            self.workspace.checkpoint(self.owner_scope(), frame.weights_checkpoint)
+        except Exception as exc:
             raise WeightsExchangeError(
-                pb.WeightsHostRefusal.Name(ack.refusal).lower(),
-                "the weights host refused checkpoint",
+                str(getattr(exc, "code", "workspace_refused")),
+                "workspace checkpoint recording refused",
+            ) from exc
+        self.send(frame)
+        self.send(
+            pb.WorkerFrame(
+                weights_transaction=self.workspace.status(
+                    self.workspace.weights_row(self.owner_scope(), transaction)
+                )
             )
+        )
 
     def _checkpoint_pending(
         self,
@@ -535,107 +542,94 @@ class WeightsExchange:
         declaration: bytes,
         requested_writer_epoch: int,
     ) -> dict[str, Any]:
-        if self.store_root is None:
-            raise WeightsExchangeError(
-                "tensorfs_store_unavailable", "this worker has no verified TensorFS Store"
-            )
-        if (
-            len(declaration_digest) != 32
-            or not transaction_id.startswith("sha256:")
-            or len(transaction_id) != 71
-            or any(character not in "0123456789abcdef" for character in transaction_id[7:])
-            or not declaration
-            or len(declaration) > weights_limits.MAX_WEIGHTS_DECLARATION_BYTES
-            or hashlib.sha256(declaration).digest() != declaration_digest
-        ):
-            raise WeightsExchangeError(
-                "weights_declaration_invalid", "declaration bytes or digest are invalid"
-            )
-        frame = pb.WorkerFrame(
-            weights_intent=pb.WeightsIntentFrame(
-                request_id=attempt.request_id,
+        if self.workspace is None:
+            raise WeightsExchangeError("workspace_unavailable", "worker has no workspace custody")
+        intent = pb.WeightsIntentFrame(
+            request_id=attempt.request_id,
+            attempt_ordinal=attempt.attempt,
+            invocation_spec_digest=attempt.digest,
+            output_slot=output_slot,
+            weights_transaction_id=transaction_id,
+            tensorfs_declaration_digest=declaration_digest,
+            tensorfs_declaration_canonical_bytes=declaration,
+        )
+        try:
+            row = cast(dict[str, Any], self.workspace.begin_weights(self.owner_scope(), intent))
+            epoch = int(row["epoch"])
+            intent.requested_writer_epoch = epoch
+            # One FIFO carries the projection and its eventual outcome. The
+            # native writer is authorized by Workspace, never by a Host ACK.
+            self.send(pb.WorkerFrame(weights_intent=intent))
+            ready = pb.WeightsIntentReadyRequest(
                 attempt_ordinal=attempt.attempt,
-                invocation_spec_digest=attempt.digest,
-                output_slot=output_slot,
-                weights_transaction_id=transaction_id,
-                tensorfs_declaration_digest=declaration_digest,
-                requested_writer_epoch=requested_writer_epoch,
-                tensorfs_declaration_canonical_bytes=declaration,
+                weights=pb.WeightsCheckpointSubject(
+                    request_id=attempt.request_id,
+                    invocation_spec_digest=attempt.digest,
+                    output_slot=output_slot,
+                    weights_transaction_id=transaction_id,
+                    writer_epoch=epoch,
+                    tensorfs_declaration_digest=declaration_digest,
+                ),
             )
-        )
-        ack = self._exchange(
-            self._key(
-                attempt.request_id,
-                attempt.attempt,
-                output_slot,
-                pb.WEIGHTS_HOST_STAGE_INTENT,
-            ),
-            frame,
-            canceled=lambda: bool(attempt.canceling),
-        )
-        self._validate_ack(ack, frame.weights_intent, pb.WEIGHTS_HOST_STAGE_INTENT)
-        if ack.outcome == pb.WEIGHTS_HOST_OUTCOME_REFUSED:
+            if row["checkpoint"]:
+                ready.checkpoint.CopyFrom(pb.CheckpointRef.FromString(row["checkpoint"]))
+            try:
+                row = cast(dict[str, Any], self.workspace.ready_weights(self.owner_scope(), ready))
+            except Exception as exc:
+                if not ready.HasField("checkpoint") or getattr(exc, "code", None) not in {
+                    "ROOT_ABSENT",
+                    "OBJECT_ABSENT",
+                }:
+                    raise
+                self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(row)))
+                # An owner may restore an acknowledged remote checkpoint. Its
+                # Ready RPC commits to the same journal; no network wait owns a lock.
+                while not row["ready"]:
+                    if attempt.canceling or self.stop.wait(0.05):
+                        raise WeightsExchangeError(
+                            "weights_canceled", "writer restoration stopped"
+                        ) from exc
+                    row = cast(
+                        dict[str, Any],
+                        self.workspace.weights_row(self.owner_scope(), transaction_id),
+                    )
+            self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(row)))
+            with self._lock:
+                self._bindings[transaction_id] = (epoch, declaration_digest)
+            restored = (
+                pb.CheckpointRef.FromString(row["restore_checkpoint"])
+                if row["restore_checkpoint"]
+                else None
+            )
+            checkpoint = (
+                (documents.spell(restored.head.digest), restored.head.length) if restored else None
+            )
+            self.writer_broker.authorize(
+                attempt, transaction_id, epoch, declaration_digest, output_slot, checkpoint
+            )
+            if row["receipt"]:
+                reference = pb.WeightsReceiptRef(
+                    weights_receipt_digest=row["receipt_digest"],
+                    weights_receipt_canonical_bytes=row["receipt"],
+                )
+                held = self._hold(transaction_id, epoch, reference)
+                attempt.weights_receipts[output_slot] = held.receipt
+            return {
+                "ok": True,
+                "weights_transaction_id": transaction_id,
+                "writer_epoch": epoch,
+                "weights_receipt_digest": documents.spell(row["receipt_digest"])
+                if row["receipt"]
+                else "",
+                "checkpoint": checkpoint,
+            }
+        except WeightsExchangeError:
+            raise
+        except Exception as exc:
             raise WeightsExchangeError(
-                pb.WeightsHostRefusal.Name(ack.refusal).lower(), "the weights host refused intent"
-            )
-        with self._lock:
-            known = self._bindings.get(ack.weights_transaction_id)
-            if known is not None and (
-                known[1] != declaration_digest or ack.writer_epoch < known[0]
-            ):
-                raise WeightsExchangeError(
-                    "weights_host_ack_mismatch",
-                    "transaction declaration changed or writer epoch regressed",
-                )
-            self._bindings[ack.weights_transaction_id] = (ack.writer_epoch, declaration_digest)
-        checkpoint = (
-            (documents.spell(ack.checkpoint.head.digest), ack.checkpoint.head.length)
-            if ack.HasField("checkpoint")
-            else None
-        )
-        self.writer_broker.authorize(
-            attempt,
-            ack.weights_transaction_id,
-            ack.writer_epoch,
-            declaration_digest,
-            output_slot,
-            checkpoint,
-        )
-        receipt_digest = b""
-        if ack.HasField("weights_receipt"):
-            receipt_digest = self._receipt_ref(ack.weights_receipt)
-            receipt_value = documents.read(
-                ack.weights_receipt.weights_receipt_canonical_bytes,
-                pb.WeightsReceipt,
-            )
-            if (
-                receipt_value.get("request_id") != attempt.request_id
-                or receipt_value.get("owner_authority_scope") != self.owner_scope()
-                or receipt_value.get("invocation_spec_digest") != documents.spell(attempt.digest)
-                or receipt_value.get("output_slot") != output_slot
-                or receipt_value.get("weights_transaction_id") != ack.weights_transaction_id
-            ):
-                raise WeightsExchangeError(
-                    "weights_receipt_identity_mismatch",
-                    "replayed receipt does not bind this attempt/output",
-                )
-            held = self._hold(
-                ack.weights_transaction_id,
-                ack.writer_epoch,
-                ack.weights_receipt,
-            )
-            if ack.manifest != held.manifest:
-                raise WeightsExchangeError(
-                    "weights_manifest_mismatch", "host replayed another produced Manifest"
-                )
-            attempt.weights_receipts[output_slot] = held.receipt
-        return {
-            "ok": True,
-            "weights_transaction_id": ack.weights_transaction_id,
-            "writer_epoch": ack.writer_epoch,
-            "weights_receipt_digest": documents.spell(receipt_digest) if receipt_digest else "",
-            "checkpoint": checkpoint,
-        }
+                str(getattr(exc, "code", "workspace_refused")),
+                "workspace writer authorization refused",
+            ) from exc
 
     def receipt(
         self,
@@ -685,36 +679,24 @@ class WeightsExchange:
                 manifest=held.manifest,
             )
         )
-        ack = self._exchange(
-            self._key(
-                attempt.request_id,
-                attempt.attempt,
-                output_slot,
-                pb.WEIGHTS_HOST_STAGE_RECEIPT,
-            ),
-            frame,
-            canceled=lambda: bool(attempt.canceling),
+        if self.workspace is None:
+            raise WeightsExchangeError("workspace_unavailable", "worker has no workspace custody")
+        try:
+            self.workspace.record_receipt(self.owner_scope(), frame.weights_receipt)
+        except Exception as exc:
+            self._drop(transaction_id)
+            raise WeightsExchangeError(
+                str(getattr(exc, "code", "workspace_refused")),
+                "workspace receipt recording refused",
+            ) from exc
+        self.send(frame)
+        self.send(
+            pb.WorkerFrame(
+                weights_transaction=self.workspace.status(
+                    self.workspace.weights_row(self.owner_scope(), transaction_id)
+                )
+            )
         )
-        self._validate_ack(ack, frame.weights_receipt, pb.WEIGHTS_HOST_STAGE_RECEIPT)
-        if ack.outcome == pb.WEIGHTS_HOST_OUTCOME_REFUSED:
-            self._drop(transaction_id)
-            raise WeightsExchangeError(
-                pb.WeightsHostRefusal.Name(ack.refusal).lower(),
-                "the weights host refused receipt",
-            )
-        if (
-            not ack.HasField("weights_receipt")
-            or self._receipt_ref(ack.weights_receipt) != receipt_digest
-        ):
-            self._drop(transaction_id)
-            raise WeightsExchangeError(
-                "weights_receipt_mismatch", "receipt ACK did not echo exact receipt bytes"
-            )
-        if ack.manifest != held.manifest:
-            self._drop(transaction_id)
-            raise WeightsExchangeError(
-                "weights_manifest_mismatch", "receipt ACK did not echo produced Manifest"
-            )
         attempt.weights_receipts[output_slot] = reference
         return {
             "ok": True,

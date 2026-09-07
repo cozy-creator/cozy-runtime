@@ -49,7 +49,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from cozy_runtime.internal import (
     accel,
@@ -1110,6 +1110,17 @@ class Worker:
             owner=options.triage_owner,
         )
         self.stop = threading.Event()
+        from cozy_runtime.internal.worker.workspace import Workspace
+        from cozy_runtime.internal.worker.workspace_rpc import Service as WorkspaceService
+
+        self.workspace = (
+            Workspace(options.tensorfs_root) if options.tensorfs_root is not None else None
+        )
+        self.workspace_service = (
+            WorkspaceService(self.workspace, self.authorize_workspace, self.workspace_weights_ready)
+            if self.workspace is not None
+            else None
+        )
         self.weights = weights.WeightsExchange(
             store_root=options.tensorfs_root,
             send=self.send,
@@ -1117,6 +1128,7 @@ class Worker:
             stop=self.stop,
             owner_scope=lambda: self.fence.record_owner_id,
             note=self.note,
+            workspace=self.workspace,
         )
         self.engine = AttemptEngine(
             records=self.records,
@@ -1822,6 +1834,71 @@ class Worker:
             inherited=dict(self.config.child_base_env),
         )
 
+    def authorize_workspace(self, claim: pb.Claim) -> str:
+        from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+
+        with self.claim_lock:
+            if (
+                not self.fence.record_owner_recorded
+                or claim.record_owner_id != self.fence.record_owner_id
+                or claim.record_owner_epoch != self.fence.record_owner_epoch
+                or claim.control_stream_epoch != 0
+                or claim.wire_minor < MIN_COMPATIBLE_WIRE_MINOR
+            ):
+                raise WorkspaceRefusal(
+                    "workspace call does not name the current authenticated owner"
+                )
+            if self.config.record_owner_public_key:
+                if (
+                    claim.worker_boot_id != self.fence.worker_boot_id
+                    or claim.worker_id != self.options.worker_id
+                ):
+                    raise WorkspaceRefusal("workspace proof names another worker lifetime")
+                try:
+                    downloads.verify_claim_proof(
+                        claim,
+                        self.config.record_owner_public_key,
+                        worker_id=self.options.worker_id,
+                        worker_boot_id=self.fence.worker_boot_id,
+                        worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
+                    )
+                except downloads.DownloadRefusal as exc:
+                    raise WorkspaceRefusal("workspace owner proof was refused") from exc
+            elif (
+                not self.bootstrap
+                or not hmac.compare_digest(claim.proof, self.bootstrap.encode())
+                or claim.worker_id not in ("", self.options.worker_id)
+                or claim.worker_boot_id not in ("", self.fence.worker_boot_id)
+            ):
+                raise WorkspaceRefusal("workspace bootstrap proof was refused")
+            return self.fence.record_owner_id
+
+    def workspace_weights_ready(self, call: pb.WeightsIntentReadyCall) -> pb.WeightsHostAck:
+        from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+
+        owner = self.authorize_workspace(call.claim)
+        if self.workspace is None:
+            raise WorkspaceRefusal("worker has no workspace")
+        value = self.workspace.ready_weights(owner, call.request)
+        row = cast(dict[str, Any], value)
+        self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(value)))
+        ack = pb.WeightsHostAck(
+            request_id=row["request"],
+            attempt_ordinal=row["ordinal"],
+            invocation_spec_digest=row["spec"],
+            output_slot=row["slot"],
+            weights_transaction_id=row["id"],
+            writer_epoch=row["epoch"],
+            tensorfs_declaration_digest=row["declaration_digest"],
+            stage=pb.WEIGHTS_HOST_STAGE_INTENT,
+            outcome=pb.WEIGHTS_HOST_OUTCOME_RECORDED,
+            record_owner_epoch=call.request.record_owner_epoch,
+            worker_boot_id=call.request.worker_boot_id,
+        )
+        if row["restore_checkpoint"]:
+            ack.checkpoint.CopyFrom(pb.CheckpointRef.FromString(row["restore_checkpoint"]))
+        return ack
+
     def prepare_model_source(
         self, request: pb.PrepareModelSourceRequest
     ) -> pb.PrepareModelSourceResult:
@@ -1929,6 +2006,16 @@ class Worker:
         another's sender.
         """
         inner = getattr(frame, frame.WhichOneof("msg"))
+        if frame.HasField("attempt_outcome") and self.workspace is not None:
+            # Outcome forwarding follows the same workspace commit that observes
+            # native receipts. A transport projection is never the authority.
+            try:
+                self.workspace.outcome(self.fence.record_owner_id, frame.attempt_outcome)
+            except ValueError:
+                # A refused malformed offer never acquired a workspace binding.
+                # The existing attempt engine still delivers its refusal.
+                if frame.attempt_outcome.request_id in self.engine.live:
+                    raise
         with self.claim_lock:
             self.stamp(inner)
             self.outbound.put(frame)
@@ -2750,15 +2837,16 @@ class Worker:
             # instead; this frame answer stays for one that has not opened it.
             self.send(self.weights.upload(inner))
         elif kind == "weights_finalize_request":
-            from . import weights_finalize
+            from . import workspace_finalize
 
             try:
-                result = weights_finalize.finalize(
+                if self.workspace is None:
+                    raise ValueError("workspace custody is unavailable")
+                result = workspace_finalize.finalize(
+                    self.workspace,
+                    self.fence.record_owner_id,
                     inner,
-                    owner_scope=self.fence.record_owner_id,
-                    attempts=tuple(self.engine.history.values()),
-                    tensorfs_root=Path(self.options.tensorfs_root or ""),
-                    journal_root=self.root,
+                    legacy_root=self.root,
                     on_abandon=self.weights.abandon,
                 )
             except Exception as exc:
@@ -2782,6 +2870,14 @@ class Worker:
         `available_attempt_slots` is the field that carries this, and it is recomputed on
         every tick.
         """
+        if self.workspace is not None and self.workspace.contains(
+            self.fence.record_owner_id, acked.request_id, acked.attempt_ordinal
+        ):
+            try:
+                self.workspace.acknowledge(self.fence.record_owner_id, acked)
+            except ValueError as exc:
+                self.note("outcome", f"workspace acknowledgment refused: {exc}")
+                return
         closed = self.engine.history.get((acked.request_id, acked.attempt_ordinal))
         job = closed.job if closed is not None else None
         disposition = self.engine.close(acked)
@@ -5216,6 +5312,23 @@ class Worker:
             )
             self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
             return
+        if self.workspace is not None:
+            result_schema = b""
+            descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
+            for slot in self.job_slots.values():
+                if slot.binding.job_descriptor_id == descriptor:
+                    declaration = self.engine._job_declaration(slot.binding, descriptor)
+                    result_schema = canonical.write(declaration["result"])
+                    break
+            replay = self.workspace.accept(
+                self.fence.record_owner_id,
+                offered,
+                result_schema=result_schema,
+                worker_boot=self.fence.worker_boot_id,
+            )
+            if replay is not None:
+                self.send(pb.WorkerFrame(attempt_outcome=replay))
+                return
         if attempt.state in ("outcome", "closed"):
             self.note(
                 "attempt",
@@ -6287,6 +6400,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     worker = Worker(config, options, host)
     if _loopback_preparation_listener(listen):
         host.numerical_environment = worker.numerical_environment
+        host.workspace_service = worker.workspace_service
 
     def terminate(signum: int, frame: object) -> None:
         worker.request_stop()

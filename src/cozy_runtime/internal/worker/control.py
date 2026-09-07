@@ -33,6 +33,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Protocol
 
+from cozy_runtime.internal.worker.workspace_rpc import Service as WorkspaceService
+from cozy_runtime.internal.worker.workspace_rpc import WorkspaceRPC
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
@@ -186,6 +188,7 @@ class GrpcControlHost:
         numerical_environment: Callable[[], bytes] | None = None,
         store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
         weights: RuntimeWeightsHost | None = None,
+        workspace_service: WorkspaceService | None = None,
     ) -> None:
         self.listen = listen
         self.addr_file = addr_file
@@ -200,6 +203,7 @@ class GrpcControlHost:
         self.derived_result_releaser = derived_result_releaser
         self.numerical_environment = numerical_environment
         self.store_collector = store_collector
+        self.workspace_service = workspace_service
         self.checkpoint_pager = checkpoint_pager
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
@@ -255,6 +259,7 @@ class GrpcControlHost:
                 self.derived_result_releaser,
                 self.numerical_environment,
                 self.store_collector,
+                self.workspace_service,
             ),
             self.server,
         )
@@ -341,7 +346,7 @@ def _refuse(context: Any, exc: BaseException) -> Any:
     return context.abort(grpc.StatusCode.INTERNAL, f"{type(exc).__name__}: {exc}"[:1024])
 
 
-class _PreparationServicer:
+class _PreparationServicer(WorkspaceRPC):
     def __init__(
         self,
         compatibility_handler: (
@@ -378,6 +383,7 @@ class _PreparationServicer:
         | None = None,
         numerical_environment: Callable[[], bytes] | None = None,
         store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
+        workspace_service: WorkspaceService | None = None,
     ) -> None:
         self.compatibility_handler = compatibility_handler
         self.package_handler = package_handler
@@ -392,6 +398,7 @@ class _PreparationServicer:
         self.derived_result_releaser = derived_result_releaser
         self.numerical_environment = numerical_environment
         self.store_collector = store_collector
+        self.workspace_service = workspace_service
 
     def ProtocolInfo(
         self, _request: pb.ProtocolInfoRequest, _context: Any
