@@ -7,7 +7,7 @@ import inspect
 from collections.abc import Awaitable, Callable, Generator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, ParamSpec, TypeVar, cast
+from typing import Any, ParamSpec, TypeVar, cast, overload
 
 import msgspec
 
@@ -35,20 +35,41 @@ class _Export:
     implementation: Callable[..., object]
     module: str
     name: str
+    reusable: bool = False
 
 
-def invocable[**P, R](fn: Callable[P, Awaitable[R]], /) -> Callable[P, Awaitable[R]]:
+@overload
+def invocable[**P, R](
+    fn: Callable[P, Awaitable[R]], /, *, reusable: bool = False
+) -> Callable[P, Awaitable[R]]: ...
+
+
+@overload
+def invocable[**P, R](
+    *, reusable: bool = False
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]: ...
+
+
+def invocable[**P, R](
+    fn: Callable[P, Awaitable[R]] | None = None, /, *, reusable: bool = False
+) -> Callable[P, Awaitable[R]] | Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
     """Mark an asynchronous implementation; explicitly register it on the package App.
 
     Calling this exported name always reserves a managed call. App registration keeps
     the implementation privately for ordinary admitted dispatch; importing a module
     never registers it or resolves a package/environment.
     """
+    if type(reusable) is not bool:
+        raise ConformanceError(
+            "invocable reuse declaration must be a boolean", code="invocable_reusable"
+        )
+    if fn is None:
+        return lambda target: invocable(target, reusable=reusable)
     if not inspect.iscoroutinefunction(fn) or "<locals>" in fn.__qualname__:
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
-    export = _Export(fn, fn.__module__, fn.__name__)
+    export = _Export(fn, fn.__module__, fn.__name__, reusable)
 
     def proxy(*args: P.args, **kwargs: P.kwargs) -> Awaitable[R]:
         if len(args) != 1 or not isinstance(args[0], Context):
@@ -90,8 +111,11 @@ class _CallType:
 
 
 class _Call[R](Awaitable[R]):
-    def __init__(self, broker: _Broker, index: int, binding: _CallType, payload: bytes):
+    def __init__(
+        self, broker: _Broker, index: int, binding: _CallType, payload: bytes, ctx: Context
+    ):
         self.broker, self.index, self.binding, self.payload = broker, index, binding, payload
+        self.ctx = ctx
         self.task: asyncio.Task[R] | None = None
 
     def __await__(self) -> Generator[Any, None, R]:
@@ -143,7 +167,7 @@ class _Broker:
             ) from exc
         if len(payload) > MAX_CALL_BYTES:
             raise CapabilityError("package call exceeds inline bound", code="child_payload_bound")
-        call = _Call[Any](self, len(self.calls), binding, payload)
+        call = _Call[Any](self, len(self.calls), binding, payload, ctx)
         self.calls.append(call)
         return call
 
@@ -153,6 +177,7 @@ class _Broker:
         await asyncio.sleep(0)
         try:
             while True:
+                call.ctx.raise_if_cancelled()
                 if self.closed:
                     raise ChildCallError("escaped_handle", "parent attempt closed", call.index)
                 for ready in self.calls:

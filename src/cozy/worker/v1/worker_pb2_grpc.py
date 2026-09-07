@@ -785,6 +785,11 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
                 _registered_method=True)
+        self.ModelSourceAdopt = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ModelSourceAdopt',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceAdoptCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
+                _registered_method=True)
         self.CheckpointPage = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/CheckpointPage',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageCall.SerializeToString,
@@ -798,6 +803,11 @@ class PodHostStub(object):
         self.LocalPackageFetch = channel.unary_stream(
                 '/cozy.worker.v1.PodHost/LocalPackageFetch',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFetchCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
+                _registered_method=True)
+        self.LocalPackageUpload = channel.stream_stream(
+                '/cozy.worker.v1.PodHost/LocalPackageUpload',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageUploadFrame.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
                 _registered_method=True)
         self.LocalPackageAbort = channel.unary_unary(
@@ -883,6 +893,12 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ModelSourceAdopt(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def CheckpointPage(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -896,6 +912,12 @@ class PodHostServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def LocalPackageFetch(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def LocalPackageUpload(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -952,6 +974,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepareCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.SerializeToString,
             ),
+            'ModelSourceAdopt': grpc.unary_unary_rpc_method_handler(
+                    servicer.ModelSourceAdopt,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceAdoptCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.SerializeToString,
+            ),
             'CheckpointPage': grpc.unary_unary_rpc_method_handler(
                     servicer.CheckpointPage,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckpointPageCall.FromString,
@@ -965,6 +992,11 @@ def add_PodHostServicer_to_server(servicer, server):
             'LocalPackageFetch': grpc.unary_stream_rpc_method_handler(
                     servicer.LocalPackageFetch,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFetchCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.SerializeToString,
+            ),
+            'LocalPackageUpload': grpc.stream_stream_rpc_method_handler(
+                    servicer.LocalPackageUpload,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageUploadFrame.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.SerializeToString,
             ),
             'LocalPackageAbort': grpc.unary_unary_rpc_method_handler(
@@ -1181,6 +1213,33 @@ class PodHost(object):
             _registered_method=True)
 
     @staticmethod
+    def ModelSourceAdopt(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ModelSourceAdopt',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourceAdoptCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ModelSourcePrepared.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def CheckpointPage(request,
             target,
             options=(),
@@ -1250,6 +1309,33 @@ class PodHost(object):
             target,
             '/cozy.worker.v1.PodHost/LocalPackageFetch',
             cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFetchCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def LocalPackageUpload(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/cozy.worker.v1.PodHost/LocalPackageUpload',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageUploadFrame.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.LocalPackageFileStatus.FromString,
             options,
             channel_credentials,

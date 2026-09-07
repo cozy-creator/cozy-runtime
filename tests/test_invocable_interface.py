@@ -33,7 +33,7 @@ class Result(msgspec.Struct, frozen=True):
     detail: Detail
 
 
-@invocable
+@invocable(reusable=True)
 async def transform(ctx: Context, *, text: str, count: int = 2) -> Result:
     ctx.raise_if_cancelled()
     return Result(text * count, Detail(len(text) * count))
@@ -75,6 +75,7 @@ def test_invocable_dispatch_uses_private_body_and_export_requires_owner(tmp_path
     assert result is not None and result.result == Result("hihi", Detail(4))
     descriptor = package_interface.read_bytes(raw)["jobs"][0]
     assert descriptor["invocable"]["defaults"] == {"request/count": 2}
+    assert descriptor["invocable"]["reusable"] is True
     assert descriptor["invocable"]["type_names"]["result/detail"] == "Detail"
 
 

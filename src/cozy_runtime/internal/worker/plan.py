@@ -222,6 +222,7 @@ class JobBinding:
     config channel and never from environment (§2)."""
     cap_micro_usd: int = 0
     reclaim_on_terminal: bool = True
+    call_interfaces: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def read(cls, record: dict[str, Any]) -> JobBinding:

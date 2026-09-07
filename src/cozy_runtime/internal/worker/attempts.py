@@ -50,6 +50,7 @@ from cozy_runtime.internal import canonical, fill, package_interface, seam
 from cozy_runtime.internal import weights_sink as weights_bridge
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
+from cozy_runtime.internal.worker.calls import Calls
 from cozy_runtime.internal.worker.child import Executor, ExecutorGone, ExecutorSupervision
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
@@ -268,6 +269,8 @@ class AttemptSlot:
     lane_id: str
     #: what the executor on this slot was sealed to see (`CUDA_VISIBLE_DEVICES`)
     devices: str = ""
+    job_device_count: int = 0
+    orchestration: bool = False
 
 
 @dataclass(slots=True)
@@ -475,6 +478,7 @@ class AttemptEngine:
         self.records = records
         self.authorizer = authorizer
         self.jobs = dict(jobs)
+        self.calls: Calls | None = None
         self.job_device_count = 0
         self.spool_root = spool_root
         self.instance_id = instance_id
@@ -1029,7 +1033,7 @@ class AttemptEngine:
                 "rss": int(caps.get("max_rss_bytes", 0)),
                 "disk": int(caps.get("max_disk_bytes", 0)),
             },
-            device_count=self.job_device_count,
+            device_count=slot.job_device_count,
         )
         attempt.plan = plan
         # A job's scratch is the RUN's, granted by the owner as `tmp/<request-id>/` and
@@ -1445,6 +1449,14 @@ class AttemptEngine:
     def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Dispatch the existing executor control request lane by typed operation."""
         kind = str(frame.get("kind", ""))
+        if kind in ("child_call", "child_poll", "child_cancel"):
+            if self.calls is None:
+                return {
+                    "ok": False,
+                    "code": "child_broker_absent",
+                    "detail": "no RecordOwner call lane",
+                }
+            return self.calls.handle(attempt, frame)
         if kind == "checkpoint":
             return self.checkpoint_exchange(attempt, frame)
         if self.weights is None or attempt.spool is None:
@@ -1653,6 +1665,7 @@ class AttemptEngine:
                 "application": attempt.job.application,
                 "package_interface": attempt.job.package_interface,
                 "job": attempt.job.job,
+                "call_interfaces": self.calls.bindings(attempt) if self.calls is not None else [],
                 "payload": attempt.payload,
                 "deadline_s": seconds,
                 "spool": str(spool),
@@ -1675,7 +1688,7 @@ class AttemptEngine:
                 "weights_work_fingerprint": attempt.weights_work_fingerprint,
                 "budget": {
                     "gpu_rate_micro_usd_per_hour": attempt.job.gpu_rate_micro_usd_per_hour,
-                    "gpu_count": self.job_device_count,
+                    "gpu_count": self.slot_of(attempt).job_device_count,
                     "cap_micro_usd": attempt.job.cap_micro_usd,
                 },
             }

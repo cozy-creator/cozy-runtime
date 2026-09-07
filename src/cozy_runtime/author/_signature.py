@@ -97,6 +97,7 @@ class Surface:
     """DECLARED but NOT PUBLISHED (#572d). Hidden callables stay in the local registry but
     are absent from the package interface, so no binding is staged and no request reaches them."""
     invocable: bool = False
+    reusable: bool = False
 
     @property
     def model_params(self) -> tuple[str, ...]:
@@ -193,6 +194,7 @@ def analyze(
     preflight: Callable[..., object] | None = None,
     hidden: bool = False,
     invocable: bool = False,
+    reusable: bool = False,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal."""
     where = f"{fn.__module__}:{fn.__qualname__}"
@@ -332,6 +334,7 @@ def analyze(
         preflight=spec,
         hidden=hidden,
         invocable=invocable,
+        reusable=reusable,
     )
 
 

@@ -66,6 +66,8 @@ def metadata(surface: Surface) -> dict[str, Any]:
         "defaults": defaults,
         "type_names": names,
         "enum_members": enums,
+        "reusable": surface.reusable,
+        "capabilities": sorted(surface.capabilities),
     }
 
 
@@ -75,10 +77,38 @@ def _identifier(value: object) -> bool:
 
 def validate(value: object, request: Any, result: Any) -> dict[str, Any]:
     """Validate every token the pure generator can turn into Python source."""
-    keys = {"module", "export", "context", "parameters", "defaults", "type_names", "enum_members"}
+    keys = {
+        "module",
+        "export",
+        "context",
+        "parameters",
+        "defaults",
+        "type_names",
+        "enum_members",
+        "reusable",
+        "capabilities",
+    }
     if not isinstance(value, dict) or set(value) != keys:
         raise ConformanceError(
             "invocable metadata has unknown or missing fields", code="invocable_interface"
+        )
+    if type(value["reusable"]) is not bool:
+        raise ConformanceError(
+            "invocable reuse declaration must be a boolean", code="invocable_interface"
+        )
+    capabilities = value["capabilities"]
+    if (
+        not isinstance(capabilities, list)
+        or not all(isinstance(capability, str) for capability in capabilities)
+        or capabilities != sorted(set(capabilities))
+    ):
+        raise ConformanceError(
+            "invocable capabilities must be sorted unique names", code="invocable_interface"
+        )
+    if value["reusable"] and set(capabilities) & {"egress", "secrets"}:
+        raise ConformanceError(
+            "reusable interface declares external or secret-dependent work",
+            code="invocable_reusable_effect",
         )
     if (
         not isinstance(value["module"], str)

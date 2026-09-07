@@ -36,11 +36,12 @@ def generate(interface: bytes) -> dict[str, bytes]:
         raise ConformanceError(
             "package declares no invocable exports", code="interface_exports_absent"
         )
-    files: dict[str, bytes] = {"py.typed": b""}
+    files: dict[str, bytes] = {}
     for module, entries in sorted(modules.items()):
         code = _module(module, entries, digest)
-        is_package = any(other.startswith(module + ".") for other in modules)
-        path = module.replace(".", "/") + ("/__init__.py" if is_package else ".py")
+        # A package-local marker never collides with another interface wheel's
+        # top-level py.typed. Public import spelling remains the exact module.
+        path = module.replace(".", "/") + "/__init__.py"
         files[path] = code.encode()
         stub = ast.parse(code)
         for node in ast.walk(stub):
@@ -50,7 +51,7 @@ def generate(interface: bytes) -> dict[str, bytes]:
         parts = module.split(".")
         for index in range(1, len(parts)):
             files.setdefault("/".join(parts[:index]) + "/__init__.py", b"")
-        files[parts[0] + "/py.typed" if len(parts) > 1 or is_package else "py.typed"] = b""
+        files[parts[0] + "/py.typed"] = b""
     return files
 
 
