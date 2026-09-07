@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -10,11 +11,11 @@ import pytest
 from cozy_runtime.internal import derive_child
 
 
-def test_declared_job_source_skips_load_but_empty_serving_still_refuses(tmp_path: Path) -> None:
-    pytest.importorskip("torch")
+@pytest.fixture
+def source_project(tmp_path: Path) -> Path:
     (tmp_path / "source_kind.py").write_text("""
 import msgspec
-from cozy_runtime.author import App, Model
+from cozy_runtime.author import App, Model, uses_components
 app = App()
 class Source(Model[object]):
     def load(self, loader):
@@ -22,6 +23,16 @@ class Source(Model[object]):
 class EmptyServing(Model[object]):
     def load(self, loader):
         pass
+class LinearPipeline:
+    def __init__(self):
+        import torch
+        self.components = {"linear": torch.nn.Linear(2, 3)}
+class Serving(Model[LinearPipeline]):
+    def load(self, loader):
+        self.pipe = loader.construct(LinearPipeline, factory=lambda config: LinearPipeline())
+    @uses_components("linear")
+    def sample(self) -> int:
+        return 3
 class Request(msgspec.Struct):
     value: int = 1
 class Result(msgspec.Struct):
@@ -32,24 +43,66 @@ def produce(payload: Request, source: Source) -> Result:
 @app.entrypoint
 def generate(payload: Request, model: EmptyServing) -> Result:
     return Result(payload.value)
+@app.entrypoint
+def linear(payload: Request, model: Serving) -> Result:
+    return Result(model.sample())
 """)
     (tmp_path / "package.toml").write_text('[application]\nobject = "source_kind:app"\n')
+    return tmp_path
+
+
+def test_declared_job_source_skips_load(source_project: Path) -> None:
     source = derive_child.DeriveRequest(
-        (derive_child.SlotRequest("produce.models.source", b"{}"),), project=tmp_path
+        (derive_child.SlotRequest("produce.models.source", b"{}"),), project=source_project
     )
     assert derive_child.derive_in(Path(sys.executable), source) == (
         derive_child.SourceSlot("produce.models.source"),
     )
-    serving = derive_child.DeriveRequest(
-        (derive_child.SlotRequest("generate.models.model", b"{}"),), project=tmp_path
-    )
-    with pytest.raises(derive_child.DeriveRefusal, match="requirements shape"):
-        derive_child.derive_in(Path(sys.executable), serving)
     unknown = derive_child.DeriveRequest(
-        (derive_child.SlotRequest("absent.models.source", b"{}"),), project=tmp_path
+        (derive_child.SlotRequest("absent.models.source", b"{}"),), project=source_project
     )
     with pytest.raises(derive_child.DeriveRefusal, match="no model slot"):
         derive_child.derive_in(Path(sys.executable), unknown)
+
+
+def test_ordinary_torch_model_derives_and_empty_serving_refuses(source_project: Path) -> None:
+    pytest.importorskip("torch")
+    serving = derive_child.DeriveRequest(
+        (derive_child.SlotRequest("linear.models.model", b"{}"),), project=source_project
+    )
+    assert derive_child.derive_in(Path(sys.executable), serving) == (
+        derive_child.TensorRequirements(
+            "linear.models.model",
+            (("linear", "bias", "f32", (3,)), ("linear", "weight", "f32", (3, 2))),
+            ("linear",),
+        ),
+    )
+    empty = derive_child.DeriveRequest(
+        (derive_child.SlotRequest("generate.models.model", b"{}"),), project=source_project
+    )
+    with pytest.raises(derive_child.DeriveRefusal, match="requirements shape"):
+        derive_child.derive_in(Path(sys.executable), empty)
+
+
+@pytest.mark.parametrize("error", ["RuntimeError", "ModuleNotFoundError"])
+def test_installed_broken_torch_import_is_not_hidden(tmp_path: Path, error: str) -> None:
+    package = tmp_path / "torch"
+    package.mkdir()
+    (package / "__init__.py").write_text(f'raise {error}("torch import failure")\n')
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); "
+            "from cozy_runtime.internal.derive_child import _warm_torch; _warm_torch()",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert f"{error}: torch import failure" in result.stderr
 
 
 def test_source_response_partition_is_exact() -> None:
