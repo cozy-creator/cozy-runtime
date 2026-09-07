@@ -55,7 +55,9 @@ def finalize(
                     request_id=row["request"],
                     attempt=row["ordinal"],
                     digest=row["spec"],
-                    spec=documents.read(row["invocation"], pb.InvocationSpec),
+                    spec=documents.read(row["invocation"], pb.InvocationSpec)
+                    if row["invocation"]
+                    else {},
                     state="closed"
                     if row["state"] == "released"
                     else "outcome"
