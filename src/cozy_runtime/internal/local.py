@@ -1051,8 +1051,11 @@ def development_placement_documents(
     if not isinstance(entries, list):
         raise RuntimeError("a local serving closure requires an PackageInterface entrypoint set")
     visible: list[Mapping[str, Any]] = [entry for entry in entries if isinstance(entry, Mapping)]
-    if not visible:
-        raise RuntimeError("a local serving closure requires at least one visible entrypoint")
+    jobs = interface.get("jobs", [])
+    if not visible and not (
+        isinstance(jobs, list) and any(isinstance(job, Mapping) for job in jobs)
+    ):
+        raise RuntimeError("a local package requires at least one visible entrypoint or job")
     if package.count("/") != 1 or not all(package.split("/")) or not release:
         raise RuntimeError("development package identity or release is invalid")
     try:
