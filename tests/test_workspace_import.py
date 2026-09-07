@@ -16,7 +16,14 @@ import tensorfs
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal.weights_sink import protocol_receipt, weights_transaction_id
+from cozy_runtime.author import WeightsPart, WeightsReceipt, WeightsTarget, WeightsTensor
+from cozy_runtime.author._weights import WeightsCommit
+from cozy_runtime.internal.weights_sink import (
+    WeightsHostBinding,
+    WeightsTransactionHost,
+    protocol_receipt,
+    weights_transaction_id,
+)
 from cozy_runtime.internal.worker.downloads import verify_claim_proof
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_import import activate, receive
@@ -604,3 +611,123 @@ def test_unqualified_attempt_cannot_supply_a_memo_mapping(tmp_path: Path) -> Non
         receive(workspace, frames([("attempt", source), ("cache", memo)], auth), auth)
     with workspace.locked(allow_frozen=True) as db:
         assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 0
+
+
+def test_native_commit_before_old_receipt_is_replayed_without_new_writer(tmp_path: Path) -> None:
+    store, workspace, records = native_export(tmp_path)
+    auth = Authority()
+    attempt = dict(
+        records[0][1], state="running", outcome_id="", outcome_digest="", outcome_canonical_bytes=""
+    )
+    weights = dict(
+        records[1][1],
+        state="intent",
+        receipt_digest="",
+        receipt_canonical_bytes="",
+        manifest_digest="",
+        manifest_length=0,
+        objects=[],
+    )
+    before = store.derived_lookup(weights["transaction_id"])
+    assert before["state"] == "committed"
+    reply = receive(workspace, frames([("attempt", attempt), ("weights", weights)], auth), auth)
+    activate(
+        workspace,
+        pb.WorkspaceActivationCall(claim=auth.claim, migration_id=reply.migration_id),
+        auth,
+    )
+    spec = documents.raw(attempt["invocation_spec_digest"])
+    workspace.accept(
+        "owner",
+        pb.AttemptOffer(
+            request_id="producer",
+            attempt_ordinal=2,
+            invocation_spec_digest=spec,
+            invocation_spec_canonical_bytes=base64.b64decode(
+                attempt["invocation_spec_canonical_bytes"]
+            ),
+        ),
+    )
+    assigned = {}
+
+    def bind(slot: str, transaction: str, digest: bytes, declaration: bytes) -> WeightsHostBinding:
+        row = workspace.begin_weights(
+            "owner",
+            pb.WeightsIntentFrame(
+                request_id="producer",
+                attempt_ordinal=2,
+                invocation_spec_digest=spec,
+                output_slot=slot,
+                weights_transaction_id=transaction,
+                tensorfs_declaration_digest=digest,
+                tensorfs_declaration_canonical_bytes=declaration,
+            ),
+        )
+        assigned.update(row)
+        return WeightsHostBinding(transaction, int(row["epoch"]))
+
+    def record(receipt: WeightsReceipt) -> None:
+        reference, _, _ = protocol_receipt(
+            receipt,
+            owner_scope="owner",
+            request_id="producer",
+            invocation_spec_digest=documents.spell(spec),
+        )
+        manifest = json.loads(receipt.tensorfs_receipt)["manifest"]
+        workspace.record_receipt(
+            "owner",
+            pb.WeightsReceiptFrame(
+                request_id="producer",
+                attempt_ordinal=2,
+                invocation_spec_digest=spec,
+                output_slot="model",
+                weights_transaction_id=receipt.weights_transaction_id,
+                writer_epoch=int(assigned["epoch"]),
+                tensorfs_declaration_digest=assigned["declaration_digest"],
+                weights_receipt=reference,
+                manifest=pb.Ref(
+                    digest=bytes.fromhex(manifest["sha256"]), length=manifest["length"]
+                ),
+            ),
+        )
+
+    plain = next(value for alias, value in tensorfs.seed_digests() if alias == "plain/1")
+    producer = WeightsTransactionHost(
+        store=store,
+        owner_scope="owner",
+        request_id="producer",
+        invocation_spec_digest=documents.spell(spec),
+        work_fingerprint="sha256:" + "42" * 32,
+        writer_session_id=2,
+        allowed_sources={},
+        output_bounds={"model": 2048},
+        bind_intent=bind,
+        record_receipt=record,
+    )
+    opened = producer.open(
+        WeightsCommit(
+            output_slot="model",
+            sources={},
+            configs={},
+            targets={
+                "model": WeightsTarget(
+                    add={
+                        "weight": WeightsTensor(
+                            logical_dtype="f32",
+                            shape=(512,),
+                            encoding=plain,
+                            parts={"value": WeightsPart(dtype="f32", shape=(512,))},
+                        )
+                    }
+                )
+            },
+            order=(("model", "weight"),),
+            max_new_bytes=2048,
+        )
+    )
+    assert opened.replayed and opened.completed_parts == frozenset({("model", "weight", "value")})
+    assert store.derived_lookup(weights["transaction_id"]) == before
+    with workspace.locked() as db:
+        row = db.execute("SELECT * FROM weights").fetchone()
+        assert row["state"] == "receipt" and row["epoch"] == 2
+        assert row["receipt"] == base64.b64decode(records[1][1]["receipt_canonical_bytes"])
