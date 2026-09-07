@@ -156,7 +156,18 @@ class App:
         )
 
     @overload
-    def job(self, fn: Callable[P, R], /) -> Callable[P, R]: ...
+    def job(
+        self,
+        fn: Callable[P, R],
+        /,
+        *,
+        name: str | None = None,
+        publishes: bool = False,
+        emits_media: bool = False,
+        weights: tuple[WeightsOutput, ...] = (),
+        source_profiles: Mapping[str, str] | None = None,
+        demand: Bound | None = None,
+    ) -> Callable[P, R]: ...
 
     @overload
     def job(

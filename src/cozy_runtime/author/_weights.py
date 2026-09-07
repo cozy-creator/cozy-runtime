@@ -598,9 +598,9 @@ class WeightsSink:
                 f"weights output {output!r} was already committed by this attempt",
                 code="weights_output_repeated",
             )
-        if not sources or len(sources) > MAX_WEIGHTS_SOURCES:
+        if len(sources) > MAX_WEIGHTS_SOURCES:
             raise CapabilityError(
-                f"weights source count is outside 1..={MAX_WEIGHTS_SOURCES}",
+                f"weights source count is outside 0..={MAX_WEIGHTS_SOURCES}",
                 code="weights_source_count",
             )
         selected: dict[str, str] = {}

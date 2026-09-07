@@ -20,6 +20,11 @@ from cozy_runtime.author import (
     Model,
     ModelArtifact,
     ObjectRef,
+    WeightsOutput,
+    WeightsPart,
+    WeightsSink,
+    WeightsTarget,
+    WeightsTensor,
     attempt,
     describe,
     invocable,
@@ -55,6 +60,56 @@ async def consume(ctx: Context, *, source: Source) -> Result:
 @invocable(reusable=True)
 async def echo(ctx: Context, *, value: ModelArtifact) -> ModelArtifact:
     return value
+
+
+@invocable(reusable=True)
+async def produce(ctx: Context, *, weights: WeightsSink) -> ModelArtifact:
+    plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
+    with weights.open(
+        "result",
+        sources={},
+        targets={
+            "model": WeightsTarget(
+                add={
+                    "weight": WeightsTensor(
+                        "f32", (512,), plain, {"value": WeightsPart("f32", (512,))}
+                    )
+                }
+            )
+        },
+        configs={},
+        order=(("model", "weight"),),
+    ) as writer:
+        writer.add_part("model", "weight", "value", b"\x31" * 2048)
+        return writer.commit().artifact
+
+
+def test_author_native_creation_call_returns_its_model_artifact(tmp_path: Path) -> None:
+    from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+
+    store = tensorfs.Store.init(tmp_path / "store")
+    host = WeightsTransactionHost(
+        store=store,
+        owner_scope="owner",
+        request_id="request",
+        invocation_spec_digest="sha256:" + "11" * 32,
+        work_fingerprint="sha256:" + "12" * 32,
+        writer_session_id=1,
+        allowed_sources={},
+        output_bounds={"result": 2048},
+    )
+    app = App()
+    app.job(produce, weights=(WeightsOutput("result", 2048),))
+    describe(app)
+    result, outcome, _ = attempt(
+        app.get("produce"),
+        {},
+        Invocation("request", tmp_path / "spool", time.monotonic() + 5, weights=host.open),
+    )
+    assert outcome.terminal == "succeeded", outcome
+    assert result is not None and isinstance(result.result, ModelArtifact)
+    assert result.result.producer_request_id == "request"
+    assert store.manifest(result.result.manifest.digest)
 
 
 def test_model_proxy_is_an_exact_artifact_and_dispatch_checks_bound_model(tmp_path: Path) -> None:
