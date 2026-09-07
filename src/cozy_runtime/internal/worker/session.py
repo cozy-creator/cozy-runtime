@@ -98,6 +98,7 @@ from cozy_runtime.internal.worker.control import (
     ControlHost,
     GrpcControlHost,
     WatchFanout,
+    _loopback_preparation_listener,
 )
 from cozy_runtime.internal.worker.lanes import (
     LANE_RELEASED,
@@ -1808,6 +1809,17 @@ class Worker:
             verified=mark_verified,
             job_plan_root=self.config.cozy_home / "job-plans",
             base=self.base,
+        )
+
+    def numerical_environment(self) -> bytes:
+        from cozy_runtime.internal.numerical_environment import fingerprint
+
+        return fingerprint(
+            self.base,
+            hostfacts.measure(self.options.accelerator_backend),
+            threads=self.options.threads,
+            alloc_conf=self.options.alloc_conf,
+            inherited=dict(self.config.child_base_env),
         )
 
     def prepare_model_source(
@@ -6228,6 +6240,8 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         listen, Path(args.root) / "control.addr", tls_cert=tls_cert, tls_key=tls_key
     )
     worker = Worker(config, options, host)
+    if _loopback_preparation_listener(listen):
+        host.numerical_environment = worker.numerical_environment
 
     def terminate(signum: int, frame: object) -> None:
         worker.request_stop()
