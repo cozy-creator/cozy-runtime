@@ -64,7 +64,9 @@ def _heads(store: Any, fixture: dict[str, Any]) -> list[Any]:
     ]
 
 
-def test_restart_preserves_native_sources_and_normal_stop_releases_them(tmp_path: Path) -> None:
+def test_restart_and_normal_recycle_preserve_sources_until_explicit_owner_release(
+    tmp_path: Path,
+) -> None:
     store, fixture = _fixture(tmp_path)
     expected = sorted([fixture["operation"], fixture["open_operation"]])
     before = _heads(store, fixture)
@@ -79,6 +81,14 @@ def test_restart_preserves_native_sources_and_normal_stop_releases_them(tmp_path
     replacement = _worker(tmp_path, owns=True, required=True)
     assert sorted(replacement.model_source_operations) == expected
     replacement.shutdown()  # no source prepare was replayed in this process
+    assert store.model_source_operations() == expected
+    assert _heads(store, fixture) == before
+    owner = _worker(tmp_path, owns=True, required=True)
+    owner.release_model_source(fixture["open_operation"])
+    assert store.model_source_operations() == [fixture["operation"]]
+    assert _heads(store, fixture) == before
+    owner.release_model_source(fixture["operation"])
+    owner.shutdown()
     assert store.model_source_operations() == []
 
 
@@ -153,12 +163,11 @@ def test_queued_preparation_observes_stop_after_acquiring_lock(
         result = pending.result(timeout=5)
     assert result.outcome == pb.MODEL_SOURCE_PREPARE_OUTCOME_REFUSED
     assert result.safe_code == "model_source_preparer_unavailable"
-    assert store.model_source_operations() == (operations if restart else [])
-    if restart:
-        assert _heads(store, fixture) == pages
-        replacement = _worker(tmp_path, owns=True, required=True)
-        replacement.shutdown()
-        assert store.model_source_operations() == []
+    assert store.model_source_operations() == operations
+    assert _heads(store, fixture) == pages
+    replacement = _worker(tmp_path, owns=True, required=True)
+    replacement.shutdown()
+    assert store.model_source_operations() == operations
 
 
 def test_refused_restart_history_keeps_source_operations(tmp_path: Path) -> None:
