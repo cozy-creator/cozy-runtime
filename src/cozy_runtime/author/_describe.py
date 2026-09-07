@@ -162,10 +162,10 @@ def check(surface: Surface) -> Surface:
     """Every build-time refusal that needs the WHOLE surface, not just one signature."""
     assert_declaration_shape(surface.payload_type)
     assert_declaration_shape(surface.result_type)
-    if surface.reusable and surface.capabilities & {"egress", "secrets"}:
+    if surface.memoize and surface.capabilities & {"egress", "secrets"}:
         raise ConformanceError(
-            "a reusable invocable cannot depend on external egress or unrecorded secrets",
-            code="invocable_reusable_effect",
+            "a memoized invocable cannot depend on external egress or unrecorded secrets",
+            code="invocable_memoize_effect",
         )
     specs = feature_specs(surface.payload_type)
     _grantable(surface)

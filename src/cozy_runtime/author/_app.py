@@ -62,7 +62,7 @@ class Registration:
     kind: Kind
     fn: Callable[..., object]
     invocable: bool = False
-    reusable: bool = False
+    memoize: bool = False
     publishes: bool = False
     emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
@@ -97,7 +97,7 @@ class Registration:
                 preflight=self.preflight,
                 hidden=self.hidden,
                 invocable=self.invocable,
-                reusable=self.reusable,
+                memoize=self.memoize,
             )
         return self._surface
 
@@ -247,7 +247,7 @@ class App:
                 kind=kind,
                 fn=export.implementation if (export := _export(target)) else target,
                 invocable=export is not None,
-                reusable=export.reusable if export is not None else False,
+                memoize=export.memoize if export is not None else False,
                 publishes=publishes,
                 emits_media=emits_media,
                 weights_outputs=weights_outputs,

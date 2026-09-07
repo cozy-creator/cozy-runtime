@@ -51,18 +51,18 @@ class Result(msgspec.Struct):
     manifest: str
 
 
-@invocable(reusable=True)
+@invocable(memoize=True)
 async def consume(ctx: Context, *, source: Source) -> Result:
     ctx.raise_if_cancelled()
     return Result(source.checkpoint_ref)
 
 
-@invocable(reusable=True)
+@invocable(memoize=True)
 async def echo(ctx: Context, *, value: ModelArtifact) -> ModelArtifact:
     return value
 
 
-@invocable(reusable=True)
+@invocable(memoize=True)
 async def produce(ctx: Context, *, weights: WeightsSink) -> ModelArtifact:
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
     with weights.open(

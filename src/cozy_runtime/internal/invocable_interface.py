@@ -71,7 +71,7 @@ def metadata(surface: Surface) -> dict[str, Any]:
         "defaults": defaults,
         "type_names": names,
         "enum_members": enums,
-        "reusable": surface.reusable,
+        "memoize": surface.memoize,
         "capabilities": sorted(surface.capabilities),
     }
 
@@ -90,16 +90,16 @@ def validate(value: object, request: Any, result: Any) -> dict[str, Any]:
         "defaults",
         "type_names",
         "enum_members",
-        "reusable",
+        "memoize",
         "capabilities",
     }
     if not isinstance(value, dict) or set(value) != keys:
         raise ConformanceError(
             "invocable metadata has unknown or missing fields", code="invocable_interface"
         )
-    if type(value["reusable"]) is not bool:
+    if type(value["memoize"]) is not bool:
         raise ConformanceError(
-            "invocable reuse declaration must be a boolean", code="invocable_interface"
+            "invocable memoization declaration must be a boolean", code="invocable_interface"
         )
     capabilities = value["capabilities"]
     if (
@@ -110,10 +110,10 @@ def validate(value: object, request: Any, result: Any) -> dict[str, Any]:
         raise ConformanceError(
             "invocable capabilities must be sorted unique names", code="invocable_interface"
         )
-    if value["reusable"] and set(capabilities) & {"egress", "secrets"}:
+    if value["memoize"] and set(capabilities) & {"egress", "secrets"}:
         raise ConformanceError(
-            "reusable interface declares external or secret-dependent work",
-            code="invocable_reusable_effect",
+            "memoized interface declares external or secret-dependent work",
+            code="invocable_memoize_effect",
         )
     if (
         not isinstance(value["module"], str)

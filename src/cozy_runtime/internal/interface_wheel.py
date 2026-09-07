@@ -17,7 +17,7 @@ from packaging.version import Version
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical, invocable_interface, package_interface
 
-GENERATOR_ABI = "cozy.interface-generator/2"
+GENERATOR_ABI = "cozy.interface-generator/3"
 _DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -247,7 +247,7 @@ def build(
     files[dist + "/package-interface.json"] = interface
     files[dist + "/METADATA"] = (
         "Metadata-Version: 2.4\n" + f"Name: {distribution}\nVersion: {version}\n"
-        "Requires-Python: >=3.12,<3.13\nRequires-Dist: cozy-runtime>=0.3.0\n"
+        "Requires-Python: >=3.12,<3.13\nRequires-Dist: cozy-runtime>=0.4.0\n"
         f"Cozy-Interface-Generator: {GENERATOR_ABI}\n"
         f"Cozy-Implementation-Digest: {implementation_digest}\n\n"
     ).encode()
