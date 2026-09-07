@@ -53,6 +53,14 @@ class _ScriptCompleted(msgspec.Struct):
     pass
 
 
+def _contains_yield(node: ast.AST) -> bool:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+        return False  # A nested generator does not make main itself a generator.
+    if isinstance(node, (ast.Yield, ast.YieldFrom)):
+        return True
+    return any(_contains_yield(child) for child in ast.iter_child_nodes(node))
+
+
 def script_app(module: str) -> App:
     """Creator's generated adapter. Discovery reads syntax without executing the script.
 
@@ -81,6 +89,11 @@ def script_app(module: str) -> App:
         raise ConformanceError(
             "script must define one main() or main(ctx)", code="script_main_missing"
         )
+    if any(_contains_yield(statement) for statement in mains[0].body):
+        raise ConformanceError(
+            "script main must execute normally, not yield a generator",
+            code="script_main_signature",
+        )
     args = mains[0].args
     positional = [*args.posonlyargs, *args.args]
     parameters = [*positional, *args.kwonlyargs]
@@ -108,6 +121,10 @@ def script_app(module: str) -> App:
             result = function(ctx=context) if keyword_context else function(context)
         else:
             result = function()
+        if inspect.isgenerator(result) or inspect.isasyncgen(result):
+            raise ConformanceError(
+                "script main returned an unexecuted generator", code="script_main_signature"
+            )
         if inspect.isawaitable(result):
 
             async def wait() -> None:

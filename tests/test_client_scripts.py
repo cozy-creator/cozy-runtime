@@ -40,7 +40,15 @@ def test_plain_main_executes_only_inside_attempt(
 
 
 @pytest.mark.parametrize(
-    "body", ["def other(): pass", "def main(value): pass", "def main(*args): pass"]
+    "body",
+    [
+        "def other(): pass",
+        "def main(value): pass",
+        "def main(*args): pass",
+        "def main():\n    raise ValueError('quality gate')\n    yield 1",
+        "async def main():\n    raise ValueError('quality gate')\n    yield 1",
+        "def main():\n    yield from [1]",
+    ],
 )
 def test_script_entrypoint_shape_refuses_without_import(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
@@ -50,6 +58,38 @@ def test_script_entrypoint_shape_refuses_without_import(
     importlib.invalidate_caches()
     with pytest.raises(ConformanceError):
         script_app("bad_script")
+
+
+def test_nested_generator_does_not_change_main_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "nested_generator_script.py").write_text(
+        "def main():\n    def values():\n        yield 7\n    assert list(values()) == [7]\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    app = script_app("nested_generator_script")
+    _, outcome, _ = attempt(
+        app.get("main"), {}, Invocation("nested", tmp_path / "out", time.monotonic() + 5)
+    )
+    assert outcome.terminal == "succeeded"
+
+
+def test_returned_generator_is_not_reported_as_completed_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "returned_generator_script.py").write_text(
+        "def work():\n"
+        "    raise ValueError('quality gate')\n"
+        "    yield 7\n"
+        "def main():\n"
+        "    return work()\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    app = script_app("returned_generator_script")
+    _, outcome, _ = attempt(
+        app.get("main"), {}, Invocation("generator", tmp_path / "out", time.monotonic() + 5)
+    )
+    assert outcome.terminal == "failed"
 
 
 def test_script_observes_cancellation_before_import(
