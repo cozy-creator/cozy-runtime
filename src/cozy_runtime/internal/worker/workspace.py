@@ -587,11 +587,25 @@ class Workspace:
                 raise WorkspaceRefusal("checkpoint writer attempt has stopped")
             if checkpoint:
                 db.native(lambda: self._validate_checkpoint(row, request.checkpoint))
-            current = db.execute(
-                "SELECT state,epoch FROM weights WHERE id=?", (row["id"],)
+            current = db.execute("SELECT * FROM weights WHERE id=?", (row["id"],)).fetchone()
+            attempt = db.execute(
+                "SELECT state,fenced FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                (owner, row["request"], row["ordinal"]),
             ).fetchone()
-            if current["state"] == "released" or current["epoch"] != row["epoch"]:
+            if (
+                current["state"] == "released"
+                or current["epoch"] != row["epoch"]
+                or current["ordinal"] != row["ordinal"]
+                or attempt is None
+                or attempt["fenced"]
+            ):
                 raise WorkspaceRefusal("writer changed during checkpoint validation")
+            if current["ready"]:
+                if checkpoint != current["restore_checkpoint"]:
+                    raise WorkspaceRefusal("writer readiness already captured another checkpoint")
+                return dict(current)
+            if attempt["state"] not in ("accepted", "running"):
+                raise WorkspaceRefusal("writer stopped during checkpoint validation")
             db.execute(
                 "UPDATE weights SET ready=1,restore_checkpoint=? WHERE id=?",
                 (checkpoint, row["id"]),
@@ -615,24 +629,33 @@ class Workspace:
                 or row["state"] != "intent"
             ):
                 raise WorkspaceRefusal("checkpoint does not belong to the current native writer")
-            if row["checkpoint"]:
-                prior = pb.CheckpointRef.FromString(row["checkpoint"])
-                if (
-                    frame.checkpoint.plan_digest != prior.plan_digest
-                    or frame.checkpoint.index < prior.index
-                    or (frame.checkpoint.index == prior.index and frame.checkpoint != prior)
-                ):
-                    raise WorkspaceRefusal("checkpoint changed or regressed its native chain")
+            self._checkpoint_advances(row["checkpoint"], frame.checkpoint)
             db.native(lambda: self._validate_checkpoint(row, frame.checkpoint))
             current = db.execute(
-                "SELECT state,epoch FROM weights WHERE id=?", (row["id"],)
+                "SELECT state,epoch,ordinal,checkpoint FROM weights WHERE id=?", (row["id"],)
             ).fetchone()
-            if current["state"] != "intent" or current["epoch"] != frame.writer_epoch:
+            if (
+                current["state"] != "intent"
+                or current["epoch"] != frame.writer_epoch
+                or current["ordinal"] != frame.attempt_ordinal
+            ):
                 raise WorkspaceRefusal("writer changed during checkpoint recording")
+            self._checkpoint_advances(current["checkpoint"], frame.checkpoint)
             db.execute(
                 "UPDATE weights SET checkpoint=? WHERE id=?",
                 (frame.checkpoint.SerializeToString(), row["id"]),
             )
+
+    @staticmethod
+    def _checkpoint_advances(previous: bytes, checkpoint: pb.CheckpointRef) -> None:
+        if previous:
+            prior = pb.CheckpointRef.FromString(previous)
+            if (
+                checkpoint.plan_digest != prior.plan_digest
+                or checkpoint.index < prior.index
+                or (checkpoint.index == prior.index and checkpoint != prior)
+            ):
+                raise WorkspaceRefusal("checkpoint changed or regressed its native chain")
 
     def _validate_checkpoint(
         self, row: sqlite3.Row | Mapping[str, Any], checkpoint: pb.CheckpointRef

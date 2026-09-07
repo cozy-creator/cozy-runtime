@@ -110,14 +110,7 @@ class _Servicer:
 
 
 class RuntimeWeightsHost(Protocol):
-    """The Runtime-hosted weights seam (proto-025) the loopback pod-supervisor dials. The
-    supervisor opens `Exchange` per accepted control session — intents and receipts go out on
-    it, host ACKs come back — and calls `Upload` once per granted object. The bodies are the
-    worker's `WeightsExchange`; this is only how they reach the loopback listener."""
-
-    def serve_exchange(
-        self, acks: Iterator[pb.WeightsHostAck]
-    ) -> Iterator[pb.WeightsHostEvent]: ...
+    """A bounded native object upload; custody observations use WorkerControl."""
 
     def upload(self, request: pb.WeightsUploadRequest) -> pb.WorkerFrame: ...
 
@@ -128,7 +121,11 @@ class _RuntimeWeightsServicer:
         self.weights = weights
 
     def Exchange(self, request_iterator: Any, context: Any) -> Any:
-        yield from self.weights.serve_exchange(request_iterator)
+        import grpc
+
+        return context.abort(
+            grpc.StatusCode.UNIMPLEMENTED, "Host writer acknowledgments were retired in wire 41"
+        )
 
     def Upload(self, request: pb.WeightsUploadRequest, context: Any) -> Any:
         # `upload` answers as a WorkerFrame for the pre-21 control lane; the unary RPC wants

@@ -2797,7 +2797,6 @@ class Worker:
             self.connected.set()
             self.bump_admission(f"snapshot {inner.snapshot_id} acknowledged; dispatch opens")
             self.note("session", f"snapshot {inner.snapshot_id} acknowledged; dispatch is open")
-            self.weights.replay_pending(self.fence.control_stream_epoch)
             for attempt in self.engine.pending_outcomes():
                 self.note(
                     "outcome",
@@ -2876,14 +2875,7 @@ class Worker:
             )
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
         elif kind == "weights_host_ack":
-            # The pre-21 host ACK lane on WorkerControl. When the supervisor has opened
-            # RuntimeWeights.Exchange the ACK arrives THERE, and any ACK still arriving here
-            # is stale — `absorb_ack` refuses one whose lane is not the one this exchange
-            # last went out on, so the two lanes never both settle an exchange.
-            try:
-                self.weights.absorb_ack(inner, lane=("control", self.fence.control_stream_epoch))
-            except weights.WeightsExchangeError as exc:
-                self.note("artifact", f"dropped host ACK: {exc.code}: {exc.detail}")
+            self.note("artifact", "retired Host writer acknowledgment ignored")
         elif kind == "child_call_result":
             if not self.calls.absorb(inner):
                 self.note("child", "dropped stale or invalid child-call result")
