@@ -786,17 +786,39 @@ def prepare_private_placement(
         or not isinstance(interface_ref.get("length"), int)
     ):
         raise PreparationRefusal("private_placement_identity_invalid", request.operation_id)
-    try:
-        download_set = documents.read(request.download_delegation, pb.DownloadDelegation)
-    except documents.DocumentError as exc:
-        raise PreparationRefusal("private_placement_download_set_invalid", exc.detail) from exc
-    packages = download_set.get("packages", [])
-    models = download_set.get("models", [])
-    if packages != [] or not isinstance(models, list) or len(models) > 32:
-        raise PreparationRefusal(
-            "private_placement_download_set_invalid",
-            "a private model download set carries no package refs and at most 32 models",
-        )
+    if request.native_models:
+        if request.download_delegation or request.download_delegation_signature:
+            raise PreparationRefusal(
+                "private_placement_access_mixed", "native and downloaded model access are exclusive"
+            )
+        slots = [row.slot for row in request.native_models]
+        if len(slots) > 32 or slots != sorted(set(slots)) or not all(slots):
+            raise PreparationRefusal(
+                "private_placement_native_models_invalid",
+                "native model slots must be unique and sorted",
+            )
+        models = [
+            {
+                "package": str(development["package"]),
+                "slot": row.slot,
+                "model": row.model,
+                "manifest": documents.spell(row.manifest.digest),
+                "manifest_length": row.manifest.length,
+            }
+            for row in request.native_models
+        ]
+    else:
+        try:
+            download_set = documents.read(request.download_delegation, pb.DownloadDelegation)
+        except documents.DocumentError as exc:
+            raise PreparationRefusal("private_placement_download_set_invalid", exc.detail) from exc
+        packages = download_set.get("packages", [])
+        models = download_set.get("models", [])
+        if packages != [] or not isinstance(models, list) or len(models) > 32:
+            raise PreparationRefusal(
+                "private_placement_download_set_invalid",
+                "a private model download set carries no package refs and at most 32 models",
+            )
     digest = str(interface_ref["digest"])
     length = int(interface_ref["length"])
     try:

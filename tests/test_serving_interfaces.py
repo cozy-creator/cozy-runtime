@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -186,3 +188,58 @@ def test_call_option_collision_does_not_change_cli_interface(tmp_path: Path) -> 
     package_interface.read_bytes(raw)
     with pytest.raises(ConformanceError, match="collide"):
         interface_wheel.generate(raw)
+
+
+def test_caller_overlay_preserves_helpers_assets_and_dependencies(tmp_path: Path) -> None:
+    root = project(tmp_path)
+    raw = package_interface.canonical_bytes(static_interface.build(root))
+    original = io.BytesIO()
+    with zipfile.ZipFile(original, "w") as archive:
+        archive.writestr("serving_fixture.py", SOURCE + "\ndef helper(): return 19\n")
+        archive.writestr("serving_fixture_data/defaults.json", b'{"width":512}')
+        archive.writestr("serving_fixture_helpers.py", "VALUE = 23\n")
+        archive.writestr(
+            "serving_fixture-0.1.0.dist-info/METADATA",
+            "Metadata-Version: 2.4\nName: serving-fixture\nVersion: 0.1.0\n"
+            "Requires-Dist: msgspec>=0.19\nRequires-Dist: numpy>=1.26\n\nDescription.\n",
+        )
+        archive.writestr(
+            "serving_fixture-0.1.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    filename, wheel = interface_wheel.build(
+        raw,
+        distribution="serving-fixture",
+        version="0.1.0",
+        implementation_digest="sha256:" + "11" * 32,
+        implementation_wheel=original.getvalue(),
+    )
+    assert interface_wheel.build(
+        raw,
+        distribution="serving-fixture",
+        version="0.1.0",
+        implementation_digest="sha256:" + "11" * 32,
+        implementation_wheel=original.getvalue(),
+    ) == (filename, wheel)
+    with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+        archive.extractall(tmp_path / "overlay")
+        metadata = archive.read("serving_fixture-0.1.0.dist-info/METADATA")
+        assert b"Requires-Dist: numpy>=1.26\n" in metadata
+        assert metadata.endswith(b"\n\nDescription.\n")
+        assert archive.read("serving_fixture_data/defaults.json") == b'{"width":512}'
+    check = """import inspect, sys
+sys.path.insert(0, sys.argv[1])
+import serving_fixture as lib
+from serving_fixture_helpers import VALUE
+assert lib.helper() == 19 and VALUE == 23
+assert lib.app.get("generate").fn is not lib.generate
+assert "capture" in inspect.signature(lib.generate).parameters
+assert "generate" in lib.__cozy_bindings__
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", check, str(tmp_path / "overlay")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

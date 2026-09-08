@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import base64
 import csv
+import email.parser
 import hashlib
 import io
 import re
@@ -17,7 +18,8 @@ from packaging.version import Version
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical, invocable_interface, package_interface
 
-GENERATOR_ABI = "cozy.interface-generator/4"
+GENERATOR_ABI = "cozy.interface-generator/5"
+MAX_IMPLEMENTATION_WHEEL = 256 << 20
 _DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -284,9 +286,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                 declarations,
                 models_name,
                 f"class {models_name}(msgspec.Struct, kw_only=True, frozen=True, "
-                "forbid_unknown_fields=True):\n"
-                + "\n".join(model_fields or ["    pass"])
-                + "\n",
+                "forbid_unknown_fields=True):\n" + "\n".join(model_fields or ["    pass"]) + "\n",
             )
             _declare(
                 declarations,
@@ -327,7 +327,12 @@ def _declare(declarations: dict[str, tuple[bytes, str]], name: str, source: str)
 
 
 def build(
-    interface: bytes, *, distribution: str, version: str, implementation_digest: str
+    interface: bytes,
+    *,
+    distribution: str,
+    version: str,
+    implementation_digest: str,
+    implementation_wheel: bytes | None = None,
 ) -> tuple[str, bytes]:
     """Package deterministic source and its exact implementation join into one wheel."""
     if (
@@ -339,13 +344,22 @@ def build(
     normalized = re.sub(r"[-_.]+", "_", distribution).lower()
     dist = f"{normalized}-{version}.dist-info"
     files = generate(interface)
-    files[dist + "/package-interface.json"] = interface
-    files[dist + "/METADATA"] = (
+    metadata = (
         "Metadata-Version: 2.4\n" + f"Name: {distribution}\nVersion: {version}\n"
         "Requires-Python: >=3.12,<3.13\nRequires-Dist: cozy-runtime>=0.4.0\n"
-        f"Cozy-Interface-Generator: {GENERATOR_ABI}\n"
-        f"Cozy-Implementation-Digest: {implementation_digest}\n\n"
     ).encode()
+    if implementation_wheel is not None:
+        files, metadata = _overlay(interface, implementation_wheel, distribution, version)
+    files[dist + "/package-interface.json"] = interface
+    header, _, description = metadata.partition(b"\n\n")
+    files[dist + "/METADATA"] = (
+        header.rstrip(b"\n")
+        + (
+            f"\nCozy-Interface-Generator: {GENERATOR_ABI}\n"
+            f"Cozy-Implementation-Digest: {implementation_digest}\n\n"
+        ).encode()
+        + description
+    )
     files[dist + "/WHEEL"] = (
         b"Wheel-Version: 1.0\nGenerator: cozy-runtime\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
     )
@@ -370,3 +384,103 @@ def build(
             info.external_attr = 0o100644 << 16
             archive.writestr(info, data)
     return f"{normalized}-{version}-py3-none-any.whl", output.getvalue()
+
+
+def _overlay(
+    interface: bytes, implementation: bytes, distribution: str, version: str
+) -> tuple[dict[str, bytes], bytes]:
+    """Retain library code/data/dependencies and replace only managed callable exports."""
+    if len(implementation) > MAX_IMPLEMENTATION_WHEEL:
+        raise ConformanceError("implementation wheel exceeds its bound", code="interface_binding")
+    with zipfile.ZipFile(io.BytesIO(implementation)) as archive:
+        members = archive.infolist()
+        if sum(row.file_size for row in members) > MAX_IMPLEMENTATION_WHEEL:
+            raise ConformanceError(
+                "implementation contents exceed their bound", code="interface_binding"
+            )
+        files = {}
+        for row in members:
+            path = row.filename
+            if row.is_dir():
+                continue
+            if (
+                path in files
+                or path.startswith("/")
+                or "\\" in path
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                or ((row.external_attr >> 16) & 0o170000) == 0o120000
+            ):
+                raise ConformanceError(
+                    "implementation wheel has invalid members", code="interface_binding"
+                )
+            files[path] = archive.read(row)
+    metadata_paths = [name for name in files if name.endswith(".dist-info/METADATA")]
+    if len(metadata_paths) != 1:
+        raise ConformanceError(
+            "implementation wheel has no unique metadata", code="interface_binding"
+        )
+    metadata_path = metadata_paths[0]
+    metadata = files[metadata_path].replace(b"\r\n", b"\n")
+    expected_dist = re.sub(r"[-_.]+", "_", distribution).lower() + "-" + version + ".dist-info"
+    if metadata_path != expected_dist + "/METADATA":
+        raise ConformanceError(
+            "implementation metadata directory differs", code="interface_binding"
+        )
+    wheel_headers = email.parser.BytesParser().parsebytes(files.get(expected_dist + "/WHEEL", b""))
+    if wheel_headers.get("Root-Is-Purelib") != "true" or wheel_headers.get_all("Tag") != [
+        "py3-none-any"
+    ]:
+        raise ConformanceError(
+            "caller overlay needs a pure Python project wheel", code="interface_binding"
+        )
+    headers = email.parser.BytesParser().parsebytes(metadata)
+
+    def normalize(name: str) -> str:
+        return re.sub(r"[-_.]+", "_", name).lower()
+
+    if (
+        normalize(str(headers.get("Name", ""))) != normalize(distribution)
+        or headers.get("Version") != version
+    ):
+        raise ConformanceError("implementation wheel identity differs", code="interface_binding")
+    # Description text is a body, not header text. Preserve it after adding bindings.
+    if headers.get("Cozy-Interface-Generator") is not None:
+        raise ConformanceError("cannot overlay another caller wheel", code="interface_binding")
+    document = package_interface.read_bytes(interface, source="caller overlay")
+    digest = "sha256:" + hashlib.sha256(interface).hexdigest()
+    modules: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
+        for entry in document[collection]:
+            if "invocable" in entry:
+                modules[entry["invocable"]["module"]].append({**entry, "_kind": kind})
+    for index, (module, entries) in enumerate(sorted(modules.items())):
+        path = module.replace(".", "/")
+        candidates = [name for name in (path + ".py", path + "/__init__.py") if name in files]
+        if len(candidates) != 1:
+            raise ConformanceError(
+                "managed module has no unique Python implementation", code="interface_binding"
+            )
+        target = candidates[0]
+        companion = "_cozy_callers_" + digest[7:23] + "_" + str(index)
+        directory = target.rpartition("/")[0]
+        generated = (directory + "/" if directory else "") + companion + ".py"
+        if generated in files:
+            raise ConformanceError(
+                "caller module collides with implementation", code="interface_binding"
+            )
+        files[generated] = _module(module, entries, digest).encode()
+        relative = "." if directory else ""
+        exports = [row["invocable"]["export"] for row in entries if row["_kind"] == "entrypoint"]
+        aliases = ", ".join(
+            [*(name + " as " + name for name in exports), "__cozy_bindings__ as __cozy_bindings__"]
+        )
+        files[target] += ("\n\nfrom " + relative + companion + " import " + aliases + "\n").encode()
+    # Rebuilt below; every other source, extension, asset and dependency header stays.
+    for name in list(files):
+        if name.startswith(metadata_path.rpartition("/")[0] + "/") and name.rpartition("/")[2] in {
+            "RECORD",
+            "RECORD.jws",
+            "RECORD.p7s",
+        }:
+            del files[name]
+    return files, metadata

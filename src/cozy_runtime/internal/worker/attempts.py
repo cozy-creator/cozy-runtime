@@ -273,6 +273,7 @@ class AttemptSlot:
     devices: str = ""
     job_device_count: int = 0
     orchestration: bool = False
+    bindings_digest: str = ""
 
 
 @dataclass(slots=True)
@@ -1134,6 +1135,12 @@ class AttemptEngine:
         slot = self.slot_of(attempt)
         declared = slot.bindings.get(plan_id)
         prepared_model = slot.prepared_models.get(plan_id)
+        if not slot.bindings_digest or serving.get("bindings_digest") != slot.bindings_digest:
+            raise AttemptRefusal(
+                "model_bindings_changed",
+                "serving invocation differs from the exact activated model bindings",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
         if declared is None or prepared_model is None:
             raise AttemptRefusal(
                 "unknown_binding",

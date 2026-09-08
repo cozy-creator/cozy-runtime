@@ -1502,6 +1502,7 @@ class Worker:
         wipes nothing (cr-066's red arm: it used to `begin_generation` the one ledger).
         """
         selected_job = None
+        bindings_digest = ""
         if attempt.spec.get("job") is not None or self.accepted.mode == "job":
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
             selected_job = next(
@@ -1527,6 +1528,8 @@ class Worker:
                 bindings = self.bindings
                 prepared = self.prepared_models
                 failed = self.failed_bindings
+                if self.placement is not None:
+                    bindings_digest = documents.spell(self.placement.bindings_digest)
             else:
                 lane = self._lane_of(attempt.placement_id)
                 supervision = hosted.supervision
@@ -1534,6 +1537,7 @@ class Worker:
                 bindings = hosted.bindings
                 prepared = hosted.prepared_models
                 failed = hosted.failed_bindings
+                bindings_digest = documents.spell(hosted.placement.bindings_digest)
         if attempt.lane_id and attempt.lane_id != lane.lane_id:
             raise AttemptRefusal(
                 "placement_lane_moved",
@@ -1565,6 +1569,7 @@ class Worker:
             if attempt.spec.get("job") is not None
             else 0,
             orchestration=lane is self.lanes.orchestration,
+            bindings_digest=bindings_digest,
         )
         attempt.slot = slot
         attempt.lane_id = lane.lane_id
@@ -1693,18 +1698,37 @@ class Worker:
             def mark_verified(digest: str, length: int, path: Path) -> None:
                 self.verified_artifacts.record(digest, length, path)
 
-            result = package_prepare.prepare_private_placement(
-                request,
-                prepared=prepared.document,
-                installed=prepared.installed,
-                artifact_cache=Path(self.options.artifact_cache or ""),
-                tensorfs_root=(
-                    Path(self.options.tensorfs_root)
-                    if self.options.tensorfs_root is not None
-                    else None
-                ),
-                verified=mark_verified,
-            )
+            with contextlib.ExitStack() as access:
+                if request.native_models:
+                    if self.workspace is None:
+                        raise package_prepare.PreparationRefusal(
+                            "private_workspace_absent",
+                            "native model preparation needs its retained workspace",
+                        )
+                    owner = self.authorize_workspace(request.claim)
+
+                    def guard() -> None:
+                        self.authorize_workspace(request.claim)
+
+                    access.enter_context(self.workspace.authorized(guard))
+                    for model in request.native_models:
+                        access.enter_context(
+                            self.workspace.held_model(owner, model.retention, model.manifest)
+                        )
+                result = package_prepare.prepare_private_placement(
+                    request,
+                    prepared=prepared.document,
+                    installed=prepared.installed,
+                    artifact_cache=Path(self.options.artifact_cache or ""),
+                    tensorfs_root=(
+                        Path(self.options.tensorfs_root)
+                        if self.options.tensorfs_root is not None
+                        else None
+                    ),
+                    verified=mark_verified,
+                )
+                if request.native_models:
+                    self.authorize_workspace(request.claim)
             joined = read_placement_set(result.placement_set)
             if (
                 len(joined) != 1
@@ -3168,10 +3192,35 @@ class Worker:
         the previous set keeps serving.
         """
         mode = desired.WhichOneof("mode") or ""
+        retained_parent = None
+        if mode == "placement_set" and desired.placement_set.HasField("orchestration_parent"):
+            retained_parent = self.job_slots.get("orchestration")
+            supplied_parent = desired.placement_set.orchestration_parent
+            if (
+                retained_parent is None
+                or supplied_parent != retained_parent.directive
+                or not supplied_parent.orchestration
+                or supplied_parent.HasField("orchestration_parent")
+                or supplied_parent.device_count
+                or supplied_parent.resource_caps.device_required
+            ):
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FAULT_KIND_CONFIG_REFUSED,
+                        subject=f"revision {desired.revision}",
+                        reason="orchestration_parent_changed",
+                        detail="serving must retain the exact already-prepared CPU parent",
+                    )
+                )
+                return
         if (
             mode != "job"
             and self.job_slots
-            and any(self._job_lane_busy(slot.lane) for slot in self.job_slots.values())
+            and any(
+                self._job_lane_busy(slot.lane)
+                for slot in self.job_slots.values()
+                if slot is not retained_parent
+            )
         ):
             self.engine.fault(
                 pb.Fault(
@@ -3252,11 +3301,15 @@ class Worker:
         self.accepted.mode = "serving" if mode == "placement_set" else mode
         if mode != "job" and self.job_slots:
             cpu = self.job_slots.get("orchestration")
-            if cpu is not None:
+            if cpu is not None and cpu is not retained_parent:
                 cpu.supervision.close()
                 self.lanes.orchestration.forget("")
-            self.job_slots.clear()
-            self.jobs.clear()
+            self.job_slots = (
+                {"orchestration": retained_parent} if retained_parent is not None else {}
+            )
+            self.jobs = {
+                slot.binding.job_descriptor_id: slot.binding for slot in self.job_slots.values()
+            }
             self.engine.jobs = self.jobs
         self.latched = ""  # a NEW revision un-latches: the latch is per desired revision
         if mode == "job":

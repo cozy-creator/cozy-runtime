@@ -65,7 +65,7 @@ class Calls:
         raw = Path(attempt.job.package_interface).read_bytes()
         interface = package_interface.read_bytes(raw)
         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-        for entry in [*interface["entrypoints"], *interface["jobs"]]:
+        for entry in interface["jobs"]:
             declaration = entry.get("invocable")
             if declaration is not None:
                 result.append(
