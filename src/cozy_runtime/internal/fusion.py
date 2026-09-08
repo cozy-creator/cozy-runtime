@@ -423,13 +423,24 @@ def ast_source(spec: Spec) -> Any:
     return ASTSource(fn, dict(spec.signature), constexprs=dict(spec.constexprs), attrs=attrs)
 
 
+def _backend(arch: int) -> Any:
+    """One compiler backend per architecture: constructing one runs `ptxas --version`."""
+    backends: dict[int, Any] = getattr(_backend, "_cached", {})
+    if arch not in backends:
+        from triton.backends.compiler import GPUTarget
+        from triton.compiler.compiler import make_backend
+
+        backends[arch] = make_backend(GPUTarget("cuda", arch, WARP_SIZE))
+        _backend._cached = backends  # type: ignore[attr-defined]
+    return backends[arch]
+
+
 def cache_key(spec: Spec, arch: int) -> str:
     """Triton's own cache hash for (sources, signature, architecture, options, Triton)."""
-    from triton.backends.compiler import GPUTarget
-    from triton.compiler.compiler import get_cache_invalidating_env_vars, make_backend
+    from triton.compiler.compiler import get_cache_invalidating_env_vars
     from triton.runtime.cache import get_cache_key
 
-    backend = make_backend(GPUTarget("cuda", arch, WARP_SIZE))
+    backend = _backend(arch)
     options = backend.parse_options({"num_warps": spec.num_warps})
     key = get_cache_key(ast_source(spec), backend, options, get_cache_invalidating_env_vars())
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
