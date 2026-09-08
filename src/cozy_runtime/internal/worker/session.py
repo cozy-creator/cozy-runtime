@@ -4806,7 +4806,7 @@ class Worker:
                     f"APPLIED {_fused.get('identity', '?')} sites={_fused.get('sites')} "
                     f"fp8_sites={_fused.get('fp8_sites')} warm={_fused.get('warm_ms')}ms"
                     if _fused.get("applied")
-                    else f"NOT APPLIED ({_fused.get('reason')})"
+                    else f"NOT APPLIED [{_fused.get('code')}] {_fused.get('reason')}"
                 ),
             )
         self.note(

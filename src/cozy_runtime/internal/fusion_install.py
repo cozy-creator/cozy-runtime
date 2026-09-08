@@ -12,9 +12,23 @@ consumer is a `fp8-rowwise/1` encoded leaf gets the quantizing epilogue and hand
 its operand directly (`leaves.PreQuantized`); any other consumer gets bf16.
 
 The package consents on its class (`fusion="accept"`), and the executor applies this plan
-only under that consent. A CUDA device whose built kernels are absent or stale is a typed
-refusal (`fusion_kernels_absent` / `fusion_kernels_stale`, from `fusion.load`), as is a
-missing Triton or diffusers; a non-CUDA device is recorded as not applicable.
+only under that consent. CONSENT IS NOT A REQUIREMENT: `accept` says "you MAY install
+fused kernels if this device has them", exactly as `encoded_leaves="accept"` says the
+runtime may serve encoded leaves to a package that then runs fine on a checkpoint carrying
+none.
+
+The line is ABSENCE vs BREAKAGE, and it is the closed `NOT_INSTALLABLE` set below, not
+"any error". ABSENCE — nothing was ever installed for this runtime on this device: no
+artifact at either fixed path, no entries for this architecture, an artifact keyed to
+another Triton or other kernel sources, no Triton, or a diffusers the plan's digests were
+not matched to. Absence is a recorded NON-APPLICATION carrying the typed code and the
+loader's own detail (which names the paths it looked in), and the eager forward serves;
+only the explicit `fusion="require"` turns it into a refusal. BREAKAGE — the artifact IS
+keyed to this runtime and still does not work (`fusion_kernels_corrupt`: a manifest that
+is not one, entry files the manifest names and does not carry, a launcher module the
+manifest names and does not carry, a cubin that will not load) — always refuses, whatever
+the consent said, because a bad bake that quietly served eager would never be found. So
+does a failure found mid-walk: the model is part-substituted and there is no eager left.
 
 Executor-only, like `fusion.py`: diffusers is imported at the top, guarded, and its absence
 is the typed `fusion_dependency_absent`.
@@ -60,6 +74,19 @@ _SOURCE_DIGESTS = {
     "FeedForward.forward": "dae2c9f53987c25ad38cacbeafb54bd72d4b780ab9772413b559a0a94c3c7058",
 }
 ROWWISE_LEAF = "cozy.fp8-rowwise.native-leaf/1"
+#: The codes that mean NOTHING WAS INSTALLED for this runtime on this device. A consenting
+#: package serves eager past exactly these; anything else is breakage and refuses. Closed on
+#: purpose: a new code is a decision, not a default.
+NOT_INSTALLABLE = frozenset(
+    {
+        "fusion_kernels_absent",
+        "fusion_kernels_stale",
+        "fusion_triton_absent",
+        "fusion_dependency_absent",
+        "fusion_dependency_mismatch",
+        "fusion_source_mismatch",
+    }
+)
 
 
 class FusionRefusal(RuntimeError):
@@ -79,6 +106,9 @@ class AppliedFusion:
     """`(module path, was, now)` per site, in walk order."""
     fp8_sites: int
     warm_ms: float
+    code: str = ""
+    """The typed non-application code when `applied` is false: the fact an operator greps
+    for. Empty on the applied path."""
 
     def identity_document(self) -> dict[str, object]:
         """The deterministic part: what the constructed generation's digest binds."""
@@ -97,6 +127,7 @@ class AppliedFusion:
     def document(self) -> dict[str, object]:
         return {
             **self.identity_document(),
+            "code": self.code,
             "reason": self.reason,
             "warm_ms": round(self.warm_ms, 1),
         }
@@ -337,21 +368,29 @@ def capability_refusal(torch: Any, device: Any) -> str:
     return ""
 
 
-def apply_fusion_plan(model: object, *, torch: Any, device: Any) -> AppliedFusion:
-    """Install the fused glue on every H3 transformer the model holds, or refuse typed.
+def apply_fusion_plan(
+    model: object, *, torch: Any, device: Any, required: bool = False
+) -> AppliedFusion:
+    """Install the fused glue on every H3 transformer the model holds.
 
-    Called under the package's `fusion="accept"` only. Absent Triton or built kernels on
-    a capable CUDA device is a `FusionRefusal` with the loader's code; an incapable device
-    returns a record that says why nothing was installed.
+    Called under the class's `fusion=` consent. `required` is the `fusion="require"`
+    spelling: without it a `NOT_INSTALLABLE` code is a recorded non-application and the
+    eager forward serves; with it, the same code refuses the placement typed. A code
+    outside that set is breakage and refuses under either consent.
     """
     reason = capability_refusal(torch, device)
     if reason:
-        return AppliedFusion(identity(), False, reason, (), 0, 0.0)
+        return AppliedFusion(identity(), False, reason, (), 0, 0.0, "fusion_device_incapable")
     try:
         fusion.load(device)
-    except fusion.FusionUnavailable as exc:
-        raise FusionRefusal(exc.code, str(exc)) from exc
-    _require_sources()
+        _require_sources()
+    except (fusion.FusionUnavailable, FusionRefusal) as exc:
+        if required or exc.code not in NOT_INSTALLABLE:
+            raise FusionRefusal(exc.code, str(exc)) from exc
+        # NOTHING HAS BEEN SUBSTITUTED, so the constructed model is the eager one and it
+        # serves. The code and the loader's detail (which names both fixed artifact paths)
+        # ride the prepare's `execution_fusion` fact and the session's boot line.
+        return AppliedFusion(identity(), False, str(exc), (), 0, 0.0, exc.code)
     substitutions: list[tuple[str, str, str]] = []
     fp8_sites = 0
     warm_ms = 0.0
@@ -366,17 +405,28 @@ def apply_fusion_plan(model: object, *, torch: Any, device: Any) -> AppliedFusio
         substitutions += installed
         fp8_sites += sites
         config = transformer.config
-        warm_ms += fusion.warm(
-            device,
-            hidden=int(config.hidden_size),
-            ffn=int(config.ffn_dim),
-            heads=int(config.num_attention_heads),
-            head_dim=int(config.attention_head_dim),
-            rotary=6 * int(config.rope_freq_dim),
-            fp8=sites > 0,
-        )
+        try:
+            warm_ms += fusion.warm(
+                device,
+                hidden=int(config.hidden_size),
+                ffn=int(config.ffn_dim),
+                heads=int(config.num_attention_heads),
+                head_dim=int(config.attention_head_dim),
+                rotary=6 * int(config.rope_freq_dim),
+                fp8=sites > 0,
+            )
+        except fusion.FusionUnavailable as exc:
+            # PAST THE POINT OF NO RETURN: the forwards are already substituted, so a
+            # width the artifact does not carry refuses whatever the consent said.
+            raise FusionRefusal(exc.code, str(exc)) from exc
     if not substitutions:
         return AppliedFusion(
-            identity(), False, "the model holds no MiniMax-H3 transformer to fuse", (), 0, 0.0
+            identity(),
+            False,
+            "the model holds no MiniMax-H3 transformer to fuse",
+            (),
+            0,
+            0.0,
+            "fusion_no_transformer",
         )
     return AppliedFusion(identity(), True, "", tuple(substitutions), fp8_sites, warm_ms)
