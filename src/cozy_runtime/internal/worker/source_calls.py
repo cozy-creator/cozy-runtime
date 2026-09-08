@@ -493,8 +493,10 @@ class SourceCalls:
                 canceled = command.service_id in self.canceled
             if canceled:
                 with self.workspace.locked() as db:
+                    # A parent interruption is retryable. Explicit logical source
+                    # cancellation already wrote stopped and must remain permanent.
                     db.execute(
-                        "UPDATE native_calls SET state='stopped' WHERE owner=? "
+                        "UPDATE native_calls SET state='failed' WHERE owner=? "
                         "AND service_id=? AND state IN ('accepted','resolved','executing')",
                         (owner, command.service_id),
                     )
