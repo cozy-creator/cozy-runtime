@@ -31,7 +31,7 @@ class Convert(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     profile: str
 
 
-_TYPES = {
+_TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
     "download_huggingface": (HuggingFace, SourceArtifact),
     "download_civitai": (Civitai, SourceArtifact),
     "convert_cozytensors": (Convert, ModelArtifact),

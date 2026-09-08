@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
+import os
 import subprocess
 import sys
 import threading
@@ -68,6 +70,13 @@ def implementation_digest(store: Any) -> str:
         digest.update(len(body).to_bytes(8, "little"))
         digest.update(body)
     digest.update(store.implementation_sha256.encode())
+    extension = importlib.import_module("tensorfs._ext")
+    extension_path = extension.__file__
+    if extension_path is None:
+        raise WorkspaceRefusal("native implementation has no immutable extension artifact")
+    with Path(extension_path).open("rb") as binary:
+        for chunk in iter(lambda: binary.read(1 << 20), b""):
+            digest.update(chunk)
     return "sha256:" + digest.hexdigest()
 
 
@@ -87,28 +96,30 @@ class SourceCalls:
         self.native_registry = native_registry
         self.lock = threading.Lock()
         self.processes: dict[str, subprocess.Popen[bytes] | None] = {}
+        self.tasks: dict[str, threading.Event] = {}
         self.parents: dict[str, str] = {}
+        self.commands: dict[str, pb.NativeSourceCommand] = {}
+        self.process_owners: dict[str, str] = {}
         self.canceled: set[str] = set()
+        self.finalizers: set[tuple[str, int]] = set()
 
     def handle(self, command: pb.NativeSourceCommand) -> None:
         owner = self.owner()
-        row = workspace_sources.accepted(self.workspace, owner, command)
         if command.phase == pb.NATIVE_SOURCE_PHASE_CANCEL:
+            workspace_sources.stopped(self.workspace, owner, command)
             with self.lock:
                 self.canceled.add(command.service_id)
                 process = self.processes.get(command.service_id)
                 if process is not None:
                     process.kill()
-            with self.workspace.locked() as db:
-                db.execute(
-                    "UPDATE native_calls SET state='canceled' "
-                    "WHERE owner=? AND service_id=? AND state<>'complete'",
-                    (owner, command.service_id),
-                )
             return
+        row = workspace_sources.accepted(self.workspace, owner, command)
+        if row["state"] not in ("stopped", "failed", "releasing", "released"):
+            with self.lock:
+                self.canceled.discard(command.service_id)
         if command.phase not in (pb.NATIVE_SOURCE_PHASE_RESOLVE, pb.NATIVE_SOURCE_PHASE_EXECUTE):
             raise WorkspaceRefusal("unknown native source execution phase")
-        if row["state"] == "canceled":
+        if row["state"] == "stopped":
             self._status(command, pb.NATIVE_SOURCE_STATE_CANCELED)
             return
         if (
@@ -119,12 +130,16 @@ class SourceCalls:
         copied = pb.NativeSourceCommand()
         copied.CopyFrom(command)
         with self.lock:
+            self.commands[command.service_id] = copied
+            self.process_owners[command.service_id] = owner
             if command.service_id in self.processes:
                 return
             self.processes[command.service_id] = None
             self.parents[command.service_id] = command.parent_call.parent_request_id
+            done = threading.Event()
+            self.tasks[command.service_id] = done
         threading.Thread(
-            target=self._run, args=(owner, copied, row), daemon=True, name="native-source"
+            target=self._run, args=(owner, copied, row, done), daemon=True, name="native-source"
         ).start()
 
     def cancel_parent(self, request_id: str) -> None:
@@ -136,10 +151,85 @@ class SourceCalls:
                     if process is not None:
                         process.kill()
 
+    def acknowledge(self, ack: pb.AttemptOutcomeAck, finished: Callable[[], None]) -> bool:
+        """Drain native processes and finalize off the heartbeat/control thread."""
+        if ack.retain_work:
+            return False
+        owner = self.owner()
+        with self.workspace.locked() as db:
+            found = db.execute(
+                "SELECT 1 FROM native_calls WHERE owner=? AND parent_request=? "
+                "AND state<>'released' LIMIT 1",
+                (owner, ack.request_id),
+            ).fetchone()
+            if found is None:
+                return False
+            parent = db.execute(
+                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+                (owner, ack.request_id, ack.attempt_ordinal),
+            ).fetchone()
+            if parent is not None:
+                if (
+                    parent["state"] not in ("outcome", "released")
+                    or parent["spec"] != ack.invocation_spec_digest
+                    or parent["outcome_id"] != ack.outcome_id
+                    or parent["outcome_digest"] != ack.outcome_digest
+                ):
+                    raise WorkspaceRefusal("native finalization changed its terminal ACK")
+            elif (
+                db.execute(
+                    "SELECT 1 FROM native_calls WHERE owner=? AND parent_request=? "
+                    "AND release_ack=? AND state='releasing' LIMIT 1",
+                    (owner, ack.request_id, workspace_sources.ack_identity(ack)),
+                ).fetchone()
+                is None
+            ):
+                raise WorkspaceRefusal("native finalization has no recorded terminal ACK")
+        key = (ack.request_id, ack.attempt_ordinal)
+        copied = pb.AttemptOutcomeAck()
+        copied.CopyFrom(ack)
+        with self.lock:
+            if key in self.finalizers:
+                return True
+            self.finalizers.add(key)
+
+        def finalize() -> None:
+            try:
+                self.cancel_parent(copied.request_id)
+                with self.lock:
+                    tasks = [
+                        done
+                        for service, done in self.tasks.items()
+                        if self.parents.get(service) == copied.request_id
+                    ]
+                for done in tasks:
+                    done.wait()
+                self.workspace.acknowledge(owner, copied)
+                finished()
+            finally:
+                with self.lock:
+                    self.finalizers.discard(key)
+
+        threading.Thread(target=finalize, daemon=True, name="native-source-release").start()
+        return True
+
+    def _latest(self, command: pb.NativeSourceCommand) -> pb.NativeSourceCommand:
+        with self.lock:
+            return self.commands.get(command.service_id, command)
+
+    def fence_owner(self, owner: str) -> None:
+        with self.lock:
+            for service, expected in self.process_owners.items():
+                if expected != owner:
+                    self.canceled.add(service)
+                    process = self.processes.get(service)
+                    if process is not None and process.poll() is None:
+                        process.kill()
+
     def _status(
         self,
         command: pb.NativeSourceCommand,
-        state: int,
+        state: pb.NativeSourceState,
         *,
         result: bytes = b"",
         receipt: bytes = b"",
@@ -148,6 +238,7 @@ class SourceCalls:
         code: str = "",
         memo_hit: bool = False,
     ) -> None:
+        command = self._latest(command)
         if not self.current(command):
             return
         call = command.parent_call
@@ -169,7 +260,13 @@ class SourceCalls:
             status.selection.CopyFrom(selection)
         self.send(pb.WorkerFrame(native_source_status=status))
 
-    def _run(self, owner: str, command: pb.NativeSourceCommand, row: dict[str, Any]) -> None:
+    def _run(
+        self,
+        owner: str,
+        command: pb.NativeSourceCommand,
+        row: dict[str, Any],
+        done: threading.Event,
+    ) -> None:
         from cozy_runtime.internal.worker import workspace_memo
 
         released = False
@@ -196,6 +293,7 @@ class SourceCalls:
             phase = "resolve" if command.phase == pb.NATIVE_SOURCE_PHASE_RESOLVE else "execute"
             envelope = {
                 "store": str(self.workspace.store_root),
+                "parent_pid": os.getpid(),
                 "operation": row["operation"],
                 "arguments": arguments,
                 "phase": phase,
@@ -293,14 +391,17 @@ class SourceCalls:
             if canceled:
                 with self.workspace.locked() as db:
                     db.execute(
-                        "UPDATE native_calls SET state='canceled' WHERE owner=? "
-                        "AND service_id=? AND state<>'complete'",
+                        "UPDATE native_calls SET state='stopped' WHERE owner=? "
+                        "AND service_id=? AND state IN ('accepted','resolved','executing')",
                         (owner, command.service_id),
                     )
                 self._status(command, pb.NATIVE_SOURCE_STATE_CANCELED)
                 return
             if process.returncode or len(output) > 2 << 20:
                 raise WorkspaceRefusal("native source execution ended without bounded result")
+            command = self._latest(command)
+            if self.owner() != owner or not self.current(command):
+                return
             answer = canonical_json.decode(output)
             if not answer.get("ok"):
                 raise WorkspaceRefusal(str(answer.get("code", "native_source_failed")))
@@ -310,6 +411,10 @@ class SourceCalls:
                 with self.lock:
                     self.processes.pop(command.service_id, None)
                     self.parents.pop(command.service_id, None)
+                    self.commands.pop(command.service_id, None)
+                    self.process_owners.pop(command.service_id, None)
+                    self.tasks.pop(command.service_id, None)
+                done.set()
                 released = True
                 self._status(command, pb.NATIVE_SOURCE_STATE_RESOLVED, selection=resolved)
                 return
@@ -332,7 +437,8 @@ class SourceCalls:
             with self.workspace.locked() as db:
                 db.execute(
                     "UPDATE native_calls SET state='failed',native_error='native_source_failed' "
-                    "WHERE owner=? AND service_id=? AND state NOT IN ('complete','canceled')",
+                    "WHERE owner=? AND service_id=? "
+                    "AND state IN ('accepted','resolved','executing')",
                     (owner, command.service_id),
                 )
             self._status(command, pb.NATIVE_SOURCE_STATE_FAILED, code="native_source_failed")
@@ -341,3 +447,7 @@ class SourceCalls:
                 with self.lock:
                     self.processes.pop(command.service_id, None)
                     self.parents.pop(command.service_id, None)
+                    self.commands.pop(command.service_id, None)
+                    self.process_owners.pop(command.service_id, None)
+                    self.tasks.pop(command.service_id, None)
+            done.set()
