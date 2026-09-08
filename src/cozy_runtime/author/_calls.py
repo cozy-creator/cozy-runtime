@@ -188,6 +188,7 @@ class _Broker:
         self.closed = False
         self.activated: set[int] = set()
         self.context: Context | None = None
+        self.grant_token = object()
 
     def bind(self, ctx: Context) -> None:
         if self.closed or self.context is not None or ctx.request_id != self.request_id:
@@ -289,6 +290,7 @@ class _Broker:
                             request_id=self.request_id,
                             guard=guard,
                             observation=call.observation,
+                            grant_token=self.grant_token,
                         )
                         return cast(R, result)
                     except (ValueError, TypeError, msgspec.ValidationError) as exc:

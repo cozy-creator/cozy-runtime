@@ -18,6 +18,7 @@ from cozy_runtime.author import App, FileAsset, Invocation, OutputError, Outputs
 from cozy_runtime.author._calls import _Broker
 from cozy_runtime.internal import source_interfaces
 from cozy_runtime.internal.pathkey import opaque_key
+from cozy_runtime.internal.worker import byte_outputs as final_outputs
 from cozy_runtime.internal.worker import commit_files, workspace_sources
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker.source_calls import SourceCalls
@@ -344,3 +345,92 @@ def test_interrupted_commit_reattaches_original_file_and_producer(
     store = tensorfs.Store.open(str(workspace.store_root))
     root = store.tree_root(plan["view_owner"])
     assert root is not None and root["released"]
+
+
+@pytest.mark.parametrize("tree", [False, True])
+def test_explicit_reexport_retains_final_bytes_before_parent_service_release(
+    tmp_path: Path, tree: bool
+) -> None:
+    workspace, command, path, data = pending(tmp_path)
+    frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    calls = SourceCalls(
+        workspace, lambda: "owner", frames.put, lambda _: True, spool_root=tmp_path / "spool"
+    )
+    calls.handle(command)
+    produced = frames.get(timeout=30).native_source_status
+    assert produced.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, produced.safe_code
+    received = pb.NativeByteRetentionRequest(
+        source=produced.byte_output, retention_id="sha256:" + "a1" * 32
+    )
+    outputs.change_hold(workspace, "owner", received, release=False)
+    path.unlink()
+    spec = command.parent_call.parent_invocation_spec_digest
+    returned = final_outputs.reexport(
+        workspace,
+        "owner",
+        "script",
+        1,
+        spec,
+        "returned",
+        received,
+        tree=tree,
+        max_bytes=200000,
+        media_type="application/json",
+    )
+    assert returned.native_tree.producer_root_id != produced.byte_output.producer_root_id
+    assert returned.native_tree.manifest == produced.byte_output.manifest
+    final_hold = pb.NativeByteRetentionRequest(
+        source=returned.native_tree, retention_id="sha256:" + "a2" * 32
+    )
+    outputs.change_hold(workspace, "owner", final_hold, release=False)
+    body, digest = documents.identity(
+        pb.AttemptOutcomeBody(
+            request_id="script",
+            attempt_ordinal=1,
+            invocation_spec_digest=documents.spell(spec),
+            status=pb.OUTCOME_STATUS_SUCCEEDED,
+            execution_started=True,
+            output_manifest=pb.OutputManifest(outputs=[returned]),
+        )
+    )
+    workspace.outcome(
+        "owner",
+        pb.AttemptOutcome(
+            request_id="script",
+            attempt_ordinal=1,
+            invocation_spec_digest=spec,
+            outcome_id="returned",
+            outcome_digest=digest,
+            outcome_canonical_bytes=body,
+        ),
+    )
+    workspace.acknowledge(
+        "owner",
+        pb.AttemptOutcomeAck(
+            request_id="script",
+            attempt_ordinal=1,
+            invocation_spec_digest=spec,
+            outcome_id="returned",
+            outcome_digest=digest,
+        ),
+    )
+    outputs.change_hold(workspace, "owner", received, release=True)
+    tensorfs.gc(str(workspace.store_root))
+    with outputs.leased(workspace, "owner", final_hold) as (_, lease, members):
+        actual = bytearray(len(data))
+        lease.read_into("sha256:" + members[0]["blob"]["sha256"], len(data), 0, len(data), actual)
+        assert actual == data
+    with pytest.raises(WorkspaceRefusal, match="retention"):
+        final_outputs.reexport(
+            workspace,
+            "owner",
+            "script",
+            1,
+            spec,
+            "late",
+            received,
+            tree=tree,
+            max_bytes=200000,
+            media_type="application/json",
+        )
+    outputs.change_hold(workspace, "owner", final_hold, release=True)

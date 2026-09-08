@@ -390,6 +390,8 @@ def commit(
     manifest_body: bytes,
     files: Sequence[tuple[str, Path]],
     max_bytes: int,
+    *,
+    retained: pb.NativeByteRetentionRequest | None = None,
 ) -> pb.NativeByteTreeRef:
     if slot.startswith(("runtime.source_files.", "runtime.commit_file.")):
         raise WorkspaceRefusal("author outputs cannot enter the native byte namespace")
@@ -430,6 +432,24 @@ def commit(
             raise WorkspaceRefusal("ordinary output changed or was permanently released")
 
         def produce() -> dict[str, Any]:
+            if retained is not None:
+                # The referenced producer remains the input. This current attempt
+                # obtains a distinct ordinary output root over the same native bytes.
+                with leased(workspace, owner, retained) as (store, _, _):
+                    if (
+                        retained.source.manifest.digest != hashlib.sha256(manifest_body).digest()
+                        or retained.source.manifest.length != len(manifest_body)
+                        or retained.source.content_bytes != content_bytes
+                        or files
+                    ):
+                        raise WorkspaceRefusal("re-export changed its retained input manifest")
+                    return dict(
+                        store.create_tree_root(
+                            root_id,
+                            documents.spell(retained.source.manifest.digest),
+                            retained.source.manifest.length,
+                        )
+                    )
             store = fill.tensorfs_module().Store.open(str(workspace.store_root))
             # Native holds its writer guard and records each member before import.
             # Separate put_file/create_tree_root calls leave a process-death/GC gap.
