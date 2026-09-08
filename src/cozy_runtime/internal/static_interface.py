@@ -224,6 +224,7 @@ class Reader:
         self.structs: dict[tuple[Path, str], type[msgspec.Struct] | None] = {}
         self.enums: dict[tuple[Path, str], type[enum.Enum]] = {}
         self.models: dict[tuple[Path, str], ModelSpec] = {}
+        self.type_aliases: set[tuple[Path, int]] = set()
 
     # ---------------------------------------------------------------- modules
 
@@ -595,7 +596,13 @@ class Reader:
             if isinstance(found, Vocab):
                 return self._vocab_type(module, node, found)
             if isinstance(found, Assigned):
-                return self.translate(found.module, found.value)
+                if found.identity in self.type_aliases:
+                    self.refuse(module, node, "a cyclic type alias", "static_unsupported")
+                self.type_aliases.add(found.identity)
+                try:
+                    return self.translate(found.module, found.value)
+                finally:
+                    self.type_aliases.remove(found.identity)
             if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
                 return self.class_type(found.module, found.node, node)
             if isinstance(found, External):
@@ -1202,6 +1209,36 @@ def _registration(
     )
 
 
+def _parameter_annotation(
+    reader: Reader,
+    module: Module,
+    node: ast.expr,
+) -> tuple[Module, ast.expr, Resolved | None]:
+    """Follow declared aliases before classifying the parameter's role.
+
+    The full original annotation is still translated for Assets, preserving every
+    collection/element bound. Resolution never imports or evaluates the alias.
+    """
+    seen: set[tuple[Path, int]] = set()
+    while True:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            node = ast.parse(node.value, mode="eval").body
+        target = node.value if isinstance(node, ast.Subscript) else node
+        if isinstance(target, ast.Subscript):
+            target = target.value
+        found = (
+            reader.resolve(module, target)
+            if isinstance(target, (ast.Name, ast.Attribute))
+            else None
+        )
+        if not isinstance(found, Assigned):
+            return module, node, found
+        if found.identity in seen:
+            reader.refuse(module, node, "a cyclic parameter type alias", "static_unsupported")
+        seen.add(found.identity)
+        module, node = found.module, found.value
+
+
 def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
     if registration.invocable:
         return static_invocable.build(reader, registration)
@@ -1214,15 +1251,7 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
     for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
         if arg.annotation is None:
             reader.refuse(module, arg, "an unannotated handler parameter")
-        node = arg.annotation
-        target = node.value if isinstance(node, ast.Subscript) else node
-        if isinstance(target, ast.Subscript):  # Annotated[Assets[...], AssetLimits(...)]
-            target = target.value
-        found = (
-            reader.resolve(module, target)
-            if isinstance(target, (ast.Name, ast.Attribute))
-            else None
-        )
+        annotation_module, node, found = _parameter_annotation(reader, module, arg.annotation)
         if isinstance(found, Vocab):
             vocab_name = found.key.partition(".")[2]
             if found.key in ("author.Context", "author.Preflight") or vocab_name in (
@@ -1230,14 +1259,14 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 "Secrets",
             ):
                 if isinstance(node, ast.Subscript):
-                    reader.translate(module, node.slice)
+                    reader.translate(annotation_module, node.slice)
                 continue
             if vocab_name in {cls.__name__ for cls in SERVICES.values()}:
                 continue
             if vocab_name in ("Assets", "Annotated"):
                 if assets is not None:
                     reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
-                assets = assets_binding(arg.arg, reader.translate(module, node))
+                assets = assets_binding(arg.arg, reader.translate(module, arg.annotation))
                 continue
         if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
             kind = reader.class_kind(found.module, found.node)
@@ -1255,7 +1284,7 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 )
                 continue
             if kind == "struct":
-                payloads.append(reader.translate(module, node))
+                payloads.append(reader.translate(module, arg.annotation))
                 continue
         reader.refuse(module, node, f"parameter {arg.arg}: not an author surface type")
     if len(payloads) != 1:
