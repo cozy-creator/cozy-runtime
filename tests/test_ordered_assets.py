@@ -18,6 +18,7 @@ from cozy_runtime.author import (
     AssetBound,
     Assets,
     AuthorError,
+    CapabilityError,
     ConformanceError,
     Context,
     FileAsset,
@@ -169,6 +170,9 @@ def test_actual_grant_hydration_preserves_collection_and_named_inputs(tmp_path: 
         ["ff0000" * 4] * 2,
         "unrelated named field",
     )
+    escaped = prepared.overlay.payload.assets[0].asset.with_label("renamed")
+    with pytest.raises(CapabilityError, match="escaped_handle"):
+        escaped.read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -313,3 +317,44 @@ def test_dataclass_payload_keeps_existing_signature_refusal() -> None:
 
     with pytest.raises(ConformanceError, match="not an author surface type"):
         describe(other)
+
+
+TinyPictures = Annotated[
+    Assets[Annotated[ImageAsset, AssetBound(max_bytes=1024, max_decoded_bytes=8)]],
+    msgspec.Meta(min_length=1, max_length=4),
+]
+
+
+def test_assets_decode_uses_existing_per_item_limit(tmp_path: Path) -> None:
+    wire, rows = inputs(tmp_path)
+    limited = App()
+
+    @limited.entrypoint
+    def decode(payload: Request, assets: TinyPictures, decoder: MediaDecoder) -> Result:
+        decoder.decode_image(assets[0])
+        raise AssertionError("12 decoded RGB bytes cannot fit an8-byte field bound")
+
+    _, outcome, _ = attempt(
+        limited.get("decode"),
+        wire,
+        Invocation("limited", tmp_path / "limited", time.monotonic() + 10, assets=rows),
+    )
+    assert outcome.terminal == "refused" and outcome.code == "decoded_bytes_limit"
+
+
+def test_collection_labels_are_exact_and_do_not_mutate_source() -> None:
+    source = ImageAsset("ref", media_type="image/png", size_bytes=12)
+    collection = Assets(
+        [source.with_label("女人"), source.with_label("Woman"), source.with_label("woman")]
+    )
+    assert source.label == "" and source.id == "" and source.position == -1
+    assert collection.by_label("女人").id == "assets.0.asset"
+    assert [a.position for a in collection] == [0, 1, 2]
+    with pytest.raises(KeyError):
+        collection.by_label("")
+    with pytest.raises(KeyError):
+        collection.by_label("WOMAN")
+    with pytest.raises(ValueError):
+        Assets([source.with_label("same"), source.with_label("same")])
+    with pytest.raises(TypeError):
+        source.with_label(None)  # type: ignore[arg-type]
