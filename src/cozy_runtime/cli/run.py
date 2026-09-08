@@ -16,6 +16,7 @@ import contextlib
 import json
 import shutil
 import sys
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -249,7 +250,9 @@ def run(
     out_dir = Path((flags.get("--out") or ["outputs"])[0]).expanduser().resolve()
     workspace = out_dir / ".run"
     if workspace.exists():
-        shutil.rmtree(workspace, ignore_errors=True)
+        from cozy_runtime.internal.worker.byte_inputs import remove_checkout
+
+        remove_checkout(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     package_code_digest = development_source_digest(project)
     if kind == "job":
@@ -278,7 +281,7 @@ def run(
         payload=document,
         capture=capture,
         outputs=outputs,
-        request_id=f"cli-{function}",
+        request_id=f"cli-{function}-{uuid.uuid4().hex}",
         timeout_ms=_timeout((flags.get("--timeout") or [""])[0]),
         kind=kind if kind == "job" else "entrypoint",
         job_descriptor_id=descriptor_id,
@@ -692,10 +695,24 @@ def _save(outcome: SliceOutcome, out_dir: Path) -> dict[str, str]:
     saved: dict[str, str] = {}
     for name, path in sorted(outcome.outputs.items()):
         source = Path(path)
-        if not source.is_file():
+        label = name.replace(".", "_")
+        if not label or Path(label).name != label:
+            raise CliError(
+                "output_path",
+                "output ID is not a local filename",
+                "use named result fields",
+                Exit.failed,
+            )
+        target = out_dir / f"{label}{_extension(outcome, name)}"
+        if source.is_dir():
+            from cozy_runtime.internal.worker.byte_inputs import remove_checkout
+
+            remove_checkout(target)
+            shutil.copytree(source, target)
+        elif source.is_file():
+            shutil.copyfile(source, target)
+        else:
             continue
-        target = out_dir / f"{name.replace('.', '_')}{_extension(outcome, name)}"
-        shutil.copyfile(source, target)
         saved[name] = str(target)
     return saved
 
