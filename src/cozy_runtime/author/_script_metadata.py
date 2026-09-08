@@ -68,7 +68,10 @@ def declarations(raw: bytes) -> tuple[dict[str, str], tuple[WeightsOutput, ...]]
             block.append(line[2:])
     if opened:
         raise ValueError("unclosed script metadata")
-    cozy = tomllib.loads("\n".join(block)).get("tool", {}).get("cozy", {})
+    tool = tomllib.loads("\n".join(block)).get("tool", {})
+    if not isinstance(tool, dict):
+        raise ValueError("script tool metadata must be a table")
+    cozy = tool.get("cozy", {})
     if not isinstance(cozy, dict) or set(cozy) - {"models", "weights"}:
         raise ValueError("script tool.cozy accepts models and weights only")
     models = cozy.get("models", {})
