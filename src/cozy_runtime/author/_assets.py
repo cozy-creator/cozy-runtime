@@ -13,6 +13,7 @@ paths cannot enter a schema, a digest, or serialized output.
 from __future__ import annotations
 
 import hashlib
+import stat
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import copy
 from dataclasses import dataclass
@@ -21,12 +22,28 @@ from typing import Any, ClassVar, Final, Literal, Self, cast, get_args, overload
 
 from PIL.Image import Image as Image
 
-from cozy_runtime.author._errors import CapabilityError, PreflightViolation
+from cozy_runtime.author._errors import CapabilityError, PreflightViolation, RuntimeFailure
 from cozy_runtime.author._markers import ImagePreparation
 from cozy_runtime.author._walker import strip, unwrap_optional
 
 _UNBOUND: Final = ""
 Fidelity = Literal["auto", "low", "medium", "high"]
+
+
+# Private process-handoff facts, never input identity or wire metadata.
+FileState = tuple[int, int, int, int, int]
+
+
+def file_state(path: Path) -> FileState:
+    try:
+        facts = path.lstat()
+    except OSError as exc:
+        raise RuntimeFailure(
+            "verified input file is unavailable", code="input_unavailable"
+        ) from exc
+    if not stat.S_ISREG(facts.st_mode):
+        raise RuntimeFailure("verified input is no longer a regular file", code="input_changed")
+    return (facts.st_dev, facts.st_ino, facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns)
 
 
 class Asset:
@@ -35,6 +52,7 @@ class Asset:
     __slots__ = (
         "_attempt",
         "_fidelity",
+        "_file_state",
         "_image_preparation",
         "_input_id",
         "_label",
@@ -73,6 +91,7 @@ class Asset:
         self._position = -1
         self._read_guard: Callable[[], None] | None = None
         self._max_decoded_bytes = 0
+        self._file_state: FileState | None = None
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.ref!r}, media_type={self.media_type!r})"
@@ -120,7 +139,7 @@ class Asset:
 
     @property
     def hydrated(self) -> bool:
-        """True once the worker materialized the bytes into the attempt spool."""
+        """True once the worker verified the granted file at its local path."""
         return self._local is not None
 
     def read_bytes(self) -> bytes:
@@ -133,7 +152,25 @@ class Asset:
             )
         if self._read_guard is not None:
             self._read_guard()
-        return self._local.read_bytes()
+        self._check_file()
+        try:
+            with self._local.open("rb") as source:
+                data = source.read(self.size_bytes + 1) if self._file_state else source.read()
+            if self._file_state and len(data) != self.size_bytes:
+                raise RuntimeFailure("input file size changed during read", code="input_changed")
+            return data
+        finally:
+            self._check_file()
+
+    def _check_file(self) -> None:
+        if self._file_state is not None and (
+            self._local is None or file_state(self._local) != self._file_state
+        ):
+            raise RuntimeFailure(
+                "input file changed after verification; keep sources unchanged until completion",
+                code="input_changed",
+                fields=[self._input_id] if self._input_id else (),
+            )
 
     def row(self) -> dict[str, Any]:
         """The manifest row. Names the fields it emits, so no local path can leak. A
@@ -440,7 +477,7 @@ class InputMetadata:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GrantedInput(InputMetadata):
-    """ONE input the worker already fetched, verified and spooled (cr-012).
+    """One input the worker verified at its granted or materialized local path.
 
     Everything on it was established BEFORE acceptance: the bytes were read under the
     grant through the one bounded reader, checked against the grant's declared length and
@@ -449,6 +486,7 @@ class GrantedInput(InputMetadata):
     """
 
     local: Path
+    file_state: FileState | None = None
 
 
 def bind(
@@ -463,6 +501,7 @@ def bind(
     input_id: str = "",
     order: int = 0,
     read_guard: Callable[[], None] | None = None,
+    source_state: FileState | None = None,
 ) -> None:
     """Hydrate an asset in place. Runtime-only: author code has no path into this.
 
@@ -477,6 +516,7 @@ def bind(
             f"asset {asset.ref!r} belongs to attempt {asset._attempt!r}", code="foreign_asset"
         )
     asset._local = local
+    asset._file_state = source_state
     asset._attempt = attempt
     asset._input_id = input_id
     asset._position = order

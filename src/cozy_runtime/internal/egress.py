@@ -128,14 +128,14 @@ class StreamReceipt:
 
 def copy_bounded(
     chunks: Iterable[bytes],
-    sink: BinaryIO,
+    sink: BinaryIO | None,
     *,
     expected_length: int | None,
     cap: int,
     prefix_bytes: int,
     what: str,
 ) -> StreamReceipt:
-    """Copy once while enforcing size and measuring identity plus a sniff prefix."""
+    """Verify one stream; write it only when a destination is needed."""
     if expected_length is not None and expected_length < 0:
         raise EgressRefusal("stream_invalid_length", f"{what}: negative expected length")
     limit = min(expected_length, cap) if expected_length is not None else cap
@@ -151,7 +151,8 @@ def copy_bounded(
                 f"deployment cap {cap} B) and was cut there. A stream may not exceed its declared "
                 "size, and finding out afterwards is not a bound",
             )
-        sink.write(chunk)
+        if sink is not None:
+            sink.write(chunk)
         digest.update(chunk)
         if len(prefix) < prefix_bytes:
             prefix.extend(chunk[: prefix_bytes - len(prefix)])

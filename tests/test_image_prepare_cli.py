@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -19,11 +20,10 @@ from cozy_runtime.internal.exits import Exit
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def request(source: Path, output: Path, *, edge: int = 64) -> dict[str, Any]:
+def request(source: Path, *, edge: int = 64) -> dict[str, Any]:
     # Deliberately ordinary, unsorted JSON: this is a CLI request, not a signed document.
     return {
         "source_path": str(source),
-        "output_directory": str(output),
         "prepare": {"profile": "image-fit/1", "max_edge": edge},
         "media_types": ["image/jpeg", "image/png", "image/webp"],
         "max_bytes": 1 << 20,
@@ -32,13 +32,14 @@ def request(source: Path, output: Path, *, edge: int = 64) -> dict[str, Any]:
 
 
 def run(body: dict[str, Any], *, expect: int = 0) -> dict[str, Any]:
-    env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+    directory = Path(body["source_path"]).parent
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "TMPDIR": str(directory)}
     result = subprocess.run(
         [str(Path(sys.executable).with_name("cozy-runtime")), "--json", "image-prepare"],
         input=json.dumps(body),
         text=True,
         capture_output=True,
-        cwd=body["output_directory"],
+        cwd=directory,
         env=env,
         timeout=60,
     )
@@ -55,12 +56,17 @@ def test_cli_image_handoff_and_raw_paths(tmp_path: Path) -> None:
         source, quality=95
     )
     before = source.read_bytes()
-    body = request(source, tmp_path)
+    body = request(source)
     answer = run(body)
     assert answer["status"] == "prepared"
     assert "digest" not in answer  # Creator fingerprints the selected carrier.
     derivative = Path(answer["path"])
-    assert derivative.parent == tmp_path
+    assert derivative.parent == tmp_path / "cozy"
+    assert derivative.name == hashlib.sha256(derivative.read_bytes()).hexdigest() + ".webp"
+    inode = derivative.stat().st_ino
+    assert run(body)["path"] == str(derivative)
+    assert derivative.stat().st_ino == inode
+    assert list(derivative.parent.iterdir()) == [derivative]
     assert answer["length"] == derivative.stat().st_size < len(before)
     expected = decode_image_path(
         source, DEFAULT_DECODE_LIMITS, _Budget(1 << 20), ImagePreparation(max_edge=64)
@@ -72,7 +78,7 @@ def test_cli_image_handoff_and_raw_paths(tmp_path: Path) -> None:
     # Raw paths retain the caller's path, including symlinks.
     linked = tmp_path / "linked.jpg"
     linked.symlink_to(source)
-    answer = run(request(linked, tmp_path, edge=1024))
+    answer = run(request(linked, edge=1024))
     assert answer["status"] == "raw" and answer["path"] == str(linked)
 
     # There is no admitted lossless carrier: Runtime performs the bounded resize.
@@ -92,7 +98,7 @@ def test_cli_keeps_a_smaller_original(tmp_path: Path) -> None:
     source = tmp_path / "tiled.png"
     image.save(source)
     before = source.read_bytes()
-    answer = run(request(source, tmp_path, edge=511))
+    answer = run(request(source, edge=511))
     assert answer["status"] == "raw"
     assert source.read_bytes() == before
     assert sorted(path.name for path in tmp_path.iterdir()) == ["tiled.png"]
@@ -101,8 +107,26 @@ def test_cli_keeps_a_smaller_original(tmp_path: Path) -> None:
 def test_cli_rejects_bad_policy_before_writing(tmp_path: Path) -> None:
     source = tmp_path / "image.png"
     Image.new("RGB", (32, 32)).save(source)
-    body = request(source, tmp_path)
+    body = request(source)
     body["prepare"]["max_edge"] = 0
     answer = run(body, expect=int(Exit.validation))
     assert answer["error"]["name"] == "image_preparation"
     assert sorted(path.name for path in tmp_path.iterdir()) == ["image.png"]
+
+
+def test_cli_refuses_corrupt_cached_derivative_without_replacing_it(tmp_path: Path) -> None:
+    source = tmp_path / "large.jpg"
+    Image.frombytes("RGB", (512, 512), random.Random(7).randbytes(512 * 512 * 3)).save(
+        source, quality=95
+    )
+    body = request(source)
+    answer = run(body)
+    derivative = Path(answer["path"])
+    inode = derivative.stat().st_ino
+    derivative.chmod(0o600)
+    derivative.write_bytes(b"corrupt")
+    answer = run(body, expect=int(Exit.validation))
+    assert answer["error"]["name"] == "image_preparation_refused"
+    assert derivative.stat().st_ino == inode
+    assert derivative.read_bytes() == b"corrupt"
+    assert list(derivative.parent.iterdir()) == [derivative]

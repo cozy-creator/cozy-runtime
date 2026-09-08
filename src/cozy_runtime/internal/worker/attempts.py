@@ -807,13 +807,7 @@ class AttemptEngine:
         )
 
     def _hydrate_inputs(self, attempt: AttemptRecord) -> None:
-        """Materialize every granted input asset into THIS attempt's spool (cr-012).
-
-        The spool is created here rather than in `_run` because that is what "before
-        acceptance" means for bytes: the attempt must own a directory before anything is
-        written into it, and an attempt refused during hydration leaves a spool with
-        nothing in it rather than an accepted attempt with nowhere to put its inputs.
-        """
+        """Verify input files; the spool only materializes native retained inputs."""
         spool = self.spool_root / opaque_key(
             "attempt-input-spool", attempt.request_id, attempt.attempt
         )
@@ -1674,6 +1668,7 @@ class AttemptEngine:
         inputs = {
             input_id: {
                 "local": str(granted.local),
+                "file_state": granted.file_state,
                 "media_type": granted.media_type,
                 "digest": granted.digest,
                 "length": granted.length,
