@@ -128,6 +128,9 @@ module = [
     "huggingface_hub",
     "diffusers",
     "diffusers.*",
+    # `kernels` (cr-114): the image's loader for baked Hub kernels; in the executor's
+    # environment, never the checking venv.
+    "kernels",
     "safetensors",
     "safetensors.*",
     "PIL",
