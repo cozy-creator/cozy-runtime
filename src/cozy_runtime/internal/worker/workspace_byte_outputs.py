@@ -327,7 +327,7 @@ def release_native(workspace: Workspace, owner: str, service_id: str) -> None:
         call = db.execute(
             "SELECT state FROM native_calls WHERE owner=? AND service_id=?", (owner, service_id)
         ).fetchone()
-        if call["state"] not in ("failed", "stopped", "releasing", "released"):
+        if call["state"] not in ("stopped", "releasing", "released"):
             raise WorkspaceRefusal("native byte release has no permanent stop intent")
         db.execute("UPDATE byte_outputs SET state='releasing' WHERE id=?", (row["id"],))
         root_id = row["id"]
@@ -597,13 +597,19 @@ def release(workspace: Workspace, owner: str, root_id: str) -> None:
         ).fetchone()
         if row is None or row["state"] not in ("releasing", "released"):
             raise WorkspaceRefusal("ordinary output release has no durable owner intent")
-        db.native(
-            lambda: (
-                fill.tensorfs_module()
-                .Store.open(str(workspace.store_root))
-                .release_tree_root(root_id)
+        try:
+            db.native(
+                lambda: (
+                    fill.tensorfs_module()
+                    .Store.open(str(workspace.store_root))
+                    .release_tree_root(root_id)
+                )
             )
-        )
+        except Exception as exc:
+            # Cancellation can win after intent reservation but before native import.
+            # Only this exact absence is already released; integrity errors still refuse.
+            if getattr(exc, "code", None) != "ROOT_ABSENT":
+                raise
         db.execute(
             "UPDATE byte_outputs SET state='released' WHERE owner=? AND id=?", (owner, root_id)
         )
