@@ -276,7 +276,9 @@ sequence, and a CLOSED vocabulary — `msgspec.Struct` classes with their
 unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Assets[...]` with
 `AssetLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`/`fusion=`,
 `@sequence_parallel`, `@uses_components`), and `@app.entrypoint`/`@app.job` with literal
-keywords and `WeightsOutput(...)` tuples. A value the package owns as DATA rather than as
+keywords and `WeightsOutput(...)` tuples. Explicit function registrations and async
+`@invocable` exports use the same schema builders, with their declared capabilities and
+immutable defaults. A value the package owns as DATA rather than as
 code — MiniMax-H3's served denoise steps are its committed task plan's, and decision #705
 forbids a second copy in serving code — is spelled `data_values(__file__, "plan.json",
 "schedules", "transformer_evaluations")`: the reader and the imported app take it from the
@@ -287,10 +289,18 @@ declaration is rebuilt as a real type
 path uses, so the two readings cannot drift. Nothing of the package is imported, executed or
 evaluated — `checks/architecture.py`'s `static-describe-executes-nothing` fence holds the
 reader's import list to that — and anything outside the vocabulary (a call or comprehension in
-an interface position, a type from outside the tree, a star import, `@invocable`, registration
-by call, a function-local import of an interface name) is a typed refusal naming `file:line`
+an interface position, a type from outside the tree, a star import, computed registration,
+or a function-local import of an interface name) is a typed refusal naming `file:line`
 and the construct: `static_unresolvable`, `static_computed`, `static_unsupported`,
 `static_module`. Never a guess.
+
+A package may build its surface out of an INSTALLED cozy package's declarations — a `Model`
+subclass, a shared request struct; `diagnostics/h3-vae-roundtrip` subclasses MiniMax-H3's
+`H3Model` and reuses its request type. That dependency's source ships in its wheel, so the
+reader reads it out of the environment it is itself installed in, confined to distributions
+declaring a `cozy.application` entry point — the same fact `discovery.py` calls an app. torch
+declares none, site-packages is never a root, and a sibling package supplies TYPES only: its
+own callables are its own, never scanned as registrations (cr-117).
 
 A generated SCRIPT app — Creator's `app = script_app("<module>")` adapter — is read the same
 way: the adapter's one job is fixed, so all that varies is whether the script has a valid
@@ -512,6 +522,32 @@ A package whose signature declares `MediaDecoder` must install `cozy-runtime[med
 `--conformance describe` refuses the release if PyAV is absent (the static reader has no
 environment to check). The package interface publishes the hard per-field
 codec ceilings and the attempt-wide retained decoded-value ceiling.
+
+Decoded image inputs can opt into preparation through their argument annotation:
+
+```python
+from typing import Annotated
+from cozy_runtime.author import AssetLimits, Assets, Image, ImagePreparation
+
+Pictures = Annotated[
+    Assets[Image],
+    AssetLimits(images=3),
+    ImagePreparation(max_edge=4096, max_pixels=16_777_216),
+]
+```
+
+These example caps are package policy. Preparation preserves aspect ratio and never
+upscales. Creator can run the shared Runtime helper before upload; Runtime applies the
+same transform to originals sent by other clients. Small inputs keep their original
+carrier. Oversized inputs use one fast lossless encoding, or the original if it is
+smaller and admissible. Source files remain unchanged. Byte length, MIME and digest
+always describe the delivered carrier, so raw and prepared uploads can have different
+memo keys while decoding to identical pixels.
+
+The helper checks source byte/pixel limits before decoding and uses an isolated 2 GiB
+address-space limit. That process limit is never applied to a GPU executor. The
+`image-fit/1` profile qualifies the shared codec closure; missing local capability
+leaves preparation to Runtime. Fidelity remains an independent package-interpreted hint.
 
 A package that prepares, binds, or fills a model selects `cozy-runtime[model-execution]`.
 That Runtime capability owns `tensorfs>=0.2,<1` from PyPI; package code does not declare

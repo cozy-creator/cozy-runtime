@@ -37,6 +37,7 @@ from cozy_runtime.author._assets import (
     Asset,
     Assets,
     GrantedInput,
+    ImageAsset,
     InputMetadata,
     Tree,
     bind,
@@ -411,6 +412,8 @@ def _prepare_assets(
         asset._input_id, asset._position = input_id, position
         asset._label = value.label
         asset._fidelity = value.fidelity
+        if cls is ImageAsset:
+            asset._image_preparation = binding.image_preparation
         value.asset = asset
         bounds[input_id] = bound
     try:

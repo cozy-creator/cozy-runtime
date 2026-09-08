@@ -63,7 +63,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         "from enum import Enum",
         "import msgspec",
         "from cozy_runtime.author import "
-        "AssetBound, Assets, Image, DecodedAudio, DecodedVideo, "
+        "AssetBound, Assets, ImagePreparation, Image, DecodedAudio, DecodedVideo, "
         "ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
         "from cozy_runtime.author import ModelArtifact",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
@@ -210,13 +210,21 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                         else expression({"asset": row["kind"]}, path)
                     )
                     bound = {
-                        key: value for key, value in row.items() if key not in {"kind", "max_count"}
+                        key: value
+                        for key, value in row.items()
+                        if key not in {"kind", "max_count", "prepare"}
                     }
                     bound["media_types"] = tuple(bound["media_types"])
                     if any(bound.values()):
                         cls = f"Annotated[{cls}, AssetBound(**{bound!r})]"
                     kinds.append(cls)
                 annotation = "Assets[" + " | ".join(kinds) + "]"
+                preparation = next(
+                    (row["prepare"] for row in entry["assets"]["kinds"] if "prepare" in row), None
+                )
+                if preparation is not None:
+                    caps = {key: value for key, value in preparation.items() if key != "profile"}
+                    annotation = f"Annotated[{annotation}, ImagePreparation(**{caps!r})]"
             default = (
                 " = " + literal(fields[name]["type"], path, defaults[path])
                 if path in defaults
