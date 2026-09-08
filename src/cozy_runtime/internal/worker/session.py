@@ -1191,6 +1191,22 @@ class Worker:
             self.send, lambda: self.fence.control_stream_epoch, lambda: self.fence.wire_minor
         )
         self.engine.calls = self.calls
+        from cozy_runtime.internal.worker.source_calls import SourceCalls
+
+        self.source_calls = (
+            SourceCalls(
+                self.workspace,
+                lambda: self.fence.record_owner_id,
+                self.send,
+                lambda command: (
+                    command.record_owner_epoch == self.fence.record_owner_epoch
+                    and command.control_stream_epoch == self.fence.control_stream_epoch
+                    and command.worker_boot_id == self.fence.worker_boot_id
+                ),
+            )
+            if self.workspace is not None
+            else None
+        )
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
         #: claim installs a FRESH queue under `claim_lock`, so the superseded stream's sender
         #: keeps draining its own (now unread) queue and can never consume a frame authored
@@ -2897,6 +2913,8 @@ class Worker:
         if kind == "attempt_offer":
             self.on_offer(inner)
         elif kind == "cancel_attempt":
+            if self.source_calls is not None:
+                self.source_calls.cancel_parent(inner.request_id)
             self.note("cancel", self.engine.cancel(inner))
         elif kind == "outcome_ack":
             self.on_outcome_ack(inner)
@@ -2912,6 +2930,14 @@ class Worker:
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
         elif kind == "weights_host_ack":
             self.note("artifact", "retired Host writer acknowledgment ignored")
+        elif kind == "native_source_command":
+            if self.source_calls is None or self.fence.wire_minor < 42:
+                self.note("source", "native source service is unavailable")
+            else:
+                try:
+                    self.source_calls.handle(inner)
+                except Exception:
+                    self.note("source", "native source command was refused")
         elif kind == "child_call_result":
             if not self.calls.absorb(inner):
                 self.note("child", "dropped stale or invalid child-call result")
