@@ -361,6 +361,8 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.derive",
     "cozy_runtime.internal.encoding",
     "cozy_runtime.internal.fill",
+    "cozy_runtime.internal.fusion",
+    "cozy_runtime.internal.fusion_install",
     "cozy_runtime.internal.planfacts",
     "cozy_runtime.internal.probe",
     "cozy_runtime.internal.residency",
@@ -880,6 +882,7 @@ class Executor:
             dtype_name,
             tensor_schema_of,
         )
+        from cozy_runtime.internal.fusion_install import FusionRefusal, apply_fusion_plan
         from cozy_runtime.internal.planfacts import PlanFacts
         from cozy_runtime.internal.probe import qualified
         from cozy_runtime.internal.residency import ComponentResidency
@@ -1261,6 +1264,13 @@ class Executor:
                 application=str(binding["application"]),
                 model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
             )
+            # THE FUSED GLUE (h3a-015), under the class's `fusion="accept"` only: a
+            # substitution of forwards after fill, refused typed when Triton is absent.
+            fused = (
+                apply_fusion_plan(model, torch=torch, device=self._rank_device(torch))
+                if getattr(model_cls, "__fusion__", "refuse") == "accept"
+                else None
+            )
             stage("execution_plan")
             # THE CONTRACT'S KERNEL, PINNED POST-FILL (cr-109) on every diffusers model of the
             # constructed pipeline, before any warm step: a warm dry step then attests it.
@@ -1289,7 +1299,7 @@ class Executor:
                 "state": backend.state,
                 "envelope": envelope,
             }
-        except AnimaOptimizationRefusal as exc:
+        except (AnimaOptimizationRefusal, FusionRefusal) as exc:
             backend.poison(())
             self.poisoned = f"execution plan refused: {exc.code}"
             return {
@@ -1393,6 +1403,7 @@ class Executor:
                 # THE CONTRACT enters the generation's identity (cr-109): demand and residency
                 # measured under 8-bit attention are keyed apart from the same bytes without it.
                 "execution_contract": contract.digest() if contract is not None else None,
+                "execution_fusion": fused.identity_document() if fused is not None else None,
             }
         )
         self.constructed_model_digest = (
@@ -1471,6 +1482,9 @@ class Executor:
             "execution_optimization_refusal": (
                 "" if optimization else fused_anima_capability_refusal()
             ),
+            # The fused-glue plan's record (h3a-015): None where the class did not consent,
+            # else what was substituted (or why nothing was) on this device.
+            "execution_fusion": fused.document() if fused is not None else None,
             # An all-inline checkpoint commits without opening the object stream. No stream
             # wall was measured in that case, and zero is the exact value rather than an
             # absent-stat KeyError after a successful construction.

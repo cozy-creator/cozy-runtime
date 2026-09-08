@@ -113,6 +113,9 @@ def _model(binding: ModelBinding) -> dict[str, Json]:
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
         doc["sequence_parallel"] = {"degrees": list(binding.sequence_parallel)}
+    if binding.fusion != "refuse":
+        # The fused-glue consent (h3a-015); the conservative default is the absent key.
+        doc["fusion"] = binding.fusion
     return doc
 
 
@@ -353,12 +356,13 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                 slot = _closed(
                     model,
                     {"class", "component_use", "path"},
-                    {"encoded_leaves", "sequence_parallel"},
+                    {"encoded_leaves", "fusion", "sequence_parallel"},
                     source,
                     model_path,
                 )
-                if "encoded_leaves" in slot and slot["encoded_leaves"] not in ("refuse", "accept"):
-                    _invalid(source, f"{model_path}.encoded_leaves", "must be refuse or accept")
+                for consent in ("encoded_leaves", "fusion"):
+                    if consent in slot and slot[consent] not in ("refuse", "accept"):
+                        _invalid(source, f"{model_path}.{consent}", "must be refuse or accept")
                 if "sequence_parallel" in slot:
                     _sequence_parallel(
                         slot["sequence_parallel"], source, f"{model_path}.sequence_parallel"

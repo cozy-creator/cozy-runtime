@@ -31,6 +31,11 @@ jobs:
       # AST import/dependency scans over the package boundaries, plus the frozen ES6 number
       # vectors replayed through the real RFC 8785 writer.
       - run: uv run python checks/architecture.py
+      # THE FUSED KERNELS ARE BUILT, NOT COMPILED AT BOOT (h3a-015): the worker image's
+      # build stage runs `fusion_build` for its architecture. This proves, with no GPU,
+      # that two builds of the sm90 artifact agree byte for byte and that every entry's key
+      # is the one the runtime loader recomputes from the kernel sources.
+      - run: uv run --with "triton==3.7.1" python -m cozy_runtime.internal.fusion_build --check --arch 90
 
   # THE BEHAVIOUR GATE: two real runs against a real build, no mocks. The public CLI is
   # installed from a freshly built wheel into a venv that has nothing else, then describes,
