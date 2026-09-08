@@ -992,7 +992,7 @@ def stage_development_placement(
     source_digest: str,
     artifact_cache: Path,
     tensorfs_root: Path,
-    found: Any = None,
+    project: Path | None = None,
     binding_overrides: Mapping[str, str] | None = None,
 ) -> StagedDevelopmentPlacement:
     """Stage one exact PlacementSet/1 plus its launch-local interface/config bytes.
@@ -1012,7 +1012,7 @@ def stage_development_placement(
         package=package,
         release=release,
         source_digest=source_digest,
-        found=found,
+        project=project,
         cozy_home=home,
         tensorfs_root=selected_store,
         artifact_cache=cache,
@@ -1037,7 +1037,7 @@ def development_placement_documents(
     package: str,
     release: str,
     source_digest: str,
-    found: Any = None,
+    project: Path | None = None,
     cozy_home: Path | None = None,
     tensorfs_root: Path | None = None,
     artifact_cache: Path | None = None,
@@ -1075,12 +1075,14 @@ def development_placement_documents(
     )
     resolved_models: Mapping[str, _DevelopmentModel] = {}
     if modeled_paths:
-        if found is None or cozy_home is None or tensorfs_root is None:
+        if project is None or cozy_home is None or tensorfs_root is None:
             raise RuntimeError(
                 "development_model_resolution_absent: modeled development requires the "
                 "discovered package, COZY_HOME, and local TensorFS store"
             )
-        resolved_models = _resolve_development_models(found, tensorfs_root, binding_overrides)
+        resolved_models = _resolve_development_models(
+            interface, project, tensorfs_root, binding_overrides
+        )
         if sorted(resolved_models) != modeled_paths:
             raise RuntimeError("development_model_mismatch: resolved binding paths changed")
 
@@ -1161,7 +1163,7 @@ def development_placement_documents(
             models=model_set,
             application=str(interface.get("application", "")),
             interface_path=interface_path,
-            development_project=str(found.project) if found is not None else "",
+            development_project=str(project) if project is not None else "",
             store=first.store if first is not None else "",
             variant=first.variant if first is not None else "",
             reference_snapshot=first.reference_snapshot if first is not None else "",
@@ -1198,8 +1200,31 @@ def development_placement_documents(
     return DevelopmentPlacementDocuments(interface_bytes, placement, declared_bindings)
 
 
+@dataclass(frozen=True, slots=True)
+class _InterfaceSlot:
+    """One declared model slot, read off the interface DOCUMENT rather than off an imported
+    app (#713). `<callable>.models.<param>` is the binding point; the class is its key."""
+
+    path: str
+    class_key: str
+
+    @property
+    def param(self) -> str:
+        return self.path.rpartition(".")[2]
+
+
+def _interface_slots(interface: Mapping[str, Any], kind: str) -> list[_InterfaceSlot]:
+    """A hidden callable is already absent from the document, so nothing is filtered here."""
+    return [
+        _InterfaceSlot(str(slot["path"]), str(slot["class"]))
+        for doc in interface.get(kind) or ()
+        for slot in doc.get("models") or ()
+    ]
+
+
 def _resolve_development_models(
-    found: Any,
+    interface: Mapping[str, Any],
+    project: Path,
     tensorfs_root: Path,
     binding_overrides: Mapping[str, str] | None = None,
 ) -> Mapping[str, _DevelopmentModel]:
@@ -1207,23 +1232,14 @@ def _resolve_development_models(
     # package.toml default for a job source (`<job>.models.<param>`) is a declared slot,
     # not `unknown_binding`. Only entrypoint slots stage models here: a serving closure
     # holds serving models, and a job's source binds per invocation (JobDirective).
-    slots = [
-        slot
-        for surface in found.surfaces
-        if surface.kind == "entrypoint" and not surface.hidden
-        for slot in surface.model_bindings
-    ]
-    job_slots = [
-        slot
-        for surface in found.surfaces
-        if surface.kind == "job" and not surface.hidden
-        for slot in surface.model_bindings
-    ]
+    slots = _interface_slots(interface, "entrypoints")
+    job_slots = _interface_slots(interface, "jobs")
     job_paths = frozenset(slot.path for slot in job_slots)
     declared = slots + job_slots
     try:
+        table = binding_table.read_table(project / "package.toml")
         chosen = binding_table.resolve(
-            declared, found.bindings, overrides=binding_overrides, optional=job_paths
+            declared, table, overrides=binding_overrides, optional=job_paths
         )
     except Exception as exc:
         raise RuntimeError(f"development_model_binding_invalid: {exc}") from exc
@@ -1290,7 +1306,7 @@ def _resolve_development_models(
         if not header.get("components"):
             raise RuntimeError(f"development_model_components_absent: {binding.ref}")
         assets = fill.Checkpoint(store_root, manifest_digest).model_assets()
-        components = _derive_components(found.project, slot.path, config_bytes, assets)
+        components = _derive_components(project, slot.path, config_bytes, assets)
         try:
             model_weight_bytes = sum(
                 int(row["length"]) for row in store.walk_cozytensors(manifest_digest)
@@ -1443,7 +1459,7 @@ def run_slice(
     workspace: Path,
     package_code_digest: str,
     package_interface_document: Mapping[str, Any] | None = None,
-    found: Any = None,
+    project: Path | None = None,
     development_tensorfs_root: Path | None = None,
     development_binding_overrides: Mapping[str, str] | None = None,
     job_records: list[dict[str, Any]] | None = None,
@@ -1477,7 +1493,7 @@ def run_slice(
             source_digest=source_digest,
             artifact_cache=workspace / "artifact-cache",
             tensorfs_root=development_tensorfs_root or workspace / "tensorfs",
-            found=found,
+            project=project,
             binding_overrides=development_binding_overrides,
         )
         bindings.update(staged.bindings)

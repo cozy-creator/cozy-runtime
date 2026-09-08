@@ -82,7 +82,7 @@ def main(argv: list[str]) -> int:
             workspace=workspace,
             package_code_digest=digest,
             package_interface_document=body,
-            found=found,
+            project=PACKAGE,
             development_tensorfs_root=home / "tensorfs",
             options=WorkerOptions(
                 root=workspace / "worker",

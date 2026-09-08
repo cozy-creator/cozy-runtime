@@ -61,25 +61,16 @@ def _contains_yield(node: ast.AST) -> bool:
     return any(_contains_yield(child) for child in ast.iter_child_nodes(node))
 
 
-def script_app(module: str) -> App:
-    """Creator's generated adapter. Discovery reads syntax without executing the script.
+SOURCE_MAX = 32 << 20
 
-    The script and imports are executed only inside the admitted remote/local
-    attempt. Authors provide main() or main(ctx), synchronous or asynchronous.
+
+def script_signature(tree: ast.Module) -> tuple[bool, bool]:
+    """`(with_context, keyword_context)` for one script's `main`, or a typed refusal.
+
+    Pure syntax over a parsed module. The STATIC reader runs this same check on the same
+    tree (cr-116), so a generated script app describes identically whether it was read or
+    imported — there is one definition of what a script's entrypoint is.
     """
-    if not module.isidentifier():
-        raise ConformanceError("script adapter requires one module", code="script_main_missing")
-    found = importlib.util.find_spec(module)
-    if found is None or not found.origin:
-        raise ConformanceError("script module is absent", code="script_main_missing")
-    with Path(found.origin).open("rb") as source:
-        raw = source.read((32 << 20) + 1)
-    if len(raw) > 32 << 20:
-        raise ConformanceError("script exceeds its source bound", code="script_source_too_large")
-    try:
-        tree = ast.parse(raw, filename=found.origin)
-    except SyntaxError as exc:
-        raise ConformanceError("script syntax is invalid", code="script_syntax") from exc
     mains = [
         node
         for node in tree.body
@@ -95,8 +86,7 @@ def script_app(module: str) -> App:
             code="script_main_signature",
         )
     args = mains[0].args
-    positional = [*args.posonlyargs, *args.args]
-    parameters = [*positional, *args.kwonlyargs]
+    parameters = [*args.posonlyargs, *args.args, *args.kwonlyargs]
     if (
         args.vararg
         or args.kwarg
@@ -106,8 +96,29 @@ def script_app(module: str) -> App:
         raise ConformanceError(
             "script entrypoint must be main() or main(ctx)", code="script_main_signature"
         )
-    with_context = bool(parameters)
-    keyword_context = bool(args.kwonlyargs)
+    return bool(parameters), bool(args.kwonlyargs)
+
+
+def script_app(module: str) -> App:
+    """Creator's generated adapter. Discovery reads syntax without executing the script.
+
+    The script and imports are executed only inside the admitted remote/local
+    attempt. Authors provide main() or main(ctx), synchronous or asynchronous.
+    """
+    if not module.isidentifier():
+        raise ConformanceError("script adapter requires one module", code="script_main_missing")
+    found = importlib.util.find_spec(module)
+    if found is None or not found.origin:
+        raise ConformanceError("script module is absent", code="script_main_missing")
+    with Path(found.origin).open("rb") as source:
+        raw = source.read(SOURCE_MAX + 1)
+    if len(raw) > SOURCE_MAX:
+        raise ConformanceError("script exceeds its source bound", code="script_source_too_large")
+    try:
+        tree = ast.parse(raw, filename=found.origin)
+    except SyntaxError as exc:
+        raise ConformanceError("script syntax is invalid", code="script_syntax") from exc
+    with_context, keyword_context = script_signature(tree)
     app = App()
 
     @app.job

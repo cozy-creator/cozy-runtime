@@ -37,6 +37,12 @@ import cozy_runtime.internal.package_interface as package_interface
 from cozy_runtime import author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._model import Model
+from cozy_runtime.author._script import (
+    SOURCE_MAX,
+    _ScriptCompleted,
+    _ScriptRequest,
+    script_signature,
+)
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import AssetsBinding, assets_binding, assets_payload
 from cozy_runtime.author._walker import is_struct
@@ -939,9 +945,12 @@ def build(project: Path) -> dict[str, Json]:
     module_name, _, attribute = application.partition(":")
     entry = reader.application_module(module_name)
     app = reader.lookup(entry, attribute, entry.tree)
+    if isinstance(app, Assigned) and (script := _script_module(reader, app)) is not None:
+        return _script_interface(reader, project, application, app, script)
     if not (isinstance(app, Assigned) and _is_app_call(reader, app)):
         raise StaticRefusal(
-            f"{application}: {attribute!r} is not `{attribute} = App()` at module scope of "
+            f"{application}: {attribute!r} is not `{attribute} = App()` or "
+            f'`{attribute} = script_app("<module>")` at module scope of '
             f"{reader.spell(entry.path)}",
             code="not_an_app",
         )
@@ -957,6 +966,51 @@ def build(project: Path) -> dict[str, Json]:
         docs[registration.name] = registration.kind, _callable(reader, registration)
     return package_interface.assemble(
         application, list(docs.values()), read_table(project / "package.toml")
+    )
+
+
+def _script_module(reader: Reader, app: Assigned) -> str | None:
+    """The module name of a generated `app = script_app("<module>")`, or None."""
+    value = app.value
+    if not isinstance(value, ast.Call) or len(value.args) != 1 or value.keywords:
+        return None
+    found = reader.resolve(app.module, value.func)
+    if not (isinstance(found, Vocab) and found.key == "author.script_app"):
+        return None
+    name = reader.fold(app.module, value.args[0])
+    if not isinstance(name, str):
+        reader.refuse(app.module, value, "script_app names one module, spelled literally")
+    return name
+
+
+def _script_interface(
+    reader: Reader, project: Path, application: str, app: Assigned, script: str
+) -> dict[str, Json]:
+    """A generated script app's surface: the ONE job the adapter registers.
+
+    The adapter's registration is fixed, so the interface is fixed too — what varies is
+    whether the script HAS a valid `main`, and that is the same syntax check `script_app`
+    itself runs, over the same parsed tree (#713: still nothing is imported).
+    """
+    module = reader.module(script, where=(app.module, app.value))
+    if len(module.source.encode()) > SOURCE_MAX:
+        reader.refuse(app.module, app.value, "the script exceeds its source bound")
+    try:
+        script_signature(module.tree)
+    except author.ConformanceError as exc:
+        reader.refuse(module, module.tree.body[0] if module.tree.body else app.value, str(exc))
+    doc = package_interface.callable_doc(
+        name="main",
+        kind="job",
+        payload_type=_ScriptRequest,
+        result_type=_ScriptCompleted,
+        models=[],
+        assets=None,
+        publishes=False,
+        weights_outputs=(),
+    )
+    return package_interface.assemble(
+        application, [("job", doc)], read_table(project / "package.toml")
     )
 
 

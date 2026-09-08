@@ -32,7 +32,7 @@ def test_job_only_project_produces_a_development_placement(tmp_path: Path) -> No
         package="local/only-job",
         release="0.0.0",
         source_digest="sha256:" + "a" * 64,
-        found=found,
+        project=tmp_path,
     )
     assert not result.placement.entrypoints
     assert not result.placement.models
