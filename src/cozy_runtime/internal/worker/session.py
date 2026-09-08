@@ -2905,13 +2905,15 @@ class Worker:
         elif kind == "weights_host_ack":
             self.note("artifact", "retired Host writer acknowledgment ignored")
         elif kind == "native_source_command":
+            from cozy_runtime.internal.worker.source_calls import refusal_frame
+
             if self.source_calls is None or self.fence.wire_minor < 42:
-                self.note("source", "native source service is unavailable")
+                self.send(refusal_frame(inner, "native_source_unavailable"))
             else:
                 try:
                     self.source_calls.handle(inner)
                 except Exception:
-                    self.note("source", "native source command was refused")
+                    self.send(refusal_frame(inner, "native_source_refused"))
         elif kind == "child_call_result":
             if not self.calls.absorb(inner):
                 self.note("child", "dropped stale or invalid child-call result")

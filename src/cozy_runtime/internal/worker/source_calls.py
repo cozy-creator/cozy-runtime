@@ -80,6 +80,23 @@ def implementation_digest(store: Any) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def refusal_frame(command: pb.NativeSourceCommand, code: str) -> pb.WorkerFrame:
+    """An authenticated rejected command keeps its caller's original correlation identity."""
+    call = command.parent_call
+    return pb.WorkerFrame(
+        native_source_status=pb.NativeSourceStatus(
+            parent_request_id=call.parent_request_id,
+            parent_attempt_ordinal=call.parent_attempt_ordinal,
+            parent_invocation_spec_digest=call.parent_invocation_spec_digest,
+            call_index=call.call_index,
+            intent_digest=call.intent_digest,
+            service_id=command.service_id,
+            state=pb.NATIVE_SOURCE_STATE_FAILED,
+            safe_code=code,
+        )
+    )
+
+
 class NativeSourceFailure(Exception):
     def __init__(self, code: str) -> None:
         self.code = code
