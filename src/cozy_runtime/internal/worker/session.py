@@ -1943,6 +1943,7 @@ class Worker:
             threads=self.options.threads,
             alloc_conf=self.options.alloc_conf,
             inherited=dict(self.config.child_base_env),
+            python=self.options.environment_python or Path(self.options.python or sys.executable),
         )
 
     def authorize_workspace(self, claim: pb.Claim) -> str:
