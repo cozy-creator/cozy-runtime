@@ -14,6 +14,7 @@ from cozy_runtime.internal.worker.workspace import Journal, Workspace, Workspace
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+TREE_MIME = "application/vnd.cozy.tree-manifest"
 MAX_RESULTS = 32
 SCHEMA5 = """
 CREATE TABLE byte_outputs (
