@@ -2965,13 +2965,13 @@ def _serialize_result(
     """
     import msgspec
 
-    from cozy_runtime.author._assets import Asset
+    from cozy_runtime.author._assets import Asset, Tree
 
     if envelope is None:
         return None, [], 0
 
     def hook(value: object) -> object:
-        if isinstance(value, Asset):
+        if isinstance(value, (Asset, Tree)):
             row = value.row()
             return {"asset_ref": row.pop("ref"), **row}
         raise TypeError(f"{type(value).__name__} has no wire spelling in a result")

@@ -352,7 +352,7 @@ class Tree:
     it was not granted — the capability is the grant, and there is no ambient store handle.
     """
 
-    __slots__ = ("_attempt", "_root", "digest", "ref")
+    __slots__ = ("_attempt", "_read_guard", "_root", "digest", "ref", "size_bytes")
 
     kind: ClassVar[str] = "tree"
 
@@ -363,6 +363,8 @@ class Tree:
         self.digest = digest
         self._root = root
         self._attempt = attempt
+        self.size_bytes = 0
+        self._read_guard: Callable[[], None] | None = None
 
     def __repr__(self) -> str:
         return f"Tree({self.ref!r}, hydrated={self.hydrated})"
@@ -387,6 +389,8 @@ class Tree:
                 "reach one it was not granted",
                 code="tree_unhydrated",
             )
+        if self._read_guard is not None:
+            self._read_guard()
         return self._root
 
     def files(self) -> tuple[Path, ...]:
@@ -394,7 +398,12 @@ class Tree:
         return tuple(p for p in sorted(self.path.rglob("*")) if p.is_file())
 
     def row(self) -> dict[str, Any]:
-        return {"ref": self.ref, "kind": self.kind, "digest": self.digest}
+        return {
+            "ref": self.ref,
+            "kind": self.kind,
+            "digest": self.digest,
+            "size_bytes": self.size_bytes,
+        }
 
 
 def asset_dec_hook(target: type, obj: Any) -> Any:
