@@ -104,7 +104,7 @@ CALLED: dict[str, str] = {
     # The incremental roster/landed seam replaces the full-file barrier in xs-025.
     "Store.prepare_model_source": (
         "(self, /, operation_id, source_selection_digest, profiles, roster, landed, "
-        "*, checkpoints=Ellipsis, adopt_from_operation_id=None)"
+        "*, checkpoints=Ellipsis, adopt_from_operation_id=None, registry=None)"
     ),
     "Store.release_model_source": "(self, /, operation_id)",
     "Store.checkpoint_page": (
