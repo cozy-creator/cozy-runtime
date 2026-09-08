@@ -5,12 +5,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import queue
+import time
 from pathlib import Path
+from typing import Any
 
+import msgspec
 import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author import App, FileAsset, Invocation, OutputError, Outputs, attempt
+from cozy_runtime.author._calls import _Broker
 from cozy_runtime.internal import source_interfaces
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import commit_files, workspace_sources
@@ -19,7 +24,99 @@ from cozy_runtime.internal.worker.source_calls import SourceCalls
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from test_native_source_views import finish_parent, reattach
 from test_workspace_native_memo import accepted
+
+
+class Empty(msgspec.Struct):
+    pass
+
+
+@pytest.mark.parametrize("fault", ["", "foreign", "unreturned", "return_committed"])
+def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
+    tmp_path: Path, fault: str
+) -> None:
+    app = App()
+    data = b"parent generated file" * 4000
+    ready_path = tmp_path / "received"
+    ready_path.write_bytes(data)
+    digest = documents.spell(hashlib.sha256(data).digest())
+    submitted = 0
+
+    @app.job
+    async def write(payload: Empty, out: Outputs) -> Empty:
+        saved = out.save_bytes(data, media_type="application/json")
+        if fault == "foreign":
+            await out.commit(FileAsset(saved.ref))
+        ready = await out.commit(saved)
+        assert ready.read_bytes() == data
+        assert await out.commit(saved) is ready
+        assert await out.commit(ready) is ready
+        with pytest.raises(OutputError, match="aggregate limit"):
+            out.save_bytes(b"x", media_type="application/json")
+        if fault == "unreturned":
+            out.save_bytes(b"", media_type="application/json")
+        if fault == "return_committed":
+            return ready  # type: ignore[return-value] # intentionally wrong R
+        return Empty()
+
+    def exchange(kind: str, body: dict[str, Any]) -> dict[str, Any]:
+        nonlocal submitted
+        if kind == "child_submit":
+            submitted += 1
+            assert body["export"] == "commit_file"
+            args = canonical_json.decode(body["payload"].encode())
+            assert args["digest"] == digest and args["size_bytes"] == len(data)
+            assert args["handle"] == "attempt:script#1/file/0001"
+            return {"ok": True}
+        if kind == "child_forget":
+            return {"ok": True}
+        assert kind == "child_poll"
+        value = {
+            "file": {
+                "asset_ref": digest,
+                "kind": "file",
+                "digest": digest,
+                "size_bytes": len(data),
+                "media_type": "application/json",
+            }
+        }
+        return {
+            "ok": True,
+            "state": "succeeded",
+            "result": canonical_json.encode(value).decode(),
+            "byte_grants": [
+                {
+                    "output_id": "file",
+                    "kind": "file",
+                    "digest": digest,
+                    "length": len(data),
+                    "local": str(ready_path),
+                    "media_type": "application/json",
+                }
+            ],
+        }
+
+    broker = _Broker("script#1", source_interfaces.bindings(), exchange)
+    _, outcome, _ = attempt(
+        app.get("write"),
+        {},
+        Invocation(
+            "script#1", tmp_path, time.monotonic() + 30, calls=broker, max_output_bytes=len(data)
+        ),
+    )
+    if fault:
+        assert (
+            outcome.code
+            == {
+                "foreign": "output_owner",
+                "unreturned": "unreturned_handle",
+                "return_committed": "result_schema",
+            }[fault]
+        ), outcome
+    else:
+        assert outcome.terminal == "succeeded", outcome
+    assert submitted == (0 if fault == "foreign" else 1)
 
 
 def pending(tmp_path: Path) -> tuple[Workspace, pb.NativeSourceCommand, Path, bytes]:
@@ -207,3 +304,43 @@ def test_file_completion_fenced_after_native_import(tmp_path: Path) -> None:
             plan["view_owner"],
         )
     outputs.release_native(workspace, "owner", command.service_id)
+
+
+@pytest.mark.parametrize("imported", [False, True])
+def test_interrupted_commit_reattaches_original_file_and_producer(
+    tmp_path: Path, imported: bool
+) -> None:
+    workspace, command, path, data = pending(tmp_path)
+    workspace_sources.accepted(workspace, "owner", command)
+    plan = commit_files.prepare(workspace, "owner", command, b"k" * 32, tmp_path / "spool")
+    if imported:
+        commit_files.execute(
+            tensorfs.Store.open(str(workspace.store_root)),
+            {
+                **plan,
+                "arguments": canonical_json.decode(command.parent_call.request_canonical_bytes),
+            },
+        )
+        path.unlink()
+    with workspace.locked() as db:
+        db.execute(
+            "UPDATE native_calls SET state='failed' WHERE service_id=?", (command.service_id,)
+        )
+    retry = reattach(workspace, command)
+    frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    restarted = Workspace(workspace.store_root)
+    calls = SourceCalls(
+        restarted, lambda: "owner", frames.put, lambda _: True, spool_root=tmp_path / "spool"
+    )
+    calls.handle(retry)
+    result = frames.get(timeout=30).native_source_status
+    assert result.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, result.safe_code
+    assert result.parent_attempt_ordinal == 2 and result.byte_output_attempt_ordinal == 1
+    assert result.byte_output.producer_root_id == plan["view_owner"]
+    assert result.byte_output.content_bytes == len(data)
+    with restarted.locked() as db:
+        assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 1
+    finish_parent(restarted, retry, retain=False)
+    store = tensorfs.Store.open(str(workspace.store_root))
+    root = store.tree_root(plan["view_owner"])
+    assert root is not None and root["released"]
