@@ -5533,15 +5533,13 @@ class Worker:
             and "job" in attempt.spec
             and attempt.state not in ("outcome", "closed")
         ):
-            result_schema = b""
-            memoize = False
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
-            for slot in self.job_slots.values():
-                if slot.binding.job_descriptor_id == descriptor:
-                    declaration = self.engine._job_declaration(slot.binding, descriptor)
-                    result_schema = canonical.write(declaration["result"])
-                    memoize = declaration.get("invocable", {}).get("memoize", False) is True
-                    break
+            assert attempt.job is not None
+            # The accepted attempt owns the selected binding on both local and
+            # placement-hosted paths. Local jobs need not populate job_slots.
+            declaration = self.engine._job_declaration(attempt.job, descriptor)
+            result_schema = canonical.write(declaration["result"])
+            memoize = declaration.get("invocable", {}).get("memoize", False) is True
             replay = self.workspace.accept(
                 self.fence.record_owner_id,
                 offered,
