@@ -18,6 +18,7 @@ def test_canceled_watchers_leave_runtime_unary_services_available() -> None:
         timeout=20,
     )
     assert child.returncode == 0, child.stdout + child.stderr
+    assert "Exception in thread control-stream" not in child.stderr
     rows = [json.loads(line) for line in child.stdout.splitlines() if line.startswith("{")]
     assert rows[0]["phase"] == "fixed" and rows[0]["remaining"] == 0
     assert rows[1]["phase"] == "recovered" and not rows[1]["worker_stopped"]
