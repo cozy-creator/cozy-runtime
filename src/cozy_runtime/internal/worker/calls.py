@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -16,6 +17,9 @@ from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.internal import canonical, package_interface
 from cozy_runtime.internal.capture_observation import document as observation_document
+from cozy_runtime.internal.seam import MAX_FRAME
+from cozy_runtime.internal.worker import byte_inputs, child_byte_results
+from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -28,6 +32,8 @@ class _Pending:
     request: pb.ChildCallRequest
     stream_epoch: int
     result: pb.ChildCallResult | None = None
+    byte_grants: list[dict[str, Any]] | None = None
+    spool: Path | None = None
 
 
 class Calls:
@@ -36,8 +42,12 @@ class Calls:
         send: Callable[[pb.WorkerFrame], None],
         stream: Callable[[], int],
         minor: Callable[[], int],
+        *,
+        workspace: Workspace | None = None,
+        owner: Callable[[], str] = lambda: "",
     ):
         self.send, self.stream, self.minor = send, stream, minor
+        self.workspace, self.owner = workspace, owner
         self.pending: dict[tuple[str, int, int], _Pending] = {}
         self.lock = threading.RLock()
 
@@ -116,17 +126,27 @@ class Calls:
                 if result is None or result.state == pb.CHILD_CALL_STATE_PENDING:
                     return {"ok": True, "state": "pending"}
                 if result.state == pb.CHILD_CALL_STATE_SUCCEEDED:
-                    return {
+                    if pending.byte_grants is None:
+                        pending.byte_grants = self._materialize(attempt, pending)
+                    answer = {
                         "ok": True,
                         "state": "succeeded",
                         "child_request_id": result.child_request_id,
                         "result": result.result_canonical_bytes.decode(),
+                        "byte_grants": pending.byte_grants,
                         **(
                             {"observation": observation_document(result.observation)}
                             if result.HasField("observation")
                             else {}
                         ),
                     }
+                    if (
+                        len(json.dumps(answer, separators=(",", ":"), sort_keys=True).encode())
+                        + 128
+                        > MAX_FRAME
+                    ):
+                        raise ValueError("child result and native grants exceed the control frame")
+                    return answer
                 return {
                     "ok": False,
                     **(
@@ -233,6 +253,10 @@ class Calls:
                 and not result.child_request_id
             ):
                 return False
+            try:
+                child_byte_results.validate(result)
+            except ValueError:
+                return False
             if result.HasField("observation"):
                 try:
                     observation_document(result.observation)
@@ -252,8 +276,38 @@ class Calls:
             pending.result = held
             return True
 
+    def _materialize(self, attempt: AttemptRecord, pending: _Pending) -> list[dict[str, Any]]:
+        result = pending.result
+        assert result is not None
+        if not result.byte_result_grants:
+            return []
+        if self.workspace is None or attempt.spool is None:
+            raise ValueError("parent has no native result workspace")
+        held_bytes = sum(
+            int(row["content_bytes"])
+            for key, earlier in self.pending.items()
+            if key[:2] == (attempt.request_id, attempt.attempt)
+            for row in (earlier.byte_grants or [])
+        )
+        pending.spool = attempt.spool / "child-results" / str(result.call_index)
+        try:
+            return child_byte_results.materialize(
+                self.workspace,
+                self.owner(),
+                result,
+                attempt.spool,
+                max_bytes=byte_inputs.MAX_BYTES - held_bytes,
+            )
+        except Exception as exc:
+            byte_inputs.remove_checkout(pending.spool)
+            if isinstance(exc, (ValueError, OSError)):
+                raise
+            raise ValueError("native child artifact bytes are unavailable") from exc
+
     def close(self, request_id: str, attempt: int) -> None:
         with self.lock:
             for key in list(self.pending):
                 if key[:2] == (request_id, attempt):
+                    if self.pending[key].spool is not None:
+                        byte_inputs.remove_checkout(self.pending[key].spool)
                     del self.pending[key]

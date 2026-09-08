@@ -63,6 +63,7 @@ from cozy_runtime.internal.worker.plan import (
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.weights import WeightsExchange
+from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -822,6 +823,8 @@ class AttemptEngine:
                 spool=spool,
                 max_bytes=binding.max_input_bytes if binding else 64 << 20,
                 max_total_bytes=binding.max_inputs_total_bytes if binding else 256 << 20,
+                workspace=Workspace(self.tensorfs_root) if self.tensorfs_root is not None else None,
+                owner=self.owner_scope(),
             )
             supervision = self.supervision_for(attempt)
             if getattr(supervision, "isolated", False):
@@ -1025,8 +1028,15 @@ class AttemptEngine:
         attempt.executor_pid = executor.pid
         attempt.placement_id = ""  # job attempts are not placement-routed
         self._fetch_payload(attempt)
+        self._hydrate_inputs(attempt)
         try:
-            attempt.trees = grants.read_trees(attempt.grant, self.authorizer)
+            attempt.trees = grants.read_trees(
+                attempt.grant,
+                self.authorizer,
+                workspace=Workspace(self.tensorfs_root) if self.tensorfs_root is not None else None,
+                owner=self.owner_scope(),
+                spool=attempt.spool,
+            )
         except grants.GrantRefusal as exc:
             raise AttemptRefusal(
                 exc.code,
@@ -1035,10 +1045,6 @@ class AttemptEngine:
                 if exc.code == "grant_expired"
                 else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             ) from exc
-        # Assets follow the same eager grant path as serving: verified and spooled before
-        # acceptance, then projected into the executor command. A job is a lifecycle mode,
-        # not a second input plane.
-        self._hydrate_inputs(attempt)
 
         caps = attempt.spec.get("resource_caps") or {}
         plan = AttemptPlan.for_job(

@@ -218,12 +218,41 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
                     content_digest=bytes.fromhex(capture_fact["content_digest"][7:]),
                 ),
             )
+            import hashlib
+
+            from cozy_runtime import canonical_json
+
+            members = [
+                {
+                    "path": name,
+                    "kind": "file",
+                    "blob": {
+                        "sha256": hashlib.sha256(
+                            (Path(capture_fact["root"]) / name).read_bytes()
+                        ).hexdigest(),
+                        "length": (Path(capture_fact["root"]) / name).stat().st_size,
+                    },
+                }
+                for name in ("capture.json", "sketches.f32")
+            ]
+            manifest = canonical_json.encode({"entries": members})
             answer.update(
                 {
                     "ok": True,
                     "state": "succeeded",
                     "result": msgspec.json.encode(result.result).decode(),
                     "observation": document(wire),
+                    "byte_grants": [
+                        {
+                            "output_id": "runtime.capture",
+                            "kind": "tree",
+                            "digest": "sha256:" + hashlib.sha256(manifest).hexdigest(),
+                            "length": len(manifest),
+                            "content_bytes": capture_fact["length"],
+                            "local": capture_fact["root"],
+                            "media_type": "application/vnd.cozy.tree-manifest",
+                        }
+                    ],
                 }
             )
             return {"ok": True}
@@ -260,5 +289,6 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
     assert pending.observation.environment.kernel_symbol == ""
     assert pending.observation.capture is not None
     assert pending.observation.capture.output_id == "runtime.capture"
-    assert pending.observation.capture.tree is None  # the native grant bridge owns hydration
+    assert pending.observation.capture.tree is not None
+    assert (pending.observation.capture.tree.path / "capture.json").is_file()
     broker.finish()

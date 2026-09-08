@@ -137,6 +137,7 @@ class PendingCall[R](Awaitable[R]):
     ):
         self.broker, self.index, self.binding, self.payload = broker, index, binding, payload
         self.ctx = ctx
+        self.request_id = ""
         self.task: asyncio.Task[R] | None = None
         self.capture: ActivationCapture | None = None
         self.observation: ExecutionObservation | None = None
@@ -155,7 +156,7 @@ def _input_ref(value: object, request_id: str) -> str:
         and value._attempt == request_id
         and re.fullmatch(r"sha256:[0-9a-f]{64}", value.digest)
     ):
-        if isinstance(value, Asset) and value._read_guard is not None:
+        if value._read_guard is not None:
             value._read_guard()
         return value.digest
     raise CapabilityError(
@@ -260,9 +261,24 @@ class _Broker:
                         )
                     try:
                         value = canonical_json.decode(raw)
-                        return cast(
-                            R, msgspec.convert(value, type=call.binding.result, strict=True)
+                        from cozy_runtime.author._call_results import decode
+
+                        def guard() -> None:
+                            if self.closed:
+                                raise CapabilityError(
+                                    "child result escaped its attempt", code="escaped_handle"
+                                )
+                            call.ctx.raise_if_cancelled()
+
+                        result, call.observation = decode(
+                            value,
+                            call.binding.result,
+                            answer.get("byte_grants", []),
+                            request_id=self.request_id,
+                            guard=guard,
+                            observation=call.observation,
                         )
+                        return cast(R, result)
                     except (ValueError, TypeError, msgspec.ValidationError) as exc:
                         raise ChildCallError(
                             "child_result_invalid",
@@ -277,6 +293,17 @@ class _Broker:
 
     @staticmethod
     def _observe(call: PendingCall[Any], answer: Mapping[str, Any]) -> None:
+        child_id = answer.get("child_request_id")
+        if child_id:
+            if (
+                not isinstance(child_id, str)
+                or len(child_id) > 256
+                or call.request_id not in ("", child_id)
+            ):
+                raise ChildCallError(
+                    "child_identity_changed", "child request identity changed", call.index
+                )
+            call.request_id = child_id
         if answer.get("observation") is None:
             return
         try:
@@ -325,9 +352,18 @@ _current: ContextVar[_Broker | None] = ContextVar("cozy_package_call_attempt", d
 
 
 def _invoke_proxy(
-    interface_digest: str, module: str, export: str, arguments: Mapping[str, object]
-) -> Awaitable[Any]:
+    interface_digest: str,
+    module: str,
+    export: str,
+    arguments: Mapping[str, object],
+    *,
+    capture: ActivationCapture | None = None,
+) -> PendingCall[Any]:
     broker = _current.get()
     if broker is None:
         raise CapabilityError("package call has no admitted attempt", code="child_broker_absent")
-    return broker.reserve(interface_digest, module, export, arguments)
+    if capture is not None and not isinstance(capture, ActivationCapture):
+        raise ConformanceError("capture needs ActivationCapture", code="capture_option")
+    call = broker.reserve(interface_digest, module, export, arguments)
+    call.capture = capture
+    return call

@@ -1180,7 +1180,11 @@ class Worker:
         from cozy_runtime.internal.worker.calls import Calls
 
         self.calls = Calls(
-            self.send, lambda: self.fence.control_stream_epoch, lambda: self.fence.wire_minor
+            self.send,
+            lambda: self.fence.control_stream_epoch,
+            lambda: self.fence.wire_minor,
+            workspace=self.workspace,
+            owner=lambda: self.fence.record_owner_id,
         )
         self.engine.calls = self.calls
         from cozy_runtime.internal.worker.source_calls import SourceCalls
