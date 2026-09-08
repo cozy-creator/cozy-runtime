@@ -5,14 +5,23 @@ from __future__ import annotations
 import hashlib
 import time
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import msgspec
 import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author import FileAsset, ImageAsset, Tree
+from cozy_runtime.author import (
+    App,
+    AssetBound,
+    Context,
+    FileAsset,
+    ImageAsset,
+    Invocation,
+    Tree,
+    attempt,
+)
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal.worker import byte_inputs, child_byte_results, grants
@@ -21,6 +30,15 @@ from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_workspace_byte_outputs import producing
+
+
+class NativeInputs(msgspec.Struct):
+    report: Annotated[FileAsset, AssetBound(max_bytes=200000, media_types=("application/json",))]
+    bundle: Tree
+
+
+class VerifiedLength(msgspec.Struct):
+    length: int
 
 
 class Result(msgspec.Struct):
@@ -195,7 +213,22 @@ def test_result_materializes_after_ack_and_gc_then_forwards_as_native_inputs(
         bound, grants.Authorizer(), spool=downstream, workspace=workspace, owner="owner"
     )
     assert inputs["report"].local.read_bytes() == data
+    assert inputs["report"].media_type == "application/json"
     assert (trees[result.bundle.digest][0] / "payload").read_bytes() == data
+    consumer = App()
+
+    @consumer.job
+    async def verify(ctx: Context, payload: NativeInputs) -> VerifiedLength:
+        assert payload.report.read_bytes() == (payload.bundle.path / "payload").read_bytes()
+        return VerifiedLength(len(payload.report.read_bytes()))
+
+    verified, outcome, _ = attempt(
+        consumer.get("verify"),
+        {"report": result.report.digest, "bundle": result.bundle.digest},
+        Invocation("downstream", downstream, time.monotonic() + 30, assets=inputs, trees=trees),
+    )
+    assert outcome.terminal == "succeeded", outcome
+    assert verified is not None and verified.result.length == len(data)
     assert inputs["report"].local != result.report._local
     assert trees[result.bundle.digest][0] != result.bundle.path
     closed = True

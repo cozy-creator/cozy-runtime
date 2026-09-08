@@ -821,7 +821,7 @@ def hydrate_inputs(
             out[entry.input_id] = GrantedInput(
                 input_id=entry.input_id,
                 local=local,
-                media_type=actual,
+                media_type=actual or declared,
                 digest="sha256:" + receipt.sha256.hex(),
                 length=receipt.length,
                 order=int(entry.order),
