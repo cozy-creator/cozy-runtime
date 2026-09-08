@@ -7,14 +7,32 @@ import hashlib
 import json
 import secrets
 from collections.abc import Callable
-from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal.worker import derived_retention, store_gc
+from cozy_runtime.internal.worker import store_gc
 from cozy_runtime.internal.worker.workspace import _ID, Journal, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+
+from .workspace_native_memo import (
+    lookup_native as lookup_native,
+)
+from .workspace_native_memo import (
+    record_native as record_native,
+)
+from .workspace_native_memo import (
+    record_reuse as record_reuse,
+)
+from .workspace_native_memo import (
+    release_native_lookup as release_native_lookup,
+)
+from .workspace_native_memo import (
+    release_native_result as release_native_result,
+)
+from .workspace_native_memo import (
+    retain_native_result as retain_native_result,
+)
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.worker.workspace import Workspace
@@ -69,7 +87,12 @@ def _hold_growth(db: Journal, owner: str, holds: list[dict[str, Any]]) -> int:
 
 
 def _source_identity(source: dict[str, Any]) -> dict[str, Any]:
-    return {name: value for name, value in source.items() if name != "outcome_canonical_bytes"}
+    return {
+        name: value
+        for name, value in source.items()
+        if name not in ("outcome_canonical_bytes", "native_receipt", "result")
+        and not (source.get("kind") == "native" and name == "parent_ordinal")
+    }
 
 
 def _compact_payload(payload: dict[str, Any]) -> bytes:
@@ -196,6 +219,10 @@ def _typed_result(
 
 def _comparison(payload: dict[str, Any], schema: Any) -> bytes:
     source = payload["source"]
+    if source.get("kind") == "native":
+        from .workspace_native_memo import compare_native
+
+        return compare_native(payload)
     body = documents.read(
         base64.b64decode(source["outcome_canonical_bytes"], validate=True), pb.AttemptOutcomeBody
     )
@@ -330,7 +357,9 @@ def _retain(
             ).fetchone()
             if row is None or row["state"] not in ("retaining", "ready"):
                 raise WorkspaceRefusal("memo consumer stopped during native acquisition")
-        result = workspace._change_hold(db, owner, _request(hold), release=False)
+        result = workspace._change_hold(
+            db, owner, _request(hold), release=False, kind=hold.get("kind", "derived")
+        )
         if (
             documents.spell(result.manifest.digest) != hold["manifest_digest"]
             or result.manifest.length != hold["manifest_length"]
@@ -352,7 +381,9 @@ def _reserve_holds(
     if not db.in_transaction:
         raise RuntimeError("memo hold reservations require their journal transaction")
     for hold in holds:
-        workspace.reserve_hold(db, owner, _request(hold), release=False)
+        workspace.reserve_hold(
+            db, owner, _request(hold), release=False, kind=hold.get("kind", "derived")
+        )
 
 
 def _drain(workspace: Workspace, db: Journal, owner: str) -> int:
@@ -362,7 +393,9 @@ def _drain(workspace: Workspace, db: Journal, owner: str) -> int:
     for row in rows:
         payload = json.loads(row["body"])
         for hold in payload["holds"]:
-            workspace._change_hold(db, owner, _request(hold), release=True)
+            workspace._change_hold(
+                db, owner, _request(hold), release=True, kind=hold.get("kind", "derived")
+            )
         if row["state"] == "disabled":
             # The negative identity survives capacity pressure, but it does not
             # need either full outcome or the result schema. Prior consumers
@@ -398,7 +431,14 @@ def _missing_cleanup(workspace: Workspace, db: Journal, owner: str, consumer: st
         (owner, row["cache_id"], row["key"]),
     )
     for hold in json.loads(row["body"])["holds"]:
-        workspace._change_hold(db, owner, _request(hold), release=True, cancel_lookup=False)
+        workspace._change_hold(
+            db,
+            owner,
+            _request(hold),
+            release=True,
+            cancel_lookup=False,
+            kind=hold.get("kind", "derived"),
+        )
     _drain(workspace, db, owner)
     completed = db.execute(
         "UPDATE operation_lookups SET state='miss' WHERE owner=? AND consumer=? "
@@ -435,13 +475,10 @@ def _missing_native_result(
             # Verify the ORIGINAL cache hold, never another consumer ID. This
             # separates an evicted source from a released recipient.
             request = _request(hold)
-            db.native(
-                partial(
-                    derived_retention.change,
-                    request,
-                    tensorfs_root=workspace.store_root,
-                    release=False,
-                )
+            from .workspace_native_memo import change_native_hold
+
+            change_native_hold(
+                workspace, db, owner, request, hold.get("kind", "derived"), release=False
             )
         except Exception as exc:
             if getattr(exc, "code", None) in {"ROOT_ABSENT", "OBJECT_ABSENT", "TRANSACTION_CLOSED"}:
@@ -745,11 +782,17 @@ def prune(workspace: Workspace, owner: str) -> pb.PruneOperationCacheResult:
             if not payload["holds"]:
                 continue
             source = payload["source"]
-            active = db.execute(
-                "SELECT 1 FROM attempts WHERE owner=? AND request=? "
-                "AND ordinal=? AND state<>'released'",
-                (owner, source["request_id"], source["attempt_ordinal"]),
-            ).fetchone()
+            if source.get("kind") == "native":
+                active = db.execute(
+                    "SELECT 1 FROM attempts WHERE owner=? AND request=? AND state<>'released'",
+                    (owner, source["parent_request"]),
+                ).fetchone()
+            else:
+                active = db.execute(
+                    "SELECT 1 FROM attempts WHERE owner=? AND request=? "
+                    "AND ordinal=? AND state<>'released'",
+                    (owner, source["request_id"], source["attempt_ordinal"]),
+                ).fetchone()
             pending = db.execute(
                 "SELECT 1 FROM operation_lookups WHERE owner=? AND cache_id=? "
                 "AND state='retaining'",
