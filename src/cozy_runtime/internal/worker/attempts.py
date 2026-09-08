@@ -566,6 +566,13 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_PROTOCOL,
             ) from exc
 
+        if spec.get("capture") is not None and spec.get("job") is not None:
+            raise AttemptRefusal(
+                "capture_mode",
+                "activation capture requires an ordinary serving invocation",
+                cause=CAUSE.CAUSE_CODE_INVALID_REQUEST,
+            )
+
         # The (attempt, digest) fence binds the ORDINAL, not the current state: an attempt
         # is one execution of one spec whether it is running, recorded or already closed.
         known = self.history.get((offered.request_id, offered.attempt_ordinal))

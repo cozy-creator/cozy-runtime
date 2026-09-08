@@ -2283,6 +2283,14 @@ class Executor:
         3. **Quiescence is proven by what exists.** A torch-free job has no stream that
            could still be moving, so the proof is structural rather than a device query.
         """
+        if command.get("capture") is not None:
+            return {
+                "ok": False,
+                "code": "capture_mode",
+                "detail": "activation capture requires an ordinary serving invocation",
+                "terminal": "refused",
+                "origin": "request",
+            }
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         budget = command.get("budget") or {}
