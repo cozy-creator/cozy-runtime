@@ -299,7 +299,7 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
     ]
     unlabelled = broker.reserve("", __name__, "child", {"assets": Assets([photo, photo])})
     assert unlabelled.payload != reservation.payload
-    with pytest.raises(Exception, match="child.asset_ungranted"):
+    with pytest.raises(CapabilityError, match=r"child\.asset_ungranted"):
         broker.reserve("", __name__, "child", {"assets": Assets([ImageAsset(photo.digest)])})
 
 
