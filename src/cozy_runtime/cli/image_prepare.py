@@ -43,7 +43,6 @@ from cozy_runtime.author._image_profile import (
 from cozy_runtime.author._markers import IMAGE_PREPARATION_PROFILE, ImagePreparation
 from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, sniff
 from cozy_runtime.cli.io import CliError, Result
-from cozy_runtime.internal import canonical
 from cozy_runtime.internal.exits import Exit
 
 _INPUT_LIMIT = 16 << 10
@@ -80,15 +79,14 @@ def _request() -> _Request:
     raw = sys.stdin.buffer.read(_INPUT_LIMIT + 1)
     if len(raw) > _INPUT_LIMIT:
         raise ValueError("image preparation input exceeds 16 KiB")
-    value = canonical.parse_canonical(raw.rstrip(b"\n"))
-    request = msgspec.convert(value, type=_Request, strict=True)
+    request = msgspec.json.decode(raw, type=_Request)
     if (
         not Path(request.source_path).is_absolute()
         or not Path(request.output_directory).is_absolute()
         or not request.prepare.profile
         or len(request.prepare.profile) > 64
         or request.max_bytes <= 0
-        or not 0 < request.max_decoded_bytes <= DEFAULT_DECODE_LIMITS.max_decoded_bytes
+        or not 0 <= request.max_decoded_bytes <= DEFAULT_DECODE_LIMITS.max_decoded_bytes
         or not request.media_types
         or len(request.media_types) != len(set(request.media_types))
         or not set(request.media_types) <= set(KIND_MEDIA["image"])
@@ -98,7 +96,7 @@ def _request() -> _Request:
 
 
 def _source(request: _Request) -> tuple[Path, int, str]:
-    source = Path(request.source_path).resolve(strict=True)
+    source = Path(request.source_path)
     facts = source.stat()
     if not stat.S_ISREG(facts.st_mode):
         raise ValueError("image preparation source must be a regular file")
@@ -151,11 +149,17 @@ def _prepare(request: _Request) -> Result:
     if not carrier:
         return _raw(source, source_length, source_mime, request.max_bytes)
     image = decode_image_path(
-        source, DEFAULT_DECODE_LIMITS, _Budget(request.max_decoded_bytes), policy
+        source,
+        DEFAULT_DECODE_LIMITS,
+        _Budget(request.max_decoded_bytes or DEFAULT_DECODE_LIMITS.max_decoded_bytes),
+        policy,
     )
     # Choose and encode once. A second format is never tried to improve this result.
-    encode = _codec.encode_webp if carrier == "image/webp" else _codec.encode_png
-    encoded = encode(image.width, image.height, image.rgb)
+    encoded = (
+        _codec.encode_webp(image.width, image.height, image.rgb, method=0)
+        if carrier == "image/webp"
+        else _codec.encode_png(image.width, image.height, image.rgb)
+    )
     if source_length <= request.max_bytes and source_length <= len(encoded):
         return _raw(source, source_length, source_mime, request.max_bytes)
     if len(encoded) > request.max_bytes:
