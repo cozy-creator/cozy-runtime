@@ -83,6 +83,7 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
         "download_civitai": pb.NATIVE_SOURCE_OPERATION_CIVITAI,
         "convert_cozytensors": pb.NATIVE_SOURCE_OPERATION_CONVERT,
         "source_files": pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES,
+        "commit_file": pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE,
     }.get(call.export)
     if expected_operation is None or command.operation != expected_operation:
         raise WorkspaceRefusal("native source operation differs from its fixed interface")
@@ -409,11 +410,15 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
         if row["state"] != "releasing":
             raise WorkspaceRefusal("native cleanup has no permanent release intent")
         row = dict(row)
-    if row["operation"] != "source_files":
+    if row["operation"] not in ("source_files", "commit_file"):
         workspace_memo.release_native_result(workspace, owner, service_id)
         workspace_memo.release_native_lookup(workspace, owner, service_id)
     store = fill.tensorfs_module().Store.open(str(workspace.store_root))
-    if row["operation"] == "source_files":
+    if row["operation"] == "commit_file":
+        from . import workspace_byte_outputs
+
+        workspace_byte_outputs.release_native(workspace, owner, service_id)
+    elif row["operation"] == "source_files":
         from . import source_views
 
         source_views.release_service(workspace, owner, row)

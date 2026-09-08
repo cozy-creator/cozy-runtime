@@ -9,6 +9,7 @@ import msgspec
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact, SourceArtifact
 from cozy_runtime.author._calls import _CallType
+from cozy_runtime.author._output_commit import CommittedFile
 from cozy_runtime.author.sources import _SourceFilesResult
 from cozy_runtime.internal import schema
 
@@ -37,11 +38,19 @@ class SourceFiles(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     source: SourceArtifact
 
 
+class CommitFile(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    handle: str
+    digest: str
+    size_bytes: int
+    media_type: str
+
+
 _TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
     "download_huggingface": (HuggingFace, SourceArtifact),
     "download_civitai": (Civitai, SourceArtifact),
     "convert_cozytensors": (Convert, ModelArtifact),
     "source_files": (SourceFiles, _SourceFilesResult),
+    "commit_file": (CommitFile, CommittedFile),
 }
 DOCUMENT = canonical_json.encode(
     {

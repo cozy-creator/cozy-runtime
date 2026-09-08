@@ -917,7 +917,9 @@ def _validate_result(surface: Surface, result: object, attempt: Attempt) -> None
 
     returned: list[str] = []
     output_handles: list[Asset | Tree] = [*assets_in(result), *trees_in(result)]
-    pending_handles = set(attempt.pending) | set(attempt.pending_trees)
+    pending_handles = (set(attempt.pending) - set(attempt.committed_files)) | set(
+        attempt.pending_trees
+    )
     for asset in output_handles:
         if asset._attempt != attempt.request_id or asset.ref not in pending_handles:
             raise OutputError(

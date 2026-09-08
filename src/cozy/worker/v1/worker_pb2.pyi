@@ -30,6 +30,7 @@ class NativeSourceOperation(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     NATIVE_SOURCE_OPERATION_CIVITAI: _ClassVar[NativeSourceOperation]
     NATIVE_SOURCE_OPERATION_CONVERT: _ClassVar[NativeSourceOperation]
     NATIVE_SOURCE_OPERATION_SOURCE_FILES: _ClassVar[NativeSourceOperation]
+    NATIVE_SOURCE_OPERATION_COMMIT_FILE: _ClassVar[NativeSourceOperation]
 
 class NativeSourceState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -344,6 +345,7 @@ NATIVE_SOURCE_OPERATION_HUGGINGFACE: NativeSourceOperation
 NATIVE_SOURCE_OPERATION_CIVITAI: NativeSourceOperation
 NATIVE_SOURCE_OPERATION_CONVERT: NativeSourceOperation
 NATIVE_SOURCE_OPERATION_SOURCE_FILES: NativeSourceOperation
+NATIVE_SOURCE_OPERATION_COMMIT_FILE: NativeSourceOperation
 NATIVE_SOURCE_STATE_UNSPECIFIED: NativeSourceState
 NATIVE_SOURCE_STATE_RESOLVED: NativeSourceState
 NATIVE_SOURCE_STATE_SUCCEEDED: NativeSourceState

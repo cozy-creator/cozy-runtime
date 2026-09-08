@@ -1222,6 +1222,7 @@ class Worker:
                     and command.control_stream_epoch == self.fence.control_stream_epoch
                     and command.worker_boot_id == self.fence.worker_boot_id
                 ),
+                spool_root=self.engine.spool_root,
             )
             if self.workspace is not None
             else None
