@@ -304,8 +304,6 @@ class ModelBinding:
             "snapshot": self.reference_snapshot,
             "variant": self.variant,
             "model_class": self.model_class,
-            "model_binding_path": self.model_binding_path,
-            "model_parameter_name": self.model_parameter_name,
             "components": list(self.components),
             "snapshots": dict(self.snapshots),
             "objective": self.objective,
@@ -437,6 +435,11 @@ class DeclaredBinding:
         generation, so the second binding was served by whichever bytes the first one
         filled (codex audit, adopted 2026-08-25). The objective belongs here for the same
         reason: it decides which of the candidates gets filled.
+
+        The binding PATH and PARAMETER NAME are outside it (h3a-018): they say where an
+        entrypoint receives the constructed model, not what is constructed. Two entrypoints
+        of one release over the same class and bytes are one generation, and the executor
+        binds it under every parameter name the group spells.
         """
         if self.weightless:
             # Nothing is constructed, so the RELEASES are the construction: every weightless

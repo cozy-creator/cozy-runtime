@@ -112,7 +112,9 @@ class Executor:
     hello: dict[str, Any] = field(default_factory=dict)
     ready_bindings: set[str] = field(default_factory=set)
     construction_key: str = ""
-    prepared_binding_set: frozenset[str] = frozenset()
+    #: Every model parameter name the prepared generation is bound under (h3a-018): a
+    #: binding this process can serve without another fill spells one of these.
+    parameters: frozenset[str] = frozenset()
     prepared_model: PreparedModel | None = None
     reserved_for_job: bool = False
     poisoned: str = ""

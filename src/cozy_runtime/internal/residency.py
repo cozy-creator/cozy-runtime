@@ -55,26 +55,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cozy_runtime.internal import accel
-from cozy_runtime.internal.fill import FillRefusal, StreamingFillBackend
+from cozy_runtime.internal.fill import FillRefusal, StreamingFillBackend, block_read_bytes
 from cozy_runtime.internal.paging import PageUnit
-
-
-def _read_bytes() -> int:
-    """Bytes THIS process has actually pulled from the block layer, or -1 (cr-100).
-
-    The one cheap way to tell a warm page-cache re-stage from a cold read: page faults on
-    the mapped CAS objects are charged here, cache hits are not. Observation only, and it
-    is allowed to be unavailable — every non-Linux host reports -1 rather than a zero that
-    would read as "warm".
-    """
-    try:
-        with open("/proc/self/io", "rb") as rows:
-            for row in rows:
-                if row.startswith(b"read_bytes:"):
-                    return int(row.split(b":")[1])
-    except (OSError, ValueError):
-        return -1
-    return -1
 
 
 class ResidencyRefusal(Exception):
@@ -599,7 +581,7 @@ class ComponentResidency:
         # component-keyed lease map made, one plane up. `destinations` above IS summed:
         # tensors put back are per component and do not overlap.
         objects: dict[str, int] = {}
-        read_before = _read_bytes()
+        read_before = block_read_bytes()
         for name in wanted:
             if name in self.backend.components:
                 continue
@@ -646,7 +628,7 @@ class ComponentResidency:
         self.staged_ms += took
         self.attempt_staged_ms += took
         self.allocator_delta_bytes += self._allocated() - allocated
-        read_after = _read_bytes()
+        read_after = block_read_bytes()
         return {
             "restored": restored,
             "held": held,
