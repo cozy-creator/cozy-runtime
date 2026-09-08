@@ -138,20 +138,22 @@ def test_script_observes_cancellation_before_import(
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("with_context", [False, True])
 def test_plain_main_uses_real_native_weights_and_returns_artifact(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_context: bool
 ) -> None:
     store, _, _, source_receipt = _committed(tmp_path)
     source = source_receipt.artifact.manifest.digest
     source_length = source_receipt.artifact.manifest.length
-    module = "native_inheritance_script"
+    module = "native_inheritance_script_" + str(with_context)
     (tmp_path / (module + ".py")).write_text(
         "# /// script\n# [tool.cozy.weights]\n# checkpoint = 2048\n# ///\n"
         "from cozy_runtime.author import Model, ModelArtifact, WeightsSink\n"
         "from cozy_runtime.author import WeightsTarget, Telemetry\n"
-        "def main(ctx, *, source: Model[object], artifacts: WeightsSink,\n"
+        f"def main({'ctx, ' if with_context else ''}*, source: Model[object],\n"
+        "         artifacts: WeightsSink,\n"
         "         tel: Telemetry) -> ModelArtifact:\n"
-        '    ctx.log("inheriting")\n'
+        '    tel.log("inheriting")\n'
         "    assert len(artifacts.structure(source).tensors) == 1\n"
         '    with artifacts.open("checkpoint", sources={"source":source},\n'
         '        targets={"model":WeightsTarget(source="source",source_component="model")},\n'
