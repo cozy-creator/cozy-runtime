@@ -1415,9 +1415,14 @@ def _inspect(
                     and len(posix.parts) == 1
                     and basename in {"pyproject.toml", "uv.lock"}
                 )
+                # Prebuilt dependency wheels may ship inert source/header resources
+                # (grpcio, SciPy, NumPy). Installation never runs a build. Authored
+                # project wheels still cannot carry native code or build inputs.
                 if (
-                    basename in _BUILD_INPUT_NAMES or suffix in _BUILD_SOURCE_SUFFIXES
-                ) and not project_metadata:
+                    wheel.owner == "project"
+                    and (basename in _BUILD_INPUT_NAMES or suffix in _BUILD_SOURCE_SUFFIXES)
+                    and not project_metadata
+                ):
                     raise EnvironmentRefusal(
                         "package_environment_native_build_input_forbidden", name
                     )
