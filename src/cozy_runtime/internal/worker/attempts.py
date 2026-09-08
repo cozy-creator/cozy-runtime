@@ -2175,6 +2175,11 @@ class AttemptEngine:
                 "a host-acknowledged receipt",
             )
         granted = set(attempt.grant.outputs) - weights_outputs
+        if attempt.spec.get("capture"):
+            if not reply.get("capture"):
+                return None, "capture_output_absent: requested activation capture was not produced"
+            # Runtime writes this reserved native tree after normal author outputs.
+            granted.discard("runtime.capture")
         if not weights_outputs <= set(attempt.grant.outputs):
             return None, "weights_receipt_set_mismatch: a weights output has no granted destination"
         spool = attempt.spool
