@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -67,7 +68,7 @@ def test_snapshot_excludes_editables_and_hooks_and_survives_source_removal(tmp_p
             "dependency/data.bin": b"accepted immutable bytes",
             "dangerous.pth": b"import os; raise RuntimeError('mutable hook')\n",
             "dependency-1.0.dist-info/entry_points.txt": (
-                b"[console_scripts]\nsnapshot-proof = json:main\n"
+                b"[console_scripts]\nsnapshot-proof = sys:exit\n"
             ),
             "../../../bin/snapshot-proof": b"#!/absent/source/bin/python\n",
         },
@@ -90,10 +91,7 @@ def test_snapshot_excludes_editables_and_hooks_and_survives_source_removal(tmp_p
     result = subprocess.run(
         [str(final / "bin/snapshot-proof"), "--help"], capture_output=True, text=True
     )
-    # The launcher reaches this environment's interpreter after publication; json:main
-    # is intentionally absent, so the concrete failure proves the entrypoint import ran.
-    assert "has no attribute 'main'" in result.stderr
-    assert "not found" not in result.stderr
+    assert result.returncode == 0, result.stderr
     assert (final / "lib/python3.12/site-packages/dependency/data.bin").read_bytes() == (
         b"accepted immutable bytes"
     )
@@ -143,3 +141,46 @@ def test_manifest_binds_bytes_and_detects_wheel_overwrite(tmp_path: Path) -> Non
     (staging / dependencies.MANIFEST_NAME).write_bytes(manifest.replace(b"1.0", b"2.0"))
     with pytest.raises(package_environment.EnvironmentRefusal, match="snapshot_invalid"):
         dependencies.read_manifest(staging, ref)
+
+
+def test_failed_final_observation_publishes_no_receipt(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source_site = _venv(source)
+    _distribution(source_site, "dependency", {"dependency.py": b"value=1\n"})
+    wheel_root = tmp_path / "wheel"
+    wheel_root.mkdir()
+    _distribution(
+        wheel_root,
+        "captured",
+        {
+            "captured.py": b"value=2\n",
+            "captured-1.0.dist-info/WHEEL": (
+                b"Wheel-Version: 1.0\nGenerator: snapshot-test\nRoot-Is-Purelib: true\n"
+                b"Tag: py3-none-any\n"
+            ),
+        },
+    )
+    path = tmp_path / "captured-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        for member in sorted(wheel_root.rglob("*")):
+            if member.is_file():
+                archive.write(member, str(member.relative_to(wheel_root)))
+    base = package_environment.observe_base(Path(sys.executable))
+    wheel, verified = package_environment.measure_wheel(path, "project", base)
+    material = package_environment.Input(
+        "sha256:" + "a" * 64,
+        wheel.digest,
+        (wheel,),
+        (package_environment.BlobGrant(wheel.digest, wheel.length, path, verified),),
+    )
+    install_root = tmp_path / "environments"
+    # This thin source deliberately lacks Runtime. The actual final observation must fail
+    # before a receipt could admit it, even though its recorded dependency copied correctly.
+    with pytest.raises(package_environment.EnvironmentRefusal, match="base_invalid"):
+        package_environment.materialize(
+            material, install_root, base=base, dependency_python=source / "bin/python"
+        )
+    assert not list((install_root / "receipts").iterdir())
+    assert not list((install_root / "contents").iterdir())
+    assert not list(install_root.glob(".environment-staging-*"))
+    assert not (source / "bin/executed").exists()
