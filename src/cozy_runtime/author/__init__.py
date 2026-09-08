@@ -14,7 +14,7 @@ fakes live in `cozy_runtime.author.fakes`.
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._app import App, Registration, RegistrationError
-from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
+from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef, SourceArtifact
 from cozy_runtime.author._assets import (
     Asset,
     AudioAsset,
@@ -209,6 +209,7 @@ __all__ = [
     "MediaDecoder",
     "Model",
     "ModelArtifact",
+    "SourceArtifact",
     "ModelAssets",
     "ModelBinding",
     "ModelDefault",
