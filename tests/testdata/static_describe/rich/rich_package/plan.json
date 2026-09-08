@@ -1,0 +1,8 @@
+{
+  "lanes": ["fp8", "mxfp8"],
+  "schedules": [
+    {"transformer_evaluations": 30},
+    {"transformer_evaluations": 40},
+    {"transformer_evaluations": 50}
+  ]
+}

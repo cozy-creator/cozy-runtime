@@ -269,13 +269,20 @@ against the line taken before its envelope was granted, and the record is record
 package code is untrusted). `cozy-runtime describe` runs it by default: `ast` over the module
 package.toml's `[application] object` names, following module-scope imports inside the tree
 (and cozy-runtime's own `cozy_runtime.derive.*` source), a constant folder over literals,
-names and integer arithmetic, and a CLOSED vocabulary — `msgspec.Struct` classes with their
+names, integer arithmetic, `tuple(…)`/`list(…)` and one comprehension over a folded
+sequence, and a CLOSED vocabulary — `msgspec.Struct` classes with their
 `tag`/`tag_field`/`kw_only` keywords and `msgspec.field(name=…)`, `Annotated` carrying
 `msgspec.Meta`/`AssetBound`/`ModelDefault`/`Preflight`, `Literal`, `Enum`/`IntEnum`/`StrEnum`,
 unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Assets[...]` with
 `AssetLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`/`fusion=`,
 `@sequence_parallel`, `@uses_components`), and `@app.entrypoint`/`@app.job` with literal
-keywords and `WeightsOutput(...)` tuples. Each declaration is rebuilt as a real type
+keywords and `WeightsOutput(...)` tuples. A value the package owns as DATA rather than as
+code — MiniMax-H3's served denoise steps are its committed task plan's, and decision #705
+forbids a second copy in serving code — is spelled `data_values(__file__, "plan.json",
+"schedules", "transformer_evaluations")`: the reader and the imported app take it from the
+same bytes through the same `cozy_runtime.author` function, confined to the calling module's
+own directory and to JSON scalars, so reading data is never running code (cr-115). Each
+declaration is rebuilt as a real type
 (`msgspec.defstruct`, `enum.Enum`) and rendered by the SAME `internal/schema.py` the import
 path uses, so the two readings cannot drift. Nothing of the package is imported, executed or
 evaluated — `checks/architecture.py`'s `static-describe-executes-nothing` fence holds the

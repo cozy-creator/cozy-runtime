@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, cast
 from cozy_runtime.author import ConformanceError, Surface, WeightsOutput
 from cozy_runtime.author._markers import IMAGE_PREPARATION_PROFILE
 from cozy_runtime.author._media import KIND_MEDIA
+from cozy_runtime.author._model import ENCODED_LEAVES, FUSION
 from cozy_runtime.author._signature import AssetInputValue, AssetsBinding
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
@@ -436,9 +437,14 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     source,
                     model_path,
                 )
-                for consent in ("encoded_leaves", "fusion"):
-                    if consent in slot and slot[consent] not in ("refuse", "accept"):
-                        _invalid(source, f"{model_path}.{consent}", "must be refuse or accept")
+                for consent, vocabulary in (
+                    ("encoded_leaves", ENCODED_LEAVES),
+                    ("fusion", FUSION),
+                ):
+                    if consent in slot and slot[consent] not in vocabulary:
+                        _invalid(
+                            source, f"{model_path}.{consent}", "must be " + " or ".join(vocabulary)
+                        )
                 if "sequence_parallel" in slot:
                     _sequence_parallel(
                         slot["sequence_parallel"], source, f"{model_path}.sequence_parallel"
