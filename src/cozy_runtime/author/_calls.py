@@ -13,7 +13,7 @@ from typing import Any, Concatenate, ParamSpec, TypeVar, cast, overload
 import msgspec
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author._assets import Asset, Assets, asset_dec_hook
+from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 
@@ -139,12 +139,12 @@ class _Call[R](Awaitable[R]):
 def _input_ref(value: object, request_id: str) -> str:
     """Forward only a verified input of this attempt; Creator rechecks its custody."""
     if (
-        isinstance(value, Asset)
+        isinstance(value, (Asset, Tree))
         and value.hydrated
         and value._attempt == request_id
         and re.fullmatch(r"sha256:[0-9a-f]{64}", value.digest)
     ):
-        if value._read_guard is not None:
+        if isinstance(value, Asset) and value._read_guard is not None:
             value._read_guard()
         return value.digest
     raise CapabilityError(
@@ -209,7 +209,7 @@ class _Broker:
                 msgspec.to_builtins(
                     request,
                     enc_hook=lambda value: (
-                        value.ref if isinstance(value, Asset) else asset_value(value)
+                        value.ref if isinstance(value, (Asset, Tree)) else asset_value(value)
                     ),
                 )
             )
