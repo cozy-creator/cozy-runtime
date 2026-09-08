@@ -165,9 +165,14 @@ def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
 
     Stage-local and overall fractions stay separate. Optional coordinates are omitted when
     the package does not know them; no layer fabricates whole-invocation completion.
+    Other events retain the executor's public record, already bounded and redacted at
+    emission. Only seam routing fields are removed; a log's scalar value is its level,
+    not its message, and a load's value may be None beside a measured position.
     """
     kind = frame.get("kind", "progress")
-    payload: Any = frame.get("value")
+    payload: Any = {
+        key: value for key, value in frame.items() if key not in {"event", "request_id", "kind"}
+    }
     if kind == "progress":
         payload = {
             "stage": str(frame.get("stage", ""))[:120],
