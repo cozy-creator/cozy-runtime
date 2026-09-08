@@ -264,8 +264,17 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt.closed = True
     return InvocationResult(
         result=result,
-        outputs=tuple(a.row() for a in assets_in(result))
-        + tuple(tree.row() for tree in trees_in(result)),
+        outputs=tuple(
+            asset.row()
+            for ref, asset in attempt.pending.items()
+            if ref not in attempt.committed_files
+        )
+        + tuple(tree.row() for tree in attempt.pending_trees.values())
+        + tuple(
+            asset.row()
+            for asset in [*assets_in(result), *trees_in(result)]
+            if inv.calls is not None and asset._grant_token is inv.calls.grant_token
+        ),
         adjustments=tuple(attempt.rows),
         features=prepared.features,
         overlay_digest=overlay.digest,
