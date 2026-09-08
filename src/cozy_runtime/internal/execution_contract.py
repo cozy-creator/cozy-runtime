@@ -8,10 +8,16 @@ contracted entry is what ran: its call count against the pinned attention sites 
 forwards, the scheme kwargs and activation dtype each call carried, and the CUDA symbol one
 profiled call launched.
 
-There is no fallback. A lane that promises 8-bit attention refuses where the kernel is absent
-or the device is not the contract's; an attempt whose count or symbol is missing fails typed.
-The runtime names no kernel: the contract names the entry, and diffusers' own reviewed wrapper
-for that entry is what `dispatch_attention_fn` calls.
+There is no fallback. A lane that promises a kernel refuses where the kernel is absent or the
+device is not the contract's; an attempt whose count or symbol is missing fails typed. The
+runtime names no kernel: the contract names the entry, and diffusers' own reviewed wrapper for
+that entry is what `dispatch_attention_fn` calls.
+
+A kernel is either an installed distribution (`sageattention`, resolved by `importlib`) or one
+the worker image BAKES from a `kernels` Hub snapshot (`flash-attn3`, h3a-012: bf16, -16 %/step
+on sm90), resolved by path under `IMAGE_KERNELS_DIR` and never over the network a pod's
+executor does not have. The contract's `class` says which numerics class the kernel is against
+the reference route; the hub fences publication on it.
 """
 
 from __future__ import annotations
@@ -26,7 +32,8 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from importlib import import_module, metadata
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import msgspec
 from packaging.version import InvalidVersion, Version
@@ -36,14 +43,46 @@ from cozy_runtime.internal.anima_optimization import DIFFUSERS_VERSION
 from cozy_runtime.internal.encoding import DeviceFacts, device_line
 from cozy_runtime.internal.resolution import ROUTE_KERNEL
 
+try:
+    from kernels import get_local_kernel
+except ImportError as _absent_kernels:  # pragma: no cover - exercised by the typed refusal arm
+    KERNELS_ABSENT = f"does not import ({_absent_kernels})"
+else:
+    KERNELS_ABSENT = ""
+
 #: The header config's name. One source of truth, inline, beside the construction configs.
 CONFIG_NAME = "execution"
 
 #: The contract's activation dtype spellings, and the torch dtype name each one is.
 ACTIVATIONS = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
 
+#: The numerics class the contract claims for its kernel against the reference bf16 SDPA
+#: route. `same`: bit-different in reduction order only (FA3 bf16, h3a-012: max abs 1.2e-7,
+#: audio bit-identical) — the hub publishes it with no gate. `quantized`: 8-bit attention —
+#: the hub publishes it only past a PASS assessment. The hub owns the allowlist of which
+#: kernel may claim which class; the runtime reads the vocabulary and applies the kernel.
+CLASSES = frozenset({"same", "quantized"})
+
+
+@dataclass(frozen=True, slots=True)
+class Baked:
+    """A kernel the worker image bakes: diffusers' backend for it, and the local name its
+    reviewed wrapper binds the kernel function to (`func = _HUB_KERNELS_REGISTRY[...]`)."""
+
+    backend: str
+    call: str
+
+
+#: Where the worker image bakes `kernels` Hub snapshots (tensorhub's cu130 Dockerfile,
+#: th-182): `<distribution>/build/<variant>/` holds one built variant and its metadata, the
+#: same shape as the fused-glue artifact under `/opt/cozy/fusion`. A contract for a baked
+#: kernel pins the Hub revision and that variant; nothing here is fetched.
+IMAGE_KERNELS_DIR = Path("/opt/cozy/kernels")
+BAKED = {"flash-attn3": Baked(backend="_flash_3_hub", call="func")}
+
 _DEVICE = re.compile(r"^sm\d{2,3}$")
 _ENTRY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_REVISION = re.compile(r"^[0-9a-f]{40}$")
 
 #: The REVIEWED diffusers wrappers at `DIFFUSERS_VERSION`, by backend name: the source digest of
 #: the function `dispatch_attention_fn` hands (query, key, value, is_causal, scale) to the
@@ -64,6 +103,7 @@ _WRAPPER_DIGESTS = {
         "d2c352e8f12f6cf2d20737e76a7f358507b204db5a61a13f9d8e466f794c9e3c"
     ),
     "sage": "712c6c1c6722a7a16cc22a23a5d32080caf7a1638b09476b576cfeb3b75486a1",
+    "_flash_3_hub": "a7a41608ec7418588c8dc9b45c9ce8649d76f2272bfab2982d0d9f97e77dcd14",
 }
 
 
@@ -90,12 +130,15 @@ class Weights(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     route: str
 
 
-class Attention(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class Attention(msgspec.Struct, frozen=True, forbid_unknown_fields=True, omit_defaults=True):
     distribution: str
     version: str
     entry: str
-    kwargs: dict[str, bool | int | float | str]
+    kwargs: dict[str, bool | int | float | str | None]
     scheme: str
+    #: A baked kernel's Hub revision and build variant; empty for an installed distribution.
+    revision: str = ""
+    variant: str = ""
 
 
 class ExecutionContract(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -103,6 +146,7 @@ class ExecutionContract(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
 
     device: str
     activations: str
+    class_: str = msgspec.field(name="class")
     weights: Weights
     attention: Attention
 
@@ -141,6 +185,8 @@ def read(configs: object) -> ExecutionContract | None:
             f"{CONFIG_NAME}.activations: {contract.activations!r} is not one of "
             f"{sorted(ACTIVATIONS)}"
         )
+    if contract.class_ not in CLASSES:
+        raise _invalid(f"{CONFIG_NAME}.class: {contract.class_!r} is not one of {sorted(CLASSES)}")
     if contract.weights.route not in ROUTE_KERNEL:
         raise _invalid(
             f"{CONFIG_NAME}.weights.route: {contract.weights.route!r} is not one of "
@@ -160,6 +206,22 @@ def read(configs: object) -> ExecutionContract | None:
         Version(attention.version)
     except InvalidVersion as exc:
         raise _invalid(f"{CONFIG_NAME}.attention.version: {exc}") from exc
+    if attention.distribution in BAKED:
+        if not _REVISION.match(attention.revision):
+            raise _invalid(
+                f"{CONFIG_NAME}.attention.revision: {attention.revision!r} is not the 40-hex "
+                f"Hub revision {attention.distribution} is baked from"
+            )
+        if not attention.variant:
+            raise _invalid(
+                f"{CONFIG_NAME}.attention.variant: empty; name the baked build variant of "
+                f"{attention.distribution}"
+            )
+    elif attention.revision or attention.variant:
+        raise _invalid(
+            f"{CONFIG_NAME}.attention.revision/variant name a baked kernel; "
+            f"{attention.distribution} is an installed distribution"
+        )
     return contract
 
 
@@ -189,26 +251,28 @@ class Kernel:
     live: dict[str, str]
     """Contract kwargs the wrapper feeds from its own parameter (`is_causal=is_causal`): the
     value is decided per call by dispatch, so it is verified per call, by that parameter."""
+    location: str = ""
+    """A baked kernel's variant directory; empty for an installed distribution."""
 
 
 def _same(actual: object, expected: object) -> bool:
     return type(actual) is type(expected) and actual == expected
 
 
-def _entry_call(wrapper: Callable[..., Any], entry_name: str) -> ast.Call:
+def _entry_call(wrapper: Callable[..., Any], call_name: str) -> ast.Call:
     tree = ast.parse(textwrap.dedent(inspect.getsource(wrapper)))
     calls = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and (
-            (isinstance(node.func, ast.Name) and node.func.id == entry_name)
-            or (isinstance(node.func, ast.Attribute) and node.func.attr == entry_name)
+            (isinstance(node.func, ast.Name) and node.func.id == call_name)
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == call_name)
         )
     ]
     if len(calls) != 1:
         raise _absent(
-            f"diffusers' {wrapper.__name__} calls {entry_name} {len(calls)} times; the "
+            f"diffusers' {wrapper.__name__} calls {call_name} {len(calls)} times; the "
             "attestation counts one kernel call per wrapper call"
         )
     return calls[0]
@@ -217,7 +281,7 @@ def _entry_call(wrapper: Callable[..., Any], entry_name: str) -> ast.Call:
 def _coverage(
     contract: ExecutionContract,
     kernel_entry: Callable[..., Any],
-    entry_name: str,
+    call_name: str,
     wrapper: Callable[..., Any],
 ) -> dict[str, str]:
     """Every contract kwarg is what the entry would RUN under diffusers' wrapper.
@@ -225,11 +289,12 @@ def _coverage(
     A wrapper passes some kwargs as constants (`tensor_layout="NHD"`), some from its own
     parameters (`is_causal=is_causal`), and leaves the rest to the entry's signature defaults
     (`qk_quant_gran`). The first and last are checked here; the middle is returned for the
-    per-call check, because its value is dispatch's to decide.
+    per-call check, because its value is dispatch's to decide. `call_name` is what the wrapper
+    calls the entry: its own name, or the local a Hub kernel is bound to.
     """
     signature = inspect.signature(kernel_entry)
     wrapper_signature = inspect.signature(wrapper)
-    call = _entry_call(wrapper, entry_name)
+    call = _entry_call(wrapper, call_name)
     positional = list(signature.parameters)[: len(call.args)]
     constants: dict[str, object] = {}
     variables: dict[str, str] = {}
@@ -272,8 +337,59 @@ def _coverage(
     return live
 
 
+def _lookup(module: Any, dotted: str, distribution: str) -> tuple[Any, Any]:
+    """`(owner, entry)` for a dotted name on a loaded module, or `kernel_absent`."""
+    owner: Any = module
+    entry: Any = module
+    for part in dotted.split("."):
+        owner = entry
+        entry = getattr(entry, part, None)
+        if entry is None:
+            raise _absent(f"{distribution}.{dotted} does not exist")
+    if not callable(entry):
+        raise _absent(f"{distribution}.{dotted} is not callable")
+    return owner, entry
+
+
+def _diffusers_backends() -> dict[Any, Callable[..., Any]]:
+    """diffusers' attention registry at the reviewed version, or `kernel_absent`."""
+    try:
+        diffusers_version = metadata.version("diffusers")
+    except metadata.PackageNotFoundError as exc:
+        raise _absent(
+            "diffusers is not installed; attention backends are pinned through it"
+        ) from exc
+    if diffusers_version != DIFFUSERS_VERSION:
+        raise _absent(
+            f"the reviewed attention wrappers are diffusers=={DIFFUSERS_VERSION}; this "
+            f"environment installs {diffusers_version}"
+        )
+    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+
+    return cast(dict[Any, Callable[..., Any]], _AttentionBackendRegistry._backends)
+
+
+def _reviewed(backend: str, wrapper: Callable[..., Any]) -> str:
+    """The wrapper's source digest, which must be the one reviewed for its backend."""
+    digest = hashlib.sha256(inspect.getsource(wrapper).encode()).hexdigest()
+    expected = _WRAPPER_DIGESTS.get(backend)
+    if expected is None:
+        raise _absent(f"diffusers backend {backend!r} has no reviewed wrapper in this runtime")
+    if digest != expected:
+        raise _absent(
+            f"diffusers' {wrapper.__name__} has source sha256:{digest}, reviewed "
+            f"sha256:{expected}; refusing the contract rather than guessing across patched source"
+        )
+    return digest
+
+
 def resolve_kernel(contract: ExecutionContract) -> Kernel:
     """The contracted entry in THIS environment, or `execution_contract_kernel_absent`."""
+    baked = BAKED.get(contract.attention.distribution)
+    return _resolve_baked(contract, baked) if baked else _resolve_installed(contract)
+
+
+def _resolve_installed(contract: ExecutionContract) -> Kernel:
     attention = contract.attention
     try:
         installed = metadata.version(attention.distribution)
@@ -293,31 +409,10 @@ def resolve_kernel(contract: ExecutionContract) -> Kernel:
         raise _absent(
             f"{attention.distribution}=={installed} does not import: {type(exc).__name__}: {exc}"
         ) from exc
-    owner: Any = module
-    entry: Any = module
-    for part in attention.entry.split("."):
-        owner = entry
-        entry = getattr(entry, part, None)
-        if entry is None:
-            raise _absent(f"{attention.distribution}.{attention.entry} does not exist")
-    if not callable(entry):
-        raise _absent(f"{attention.distribution}.{attention.entry} is not callable")
+    owner, entry = _lookup(module, attention.entry, attention.distribution)
     entry_name = attention.entry.rsplit(".", 1)[-1]
-    try:
-        diffusers_version = metadata.version("diffusers")
-    except metadata.PackageNotFoundError as exc:
-        raise _absent(
-            "diffusers is not installed; attention backends are pinned through it"
-        ) from exc
-    if diffusers_version != DIFFUSERS_VERSION:
-        raise _absent(
-            f"the reviewed attention wrappers are diffusers=={DIFFUSERS_VERSION}; this "
-            f"environment installs {diffusers_version}"
-        )
-    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
-
     found: list[tuple[str, Callable[..., Any]]] = []
-    for member, wrapper in _AttentionBackendRegistry._backends.items():
+    for member, wrapper in _diffusers_backends().items():
         names = wrapper.__code__.co_names
         if entry_name not in names:
             continue
@@ -332,17 +427,71 @@ def resolve_kernel(contract: ExecutionContract) -> Kernel:
             + (f" ({', '.join(name for name, _ in found)})" if found else "")
         )
     backend, wrapper = found[0]
-    digest = hashlib.sha256(inspect.getsource(wrapper).encode()).hexdigest()
-    expected = _WRAPPER_DIGESTS.get(backend)
-    if expected is None:
-        raise _absent(f"diffusers backend {backend!r} has no reviewed wrapper in this runtime")
-    if digest != expected:
-        raise _absent(
-            f"diffusers' {wrapper.__name__} has source sha256:{digest}, reviewed "
-            f"sha256:{expected}; refusing the contract rather than guessing across patched source"
-        )
+    digest = _reviewed(backend, wrapper)
     live = _coverage(contract, entry, entry_name, wrapper)
     return Kernel(entry, entry_name, installed, backend, wrapper, digest, live)
+
+
+def _resolve_baked(contract: ExecutionContract, baked: Baked) -> Kernel:
+    """The baked snapshot under `IMAGE_KERNELS_DIR`, loaded by path through `kernels`.
+
+    diffusers resolves a Hub kernel over the network on first use (`get_kernel(repo,
+    version=1)` reads tags); the loaded module is placed in that registry slot instead, so
+    the pin never reaches for a network the executor does not have.
+    """
+    attention = contract.attention
+    name = f"{attention.distribution}@{attention.revision[:12]}/{attention.variant}"
+    if KERNELS_ABSENT:
+        raise _absent(f"{name} loads through the `kernels` distribution, which {KERNELS_ABSENT}")
+    location = IMAGE_KERNELS_DIR / attention.distribution
+    variant_dir = location / "build" / attention.variant
+    if not (variant_dir / "metadata.json").is_file():
+        raise _absent(
+            f"{name} is not baked at {variant_dir}; the worker image bakes it there and this "
+            "executor has no network to fetch it"
+        )
+    built = json.loads((variant_dir / "metadata.json").read_text())
+    if str(built.get("version")) != attention.version:
+        raise _absent(
+            f"{variant_dir} is {attention.distribution} version {built.get('version')!r}; the "
+            f"contract needs {attention.version}"
+        )
+    try:
+        module = get_local_kernel(location)
+    except Exception as exc:
+        raise _absent(f"{name} does not load from {location}: {type(exc).__name__}: {exc}") from exc
+    loaded = Path(str(getattr(module, "__file__", ""))).resolve().parent
+    if loaded != variant_dir.resolve():
+        raise _absent(
+            f"this torch resolves {attention.distribution} to build variant {loaded.name!r} "
+            f"where the contract names {attention.variant!r}"
+        )
+    _, entry = _lookup(module, attention.entry, attention.distribution)
+    from diffusers.models.attention_dispatch import _HUB_KERNELS_REGISTRY, AttentionBackendName
+
+    member = AttentionBackendName(baked.backend)
+    wrapper = _diffusers_backends()[member]
+    digest = _reviewed(baked.backend, wrapper)
+    live = _coverage(contract, entry, baked.call, wrapper)
+    config = _HUB_KERNELS_REGISTRY[member]
+    config.kernel_fn = entry
+    for attr, slot in (
+        ("wrapped_forward_attr", "wrapped_forward_fn"),
+        ("wrapped_backward_attr", "wrapped_backward_fn"),
+    ):
+        dotted = getattr(config, attr)
+        if dotted:
+            setattr(config, slot, _lookup(module, dotted, attention.distribution)[1])
+    return Kernel(
+        entry,
+        attention.entry.rsplit(".", 1)[-1],
+        attention.version,
+        baked.backend,
+        wrapper,
+        digest,
+        live,
+        str(variant_dir),
+    )
 
 
 # ------------------------------------------------------------------------ application
@@ -385,6 +534,7 @@ class AppliedContract:
             "contract": self.contract.document(),
             "backend": self.kernel.backend,
             "installed_version": self.kernel.installed_version,
+            "location": self.kernel.location,
             "wrapper_digest": "sha256:" + self.kernel.wrapper_digest,
             "hosts": dict(self.hosts),
             "sites": sum(self.hosts.values()),

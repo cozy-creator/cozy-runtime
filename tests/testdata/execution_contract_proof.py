@@ -23,6 +23,7 @@ from cozy_runtime.internal.encoding import measure_device
 DESIGN_CONTRACT: dict[str, Any] = {
     "device": "sm90",
     "activations": "bf16",
+    "class": "quantized",
     "weights": {"route": "encoded_gemm"},
     "attention": {
         "distribution": "sageattention",
@@ -45,6 +46,7 @@ DESIGN_CONTRACT: dict[str, Any] = {
 STANDIN_CONTRACT: dict[str, Any] = {
     "device": "sm89",
     "activations": "bf16",
+    "class": "quantized",
     "weights": {"route": "verbatim"},
     "attention": {
         "distribution": "sageattention",

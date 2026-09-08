@@ -41,6 +41,7 @@ from cozy_runtime.internal.resolution import ConstructionFacts, PlanRefusal, Var
 CONTRACT: dict[str, Any] = {
     "device": "sm90",
     "activations": "bf16",
+    "class": "quantized",
     "weights": {"route": "encoded_gemm"},
     "attention": {
         "distribution": "sageattention",
@@ -56,6 +57,34 @@ CONTRACT: dict[str, Any] = {
         "scheme": (
             "qk int8 per-thread (Q64/16, K128/128) K-mean-smoothed; v fp8-e4m3 per-channel; "
             "pv fp32+fp32"
+        ),
+    },
+}
+
+
+#: The same-class lane's contract (h3a-012): FA3 bf16 baked in the cu130 image, no descale.
+FA3_CONTRACT: dict[str, Any] = {
+    "device": "sm90",
+    "activations": "bf16",
+    "class": "same",
+    "weights": {"route": "encoded_gemm"},
+    "attention": {
+        "distribution": "flash-attn3",
+        "version": "1",
+        "revision": "7cb368cf8278b583132eb72cbf312d54586df2e2",
+        "variant": "torch-stable-abi29-cu130-x86_64-linux",
+        "entry": "flash_attn_func",
+        "kwargs": {
+            "causal": False,
+            "q_descale": None,
+            "k_descale": None,
+            "v_descale": None,
+            "num_splits": 1,
+            "deterministic": False,
+        },
+        "scheme": (
+            "bf16 q/k/v with no descale (the bf16 path, not fp8); fp32 softmax and PV "
+            "accumulation; full non-causal attention, no window, no softcap"
         ),
     },
 }
@@ -102,6 +131,9 @@ def test_the_design_contract_reads_verbatim_and_digests_stably() -> None:
         (lambda d: d.__setitem__("device", 90), "device"),
         (lambda d: d.__setitem__("device", "hopper"), "device"),
         (lambda d: d.__setitem__("activations", "int8"), "activations"),
+        (lambda d: d.__setitem__("class", "faster"), "class"),
+        (lambda d: d.pop("class"), "class"),
+        (lambda d: d["attention"].__setitem__("revision", "7cb368cf"), "revision"),
         (lambda d: d["weights"].__setitem__("route", "decode_floor"), "weights.route"),
         (lambda d: d["attention"].__setitem__("entry", "a-b"), "attention.entry"),
         (lambda d: d["attention"].__setitem__("version", "latest!"), "attention.version"),
@@ -115,6 +147,32 @@ def test_a_malformed_contract_refuses_invalid_naming_the_field(mutate: Any, name
     refused = _refusal(lambda: execution_contract.read(_configs(document)))
     assert refused.code == "execution_contract_invalid"
     assert names.split(".")[-1] in str(refused)
+
+
+def test_the_baked_kernel_contract_reads_verbatim_and_pins_its_snapshot() -> None:
+    contract = execution_contract.read(_configs(FA3_CONTRACT))
+    assert contract is not None
+    assert contract.document() == FA3_CONTRACT
+    assert contract.class_ == "same"
+    assert contract.attention.revision == "7cb368cf8278b583132eb72cbf312d54586df2e2"
+    assert contract.attention.kwargs["q_descale"] is None
+    assert contract.digest() != execution_contract.read(_configs(CONTRACT)).digest()  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "names"),
+    [
+        (lambda d: d["attention"].__setitem__("revision", "v1"), "revision"),
+        (lambda d: d["attention"].pop("revision"), "revision"),
+        (lambda d: d["attention"].__setitem__("variant", ""), "variant"),
+        (lambda d: d["attention"].pop("variant"), "variant"),
+    ],
+)
+def test_a_baked_kernel_without_its_pin_refuses_invalid(mutate: Any, names: str) -> None:
+    document = json.loads(json.dumps(FA3_CONTRACT))
+    mutate(document)
+    refused = _refusal(lambda: execution_contract.read(_configs(document)))
+    assert refused.code == "execution_contract_invalid" and names in str(refused)
 
 
 def test_a_non_canonical_or_external_config_refuses_invalid() -> None:
@@ -146,6 +204,22 @@ def test_an_absent_distribution_refuses_kernel_absent_naming_it() -> None:
     refused = _refusal(lambda: execution_contract.resolve_kernel(contract))
     assert refused.code == "execution_contract_kernel_absent"
     assert "sageattention==2.2.0" in str(refused) and "not installed" in str(refused)
+
+
+def test_the_baked_kernel_lane_refuses_off_sm90_and_where_nothing_is_baked() -> None:
+    """The local arms of the FA3 lane (sm90-only kernel, RTX 4070 box): the device class
+    refuses before any lookup, and off the worker image the snapshot is not baked."""
+    contract = execution_contract.read(_configs(FA3_CONTRACT))
+    assert contract is not None
+    refused = _refusal(functools.partial(execution_contract.check_device, contract, _device(89)))
+    assert refused.code == "execution_contract_unsupported" and "sm90" in str(refused)
+    if (execution_contract.IMAGE_KERNELS_DIR / "flash-attn3").exists():
+        pytest.skip("flash-attn3 is baked here; the absent arm needs it absent")
+    refused = _refusal(lambda: execution_contract.resolve_kernel(contract))
+    assert refused.code == "execution_contract_kernel_absent"
+    assert "flash-attn3@7cb368cf8278/torch-stable-abi29-cu130-x86_64-linux" in str(refused)
+    if not execution_contract.KERNELS_ABSENT:
+        assert str(execution_contract.IMAGE_KERNELS_DIR / "flash-attn3") in str(refused)
 
 
 def test_a_wrong_version_or_missing_entry_refuses_kernel_absent() -> None:

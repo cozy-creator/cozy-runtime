@@ -35,7 +35,7 @@ from cozy_runtime.author._decode import (
     decode_image_path,
     image_target_size,
 )
-from cozy_runtime.internal import package_interface
+from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import Discovered
 
 
@@ -173,3 +173,29 @@ def test_source_pixels_do_not_hide_behind_small_prepared_output(tmp_path: Path) 
         _decode_image_frame(
             frame, limits, _Budget(limits.max_decoded_bytes), rotation=0, preparation=prep
         )
+
+
+def test_image_preparation_static_reader_never_imports_package(tmp_path: Path) -> None:
+    (tmp_path / "package.toml").write_text('[application]\nobject="image_preparation:app"\n')
+    (tmp_path / "image_preparation.py").write_text("""
+from typing import Annotated
+import msgspec
+from cozy_runtime.author import App, Assets, Image, ImagePreparation, AssetLimits
+raise AssertionError("package analysis executed user code")
+class Request(msgspec.Struct):
+    prompt: str
+class Result(msgspec.Struct):
+    width: int
+app = App()
+@app.entrypoint
+def render(
+    payload: Request,
+    assets: Annotated[Assets[Image], AssetLimits(images=2), ImagePreparation(max_edge=512)],
+) -> Result:
+    return Result(assets[0].width)
+""")
+    body = static_interface.build(tmp_path)
+    assert body["entrypoints"][0]["assets"]["kinds"][0]["prepare"] == {
+        "profile": "image-fit/1",
+        "max_edge": 512,
+    }

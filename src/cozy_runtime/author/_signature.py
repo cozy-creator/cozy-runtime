@@ -488,20 +488,8 @@ def analyze(
         payload_type = payloads[0].annotation
         if assets_params:
             binding = assets_binding(assets_params[0].name, assets_params[0].annotation)
-            original = typing.cast(type[msgspec.Struct], payload_type)
-            if any(
-                f.encode_name == binding.parameter or f.name == binding.parameter
-                for f in msgspec.structs.fields(original)
-            ):
-                raise ConformanceError(
-                    "Assets parameter collides with a payload field", code="assets_field_collision"
-                )
-            payload_type = msgspec.defstruct(
-                f"{fn.__name__}Request",
-                [(binding.parameter, typing.cast(Any, binding.wire_type))],
-                bases=(original,),
-                module=fn.__module__,
-                kw_only=True,
+            payload_type = assets_payload(
+                typing.cast(type[msgspec.Struct], payload_type), binding, fn.__name__, fn.__module__
             )
     contexts = [p for p in params if p.role == "context"]
     if len(contexts) > 1:
@@ -548,6 +536,27 @@ def analyze(
         hidden=hidden,
         invocable=invocable,
         memoize=memoize,
+    )
+
+
+def assets_payload(
+    payload_type: type[msgspec.Struct], binding: AssetsBinding, fn_name: str, module: str
+) -> type[msgspec.Struct]:
+    """The request struct with the Assets occurrence field appended — ONE construction, read
+    by the import path and the static reader alike."""
+    if any(
+        f.encode_name == binding.parameter or f.name == binding.parameter
+        for f in msgspec.structs.fields(payload_type)
+    ):
+        raise ConformanceError(
+            "Assets parameter collides with a payload field", code="assets_field_collision"
+        )
+    return msgspec.defstruct(
+        f"{fn_name}Request",
+        [(binding.parameter, typing.cast(Any, binding.wire_type))],
+        bases=(payload_type,),
+        module=module,
+        kw_only=True,
     )
 
 
