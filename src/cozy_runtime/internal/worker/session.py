@@ -1831,6 +1831,7 @@ class Worker:
                 job_plan_root=self.config.cozy_home / "job-plans",
                 base=self.base,
                 materialized=materialized.append,
+                dependency_python=self.options.environment_python,
             )
             prepared = read_placement_set(result.placement_set)
             if len(prepared) != 1 or not prepared[0].get("development"):
@@ -3873,7 +3874,11 @@ class Worker:
             return None
         try:
             installed_environment = prepared_environment
-            if self.options.environment_python is not None:
+            if (
+                installed_environment is None
+                and self.options.install_root is None
+                and self.options.environment_python is not None
+            ):
                 package = placement.package or placement.development
                 project_wheel = package.get("project_wheel", {})
                 project_ref = (
@@ -6354,7 +6359,8 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--environment-python",
         default="",
-        help="Python from one already-complete local package venv",
+        help="installed local package Python; with --install-root, supplies dependencies "
+        "for a captured immutable generation",
     )
     parser.add_argument(
         "--artifact-cache",
@@ -6379,14 +6385,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-cert", default="", help="PEM cert for a non-loopback listener")
     parser.add_argument("--tls-key", default="", help="PEM key for a non-loopback listener")
     args = parser.parse_args(argv)
-
-    if args.install_root and args.environment_python:
-        print(
-            "[worker] --install-root and --environment-python are mutually exclusive",
-            file=sys.stderr,
-            flush=True,
-        )
-        return int(Exit.structural)
 
     isolated = args.executor_uid >= 0 or args.executor_gid >= 0
     if isolated and (
