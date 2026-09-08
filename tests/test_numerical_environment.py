@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +16,66 @@ from cozy_runtime.internal.numerical_environment import NumericalEnvironmentRefu
 from cozy_runtime.internal.worker.control import _PreparationServicer
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
+
+
+def test_probe_uses_selected_interpreter_and_ignores_install_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cozy_runtime.internal import package_environment
+
+    root = Path(__file__).parents[1]
+    wheelhouse = tmp_path / "wheels"
+    subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(wheelhouse)],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    (wheel,) = wheelhouse.glob("*.whl")
+    interpreters = []
+    for name in ("first", "relocated"):
+        prefix = tmp_path / name
+        python = prefix / "bin/python"
+        copied_wheel = tmp_path / (name + "-wheels") / wheel.name
+        copied_wheel.parent.mkdir()
+        shutil.copyfile(wheel, copied_wheel)
+        subprocess.run(
+            ["uv", "venv", str(prefix), "--python", sys.executable], check=True, capture_output=True
+        )
+        subprocess.run(
+            ["uv", "pip", "install", "--offline", "--python", str(python), str(copied_wheel)],
+            check=True,
+            capture_output=True,
+        )
+        interpreters.append((python, package_environment.observe_base(python)))
+
+    def wrong_control(*args: object, **kwargs: object) -> None:
+        raise AssertionError("control interpreter distribution discovery was used")
+
+    monkeypatch.setattr("importlib.metadata.distribution", wrong_control)
+    device = HostFacts(backend="cpu")
+    identities = [
+        fingerprint(base, device, threads=1, alloc_conf="", inherited={}, python=python)
+        for python, base in interpreters
+    ]
+    assert len(identities[0]) == 32 and identities[0] == identities[1]
+    python, base = interpreters[0]
+    for distributions in (
+        tuple(
+            (name, "0.0.0" if name == "cozy-runtime" else version)
+            for name, version in base.distributions
+        ),
+        (*base.distributions, ("torch", "2.14.0")),
+    ):
+        with pytest.raises(NumericalEnvironmentRefusal):
+            fingerprint(
+                replace(base, distributions=distributions),
+                device,
+                threads=1,
+                alloc_conf="",
+                inherited={},
+                python=python,
+            )
 
 
 def test_installed_code_changes_reuse_identity_without_version_or_machine_changes(
