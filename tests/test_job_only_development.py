@@ -56,8 +56,8 @@ def test_empty_interface_still_refuses() -> None:
         )
 
 
-@pytest.mark.parametrize("kind", ["job", "entrypoint"])
-def test_metadata_placement_never_imports_weightless_or_job_source(
+@pytest.mark.parametrize("kind", ["job", "entrypoint", "modeled"])
+def test_metadata_placement_never_imports_source(
     tmp_path: Path, kind: str
 ) -> None:
     module = f"never_import_placement_{kind}"
@@ -66,11 +66,18 @@ def test_metadata_placement_never_imports_weightless_or_job_source(
     (tmp_path / f"{module}.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
         "import unavailable_package_dependency\n"
-        "import msgspec\nfrom cozy_runtime.author import App\napp = App()\n"
+        "import msgspec\nfrom cozy_runtime.author import App, Model, uses_components\n"
+        "app = App()\n"
+        "class ExampleModel(Model[object]):\n"
+        "    def load(self, loader):\n"
+        "        raise RuntimeError('constructor ran during metadata')\n"
+        "    @uses_components('example')\n"
+        "    def predict(self):\n        return None\n"
         "class Request(msgspec.Struct):\n    value: int\n"
         "class Result(msgspec.Struct):\n    value: int\n"
-        f"@app.{kind}\n"
-        "def run(payload: Request) -> Result:\n    return Result(payload.value)\n"
+        f"@app.{'entrypoint' if kind == 'modeled' else kind}\n"
+        f"def run(payload: Request{', model: ExampleModel' if kind == 'modeled' else ''})"
+        " -> Result:\n    return Result(payload.value)\n"
     )
     result = subprocess.run(
         [
@@ -95,6 +102,11 @@ def test_metadata_placement_never_imports_weightless_or_job_source(
         check=False,
         env={**os.environ, "COZY_HOME": str(tmp_path / "home")},
     )
+    if kind == "modeled":
+        assert result.returncode != 0
+        assert "worker_preparation_required" in result.stdout + result.stderr
+        assert not marker.exists()
+        return
     assert result.returncode == 0, result.stderr
     body = json.loads(result.stdout)
     interface = json.loads(base64.b64decode(body["package_interface"]["canonical_bytes_base64"]))

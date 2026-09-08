@@ -252,7 +252,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
 
 
 def development_placement(config: RuntimeConfig, args: list[str], opts: Options) -> Result:
-    """Internal Creator plumbing for one honest source-checkout PlacementSet."""
+    """Read job or weightless placement metadata without running package code."""
 
     from cozy_runtime.author import ConformanceError
     from cozy_runtime.internal import local, static_interface
@@ -308,6 +308,16 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
             if "--environment-python" in values
             else None,
         )
+        entries = interface["entrypoints"]
+        assert isinstance(entries, list)
+        modeled = any(isinstance(entry, dict) and entry.get("models") for entry in entries)
+        if modeled:
+            raise CliError(
+                "worker_preparation_required",
+                "modeled serving placement requires worker preparation",
+                "run the package through Cozy so its worker prepares the exact model components",
+                Exit.structural,
+            )
         development = local.development_placement_documents(
             interface,
             package=package,
