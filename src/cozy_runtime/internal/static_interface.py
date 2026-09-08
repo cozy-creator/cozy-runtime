@@ -5,7 +5,8 @@ compiles or evaluates a package module. No `importlib`, no `sys.path`, no `exec`
 `compile`, no annotation evaluation, no module top level. It reads text, parses it with
 `ast`, follows the package's own module-scope import graph (plus cozy-runtime's own source
 for `cozy_runtime.derive.*`), folds constants with its own evaluator over literal and
-arithmetic nodes, and translates every interface-bearing declaration into real types built
+arithmetic nodes and the values of the package's own committed JSON data assets
+(`author.data_values`), and translates every interface-bearing declaration into real types built
 from the CLOSED author vocabulary — `msgspec.defstruct`, `enum.Enum`, `typing.Literal`/
 `Annotated`, cozy-runtime's own asset, marker and service classes. Rendering is then
 `schema.render`, the SAME renderer the import path uses, so the two derivations cannot drift
@@ -22,6 +23,7 @@ from __future__ import annotations
 import ast
 import enum
 import tomllib
+import types
 import typing
 from collections.abc import Callable, Mapping, Sequence, Set
 from dataclasses import dataclass, field
@@ -161,8 +163,10 @@ _AUTHOR_TYPES = (
     "Secrets",
     *(cls.__name__ for cls in SERVICES.values()),
 )
-#: Author-surface constructors a folded constant may call: each validates its own arguments.
-_AUTHOR_VALUES = ("AssetBound", "AssetLimits", "WeightsOutput", "Bound", "Shape")
+#: Author-surface callables a folded constant may reach: each validates its own arguments.
+#: `data_values` READS a committed JSON asset — data, never code — through the same function
+#: the imported app calls, so a value the plan owns needs no second copy in source (#705).
+_AUTHOR_VALUES = ("AssetBound", "AssetLimits", "WeightsOutput", "Bound", "Shape", "data_values")
 #: Struct class keywords `msgspec.defstruct` takes verbatim. `rename` and `array_like` change
 #: the wire and are refused; everything else here is either wire-neutral or passed through.
 _STRUCT_KEYWORDS = frozenset(
@@ -182,6 +186,13 @@ _STRUCT_KEYWORDS = frozenset(
         "repr_omit_defaults",
     }
 )
+#: `tuple(...)`/`list(...)` over a folded sequence: the only builtins a constant may call.
+_SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
+    "builtins.tuple": tuple,
+    "builtins.list": list,
+}
+#: A fold carries no local names unless a comprehension binds its own target.
+_NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
 _ENTRYPOINT_KEYWORDS = frozenset({"name", "preflight", "demand", "hidden"})
 _JOB_KEYWORDS = frozenset({"name", "publishes", "emits_media", "weights", "demand"})
@@ -405,23 +416,30 @@ class Reader:
 
     # ------------------------------------------------------------- constants
 
-    def fold(self, module: Module, node: ast.expr) -> object:
-        """The value of a literal/arithmetic expression, through module-level names."""
+    def fold(
+        self, module: Module, node: ast.expr, scope: Mapping[str, object] = _NO_SCOPE
+    ) -> object:
+        """The value of a literal/arithmetic expression, through module-level names.
+
+        `scope` carries a comprehension's own target and nothing else is ever local.
+        """
         if isinstance(node, ast.Constant):
             return node.value
         if isinstance(node, (ast.Tuple, ast.List)):
-            items = [self.fold(module, item) for item in node.elts]
+            items = [self.fold(module, item, scope) for item in node.elts]
             return tuple(items) if isinstance(node, ast.Tuple) else items
         if isinstance(node, ast.Dict):
             if any(key is None for key in node.keys):
                 self.refuse(module, node, "a dict splat", "static_computed")
             return {
-                self.fold(module, key): self.fold(module, value)
+                self.fold(module, key, scope): self.fold(module, value, scope)
                 for key, value in zip(node.keys, node.values, strict=True)
                 if key is not None
             }
+        if isinstance(node, (ast.GeneratorExp, ast.ListComp)):
+            return self._comprehension(module, node, scope)
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
-            operand = self.fold(module, node.operand)
+            operand = self.fold(module, node.operand, scope)
             if isinstance(operand, bool) or not isinstance(operand, (int, float)):
                 self.refuse(module, node, "unary arithmetic on a non-number", "static_computed")
             if isinstance(node.op, ast.USub):
@@ -430,7 +448,12 @@ class Reader:
                 return +operand
             return ~int(operand)
         if isinstance(node, ast.BinOp):
-            return self._arithmetic(module, node)
+            return self._arithmetic(module, node, scope)
+        if isinstance(node, ast.Name) and node.id in scope:
+            return scope[node.id]
+        if isinstance(node, ast.Name) and node.id == "__file__":
+            # The one dunder a data asset is addressed from: this module's own file.
+            return str(module.path)
         if isinstance(node, (ast.Name, ast.Attribute)):
             found = self.resolve(module, node)
             if isinstance(found, Assigned):
@@ -440,6 +463,13 @@ class Reader:
             self.refuse(module, node, "not a module-level constant")
         if isinstance(node, ast.Call):
             callee = self.resolve(module, node.func)
+            if isinstance(callee, Vocab) and callee.key in _SEQUENCE_BUILTINS:
+                if len(node.args) != 1 or node.keywords:
+                    self.refuse(module, node, "a sequence built from several arguments")
+                sequence = self.fold(module, node.args[0], scope)
+                if not isinstance(sequence, (tuple, list, dict)):
+                    self.refuse(module, node, "a sequence built from a non-sequence")
+                return _SEQUENCE_BUILTINS[callee.key](list(sequence))
             if isinstance(callee, Vocab) and callee.key in (
                 *(f"author.{name}" for name in _AUTHOR_VALUES),
                 "msgspec.Meta",
@@ -449,15 +479,18 @@ class Reader:
                     return author.Shape(pixels={})
                 constructor = _vocab_object(callee.key)
                 assert callable(constructor)
-                args = [self.fold(module, arg) for arg in node.args]
+                args = [self.fold(module, arg, scope) for arg in node.args]
                 kwargs = {
-                    keyword.arg: self.fold(module, keyword.value)
+                    keyword.arg: self.fold(module, keyword.value, scope)
                     for keyword in node.keywords
                     if keyword.arg is not None
                 }
                 if len(kwargs) != len(node.keywords):
                     self.refuse(module, node, "a keyword splat", "static_computed")
-                return constructor(*args, **kwargs)
+                try:
+                    return constructor(*args, **kwargs)
+                except (author.AuthorError, OSError, TypeError, ValueError) as exc:
+                    self.refuse(module, node, str(exc), "static_unsupported")
             self.refuse(
                 module, node, "a call: its value exists only at run time", "static_computed"
             )
@@ -465,8 +498,32 @@ class Reader:
             module, node, "an expression the constant folder does not evaluate", "static_computed"
         )
 
-    def _arithmetic(self, module: Module, node: ast.BinOp) -> object:
-        left, right = self.fold(module, node.left), self.fold(module, node.right)
+    def _comprehension(
+        self, module: Module, node: ast.GeneratorExp | ast.ListComp, scope: Mapping[str, object]
+    ) -> object:
+        """One comprehension over a folded sequence: `tuple(F(x) for x in CONSTANT)`.
+
+        Deterministic by construction: the element is folded exactly as any other constant
+        is, with the clause's own target bound, and nothing of the package runs.
+        """
+        if len(node.generators) != 1:
+            self.refuse(module, node, "a comprehension with several clauses", "static_computed")
+        clause = node.generators[0]
+        if clause.ifs or clause.is_async or not isinstance(clause.target, ast.Name):
+            self.refuse(
+                module, node, "a filtered, async or unpacking comprehension", "static_computed"
+            )
+        items = self.fold(module, clause.iter, scope)
+        if not isinstance(items, (tuple, list, dict)):
+            self.refuse(
+                module, clause.iter, "a comprehension over a non-sequence", "static_computed"
+            )
+        folded = [self.fold(module, node.elt, {**scope, clause.target.id: item}) for item in items]
+        return folded if isinstance(node, ast.ListComp) else tuple(folded)
+
+    def _arithmetic(self, module: Module, node: ast.BinOp, scope: Mapping[str, object]) -> object:
+        left = self.fold(module, node.left, scope)
+        right = self.fold(module, node.right, scope)
         ints = (
             isinstance(left, int)
             and isinstance(right, int)

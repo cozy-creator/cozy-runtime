@@ -17,7 +17,7 @@ from cozy_runtime.author import (
     WeightsSink,
 )
 
-from .bounds import IMAGE_BOUND, LANE_BYTES
+from .bounds import IMAGE_BOUND, LANE_BYTES, LANE_ENCODINGS
 from .models import RenderModel, SourceModel
 from .schemas import (
     Facts,
@@ -56,10 +56,7 @@ def draft(payload: RenderRequest, model: RenderModel) -> RenderResult:
 
 @app.job(
     name="quantize",
-    weights=(
-        WeightsOutput("fp8", max_new_bytes=LANE_BYTES),
-        WeightsOutput("mxfp8", max_new_bytes=LANE_BYTES),
-    ),
+    weights=tuple(WeightsOutput(lane, max_new_bytes=LANE_BYTES) for lane in LANE_ENCODINGS),
 )
 def quantize(
     ctx: Context,
