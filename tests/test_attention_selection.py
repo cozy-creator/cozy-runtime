@@ -12,11 +12,14 @@ loop, and nothing about that depends on what produced the record.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import importlib.util
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +31,21 @@ from cozy_runtime.author._observations import (
     EventRing,
     ObservationRefusal,
 )
-from cozy_runtime.internal import attention
+from cozy_runtime.cli import host
+from cozy_runtime.cli import run as cli_run
+from cozy_runtime.cli.io import CliError
+from cozy_runtime.internal import attention, child_env, package_interface
+from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import DeviceFacts
+from cozy_runtime.internal.local import LocalRequest, development_source_digest, run_slice
 from cozy_runtime.internal.worker.attempts import AttemptRecord
+from cozy_runtime.internal.worker.plan import DeclaredBinding, ModelBinding
+from cozy_runtime.internal.worker.session import WorkerOptions, executor_prepare_command
+from test_end_to_end import NO_EXECUTOR
+
+PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
+needs_executor = pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 
 
 def _device(sm: int, kind: str = "cuda") -> DeviceFacts:
@@ -269,3 +284,146 @@ def test_the_attempt_confession_of_a_huge_value_is_admitted() -> None:
     assert attempt.ring.caps()["refused"] == 0 and attempt.ring.caps()["truncated"] == 1
     assert [row["kind"] for row in attempt.confessions] == ["attention"]
     assert len(str(attempt.ring.events[-1].value)) == TEXT_CAP
+
+
+# ------------------------------------------ the execution-path override, threaded (cr-125)
+
+
+def _binding(models: int = 1) -> DeclaredBinding:
+    """One resolved binding, exactly the shape the boot path hands the prepare builder."""
+    slots = tuple(
+        ModelBinding(
+            model_class="pkg:Dit",
+            model_binding_path=f"m{index}",
+            model_parameter_name=f"p{index}",
+            store="store",
+            variant="fp8",
+            reference_snapshot="sha256:aa",
+            components=("dit",),
+            snapshots={"dit": "sha256:aa"},
+        )
+        for index in range(models)
+    )
+    return DeclaredBinding(
+        entrypoint_binding_digest="sha256:bb",
+        entrypoint="fl2va",
+        model_class=slots[0].model_class,
+        model_binding_path=slots[0].model_binding_path,
+        model_parameter_name=slots[0].model_parameter_name,
+        release="rel-1",
+        models=slots if models > 1 else (),
+        components=slots[0].components,
+        snapshots=slots[0].snapshots,
+        store=slots[0].store,
+        variant=slots[0].variant,
+        reference_snapshot=slots[0].reference_snapshot,
+    )
+
+
+def test_a_serving_prepare_carries_no_pin_at_all() -> None:
+    """PRODUCTION IS KNOB-FREE. The override is absent by default and the serving prepare is
+    byte-identical to what it was before cr-125 — the key is not present, not empty."""
+    served = executor_prepare_command(_binding(), devices="0", authorized_device_limit_bytes=7)
+    assert "attention_pin" not in served
+    # And nothing can put one there from a `serve` launch: the flag set is CLOSED and does
+    # not carry it, so the guard is the absence of a way to say it rather than a condition.
+    assert not any("attention" in flag for flag in host._SERVE_FLAGS)
+    assert WorkerOptions(root=Path("/tmp")).attention_pin == ""
+
+
+def test_a_pinned_prepare_names_one_kernel_for_every_model_of_the_construction() -> None:
+    """The pin rides the ONE prepare funnel, and a group takes it whole: two models of one
+    construction cannot serve two different execution paths and still be one measurement."""
+    single = executor_prepare_command(
+        _binding(), devices="0", authorized_device_limit_bytes=7, attention_pin="sageattention"
+    )
+    assert single["attention_pin"] == "sageattention"
+    group = executor_prepare_command(
+        _binding(models=2),
+        devices="0",
+        authorized_device_limit_bytes=7,
+        attention_pin="sageattention",
+    )
+    # It sits on the COMMAND, not inside a model row: `_prepare_many` hands the same value
+    # to every child prepare, the way it hands them one device authorization.
+    assert group["attention_pin"] == "sageattention"
+    assert all("attention_pin" not in row["binding"] for row in group["models"])
+
+
+@pytest.mark.parametrize(
+    "term",
+    [
+        "kernel.gemm=rowwise",  # an axis this runtime does not have
+        "kernel.attention",  # no value
+        "kernel.attention=",  # an empty pin is not a pin
+        "kernel.attention:=sageattention",  # the typed-JSON form of the payload grammar
+    ],
+)
+def test_an_unusable_kernel_term_refuses_instead_of_becoming_a_payload_field(term: str) -> None:
+    """The reserved namespace is claimed BEFORE the payload grammar sees a term, so a
+    mistyped override can never quietly land on a package's own field."""
+    with pytest.raises(CliError) as refused:
+        cli_run.split_flags(["marco", term])
+    assert refused.value.name == "usage"
+    assert "kernel.attention=<name>" in str(refused.value.remedy)
+
+
+def test_the_claimed_pin_leaves_the_payload_terms_untouched() -> None:
+    terms, flags = cli_run.split_flags(
+        ["fl2va", "prompt=a cat", "kernel.attention=sageattention", "--seed", "7"]
+    )
+    assert terms == ["fl2va", "prompt=a cat"]
+    assert flags["kernel.attention"] == ["sageattention"]
+    assert flags["--seed"] == ["7"]
+
+
+@needs_executor
+def test_a_pin_that_cannot_be_honoured_refuses_through_the_whole_real_path() -> None:
+    """THE THREAD, end to end and unmocked: `cozy-runtime run`'s ephemeral worker, the real
+    prepare command, a real executor child process.
+
+    `examples/marco-polo` declares no model, so it holds no attention site — and a pin with
+    nowhere to go is REFUSED rather than ignored. That is the same rule the A/B rests on: a
+    run that reported success while serving something other than what was named would make
+    the measurement worthless, so the runtime never quietly drops a pin.
+    """
+    base = {
+        k: v
+        for k, v in os.environ.items()
+        if not child_env.erased(k) and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+    }
+    with tempfile.TemporaryDirectory(prefix="cz-pin.", dir="/tmp") as raw:
+        root = Path(raw)
+        config = RuntimeConfig(
+            cozy_home=root / "home",
+            credentials=Credentials(),
+            child_base_env=tuple(sorted(base.items())),
+        )
+        workspace = root / "run"
+        workspace.mkdir(parents=True, exist_ok=True)
+        body = package_interface.build(discover(PACKAGE))
+        with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):
+            outcome = run_slice(
+                config,
+                LocalRequest(
+                    entrypoint="marco",
+                    payload={"message": "marco"},
+                    outputs=(),
+                    request_id="pin-weightless",
+                    kind="entrypoint",
+                ),
+                workspace=workspace,
+                package_code_digest=development_source_digest(PACKAGE),
+                package_interface_document=body,
+                project=PACKAGE,
+                development_tensorfs_root=config.cozy_home / "tensorfs",
+                options=WorkerOptions(
+                    root=workspace / "worker",
+                    devices="0",
+                    attention_pin="sageattention",
+                ),
+            )
+    reasons = [fault["reason"] for fault in outcome.faults]
+    assert "attention_kernel_unsupported" in reasons, outcome.faults
+    assert outcome.result is None, outcome.result
+    assert any("sageattention" in str(fault["detail"]) for fault in outcome.faults)
