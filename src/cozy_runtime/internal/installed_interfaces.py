@@ -40,6 +40,7 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
             continue
         if (
             generator != interface_wheel.GENERATOR_ABI
+            or metadata.get("Cozy-Interface-Layout") not in {"overlay", "generated"}
             or implementation is None
             or not canonical.DIGEST_RE.fullmatch(implementation)
         ):
