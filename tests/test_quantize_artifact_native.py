@@ -280,6 +280,9 @@ def test_half_written_group_recomputes_and_inherits_unchanged_parts(
     assert outcome.terminal == "succeeded", outcome
     assert isinstance(complete, ModelArtifact)
     assert complete.manifest == resumed.manifest
-    original = tensorfs.parse_header(bytes(store.manifest(source.manifest.digest)["header"]))
-    result = tensorfs.parse_header(bytes(store.manifest(resumed.manifest.digest)["header"]))
+    original_bytes = store.manifest(source.manifest.digest)["header"]
+    result_bytes = store.manifest(resumed.manifest.digest)["header"]
+    assert original_bytes is not None and result_bytes is not None
+    original = tensorfs.parse_header(original_bytes)
+    result = tensorfs.parse_header(result_bytes)
     assert result["components"]["unet"]["bias"] == original["components"]["unet"]["bias"]
