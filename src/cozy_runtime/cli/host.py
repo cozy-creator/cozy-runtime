@@ -252,7 +252,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
 
 
 def development_placement(config: RuntimeConfig, args: list[str], opts: Options) -> Result:
-    """Internal Creator plumbing for one honest source-checkout PlacementSet."""
+    """Read job or weightless placement metadata without running package code."""
 
     from cozy_runtime.author import ConformanceError
     from cozy_runtime.internal import local, static_interface
@@ -263,7 +263,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
     values: dict[str, str] = {}
     rest = list(args)
     required = {"--package", "--release", "--source-digest", "--tensorfs-root"}
-    allowed = set(required)
+    allowed = set(required) | {"--environment-python"}
     while rest:
         flag = rest.pop(0)
         if flag not in allowed or not rest:
@@ -302,8 +302,24 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
         )
     project = Path(opts.dir).expanduser().resolve()
     try:
+        interface = static_interface.build(
+            project,
+            environment_python=Path(values["--environment-python"])
+            if "--environment-python" in values
+            else None,
+        )
+        entries = interface["entrypoints"]
+        assert isinstance(entries, list)
+        modeled = any(isinstance(entry, dict) and entry.get("models") for entry in entries)
+        if modeled:
+            raise CliError(
+                "worker_preparation_required",
+                "modeled serving placement requires worker preparation",
+                "run the package through Cozy so its worker prepares the exact model components",
+                Exit.structural,
+            )
         development = local.development_placement_documents(
-            static_interface.build(project),
+            interface,
             package=package,
             release=release,
             source_digest=source_digest,

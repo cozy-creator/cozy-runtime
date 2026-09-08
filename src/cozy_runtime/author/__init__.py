@@ -16,7 +16,7 @@ things a package author touches, minus the codec plane (cr-017). Per-service fak
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._app import App, Registration, RegistrationError
-from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
+from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef, SourceArtifact
 from cozy_runtime.author._assets import (
     Asset,
     AssetInfo,
@@ -145,6 +145,7 @@ from cozy_runtime.author._weights import (
     WeightsConfig,
     WeightsOutput,
     WeightsPart,
+    WeightsPartSource,
     WeightsReceipt,
     WeightsSink,
     WeightsSource,
@@ -153,6 +154,12 @@ from cozy_runtime.author._weights import (
     WeightsTarget,
     WeightsTensor,
     WeightsTransaction,
+)
+from cozy_runtime.author.publication import (
+    CheckpointRef,
+    ReleaseReceipt,
+    publish_release,
+    upload_checkpoint,
 )
 
 __all__ = [
@@ -181,6 +188,7 @@ __all__ = [
     "CapabilityError",
     "CheckpointConflict",
     "CheckpointDeclaration",
+    "CheckpointRef",
     "CheckpointSave",
     "CheckpointSinkUnbuilt",
     "Checkpoints",
@@ -242,6 +250,7 @@ __all__ = [
     "Recipe",
     "Registration",
     "RegistrationError",
+    "ReleaseReceipt",
     "RequestFeatures",
     "RequestView",
     "SavedAudioFacts",
@@ -253,6 +262,7 @@ __all__ = [
     "Secrets",
     "Settings",
     "Shape",
+    "SourceArtifact",
     "Surface",
     "Telemetry",
     "TensorSpec",
@@ -262,6 +272,7 @@ __all__ = [
     "WeightsConfig",
     "WeightsOutput",
     "WeightsPart",
+    "WeightsPartSource",
     "WeightsReceipt",
     "WeightsSink",
     "WeightsSource",
@@ -281,9 +292,11 @@ __all__ = [
     "invoke",
     "prepare",
     "probe_activations",
+    "publish_release",
     "register_adapter",
     "registered_adapters",
     "script_app",
     "sequence_parallel",
+    "upload_checkpoint",
     "uses_components",
 ]

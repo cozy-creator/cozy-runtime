@@ -19,6 +19,7 @@ class Options:
     dir: str = "."
     package_interface: str = ""
     conformance: bool = False
+    environment_python: str = ""
 
 
 @dataclass(frozen=True, slots=True)

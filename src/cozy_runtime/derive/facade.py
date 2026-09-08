@@ -23,8 +23,10 @@ import msgspec
 from cozy_runtime.author import (
     Context,
     Model,
+    ModelArtifact,
     Telemetry,
     UnsupportedInput,
+    WeightsReceipt,
     WeightsSink,
     WeightsSource,
     WeightsTarget,
@@ -151,6 +153,49 @@ def quantize(
     ``source`` is the granted source Model (constructed or derive-only) or the
     ``WeightsSink.structure`` view already fetched from it — both reach the same tensors.
     """
+    return _quantize(source, plan, sink=sink, ctx=ctx, tel=tel, output=output)[0]
+
+
+def quantize_artifact(
+    source: Model[Any] | WeightsSource,
+    plan: QuantizePlan,
+    /,
+    *,
+    sink: WeightsSink,
+    ctx: Context,
+    tel: Telemetry,
+    output: str = "model",
+) -> ModelArtifact:
+    """Run the same lane kernel and return its immutable managed-call artifact.
+
+    Measurements and receipt provenance remain on the original execution. The result
+    contains no per-attempt counters, so memoized operations can retain it unchanged.
+    """
+    result, receipt = _quantize(source, plan, sink=sink, ctx=ctx, tel=tel, output=output)
+    tel.log(
+        "quantization measurement",
+        output=output,
+        encoded_keys=result.encoded_keys,
+        reused_keys=result.reused_keys,
+        source_bytes_read_this_run=result.source_bytes_read_this_run,
+        new_bytes_written_this_run=result.new_bytes_written_this_run,
+        saturated_elements_this_run=result.saturated_elements_this_run,
+        worst_relative_frobenius=result.worst_relative_frobenius,
+        normalization_worst_relative_frobenius=result.normalization_worst_relative_frobenius,
+    )
+    return receipt.artifact
+
+
+def _quantize(
+    source: Model[Any] | WeightsSource,
+    plan: QuantizePlan,
+    /,
+    *,
+    sink: WeightsSink,
+    ctx: Context,
+    tel: Telemetry,
+    output: str,
+) -> tuple[QuantizeResult, WeightsReceipt]:
     model, structure = _resolve(source, sink)
     bf16 = prepare_bf16(structure, keep=plan.keep)
     canonical = plan.encoding is None
@@ -207,7 +252,7 @@ def quantize(
                 kept_keys=len(bf16.kept),
                 normalization_worst_relative_frobenius=None,
                 canonical=canonical,
-            )
+            ), receipt
         normalization = write_bf16(
             transaction, ctx, tel, plan=bf16, source="source", excluded=selected or None
         )
@@ -259,7 +304,7 @@ def quantize(
         kept_keys=len(bf16.kept),
         normalization_worst_relative_frobenius=normalization.worst_relative_frobenius,
         canonical=canonical,
-    )
+    ), receipt
 
 
 def _resolve(

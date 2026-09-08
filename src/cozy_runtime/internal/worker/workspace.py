@@ -83,6 +83,7 @@ CREATE TABLE attempts (
  worker_boot TEXT NOT NULL DEFAULT '', result_schema BLOB NOT NULL DEFAULT x'',
  process_owner BLOB NOT NULL DEFAULT x'',
  transport_owner TEXT NOT NULL DEFAULT '',
+ memoize INTEGER NOT NULL DEFAULT 0 CHECK(memoize IN (0,1)),
  PRIMARY KEY(owner,request,ordinal)
 ) STRICT;
 CREATE TABLE weights (
@@ -95,6 +96,8 @@ CREATE TABLE weights (
  receipt_digest BLOB NOT NULL DEFAULT x'', native_digest BLOB NOT NULL DEFAULT x'',
  manifest BLOB NOT NULL DEFAULT x'', manifest_length INTEGER NOT NULL DEFAULT 0,
  objects BLOB NOT NULL DEFAULT x'5b5d',
+ adoption_source TEXT NOT NULL DEFAULT '', adoption_epoch INTEGER NOT NULL DEFAULT 0,
+ adoption_checkpoint BLOB NOT NULL DEFAULT x'',
  UNIQUE(owner,request,spec,slot)
 ) STRICT;
 CREATE TABLE holds (
@@ -116,6 +119,13 @@ CREATE TABLE operation_lookups (
  ('retaining','ready','missing','miss','released','acknowledged')),
  PRIMARY KEY(owner,consumer)
 ) STRICT;
+"""
+
+_MIGRATION_3 = """
+ALTER TABLE attempts ADD COLUMN memoize INTEGER NOT NULL DEFAULT 0 CHECK(memoize IN (0,1));
+ALTER TABLE weights ADD COLUMN adoption_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE weights ADD COLUMN adoption_epoch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE weights ADD COLUMN adoption_checkpoint BLOB NOT NULL DEFAULT x'';
 """
 
 
@@ -157,14 +167,25 @@ class Workspace:
             db.execute("PRAGMA synchronous=FULL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
-                db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=2;COMMIT;")
-            elif version == 1:
-                db.executescript(
-                    "BEGIN IMMEDIATE; ALTER TABLE attempts ADD COLUMN "
-                    "process_owner BLOB NOT NULL DEFAULT x''; PRAGMA user_version=2; COMMIT;"
+                db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=3;COMMIT;")
+            elif version in (1, 2):
+                process_column = (
+                    "ALTER TABLE attempts ADD COLUMN process_owner BLOB NOT NULL DEFAULT x'';"
+                    if version == 1
+                    else ""
                 )
-            elif version != 2:
+                db.executescript(
+                    "BEGIN IMMEDIATE;"
+                    + process_column
+                    + _MIGRATION_3
+                    + "PRAGMA user_version=3; COMMIT;"
+                )
+            elif version not in (3, 4):
                 raise WorkspaceRefusal("workspace journal schema is not supported")
+            if version <= 3:
+                from .workspace_sources import SCHEMA4
+
+                db.executescript("BEGIN IMMEDIATE;" + SCHEMA4 + "PRAGMA user_version=4; COMMIT;")
             if (
                 not allow_frozen
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
@@ -198,6 +219,7 @@ class Workspace:
         *,
         result_schema: bytes = b"",
         worker_boot: str = "",
+        memoize: bool = False,
     ) -> pb.AttemptOutcome | None:
         self.owner(owner)
         self.recover(owner)
@@ -229,7 +251,8 @@ class Workspace:
                 return None
             db.execute(
                 "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state,"
-                "worker_boot,result_schema,process_owner) VALUES(?,?,?,?,?,'accepted',?,?,?)",
+                "worker_boot,result_schema,process_owner,memoize) "
+                "VALUES(?,?,?,?,?,'accepted',?,?,?,?)",
                 (
                     owner,
                     offer.request_id,
@@ -239,6 +262,7 @@ class Workspace:
                     worker_boot,
                     result_schema,
                     process_owner,
+                    int(memoize),
                 ),
             )
 
@@ -427,7 +451,10 @@ class Workspace:
             )
 
     def acknowledge(self, owner: str, ack: pb.AttemptOutcomeAck) -> None:
+        from . import workspace_sources
+
         self.owner(owner)
+        source_releases: list[str] = []
         with self.locked() as db:
             row = db.execute(
                 "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
@@ -435,6 +462,16 @@ class Workspace:
                 (owner, owner, ack.request_id, ack.attempt_ordinal),
             ).fetchone()
             if row is None and not ack.retain_work:
+                source_releases = [
+                    r[0]
+                    for r in db.execute(
+                        "SELECT service_id FROM native_calls WHERE owner=? AND parent_request=? "
+                        "AND release_ack=? AND state='releasing'",
+                        (owner, ack.request_id, workspace_sources.ack_identity(ack)),
+                    )
+                ]
+                for service in source_releases:
+                    db.native(partial(workspace_sources.release, self, owner, service))
                 return
             if (
                 row is None
@@ -456,6 +493,7 @@ class Workspace:
                 ),
             )
             if not ack.retain_work:
+                source_releases = workspace_sources.release_intent(db, owner, ack)
                 active = db.execute(
                     "SELECT 1 FROM weights WHERE owner=? AND request=? AND ordinal=? "
                     "AND state<>'released' LIMIT 1",
@@ -478,6 +516,9 @@ class Workspace:
                     "AND state='released'",
                     (row["owner"], ack.request_id, ack.attempt_ordinal),
                 )
+
+        for service in source_releases:
+            workspace_sources.release(self, owner, service)
 
     def begin_weights(self, owner: str, intent: pb.WeightsIntentFrame) -> dict[str, Any]:
         """Assign the epoch once, before native begin; the Host observes this decision."""
@@ -554,10 +595,13 @@ class Workspace:
                         declaration,
                     ),
                 )
-            return dict(
-                db.execute(
-                    "SELECT * FROM weights WHERE id=?", (intent.weights_transaction_id,)
-                ).fetchone()
+            from .workspace_partial import adopt
+
+            return adopt(
+                self,
+                db,
+                owner,
+                intent.weights_transaction_id,
             )
 
     def record_receipt(self, owner: str, frame: pb.WeightsReceiptFrame) -> None:
@@ -816,8 +860,11 @@ class Workspace:
         request: pb.DerivedRetentionRequest,
         *,
         release: bool = False,
+        kind: str = "derived",
     ) -> None:
         self.owner(owner)
+        if kind not in ("derived", "tree"):
+            raise WorkspaceRefusal("unknown native retention kind")
         if (
             _DIGEST.fullmatch(request.weights_transaction_id) is None
             or _DIGEST.fullmatch(request.retention_id) is None
@@ -827,7 +874,9 @@ class Workspace:
         row = db.execute("SELECT * FROM holds WHERE id=?", (request.retention_id,)).fetchone()
         subject = (owner, request.weights_transaction_id, request.tensorfs_receipt_digest)
         if row is not None:
-            if (row["owner"], row["transaction_id"], row["native_digest"]) != subject:
+            if (row["owner"], row["transaction_id"], row["native_digest"]) != subject or row[
+                "kind"
+            ] != kind:
                 raise WorkspaceRefusal("retention identity already belongs to another subject")
             if not release and row["state"] in ("releasing", "released"):
                 raise WorkspaceRefusal("released retention cannot be recreated")
@@ -839,9 +888,15 @@ class Workspace:
             ).fetchone()
             retained = db.execute(
                 "SELECT 1 FROM holds WHERE owner=? AND transaction_id=? "
-                "AND native_digest=? AND state='held'",
-                subject,
+                "AND native_digest=? AND kind=? AND state='held'",
+                (*subject, kind),
             ).fetchone()
+            if original is not None and kind != "derived":
+                raise WorkspaceRefusal("weights receipt cannot authorize a source-tree hold")
+            if original is None:
+                from .workspace_native_memo import native_receipt_owned
+
+                original = native_receipt_owned(db, owner, request, kind, release=release)
             pending_release = False
             if release and original is None and retained is None:
                 # Durable memo/lookup intent authorizes cancellation of a root
@@ -864,8 +919,9 @@ class Workspace:
             if original is None and retained is None and not pending_release:
                 raise WorkspaceRefusal("native result has no receipt owned by this workspace owner")
             db.execute(
-                "INSERT INTO holds(id,owner,transaction_id,native_digest,state) VALUES(?,?,?,?,?)",
-                (request.retention_id, *subject, "releasing" if release else "retaining"),
+                "INSERT INTO holds(id,owner,transaction_id,native_digest,state,kind) "
+                "VALUES(?,?,?,?,?,?)",
+                (request.retention_id, *subject, "releasing" if release else "retaining", kind),
             )
 
     def _change_hold(
@@ -876,8 +932,9 @@ class Workspace:
         *,
         release: bool,
         cancel_lookup: bool = True,
+        kind: str = "derived",
     ) -> pb.DerivedRetentionResult:
-        self.reserve_hold(db, owner, request, release=release)
+        self.reserve_hold(db, owner, request, release=release, kind=kind)
         if release:
             db.execute("UPDATE holds SET state='releasing' WHERE id=?", (request.retention_id,))
         if release and cancel_lookup:
@@ -889,20 +946,14 @@ class Workspace:
             )
         # The intent above is durable before entering native code. A crash on
         # either side of this call leaves the same idempotent intent to replay.
-        result = db.native(
-            lambda: derived_retention.change(
-                request, tensorfs_root=self.store_root, release=release
-            )
-        )
+        from .workspace_native_memo import change_native_hold
+
+        result = change_native_hold(self, db, owner, request, kind, release=release)
         current = db.execute(
             "SELECT state FROM holds WHERE id=?", (request.retention_id,)
         ).fetchone()
         if not release and current["state"] in ("releasing", "released"):
-            db.native(
-                lambda: derived_retention.change(
-                    request, tensorfs_root=self.store_root, release=True
-                )
-            )
+            change_native_hold(self, db, owner, request, kind, release=True)
             raise WorkspaceRefusal("retention was released during native acquisition")
         manifest = result.manifest if result.HasField("manifest") else None
         db.execute(

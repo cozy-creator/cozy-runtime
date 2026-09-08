@@ -40,7 +40,12 @@ def run(function: str | None, opts: Options) -> Result:
                 ) from exc
             body = package_interface.read_bytes(raw, str(interface))
         else:
-            body = static_interface.build(project)
+            body = static_interface.build(
+                project,
+                environment_python=Path(opts.environment_python)
+                if opts.environment_python
+                else None,
+            )
             if opts.conformance:
                 rows = (("conformance", _conformance(project, body)),)
     except ConformanceError as exc:

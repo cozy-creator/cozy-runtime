@@ -4,14 +4,16 @@ Runtime observes the actual interpreter's standard library and narrow protected 
 Python, cozy-runtime, msgspec, TensorFS, and, when present, Torch/Triton/CUDA/NVIDIA. A placement
 creates one ordinary uv venv containing only the package project wheel and package-owned dependency
 wheels. It never re-resolves the lock, copies a protected package, or re-hashes the base
-environment's RECORD tree. The one deliberate exception is cr-070's boot-install slow path: an
-image-carried distribution whose observed version falls outside the wheels' declared ranges is
-installed in range from the index, alone (`--no-deps`), logged, and re-verified on every open.
+environment's RECORD tree in the image-backed path. The cr-070 boot-install slow path installs an
+image-carried distribution whose observed version falls outside the wheels' declared ranges
+in range from the index, alone (`--no-deps`), logged, and re-verified on every open.
 
 The OCI image digest protects image-resident bytes. This module protects bytes that arrive
 after boot: exact wheel grants are hashed once, inspected, installed by uv into private staging,
-and atomically published. Reuse reads only the small receipt; actual base compatibility is
-re-observed before admission and Runtime does not walk or hash the installed tree again.
+and atomically published. Local preparation can instead snapshot the regular installed
+dependency closure into staging; that copied content joins the wheel identity. Reuse reads only
+the small receipt; actual base compatibility is re-observed before admission and Runtime does
+not walk or hash the installed tree again.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import subprocess
 import sys
 import uuid
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
@@ -380,6 +382,7 @@ def materialize(
     *,
     python: Path = Path(sys.executable),
     base: base_observation.Observation | None = None,
+    dependency_python: Path | None = None,
 ) -> InstalledEnvironment:
     """Verify exact wheels and atomically publish one ordinary uv virtual environment.
 
@@ -399,6 +402,8 @@ def materialize(
 
     _require_digest(source.environment_digest, "environment_digest")
     _require_digest(source.project_wheel_digest, "project_wheel_digest")
+    if dependency_python is not None:
+        return _materialize_dependency_snapshot(source, root, python, dependency_python, base)
     observed = base or observe_base(python)
     wheels = _verify_inventory(source, observed, venv_precedence=True)
     uv = _uv_binary()
@@ -1002,6 +1007,10 @@ def open_generation(
         raise EnvironmentRefusal(
             "package_environment_content_identity_invalid", "interpreter identity is absent"
         )
+    if "dependency_snapshot" in identity:
+        from cozy_runtime.internal import _installed_dependencies
+
+        _installed_dependencies.read_manifest(generation, identity["dependency_snapshot"])
     python_abi = identity["interpreter"].get("python_abi")
     match = re.fullmatch(r"cp([0-9])([0-9]{2})", str(python_abi))
     if match is None:
@@ -1757,6 +1766,8 @@ def _install_with_uv(
     staging: Path,
     inspected: Sequence[_Inspected],
     boot_installs: Sequence[BootInstall] = (),
+    *,
+    dependencies: Callable[[Path], None] | None = None,
 ) -> None:
     commands = [
         [
@@ -1770,7 +1781,7 @@ def _install_with_uv(
             "clone",
             "--python",
             str(python),
-            "--system-site-packages",
+            *(["--system-site-packages"] if dependencies is None else []),
             str(staging),
         ],
         [
@@ -1811,7 +1822,7 @@ def _install_with_uv(
                 *(row.requirement for row in boot_installs),
             ]
         )
-    for command in commands:
+    for index, command in enumerate(commands):
         result = subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
@@ -1825,6 +1836,9 @@ def _install_with_uv(
                 "package_environment_uv_failed",
                 detail or f"uv exited {result.returncode}",
             )
+
+        if index == 0 and dependencies is not None:
+            dependencies(staging)
 
 
 def _verify_boot_installs(
@@ -1947,7 +1961,11 @@ def _content_matches_receipt(identity: object, receipt: Mapping[str, Any]) -> bo
         )
     return (
         isinstance(identity, dict)
-        and set(identity) == {"format", "interpreter", "uv_version", "wheel_digests"}
+        and set(identity)
+        in (
+            {"format", "interpreter", "uv_version", "wheel_digests"},
+            {"format", "interpreter", "uv_version", "wheel_digests", "dependency_snapshot"},
+        )
         and identity.get("format") == "cozy.runtime.PackageEnvironment/1"
         and isinstance(identity.get("interpreter"), dict)
         and set(identity["interpreter"]) == {"libc", "os_arch", "python_abi"}
@@ -2080,3 +2098,107 @@ def _fsync_dir(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _materialize_dependency_snapshot(
+    source: Input,
+    root: Path,
+    python: Path,
+    dependency_python: Path,
+    base: base_observation.Observation | None,
+) -> InstalledEnvironment:
+    from cozy_runtime.internal import _installed_dependencies
+
+    observed = base or observe_base(python)
+    wheels = _verify_inventory(source, observed, venv_precedence=True)
+    inspected = _verify_grants(source, wheels, observed)
+    uv = _uv_binary()
+    if _observed_uv_version(uv) != observed.uv_version:
+        raise EnvironmentRefusal("package_environment_uv_changed", observed.uv_version)
+    _require_owned_root(root)
+    _remove_dead_staging(root)
+    contents, receipts = root / "contents", root / "receipts"
+    contents.mkdir(parents=True, exist_ok=True, mode=0o711)
+    receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
+    contents.chmod(0o711)
+    receipts.chmod(0o700)
+    staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
+    manifest = b""
+
+    def copy_dependencies(target: Path) -> None:
+        nonlocal manifest
+        manifest = _installed_dependencies.snapshot(
+            dependency_python, target, {wheel.distribution for wheel in wheels}
+        )
+
+    try:
+        _install_with_uv(uv, python, staging, inspected, dependencies=copy_dependencies)
+        _installed_dependencies.verify_files(staging, manifest)
+        target_site = next(staging.glob("lib/python*/site-packages"))
+        captured = [
+            info
+            for info in target_site.glob("*.dist-info")
+            if _name(
+                str(
+                    BytesParser()
+                    .parsebytes((info / "METADATA").read_bytes(), headersonly=True)
+                    .get("Name", "")
+                )
+            )
+            in {wheel.distribution for wheel in wheels}
+        ]
+        _installed_dependencies.rewrite_launchers(
+            staging, target_site, captured, set(), replace=True
+        )
+        _installed_dependencies.verify_files(staging, manifest)
+        actual = observe_base(staging / "bin" / "python")
+        if actual.interpreter_identity != observed.interpreter_identity:
+            raise EnvironmentRefusal(
+                "package_environment_dependency_snapshot_mismatch", "interpreter"
+            )
+        _verify_inventory(source, actual, venv_precedence=True)
+        _verify_python_requirements(inspected, actual)
+        snapshot = canonical.parse_canonical(manifest)
+        assert isinstance(snapshot, dict)
+        for row in snapshot["distributions"]:
+            if actual.distribution_versions.get(row["distribution"]) != row["version"]:
+                raise EnvironmentRefusal(
+                    "package_environment_dependency_snapshot_mismatch", row["distribution"]
+                )
+        identity = _content_identity(wheels, actual.interpreter_identity, observed.uv_version)
+        identity["dependency_snapshot"] = {"digest": _sha(manifest), "length": len(manifest)}
+        content_bytes = canonical.write(identity)
+        content_digest = _sha(content_bytes)
+        receipt_bytes = canonical.write(_receipt(source, wheels, content_digest))
+        receipt_digest = _sha(receipt_bytes)
+        final = contents / content_digest.removeprefix("sha256:")
+        _write_once(staging / _installed_dependencies.MANIFEST_NAME, manifest)
+        _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
+        _make_read_only(staging)
+        _fsync_dir(staging)
+        reused = False
+        try:
+            os.rename(staging, final)
+            final.chmod(0o555)
+        except OSError as exc:
+            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise
+            _installed_dependencies.read_manifest(final, identity["dependency_snapshot"])
+            _remove_tree(staging)
+            reused = True
+        _fsync_dir(contents)
+        _publish_receipt(
+            receipts / f"{receipt_digest.removeprefix('sha256:')}.json", receipt_bytes, receipts
+        )
+        return open_generation(
+            root,
+            receipt_digest=receipt_digest,
+            environment_digest=source.environment_digest,
+            python=python,
+            reused=reused,
+        )
+    except OSError as exc:
+        raise EnvironmentRefusal("package_environment_dependency_snapshot_io", str(exc)) from exc
+    finally:
+        if staging.exists():
+            _remove_tree(staging)

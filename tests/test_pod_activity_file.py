@@ -219,8 +219,8 @@ def test_a_stopped_executor_leaves_an_attempt_in_flight_with_a_meter_that_has_st
     window = summary["window"]
     assert len(window) == 2, "the attempt was never admitted, so nothing was stopped"
     assert summary["ended"] == "terminal", (summary["ended"], summary["error"])
-    # The frozen window is the ticks published while the executor was stopped, from the
-    # first that says an attempt is in flight — the next tick after acceptance.
+    # The driver confirms the kernel stop and excludes the one publication whose
+    # meter read may already have started before that stop.
     frozen = [s for s in samples if window[0] < s["sequence"] <= window[1]]
     held = list(itertools.dropwhile(lambda s: s["attempts_in_flight"] == 0, frozen))
     assert len(held) > 4, f"only {len(held)} of {len(frozen)} samples saw the stopped attempt"

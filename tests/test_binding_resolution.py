@@ -102,3 +102,18 @@ def test_the_interface_arm_reads_the_jobs_array(tmp_path: Path) -> None:
         ("retouch.models.model", "cozytest/tenant@1"),
         ("touch.models.model", "cozytest/tenant@1"),
     ]
+
+
+def test_source_binding_resolution_never_imports_the_package(tmp_path: Path) -> None:
+    project = _package(tmp_path, "tenant_static_bindings", job_binding=True)
+    module = project / "tenant_static_bindings.py"
+    module.write_text(
+        module.read_text() + "\nraise RuntimeError('bindings imported package code')\n"
+    )
+    records, plans = resolved_bindings(Options(dir=str(project)))
+    assert plans == []
+    assert [row["model_binding_path"] for row in records] == [
+        "prune.models.source",
+        "retouch.models.model",
+        "touch.models.model",
+    ]
