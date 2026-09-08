@@ -189,3 +189,8 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
         worker.shutdown()
         channel.close()
         server.join(5)
+        assert not server.is_alive(), "control host did not finish transport teardown"
+        assert not any(
+            thread.name == "control-stream" and thread.is_alive()
+            for thread in threading.enumerate()
+        ), "control reader survived its host"
