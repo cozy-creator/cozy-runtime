@@ -15,6 +15,7 @@ from cozy_runtime.author import ConformanceError, Surface, WeightsOutput
 from cozy_runtime.author._markers import IMAGE_PREPARATION_PROFILE
 from cozy_runtime.author._media import KIND_MEDIA
 from cozy_runtime.author._model import ENCODED_LEAVES, FUSION
+from cozy_runtime.author._model_defaults import DefaultLadder, default_ladder
 from cozy_runtime.author._signature import AssetInputValue, AssetsBinding
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
@@ -94,6 +95,7 @@ def _callable(surface: Surface) -> dict[str, Json]:
                 binding.fusion,
                 binding.components,
                 binding.sequence_parallel,
+                defaults=surface.model_defaults.get(binding.param, ()),
             )
             for binding in surface.model_bindings
         ],
@@ -172,10 +174,12 @@ def model_slot(
     fusion: str,
     components: Mapping[str, Sequence[str]],
     sequence_parallel: Sequence[int],
+    *,
+    defaults: DefaultLadder = (),
 ) -> dict[str, Json]:
     """One model slot. The PATH is the binding point, the CLASS carries `encoded_leaves`,
-    and the per-public-method component sets are the ComponentUseContracts. Which artifact
-    ever satisfies it is a binding-clock fact and is not here (model-code-fit §1)."""
+    and the per-public-method component sets are the ComponentUseContracts. Optional authored
+    defaults are unresolved source metadata; exact artifact selection remains dispatch-owned."""
     doc: dict[str, Json] = {
         "path": path,
         "class": class_name,
@@ -184,6 +188,8 @@ def model_slot(
         # contract sorts — a reordered method body is not a surface change.
         "component_use": {method: sorted(names) for method, names in sorted(components.items())},
     }
+    if defaults:
+        doc["default_ladder"] = [{"gpu": gpu, "lane": lane} for gpu, lane in defaults]
     if sequence_parallel:
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
@@ -245,6 +251,11 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
     """The package interface's fixed point, proven over the built document (§1.0)."""
     if isinstance(value, Mapping):
         for key, item in value.items():
+            if key == "default_ladder" and re.fullmatch(
+                r"\.(?:entrypoints|jobs)\[\d+\]\.models\[\d+\]", path
+            ):
+                default_ladder(item)
+                continue
             if key in _FORBIDDEN_KEYS:
                 raise ConformanceError(
                     f"{path}.{key}: the package interface is the SOURCE-STABLE surface — release "
@@ -433,10 +444,12 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                 slot = _closed(
                     model,
                     {"class", "component_use", "path"},
-                    {"encoded_leaves", "fusion", "sequence_parallel"},
+                    {"encoded_leaves", "fusion", "sequence_parallel", "default_ladder"},
                     source,
                     model_path,
                 )
+                if "default_ladder" in slot:
+                    default_ladder(slot["default_ladder"])
                 for consent, vocabulary in (
                     ("encoded_leaves", ENCODED_LEAVES),
                     ("fusion", FUSION),

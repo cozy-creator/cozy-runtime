@@ -12,6 +12,7 @@ import cozy_runtime.internal.package_interface as package_interface
 from cozy_runtime import author
 from cozy_runtime.author._assets import Assets
 from cozy_runtime.author._describe import assert_declaration_shape
+from cozy_runtime.author._model_defaults import check_model_arguments
 from cozy_runtime.author._services import JOB_ONLY, SERVICES, SERVING_ONLY, UNGRANTABLE
 from cozy_runtime.author._signature import _classify, _wire_default, _wire_type, assets_binding
 from cozy_runtime.author._walker import is_struct, strip
@@ -68,6 +69,7 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
                     model.fusion,
                     model.components,
                     model.sequence_parallel,
+                    defaults=registration.model_defaults.get(arg.arg, ()),
                 )
             )
             fields.append((arg.arg, author.ModelArtifact | None, None))
@@ -151,6 +153,10 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
         assets=assets,
         publishes=registration.publishes,
         weights_outputs=registration.weights,
+    )
+    check_model_arguments(
+        registration.model_defaults,
+        [str(slot["path"]).rsplit(".", 1)[-1] for slot in models],
     )
     metadata = invocable_interface.from_types(
         payload,
