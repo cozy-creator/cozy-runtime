@@ -588,7 +588,9 @@ def fence_torch_free_import() -> list[str]:
     return bad
 
 
-STATIC_READER = SRC / "internal" / "static_interface.py"
+STATIC_READERS = tuple(
+    SRC / "internal" / name for name in ("static_interface.py", "static_invocable.py")
+)
 #: Modules and builtins through which source becomes execution. The static reader may name none.
 EXECUTION_MODULES = frozenset({"importlib", "sys", "runpy", "subprocess", "builtins"})
 EXECUTION_CALLS = frozenset({"exec", "eval", "compile", "__import__"})
@@ -601,6 +603,9 @@ STATIC_READER_IMPORTS = frozenset(
         "cozy_runtime.internal.package_interface",
         "cozy_runtime.internal.bindings",
         "cozy_runtime.internal.canonical",
+        "cozy_runtime.internal.static_interface",
+        "cozy_runtime.internal.static_invocable",
+        "cozy_runtime.internal.invocable_interface",
     }
 )
 
@@ -614,26 +619,29 @@ def fence_static_describe_executes_nothing() -> list[str]:
     the reader's whole import list and call surface is held here: no execution module, no
     execution builtin, no `sys.path`, and no runtime module that imports packages.
     """
-    tree = ast.parse(STATIC_READER.read_text())
-    where = STATIC_READER.relative_to(ROOT)
     bad = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            names = (
-                [a.name for a in node.names]
-                if isinstance(node, ast.Import)
-                else [node.module or ""]
-            )
-            for name in names:
-                if name.split(".")[0] in EXECUTION_MODULES:
-                    bad.append(f"{where}:{node.lineno} imports {name} — a door to execution")
-                elif name.split(".")[0] == "cozy_runtime" and not (
-                    name in STATIC_READER_IMPORTS or name.startswith("cozy_runtime.author.")
-                ):
-                    bad.append(f"{where}:{node.lineno} imports {name}, which is not a pure reader")
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in EXECUTION_CALLS:
-                bad.append(f"{where}:{node.lineno} calls {node.func.id}()")
+    for reader in STATIC_READERS:
+        tree = ast.parse(reader.read_text())
+        where = reader.relative_to(ROOT)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = (
+                    [a.name for a in node.names]
+                    if isinstance(node, ast.Import)
+                    else [node.module or ""]
+                )
+                for name in names:
+                    if name.split(".")[0] in EXECUTION_MODULES:
+                        bad.append(f"{where}:{node.lineno} imports {name} — a door to execution")
+                    elif name.split(".")[0] == "cozy_runtime" and not (
+                        name in STATIC_READER_IMPORTS or name.startswith("cozy_runtime.author.")
+                    ):
+                        bad.append(
+                            f"{where}:{node.lineno} imports {name}, which is not a pure reader"
+                        )
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in EXECUTION_CALLS:
+                    bad.append(f"{where}:{node.lineno} calls {node.func.id}()")
     return bad
 
 

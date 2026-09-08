@@ -151,6 +151,40 @@ class AssetLimits:
         }
 
 
+IMAGE_PREPARATION_PROFILE = "image-fit/1"
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePreparation:
+    """Opt-in useful image geometry for an Assets argument, preserving aspect ratio.
+
+    These caps request preparation, not rejection of a larger source image. Source
+    resource ceilings remain separate. Fidelity is interpreted by the package.
+    """
+
+    max_edge: int | None = None
+    max_pixels: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_edge is None and self.max_pixels is None:
+            raise ConformanceError("ImagePreparation needs a cap", code="image_preparation")
+        for value in (self.max_edge, self.max_pixels):
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ConformanceError(
+                    "image preparation caps must be positive integers", code="image_preparation"
+                )
+
+    def descriptor(self) -> dict[str, str | int]:
+        return {
+            "profile": IMAGE_PREPARATION_PROFILE,
+            **{
+                key: value
+                for key, value in (("max_edge", self.max_edge), ("max_pixels", self.max_pixels))
+                if value is not None
+            },
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class AssetBound:
     """cr-012 — the TYPED bounds on ONE input-asset field.

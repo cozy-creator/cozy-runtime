@@ -7,6 +7,7 @@ import inspect
 import keyword
 import types
 import typing
+from collections.abc import Mapping, Sequence
 from typing import Any, get_args, get_origin
 
 import msgspec
@@ -18,6 +19,43 @@ from cozy_runtime.internal import canonical, schema
 
 
 def metadata(surface: Surface) -> dict[str, Any]:
+    parameters = [
+        parameter.name
+        for parameter in surface.params
+        if parameter.role in ("wire", "model", "assets")
+    ]
+    signature = inspect.signature(surface.fn)
+    defaults = {
+        name: signature.parameters[name].default
+        for name in parameters
+        if signature.parameters[name].default is not inspect.Parameter.empty
+    }
+    return from_types(
+        surface.payload_type,
+        surface.result_type,
+        module=surface.fn.__module__,
+        export=surface.fn.__name__,
+        context=next(p.name for p in surface.params if p.role == "context"),
+        parameters=parameters,
+        parameter_defaults=defaults,
+        memoize=surface.memoize,
+        capabilities=sorted(surface.capabilities),
+    )
+
+
+def from_types(
+    payload_type: object,
+    result_type: object,
+    *,
+    module: str,
+    export: str,
+    context: str,
+    parameters: Sequence[str],
+    parameter_defaults: Mapping[str, object],
+    memoize: bool,
+    capabilities: Sequence[str],
+) -> dict[str, Any]:
+    """Portable names/defaults from resolved types, shared by both interface readers."""
     defaults: dict[str, Any] = {}
     names: dict[str, str] = {}
     enums: dict[str, list[str]] = {}
@@ -51,30 +89,19 @@ def metadata(surface: Surface) -> dict[str, Any]:
             ):
                 walk(member, path + f"/union/{index}")
 
-    walk(surface.payload_type, "request")
-    walk(surface.result_type, "result")
-    parameters = [
-        parameter.name
-        for parameter in surface.params
-        if parameter.role in ("wire", "model", "assets")
-    ]
-    signature = inspect.signature(surface.fn)
-    for name in parameters:
-        default = signature.parameters[name].default
-        if default is not inspect.Parameter.empty:
-            defaults["request/" + name] = default
+    walk(payload_type, "request")
+    walk(result_type, "result")
+    defaults.update({"request/" + name: value for name, value in parameter_defaults.items()})
     return {
-        "module": surface.fn.__module__,
-        "export": surface.fn.__name__,
-        "context": next(
-            parameter.name for parameter in surface.params if parameter.role == "context"
-        ),
-        "parameters": parameters,
+        "module": module,
+        "export": export,
+        "context": context,
+        "parameters": list(parameters),
         "defaults": defaults,
         "type_names": names,
         "enum_members": enums,
-        "memoize": surface.memoize,
-        "capabilities": sorted(surface.capabilities),
+        "memoize": memoize,
+        "capabilities": sorted(capabilities),
     }
 
 
