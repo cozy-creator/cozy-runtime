@@ -72,6 +72,37 @@ def test_the_ranked_table_is_ordered_by_a_measurement_and_ends_in_the_floor() ->
     assert attention._admits(floor, "float32", 512) and attention._admits(floor, "", 0)
 
 
+def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
+    """cr-127. A kernel is admitted only if it AGREES with exact fp32 attention, so every entry
+    has to say how far it is allowed to drift. The two classes are visible in the numbers: an
+    exact kernel is held near bf16's own 2.3e-3 floor, and a numerics-changing one is allowed
+    its quantisation (h3a-013 measured 3.7-4.0e-2) and nothing like the 311 a dead kernel
+    returned."""
+    for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
+        assert candidate.rel_l2_max > 0, candidate.name
+        assert candidate.rel_l2_max < 1, candidate.name
+    exact = {"flash-attn3", "sdpa", "cudnn"}
+    for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
+        budget = candidate.rel_l2_max
+        assert (budget <= 2e-2) is (candidate.name in exact), (candidate.name, budget)
+    assert attention.PROBE == (1, 256, 4, 128)
+
+
+def test_fp8_attention_is_measured_and_deliberately_not_ranked() -> None:
+    """h3a-013 timed both 8-bit arms on an H100 and NEITHER is ranked. The reason is recorded
+    in the module, because a table that only records speed would have promoted them: flash-attn3
+    fp8 is 1.31x rank 1 from the .so we already ship. It is not ranked because it is INEXACT
+    (~16x bf16's floor) and no gate we own can separate 'degrades quality' from 'changes the
+    sample' — and because at 2.68 c/s it misses the 2.5 target anyway."""
+    assert "flash-attn3-fp8" not in attention.BY_NAME
+    assert [c.name for c in attention.CANDIDATES] == ["flash-attn3", "sdpa"]
+    doc = attention.__doc__ or ""
+    assert "1.31x" in doc and "2.68 c/s" in doc and "PINNABLE" in doc
+    # And the reason it is not merely deferred: diffusers 0.40.0 has no fp8 FA3 backend, so it
+    # is not an `AttentionBackendName` this table could name at all.
+    assert "q_descale=k_descale=v_descale=None" in doc
+
+
 def test_every_nameable_kernel_has_one_name_and_one_backend() -> None:
     names = [c.name for c in (*attention.CANDIDATES, *attention.PINNABLE)]
     backends = [c.backend for c in (*attention.CANDIDATES, *attention.PINNABLE)]
@@ -128,15 +159,15 @@ def test_a_candidate_that_fails_to_resolve_for_any_reason_drops_out_of_auto() ->
     broken = attention.BY_NAME["flash-attn3"]
     real = attention._resolve
 
-    def planted(candidate: attention.Candidate) -> attention.Ready:
+    def planted(candidate: attention.Candidate, device: DeviceFacts) -> attention.Ready:
         if candidate is broken:
             raise RuntimeError("ImportError: undefined symbol: _ZN3c105ErrorC1E")
-        return real(candidate)
+        return real(candidate, device)
 
     attention._resolve = planted
     try:
         assert "flash-attn3" not in [entry.name for entry in attention.available(_device(90))]
-        assert "flash-attn3" not in attention.image_kernels()
+        assert "flash-attn3" not in attention.image_kernels(_device(90))
         # The pin does NOT swallow it: a caller who named it is told, not quietly served
         # something else.
         with pytest.raises(RuntimeError, match="undefined symbol"):
@@ -249,6 +280,35 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
 
     # And the pin computes: one real forward through the pinned site.
     assert out["forward"] == {"shape": [1, 64, 1024], "dtype": "torch.bfloat16"}
+
+    # cr-127. Every kernel this card offers agrees with exact fp32 attention well inside its
+    # declared budget, and the number is the bf16 floor h3a-013 measured on an H100
+    # (2.32-2.33e-3) — the same arithmetic on a different card, so the budget is calibrated
+    # against a measurement rather than picked.
+    assert set(out["selfcheck_rel_l2"]) >= {"sdpa"}
+    for name, disagreement in out["selfcheck_rel_l2"].items():
+        assert 1e-3 < disagreement < out["selfcheck_budgets"][name], (name, disagreement)
+    assert all(budget > 0 for budget in out["selfcheck_budgets"].values())
+
+    # THE PLANTED DEFECT, three shapes, through diffusers' own registry and dispatch. `empty`
+    # is what upstream's meta stub did; `nan` is the h3a-023 hazard, which a bare ratio test
+    # would PASS because NaN compares False; `wrong` is finite, right-shaped and the right
+    # magnitude — the arm no finiteness check and no implausible-rate check can catch.
+    for kind in ("empty", "nan", "wrong"):
+        for name in ("sdpa", "cudnn"):
+            refusal = out[f"dead_{kind}_{name}_pin"]
+            assert refusal["code"] == "attention_kernel_wrong", (kind, name, refusal)
+            assert name in refusal["detail"] and f"sm{out['sm']}" in refusal["detail"]
+        # A PIN refuses; AUTO drops. With the floor itself dead, auto-selection offers
+        # NOTHING rather than silently serving a kernel that returns uninitialized memory —
+        # which is exactly what would have shipped corrupted video.
+        assert out[f"dead_{kind}_auto"] == []
+        assert "sdpa" not in out[f"dead_{kind}_image_kernels"]
+    # The finite arm names the disagreement it measured, so triage reads a number.
+    assert "rel L2 15.99" in out["dead_wrong_sdpa_pin"]["detail"]
+    # And the green arm holds again once the plants are removed: a passing red arm is not a
+    # registry left broken.
+    assert out["selfcheck_restored"] == out["offered"]
 
 
 # ------------------------------------------------- the durable record is BOUNDED (cr-122)

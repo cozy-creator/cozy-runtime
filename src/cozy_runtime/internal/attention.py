@@ -14,11 +14,50 @@ head dimension fit. Nothing is measured at run time and nothing falls back per c
 ran is a pure function of (device, image digest, checkpoint) — which is why one BOOT line is
 the whole record and no per-attempt attestation is kept.
 
-A NUMERICS-CHANGING KERNEL IS NOT AUTOMATICALLY FASTER. 8-bit attention (SageAttention2) is
-admitted by owner ruling but is NOT ranked: nothing has measured it against FA3 on our shapes,
-and ranking an unmeasured kernel first would be a claim rather than a fact. It sits in
-`PINNABLE` and is reachable through the execution-path override (cr-125), which is the tool
-that would produce the measurement that promotes it.
+A NUMERICS-CHANGING KERNEL IS NOT AUTOMATICALLY FASTER, and speed is not the only thing a
+rank asserts. 8-bit attention has now been measured (h3a-013, H100 SXM, H3's own geometry):
+SageAttention2 sm90 is 1.12x rank 1, and flash-attn3's OWN fp8-e4m3 path — the same baked `.so`
+this image already ships — is 1.31x. Neither is ranked, and the reason is not the speed:
+
+  An EXACT kernel needs no quality evidence to be promoted. flash-attn3 became rank 1 over
+  cuDNN on a speed measurement alone because the two agree to max abs 1.2e-7, three orders
+  BELOW bf16's own 2.3e-3 representation floor — the same computation, reordered. The
+  generated video still moved (26.5 dB PSNR, 0.873 SSIM against the paired control), because a
+  30-step sampler amplifies any perturbation; that is a property of the sampler, not a defect
+  of either kernel, and it is provable that the arithmetic did not change.
+
+  An INEXACT kernel cannot make that argument. Both 8-bit arms sit at 3.7-4.0e-2, ~16x the
+  bf16 floor. Nothing we own can currently separate "fp8 degrades quality" from "fp8 changes
+  the sample": h3a-001's gate is unbuilt, cozy-eval has no ratified conditions, and h3a-020 §5
+  MEASURED that `cozy-eval compare` refuses the paired video form for an attention-backend
+  change and that paired audio distance cannot separate them either. A promotion would change
+  every customer's output on an image upgrade, silently, with no instrument that could tell us
+  whether it got worse. And it would not even reach the target: fp8 takes the 5 s cell to
+  2.68 c/s against a 2.5 target, still 7% short, and the 14 s cell to 4.75, 1.9x short. So it
+  buys an unverifiable quality risk for something that misses anyway.
+
+  fp8 therefore belongs in `PINNABLE` — available for measurement, chosen deliberately — and
+  the pin is the instrument that produces the evidence a promotion would need. Note also that
+  it cannot be spelled here yet: diffusers 0.40.0's `_flash_3_hub` backend hard-codes
+  `q_descale=k_descale=v_descale=None` and constrains q/k/v to bf16/fp16, so FA3-fp8 is not an
+  `AttentionBackendName` at all. h3a-013 reached it by calling the baked kernel directly.
+  Adding it is a new dispatch path that quantises per call, not a row in this table.
+
+AN IMPORT IS NOT A PROOF THAT A KERNEL COMPUTES. h3a-013 measured the image's baked
+`sageattention` sm90 kernel returning UNINITIALIZED MEMORY on an H100 — no exception, the right
+shape and dtype, rel L2 311, at 14.5x the card's fp8 peak because no kernel launched at all
+(upstream `sm90_compile.py` bound a `register_fake` meta stub over the `custom_op` of the same
+name). The image gate proved only that it imported and that its extension file existed; both
+were true. So a kernel is now PROVEN, once, at prepare, against exact fp32 attention on the
+device it will actually run on, and one that disagrees beyond its DECLARED budget is dropped
+from auto-selection and refused to a pin. This does not weaken the purity claim above: the
+verdict is a deterministic function of (device, image), computed once, never per call.
+
+The implausible RATE — 14.5x a card's theoretical peak — is the symptom that made the defect
+visible, and it is deliberately NOT the check. It would need a per-device peak table we do not
+maintain and would say nothing about a kernel that is merely wrong at a plausible speed. The
+numeric check catches the same failure with three orders of magnitude of margin (rel L2 311
+against a 0.2 budget) and no device-specific constant.
 """
 
 from __future__ import annotations
@@ -76,6 +115,11 @@ class Candidate:
     baked: str = ""
     #: An installed distribution this kernel needs, by project name; empty when torch's own.
     distribution: str = ""
+    #: The relative-L2 disagreement with exact fp32 attention this kernel is ALLOWED at
+    #: `PROBE`, at which point it stops being attention. Every entry declares one, because the
+    #: budget is the statement of what the kernel is: an exact kernel may not drift past bf16's
+    #: own floor, and an 8-bit one is permitted its quantisation and nothing more.
+    rel_l2_max: float = 0.0
     #: Why this entry sits where it sits. A rank is a MEASUREMENT or it is not a rank.
     why: str = ""
 
@@ -92,6 +136,7 @@ CANDIDATES: tuple[Candidate, ...] = (
         dtypes=frozenset({"bfloat16", "float16"}),
         max_head_dim=256,
         baked="flash-attn3",
+        rel_l2_max=2e-2,
         why=(
             "MEASURED on an H100 SXM (h3a-012, one DiT forward at S=106,932): 22.84 s of "
             "attention against cuDNN's 28.45 s — 718 vs 576 TF/s, 29.02 vs 34.70 s per "
@@ -106,6 +151,7 @@ CANDIDATES: tuple[Candidate, ...] = (
         min_sm=0,
         dtypes=frozenset(),
         max_head_dim=0,
+        rel_l2_max=2e-2,
         why=(
             "torch's own `scaled_dot_product_attention` dispatch, and the FLOOR: it takes "
             "every dtype, head dimension and mask, so a site no ranked kernel admits still "
@@ -126,6 +172,7 @@ PINNABLE: tuple[Candidate, ...] = (
         min_sm=80,
         dtypes=frozenset({"bfloat16", "float16"}),
         max_head_dim=128,
+        rel_l2_max=2e-2,
         why=(
             "MEASURED SLOWER than the floor it duplicates (h3a-012): 34.99 s against 34.70 s, "
             "because diffusers' wrapper adds three `.contiguous()` around the same cuDNN "
@@ -140,11 +187,16 @@ PINNABLE: tuple[Candidate, ...] = (
         dtypes=frozenset({"bfloat16", "float16"}),
         max_head_dim=128,
         distribution="sageattention",
+        rel_l2_max=2e-1,
         why=(
             "8-bit attention: Q/K int8 per-thread, V fp8-e4m3 per-channel, fp32+fp32 PV. It "
-            "CHANGES THE NUMBERS, which the owner admits (2026-09-08), but it has never been "
-            "timed against flash-attn3 on our shapes — h3a-013 has no run — so it is "
-            "nameable and not chosen"
+            "CHANGES THE NUMBERS, which the owner admits (2026-09-08). NOW TIMED (h3a-013, "
+            "H100 SXM at H3's geometry): 1.12x flash-attn3, against flash-attn3's own fp8 "
+            "path at 1.31x — so it is not even the best 8-bit arm, and 1.12x does not justify "
+            "a dependency. It also SHIPPED DEAD: worker images before th-192 baked upstream "
+            "eb615cf6, whose `sm90_compile.py` bound a `register_fake` meta stub over the "
+            "custom op, so every sm90 call returned its uninitialized output buffer at rel L2 "
+            "311 with no error. The self-check below refuses exactly that, on any image"
         ),
     ),
 )
@@ -257,8 +309,83 @@ def _lookup(module: Any, dotted: str, name: str) -> Any:
     return entry
 
 
-def _resolve(candidate: Candidate) -> Ready:
-    """One candidate, proven present here, or a typed absence naming what is missing."""
+#: The self-check's shape: (batch, sequence, heads, head dimension). Small enough that the
+#: whole proof costs under a millisecond of a prepare that already takes minutes, and large
+#: enough to cross a real kernel's tiling — 256 rows is two 128-row blocks, and 128 is the head
+#: dimension every entry in both tables serves.
+PROBE: tuple[int, int, int, int] = (1, 256, 4, 128)
+
+
+def _computes(entry: Ready, device: DeviceFacts) -> None:
+    """PROVE the kernel computes attention on THIS device, or refuse it by name.
+
+    Runs one forward through the same `dispatch_attention_fn` a pinned processor dispatches
+    through — not a hand-rolled call to the kernel — and compares it against exact fp32
+    attention over the kernel's own inputs, so bf16's input rounding is not charged to it.
+
+    Non-finite output fails BEFORE the ratio, because a NaN comparison is False and would
+    otherwise report a pass. That is the whole reason this is written as a guard rather than a
+    one-line assert: the h3a-023 hazard note records live NaN reports for this kernel family on
+    Hopper, and the check that misses NaN is worse than no check.
+    """
+    if device.kind != "cuda":
+        # There is no device to prove anything on, and the only entry a CPU executor admits is
+        # torch's own eager dispatch. Silence here is the honest answer, not a skipped gate.
+        return
+    import torch
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+    batch, sequence, heads, dim = PROBE
+    dtype = (
+        torch.bfloat16
+        if not entry.candidate.dtypes or "bfloat16" in entry.candidate.dtypes
+        else torch.float16
+    )
+    seed = torch.Generator(device="cuda").manual_seed(0x5A6E)
+    shape = (batch, sequence, heads, dim)
+    query, key, value = (
+        (torch.randn(shape, generator=seed, device="cuda", dtype=torch.float32) * 0.5).to(dtype)
+        for _ in range(3)
+    )
+    with torch.no_grad():
+        got = dispatch_attention_fn(query, key, value, backend=entry.member)
+    if isinstance(got, tuple):
+        got = got[0]
+
+    exact = torch.nn.functional.scaled_dot_product_attention(
+        *(tensor.transpose(1, 2).float() for tensor in (query, key, value))
+    ).transpose(1, 2)
+    if tuple(got.shape) != tuple(exact.shape):
+        raise AttentionRefusal(
+            "attention_kernel_wrong",
+            f"{entry.name} returned {tuple(got.shape)} where attention over {shape} is "
+            f"{tuple(exact.shape)}",
+        )
+    got = got.float()
+    if not bool(torch.isfinite(got).all()):
+        raise AttentionRefusal(
+            "attention_kernel_wrong",
+            f"{entry.name} returned non-finite values on {device.name} (sm{device.sm}); it is "
+            "not serving attention and a NaN would pass every ratio test",
+        )
+    disagreement = float((got - exact).norm() / exact.norm())
+    if disagreement > entry.candidate.rel_l2_max:
+        raise AttentionRefusal(
+            "attention_kernel_wrong",
+            f"{entry.name} disagrees with exact fp32 attention at rel L2 {disagreement:.4g} on "
+            f"{device.name} (sm{device.sm}), past its declared budget of "
+            f"{entry.candidate.rel_l2_max:.4g}. A kernel that returns its uninitialized output "
+            "buffer raises nothing and has the right shape (h3a-013), so this is the only "
+            "thing that can tell the difference",
+        )
+
+
+def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
+    """One candidate, proven present here AND proven to compute, or a typed refusal.
+
+    Present is not enough: an import and an extension file were both true of a kernel that
+    returned uninitialized memory (h3a-013), so resolution ends with `_computes`.
+    """
     registry = _registry()
     member = _member(candidate.backend)
     if member not in registry._backends:
@@ -268,7 +395,9 @@ def _resolve(candidate: Candidate) -> Ready:
         )
     if candidate.baked:
         loaded_member, location = _load_baked(candidate)
-        return Ready(candidate, loaded_member, location)
+        ready = Ready(candidate, loaded_member, location)
+        _computes(ready, device)
+        return ready
     if candidate.distribution:
         try:
             installed = metadata.version(candidate.distribution)
@@ -286,7 +415,9 @@ def _resolve(candidate: Candidate) -> Ready:
                 f"{candidate.distribution}=={installed} does not import: "
                 f"{type(exc).__name__}: {exc}",
             ) from exc
-    return Ready(candidate, member)
+    ready = Ready(candidate, member)
+    _computes(ready, device)
+    return ready
 
 
 def for_device(device: DeviceFacts) -> list[Candidate]:
@@ -308,12 +439,15 @@ def available(device: DeviceFacts) -> list[Ready]:
     ready: list[Ready] = []
     for candidate in for_device(device):
         try:
-            ready.append(_resolve(candidate))
+            ready.append(_resolve(candidate, device))
         except Exception:
             # BROAD ON PURPOSE. Auto-selection has no refusal arm — the floor takes
             # everything — so a kernel that fails to resolve for ANY reason must drop out of
             # the ranking rather than fail the prepare that was only trying to go faster. A
-            # PIN is the opposite and keeps its typed refusals (`pinned`).
+            # PIN is the opposite and keeps its typed refusals (`pinned`). A kernel that
+            # RESOLVES BUT DOES NOT COMPUTE now leaves by this same door, which is the point:
+            # auto-selection silently taking a dead kernel is what would have shipped
+            # corrupted video (h3a-013).
             continue
     return ready
 
@@ -336,7 +470,7 @@ def pinned(name: str, device: DeviceFacts) -> list[Ready]:
             f"{name} needs sm{candidate.min_sm} or better; this executor holds "
             f"{device.kind} sm{device.sm}",
         )
-    return [_resolve(candidate)]
+    return [_resolve(candidate, device)]
 
 
 # ------------------------------------------------------------------------------ the pin
@@ -510,12 +644,19 @@ def select(device: DeviceFacts, roots: Mapping[str, Any], pin: str = "") -> Appl
     return install(pinned(pin, device) if pin else available(device), roots, pin)
 
 
-def image_kernels() -> str:
-    """What the image ships, for a refusal message. Discoverability is the point (cr-125)."""
+def image_kernels(device: DeviceFacts) -> str:
+    """What this image and device can actually RUN, for a refusal message (cr-125).
+
+    Device-filtered first, so a card the entry does not claim is never probed; and it lists
+    what computes, not what imports — naming a kernel here that returns garbage would send a
+    developer straight at the trap the refusal was meant to steer them away from.
+    """
     shipped: list[str] = []
     for candidate in (*CANDIDATES, *PINNABLE):
+        if candidate.min_sm and (device.kind != "cuda" or device.sm < candidate.min_sm):
+            continue
         try:
-            _resolve(candidate)
+            _resolve(candidate, device)
         except Exception:
             continue
         shipped.append(candidate.name)
