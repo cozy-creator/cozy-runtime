@@ -1,0 +1,17 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "cozy-script-fixture"
+version = "0.1.0"
+description = "Creator's generated script-app shape, exactly as packagepublish writes it"
+requires-python = ">=3.12,<3.13"
+dependencies = ["cozy-runtime>=0.1,<1"]
+
+[project.entry-points."cozy.application"]
+default = "cozy_script_entry:app"
+
+[tool.uv.build-backend]
+module-name = ["cozy_script", "cozy_script_entry"]
+module-root = ""
