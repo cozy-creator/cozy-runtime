@@ -903,6 +903,9 @@ class LocalRecordOwner:
         else:
             spec.serving.entrypoint_binding_digest = binding_digest
             spec.serving.attempt_binding_id = binding_digest
+            if self.placement is None:
+                raise RuntimeError("serving dispatch has no exact prepared placement")
+            spec.serving.bindings_digest = documents.spell(self.placement.bindings_digest)
         canonical_bytes, digest = documents.identity(spec)
         self.spec_digest = digest
         self.spec_canonical_bytes = canonical_bytes

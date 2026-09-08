@@ -385,6 +385,13 @@ class TwoTenantOwner(LocalRecordOwner):
         )
         spec.serving.entrypoint_binding_digest = binding_digest
         spec.serving.attempt_binding_id = binding_digest
+        spec.serving.bindings_digest = documents.spell(
+            next(
+                placement.bindings_digest
+                for placement in self.placements
+                if placement.placement_id == placement_id
+            )
+        )
         canonical_bytes, digest = documents.identity(spec)
         self.spec_digest = digest
         self.spec_canonical_bytes = canonical_bytes

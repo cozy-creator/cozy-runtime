@@ -351,12 +351,14 @@ def build(
     if implementation_wheel is not None:
         files, metadata = _overlay(interface, implementation_wheel, distribution, version)
     files[dist + "/package-interface.json"] = interface
+    layout = "overlay" if implementation_wheel is not None else "generated"
     header, _, description = metadata.partition(b"\n\n")
     files[dist + "/METADATA"] = (
         header.rstrip(b"\n")
         + (
             f"\nCozy-Interface-Generator: {GENERATOR_ABI}\n"
-            f"Cozy-Implementation-Digest: {implementation_digest}\n\n"
+            f"Cozy-Implementation-Digest: {implementation_digest}\n"
+            f"Cozy-Interface-Layout: {layout}\n\n"
         ).encode()
         + description
     )
@@ -446,35 +448,13 @@ def _overlay(
     # Description text is a body, not header text. Preserve it after adding bindings.
     if headers.get("Cozy-Interface-Generator") is not None:
         raise ConformanceError("cannot overlay another caller wheel", code="interface_binding")
-    document = package_interface.read_bytes(interface, source="caller overlay")
-    digest = "sha256:" + hashlib.sha256(interface).hexdigest()
-    modules: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
-        for entry in document[collection]:
-            if "invocable" in entry:
-                modules[entry["invocable"]["module"]].append({**entry, "_kind": kind})
-    for index, (module, entries) in enumerate(sorted(modules.items())):
-        path = module.replace(".", "/")
-        candidates = [name for name in (path + ".py", path + "/__init__.py") if name in files]
-        if len(candidates) != 1:
-            raise ConformanceError(
-                "managed module has no unique Python implementation", code="interface_binding"
-            )
-        target = candidates[0]
-        companion = "_cozy_callers_" + digest[7:23] + "_" + str(index)
-        directory = target.rpartition("/")[0]
-        generated = (directory + "/" if directory else "") + companion + ".py"
+    for target, (generated, source, suffix) in overlay_sources(interface, set(files)).items():
         if generated in files:
             raise ConformanceError(
                 "caller module collides with implementation", code="interface_binding"
             )
-        files[generated] = _module(module, entries, digest).encode()
-        relative = "." if directory else ""
-        exports = [row["invocable"]["export"] for row in entries if row["_kind"] == "entrypoint"]
-        aliases = ", ".join(
-            [*(name + " as " + name for name in exports), "__cozy_bindings__ as __cozy_bindings__"]
-        )
-        files[target] += ("\n\nfrom " + relative + companion + " import " + aliases + "\n").encode()
+        files[generated] = source
+        files[target] += suffix
     # Rebuilt below; every other source, extension, asset and dependency header stays.
     for name in list(files):
         if name.startswith(metadata_path.rpartition("/")[0] + "/") and name.rpartition("/")[2] in {
@@ -484,3 +464,35 @@ def _overlay(
         }:
             del files[name]
     return files, metadata
+
+
+def overlay_sources(interface: bytes, available: set[str]) -> dict[str, tuple[str, bytes, bytes]]:
+    """Expected trusted companion source and terminal import for each library module."""
+    document = package_interface.read_bytes(interface, source="caller overlay")
+    digest = "sha256:" + hashlib.sha256(interface).hexdigest()
+    modules: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
+        for entry in document[collection]:
+            if "invocable" in entry:
+                modules[entry["invocable"]["module"]].append({**entry, "_kind": kind})
+    result: dict[str, tuple[str, bytes, bytes]] = {}
+    for index, (module, entries) in enumerate(sorted(modules.items())):
+        path = module.replace(".", "/")
+        candidates = [name for name in (path + ".py", path + "/__init__.py") if name in available]
+        if len(candidates) != 1:
+            raise ConformanceError(
+                "managed module has no unique Python implementation", code="interface_binding"
+            )
+        target = candidates[0]
+        companion = "_cozy_callers_" + digest[7:23] + "_" + str(index)
+        directory = target.rpartition("/")[0]
+        generated = (directory + "/" if directory else "") + companion + ".py"
+        source = _module(module, entries, digest).encode()
+        relative = "." if directory else ""
+        exports = [row["invocable"]["export"] for row in entries if row["_kind"] == "entrypoint"]
+        aliases = ", ".join(
+            [*(name + " as " + name for name in exports), "__cozy_bindings__ as __cozy_bindings__"]
+        )
+        suffix = ("\n\nfrom " + relative + companion + " import " + aliases + "\n").encode()
+        result[target] = (generated, source, suffix)
+    return result

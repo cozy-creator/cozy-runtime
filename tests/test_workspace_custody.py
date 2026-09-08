@@ -197,7 +197,8 @@ def test_native_serving_lease_rechecks_owner_identity_and_release(tmp_path: Path
     source = retention(receipt, 17)
     held = workspace.retain("owner", source)
     with workspace.held_model("owner", source, held.manifest):
-        tensorfs.gc(str(store.root))
+        with pytest.raises(tensorfs.errors.StoreBusy):
+            tensorfs.gc(str(store.root))
         assert store.manifest(documents.spell(held.manifest.digest))["manifest"]
     with (
         pytest.raises(WorkspaceRefusal, match="exact retained"),
