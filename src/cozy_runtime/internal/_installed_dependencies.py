@@ -114,13 +114,23 @@ def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) 
         outgoing.flush()
         os.fsync(outgoing.fileno())
         after = os.fstat(incoming.fileno())
-    if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    ):
-        raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
+    # uv may link/unlink other cache names for this inode while we copy it. That changes
+    # ctime and nlink without changing content; the copied bytes still prove their RECORD hash.
+    for observed in (info, before):
+        if (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_mode,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_mode,
+        ):
+            raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
     if expected:
         algorithm, separator, encoded = expected.partition("=")
         if not separator or algorithm not in {"sha256", "sha384", "sha512"}:

@@ -6,9 +6,11 @@ import base64
 import csv
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
+import threading
 import zipfile
 from pathlib import Path
 
@@ -184,3 +186,55 @@ def test_failed_final_observation_publishes_no_receipt(tmp_path: Path) -> None:
     assert not list((install_root / "contents").iterdir())
     assert not list(install_root.glob(".environment-staging-*"))
     assert not (source / "bin/executed").exists()
+
+
+def test_dependency_copy_accepts_concurrent_uv_hardlink_churn(tmp_path: Path) -> None:
+    source, target, sibling = tmp_path / "source", tmp_path / "copied", tmp_path / "cache-link"
+    body = b"recorded dependency bytes\n" * (1 << 20)
+    source.write_bytes(body)
+    expected = (
+        "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(body).digest()).rstrip(b"=").decode()
+    )
+    before = source.stat()
+    started, stop = threading.Event(), threading.Event()
+    links = 0
+
+    def churn() -> None:
+        nonlocal links
+        while not stop.is_set():
+            os.link(source, sibling)
+            sibling.unlink()
+            links += 1
+            started.set()
+
+    thread = threading.Thread(target=churn)
+    thread.start()
+    try:
+        assert started.wait(timeout=5)
+        dependencies._copy_dependency_file(source, target, expected, str(len(body)))
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+    after = source.stat()
+    assert not thread.is_alive()
+    assert links > 1
+    assert after.st_ctime_ns != before.st_ctime_ns
+    assert after.st_mtime_ns == before.st_mtime_ns
+    assert source.read_bytes() == target.read_bytes() == body
+
+
+def test_dependency_copy_refuses_changed_bytes_even_with_restored_mtime(tmp_path: Path) -> None:
+    source, target = tmp_path / "source", tmp_path / "copied"
+    original = b"accepted bytes"
+    source.write_bytes(original)
+    before = source.stat()
+    expected = (
+        "sha256="
+        + base64.urlsafe_b64encode(hashlib.sha256(original).digest()).rstrip(b"=").decode()
+    )
+    source.write_bytes(b"modified bytes")
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert source.stat().st_size == before.st_size
+    assert source.stat().st_mtime_ns == before.st_mtime_ns
+    with pytest.raises(package_environment.EnvironmentRefusal, match="member_changed"):
+        dependencies._copy_dependency_file(source, target, expected, str(len(original)))
