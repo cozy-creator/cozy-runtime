@@ -17,7 +17,9 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Final, Self, get_args, overload
+from typing import Any, ClassVar, Final, Self, cast, get_args, overload
+
+from PIL.Image import Image as Image
 
 from cozy_runtime.author._errors import CapabilityError, PreflightViolation
 
@@ -141,35 +143,59 @@ class FileAsset(Asset):
     kind: ClassVar[str] = "file"
 
 
-class Assets[T: Asset](Sequence[T]):
-    """An ordered input collection using the existing typed asset handles.
+@dataclass(frozen=True, slots=True)
+class AssetInfo:
+    """Readonly declared input metadata; accessing it never reads or decodes bytes."""
 
-    Construction gives each occurrence its own handle, ID and position. Reusing a
-    file preserves its content identity and granted access while keeping both list
-    positions. Nonempty labels must be unique and are preserved on copies. It performs
-    no I/O or decode, and does not mutate the source handles.
-    Runtime assigns the declared slot's IDs when binding a managed invocation.
+    id: str
+    position: int
+    label: str
+    kind: str
+    media_type: str
+    size_bytes: int
+    digest: str
+
+
+class Assets[T](Sequence[T]):
+    """Ordered granted inputs, accessed by position or an optional unique label.
+
+    ``Assets[Image]`` yields real PIL images; ``Assets[Mixed]`` yields decoded image,
+    video or audio values. Decode is lazy and uses the attempt's shared decoder.
+    ``info(key)`` exposes metadata without decoding, including during preflight.
+    Explicit ``Assets[ImageAsset]`` and other handle types remain a raw input view.
+    Construction holds references for forwarding; value access starts at injection.
     """
 
-    __slots__ = ("_items",)
+    __slots__ = ("_cache", "_decoded", "_guard", "_items", "_project")
 
-    def __init__(self, values: Iterable[T] = ()) -> None:
-        items: list[T] = []
+    def __init__(self, values: Iterable[Asset] = ()) -> None:
+        items: list[Asset] = []
         for position, value in enumerate(values):
             if not isinstance(value, Asset):
-                raise TypeError("Assets accepts typed asset handles")
+                raise TypeError("Assets construction accepts granted asset handles")
             item = copy(value)
             item._input_id = f"assets.{position}.asset"
             item._position = position
             items.append(item)
         self._items = tuple(items)
+        self._project: Callable[[Asset], object] | None = None
+        self._decoded = True
+        self._cache: dict[int, object] = {}
+        self._guard: Callable[[], None] | None = None
         self._check_labels()
 
     @classmethod
-    def _from_bound(cls, values: Iterable[T]) -> Assets[T]:
-        """Retain the existing slot IDs/order after shared input binding."""
-        result = cls.__new__(cls)
-        items: list[T] = []
+    def _from_bound(
+        cls,
+        values: Iterable[Asset],
+        *,
+        decoded: bool = False,
+        project: Callable[[Asset], object] | None = None,
+        guard: Callable[[], None] | None = None,
+    ) -> Assets[T]:
+        """Retain exact slot IDs/order after binding; no byte acquisition or decode."""
+        result = cls()
+        items: list[Asset] = []
         seen: set[str] = set()
         for position, value in enumerate(values):
             if not isinstance(value, Asset):
@@ -179,6 +205,9 @@ class Assets[T: Asset](Sequence[T]):
             seen.add(value.id)
             items.append(copy(value))
         result._items = tuple(items)
+        result._project = project
+        result._decoded = decoded
+        result._guard = guard
         result._check_labels()
         return result
 
@@ -191,31 +220,85 @@ class Assets[T: Asset](Sequence[T]):
         return len(self._items)
 
     def __iter__(self) -> Iterator[T]:
-        return iter(self._items)
+        return (self[index] for index in range(len(self)))
+
+    def _index(self, key: int | str) -> int:
+        if isinstance(key, str):
+            if key:
+                for index, item in enumerate(self._items):
+                    if item.label == key:
+                        return index
+            raise KeyError(key)
+        index = key if key >= 0 else len(self) + key
+        if not 0 <= index < len(self):
+            raise IndexError(key)
+        return index
 
     @overload
-    def __getitem__(self, index: int) -> T: ...
+    def __getitem__(self, key: int | str) -> T: ...
 
     @overload
-    def __getitem__(self, index: slice) -> tuple[T, ...]: ...
+    def __getitem__(self, key: slice) -> Assets[T]: ...
 
-    def __getitem__(self, index: int | slice) -> T | tuple[T, ...]:
-        return self._items[index]
+    def __getitem__(self, key: int | str | slice) -> T | Assets[T]:
+        if isinstance(key, slice):
+            return self.select(*range(len(self))[key])
+        index = self._index(key)
+        if not self._decoded:
+            return cast(T, self._items[index])
+        if self._guard is not None:
+            self._guard()
+        if self._project is None:
+            raise PreflightViolation(
+                "Assets values are available after hydration; use info(key) for metadata",
+                code="asset_bytes_unavailable",
+            )
+        if index not in self._cache:
+            self._cache[index] = self._project(self._items[index])
+        return cast(T, self._cache[index])
+
+    @overload
+    def get(self, key: int | str, default: None = None) -> T | None: ...
+
+    @overload
+    def get[D](self, key: int | str, default: D) -> T | D: ...
+
+    def get(self, key: int | str, default: object = None) -> object:
+        """Read an optional occurrence, returning default only when the key is absent."""
+        try:
+            index = self._index(key)
+        except (IndexError, KeyError):
+            return default
+        return self[index]
+
+    def info(self, key: int | str) -> AssetInfo:
+        item = self._items[self._index(key)]
+        return AssetInfo(
+            item.id,
+            item.position,
+            item.label,
+            item.kind,
+            item.media_type,
+            item.size_bytes,
+            item.digest,
+        )
+
+    def select(self, *keys: int | str) -> Assets[T]:
+        """Select/reorder occurrences without decoding or changing their granted bytes."""
+        result: Assets[T] = Assets(self._items[self._index(key)] for key in keys)
+        result._decoded = self._decoded
+        result._project = self._project
+        result._guard = self._guard
+        return result
 
     def by_id(self, input_id: str) -> T:
-        """Return an occurrence by its request-local ID, or raise KeyError."""
-        for item in self._items:
+        for index, item in enumerate(self._items):
             if item.id == input_id:
-                return item
+                return self[index]
         raise KeyError(input_id)
 
     def by_label(self, label: str) -> T:
-        """Look up an exact nonempty label, or raise KeyError."""
-        if label:
-            for item in self._items:
-                if item.label == label:
-                    return item
-        raise KeyError(label)
+        return self[label]
 
 
 def asset_kinds(annotation: object) -> frozenset[str]:

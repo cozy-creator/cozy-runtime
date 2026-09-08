@@ -11,7 +11,7 @@ import inspect
 import types
 import typing
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, get_args, get_origin
 
 import msgspec
@@ -19,6 +19,7 @@ import msgspec
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import Asset, Assets, AudioAsset, FileAsset, ImageAsset, VideoAsset
 from cozy_runtime.author._context import Context
+from cozy_runtime.author._decode import DECODED_ASSET_TYPES, DEFAULT_DECODE_LIMITS
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import AssetBound, Bound, _PreflightMarker
 from cozy_runtime.author._model import Model, component_use
@@ -60,6 +61,7 @@ class AssetsBinding:
     parameter: str
     annotation: object
     kinds: tuple[tuple[type[Asset], AssetBound | None], ...]
+    decoded: bool = False
 
     @property
     def wire_type(self) -> object:
@@ -85,18 +87,37 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
     inner, _ = strip(item)
     options = get_args(inner) if get_origin(inner) in (typing.Union, types.UnionType) else (item,)
     kinds: dict[str, tuple[type[Asset], AssetBound | None]] = {}
+    decoded: bool | None = None
     for option in options:
         cls, markers = strip(option)
+        value_type = cls in DECODED_ASSET_TYPES
+        if decoded is not None and value_type != decoded:
+            raise ConformanceError(
+                "Assets cannot mix decoded values and raw handles in one view",
+                code="assets_element",
+            )
+        decoded = value_type
+        if value_type:
+            cls = DECODED_ASSET_TYPES[typing.cast(type, cls)]
         if cls not in (ImageAsset, VideoAsset, AudioAsset, FileAsset):
-            raise ConformanceError("Assets elements must be typed assets", code="assets_element")
+            raise ConformanceError(
+                "Assets elements must be media values or typed assets", code="assets_element"
+            )
         cls = typing.cast(type[Asset], cls)
         if cls.kind in kinds:
             raise ConformanceError("Assets repeats a media kind", code="assets_element")
         bound = next((marker for marker in markers if isinstance(marker, AssetBound)), None)
+        if value_type:
+            if bound is None:
+                bound = AssetBound(max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes)
+            elif bound.max_decoded_bytes is None:
+                bound = replace(bound, max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes)
         if bound is not None:
             bound.check_kind(cls.kind)
         kinds[cls.kind] = cls, bound
-    return AssetsBinding(name, annotation, tuple(kinds[key] for key in sorted(kinds)))
+    return AssetsBinding(
+        name, annotation, tuple(kinds[key] for key in sorted(kinds)), bool(decoded)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,8 +227,8 @@ def _classify(name: str, annotation: object, where: str) -> Param:
         return Param(name, "context", base)
     origin = get_origin(base)
     if base is Assets or origin is Assets:
-        assets_binding(name, annotation)
-        return Param(name, "assets", annotation)
+        binding = assets_binding(name, annotation)
+        return Param(name, "assets", annotation, "media_decode" if binding.decoded else None)
     for capability, service in _PARAMETERIZED.items():
         if base is service or origin is service:
             args = get_args(base)
@@ -297,7 +318,14 @@ def analyze(
                     "invocable Assets must be keyword-only", code="invocable_signature"
                 )
             binding = assets_binding(parameter.name, annotation)
-            params.append(Param(parameter.name, "assets", annotation))
+            params.append(
+                Param(
+                    parameter.name,
+                    "assets",
+                    annotation,
+                    "media_decode" if binding.decoded else None,
+                )
+            )
             if invocable:
                 wire_fields.append((parameter.name, binding.wire_type))
             continue

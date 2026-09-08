@@ -1,4 +1,4 @@
-"""The one bounded input-media decoder: verified bytes in, immutable values out.
+"""The one bounded input-media decoder: verified bytes in, bounded media values out.
 
 There is deliberately no path, URL, fetch, resize, model-normalization, or output-codec
 surface here. PyAV is a lazy member of the ``media`` extra; the base author package does
@@ -17,8 +17,10 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, Protocol, TypeVar
 
+from PIL.Image import frombytes as pil_frombytes
+
 from cozy_runtime.author import _color
-from cozy_runtime.author._assets import AudioAsset, ImageAsset, VideoAsset
+from cozy_runtime.author._assets import Asset, AudioAsset, Image, ImageAsset, VideoAsset
 from cozy_runtime.author._errors import AuthorError, CapabilityError, InvalidRequest, RuntimeFailure
 
 
@@ -32,7 +34,7 @@ class _Attempt(Protocol):
 class DecodeLimits:
     """Runtime codec ceilings. A field's retained-value bound can only lower these.
 
-    ``max_decoded_bytes`` accounts for the immutable RGB8/float32 values returned to the
+    ``max_decoded_bytes`` accounts for the retained RGB8/float32 values returned to the
     handler. It is not a claim about peak process RSS: encoded input, codec working memory,
     and transient conversion buffers remain implementation memory.
     """
@@ -132,6 +134,10 @@ class DecodedVideo:
     @property
     def duration(self) -> Fraction:
         return (self.frame_pts[-1] + self.frame_durations[-1] - self.frame_pts[0]) * self.time_base
+
+
+Mixed = Image | DecodedVideo | DecodedAudio
+DECODED_ASSET_TYPES = {Image: ImageAsset, DecodedVideo: VideoAsset, DecodedAudio: AudioAsset}
 
 
 @dataclass(frozen=True, slots=True)
@@ -913,6 +919,17 @@ class MediaDecoder:
         self._limits = limits
         self._budget = _Budget(limits.max_decoded_bytes)
         self._open_streams = 0
+
+    def value(self, asset: Asset) -> Mixed:
+        """The lazy Assets projection, sharing this decoder's checks and budget."""
+        if isinstance(asset, ImageAsset):
+            image = self.decode_image(asset)
+            return pil_frombytes("RGB", (image.width, image.height), image.rgb)
+        if isinstance(asset, VideoAsset):
+            return self.decode_video(asset)
+        if isinstance(asset, AudioAsset):
+            return self.decode_audio(asset)
+        raise CapabilityError("decoded Assets requires image, video or audio", code="asset_kind")
 
     def decode_image(self, asset: ImageAsset) -> DecodedImage:
         av, budget, path = self._start(asset, ImageAsset, "decode_image")

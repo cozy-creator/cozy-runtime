@@ -63,7 +63,8 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         "from enum import Enum",
         "import msgspec",
         "from cozy_runtime.author import "
-        "AssetBound, Assets, ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
+        "AssetBound, Assets, Image, DecodedAudio, DecodedVideo, "
+        "ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
         "from cozy_runtime.author import ModelArtifact",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
         "",
@@ -201,7 +202,13 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
             if entry.get("assets", {}).get("parameter") == name:
                 kinds = []
                 for row in entry["assets"]["kinds"]:
-                    cls = expression({"asset": row["kind"]}, path)
+                    cls = (
+                        {"image": "Image", "audio": "DecodedAudio", "video": "DecodedVideo"}[
+                            row["kind"]
+                        ]
+                        if entry["assets"].get("view") == "decoded"
+                        else expression({"asset": row["kind"]}, path)
+                    )
                     bound = {key: value for key, value in row.items() if key != "kind"}
                     bound["media_types"] = tuple(bound["media_types"])
                     if any(bound.values()):

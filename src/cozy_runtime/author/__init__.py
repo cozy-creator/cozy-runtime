@@ -19,9 +19,11 @@ from cozy_runtime.author._app import App, Registration, RegistrationError
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._assets import (
     Asset,
+    AssetInfo,
     Assets,
     AudioAsset,
     FileAsset,
+    Image,
     ImageAsset,
     Tree,
     VideoAsset,
@@ -49,6 +51,7 @@ from cozy_runtime.author._decode import (
     DecoderUnavailable,
     MediaDecodeError,
     MediaDecoder,
+    Mixed,
 )
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, decode_request
 from cozy_runtime.author._demand import RequestFeatures
@@ -161,6 +164,7 @@ __all__ = [
     "Artifact",
     "Asset",
     "AssetBound",
+    "AssetInfo",
     "Assets",
     "AudioAsset",
     "AuthorError",
@@ -203,6 +207,7 @@ __all__ = [
     "EgressResponse",
     "FileAsset",
     "Fit",
+    "Image",
     "ImageAsset",
     "ImageFrame",
     "InvalidRequest",
@@ -211,6 +216,7 @@ __all__ = [
     "Loader",
     "MediaDecodeError",
     "MediaDecoder",
+    "Mixed",
     "Model",
     "ModelArtifact",
     "ModelAssets",

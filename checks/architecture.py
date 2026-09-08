@@ -60,14 +60,13 @@ PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
     "cli": (),
 }
 GENERATED_PROTOCOL_PREFIX = "cozy.worker.v1"
-# The author surface is import-fenced to stdlib + schema/typing libraries only.
-AUTHOR_ALLOWED_THIRD_PARTY = ("msgspec",)
+# Pillow is a base dependency and the actual public Image value type; imports stay at module scope.
+AUTHOR_ALLOWED_THIRD_PARTY = ("msgspec", "PIL")
 # The `media` extra's encoder (cr-017): allowed in the author package ONLY function-scoped,
 # the same shape as torch in the harness — importing the author surface never pulls it, and
 # an absent wheel is the typed `encoder_unavailable` refusal, not an ImportError at import.
 AUTHOR_ALLOWED_LAZY: dict[str, frozenset[str]] = {
     "av": frozenset({"_codec.py", "_decode.py"}),
-    "PIL": frozenset({"_codec.py"}),
 }
 
 ENV_AUTHORITY = SRC / "internal" / "config.py"

@@ -95,7 +95,10 @@ def _callable(surface: Surface) -> dict[str, Json]:
             if bound and bound.max_decoded_bytes is not None:
                 row["max_decoded_bytes"] = bound.max_decoded_bytes
             kinds.append(row)
-        doc["assets"] = {"parameter": binding.parameter, "kinds": kinds}
+        slot: dict[str, Json] = {"parameter": binding.parameter, "kinds": kinds}
+        if binding.decoded:
+            slot["view"] = "decoded"
+        doc["assets"] = slot
     if surface.kind == "job":
         doc["publishes"] = surface.publishes
         if surface.weights_outputs:
@@ -460,7 +463,9 @@ def _portable_name(value: Json, source: str, path: str) -> str:
 
 
 def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
-    slot = _closed(value, {"parameter", "kinds"}, set(), source, path)
+    slot = _closed(value, {"parameter", "kinds"}, {"view"}, source, path)
+    if "view" in slot and slot["view"] != "decoded":
+        _invalid(source, f"{path}.view", "must be decoded when present")
     parameter = slot["parameter"]
     if not isinstance(parameter, str) or not parameter.isidentifier():
         _invalid(source, path, "assets parameter must be an identifier")

@@ -5,7 +5,7 @@ import io
 import json
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -21,6 +21,7 @@ from cozy_runtime.author import (
     CapabilityError,
     ConformanceError,
     Context,
+    DecodedVideo,
     FileAsset,
     ImageAsset,
     Invocation,
@@ -31,6 +32,9 @@ from cozy_runtime.author import (
     describe,
     invocable,
     prepare,
+)
+from cozy_runtime.author import (
+    Image as InputImage,
 )
 from cozy_runtime.author._assets import GrantedInput, InputMetadata
 from cozy_runtime.author._calls import _Broker, _CallType
@@ -263,8 +267,8 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
         attempt="parent",
         digest=rows["assets.0.asset"].digest,
     )
-    original = Assets([photo.with_label("original")])
-    forwarded = Assets([original[0].with_label("second"), original[0].with_label("first")])
+    original: Assets[ImageAsset] = Assets([photo.with_label("original")])
+    forwarded: Assets[ImageAsset] = Assets([photo.with_label("second"), photo.with_label("first")])
     reservation = broker.reserve("", __name__, "child", {"assets": forwarded})
     payload = json.loads(reservation.payload)
     assert payload == {
@@ -273,7 +277,7 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
             {"asset": photo.digest, "label": "first"},
         ]
     }
-    assert original[0].label == "original" and original[0].id == "assets.0.asset"
+    assert original.info(0).label == "original" and original.info(0).id == "assets.0.asset"
     selected = {
         key: replace(row, input_id=key) for key, row in rows.items() if key.startswith("assets.")
     }
@@ -285,12 +289,13 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
     assert outcome.terminal == "succeeded", outcome
     assert result is not None and result.result.labels == ["second", "first"]
     assert result.result.ids == ["assets.0.asset", "assets.1.asset"]
-    reordered = broker.reserve(
-        "", __name__, "child", {"assets": Assets([forwarded[1], forwarded[0]])}
-    )
+    reordered = broker.reserve("", __name__, "child", {"assets": forwarded.select(1, 0)})
     assert reordered.payload != reservation.payload
     relabelled = broker.reserve(
-        "", __name__, "child", {"assets": Assets([forwarded[0].with_label("woman"), forwarded[1]])}
+        "",
+        __name__,
+        "child",
+        {"assets": Assets([photo.with_label("woman"), photo.with_label("first")])},
     )
     assert relabelled.payload != reservation.payload
     assert [row["asset"] for row in json.loads(relabelled.payload)["assets"]] == [
@@ -343,12 +348,12 @@ def test_assets_decode_uses_existing_per_item_limit(tmp_path: Path) -> None:
 
 def test_collection_labels_are_exact_and_do_not_mutate_source() -> None:
     source = ImageAsset("ref", media_type="image/png", size_bytes=12)
-    collection = Assets(
+    collection: Assets[ImageAsset] = Assets(
         [source.with_label("女人"), source.with_label("Woman"), source.with_label("woman")]
     )
     assert source.label == "" and source.id == "" and source.position == -1
-    assert collection.by_label("女人").id == "assets.0.asset"
-    assert [a.position for a in collection] == [0, 1, 2]
+    assert collection.info("女人").id == "assets.0.asset"
+    assert [collection.info(i).position for i in range(len(collection))] == [0, 1, 2]
     with pytest.raises(KeyError):
         collection.by_label("")
     with pytest.raises(KeyError):
@@ -357,3 +362,148 @@ def test_collection_labels_are_exact_and_do_not_mutate_source() -> None:
         Assets([source.with_label("same"), source.with_label("same")])
     with pytest.raises(TypeError):
         source.with_label(None)  # type: ignore[arg-type]
+
+
+SimplePictures = Annotated[Assets[InputImage], msgspec.Meta(min_length=1, max_length=4)]
+
+
+@invocable(memoize=True)
+async def decoded_child(ctx: Context, *, assets: SimplePictures) -> Result:
+    return Result(
+        [assets.info(i).label for i in range(len(assets))],
+        [assets.info(i).id for i in range(len(assets))],
+        [assets.info(i).position for i in range(len(assets))],
+        [assets.info(i).digest for i in range(len(assets))],
+        [image.tobytes().hex() for image in assets],
+        "",
+    )
+
+
+decoded_app = App()
+decoded_app.job(decoded_child)
+
+
+def test_decoded_assets_are_lazy_real_images_with_one_attempt_budget(tmp_path: Path) -> None:
+    wire, rows = inputs(tmp_path)
+    escaped: list[Assets[InputImage]] = []
+    inspected: list[str] = []
+
+    def inspect_inputs(payload: Request, assets: SimplePictures) -> Facts:
+        assert assets.info("alice").media_type == "image/png"
+        inspected.append(assets.info(0).digest)
+        with pytest.raises(FrozenInstanceError):
+            assets.info(0).label = "changed"  # type: ignore[misc]
+        with pytest.raises(PreflightViolation, match="metadata"):
+            assets[0]
+        assert assets.get("missing") is None
+        return Facts(("alice", ""), (0, 1))
+
+    local = App()
+
+    @local.entrypoint(preflight=inspect_inputs)
+    def decode(payload: Request, assets: SimplePictures, decoder: MediaDecoder) -> Result:
+        assert decoder._budget.used == 0  # info and preflight performed no decode.
+        first = assets["alice"]
+        assert type(first) is InputImage and first.mode == "RGB" and first.size == (2, 2)
+        assert assets[0] is first and assets.get("alice") is first
+        assert decoder._budget.used == 12
+        second = assets[1]
+        assert second is not first and decoder._budget.used == 24
+        first.putpixel((0, 0), (0, 0, 255))
+        assert second.getpixel((0, 0)) == (255, 0, 0)
+        escaped.append(assets)
+        return Result([], [], [], [], [second.tobytes().hex()], payload.named.read_bytes().decode())
+
+    prepared = prepare(local.get("decode"), wire, input_metadata=rows)
+    assert inspected == [rows["assets.0.asset"].digest]
+    result, outcome, _ = run_prepared(
+        prepared, Invocation("decoded", tmp_path / "decoded", time.monotonic() + 10, assets=rows)
+    )
+    assert outcome.terminal == "succeeded", outcome
+    assert result is not None and result.result.rgb == ["ff0000" * 4]
+    with pytest.raises(CapabilityError, match="escaped_handle"):
+        escaped[0]["alice"]  # Cached values cannot bypass the collection lifetime check.
+
+
+def test_decoded_selection_forwards_custody_without_decoding(tmp_path: Path) -> None:
+    _, rows = inputs(tmp_path)
+    photo = ImageAsset(
+        rows["assets.0.asset"].digest,
+        local=rows["assets.0.asset"].local,
+        digest=rows["assets.0.asset"].digest,
+        attempt="parent",
+    )
+    original: Assets[InputImage] = Assets([photo.with_label("one"), photo.with_label("two")])
+    original._decoded = True
+
+    def no_decode(asset: Any) -> object:
+        raise AssertionError("selection/serialization must not decode")
+
+    original._project = no_decode
+    forwarded = original.select("two", "one")
+    assert forwarded.info(0).label == "two" and original.info(0).label == "one"
+    assert forwarded[:1].info(0).label == "two"
+    surface = describe(decoded_app)[0]
+    assert isinstance(surface.payload_type, type)
+    broker = _Broker(
+        "parent",
+        {
+            ("", __name__, "decoded_child"): _CallType(
+                "sha256:" + "b" * 64, __name__, "decoded_child", surface.payload_type, Result
+            )
+        },
+        lambda _operation, _payload: {},
+    )
+    broker.bind(fake_context(request_id="parent"))
+    call = broker.reserve("", __name__, "decoded_child", {"assets": forwarded})
+    payload = json.loads(call.payload)
+    assert [row["label"] for row in payload["assets"]] == ["two", "one"]
+    selected = {key: row for key, row in rows.items() if key.startswith("assets.")}
+    result, outcome, _ = attempt(
+        decoded_app.get("decoded_child"),
+        payload,
+        Invocation(
+            "decoded-child", tmp_path / "decoded-child", time.monotonic() + 10, assets=selected
+        ),
+    )
+    assert outcome.terminal == "succeeded", outcome
+    assert result is not None and result.result.labels == ["two", "one"]
+    assert result.result.rgb == ["ff0000" * 4] * 2
+
+
+def test_decoded_descriptor_and_generated_client_preserve_the_value_type(tmp_path: Path) -> None:
+    found = Discovered(
+        decoded_app,
+        __name__ + ":decoded_app",
+        tmp_path,
+        sys.modules[__name__],
+        describe(decoded_app),
+        {},
+    )
+    document = package_interface.build(found)
+    slot = document["jobs"][0]["assets"]
+    assert slot["view"] == "decoded"
+    assert slot["kinds"][0]["max_decoded_bytes"] == 2 * 1024**3
+    raw = package_interface.canonical_bytes(document)
+    package_interface.read_bytes(raw)
+    generated = interface_wheel.generate(raw)
+    assert any(b"Assets[Annotated[Image," in value for value in generated.values())
+    for key, value in generated.items():
+        if key.endswith(".py"):
+            compile(value, key, "exec")
+    for invalid_view in ("raw", "pixels", None, 1):
+        invalid = json.loads(json.dumps(document))
+        invalid["jobs"][0]["assets"]["view"] = invalid_view
+        with pytest.raises(ConformanceError):
+            package_interface.read_bytes(json.dumps(invalid).encode())
+
+
+def test_assets_refuses_mixed_raw_and_decoded_view() -> None:
+    local = App()
+
+    @local.entrypoint
+    def bad(payload: Request, assets: Assets[ImageAsset | DecodedVideo]) -> Result:
+        raise AssertionError("mixed view must refuse during describe")
+
+    with pytest.raises(ConformanceError, match="mix decoded values and raw"):
+        describe(local)

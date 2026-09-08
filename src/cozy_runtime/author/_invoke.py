@@ -331,7 +331,8 @@ def _preflight(surface: Surface, overlay: Overlay, settings: object) -> tuple[ob
         if role == "assets":
             args.append(
                 Assets._from_bound(
-                    row.asset for row in getattr(overlay.payload, str(spec.assets_parameter))
+                    (row.asset for row in getattr(overlay.payload, str(spec.assets_parameter))),
+                    decoded=bool(surface.assets_binding and surface.assets_binding.decoded),
                 )
             )
         else:
@@ -710,14 +711,28 @@ def _inject(
     """Build the call kwargs. A service absent from the signature is never constructed —
     which is precisely why a handler without `Outputs` structurally cannot save."""
     kwargs: dict[str, object] = {}
+    # Both the implicit decoded view and an explicitly requested service share one budget.
+    decoder = (
+        MediaDecoder(
+            attempt,
+            active=lambda: any(model._cozy_active is not None for model in inv.models.values()),
+        )
+        if "media_decode" in surface.capabilities
+        else None
+    )
     for param in surface.params:
         if param.role == "context":
             kwargs[param.name] = ctx
         elif param.role == "payload":
             kwargs[param.name] = _payload_value(surface, overlay.payload)
         elif param.role == "assets":
+            binding = surface.assets_binding
+            assert binding is not None
             kwargs[param.name] = Assets._from_bound(
-                row.asset for row in getattr(overlay.payload, param.name)
+                (row.asset for row in getattr(overlay.payload, param.name)),
+                decoded=binding.decoded,
+                project=decoder.value if decoder is not None else None,
+                guard=lambda: attempt.check_open("Assets"),
             )
         elif param.role == "wire":
             kwargs[param.name] = getattr(overlay.payload, param.name)
@@ -736,6 +751,9 @@ def _inject(
                     fields=[param.name],
                 )
             kwargs[param.name] = model
+        elif param.capability == "media_decode":
+            assert decoder is not None
+            kwargs[param.name] = decoder
         else:
             kwargs[param.name] = _service(param, attempt, ctx, inv, surface)
     return kwargs
@@ -783,11 +801,6 @@ def _service(
                 open_transaction=inv.weights,
                 source_structure=inv.weights_source_structure,
                 cancel=inv.cancel,
-            )
-        case "media_decode":
-            return MediaDecoder(
-                attempt,
-                active=lambda: any(model._cozy_active is not None for model in inv.models.values()),
             )
     raise ConformanceError(f"no injector for capability {param.capability!r}")
 
