@@ -1,6 +1,6 @@
 """h3a-015 yardstick: eager vs fused (AOT Triton) vs regional `torch.compile`, same pod.
 
-A weightless package (random weights at MiniMax-H3's real widths, never a checkpoint), so
+A model-less GPU job (random weights at MiniMax-H3's real widths, never a checkpoint), so
 `cozy run local/h3-glue-bench/bench --rental-only` measures the three execution plans of
 one H3 transformer block at the served sequence length on whatever card the rental holds.
 Not shipped: the fused plan is the product; compile is measured here only as the yardstick
@@ -28,7 +28,7 @@ import torch
 from diffusers import MiniMaxH3Transformer3DModel
 from torch.profiler import ProfilerActivity, profile
 
-from cozy_runtime.author import App, Config, Context, Loader, Model
+from cozy_runtime.author import App, Context
 from cozy_runtime.internal import fusion, fusion_build, fusion_install
 from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf
 
@@ -80,26 +80,6 @@ class BenchResult(msgspec.Struct):
     distance: dict[str, Distance]
     cold: Cold
     kernels: list[KernelShare]
-
-
-class Bench:
-    def __init__(self) -> None:
-        self.components: dict[str, object] = {}
-
-
-def _build(config: Config) -> Bench:
-    del config
-    return Bench()
-
-
-class BenchModel(Model[Bench]):
-    pipe: Bench
-
-    def load(self, loader: Loader) -> None:
-        self.pipe = loader.construct(Bench, factory=_build)
-
-    def unload(self, loader: Loader) -> None:
-        return None
 
 
 class _Holder:
@@ -303,9 +283,9 @@ def run(request: BenchRequest, device: Any) -> BenchResult:
 app = App()
 
 
-@app.entrypoint
-def bench(payload: BenchRequest, model: BenchModel, ctx: Context) -> BenchResult:
-    del model
+@app.job
+def bench(payload: BenchRequest, ctx: Context) -> BenchResult:
+    """A GPU job with no model: the card is the subject, random weights are the fixture."""
     return run(payload, ctx.device)
 
 

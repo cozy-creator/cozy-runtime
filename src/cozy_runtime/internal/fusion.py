@@ -48,6 +48,12 @@ from cozy_runtime.internal.encoding.leaves import PreQuantized
 
 try:
     import torch
+except ImportError as _absent:  # pragma: no cover - the executor always has torch
+    TORCH_ABSENT = f"torch does not import ({_absent})"
+else:
+    TORCH_ABSENT = ""
+
+try:
     import triton
     import triton.language as tl
     from triton.backends.compiler import GPUTarget
@@ -63,7 +69,7 @@ try:
     from triton.runtime.build import platform_key
     from triton.runtime.cache import get_cache_key, get_cache_manager
 except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal arm
-    TRITON_ABSENT = f"torch or triton does not import ({_absent})"
+    TRITON_ABSENT = f"triton does not import ({_absent})"
 else:
     TRITON_ABSENT = ""
 
@@ -101,6 +107,11 @@ class FusionUnavailable(RuntimeError):
 def _require_triton() -> None:
     if TRITON_ABSENT:
         raise FusionUnavailable("fusion_triton_absent", TRITON_ABSENT)
+
+
+def _require_torch() -> None:
+    if TORCH_ABSENT:
+        raise FusionUnavailable("fusion_triton_absent", TORCH_ABSENT)
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,6 +586,7 @@ def load(device: Any, directory: Path | None = None) -> _Loaded:
     `CompiledKernel` from the artifact's files and loads its cubin onto the device.
     """
     _require_triton()
+    _require_torch()
     loaded: dict[int, _Loaded] = getattr(load, "_cached", {})
     index = torch.device(device).index or 0
     if index in loaded:
