@@ -58,9 +58,9 @@ from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import (
     accel,
+    attention,
     canonical,
     child_env,
-    execution_contract,
     model_config,
     package_interface,
     sandbox,
@@ -414,9 +414,9 @@ class Executor:
         self._prepare_consumed = False
         self.poisoned = ""
         self.constructed_model_digest = ""
-        #: The lane's execution contract, pinned on this generation and attested per attempt
-        #: (cr-109). None when the header carries no `execution` config.
-        self.attestation: execution_contract.Attestation | None = None
+        #: What the runtime pinned on this generation's attention sites (cr-123). One BOOT
+        #: line, not a per-attempt record: the choice is a function of device and image.
+        self.attention: attention.Applied | None = None
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
@@ -1029,20 +1029,6 @@ class Executor:
         if not isinstance(config_document, dict):
             raise RuntimeError("the CozyTensors construction config is not an object")
         stage("construction_config")
-        # THE LANE'S EXECUTION CONTRACT (cr-109), read where the construction config is read
-        # and refused BEFORE a plan is resolved or a byte is reserved: the device class first,
-        # then the kernel this environment can bind. There is no fallback on this axis; a
-        # refusal replaces the executor and the hub walks the ladder to the next rung.
-        kernel: execution_contract.Kernel | None = None
-        try:
-            contract = execution_contract.read(config_checkpoint.header.get("configs"))
-            if contract is not None:
-                execution_contract.check_device(contract, device_facts)
-                kernel = execution_contract.resolve_kernel(contract)
-        except execution_contract.ExecutionContractRefusal as exc:
-            self.poisoned = f"execution contract refused: {exc.code}"
-            return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
-        stage("execution_contract")
         construction = ConstructionFacts(
             release=str(binding["release"]),
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
@@ -1069,7 +1055,6 @@ class Executor:
                 encoded_leaves=consent,
                 steps_basis=int(binding.get("steps_basis") or 20),
                 dtype_name=dtype_name,
-                route=contract.weights.route if contract is not None else "",
             )
         except PlanRefusal as exc:
             self.poisoned = f"plan refused: {exc.code}"
@@ -1282,22 +1267,11 @@ class Executor:
                 else None
             )
             stage("execution_plan")
-            # THE CONTRACT'S KERNEL, PINNED POST-FILL (cr-109) on the components the contract
-            # GOVERNS (cr-122) — the ones whose tensors resolved on its own `weights.route`,
-            # read off the fill plane's component roots rather than guessed by walking the
-            # constructed object — before any warm step: a warm dry step then attests it.
-            applied = (
-                execution_contract.apply(
-                    contract,
-                    kernel,
-                    execution_contract.scope(
-                        contract, plan, {**backend.components, **backend.parked}
-                    ),
-                )
-                if contract is not None and kernel is not None
-                else None
-            )
-            stage("execution_contract_apply")
+            # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-123),
+            # per attention SITE and before any warm step. No checkpoint is consulted:
+            # attention is weightless, so the choice is (device, image) and nothing else.
+            applied = attention.select(device_facts, {**backend.components, **backend.parked})
+            stage("attention_pin")
         except ModelFitRefused as exc:
             # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
             # loader asked before `materialize`, so the only thing to undo is the read
@@ -1328,9 +1302,9 @@ class Executor:
                 "envelope": envelope,
                 "poison": backend.poison_report,
             }
-        except execution_contract.ExecutionContractRefusal as exc:
+        except attention.AttentionRefusal as exc:
             backend.poison(())
-            self.poisoned = f"execution contract refused: {exc.code}"
+            self.poisoned = f"attention refused: {exc.code}"
             return {
                 "ok": False,
                 "code": exc.code,
@@ -1409,18 +1383,13 @@ class Executor:
         # fence are deleted whole (model-code-fit D12) — its only consumer was a fence the
         # planner had already disabled.
         self.plan = plan
-        self.attestation = (
-            execution_contract.Attestation([applied]) if applied is not None else None
-        )
+        self.attention = applied
         constructed_preimage = canonical.write(
             {
                 "plan_digest": plan.digest(),
                 # THE APPLIED CEILING, derived from the card (cl-027).
                 "resident_budget_bytes": resident_budget,
                 "execution_optimization": optimization.document() if optimization else None,
-                # THE CONTRACT enters the generation's identity (cr-109): demand and residency
-                # measured under 8-bit attention are keyed apart from the same bytes without it.
-                "execution_contract": contract.digest() if contract is not None else None,
                 "execution_fusion": fused.identity_document() if fused is not None else None,
             }
         )
@@ -1590,9 +1559,8 @@ class Executor:
             # `mixed(...)` as what it IS.
             "delivery": plan.wire_document(),
             "execution_optimization": optimization.document() if optimization else None,
-            # THE CONTRACT AS APPLIED (cr-109): digest, backend, the sites pinned per host. The
-            # kernel symbol lands here after the first attested call profiles it.
-            "execution_contract": applied.document() if applied is not None else None,
+            # WHAT THE RUNTIME PINNED (cr-123): kernel per component, and what it chose among.
+            "attention": applied.document() if applied is not None else None,
         }
         return {
             "ok": True,
@@ -1685,13 +1653,6 @@ class Executor:
             if child.residency is not None
         }
         self.residency = _CompositeResidency(residencies)
-        applied = [
-            row
-            for _, child, _ in children
-            if child.attestation is not None
-            for row in child.attestation.applied
-        ]
-        self.attestation = execution_contract.Attestation(applied) if applied else None
 
         constructed = [
             {"parameter": parameter, "digest": str(reply["constructed_model_digest"])}
@@ -1997,8 +1958,6 @@ class Executor:
             )
         if torch is not None:
             accel.reset_peak(torch, self.device_kind)
-        if self.attestation is not None:
-            self.attestation.open()
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
@@ -2045,7 +2004,6 @@ class Executor:
         # host frames, so `device_lease_ms` is device time and the encode is the worker's.
         lease_ms = (time.perf_counter() - lease_acquired) * 1000
         quiescent = self._quiescent() if torch is not None else True
-        attested = self.attestation.close() if self.attestation is not None else None
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
         # A typed refusal before handler entry leaves a Ready executor untouched. This is
@@ -2060,18 +2018,6 @@ class Executor:
             "fields": list(outcome.fields),
             "traceback": outcome.traceback,
         }
-        if attested is not None and attested["refusal"] and outcome.terminal == "succeeded":
-            # THE CONTRACT WAS NOT OBSERVED (cr-109). The handler returned, and the kernel the
-            # lane promises did not run the number of times the pinned sites predict, or ran
-            # under another scheme. A result computed by some other attention is not this
-            # lane's result, and the generation that let it happen is replaced.
-            terminal.update(
-                terminal="failed",
-                origin="runtime",
-                code="execution_contract_unobserved",
-                message=attested["refusal"][:2048],
-            )
-            self.poisoned = "execution_contract_unobserved"
         # THE RESIDENCY PLANE'S POISON IS THIS PROCESS'S POISON (#613). A mid-mutation
         # failure or an accounting violation there can fire BEFORE handler entry (admission
         # runs at scope enter), so the phase bit above cannot see it — and the transaction
@@ -2091,7 +2037,6 @@ class Executor:
             "attribution": record.attribution.document(),
             "position": record.position,
             "outcome": terminal,
-            "execution_contract": attested,
             "quiescent": quiescent,
             **_env_document(),
             "poisoned": self.poisoned,

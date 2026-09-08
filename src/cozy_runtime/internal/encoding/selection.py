@@ -651,8 +651,7 @@ class TensorCandidates:
     """The capability refusal, verbatim, if NO route qualified."""
     routes_offered: frozenset[str] = frozenset()
     """Every route this tensor's BYTES and SHAPE admit on some device, qualified here or
-    not. `by_route` minus this is what this card did not qualify — which is the fact a lane's
-    execution contract binds against (cr-109)."""
+    not. `by_route` minus this is what this card did not qualify."""
 
 
 class Selector:

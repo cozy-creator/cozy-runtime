@@ -93,13 +93,6 @@ _PREFERENCE: dict[str, tuple[str, ...]] = {
     "decode_floor": ("decoded_float", "verbatim", "encoded_gemm"),
 }
 
-#: The ONE policy a lane's execution contract admits for its bound `weights.route` (cr-109).
-_POLICY_FOR_ROUTE: dict[str, str] = {
-    "encoded_gemm": "encoded_gemm",
-    "decoded_float": "decode_floor",
-    "verbatim": "decode_floor",
-}
-
 
 def route_label(census: Mapping[str, int]) -> str:
     """A route census -> the plan's human-facing name. THE derivation, in one place.
@@ -599,14 +592,8 @@ def resolve(
     encoded_leaves: str = "refuse",
     steps_basis: int = 20,
     dtype_name: Any,
-    route: str = "",
 ) -> ResolvedModelPlan:
     """Offered variants + header rows + capability records + banked facts -> ONE plan.
-
-    `route` is a lane's execution contract binding (cr-109): when set, it names the ONLY
-    admitted policy, every tensor whose bytes admit that route must take it, and neither the
-    decode floor nor a differently-routed fallback is offered — a device that cannot serve
-    the contract refuses `execution_contract_unsupported` and the ladder's next rung serves it.
 
     `rows_for` is variant name -> that variant's header rows (`fill.PlanRow`-shaped:
     `.key`, `.component`, `.dtype`, `.shape`, `.encoded`). `dtype_name` maps a TensorFS dtype
@@ -679,16 +666,7 @@ def resolve(
             )
             continue
         seen: set[str] = set()
-        for policy in (_POLICY_FOR_ROUTE[route],) if route else POLICIES:
-            if route and policy == "encoded_gemm" and encoded_leaves != "accept":
-                raise PlanRefusal(
-                    "execution_contract_unsupported",
-                    f"the lane's execution contract binds weights.route={route!r} and the "
-                    f"package declares encoded_leaves={encoded_leaves!r}: a route that "
-                    "replaces the computing module needs the package's consent, and a "
-                    "contract lane is never served through the decode floor instead",
-                    walk,
-                )
+        for policy in POLICIES:
             if policy == "encoded_gemm" and encoded_leaves != "accept":
                 # THE CONSENT GATE, MOVED INTO RESOLUTION. It used to fire at `materialize`,
                 # with the plan already chosen and the package already imported; a plan the
@@ -718,8 +696,6 @@ def resolve(
                 steps_basis=steps_basis,
                 dtype_name=dtype_name,
             )
-            if route:
-                _require_route(plan, route, resolved_candidates, walk)
             digest = plan.digest()
             if digest in seen:
                 # The two policies COINCIDE whenever no tensor has a real choice, which is
@@ -771,26 +747,6 @@ def resolve(
                 )
             )
         return _replace(best, confession=confession, walk=tuple(walk))
-
-    if route:
-        # A CONTRACT LANE HAS ONE PLAN AND NO FLOOR TO FALL TO (cr-109). Unmeasured is the
-        # ordinary first-run state and is confessed, exactly as below; what is not offered is
-        # a differently-routed plan in its place.
-        bound = leaved.get(reference[0].name) or floors.get(reference[0].name)
-        if bound is not None:
-            for row in walk:
-                if row.get("plan") == bound.digest():
-                    row["verdict"] = "chosen_uncalibrated"
-            return _replace(
-                bound,
-                confession=(
-                    f"UNCALIBRATED: no offered plan has a banked {objective} measurement on "
-                    f"{device.tuple_key()}; the lane's execution contract binds "
-                    f"weights.route={route!r}, so resolution serves its {bound.label()} plan "
-                    "unmeasured and this prepare banks the facts a later resolution can rank"
-                ),
-                walk=tuple(walk),
-            )
 
     # NOTHING SCORED. This is the path the old design REFUSED on (`objective_unranked`) and
     # it is the ordinary state of a rig that has never run this plan: the deployment still
@@ -969,41 +925,6 @@ def _build(
         encoded_leaves=encoded_leaves,
         steps_basis=steps_basis,
     )
-
-
-def _require_route(
-    plan: ResolvedModelPlan,
-    route: str,
-    resolved: Sequence[tuple[Any, Any]],
-    walk: Sequence[Mapping[str, Any]],
-) -> None:
-    """A contract lane's route is BINDING (cr-109): every tensor whose bytes admit it takes it.
-
-    This is where today's floor confession would appear for a contract-less lane — a leaf the
-    device did not qualify quietly resolving to `decoded_float` — and a contract lane refuses
-    there instead, typed, naming the first tensor that was floored and why.
-    """
-    by_key = plan.by_key()
-    offered = [row.key for row, found in resolved if route in found.routes_offered]
-    if not offered:
-        raise PlanRefusal(
-            "execution_contract_unsupported",
-            f"the lane's execution contract binds weights.route={route!r} and no tensor of "
-            "this checkpoint stores bytes that route consumes",
-            walk,
-        )
-    floored = [key for key in offered if by_key[key].route != route]
-    if floored:
-        first = by_key[floored[0]]
-        raise PlanRefusal(
-            "execution_contract_unsupported",
-            f"the lane's execution contract binds weights.route={route!r}; on "
-            f"{device_line(plan.device)} {len(floored)} of {len(offered)} tensor(s) storing "
-            f"bytes for it resolved to {first.route!r} instead ({floored[0]}: "
-            f"{first.reason[:300]}). A contract lane is not served through the decode floor: "
-            "the ladder's next rung serves this device",
-            walk,
-        )
 
 
 def _prefer(by_route: Mapping[str, Selection], policy: str) -> Selection:
