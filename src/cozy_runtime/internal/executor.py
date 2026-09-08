@@ -1282,10 +1282,18 @@ class Executor:
                 else None
             )
             stage("execution_plan")
-            # THE CONTRACT'S KERNEL, PINNED POST-FILL (cr-109) on every diffusers model of the
-            # constructed pipeline, before any warm step: a warm dry step then attests it.
+            # THE CONTRACT'S KERNEL, PINNED POST-FILL (cr-109) on the components the contract
+            # GOVERNS (cr-122) — the ones whose tensors resolved on its own `weights.route`,
+            # read off the fill plane's component roots rather than guessed by walking the
+            # constructed object — before any warm step: a warm dry step then attests it.
             applied = (
-                execution_contract.apply(contract, kernel, model)
+                execution_contract.apply(
+                    contract,
+                    kernel,
+                    execution_contract.scope(
+                        contract, plan, {**backend.components, **backend.parked}
+                    ),
+                )
                 if contract is not None and kernel is not None
                 else None
             )
