@@ -319,8 +319,11 @@ def settle_frame(attempt: Attempt, handle: str) -> Asset:
 
 
 class Outputs(_Bound):
-    """Transactional outputs (`out`). Every save REGISTERS a pending handle and validates
-    its declared bounds; nothing is durable until the handler returns it (§3.4 step 1)."""
+    """Transactional outputs (``out``). Save registers a bounded pending handle.
+
+    Returning a saved value completes it with the invocation. ``await commit(file)``
+    completes an owned file earlier so the running caller can forward it.
+    """
 
     __slots__ = ()
 
