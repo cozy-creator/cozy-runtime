@@ -5,13 +5,11 @@ from __future__ import annotations
 import ast
 import builtins
 import importlib
-import tomllib
 from typing import Any, get_origin
 
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._loader import Loader
 from cozy_runtime.author._model import Model
-from cozy_runtime.author._weights import WeightsOutput
 
 
 class _ScriptSource(Model[object]):
@@ -58,43 +56,3 @@ def annotation(node: ast.expr, tree: ast.Module) -> Any:
 def parameter_type(node: ast.expr, tree: ast.Module) -> Any:
     value = annotation(node, tree)
     return _ScriptSource if value is Model or get_origin(value) is Model else value
-
-
-def declarations(raw: bytes) -> tuple[dict[str, str], tuple[WeightsOutput, ...]]:
-    block: list[str] = []
-    opened = found = False
-    for line in raw.decode("utf-8").splitlines():
-        if line == "# /// script":
-            if opened or found:
-                raise ValueError("multiple script metadata blocks")
-            opened = True
-        elif opened and line == "# ///":
-            opened, found = False, True
-        elif opened:
-            if not (line == "#" or line.startswith("# ")):
-                raise ValueError("script metadata must contain comment lines")
-            block.append(line[2:])
-    if opened:
-        raise ValueError("unclosed script metadata")
-    cozy = tomllib.loads("\n".join(block)).get("tool", {}).get("cozy", {})
-    if not isinstance(cozy, dict) or set(cozy) - {"models", "weights"}:
-        raise ValueError("script tool.cozy accepts models and weights only")
-    models = cozy.get("models", {})
-    weights = cozy.get("weights", {})
-    if not isinstance(models, dict) or any(
-        not name.isidentifier() or not isinstance(value, str) or not value
-        for name, value in models.items()
-    ):
-        raise ValueError("script models must map parameter names to default references")
-    if (
-        not isinstance(weights, dict)
-        or len(weights) > 16
-        or any(
-            not name.isidentifier() or type(value) is not int or not 0 < value <= (1 << 63) - 1
-            for name, value in weights.items()
-        )
-    ):
-        raise ValueError("script weights must map output names to finite positive byte limits")
-    return models, tuple(
-        WeightsOutput(name, max_new_bytes=limit) for name, limit in weights.items()
-    )
