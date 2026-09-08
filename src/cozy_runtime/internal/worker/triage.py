@@ -271,6 +271,16 @@ def explain(document: dict[str, Any]) -> list[str]:
         lines.append(f"fault     {fault.get('reason')}: {str(fault.get('detail', ''))[:200]}")
     for row in document.get("confessions", ()):
         lines.append(f"confessed {row.get('name')}: {row.get('value')}")
+    execution = document.get("plan", {}).get("execution") or {}
+    if execution:
+        lines.append(
+            f"execution {execution.get('scheme')}: {execution.get('entry')} "
+            f"x{execution.get('calls', '?')} of {execution.get('expected_calls', '?')} predicted "
+            f"via {execution.get('backend')}, kernel "
+            f"{execution.get('kernel_symbol') or 'unobserved'} "
+            f"{execution.get('kernel_self_ms', 0)} ms self"
+            + (f" — {execution['refusal']}" if execution.get("refusal") else "")
+        )
     for row in document.get("liveness", ()):
         if row.get("verdict"):
             lines.append(

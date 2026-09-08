@@ -270,6 +270,9 @@ class PreparedModel:
     """What the fill COMMITTED, measured. Distinct from the deployment's declared
     `model_weight_bytes` and from the ledger's live resident map — three different facts
     that were all called some form of "vram bytes"."""
+    execution_contract: dict[str, Any] = dataclasses.field(default_factory=dict)
+    """The lane's execution contract AS APPLIED by the prepare (cr-109): digest, backend,
+    pinned sites. Empty for a lane whose header carries no `execution` config."""
 
 
 @dataclass(frozen=True, slots=True)
