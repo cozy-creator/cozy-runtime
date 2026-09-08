@@ -10,6 +10,7 @@ the bound is over the tensor's range, not per element: `|fused - eager| <= 2^-6 
 (`_RANGE`). The mismatch FRACTION is the sharp criterion — a wrong table row, a wrong
 partner channel or a dropped rounding differs on ~50% of elements, not 1e-5.
 
+Imports are at the top and guarded (torch/triton/diffusers absent skips every card arm).
 The kernels are never compiled here: a session fixture builds the artifact for this card
 with `fusion_build` (the same command the worker image's build stage runs) and the loader
 resolves cubins from it; one arm proves `triton.compile` is never reached.
@@ -23,7 +24,6 @@ exercised on the real `_scaled_mm` route.
 from __future__ import annotations
 
 import json
-import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -32,22 +32,31 @@ import pytest
 
 from cozy_runtime.author import ConformanceError, Model
 from cozy_runtime.internal import fusion, fusion_build, fusion_install
+from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf, quantize_activation_rowwise
+
+try:
+    import torch
+    import triton
+    from diffusers import MiniMaxH3Transformer3DModel
+    from diffusers.models.transformers.transformer_minimax_h3 import (
+        MiniMaxH3RotaryPosEmbed,
+        _apply_rotary_emb,
+    )
+    from triton.compiler import compiler
+    from triton.runtime.cache import get_cache_manager
+except ImportError as _absent:
+    CARD_ABSENT = f"torch, triton and diffusers must be importable: {_absent}"
+else:
+    CARD_ABSENT = ""
 
 
 def _card() -> str:
-    try:
-        import torch
-    except ImportError as exc:
-        return f"torch must be importable: {exc}"
+    if CARD_ABSENT:
+        return CARD_ABSENT
     if not torch.cuda.is_available():
         return "a CUDA device is required"
     if torch.cuda.get_device_capability()[0] < 8:
         return "the fused glue needs sm80+"
-    try:
-        import diffusers  # noqa: F401
-        import triton  # noqa: F401
-    except ImportError as exc:
-        return f"diffusers and triton must be importable: {exc}"
     return ""
 
 
@@ -61,8 +70,6 @@ EPS = 1e-5
 
 
 def _arch() -> int:
-    import torch
-
     major, minor = torch.cuda.get_device_capability()
     return int(major) * 10 + int(minor)
 
@@ -91,8 +98,6 @@ def _no_grad(artifact: Path) -> Iterator[None]:
     if NO_CARD:
         yield
         return
-    import torch
-
     _point_loader_at(artifact)
     with torch.no_grad():
         yield
@@ -115,10 +120,6 @@ def _tables(torch: Any, rows: int, device: Any) -> tuple[Any, ...]:
 @needs_card
 @pytest.mark.parametrize("batch", [1, 2])
 def test_row_kernels_match_eager(batch: int) -> None:
-    import torch
-
-    from cozy_runtime.internal.encoding.leaves import quantize_activation_rowwise
-
     torch.manual_seed(20260907)
     device, seq, rows = torch.device("cuda"), 1024, 9
     x = (2 * torch.randn(batch, seq, HIDDEN, device=device)).to(torch.bfloat16)
@@ -167,12 +168,6 @@ def test_row_kernels_match_eager(batch: int) -> None:
 @needs_card
 @pytest.mark.parametrize("batch", [1, 2])
 def test_rope_kernel_matches_eager(batch: int) -> None:
-    import torch
-    from diffusers.models.transformers.transformer_minimax_h3 import (
-        MiniMaxH3RotaryPosEmbed,
-        _apply_rotary_emb,
-    )
-
     torch.manual_seed(20260907)
     device, seq = torch.device("cuda"), 512
     query = torch.randn(batch, seq, HEADS, HEAD_DIM, device=device).to(torch.bfloat16)
@@ -195,8 +190,6 @@ class _Holder:
 
 
 def _one_block_transformer(torch: Any, device: Any) -> Any:
-    from diffusers import MiniMaxH3Transformer3DModel
-
     transformer = MiniMaxH3Transformer3DModel(num_layers=1, num_refiner_layers=1)
     with torch.no_grad():
         for parameter in transformer.parameters():
@@ -233,8 +226,6 @@ def _packed_inputs(torch: Any, device: Any, seq: int) -> dict[str, Any]:
 
 def _encode_leaves(torch: Any, transformer: Any) -> int:
     """Stand the block's six Linears in as `fp8-rowwise/1` leaves, the fill's own way."""
-    from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf
-
     provider = RowwiseNativeLeaf(encoding="fp8-rowwise/1")
     block = transformer.transformer_blocks[0]
     sites = {
@@ -262,8 +253,6 @@ def _encode_leaves(torch: Any, transformer: Any) -> int:
 @needs_card
 @pytest.mark.parametrize("encoded", [False, True])
 def test_installed_block_matches_eager_transformer(encoded: bool) -> None:
-    import torch
-
     device = torch.device("cuda")
     transformer = _one_block_transformer(torch, device)
     if encoded:
@@ -298,10 +287,6 @@ def test_installed_block_matches_eager_transformer(encoded: bool) -> None:
 @needs_card
 def test_loader_never_compiles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A fresh cache scope, `triton.compile` armed to fail: load and launch every entry."""
-    import torch
-    import triton
-    from triton.compiler import compiler
-    from triton.runtime.cache import get_cache_manager
 
     def refuse(*args: object, **kwargs: object) -> object:
         raise AssertionError("the runtime reached triton.compile")
@@ -322,8 +307,6 @@ def test_loader_never_compiles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
 
 @needs_card
 def test_artifact_absent_or_stale_refuses_typed(tmp_path: Path, artifact: Path) -> None:
-    import torch
-
     device = torch.device("cuda")
     _point_loader_at(tmp_path)
     with pytest.raises(fusion.FusionUnavailable) as absent:
@@ -365,8 +348,6 @@ def test_build_is_deterministic() -> None:
 
 @needs_card
 def test_source_drift_refuses_before_any_substitution(monkeypatch: pytest.MonkeyPatch) -> None:
-    import torch
-
     device = torch.device("cuda")
     transformer = _one_block_transformer(torch, device)
     was = type(transformer.transformer_blocks[0])
@@ -379,12 +360,9 @@ def test_source_drift_refuses_before_any_substitution(monkeypatch: pytest.Monkey
 
 @needs_card
 def test_absent_triton_refuses_typed(monkeypatch: pytest.MonkeyPatch) -> None:
-    import torch
-
     device = torch.device("cuda")
-    monkeypatch.delattr(fusion._kernels, "_cached", raising=False)
     monkeypatch.setattr(fusion.load, "_cached", {}, raising=False)
-    monkeypatch.setitem(sys.modules, "triton", None)
+    monkeypatch.setattr(fusion, "TRITON_ABSENT", "triton does not import (planted)")
     with pytest.raises(fusion_install.FusionRefusal) as refused:
         fusion_install.apply_fusion_plan(
             _Holder(_one_block_transformer(torch, device)), torch=torch, device=device

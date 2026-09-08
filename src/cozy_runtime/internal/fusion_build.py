@@ -9,12 +9,12 @@ Triton's own launcher module for this platform, into one directory:
     <out>/utils/<key>/cuda_utils.*.so Triton's launcher module
 
 The worker image's cu130 build stage runs this after installing the runtime wheel, into
-the package's own `_kernels/fusion` (the default `--out`), so a pod loads and never
-compiles. A developer runs the same command once per box for their card. `--check`
-rebuilds into a scratch directory and proves the build is deterministic and that the
-loader's key recomputation matches — what CI runs, with no GPU. `--verify` proves an
-existing artifact (the image's `/opt/cozy/fusion`) matches the installed runtime — what
-the image build asserts after copying it in, also with no GPU.
+`/out/fusion` (copied to `/opt/cozy/fusion`), so a pod loads and never compiles. A
+developer runs the same command once per box for their card (the default `--out` is the
+installed package's own `_kernels/fusion`). `--check` rebuilds into a scratch directory and
+proves the build is deterministic and that the loader's key recomputation matches — what
+CI runs, with no GPU. `--verify` proves an existing artifact matches the installed runtime
+— what the image build asserts after copying it in, also with no GPU.
 """
 
 from __future__ import annotations
@@ -29,6 +29,12 @@ from typing import Any
 
 from cozy_runtime.internal import fusion
 
+try:
+    import triton
+    from triton.backends.compiler import GPUTarget
+except ImportError:  # pragma: no cover - `fusion.TRITON_ABSENT` names it
+    pass
+
 
 def build(out: Path, archs: tuple[int, ...], *, utils: bool = True) -> dict[str, Any]:
     """Compile the artifact into `out` (replacing it) and return its manifest.
@@ -36,10 +42,8 @@ def build(out: Path, archs: tuple[int, ...], *, utils: bool = True) -> dict[str,
     `utils=False` skips Triton's launcher module, which links against the host's
     `libcuda.so.1`: a driverless CI runner can still prove the cubins.
     """
-    import triton
-    from triton.backends.compiler import GPUTarget
-    from triton.runtime.cache import get_cache_manager
-
+    if fusion.TRITON_ABSENT:
+        raise SystemExit(f"fusion_build: {fusion.TRITON_ABSENT}")
     if triton.__version__ != fusion.TRITON_VERSION:
         raise SystemExit(
             f"fusion_build: triton {triton.__version__} != pinned {fusion.TRITON_VERSION}"
@@ -49,7 +53,7 @@ def build(out: Path, archs: tuple[int, ...], *, utils: bool = True) -> dict[str,
     out.mkdir(parents=True)
     targets: dict[str, dict[str, str]] = {}
     with tempfile.TemporaryDirectory(prefix="cozy-fusion-build-") as scratch:
-        triton.knobs.cache.dir = scratch  # Triton's own cache goes to scratch, not the box's
+        triton.knobs.cache.dir = scratch  # Triton's own cache goes to scratch
         for arch in archs:
             entries: dict[str, str] = {}
             for profile in fusion.PROFILES.values():
@@ -73,10 +77,7 @@ def build(out: Path, archs: tuple[int, ...], *, utils: bool = True) -> dict[str,
             targets[f"sm{arch}"] = entries
         utils_key = fusion.utils_key()
         if utils:
-            from triton.backends.nvidia.driver import CudaUtils
-
-            CudaUtils()  # compiles Triton's launcher module into the scratch cache
-            built = Path(get_cache_manager(utils_key).cache_dir)
+            built = fusion.build_utils()
             destination = out / "utils" / utils_key
             destination.mkdir(parents=True)
             for path in built.iterdir():

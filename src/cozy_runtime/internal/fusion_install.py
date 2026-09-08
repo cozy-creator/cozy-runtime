@@ -14,7 +14,10 @@ its operand directly (`leaves.PreQuantized`); any other consumer gets bf16.
 The package consents on its class (`fusion="accept"`), and the executor applies this plan
 only under that consent. A CUDA device whose built kernels are absent or stale is a typed
 refusal (`fusion_kernels_absent` / `fusion_kernels_stale`, from `fusion.load`), as is a
-missing Triton; a non-CUDA device is recorded as not applicable.
+missing Triton or diffusers; a non-CUDA device is recorded as not applicable.
+
+Executor-only, like `fusion.py`: diffusers is imported at the top, guarded, and its absence
+is the typed `fusion_dependency_absent`.
 """
 
 from __future__ import annotations
@@ -28,6 +31,21 @@ from importlib import metadata
 from typing import Any
 
 from cozy_runtime.internal import fusion
+
+try:
+    from diffusers.models.activations import SwiGLU
+    from diffusers.models.attention import FeedForward
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+    from diffusers.models.transformers.transformer_minimax_h3 import (
+        MiniMaxH3AttnProcessor,
+        MiniMaxH3Transformer3DModel,
+        MiniMaxH3TransformerBlock,
+        _apply_rotary_emb,
+    )
+except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal
+    DIFFUSERS_ABSENT = f"diffusers does not import ({_absent})"
+else:
+    DIFFUSERS_ABSENT = ""
 
 DIFFUSERS_VERSION = "0.40.0"
 _SOURCE_DIGESTS = {
@@ -96,7 +114,7 @@ def _source_digest(value: Callable[..., object]) -> str:
 def identity() -> str:
     document = {
         "diffusers": DIFFUSERS_VERSION,
-        "kernels": _source_digest(fusion._kernels),
+        "kernels": fusion.source_digest() if not fusion.TRITON_ABSENT else "",
         "plan": "h3-glue-fusion/1",
         "sources": _SOURCE_DIGESTS,
     }
@@ -109,7 +127,9 @@ def identity() -> str:
     )
 
 
-def _require_sources() -> dict[str, Any]:
+def _require_sources() -> None:
+    if DIFFUSERS_ABSENT:
+        raise FusionRefusal("fusion_dependency_absent", DIFFUSERS_ABSENT)
     try:
         installed = metadata.version("diffusers")
     except metadata.PackageNotFoundError as exc:
@@ -121,15 +141,12 @@ def _require_sources() -> dict[str, Any]:
             "fusion_dependency_mismatch",
             f"the fused glue plan pins diffusers=={DIFFUSERS_VERSION}, found {installed}",
         )
-    from diffusers.models import activations, attention
-    from diffusers.models.transformers import transformer_minimax_h3 as h3
-
     sources: dict[str, Callable[..., object]] = {
-        "MiniMaxH3TransformerBlock.forward": h3.MiniMaxH3TransformerBlock.forward,
-        "MiniMaxH3AttnProcessor.__call__": h3.MiniMaxH3AttnProcessor.__call__,
-        "_apply_rotary_emb": h3._apply_rotary_emb,
-        "SwiGLU.forward": activations.SwiGLU.forward,
-        "FeedForward.forward": attention.FeedForward.forward,
+        "MiniMaxH3TransformerBlock.forward": MiniMaxH3TransformerBlock.forward,
+        "MiniMaxH3AttnProcessor.__call__": MiniMaxH3AttnProcessor.__call__,
+        "_apply_rotary_emb": _apply_rotary_emb,
+        "SwiGLU.forward": SwiGLU.forward,
+        "FeedForward.forward": FeedForward.forward,
     }
     for name, source in sources.items():
         actual = _source_digest(source)
@@ -139,28 +156,19 @@ def _require_sources() -> dict[str, Any]:
                 f"{name} has source sha256:{actual}, expected sha256:{_SOURCE_DIGESTS[name]}; "
                 "refusing to fuse beside a diffusers source the kernels were not matched to",
             )
-    return {"h3": h3, "activations": activations, "attention": attention}
 
 
 # ------------------------------------------------------------------ fused modules
 
+if not DIFFUSERS_ABSENT:
 
-def _fused_classes(modules: dict[str, Any]) -> dict[str, type]:
-    """The fused subclasses, built once against the exact diffusers classes they replace."""
-    cached = getattr(_fused_classes, "_cached", None)
-    if cached is not None:
-        return cached  # type: ignore[no-any-return]
-    from diffusers.models.attention_dispatch import dispatch_attention_fn
-
-    h3, activations = modules["h3"], modules["activations"]
-
-    class FusedSwiGLU(activations.SwiGLU):  # type: ignore[misc, name-defined]
+    class FusedSwiGLU(SwiGLU):  # type: ignore[misc]
         _fusion_fp8: bool = False
 
         def forward(self, hidden_states: Any) -> Any:
             return fusion.swiglu(self.proj(hidden_states), fp8=self._fusion_fp8)
 
-    class FusedMiniMaxH3AttnProcessor(h3.MiniMaxH3AttnProcessor):  # type: ignore[misc, name-defined]
+    class FusedMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):  # type: ignore[misc]
         def __call__(
             self,
             attn: Any,
@@ -190,7 +198,7 @@ def _fused_classes(modules: dict[str, Any]) -> dict[str, type]:
             hidden_states = hidden_states.flatten(2, 3).type_as(query)
             return attn.to_out[1](attn.to_out[0](hidden_states))
 
-    class FusedMiniMaxH3TransformerBlock(h3.MiniMaxH3TransformerBlock):  # type: ignore[misc, name-defined]
+    class FusedMiniMaxH3TransformerBlock(MiniMaxH3TransformerBlock):  # type: ignore[misc]
         _fusion_attn_fp8: bool = False
         _fusion_ff_fp8: bool = False
 
@@ -229,16 +237,6 @@ def _fused_classes(modules: dict[str, Any]) -> dict[str, type]:
             ff_output = self.ff.net[2](self.ff.net[0](normed))
             return fusion.gate_add(hidden_states, gate_mlp, ff_output, adaln_indices)
 
-    classes: dict[str, type] = {
-        "SwiGLU": FusedSwiGLU,
-        "MiniMaxH3AttnProcessor": FusedMiniMaxH3AttnProcessor,
-        "MiniMaxH3TransformerBlock": FusedMiniMaxH3TransformerBlock,
-    }
-    for cls in classes.values():
-        cls.__qualname__ = cls.__name__  # the substitution record names classes, not closures
-    _fused_classes._cached = classes  # type: ignore[attr-defined]
-    return classes
-
 
 # ------------------------------------------------------------------------ install
 
@@ -262,12 +260,9 @@ def _shape(condition: bool, detail: str) -> None:
         raise FusionRefusal("fusion_block_shape", detail)
 
 
-def _install_transformer(
-    transformer: Any, root: str, modules: dict[str, Any], fused: dict[str, type]
-) -> tuple[list[tuple[str, str, str]], int]:
-    h3, activations, attention = modules["h3"], modules["activations"], modules["attention"]
+def _install_transformer(transformer: Any, root: str) -> tuple[list[tuple[str, str, str]], int]:
     _shape(
-        type(transformer).forward is h3.MiniMaxH3Transformer3DModel.forward,
+        type(transformer).forward is MiniMaxH3Transformer3DModel.forward,
         f"{root}: {_type_name(transformer)} overrides the Diffusers MiniMax-H3 forward",
     )
     substitutions: list[tuple[str, str, str]] = []
@@ -276,12 +271,12 @@ def _install_transformer(
         path = f"{root}.transformer_blocks.{index}"
         attn, ff = block.attn, block.ff
         _shape(
-            type(block) is h3.MiniMaxH3TransformerBlock
-            and type(attn.processor) is h3.MiniMaxH3AttnProcessor
+            type(block) is MiniMaxH3TransformerBlock
+            and type(attn.processor) is MiniMaxH3AttnProcessor
             and not attn.fused_projections
-            and type(ff) is attention.FeedForward
+            and type(ff) is FeedForward
             and len(ff.net) == 3
-            and type(ff.net[0]) is activations.SwiGLU
+            and type(ff.net[0]) is SwiGLU
             and type(ff.net[1]).__name__ == "Dropout"
             and ff.net[1].p == 0.0
             and block.norm1.weight is not None
@@ -296,7 +291,7 @@ def _install_transformer(
         out_fp8 = _rowwise_leaf(ff.net[2])
         fp8_sites += attn_fp8 + ff_fp8 + out_fp8
 
-        processor = fused["MiniMaxH3AttnProcessor"]()
+        processor = FusedMiniMaxH3AttnProcessor()
         processor._attention_backend = attn.processor._attention_backend
         processor._parallel_config = attn.processor._parallel_config
         substitutions.append(
@@ -304,22 +299,18 @@ def _install_transformer(
         )
         attn.set_processor(processor)
 
-        substitutions.append(
-            (f"{path}.ff.net.0", _type_name(ff.net[0]), _type_name(fused["SwiGLU"]))
-        )
-        ff.net[0].__class__ = fused["SwiGLU"]
+        substitutions.append((f"{path}.ff.net.0", _type_name(ff.net[0]), _type_name(FusedSwiGLU)))
+        ff.net[0].__class__ = FusedSwiGLU
         ff.net[0]._fusion_fp8 = out_fp8
 
-        substitutions.append(
-            (path, _type_name(block), _type_name(fused["MiniMaxH3TransformerBlock"]))
-        )
-        block.__class__ = fused["MiniMaxH3TransformerBlock"]
+        substitutions.append((path, _type_name(block), _type_name(FusedMiniMaxH3TransformerBlock)))
+        block.__class__ = FusedMiniMaxH3TransformerBlock
         block._fusion_attn_fp8 = attn_fp8
         block._fusion_ff_fp8 = ff_fp8
     return substitutions, fp8_sites
 
 
-def _transformers(model: object, h3: Any) -> Iterator[tuple[str, Any]]:
+def _transformers(model: object) -> Iterator[tuple[str, Any]]:
     """Every MiniMax-H3 transformer root the model holds, by component name.
 
     The loader's census reads component roots from a constructed object's `components`
@@ -331,7 +322,7 @@ def _transformers(model: object, h3: Any) -> Iterator[tuple[str, Any]]:
         table = getattr(value, "components", None)
         roots = table.items() if isinstance(table, Mapping) else ((attribute, value),)
         for name, member in roots:
-            if isinstance(member, h3.MiniMaxH3Transformer3DModel) and id(member) not in seen:
+            if isinstance(member, MiniMaxH3Transformer3DModel) and id(member) not in seen:
                 seen.add(id(member))
                 yield str(name), member
 
@@ -349,9 +340,9 @@ def capability_refusal(torch: Any, device: Any) -> str:
 def apply_fusion_plan(model: object, *, torch: Any, device: Any) -> AppliedFusion:
     """Install the fused glue on every H3 transformer the model holds, or refuse typed.
 
-    Called under the package's `fusion="accept"` only. Absent Triton on a capable CUDA
-    device is `FusionRefusal(fusion_triton_absent)`; an incapable device returns a record
-    that says why nothing was installed.
+    Called under the package's `fusion="accept"` only. Absent Triton or built kernels on
+    a capable CUDA device is a `FusionRefusal` with the loader's code; an incapable device
+    returns a record that says why nothing was installed.
     """
     reason = capability_refusal(torch, device)
     if reason:
@@ -360,14 +351,13 @@ def apply_fusion_plan(model: object, *, torch: Any, device: Any) -> AppliedFusio
         fusion.load(device)
     except fusion.FusionUnavailable as exc:
         raise FusionRefusal(exc.code, str(exc)) from exc
-    modules = _require_sources()
-    fused = _fused_classes(modules)
+    _require_sources()
     substitutions: list[tuple[str, str, str]] = []
     fp8_sites = 0
     warm_ms = 0.0
-    for name, transformer in _transformers(model, modules["h3"]):
+    for name, transformer in _transformers(model):
         before = _tensor_census(transformer)
-        installed, sites = _install_transformer(transformer, name, modules, fused)
+        installed, sites = _install_transformer(transformer, name)
         if _tensor_census(transformer) != before:
             raise FusionRefusal(
                 "fusion_tensor_schema_changed",

@@ -15,20 +15,22 @@ the row variance), and those elements are the whole distance between fused and e
 
 NOTHING COMPILES AT RUNTIME. The `@triton.jit` functions below are the kernel SOURCES;
 `fusion_build.py` compiles every (kernel, constexpr signature) x architecture ahead of
-time — in the worker image's build stage, or once on a developer's box — into
-`KERNELS_DIR`, a plain directory of Triton cache entries plus a manifest. `load()` resolves
-each spec to its cubin by recomputing Triton's own cache key from the sources, the pinned
-Triton and the device architecture, and refuses typed (`fusion_kernels_absent` /
-`fusion_kernels_stale`) when the artifact does not hold exactly that key. The key covers
-kernel source, signature and architecture only: a LoRA, a component swap, a step count or
-a reference count cannot invalidate it, because none of them enters the kernel.
+time — in the worker image's build stage, or once on a developer's box — into a plain
+directory of Triton cache entries plus a manifest. `load()` resolves each spec to its cubin
+by recomputing Triton's own cache key from the sources, the pinned Triton and the device
+architecture, and refuses typed (`fusion_kernels_absent` / `fusion_kernels_stale`) when the
+artifact does not hold exactly that key. The key covers kernel source (including the
+kernel's line position in this file), signature and architecture only: a LoRA, a component
+swap, a step count or a reference count cannot invalidate it, because none of them enters
+the kernel.
 
 Adapted from NVlabs/Sana `sol-engine` `models/minimax_h3/{GB200,GB10}/fusions.py`
 (Apache-2.0): the per-row program shape, the table-row gather inside the kernel, the
 partner-channel RoPE and the integer-domain bf16 rounding are theirs.
 
-Triton is imported inside functions only: the runtime package stays torch- and
-triton-free at import, and a missing Triton is a typed `FusionUnavailable`.
+This module is EXECUTOR-ONLY: torch and Triton are imported at the top, guarded, and a
+missing Triton is a typed `FusionUnavailable` at first use, never a silent fallback. The
+torch-free runtime package never imports it (`checks/architecture.py::torch-free-import`).
 """
 
 from __future__ import annotations
@@ -37,11 +39,39 @@ import hashlib
 import inspect
 import json
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal.encoding.leaves import PreQuantized
+
+try:
+    import torch
+except ImportError as _absent:  # pragma: no cover - the executor always has torch
+    TORCH_ABSENT = f"torch does not import ({_absent})"
+else:
+    TORCH_ABSENT = ""
+
+try:
+    import triton
+    import triton.language as tl
+    from triton.backends.compiler import GPUTarget
+    from triton.backends.nvidia.driver import CudaUtils
+    from triton.backends.nvidia.driver import __file__ as _driver_file
+    from triton.compiler import ASTSource
+    from triton.compiler.compiler import (
+        CompiledKernel,
+        get_cache_invalidating_env_vars,
+        make_backend,
+    )
+    from triton.language.extra import libdevice
+    from triton.runtime.build import platform_key
+    from triton.runtime.cache import get_cache_key, get_cache_manager
+except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal arm
+    TRITON_ABSENT = f"triton does not import ({_absent})"
+else:
+    TRITON_ABSENT = ""
 
 #: Where the built artifact lives, two fixed locations and no path configuration: a
 #: developer builds into the installed package (beside `_C.abi3.so`); the worker image's
@@ -72,6 +102,16 @@ class FusionUnavailable(RuntimeError):
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)
         self.code = code
+
+
+def _require_triton() -> None:
+    if TRITON_ABSENT:
+        raise FusionUnavailable("fusion_triton_absent", TRITON_ABSENT)
+
+
+def _require_torch() -> None:
+    if TORCH_ABSENT:
+        raise FusionUnavailable("fusion_triton_absent", TORCH_ABSENT)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,30 +244,7 @@ def specs(*, hidden: int, ffn: int, head_dim: int, rotary: int) -> tuple[Spec, .
 
 # ------------------------------------------------------------------- kernel sources
 
-
-@dataclass(frozen=True, slots=True)
-class _Sources:
-    norm_mod: Any
-    gate_add: Any
-    swiglu: Any
-    rope_norm: Any
-    triton: Any
-
-    def __getitem__(self, name: str) -> Any:
-        return getattr(self, name)
-
-
-def _kernels() -> _Sources:
-    """The kernel sources, as Triton JIT objects (compiled only by `fusion_build`)."""
-    cached = getattr(_kernels, "_cached", None)
-    if cached is not None:
-        return cached  # type: ignore[no-any-return]
-    try:
-        import triton
-        import triton.language as tl
-        from triton.language.extra import libdevice
-    except Exception as exc:
-        raise FusionUnavailable("fusion_triton_absent", f"triton does not import ({exc})") from exc
+if not TRITON_ABSENT:
 
     @triton.jit
     def _rb(x):  # type: ignore[no-untyped-def]
@@ -245,7 +262,7 @@ def _kernels() -> _Sources:
         )
 
     @triton.jit  # type: ignore[untyped-decorator]
-    def norm_mod(  # type: ignore[no-untyped-def]
+    def _norm_mod_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         branch_ptr,
         gate_ptr,
@@ -292,7 +309,7 @@ def _kernels() -> _Sources:
             tl.store(out_ptr + offset, out.to(tl.bfloat16), mask=mask)
 
     @triton.jit  # type: ignore[untyped-decorator]
-    def gate_add(  # type: ignore[no-untyped-def]
+    def _gate_add_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         branch_ptr,
         gate_ptr,
@@ -323,7 +340,7 @@ def _kernels() -> _Sources:
         return _rb(value * activated)
 
     @triton.jit  # type: ignore[untyped-decorator]
-    def swiglu(  # type: ignore[no-untyped-def]
+    def _swiglu_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         out_ptr,
         scale_out_ptr,
@@ -361,7 +378,7 @@ def _kernels() -> _Sources:
                 )
 
     @triton.jit  # type: ignore[untyped-decorator]
-    def rope_norm(  # type: ignore[no-untyped-def]
+    def _rope_norm_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         out_ptr,
         weight_ptr,
@@ -403,14 +420,31 @@ def _kernels() -> _Sources:
         out = tl.where(rotating, turned, normed)
         tl.store(out_ptr + base + chan, out.to(tl.bfloat16), mask=mask)
 
-    sources = _Sources(norm_mod, gate_add, swiglu, rope_norm, triton)
-    _kernels._cached = sources  # type: ignore[attr-defined]
-    return sources
+    _KERNELS: dict[str, Any] = {
+        "norm_mod": _norm_mod_kernel,
+        "gate_add": _gate_add_kernel,
+        "swiglu": _swiglu_kernel,
+        "rope_norm": _rope_norm_kernel,
+    }
+    _SOURCES: tuple[Any, ...] = (
+        _rb,
+        _e4m3,
+        _silu_product,
+        _norm_mod_kernel,
+        _gate_add_kernel,
+        _swiglu_kernel,
+        _rope_norm_kernel,
+    )
+else:  # pragma: no cover
+    _KERNELS = {}
+    _SOURCES = ()
 
 
 def source_digest() -> str:
     """The kernel sources' identity, as the manifest and the artifact key record it."""
-    return hashlib.sha256(inspect.getsource(_kernels).encode()).hexdigest()
+    _require_triton()
+    text = "\n".join(inspect.getsource(fn.fn) for fn in _SOURCES)
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 # ------------------------------------------------------------------ artifact keys
@@ -418,9 +452,8 @@ def source_digest() -> str:
 
 def ast_source(spec: Spec) -> Any:
     """The exact Triton `ASTSource` a spec compiles from — builder and loader share it."""
-    from triton.compiler import ASTSource
-
-    fn = _kernels()[spec.kernel]
+    _require_triton()
+    fn = _KERNELS[spec.kernel]
     attrs = {(fn.arg_names.index(name),): [["tt.divisibility", 16]] for name in spec.aligned}
     return ASTSource(fn, dict(spec.signature), constexprs=dict(spec.constexprs), attrs=attrs)
 
@@ -429,9 +462,6 @@ def _backend(arch: int) -> Any:
     """One compiler backend per architecture: constructing one runs `ptxas --version`."""
     backends: dict[int, Any] = getattr(_backend, "_cached", {})
     if arch not in backends:
-        from triton.backends.compiler import GPUTarget
-        from triton.compiler.compiler import make_backend
-
         backends[arch] = make_backend(GPUTarget("cuda", arch, WARP_SIZE))
         _backend._cached = backends  # type: ignore[attr-defined]
     return backends[arch]
@@ -439,9 +469,6 @@ def _backend(arch: int) -> Any:
 
 def cache_key(spec: Spec, arch: int) -> str:
     """Triton's own cache hash for (sources, signature, architecture, options, Triton)."""
-    from triton.compiler.compiler import get_cache_invalidating_env_vars
-    from triton.runtime.cache import get_cache_key
-
     backend = _backend(arch)
     options = backend.parse_options({"num_warps": spec.num_warps})
     key = get_cache_key(ast_source(spec), backend, options, get_cache_invalidating_env_vars())
@@ -450,11 +477,16 @@ def cache_key(spec: Spec, arch: int) -> str:
 
 def utils_key() -> str:
     """The cache key of Triton's launcher module (`cuda_utils`), platform-bound."""
-    from triton.backends.nvidia import driver
-    from triton.runtime.build import platform_key
-
-    source = (Path(driver.__file__).parent / "driver.c").read_text()
+    _require_triton()
+    source = (Path(_driver_file).parent / "driver.c").read_text()
     return hashlib.sha256((source + platform_key()).encode("utf-8")).hexdigest()
+
+
+def build_utils() -> Path:
+    """Compile Triton's launcher module into the current cache scope; its entry directory."""
+    _require_triton()
+    CudaUtils()
+    return Path(get_cache_manager(utils_key()).cache_dir)
 
 
 # ------------------------------------------------------------------------- loader
@@ -464,7 +496,6 @@ def utils_key() -> str:
 class _Loaded:
     arch: int
     compiled: dict[str, Any]
-    triton: Any
 
     def launch(self, kernel: str, **constexprs: int) -> Any:
         key = f"{kernel}[" + ",".join(f"{k}={v}" for k, v in constexprs.items()) + "]"
@@ -498,13 +529,13 @@ def check_artifact(directory: Path, arch: int) -> dict[str, Any]:
     Every spec's key is recomputed and must equal the artifact's; the image build asserts
     this after copying the artifact in, and `load` runs it before touching the device.
     """
+    _require_triton()
     path = directory / MANIFEST
     if not path.is_file():
         raise FusionUnavailable("fusion_kernels_absent", f"no fused-kernel artifact at {directory}")
     manifest = json.loads(path.read_text())
     if not isinstance(manifest, dict):
         raise FusionUnavailable("fusion_kernels_stale", f"{path} is not a manifest object")
-    triton = _kernels().triton
     if triton.__version__ != TRITON_VERSION:
         raise FusionUnavailable(
             "fusion_kernels_stale",
@@ -539,7 +570,8 @@ def check_artifact(directory: Path, arch: int) -> dict[str, Any]:
                     f"this runtime's key is {expected[:12]} — the artifact was built from other "
                     "sources",
                 )
-            if not (directory / f"sm{arch}" / expected / f"{spec.kernel}.json").is_file():
+            entry_file = f"{_KERNELS[spec.kernel].__name__}.json"
+            if not (directory / f"sm{arch}" / expected / entry_file).is_file():
                 raise FusionUnavailable(
                     "fusion_kernels_absent", f"{spec.key} for sm{arch}: entry files are missing"
                 )
@@ -553,8 +585,8 @@ def load(device: Any, directory: Path | None = None) -> _Loaded:
     Triton cache scope so Triton itself never compiles it either, then constructs each
     `CompiledKernel` from the artifact's files and loads its cubin onto the device.
     """
-    import torch
-
+    _require_triton()
+    _require_torch()
     loaded: dict[int, _Loaded] = getattr(load, "_cached", {})
     index = torch.device(device).index or 0
     if index in loaded:
@@ -563,10 +595,7 @@ def load(device: Any, directory: Path | None = None) -> _Loaded:
     major, minor = torch.cuda.get_device_capability(index)
     arch = major * 10 + minor
     manifest = check_artifact(directory, arch)
-    triton = _kernels().triton
-    _place_utils(directory, manifest, triton)
-    from triton.compiler.compiler import CompiledKernel
-
+    _place_utils(directory, manifest)
     compiled: dict[str, Any] = {}
     for profile in PROFILES.values():
         for spec in specs(**profile):
@@ -581,16 +610,14 @@ def load(device: Any, directory: Path | None = None) -> _Loaded:
                     "fusion_kernels_absent", f"{spec.key} does not load on sm{arch}: {exc}"
                 ) from exc
             compiled[spec.key] = kernel
-    result = _Loaded(arch, compiled, triton)
+    result = _Loaded(arch, compiled)
     loaded[index] = result
     load._cached = loaded  # type: ignore[attr-defined]
     return result
 
 
-def _place_utils(directory: Path, manifest: dict[str, Any], triton: Any) -> None:
+def _place_utils(directory: Path, manifest: dict[str, Any]) -> None:
     """Triton's launcher module goes into the imposed cache scope before the driver wakes."""
-    from triton.runtime.cache import get_cache_manager
-
     key = str(manifest["utils"])
     target = Path(get_cache_manager(key).cache_dir)
     source = directory / "utils" / key
@@ -622,7 +649,7 @@ def _table(t: Any) -> Any:
     return t if t.stride(-1) == 1 else t.contiguous()
 
 
-def _require(x: Any, torch: Any) -> _Loaded:
+def _require(x: Any) -> _Loaded:
     if x.dtype is not torch.bfloat16 or not x.is_cuda:
         raise FusionUnavailable(
             "fusion_block_shape",
@@ -642,9 +669,7 @@ def _launch_norm_mod(
     eps: float,
     fp8: bool,
 ) -> tuple[Any, Any, Any]:
-    import torch
-
-    loaded = _require(x, torch)
+    loaded = _require(x)
     width = int(x.shape[-1])
     rows = _rows(x, width)
     n = int(rows.shape[0])
@@ -724,9 +749,7 @@ def gate_add_rmsnorm_modulate(
 
 def gate_add(residual: Any, gate: Any, branch: Any, index: Any) -> Any:
     """`residual + gate[index] * branch`, one pass (eager: a gather, a mul and an add)."""
-    import torch
-
-    loaded = _require(residual, torch)
+    loaded = _require(residual)
     width = int(residual.shape[-1])
     rows, branch_rows = _rows(residual, width), _rows(branch, width)
     gate = _table(gate)
@@ -749,9 +772,7 @@ def gate_add(residual: Any, gate: Any, branch: Any, index: Any) -> Any:
 
 def swiglu(x: Any, *, fp8: bool = False) -> Any:
     """`value * silu(gate)` over a `[..., 2F]` projection: one read of 2F, one write of F."""
-    import torch
-
-    loaded = _require(x, torch)
+    loaded = _require(x)
     width = int(x.shape[-1])
     half = width // 2
     rows = _rows(x, width)
@@ -775,9 +796,7 @@ def rmsnorm_rope(x: Any, weight: Any, cos: Any, sin: Any, eps: float) -> Any:
 
     `cos`/`sin` are `(seq, rotary_dim)`; channels past `rotary_dim` pass through.
     """
-    import torch
-
-    loaded = _require(x, torch)
+    loaded = _require(x)
     batch, seq, heads, head_dim = (int(d) for d in x.shape)
     rotary = int(cos.shape[-1])
     flat = x.reshape(batch * seq, heads * head_dim)
@@ -815,10 +834,6 @@ def warm(
     Nothing compiles: `load` refuses typed before this runs anything. Returns the
     milliseconds the loads and first launches took — the cold-pod cost the artifact buys.
     """
-    import time
-
-    import torch
-
     started = time.perf_counter()
     load(device)
     rows, table = 2, 3
