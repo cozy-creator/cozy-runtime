@@ -292,6 +292,14 @@ by call, a function-local import of an interface name) is a typed refusal naming
 and the construct: `static_unresolvable`, `static_computed`, `static_unsupported`,
 `static_module`. Never a guess.
 
+A package may build its surface out of an INSTALLED cozy package's declarations — a `Model`
+subclass, a shared request struct; `diagnostics/h3-vae-roundtrip` subclasses MiniMax-H3's
+`H3Model` and reuses its request type. That dependency's source ships in its wheel, so the
+reader reads it out of the environment it is itself installed in, confined to distributions
+declaring a `cozy.application` entry point — the same fact `discovery.py` calls an app. torch
+declares none, site-packages is never a root, and a sibling package supplies TYPES only: its
+own callables are its own, never scanned as registrations (cr-117).
+
 A generated SCRIPT app — Creator's `app = script_app("<module>")` adapter — is read the same
 way: the adapter's one job is fixed, so all that varies is whether the script has a valid
 `main`, and `author/_script.py`'s `script_signature` is the ONE definition of that shape, run
