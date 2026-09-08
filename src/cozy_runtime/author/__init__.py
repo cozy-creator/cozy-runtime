@@ -146,6 +146,12 @@ from cozy_runtime.author._weights import (
     WeightsTensor,
     WeightsTransaction,
 )
+from cozy_runtime.author.publication import (
+    CheckpointRef,
+    ReleaseReceipt,
+    publish_release,
+    upload_checkpoint,
+)
 
 __all__ = [
     "DEFAULT_DECODE_LIMITS",
@@ -170,6 +176,7 @@ __all__ = [
     "CapabilityError",
     "CheckpointConflict",
     "CheckpointDeclaration",
+    "CheckpointRef",
     "CheckpointSave",
     "CheckpointSinkUnbuilt",
     "Checkpoints",
@@ -229,6 +236,7 @@ __all__ = [
     "Recipe",
     "Registration",
     "RegistrationError",
+    "ReleaseReceipt",
     "RequestFeatures",
     "RequestView",
     "SavedAudioFacts",
@@ -268,9 +276,11 @@ __all__ = [
     "invoke",
     "prepare",
     "probe_activations",
+    "publish_release",
     "register_adapter",
     "registered_adapters",
     "script_app",
     "sequence_parallel",
+    "upload_checkpoint",
     "uses_components",
 ]
