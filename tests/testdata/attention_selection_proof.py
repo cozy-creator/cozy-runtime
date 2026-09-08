@@ -187,6 +187,10 @@ def main() -> None:
     out["unknown"] = _refusal(lambda: attention.pinned("no-such-kernel", device))
     out["too_old"] = _refusal(lambda: attention.pinned("flash-attn3", _device_at(80)))
     out["absent"] = _refusal(lambda: attention.pinned("sageattention", _device_at(90)))
+    # h3a-022. ABOVE the ceiling, through the real registry: a card outside a kernel's declared
+    # range is refused by name, and the kernel is never reached — which is the only outcome
+    # that helps when reaching it exits the process from C++ rather than raising.
+    out["too_new"] = _refusal(lambda: attention.pinned("sageattention", _device_at(120)))
 
     # ONE REAL FORWARD through a pinned site, so the pin is a thing that computes and not a
     # field that was set.
