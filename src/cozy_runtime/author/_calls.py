@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
-from collections.abc import Awaitable, Callable, Generator, Mapping
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Concatenate, ParamSpec, TypeVar, cast, overload
 
 import msgspec
@@ -17,6 +17,7 @@ from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
 from cozy_runtime.author._capture import ActivationCapture, ExecutionObservation
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
+from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -40,17 +41,22 @@ class _Export:
     module: str
     name: str
     memoize: bool = False
+    defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
 
 
 @overload
 def invocable[**P, R](
-    fn: Callable[Concatenate[Context, P], Awaitable[R]], /, *, memoize: bool = False
+    fn: Callable[Concatenate[Context, P], Awaitable[R]],
+    /,
+    *,
+    memoize: bool = False,
+    defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
 ) -> Callable[P, PendingCall[R]]: ...
 
 
 @overload
 def invocable[**P, R](
-    *, memoize: bool = False
+    *, memoize: bool = False, defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None
 ) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]: ...
 
 
@@ -59,6 +65,7 @@ def invocable[**P, R](
     /,
     *,
     memoize: bool = False,
+    defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
 ) -> (
     Callable[P, PendingCall[R]]
     | Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]
@@ -74,12 +81,12 @@ def invocable[**P, R](
             "invocable memoization declaration must be a boolean", code="invocable_memoize"
         )
     if fn is None:
-        return lambda target: invocable(target, memoize=memoize)
+        return lambda target: invocable(target, memoize=memoize, defaults=defaults)
     if not inspect.iscoroutinefunction(fn) or "<locals>" in fn.__qualname__:
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
-    export = _Export(fn, fn.__module__, fn.__name__, memoize)
+    export = _Export(fn, fn.__module__, fn.__name__, memoize, model_defaults(defaults))
 
     def proxy(*args: P.args, **kwargs: P.kwargs) -> PendingCall[R]:
         if args:
