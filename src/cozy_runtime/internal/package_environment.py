@@ -383,6 +383,7 @@ def materialize(
     python: Path = Path(sys.executable),
     base: base_observation.Observation | None = None,
     dependency_python: Path | None = None,
+    exact_dependencies: bool = False,
 ) -> InstalledEnvironment:
     """Verify exact wheels and atomically publish one ordinary uv virtual environment.
 
@@ -424,7 +425,7 @@ def materialize(
     final = contents / content_digest.removeprefix("sha256:")
     receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
     inspected = _verify_grants(source, wheels, observed)
-    boot_installs = _verify_python_requirements(inspected, observed, boot=True)
+    boot_installs = _verify_python_requirements(inspected, observed, boot=not exact_dependencies)
     if receipt_path.exists():
         installed = open_generation(
             root,
@@ -434,6 +435,8 @@ def materialize(
             python=python,
         )
         _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+        if exact_dependencies:
+            _verify_installed_requirements(installed.site_packages, inspected, observed)
         return installed
     reused = final.exists()
     _require_owned_root(root)
@@ -457,6 +460,8 @@ def materialize(
                 base=observed,
             )
             _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
+            if exact_dependencies:
+                _verify_installed_requirements(staged.site_packages, inspected, observed)
             _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
             _make_read_only(staging)
             _fsync_dir(staging)
@@ -483,7 +488,53 @@ def materialize(
     )
     if reused:
         _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+    if exact_dependencies:
+        _verify_installed_requirements(installed.site_packages, inspected, observed)
     return installed
+
+
+def _verify_installed_requirements(
+    site_packages: Path,
+    inspected: Sequence[_Inspected],
+    base: base_observation.Observation,
+) -> None:
+    """Verify actual installed metadata against the captured wheel and requirement roster."""
+    installed: dict[str, str] = {}
+    for info in site_packages.glob("*.dist-info"):
+        path = info / "METADATA"
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_METADATA_BYTES:
+            raise EnvironmentRefusal("package_environment_installed_metadata_invalid", info.name)
+        metadata = BytesParser().parsebytes(path.read_bytes())
+        name, version = _name(str(metadata.get("Name", ""))), str(metadata.get("Version", ""))
+        if not name or not version or name in installed:
+            raise EnvironmentRefusal("package_environment_installed_metadata_invalid", info.name)
+        installed[name] = version
+    for item in inspected:
+        if installed.get(item.wheel.distribution) != item.wheel.version:
+            raise EnvironmentRefusal(
+                "package_environment_installed_dependency_changed",
+                f"distribution={item.wheel.distribution} expected={item.wheel.version} "
+                f"actual={installed.get(item.wheel.distribution)!r}",
+            )
+    joined = {**base.distribution_versions, **installed}
+    environment = _marker_environment(base)
+    for item in inspected:
+        for requirement in item.requirements:
+            if requirement.marker is not None and not requirement.marker.evaluate(environment):
+                continue
+            actual = joined.get(_name(requirement.name))
+            try:
+                accepted = actual is not None and requirement.specifier.contains(
+                    Version(actual), prereleases=True
+                )
+            except InvalidVersion:
+                accepted = False
+            if not accepted:
+                raise EnvironmentRefusal(
+                    "package_environment_installed_dependency_changed",
+                    f"distribution={item.wheel.distribution} "
+                    f"requires={requirement} actual={actual!r}",
+                )
 
 
 @dataclass(frozen=True, slots=True)
