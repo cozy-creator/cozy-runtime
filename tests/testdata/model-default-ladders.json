@@ -1,0 +1,372 @@
+{
+  "valid": [
+    {
+      "name": "single",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        }
+      ]
+    },
+    {
+      "name": "shared_release",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "5090",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-adaln-pruned"
+        },
+        {
+          "gpu": "*",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/bf16-pruned"
+        }
+      ]
+    },
+    {
+      "name": "portable_punctuation",
+      "ladder": [
+        {
+          "gpu": "NVIDIA RTX 5090",
+          "lane": "alice/m.o_d-e_l@RC+2!a/fp8+fast!"
+        }
+      ]
+    }
+  ],
+  "invalid": [
+    {
+      "name": "empty",
+      "ladder": []
+    },
+    {
+      "name": "not_array",
+      "ladder": {
+        "gpu": "H100",
+        "lane": "paul/minimax-h3@1.0.0-rc.2/fp8"
+      }
+    },
+    {
+      "name": "too_many",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        }
+      ]
+    },
+    {
+      "name": "missing_gpu",
+      "ladder": [
+        {
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8"
+        }
+      ]
+    },
+    {
+      "name": "unknown_field",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned",
+          "extra": true
+        }
+      ]
+    },
+    {
+      "name": "gpu_empty",
+      "ladder": [
+        {
+          "gpu": "",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        }
+      ]
+    },
+    {
+      "name": "gpu_too_long",
+      "ladder": [
+        {
+          "gpu": "HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        }
+      ]
+    },
+    {
+      "name": "gpu_outer_space",
+      "ladder": [
+        {
+          "gpu": " H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        }
+      ]
+    },
+    {
+      "name": "gpu_no_token",
+      "ladder": [
+        {
+          "gpu": "?!",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        }
+      ]
+    },
+    {
+      "name": "gpu_bool",
+      "ladder": [
+        {
+          "gpu": true,
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        }
+      ]
+    },
+    {
+      "name": "wildcard_not_last",
+      "ladder": [
+        {
+          "gpu": "*",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        }
+      ]
+    },
+    {
+      "name": "unqualified_lane",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "fp8"
+        }
+      ]
+    },
+    {
+      "name": "missing_lane",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/"
+        }
+      ]
+    },
+    {
+      "name": "missing_release",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3/fp8"
+        }
+      ]
+    },
+    {
+      "name": "digest_pin",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/fp8"
+        }
+      ]
+    },
+    {
+      "name": "digest_shaped_release",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/fp8"
+        }
+      ]
+    },
+    {
+      "name": "uppercase_repository",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "Paul/minimax-h3@v1/fp8"
+        }
+      ]
+    },
+    {
+      "name": "lane_space",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8 fast"
+        }
+      ]
+    },
+    {
+      "name": "lane_slash",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8/fast"
+        }
+      ]
+    },
+    {
+      "name": "lane_backslash",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/C:\\Users\\file"
+        }
+      ]
+    },
+    {
+      "name": "mixed_model",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/sdxl@1.0.0-rc.2/fp8"
+        }
+      ]
+    },
+    {
+      "name": "mixed_release",
+      "ladder": [
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-fa3-adaln-pruned"
+        },
+        {
+          "gpu": "H100",
+          "lane": "paul/minimax-h3@2.0.0/fp8"
+        }
+      ]
+    }
+  ]
+}
