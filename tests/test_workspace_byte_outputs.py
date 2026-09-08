@@ -99,11 +99,11 @@ def test_reserved_capture_grant_commits_native_tree_without_author_asset(tmp_pat
     # Only the post-processing collaborators are needed; TensorFS custody is real.
     post = cast(AttemptEngine, engine)
     record = cast(AttemptRecord, attempt)
-    result, error = post._tail(record, {"outputs": [], "capture": capture})
+    result, error = AttemptEngine._tail(post, record, {"outputs": [], "capture": capture})
     assert error is None and result is not None
     assert [entry.output_id for entry in result.outputs] == ["runtime.capture"]
     assert result.outputs[0].native_tree.content_bytes == len(metadata) + len(sketches)
-    missing, error = post._tail(record, {"outputs": []})
+    missing, error = AttemptEngine._tail(post, record, {"outputs": []})
     assert missing is None and error is not None and error.startswith("capture_output_absent:")
 
 
