@@ -7,7 +7,9 @@ parameter types, so there is no second document to drift (§1.0/§1.3/§1.7).
 
 from __future__ import annotations
 
+import enum
 import inspect
+import math
 import types
 import typing
 from collections.abc import Callable, Mapping
@@ -17,11 +19,20 @@ from typing import Any, Literal, get_args, get_origin
 import msgspec
 
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._assets import Asset, Assets, AudioAsset, FileAsset, ImageAsset, VideoAsset
+from cozy_runtime.author._assets import (
+    Asset,
+    Assets,
+    AudioAsset,
+    Fidelity,
+    FileAsset,
+    ImageAsset,
+    Tree,
+    VideoAsset,
+)
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import DECODED_ASSET_TYPES, DEFAULT_DECODE_LIMITS
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import AssetBound, Bound, _PreflightMarker
+from cozy_runtime.author._markers import AssetBound, AssetLimits, Bound, _PreflightMarker
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
@@ -62,10 +73,17 @@ class AssetsBinding:
     annotation: object
     kinds: tuple[tuple[type[Asset], AssetBound | None], ...]
     decoded: bool = False
+    counts: tuple[tuple[str, int], ...] = ()
+    max_length: int | None = None
 
     @property
     def wire_type(self) -> object:
-        _, markers = strip(self.annotation)
+        _, declared = strip(self.annotation)
+        markers = tuple(marker for marker in declared if not isinstance(marker, AssetLimits))
+        if self.max_length is not None and not any(
+            isinstance(marker, msgspec.Meta) and marker.max_length is not None for marker in markers
+        ):
+            markers += (msgspec.Meta(max_length=self.max_length),)
         return (
             typing.Annotated[(list[AssetInputValue], *markers)]
             if markers
@@ -78,10 +96,11 @@ class AssetInputValue(msgspec.Struct, forbid_unknown_fields=True):
 
     asset: FileAsset
     label: str = ""
+    fidelity: Fidelity = "auto"
 
 
 def assets_binding(name: str, annotation: object) -> AssetsBinding:
-    base, _ = strip(annotation)
+    base, metadata = strip(annotation)
     args = get_args(base)
     item = args[0] if args else ImageAsset | VideoAsset | AudioAsset | FileAsset
     inner, _ = strip(item)
@@ -90,6 +109,10 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
     decoded: bool | None = None
     for option in options:
         cls, markers = strip(option)
+        if any(isinstance(marker, AssetLimits) for marker in markers):
+            raise ConformanceError(
+                "AssetLimits annotates the Assets collection", code="asset_limits"
+            )
         value_type = cls in DECODED_ASSET_TYPES
         if decoded is not None and value_type != decoded:
             raise ConformanceError(
@@ -115,8 +138,38 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
         if bound is not None:
             bound.check_kind(cls.kind)
         kinds[cls.kind] = cls, bound
+    limits = [marker for marker in metadata if isinstance(marker, AssetLimits)]
+    if limits and any(marker != limits[0] for marker in limits[1:]):
+        raise ConformanceError("conflicting AssetLimits markers", code="asset_limits")
+    counts = limits[0].counts if limits else {}
+    if set(counts) - set(kinds):
+        raise ConformanceError("AssetLimits names an undeclared media kind", code="asset_limits")
+    totals = {
+        marker.max_length
+        for marker in metadata
+        if isinstance(marker, msgspec.Meta) and marker.max_length is not None
+    }
+    if limits and limits[0].total is not None:
+        totals.add(limits[0].total)
+    if len(totals) > 1:
+        raise ConformanceError("conflicting Assets total/max_length", code="asset_limits")
+    max_length = next(iter(totals), None)
+    if max_length is None and counts and set(counts) == set(kinds):
+        max_length = sum(counts.values())
+    if max_length is not None and any(
+        isinstance(marker, msgspec.Meta)
+        and marker.min_length is not None
+        and marker.min_length > max_length
+        for marker in metadata
+    ):
+        raise ConformanceError("Assets minimum exceeds its total limit", code="asset_limits")
     return AssetsBinding(
-        name, annotation, tuple(kinds[key] for key in sorted(kinds)), bool(decoded)
+        name,
+        annotation,
+        tuple(kinds[key] for key in sorted(kinds)),
+        bool(decoded),
+        tuple(sorted(counts.items())),
+        max_length,
     )
 
 
@@ -309,7 +362,11 @@ def analyze(
                 fields=[parameter.name],
             )
         annotation = hints[parameter.name]
-        base, _ = strip(annotation)
+        base, markers = strip(annotation)
+        if any(isinstance(marker, AssetLimits) for marker in markers) and not (
+            base is Assets or get_origin(base) is Assets
+        ):
+            raise ConformanceError("AssetLimits annotates an Assets input", code="asset_limits")
         if base is Assets or get_origin(base) is Assets:
             if parameter.default is not parameter.empty:
                 raise ConformanceError("Assets inputs cannot have defaults", code="assets_default")
@@ -474,11 +531,8 @@ def _wire_default(value: object) -> None:
     """Only immutable canonical values can change omission into an exact intent."""
     if value is None or type(value) in (str, bool, int):
         return
-    if type(value) is float:
-        import math
-
-        if math.isfinite(value):
-            return
+    if type(value) is float and math.isfinite(value):
+        return
     raise ConformanceError(
         "invocable defaults must be immutable canonical scalars", code="invocable_default"
     )
@@ -486,11 +540,6 @@ def _wire_default(value: object) -> None:
 
 def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
     """Refuse interpreter-local values before an interface is generated."""
-    import enum
-    import types
-
-    from cozy_runtime.author._assets import Asset, Tree
-
     base, _ = strip(annotation)
     if base in (str, int, float, bool, type(None)):
         return

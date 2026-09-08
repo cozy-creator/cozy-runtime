@@ -213,10 +213,14 @@ def _media_decode_bounds(surface: Surface) -> None:
     if "media_decode" not in surface.capabilities:
         return
     reached = 0
-    fields = [
-        (node.path, asset_kinds(node.annotation), node.marker(AssetBound))
-        for node in walk(surface.payload_type)
-    ]
+    fields = (
+        [
+            (node.path, asset_kinds(node.annotation), node.marker(AssetBound))
+            for node in walk(surface.payload_type)
+        ]
+        if any(p.role == "service" and p.capability == "media_decode" for p in surface.params)
+        else []
+    )
     if binding := surface.assets_binding:
         fields.extend(
             (binding.parameter, frozenset({cls.kind}), bound) for cls, bound in binding.kinds

@@ -209,7 +209,9 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                         if entry["assets"].get("view") == "decoded"
                         else expression({"asset": row["kind"]}, path)
                     )
-                    bound = {key: value for key, value in row.items() if key != "kind"}
+                    bound = {
+                        key: value for key, value in row.items() if key not in {"kind", "max_count"}
+                    }
                     bound["media_types"] = tuple(bound["media_types"])
                     if any(bound.values()):
                         cls = f"Annotated[{cls}, AssetBound(**{bound!r})]"

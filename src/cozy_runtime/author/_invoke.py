@@ -371,6 +371,8 @@ def _prepare_assets(
         return {}
     values = getattr(payload, binding.parameter)
     bounds: dict[str, AssetBound | None] = {}
+    counts: dict[str, int] = {}
+    limits = dict(binding.counts)
     for position, value in enumerate(values):
         input_id = f"{binding.parameter}.{position}.asset"
         row = metadata.get(input_id)
@@ -394,12 +396,20 @@ def _prepare_assets(
                 fields=[input_id],
             )
         cls, bound = options[0]
+        counts[cls.kind] = counts.get(cls.kind, 0) + 1
+        if cls.kind in limits and counts[cls.kind] > limits[cls.kind]:
+            raise InvalidRequest(
+                "Assets media kind count exceeds its declared limit",
+                code="asset_count",
+                fields=[binding.parameter],
+            )
         asset = cls(
             value.asset.ref, media_type=row.media_type, size_bytes=row.length, digest=row.digest
         )
         _check_input(asset, row, bound, bound.max_bytes or 0 if bound else 0, position)
         asset._input_id, asset._position = input_id, position
         asset._label = value.label
+        asset._fidelity = value.fidelity
         value.asset = asset
         bounds[input_id] = bound
     try:

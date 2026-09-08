@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import io
 import json
 import sys
@@ -16,6 +17,7 @@ from PIL import Image
 from cozy_runtime.author import (
     App,
     AssetBound,
+    AssetLimits,
     Assets,
     AuthorError,
     CapabilityError,
@@ -26,6 +28,7 @@ from cozy_runtime.author import (
     ImageAsset,
     Invocation,
     MediaDecoder,
+    Mixed,
     Preflight,
     PreflightViolation,
     attempt,
@@ -112,9 +115,11 @@ async def child(ctx: Context, *, assets: Pictures) -> Result:
 app.job(child)
 
 
-def inputs(root: Path) -> tuple[dict[str, object], dict[str, GrantedInput]]:
+def inputs(
+    root: Path, size: tuple[int, int] = (2, 2)
+) -> tuple[dict[str, Any], dict[str, GrantedInput]]:
     image = io.BytesIO()
-    Image.new("RGB", (2, 2), (255, 0, 0)).save(image, format="PNG")
+    Image.new("RGB", size, (255, 0, 0)).save(image, format="PNG")
     raw = image.getvalue()
     photo = root / "photo.png"
     photo.write_bytes(raw)
@@ -273,8 +278,8 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
     payload = json.loads(reservation.payload)
     assert payload == {
         "assets": [
-            {"asset": photo.digest, "label": "second"},
-            {"asset": photo.digest, "label": "first"},
+            {"asset": photo.digest, "label": "second", "fidelity": "auto"},
+            {"asset": photo.digest, "label": "first", "fidelity": "auto"},
         ]
     }
     assert original.info(0).label == "original" and original.info(0).id == "assets.0.asset"
@@ -291,6 +296,19 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
     assert result.result.ids == ["assets.0.asset", "assets.1.asset"]
     reordered = broker.reserve("", __name__, "child", {"assets": forwarded.select(1, 0)})
     assert reordered.payload != reservation.payload
+    fidelity = broker.reserve(
+        "",
+        __name__,
+        "child",
+        {
+            "assets": Assets(
+                [photo.with_label("second").with_fidelity("low"), photo.with_label("first")]
+            )
+        },
+    )
+    assert fidelity.payload != reservation.payload
+    assert [item["asset"] for item in json.loads(fidelity.payload)["assets"]] == [photo.digest] * 2
+    assert photo.fidelity == "auto"
     relabelled = broker.reserve(
         "",
         __name__,
@@ -507,3 +525,108 @@ def test_assets_refuses_mixed_raw_and_decoded_view() -> None:
 
     with pytest.raises(ConformanceError, match="mix decoded values and raw"):
         describe(local)
+
+
+LimitedMixed = Annotated[Assets[Mixed], AssetLimits(images=1, videos=1, audio=1, total=3)]
+SimpleLimited = Annotated[Assets[InputImage], AssetLimits(images=2)]
+
+
+def test_kind_count_refuses_before_hydration(tmp_path: Path) -> None:
+    wire, rows = inputs(tmp_path)
+    local = App()
+
+    @local.entrypoint
+    def limited(payload: Request, assets: LimitedMixed) -> Result:
+        raise AssertionError("two images exceed the kind limit despite fitting total3")
+
+    with pytest.raises(AuthorError, match="asset_count"):
+        prepare(local.get("limited"), wire, input_metadata=rows)
+
+
+@pytest.mark.parametrize("fidelity", ["auto", "low", "medium", "high"])
+def test_fidelity_is_metadata_and_does_not_resize(tmp_path: Path, fidelity: str) -> None:
+    wire, rows = inputs(tmp_path, (513, 257))
+    wire["assets"][0]["fidelity"] = fidelity
+    local = App()
+
+    @local.entrypoint
+    def render(payload: Request, assets: SimpleLimited) -> Result:
+        assert assets.info("alice").fidelity == fidelity
+        assert assets.info(1).fidelity == "auto"
+        assert assets["alice"].size == (513, 257)
+        assert assets[1].size == (513, 257)
+        assert assets.select(0).info(0).fidelity == fidelity
+        return Result([], [], [], [], [], "")
+
+    result, outcome, _ = attempt(
+        local.get("render"),
+        wire,
+        Invocation("fidelity", tmp_path / "fidelity", time.monotonic() + 10, assets=rows),
+    )
+    assert outcome.terminal == "succeeded", outcome
+    assert result is not None
+
+
+@pytest.mark.parametrize("value", ["unknown", "", None, 1])
+def test_invalid_fidelity_refuses_before_input_acquisition(tmp_path: Path, value: object) -> None:
+    wire, rows = inputs(tmp_path)
+    wire["assets"][0]["fidelity"] = value
+    with pytest.raises(AuthorError):
+        prepare(app.get("collect"), wire, input_metadata=rows)
+
+
+def test_count_metadata_comes_from_argument_and_conflicts_refuse(tmp_path: Path) -> None:
+    local = App()
+
+    @local.entrypoint
+    def limited(payload: Request, assets: SimpleLimited) -> Result:
+        raise AssertionError("describe only")
+
+    found = Discovered(local, "example:app", tmp_path, sys.modules[__name__], describe(local), {})
+    doc = package_interface.build(found)
+    entry = doc["entrypoints"][0]
+    assert entry["assets"]["kinds"][0]["max_count"] == 2
+    assert (
+        next(field for field in entry["request"]["fields"] if field["name"] == "assets")[
+            "constraints"
+        ]["max_length"]
+        == 2
+    )
+    for count in (-1, True, 1.5, "2"):
+        bad = json.loads(json.dumps(doc))
+        bad["entrypoints"][0]["assets"]["kinds"][0]["max_count"] = count
+        with pytest.raises(ConformanceError):
+            package_interface.read_bytes(json.dumps(bad).encode())
+    conflict = App()
+
+    @conflict.entrypoint
+    def wrong(
+        payload: Request,
+        assets: Annotated[Assets[InputImage], AssetLimits(total=2), msgspec.Meta(max_length=3)],
+    ) -> Result:
+        raise AssertionError("conflicting declarations must refuse")
+
+    with pytest.raises(ConformanceError, match="conflicting Assets total"):
+        describe(conflict)
+    misplaced = App()
+
+    @misplaced.entrypoint
+    def wrong_field(payload: Annotated[Request, AssetLimits(images=2)]) -> Result:
+        raise AssertionError("count marker belongs only on Assets")
+
+    with pytest.raises(ConformanceError, match="AssetLimits annotates"):
+        describe(misplaced)
+    assert "assets" not in inspect.signature(invocable).parameters
+
+
+def test_implicit_decode_does_not_require_bounds_on_named_raw_media() -> None:
+    class WithRaw(msgspec.Struct):
+        photo: ImageAsset
+
+    def handler(payload: Request, assets: SimpleLimited) -> Result:
+        raise AssertionError("describe only")
+
+    handler.__annotations__["payload"] = WithRaw
+    local = App()
+    local.entrypoint(handler)
+    describe(local)

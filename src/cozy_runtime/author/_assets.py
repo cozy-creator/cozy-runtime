@@ -17,13 +17,15 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Final, Self, cast, get_args, overload
+from typing import Any, ClassVar, Final, Literal, Self, cast, get_args, overload
 
 from PIL.Image import Image as Image
 
 from cozy_runtime.author._errors import CapabilityError, PreflightViolation
+from cozy_runtime.author._walker import strip, unwrap_optional
 
 _UNBOUND: Final = ""
+Fidelity = Literal["auto", "low", "medium", "high"]
 
 
 class Asset:
@@ -31,6 +33,7 @@ class Asset:
 
     __slots__ = (
         "_attempt",
+        "_fidelity",
         "_input_id",
         "_label",
         "_local",
@@ -62,6 +65,7 @@ class Asset:
         self._local = local
         self._attempt = attempt
         self._input_id = ""
+        self._fidelity: Fidelity = "auto"
         self._label = ""
         self._position = -1
         self._read_guard: Callable[[], None] | None = None
@@ -90,6 +94,18 @@ class Asset:
     def label(self) -> str:
         """An optional caller-supplied name for this occurrence; empty when omitted."""
         return self._label
+
+    @property
+    def fidelity(self) -> Fidelity:
+        """Per-occurrence model hint; the generic loader never resizes because of it."""
+        return self._fidelity
+
+    def with_fidelity(self, fidelity: Fidelity) -> Self:
+        if fidelity not in get_args(Fidelity):
+            raise ValueError("asset fidelity must be auto, low, medium or high")
+        result = copy(self)
+        result._fidelity = fidelity
+        return result
 
     def with_label(self, label: str) -> Self:
         """Name a copy of this handle without changing its bytes or the original."""
@@ -150,6 +166,7 @@ class AssetInfo:
     id: str
     position: int
     label: str
+    fidelity: Fidelity
     kind: str
     media_type: str
     size_bytes: int
@@ -277,6 +294,7 @@ class Assets[T](Sequence[T]):
             item.id,
             item.position,
             item.label,
+            item.fidelity,
             item.kind,
             item.media_type,
             item.size_bytes,
@@ -309,8 +327,6 @@ def asset_kinds(annotation: object) -> frozenset[str]:
     own asset field. Stopping at records keeps tagged-union reference schemas from growing
     a second, lossy path-based authority over their leaf fields.
     """
-    from cozy_runtime.author._walker import strip, unwrap_optional
-
     base, _ = strip(annotation)
     base, _ = unwrap_optional(base)
     if isinstance(base, type):

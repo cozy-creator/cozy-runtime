@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Annotated, TypeAlias, TypeVar
 
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._media import KIND_MEDIA
 
 T = TypeVar("T")
 K = TypeVar("K")
@@ -119,6 +120,38 @@ class Bound:
 
 
 @dataclass(frozen=True, slots=True)
+class AssetLimits:
+    """Upper counts for one Assets input; compiled into its normal request schema."""
+
+    images: int | None = None
+    videos: int | None = None
+    audio: int | None = None
+    total: int | None = None
+
+    def __post_init__(self) -> None:
+        values = (self.images, self.videos, self.audio, self.total)
+        if all(value is None for value in values):
+            raise ConformanceError("AssetLimits must declare a count", code="asset_limits")
+        for value in values:
+            if value is not None and (type(value) is not int or value < 0):
+                raise ConformanceError(
+                    "asset counts must be nonnegative integers", code="asset_limits"
+                )
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return {
+            kind: count
+            for kind, count in (
+                ("image", self.images),
+                ("video", self.videos),
+                ("audio", self.audio),
+            )
+            if count is not None
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AssetBound:
     """cr-012 — the TYPED bounds on ONE input-asset field.
 
@@ -137,9 +170,8 @@ class AssetBound:
       and returned to the handler, not codec working memory or peak process RSS. Request data
       cannot set it.
 
-    COUNT bounds are not here on purpose: `Annotated[list[ImageAsset], Meta(max_length=9)]`
-    is msgspec's own, it is already in the package interface's constraint vocabulary, and a second
-    spelling of a limit that already validates would be a second contract.
+    Counts belong to the collection: Meta(max_length=...) or the AssetLimits decorator
+    declaration. Both compile centrally into the same request and kind constraints.
     """
 
     max_bytes: int | None = None
@@ -165,8 +197,6 @@ class AssetBound:
 
     def check_kind(self, kind: str) -> None:
         """A declared type outside the KIND's own set is a conformance error at describe."""
-        from cozy_runtime.author._media import KIND_MEDIA
-
         if self.max_decoded_bytes is not None and kind not in {"image", "video", "audio"}:
             raise ConformanceError(
                 f"AssetBound(max_decoded_bytes=) cannot annotate a {kind!r} asset: only "

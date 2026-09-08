@@ -97,6 +97,7 @@ from cozy_runtime.author._loader import (
 )
 from cozy_runtime.author._markers import (
     AssetBound,
+    AssetLimits,
     Bound,
     ModelDefault,
     Preflight,
@@ -165,6 +166,7 @@ __all__ = [
     "Asset",
     "AssetBound",
     "AssetInfo",
+    "AssetLimits",
     "Assets",
     "AudioAsset",
     "AuthorError",

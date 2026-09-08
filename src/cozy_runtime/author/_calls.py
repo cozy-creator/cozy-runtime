@@ -195,7 +195,10 @@ class _Broker:
 
             def asset_value(value: object) -> object:
                 if isinstance(value, Assets):
-                    return [{"asset": item, "label": item.label} for item in value._items]
+                    return [
+                        {"asset": item, "label": item.label, "fidelity": item.fidelity}
+                        for item in value._items
+                    ]
                 return _input_ref(value, ctx.request_id)
 
             plain = msgspec.to_builtins(dict(arguments), enc_hook=asset_value)

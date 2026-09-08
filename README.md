@@ -36,6 +36,8 @@ runner whose own cgroup is not delegated) and name that host fact as the reason.
 CI runs the build, ruff, mypy, the reproducible-wheel check and `checks/architecture.py`'s
 AST import scans, and nothing else. Hardware is verified by hand on a rented card.
 
+For labelled model-ready input media, see [Ordered media inputs](docs/assets.md).
+
 ## Layout
 
 | package | role | may import |

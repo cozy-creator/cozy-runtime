@@ -13,6 +13,7 @@ from typing import NoReturn, cast
 
 from cozy_runtime.author import ConformanceError, ModelBinding, Surface
 from cozy_runtime.author._media import KIND_MEDIA
+from cozy_runtime.author._signature import AssetInputValue
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
@@ -90,6 +91,9 @@ def _callable(surface: Surface) -> dict[str, Json]:
                     bound.media_types if bound and bound.media_types else KIND_MEDIA[cls.kind]
                 ),
             }
+            counts = dict(binding.counts)
+            if cls.kind in counts:
+                row["max_count"] = counts[cls.kind]
             if bound and bound.max_bytes is not None:
                 row["max_bytes"] = bound.max_bytes
             if bound and bound.max_decoded_bytes is not None:
@@ -471,14 +475,9 @@ def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
         _invalid(source, path, "assets parameter must be an identifier")
     fields = request.get("fields", []) if isinstance(request, dict) else []
     selected = [f for f in fields if isinstance(f, dict) and f.get("name") == parameter]
-    occurrence = {
-        "fields": [
-            {"name": "asset", "type": {"asset": "file"}},
-            {"name": "label", "type": "str", "wire": "optional"},
-        ]
-    }
-    if len(selected) != 1 or selected[0].get("type") != {"list": occurrence}:
-        _invalid(source, path, "assets parameter must name a list of asset/label records")
+    occurrence = schema.render(list[AssetInputValue])
+    if len(selected) != 1 or selected[0].get("type") != occurrence:
+        _invalid(source, path, "assets parameter must name the declared occurrence records")
     kinds = slot["kinds"]
     if not isinstance(kinds, list) or not 1 <= len(kinds) <= 4:
         _invalid(source, path, "assets kinds must be a nonempty bounded list")
@@ -486,11 +485,19 @@ def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
     media: set[str] = set()
     for value in kinds:
         row = _closed(
-            value, {"kind", "media_types"}, {"max_bytes", "max_decoded_bytes"}, source, path
+            value,
+            {"kind", "media_types"},
+            {"max_bytes", "max_decoded_bytes", "max_count"},
+            source,
+            path,
         )
         kind = row["kind"]
         if kind not in ("image", "video", "audio", "file") or str(kind) in seen:
             _invalid(source, path, "assets kinds must be recognized and unique")
+        if slot.get("view") == "decoded" and kind == "file":
+            _invalid(source, path, "decoded Assets does not include generic file handles")
+        if "max_count" in row and (type(row["max_count"]) is not int or row["max_count"] < 0):
+            _invalid(source, path, "assets kind max_count must be a nonnegative integer")
         seen.add(str(kind))
         types = row["media_types"]
         if not isinstance(types, list) or (not types and kind != "file"):
