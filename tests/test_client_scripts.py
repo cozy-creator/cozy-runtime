@@ -6,7 +6,18 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.author import ConformanceError, Invocation, attempt, describe, script_app
+from cozy_runtime.author import (
+    ConformanceError,
+    Invocation,
+    ModelArtifact,
+    attempt,
+    describe,
+    script_app,
+)
+from cozy_runtime.author._model import _derive_model
+from cozy_runtime.author._script_types import _ScriptSource
+from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+from test_weights_resume_native import _committed
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -125,3 +136,101 @@ def test_script_observes_cancellation_before_import(
     )
     assert outcome.terminal == "canceled"
     assert not marker.exists()
+
+
+def test_plain_main_uses_real_native_weights_and_returns_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _, _, source_receipt = _committed(tmp_path)
+    source = source_receipt.artifact.manifest.digest
+    source_length = source_receipt.artifact.manifest.length
+    module = "native_inheritance_script"
+    (tmp_path / (module + ".py")).write_text(
+        "# /// script\n# [tool.cozy.weights]\n# checkpoint = 2048\n# ///\n"
+        "from cozy_runtime.author import Model, ModelArtifact, WeightsSink\n"
+        "from cozy_runtime.author import WeightsTarget, Telemetry\n"
+        "def main(ctx, *, source: Model[object], artifacts: WeightsSink,\n"
+        "         tel: Telemetry) -> ModelArtifact:\n"
+        '    ctx.log("inheriting")\n'
+        "    assert len(artifacts.structure(source).tensors) == 1\n"
+        '    with artifacts.open("checkpoint", sources={"source":source},\n'
+        '        targets={"model":WeightsTarget(source="source",source_component="model")},\n'
+        '        configs={}, order=(("model","weight"),)) as transaction:\n'
+        "        tel.progress(1.0)\n"
+        "        return transaction.commit().artifact\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    app = script_app(module)
+    describe(app)
+    host = WeightsTransactionHost(
+        store=store,
+        owner_scope="script-proof",
+        request_id="script-weights",
+        invocation_spec_digest="sha256:" + "53" * 32,
+        work_fingerprint="sha256:" + "54" * 32,
+        writer_session_id=1,
+        allowed_sources={source: source_length},
+        output_bounds={"checkpoint": 2048},
+    )
+    result, outcome, _ = attempt(
+        app.get("main"),
+        {},
+        Invocation(
+            "script-weights",
+            tmp_path / "out",
+            time.monotonic() + 10,
+            models={"source": _derive_model(_ScriptSource, source)},
+            weights=host.open,
+            weights_source_structure=host.structure,
+        ),
+    )
+    assert outcome.terminal == "succeeded", outcome
+    assert result is not None
+    assert isinstance(result.result.value, ModelArtifact)
+    assert result.result.value.manifest == source_receipt.artifact.manifest
+    assert result.result.value.producer_request_id == "script-weights"
+    assert result.result.value.tensorfs_receipt_digest != source_receipt.tensorfs_receipt_digest
+
+
+def test_plain_main_saves_and_returns_real_media(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = "image_script"
+    (tmp_path / (module + ".py")).write_text(
+        "from cozy_runtime.author import ImageAsset, ImageFrame, Outputs, Telemetry\n"
+        "async def main(*, out: Outputs, tel: Telemetry) -> ImageAsset:\n"
+        '    tel.log("saving")\n'
+        '    return out.save_image(ImageFrame(2, 2, b"\\xff\\x00\\x00" * 4), format="png")\n'
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    app = script_app(module)
+    describe(app)
+    result, outcome, _ = attempt(
+        app.get("main"), {}, Invocation("script-image", tmp_path / "out", time.monotonic() + 10)
+    )
+    assert outcome.terminal == "succeeded", outcome
+    assert result is not None
+    assert result.result.value.media_type == "image/png"
+    assert len(result.outputs) == 1
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "def main(*, source): pass",
+        "def main(*, source: unknown()): pass",
+        "def main(*, source: Model = None): pass",
+        "def main(*, source: int): pass",
+        "# /// script\n# [tool.cozy.weights]\n# result = -1\n# ///\ndef main(): pass",
+        '# /// script\n# [tool.cozy.models]\n# missing = "a/b"\n# ///\ndef main(): pass',
+    ],
+)
+def test_script_injected_contract_refuses_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declaration: str
+) -> None:
+    (tmp_path / "bad_capability_script.py").write_text(
+        'from cozy_runtime.author import Model\nraise RuntimeError("not executed")\n' + declaration
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(ConformanceError, match="script"):
+        script_app("bad_capability_script")
