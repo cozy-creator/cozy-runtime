@@ -85,12 +85,20 @@ global flags:
                    exact PackageInterface input for describe/bindings (no package import)
   --environment-python <venv/bin/python>
                    describe/bindings source roots of an explicit venv; never executes it
+  --distribution <name>
+                   describe one installed wheel in --environment-python, without imports
   --conformance    describe only: also IMPORT the app in this interpreter — which must be
                    the package's own locked venv — and refuse unless it matches the source
   -h, --help       this text
 """
 
-_VALUE_FLAGS = ("--fields", "--dir", "--package-interface", "--environment-python")
+_VALUE_FLAGS = (
+    "--fields",
+    "--dir",
+    "--package-interface",
+    "--environment-python",
+    "--distribution",
+)
 #: Verbs that own their own flag parsing: everything after the verb belongs to them, so a
 #: payload term like `--in` is not eaten by the global pass.
 _OWNS_ARGS = (
@@ -111,6 +119,7 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
     directory = "."
     package_interface = ""
     environment_python = ""
+    distribution = ""
     verb: str | None = None
     args: list[str] = []
     unknown: list[str] = []
@@ -144,6 +153,8 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
                 directory = inline
             elif flag == "--environment-python":
                 environment_python = inline
+            elif flag == "--distribution":
+                distribution = inline
             else:
                 package_interface = inline
         elif item.startswith("-") and item != "-":
@@ -164,13 +175,32 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
         verb,
         args,
         Options(
-            as_json, full, fields, directory, package_interface, conformance, environment_python
+            as_json,
+            full,
+            fields,
+            directory,
+            package_interface,
+            conformance,
+            environment_python,
+            distribution,
         ),
         want_help,
     )
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
+    if opts.distribution and (
+        verb != "describe"
+        or not opts.environment_python
+        or opts.package_interface
+        or opts.conformance
+    ):
+        raise CliError(
+            "usage",
+            "--distribution requires static describe with --environment-python only",
+            "cozy-runtime describe --distribution <name> --environment-python <venv/bin/python>",
+            Exit.usage,
+        )
     if opts.environment_python and verb not in ("describe", "bindings"):
         raise CliError(
             "usage",
