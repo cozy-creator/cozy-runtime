@@ -1471,7 +1471,7 @@ class AttemptEngine:
     def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Dispatch the existing executor control request lane by typed operation."""
         kind = str(frame.get("kind", ""))
-        if kind in ("child_call", "child_poll", "child_cancel"):
+        if kind in ("child_call", "child_poll", "child_cancel", "child_forget"):
             if self.calls is None:
                 return {
                     "ok": False,

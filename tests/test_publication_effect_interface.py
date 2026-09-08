@@ -59,8 +59,8 @@ def test_effect_reservations_use_existing_parent_index_and_refuse_unknown_inputs
         app.get("script"), {}, Invocation("parent", tmp_path, time.monotonic() + 10, calls=broker)
     )
     assert outcome.code == "unawaited_child_call"
-    assert [call.index for call in broker.calls] == [0, 1]
-    assert [call.binding.export for call in broker.calls] == [
+    assert [call.index for call in broker.calls.values()] == [0, 1]
+    assert [call.binding.export for call in broker.calls.values()] == [
         "upload_checkpoint",
         "publish_release",
     ]
