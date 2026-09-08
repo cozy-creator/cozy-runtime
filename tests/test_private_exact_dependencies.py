@@ -18,7 +18,14 @@ from cozy_runtime.internal import package_environment as environment
 from cozy_runtime.internal.base_observation import Observation
 
 
-def _wheel(root: Path, name: str, requirements: tuple[str, ...], code: bytes) -> Path:
+def _wheel(
+    root: Path,
+    name: str,
+    requirements: tuple[str, ...],
+    code: bytes,
+    *,
+    resources: dict[str, bytes] | None = None,
+) -> Path:
     info = f"{name}-1.0.dist-info"
     metadata = f"Metadata-Version: 2.3\nName: {name}\nVersion: 1.0\n"
     metadata += "".join(f"Requires-Dist: {value}\n" for value in requirements)
@@ -27,6 +34,7 @@ def _wheel(root: Path, name: str, requirements: tuple[str, ...], code: bytes) ->
         f"{info}/METADATA": (metadata + "\n").encode(),
         f"{info}/WHEEL": (b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"),
     }
+    members.update(resources or {})
     rows = [
         (
             path,
@@ -114,3 +122,44 @@ def test_private_missing_wheel_refuses_then_real_install_and_reopen_verify(tmp_p
     with pytest.raises(environment.EnvironmentRefusal) as changed:
         environment.materialize(material, root, base=base, exact_dependencies=True)
     assert changed.value.code == "package_environment_installed_dependency_changed"
+
+
+def test_prebuilt_dependency_source_resources_are_installed_without_building(
+    tmp_path: Path,
+) -> None:
+    base = environment.observe_base(Path(sys.executable))
+    resources = {
+        "resource_helper/data/wrapper.cc": b"not compilable C++\n",
+        "resource_helper/data/include.h": b"not compilable C\n",
+        "resource_helper/data/setup.py": b"raise RuntimeError('build must never run')\n",
+    }
+    helper = _wheel(tmp_path, "resource_helper", (), b"VALUE=37\n", resources=resources)
+    project = _wheel(
+        tmp_path, "resource_client", ("resource_helper==1.0",), b"import resource_helper\n"
+    )
+    installed = environment.materialize(
+        _material(project, (helper,), base),
+        tmp_path / "installed",
+        base=base,
+        exact_dependencies=True,
+    )
+    for member, content in resources.items():
+        assert (installed.site_packages / member).read_bytes() == content
+    result = subprocess.run(
+        [str(installed.python), "-I", "-c", "import resource_helper;print(resource_helper.VALUE)"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "37"
+
+
+@pytest.mark.parametrize(
+    "member", ["kernel.c", "include.h", "nested/setup.py", "nested/pyproject.toml"]
+)
+def test_project_native_build_resources_still_refuse(tmp_path: Path, member: str) -> None:
+    base = environment.observe_base(Path(sys.executable))
+    project = _wheel(tmp_path, "unsafe_project", (), b"VALUE=1\n", resources={member: b"data\n"})
+    with pytest.raises(environment.EnvironmentRefusal) as caught:
+        environment.measure_wheel(project, "project", base)
+    assert caught.value.code == "package_environment_native_build_input_forbidden"
