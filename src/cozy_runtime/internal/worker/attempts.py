@@ -370,6 +370,8 @@ class AttemptRecord:
     #: the lane's execution contract as ATTESTED by this attempt (cr-109): calls of the
     #: contracted entry against the pinned sites x forwards, and the profiled kernel symbol
     execution_contract: dict[str, Any] = dataclasses_field(default_factory=dict)
+    execution_observation: dict[str, Any] = dataclasses_field(default_factory=dict)
+    capture_result: dict[str, Any] = dataclasses_field(default_factory=dict)
 
     #: the record the plan was PRICED against, resolved once by the executor's kernel
     prepared: PreparedRequest | None = None
@@ -750,6 +752,7 @@ class AttemptEngine:
                     "request_id": f"{attempt.request_id}#{attempt.attempt}",
                     "entrypoint": declared.entrypoint,
                     "payload": attempt.payload,
+                    **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
                     "input_metadata": {
                         name: {
                             "input_id": name,
@@ -1708,6 +1711,7 @@ class AttemptEngine:
         assert attempt.declared is not None and attempt.plan is not None
         return {
             "cmd": "invoke",
+            **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
             "request_id": key,
             "entrypoint": attempt.declared.entrypoint,
             "deadline_s": seconds,
@@ -1741,6 +1745,8 @@ class AttemptEngine:
         attempt.resulted_at = time.perf_counter()
         self.monitor.end(key, "returned")
         attempt.execution_contract = dict(reply.get("execution_contract") or {})
+        attempt.execution_observation = dict(reply.get("execution_observation") or {})
+        attempt.capture_result = dict(reply.get("capture") or {})
         if attempt.execution_contract:
             # WHAT ATTESTED, as a typed row every reader of confessions keys on (cr-109): the
             # throughput table and the gate read the lane by what ran, never by the contract's
@@ -2480,8 +2486,23 @@ class AttemptEngine:
             # mint `attempt_ordinal + 1` and send it elsewhere with no cooldown.
             execution_started=attempt.executions > 0,
         )
+        if attempt.execution_observation:
+            from cozy_runtime.internal.capture_observation import environment
+
+            body.observation.environment.CopyFrom(
+                environment(attempt.execution_observation, boot_id=self.boot_id)
+            )
         if manifest is not None:
             body.output_manifest.CopyFrom(manifest)
+            if attempt.capture_result and any(
+                row.output_id == "runtime.capture" for row in manifest.outputs
+            ):
+                body.observation.capture.CopyFrom(
+                    pb.ActivationCaptureResult(
+                        output_id="runtime.capture",
+                        content_digest=documents.raw(attempt.capture_result["content_digest"]),
+                    )
+                )
         if shortfall is not None:
             body.cause.shortfall.CopyFrom(
                 pb.ResourceShortfall(

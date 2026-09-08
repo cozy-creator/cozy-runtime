@@ -1,7 +1,7 @@
 """Fixed-size activation evidence per (tap, step): a JL sketch plus exact scalars.
 
-Sequential two-pass never keeps two resident models, so a pass cannot keep full taps
-either. Each (tap, step) keeps KILOBYTES: a CountSketch random projection of the flattened
+An ordinary render retains no full activation tensors. Each (tap, step) keeps KILOBYTES:
+a CountSketch random projection of the flattened
 activation — linear, so the sketch of a DIFF is the diff of the sketches, and rel-L2 and
 cosine come out within ~sqrt(2/dim) of exact — beside exact per-run scalars (mean/std,
 max-abs, outlier fraction, NaN/Inf counts). Sketches accumulate in fp32 whatever dtype the
@@ -21,8 +21,6 @@ import math
 from typing import Any
 
 import msgspec
-
-from cozy_runtime.probe._taps import ProbeRefusal
 
 _SEED_DOMAIN = b"cozy.probe.sketch/1"
 
@@ -47,19 +45,6 @@ class Observation(msgspec.Struct):
     std: float
     max_abs: float
     outlier_frac: float
-
-
-class DiffStats(msgspec.Struct, frozen=True):
-    """One report row's numbers. ``None`` marks an undefined stat (a zero norm, an
-    identical pair) — never a NaN or an infinity, which canonical JSON refuses."""
-
-    rel_l2: float | None
-    cosine: float | None
-    snr_db: float | None
-    max_abs_delta: float
-    outlier_frac: float
-    nan_inf_ref: int
-    nan_inf_cand: int
 
 
 class TapStepAccumulator:
@@ -147,51 +132,6 @@ class TapStepAccumulator:
             max_abs=self.max_abs,
             outlier_frac=self.outliers / self.count if self.count else 0.0,
         )
-
-
-def compare(tap: str, step: int, reference: Observation, candidate: Observation) -> DiffStats:
-    """Diff two lanes' evidence for one (tap, step).
-
-    ``rel_l2``/``cosine``/``snr_db`` read the sketches; ``max_abs_delta`` is the delta of
-    the two EXACT max-abs scalars (the elementwise max would need full taps, which the
-    memory design never keeps); ``outlier_frac`` is the candidate side's own exact
-    fraction. NaN/Inf ride as counts per lane.
-    """
-    import torch
-
-    if reference.shapes != candidate.shapes:
-        raise ProbeRefusal(
-            f"tap {tap!r} step {step}: reference fired {reference.shapes}, candidate "
-            f"{candidate.shapes} — lanes change weights, never tensor schema",
-            code="tap_shape_divergence",
-        )
-    ref = reference.sketch.double()
-    cand = candidate.sketch.double()
-    ref_norm = float(torch.linalg.vector_norm(ref))
-    cand_norm = float(torch.linalg.vector_norm(cand))
-    diff_norm = float(torch.linalg.vector_norm(ref - cand))
-    rel_l2: float | None
-    if ref_norm > 0.0:
-        rel_l2 = diff_norm / ref_norm
-    elif diff_norm == 0.0:
-        rel_l2 = 0.0
-    else:
-        rel_l2 = None
-    cosine: float | None = None
-    if diff_norm == 0.0 and ref_norm > 0.0:
-        cosine = 1.0  # identical sketches: exactly aligned, no rounding residue
-    elif ref_norm > 0.0 and cand_norm > 0.0:
-        cosine = max(-1.0, min(1.0, float(torch.dot(ref, cand)) / (ref_norm * cand_norm)))
-    snr_db = -20.0 * math.log10(rel_l2) if rel_l2 is not None and rel_l2 > 0.0 else None
-    return DiffStats(
-        rel_l2=rel_l2,
-        cosine=cosine,
-        snr_db=snr_db,
-        max_abs_delta=abs(reference.max_abs - candidate.max_abs),
-        outlier_frac=candidate.outlier_frac,
-        nan_inf_ref=reference.nan + reference.inf,
-        nan_inf_cand=candidate.nan + candidate.inf,
-    )
 
 
 def _projection(tap: str, firing: int, numel: int, dim: int, device: Any) -> tuple[Any, Any]:

@@ -35,6 +35,7 @@ from cozy_runtime.author._assets import (
     VideoAsset,
     digest_bytes,
 )
+from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import (
     DecodedAudioChunk,
@@ -843,6 +844,9 @@ class Telemetry(_Bound):
         # too. Starting it at the first call would silently drop step 0 from the count — and
         # on a one-step request that is the whole measurement.
         attempt._step_mark = time.perf_counter()
+        capture = _capture_clock.get()
+        if capture is not None:
+            capture.schedule(total)
 
         def on_step(step: int) -> None:
             self._ctx.raise_if_cancelled()
@@ -864,6 +868,8 @@ class Telemetry(_Bound):
                 elif valid_total and isinstance(step, int) and not 0 <= step < total:
                     self._diagnose("step must be within the declared total")
                 return
+            if capture is not None:
+                capture.completed(step)
             raw_fraction = (step + 1) / total
             fraction = round(raw_fraction, 6)
             overall = None
