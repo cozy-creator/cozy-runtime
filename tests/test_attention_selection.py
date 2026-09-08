@@ -138,7 +138,11 @@ def test_a_site_is_admitted_by_its_own_dtype_and_head_dimension(
 
 def test_the_device_alone_decides_which_ranked_kernels_are_even_candidates() -> None:
     """The pure half of the rule: no import, no image, just the card. A device below a
-    kernel's floor never sees it, and every device sees the floor last."""
+    kernel's floor never sees it, and every device sees the floor last.
+
+    A BAKED kernel's ceiling is not here, and that is deliberate: it lives in the artifact,
+    which this half is not allowed to read. So sm_100 and sm_120 still list `flash-attn3`
+    here and are refused one step later, at resolution, by the binary's own declaration."""
     for device in (_device(0, kind="cpu"), _device(70), _device(89)):
         assert [c.name for c in attention.for_device(device)] == ["sdpa"]
     assert [c.name for c in attention.for_device(_device(90))] == ["flash-attn3", "sdpa"]
@@ -148,6 +152,161 @@ def test_the_device_alone_decides_which_ranked_kernels_are_even_candidates() -> 
         offered = [entry.name for entry in attention.available(device)]
         ranked = [candidate.name for candidate in attention.for_device(device)]
         assert offered == [name for name in ranked if name in offered]
+
+
+# ----------------------------------------------------------- the range is bounded ABOVE too
+
+
+def test_every_candidate_states_the_architectures_it_serves_and_where_that_came_from() -> None:
+    """h3a-022. The defect was an OPEN-ENDED range: `min_sm=90` and nothing above it, on an
+    entry whose `.so` carries `sm_90a` and dies from C++ anywhere else. So every entry now
+    answers "and up to what?", and the answer comes from one of exactly two places.
+
+    A BAKED entry answers with its artifact and declares no `max_sm` at all — a static copy of
+    a binary's arch list is the thing that drifted. Everything else declares one, and a 0 is a
+    CLAIM about a dispatcher that owns its own fallback, not a field nobody filled in."""
+    for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
+        assert not (candidate.baked and candidate.max_sm), candidate.name
+        assert not candidate.max_sm or candidate.max_sm >= candidate.min_sm, candidate.name
+    # The two shapes, named. `flash-attn3` is the artifact-bounded one; `sageattention` is
+    # bounded here because its architecture is IN ITS BACKEND NAME and so cannot drift; the
+    # two torch backends are unbounded because torch, not this image, builds them.
+    assert attention.BY_NAME["flash-attn3"].baked and not attention.BY_NAME["flash-attn3"].max_sm
+    assert attention.BY_NAME["sageattention"].max_sm == 90
+    assert attention.BY_NAME["sageattention"].backend.endswith("sm90")
+    assert attention.BY_NAME["cudnn"].max_sm == 0 and attention.BY_NAME["sdpa"].max_sm == 0
+    # The floor may never be bounded above: a card it refused would hold no attention at all.
+    assert attention.CANDIDATES[-1].name == "sdpa"
+    assert attention.CANDIDATES[-1].min_sm == 0 and attention.CANDIDATES[-1].max_sm == 0
+
+
+@pytest.mark.parametrize(
+    ("declared", "sm", "covers"),
+    [
+        # The baked snapshot's own two entries, against every card the published ladder binds.
+        ("9.0a", 90, True),  # H100/H200 — the only card this image's FA3 has an image for
+        ("9.0a", 100, False),  # B200
+        ("9.0a", 120, False),  # RTX PRO 6000 Blackwell / RTX 5090 — the abort h3a-022 measured
+        ("8.0", 90, False),  # never across a major generation, however close the numbers
+        ("8.0", 120, False),
+        # NVIDIA's binary-compatibility rule: X.y runs on X.z for z >= y, same major only.
+        ("8.0", 80, True),
+        ("8.0", 86, True),
+        ("8.0", 89, True),
+        ("8.6", 80, False),
+        # An ACCELERATED target is architecture-conditional and does not even carry forward to
+        # a higher minor of its own generation; a FAMILY target does.
+        ("12.0a", 121, False),
+        ("12.0f", 121, True),
+        ("12.0", 121, True),
+        ("12.1a", 121, True),
+        # Spellings a kernel-builder artifact and a torch arch list actually use.
+        ("sm_120", 120, True),
+        ("compute_90a", 90, True),
+        # UNREADABLE IS NOT COVERED. A declaration this runtime cannot parse must never admit
+        # a kernel it could not check, because the failure it is checking for is unrecoverable.
+        ("", 90, False),
+        ("hopper", 90, False),
+        ("9.x", 90, False),
+    ],
+)
+def test_device_code_covers_a_card_by_nvidias_rule_and_never_by_optimism(
+    declared: str, sm: int, covers: bool
+) -> None:
+    assert attention._covers(declared, sm) is covers
+
+
+def test_a_static_ceiling_refuses_the_card_by_name_instead_of_reaching_the_kernel() -> None:
+    """RED ARM, no plant and no device: `sageattention`'s declared range excludes sm_120, so a
+    pin naming it there is refused BY NAME rather than admitted and probed.
+
+    Admitting it is what the old table did, and probing it is what would then have run the
+    kernel: h3a-022 measured `cudaErrorNoKernelImageForDevice` out of this extension on an
+    sm_120 card, from an image that builds it `arch=compute_90a,code=sm_90a`."""
+    refused = _refusal(lambda: attention.pinned("sageattention", _device(120)))
+    assert refused.code == "attention_kernel_unsupported"
+    assert "sageattention serves sm90 only" in str(refused)
+    assert "sm120" in str(refused)
+    # The refusal is also the discoverability (cr-125): it says what this card CAN run.
+    assert "This image runs" in str(refused)
+    # And the same entry on the card it does claim gets past the device gate, so the ceiling
+    # is a bound and not a blanket refusal — sm90 reaches resolution and fails on absence.
+    assert _refusal(lambda: attention.pinned("sageattention", _device(90))).code == (
+        "attention_kernel_absent"
+    )
+    # The device gate is applied wherever a candidate is offered, not only at the pin.
+    assert "sageattention" not in attention.image_kernels(_device(120))
+
+
+def test_a_baked_kernels_ceiling_is_read_from_the_artifact_and_refuses_the_card_by_name(
+    tmp_path: Path,
+) -> None:
+    """THE DEFECT, closed against the REAL baked metadata. `backend.archs` below is verbatim
+    from `kernels-community/flash-attn3` at revision `7cb368cf…`, variant
+    `torch-stable-abi29-cu130-x86_64-linux` — the exact snapshot the cu130 worker image bakes
+    at `/opt/cozy/kernels/flash-attn3` and the exact one h3a-022 measured aborting on sm_120.
+
+    The whole point of reading it is that the runtime never had to be told: the table said
+    `min_sm=90` with no ceiling, the binary said `9.0a`, and the two disagreed for as long as
+    nobody compared them. Now the artifact is the authority.
+
+    No `kernels` distribution, no diffusers and no CUDA device are needed to reach this — the
+    gate runs before any of them, because a card the binary has no image for must be refused
+    wherever this code runs, not only where the rest of the stack happens to be installed."""
+    variant = "torch-stable-abi29-cu130-x86_64-linux"
+    build = tmp_path / "flash-attn3" / "build" / variant
+    build.mkdir(parents=True)
+    (build / "metadata.json").write_text(
+        json.dumps(
+            {
+                "name": "flash-attn3",
+                "id": "_flash_attn3_cuda_0f52d9d",
+                "version": 1,
+                "license": "BSD-3-Clause",
+                "backend": {"type": "cuda", "archs": ["8.0", "9.0a"]},
+            }
+        )
+    )
+    real = attention.IMAGE_KERNELS_DIR
+    attention.IMAGE_KERNELS_DIR = tmp_path
+    try:
+        flash = attention.BY_NAME["flash-attn3"]
+        assert attention._baked_archs(flash) == {variant: ["8.0", "9.0a"]}
+
+        # B200 and the 5090 rung of the published `paul/minimax-h3` ladder. Both are refused
+        # by name, and neither reaches the kernel — which is the only outcome that helps,
+        # because the kernel's answer is `exit(1)` and not an exception.
+        for sm in (100, 120):
+            refused = _refusal(lambda card=sm: attention.pinned("flash-attn3", _device(card)))
+            assert refused.code == "attention_kernel_unsupported"
+            assert variant in str(refused) and "'9.0a'" in str(refused)
+            assert f"sm{sm}" in str(refused)
+            assert "exits the process from C++" in str(refused)
+            # AUTO drops it rather than failing the prepare, and never calls it either.
+            assert "flash-attn3" not in [e.name for e in attention.available(_device(sm))]
+            assert "flash-attn3" not in attention.image_kernels(_device(sm))
+
+        # GREEN: the card the artifact DOES declare gets through the arch gate and fails
+        # further in, on what this environment actually lacks. A gate that refused everything
+        # would pass the red arms above while shipping nothing.
+        assert _refusal(lambda: attention.pinned("flash-attn3", _device(90))).code == (
+            "attention_kernel_absent"
+        )
+
+        # SILENCE IS NOT ADMISSION. A baked variant that declares no architecture is refused
+        # on every card, because a check that read nothing must not look like one that passed.
+        (build / "metadata.json").write_text(json.dumps({"name": "flash-attn3", "version": 1}))
+        assert attention._baked_archs(flash) == {variant: []}
+        assert _refusal(lambda: attention.pinned("flash-attn3", _device(90))).code == (
+            "attention_kernel_unsupported"
+        )
+    finally:
+        attention.IMAGE_KERNELS_DIR = real
+    # And with no snapshot baked at all the answer is ABSENT, as it always was: an image that
+    # ships no kernel is not an image that ships one for the wrong card.
+    assert _refusal(lambda: attention.pinned("flash-attn3", _device(90))).code == (
+        "attention_kernel_absent"
+    )
 
 
 def test_a_candidate_that_fails_to_resolve_for_any_reason_drops_out_of_auto() -> None:
@@ -277,6 +436,13 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     assert out["too_old"]["code"] == "attention_kernel_unsupported"
     assert out["absent"]["code"] == "attention_kernel_absent"
     assert "sdpa" in out["image_kernels"]
+    # A device refusal names what this image and card DO run, so the developer who pinned a
+    # kernel that cannot serve here is not left guessing (cr-125's discoverability rule).
+    assert "This image runs" in out["too_old"]["detail"]
+    # h3a-022, through the real registry: the range is bounded ABOVE as well as below, and the
+    # card above the ceiling is refused by name rather than probed.
+    assert out["too_new"]["code"] == "attention_kernel_unsupported"
+    assert "sageattention serves sm90 only" in out["too_new"]["detail"]
 
     # And the pin computes: one real forward through the pinned site.
     assert out["forward"] == {"shape": [1, 64, 1024], "dtype": "torch.bfloat16"}
