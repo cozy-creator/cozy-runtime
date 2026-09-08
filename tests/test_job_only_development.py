@@ -57,9 +57,7 @@ def test_empty_interface_still_refuses() -> None:
 
 
 @pytest.mark.parametrize("kind", ["job", "entrypoint", "modeled"])
-def test_metadata_placement_never_imports_source(
-    tmp_path: Path, kind: str
-) -> None:
+def test_metadata_placement_never_imports_source(tmp_path: Path, kind: str) -> None:
     module = f"never_import_placement_{kind}"
     marker = tmp_path / "imported"
     (tmp_path / "package.toml").write_text(f'[application]\nobject = "{module}:app"\n')
