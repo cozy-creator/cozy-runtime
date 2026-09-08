@@ -98,6 +98,8 @@ def _callable(surface: Surface) -> dict[str, Json]:
                 row["max_bytes"] = bound.max_bytes
             if bound and bound.max_decoded_bytes is not None:
                 row["max_decoded_bytes"] = bound.max_decoded_bytes
+            if cls.kind == "image" and binding.image_preparation is not None:
+                row["prepare"] = dict(binding.image_preparation.descriptor())
             kinds.append(row)
         slot: dict[str, Json] = {"parameter": binding.parameter, "kinds": kinds}
         if binding.decoded:
@@ -487,7 +489,7 @@ def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
         row = _closed(
             value,
             {"kind", "media_types"},
-            {"max_bytes", "max_decoded_bytes", "max_count"},
+            {"max_bytes", "max_decoded_bytes", "max_count", "prepare"},
             source,
             path,
         )
@@ -511,6 +513,21 @@ def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
             ):
                 _invalid(source, path, "assets MIME types must be distinct and canonical")
             media.add(mime)
+        if "prepare" in row:
+            if kind != "image" or slot.get("view") != "decoded":
+                _invalid(source, path, "image preparation needs decoded image Assets")
+            preparation = _closed(
+                row["prepare"], {"profile"}, {"max_edge", "max_pixels"}, source, path + ".prepare"
+            )
+            if preparation["profile"] != "image-fit/1" or not any(
+                key in preparation for key in ("max_edge", "max_pixels")
+            ):
+                _invalid(source, path, "unknown or empty image preparation")
+            for key in ("max_edge", "max_pixels"):
+                if key in preparation and (
+                    type(preparation[key]) is not int or cast(int, preparation[key]) <= 0
+                ):
+                    _invalid(source, path, "image preparation caps must be positive integers")
         for limit in ("max_bytes", "max_decoded_bytes"):
             if limit in row and (type(row[limit]) is not int or cast(int, row[limit]) <= 0):
                 _invalid(source, path, "assets byte limits must be positive integers")

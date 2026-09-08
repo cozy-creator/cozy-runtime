@@ -22,6 +22,7 @@ from typing import Any, ClassVar, Final, Literal, Self, cast, get_args, overload
 from PIL.Image import Image as Image
 
 from cozy_runtime.author._errors import CapabilityError, PreflightViolation
+from cozy_runtime.author._markers import ImagePreparation
 from cozy_runtime.author._walker import strip, unwrap_optional
 
 _UNBOUND: Final = ""
@@ -34,6 +35,7 @@ class Asset:
     __slots__ = (
         "_attempt",
         "_fidelity",
+        "_image_preparation",
         "_input_id",
         "_label",
         "_local",
@@ -65,6 +67,7 @@ class Asset:
         self._local = local
         self._attempt = attempt
         self._input_id = ""
+        self._image_preparation: ImagePreparation | None = None
         self._fidelity: Fidelity = "auto"
         self._label = ""
         self._position = -1

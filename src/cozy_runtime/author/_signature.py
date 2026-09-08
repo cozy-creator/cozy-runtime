@@ -32,7 +32,13 @@ from cozy_runtime.author._assets import (
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import DECODED_ASSET_TYPES, DEFAULT_DECODE_LIMITS
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import AssetBound, AssetLimits, Bound, _PreflightMarker
+from cozy_runtime.author._markers import (
+    AssetBound,
+    AssetLimits,
+    Bound,
+    ImagePreparation,
+    _PreflightMarker,
+)
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
@@ -75,11 +81,14 @@ class AssetsBinding:
     decoded: bool = False
     counts: tuple[tuple[str, int], ...] = ()
     max_length: int | None = None
+    image_preparation: ImagePreparation | None = None
 
     @property
     def wire_type(self) -> object:
         _, declared = strip(self.annotation)
-        markers = tuple(marker for marker in declared if not isinstance(marker, AssetLimits))
+        markers = tuple(
+            marker for marker in declared if not isinstance(marker, (AssetLimits, ImagePreparation))
+        )
         if self.max_length is not None and not any(
             isinstance(marker, msgspec.Meta) and marker.max_length is not None for marker in markers
         ):
@@ -109,10 +118,12 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
     decoded: bool | None = None
     for option in options:
         cls, markers = strip(option)
-        if any(isinstance(marker, AssetLimits) for marker in markers):
-            raise ConformanceError(
-                "AssetLimits annotates the Assets collection", code="asset_limits"
-            )
+        for marker in markers:
+            if isinstance(marker, (AssetLimits, ImagePreparation)):
+                raise ConformanceError(
+                    f"{type(marker).__name__} annotates the Assets collection",
+                    code="asset_limits" if isinstance(marker, AssetLimits) else "image_preparation",
+                )
         value_type = cls in DECODED_ASSET_TYPES
         if decoded is not None and value_type != decoded:
             raise ConformanceError(
@@ -163,6 +174,13 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
         for marker in metadata
     ):
         raise ConformanceError("Assets minimum exceeds its total limit", code="asset_limits")
+    preparations = [marker for marker in metadata if isinstance(marker, ImagePreparation)]
+    if preparations and (not decoded or "image" not in kinds):
+        raise ConformanceError(
+            "ImagePreparation requires decoded image Assets", code="image_preparation"
+        )
+    if preparations and any(marker != preparations[0] for marker in preparations[1:]):
+        raise ConformanceError("conflicting ImagePreparation markers", code="image_preparation")
     return AssetsBinding(
         name,
         annotation,
@@ -170,6 +188,7 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
         bool(decoded),
         tuple(sorted(counts.items())),
         max_length,
+        preparations[0] if preparations else None,
     )
 
 
@@ -363,10 +382,15 @@ def analyze(
             )
         annotation = hints[parameter.name]
         base, markers = strip(annotation)
-        if any(isinstance(marker, AssetLimits) for marker in markers) and not (
-            base is Assets or get_origin(base) is Assets
-        ):
-            raise ConformanceError("AssetLimits annotates an Assets input", code="asset_limits")
+        if not (base is Assets or get_origin(base) is Assets):
+            for marker in markers:
+                if isinstance(marker, (AssetLimits, ImagePreparation)):
+                    raise ConformanceError(
+                        f"{type(marker).__name__} annotates an Assets input",
+                        code="asset_limits"
+                        if isinstance(marker, AssetLimits)
+                        else "image_preparation",
+                    )
         if base is Assets or get_origin(base) is Assets:
             if parameter.default is not parameter.empty:
                 raise ConformanceError("Assets inputs cannot have defaults", code="assets_default")
