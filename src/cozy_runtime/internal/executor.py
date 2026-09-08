@@ -2519,13 +2519,13 @@ class Executor:
             elif row.get("native_effect"):
                 from cozy_runtime.internal import effect_interfaces
 
-                binding = effect_interfaces.bindings().get((interface, module, export))
-                if binding is None:
+                effect_binding = effect_interfaces.bindings().get((interface, module, export))
+                if effect_binding is None:
                     raise CapabilityError(
                         "native effect interface differs from the fixed service",
                         code="child_interface",
                     )
-                bindings[("", module, export)] = binding
+                bindings[("", module, export)] = effect_binding
             elif row.get("self"):
                 assert self.discovered is not None
                 surface = next(
