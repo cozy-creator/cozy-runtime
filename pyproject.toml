@@ -28,6 +28,8 @@ dependencies = [
 dev = [
     "mypy>=1.13",
     "pytest>=8.4",
+    # The public capture reader validates the writer contract in tests.
+    "cozy-eval==0.4.0",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
     "tensorfs>=0.3.22,<0.3.23",

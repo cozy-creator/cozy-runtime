@@ -9,8 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import msgspec
+
 from cozy_runtime.author._calls import MAX_CALL_BYTES, MAX_DIRECT_CALLS
+from cozy_runtime.author._capture import ActivationCapture
+from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.internal import canonical, package_interface
+from cozy_runtime.internal.capture_observation import document as observation_document
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -116,14 +121,30 @@ class Calls:
                         "state": "succeeded",
                         "child_request_id": result.child_request_id,
                         "result": result.result_canonical_bytes.decode(),
+                        **(
+                            {"observation": observation_document(result.observation)}
+                            if result.HasField("observation")
+                            else {}
+                        ),
                     }
                 return {
                     "ok": False,
+                    **(
+                        {"observation": observation_document(result.observation)}
+                        if result.HasField("observation")
+                        else {}
+                    ),
                     "code": result.safe_code or "child_failed",
                     "detail": result.safe_detail,
                     "child_request_id": result.child_request_id,
                 }
-            except (OSError, ValueError, canonical.CanonicalError, documents.DocumentError) as exc:
+            except (
+                OSError,
+                ValueError,
+                InvalidRequest,
+                canonical.CanonicalError,
+                documents.DocumentError,
+            ) as exc:
                 return {"ok": False, "code": "child_call_refused", "detail": str(exc)[:1024]}
 
     def _request(
@@ -151,6 +172,11 @@ class Calls:
         value = canonical.parse_canonical(payload.encode())
         if not isinstance(value, dict):
             raise ValueError("call request must be a canonical object")
+        capture = None
+        if frame.get("capture") is not None:
+            if self.minor() < 43:
+                raise ValueError("owner does not support capture")
+            capture = msgspec.convert(frame["capture"], type=ActivationCapture, strict=True)
         digest = hashlib.sha256(
             canonical.write(
                 {
@@ -158,6 +184,7 @@ class Calls:
                     "module": module,
                     "export": export,
                     "request": value,
+                    **({"capture": capture.document()} if capture is not None else {}),
                 }
             )
         ).digest()
@@ -171,6 +198,9 @@ class Calls:
             export=export,
             request_canonical_bytes=payload.encode(),
             intent_digest=digest,
+            capture=pb.ActivationCapture(components=capture.components, steps=capture.steps)
+            if capture is not None
+            else None,
         )
 
     def absorb(self, result: pb.ChildCallResult) -> bool:
@@ -203,6 +233,11 @@ class Calls:
                 and not result.child_request_id
             ):
                 return False
+            if result.HasField("observation"):
+                try:
+                    observation_document(result.observation)
+                except (ValueError, documents.DocumentError):
+                    return False
             if result.state == pb.CHILD_CALL_STATE_SUCCEEDED:
                 try:
                     canonical.parse_canonical(result.result_canonical_bytes)

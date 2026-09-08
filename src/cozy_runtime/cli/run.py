@@ -21,7 +21,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.author import ConformanceError
+import msgspec
+
+from cozy_runtime.author import ActivationCapture, ConformanceError, InvalidRequest
 from cozy_runtime.cli import payload as payload_grammar
 from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.internal import bindings as binding_table
@@ -50,6 +52,7 @@ VALUE_FLAGS = (
     "--input",
     "--org",
     "--tensorfs-root",
+    "--capture",
 )
 BOOL_FLAGS = ("--offline", "--stream", "--strict-keys")
 
@@ -197,6 +200,22 @@ def run(
             "model:<parameter> bindings and never guesses a local model or loads one",
             Exit.structural,
         )
+    capture = None
+    if flags.get("--capture"):
+        from cozy_runtime.probe._capture import validate_components
+
+        try:
+            capture = msgspec.json.decode(flags["--capture"][-1], type=ActivationCapture)
+            validate_components(capture, [slot.model_class for slot in slots])
+            if kind != "entrypoint":
+                raise InvalidRequest("capture is an entrypoint option", code="capture_mode")
+        except (ValueError, msgspec.DecodeError, InvalidRequest) as exc:
+            raise CliError(
+                "capture",
+                str(exc),
+                "pass --capture as an ActivationCapture JSON object",
+                Exit.validation,
+            ) from exc
     overrides = _overrides(flags.get("--model") or [], slots)
     tensorfs_root: Path | None = None
     if slots:
@@ -257,6 +276,7 @@ def run(
     request = LocalRequest(
         entrypoint=function,
         payload=document,
+        capture=capture,
         outputs=outputs,
         request_id=f"cli-{function}",
         timeout_ms=_timeout((flags.get("--timeout") or [""])[0]),
@@ -556,6 +576,7 @@ def _render(
     document: dict[str, Any] = {
         "status": status,
         "result": outcome.result,
+        "observation": terminal.get("observation"),
         "outputs": saved,
         "invocation": outcome.invocation,
         "accepted": accepted,

@@ -159,6 +159,19 @@ wheels = [
 ]
 
 [[package]]
+name = "cozy-eval"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "msgspec" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/47/be8ded1dbc4d520d588a8770a0c7e597c7edd42d8949eb3006a7df5a1e45/cozy_eval-0.4.0.tar.gz", hash = "sha256:6f1193f3984222415b8db404a8d601cda58d14e903138f6818811493bc3d90ff", size = 1834890, upload-time = "2026-09-08T06:21:58.108Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/6d/e5f9de8ef070302df96e300eada3a4047c9299d72618832d9e061438420a/cozy_eval-0.4.0-py3-none-any.whl", hash = "sha256:4442b4ad918e9233263598bd60655620fb01d6118afc23bc7a8b06b380df4d07", size = 337794, upload-time = "2026-09-08T06:21:56.473Z" },
+]
+
+[[package]]
 name = "cozy-runtime"
 version = "0.7.2"
 source = { editable = "." }
@@ -191,6 +204,7 @@ model-execution = [
 [package.dev-dependencies]
 dev = [
     { name = "av" },
+    { name = "cozy-eval" },
     { name = "mypy" },
     { name = "numpy" },
     { name = "pytest" },
@@ -220,6 +234,7 @@ provides-extras = ["derive", "corpus", "media", "model-execution"]
 [package.metadata.requires-dev]
 dev = [
     { name = "av", specifier = ">=18.1,<19" },
+    { name = "cozy-eval", specifier = "==0.4.0" },
     { name = "mypy", specifier = ">=1.13" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=8.4" },
