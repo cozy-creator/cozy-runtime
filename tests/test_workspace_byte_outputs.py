@@ -6,6 +6,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import grpc
 import pytest
@@ -15,7 +16,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker import workspace_memo
 from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
-from cozy_runtime.internal.worker.attempts import AttemptEngine
+from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRecord
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_rpc import Service, WorkspaceRPC
 from cozy_runtime.protocol import documents
@@ -95,11 +96,14 @@ def test_reserved_capture_grant_commits_native_tree_without_author_asset(tmp_pat
         _publication=lambda *args: SimpleNamespace(document=lambda: {}, digest=lambda: b"r" * 32),
         records=SimpleNamespace(append=lambda *args: None),
     )
-    result, error = AttemptEngine._tail(engine, attempt, {"outputs": [], "capture": capture})
+    # Only the post-processing collaborators are needed; TensorFS custody is real.
+    post = cast(AttemptEngine, engine)
+    record = cast(AttemptRecord, attempt)
+    result, error = post._tail(record, {"outputs": [], "capture": capture})
     assert error is None and result is not None
     assert [entry.output_id for entry in result.outputs] == ["runtime.capture"]
     assert result.outputs[0].native_tree.content_bytes == len(metadata) + len(sketches)
-    missing, error = AttemptEngine._tail(engine, attempt, {"outputs": []})
+    missing, error = post._tail(record, {"outputs": []})
     assert missing is None and error is not None and error.startswith("capture_output_absent:")
 
 
