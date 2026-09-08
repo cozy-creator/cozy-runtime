@@ -1,0 +1,530 @@
+"""The runtime picks the fastest attention kernel this device and this image support (cr-124).
+
+ATTENTION IS WEIGHTLESS. No checkpoint stores an attention kernel, so no checkpoint can name
+one, and binding a kernel to a lane pointer was a category error (decision #707 as amended
+2026-09-08). The only genuine weight-to-kernel coupling is in the GEMMs — fp8-rowwise weights need a
+rowwise-fp8 GEMM, mxfp8 needs block scales — and that coupling is already expressed by the
+checkpoint's own weight encoding plus `resolution.py`'s encoded-leaf routing. It needs no
+contract, and neither does this.
+
+THE RULE IS STATIC AND VERSIONED. `CANDIDATES` is an ordered table whose order is MEASURED on
+the device it claims, never asserted from a vendor's benchmark. Selection walks it and takes
+the first entry this device admits, this image ships, and the attention site's own dtype and
+head dimension fit. Nothing is measured at run time and nothing falls back per call, so what
+ran is a pure function of (device, image digest, checkpoint) — which is why one BOOT line is
+the whole record and no per-attempt attestation is kept.
+
+A NUMERICS-CHANGING KERNEL IS NOT AUTOMATICALLY FASTER. 8-bit attention (SageAttention2) is
+admitted by owner ruling but is NOT ranked: nothing has measured it against FA3 on our shapes,
+and ranking an unmeasured kernel first would be a claim rather than a fact. It sits in
+`PINNABLE` and is reachable through the execution-path override (cr-125), which is the tool
+that would produce the measurement that promotes it.
+"""
+
+from __future__ import annotations
+
+import json
+from collections import deque
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
+from importlib import import_module, metadata
+from pathlib import Path
+from typing import Any
+
+from cozy_runtime.internal.anima_optimization import DIFFUSERS_VERSION
+from cozy_runtime.internal.encoding import DeviceFacts
+
+try:
+    from kernels import get_local_kernel
+except ImportError as _absent_kernels:  # pragma: no cover - exercised by the absent arm
+    KERNELS_ABSENT = f"does not import ({_absent_kernels})"
+else:
+    KERNELS_ABSENT = ""
+
+#: Where the worker image bakes `kernels` Hub snapshots (tensorhub's cu130 Dockerfile):
+#: `<distribution>/build/<variant>/` holds one built variant and its metadata. Nothing here is
+#: fetched — a pod's executor has no network for it.
+IMAGE_KERNELS_DIR = Path("/opt/cozy/kernels")
+
+
+class AttentionRefusal(RuntimeError):
+    """A typed refusal on the attention axis. Only a PIN can raise one; auto never does."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class Candidate:
+    """One attention kernel the runtime knows how to reach, and what it needs to run."""
+
+    #: The stable public name. This is the execution-path override's vocabulary (cr-125) and
+    #: the word the boot line prints; it is NOT diffusers' backend spelling, which is an
+    #: implementation detail of the version we pin.
+    name: str
+    #: diffusers' backend member value at `DIFFUSERS_VERSION`.
+    backend: str
+    #: The lowest CUDA compute capability, as `DeviceFacts.sm` spells it (90 = sm90).
+    min_sm: int
+    #: Activation dtypes the kernel takes. Empty = any (torch's own dispatch).
+    dtypes: frozenset[str]
+    #: The largest per-head dimension the kernel serves. 0 = unbounded.
+    max_head_dim: int
+    #: A `kernels` Hub snapshot the image BAKES, by distribution directory name; empty for a
+    #: kernel that is installed as an ordinary distribution or is torch's own.
+    baked: str = ""
+    #: An installed distribution this kernel needs, by project name; empty when torch's own.
+    distribution: str = ""
+    #: Why this entry sits where it sits. A rank is a MEASUREMENT or it is not a rank.
+    why: str = ""
+
+
+#: RANKED, FASTEST FIRST — and every rank cites the run that put it there. A kernel with no
+#: measurement ON THIS DEVICE is not ranked, because a rank we cannot cite is a guess.
+#: Reordering this table changes what a pod computes, so it moves with the runtime version
+#: and with nothing else.
+CANDIDATES: tuple[Candidate, ...] = (
+    Candidate(
+        name="flash-attn3",
+        backend="_flash_3_hub",
+        min_sm=90,
+        dtypes=frozenset({"bfloat16", "float16"}),
+        max_head_dim=256,
+        baked="flash-attn3",
+        why=(
+            "MEASURED on an H100 SXM (h3a-012, one DiT forward at S=106,932): 22.84 s of "
+            "attention against cuDNN's 28.45 s — 718 vs 576 TF/s, 29.02 vs 34.70 s per "
+            "forward. On the SERVED path (th-186 run 410, FL2VA 5 s / 30 steps) 159.6 s "
+            "execution against a paired 181.2 s control: -14.3 % s/step. Same math to "
+            "kernel-precision noise: max abs 1.2e-7, rel L2 2.8e-10, audio bit-identical"
+        ),
+    ),
+    Candidate(
+        name="sdpa",
+        backend="native",
+        min_sm=0,
+        dtypes=frozenset(),
+        max_head_dim=0,
+        why=(
+            "torch's own `scaled_dot_product_attention` dispatch, and the FLOOR: it takes "
+            "every dtype, head dimension and mask, so a site no ranked kernel admits still "
+            "runs. It is not a fallback nobody measured — on sm90 torch's C++ chooser already "
+            "selects cuDNN (h3a-012: 34.70 s/forward, the arm every H3 number is quoted "
+            "against), which is why pinning cuDNN explicitly buys nothing"
+        ),
+    ),
+)
+
+#: ADMITTED AND NAMEABLE, BUT NOT RANKED. Two different reasons, both the same rule: a rank is
+#: a measurement. Name one with the execution-path override (cr-125) to measure it; a
+#: measurement that beats the table promotes it into `CANDIDATES` in a runtime release.
+PINNABLE: tuple[Candidate, ...] = (
+    Candidate(
+        name="cudnn",
+        backend="_native_cudnn",
+        min_sm=80,
+        dtypes=frozenset({"bfloat16", "float16"}),
+        max_head_dim=128,
+        why=(
+            "MEASURED SLOWER than the floor it duplicates (h3a-012): 34.99 s against 34.70 s, "
+            "because diffusers' wrapper adds three `.contiguous()` around the same cuDNN "
+            "kernel torch already picks. Nameable so the reference arm can be pinned "
+            "explicitly, never chosen"
+        ),
+    ),
+    Candidate(
+        name="sageattention",
+        backend="_sage_qk_int8_pv_fp8_cuda_sm90",
+        min_sm=90,
+        dtypes=frozenset({"bfloat16", "float16"}),
+        max_head_dim=128,
+        distribution="sageattention",
+        why=(
+            "8-bit attention: Q/K int8 per-thread, V fp8-e4m3 per-channel, fp32+fp32 PV. It "
+            "CHANGES THE NUMBERS, which the owner admits (2026-09-08), but it has never been "
+            "timed against flash-attn3 on our shapes — h3a-013 has no run — so it is "
+            "nameable and not chosen"
+        ),
+    ),
+)
+
+#: Every kernel the override may name, by public name.
+BY_NAME: dict[str, Candidate] = {c.name: c for c in (*CANDIDATES, *PINNABLE)}
+
+
+@dataclass(frozen=True, slots=True)
+class Ready:
+    """One candidate PROVEN present in this environment, with diffusers' member for it."""
+
+    candidate: Candidate
+    member: Any
+    location: str = ""
+    """A baked kernel's variant directory; empty otherwise."""
+
+    @property
+    def name(self) -> str:
+        return self.candidate.name
+
+
+def _registry() -> Any:
+    """diffusers' attention backend registry at the reviewed version, or a typed absence."""
+    try:
+        installed = metadata.version("diffusers")
+    except metadata.PackageNotFoundError as exc:
+        raise AttentionRefusal(
+            "attention_kernel_absent", "diffusers is not installed; attention backends are its"
+        ) from exc
+    if installed != DIFFUSERS_VERSION:
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"the reviewed attention backends are diffusers=={DIFFUSERS_VERSION}; this "
+            f"environment installs {installed}",
+        )
+    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+
+    return _AttentionBackendRegistry
+
+
+def _member(backend: str) -> Any:
+    from diffusers.models.attention_dispatch import AttentionBackendName
+
+    return AttentionBackendName(backend)
+
+
+def _load_baked(candidate: Candidate) -> tuple[Any, str]:
+    """Load the image's baked snapshot into diffusers' Hub slot so nothing is fetched.
+
+    diffusers resolves a Hub kernel over the network on first use; filling `kernel_fn` and the
+    wrapped forward/backward slots makes `_maybe_download_kernel_for_backend` a no-op, which
+    is the only reason a pod without egress can run FlashAttention-3 at all.
+    """
+    if KERNELS_ABSENT:
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"{candidate.name} loads through the `kernels` distribution, which {KERNELS_ABSENT}",
+        )
+    location = IMAGE_KERNELS_DIR / candidate.baked
+    builds = location / "build"
+    variants = (
+        sorted(p for p in builds.iterdir() if (p / "metadata.json").is_file())
+        if (builds.is_dir())
+        else []
+    )
+    if not variants:
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"{candidate.name} is not baked under {builds}; the worker image bakes it there "
+            "and this executor has no network to fetch it",
+        )
+    try:
+        module = get_local_kernel(location)
+    except Exception as exc:
+        # A snapshot this torch cannot load is an ABSENT kernel, not a crash: the image
+        # baked a variant built for another ABI, and the floor still serves.
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"{candidate.name} does not load from {location}: {type(exc).__name__}: {exc}",
+        ) from exc
+    loaded = Path(str(getattr(module, "__file__", ""))).resolve().parent
+    from diffusers.models.attention_dispatch import _HUB_KERNELS_REGISTRY
+
+    member = _member(candidate.backend)
+    if member not in _HUB_KERNELS_REGISTRY:
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"diffusers=={DIFFUSERS_VERSION} does not resolve {candidate.backend!r} through "
+            "its Hub-kernel registry, so a baked snapshot cannot be placed in its slot",
+        )
+    config = _HUB_KERNELS_REGISTRY[member]
+    config.kernel_fn = _lookup(module, config.function_attr, candidate.name)
+    for attr, slot in (
+        ("wrapped_forward_attr", "wrapped_forward_fn"),
+        ("wrapped_backward_attr", "wrapped_backward_fn"),
+    ):
+        dotted = getattr(config, attr)
+        if dotted:
+            setattr(config, slot, _lookup(module, dotted, candidate.name))
+    return member, str(loaded)
+
+
+def _lookup(module: Any, dotted: str, name: str) -> Any:
+    entry: Any = module
+    for part in dotted.split("."):
+        entry = getattr(entry, part, None)
+        if entry is None:
+            raise AttentionRefusal("attention_kernel_absent", f"{name} does not expose {dotted}")
+    return entry
+
+
+def _resolve(candidate: Candidate) -> Ready:
+    """One candidate, proven present here, or a typed absence naming what is missing."""
+    registry = _registry()
+    member = _member(candidate.backend)
+    if member not in registry._backends:
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"diffusers=={DIFFUSERS_VERSION} registers no backend {candidate.backend!r}",
+        )
+    if candidate.baked:
+        loaded_member, location = _load_baked(candidate)
+        return Ready(candidate, loaded_member, location)
+    if candidate.distribution:
+        try:
+            installed = metadata.version(candidate.distribution)
+        except metadata.PackageNotFoundError as exc:
+            raise AttentionRefusal(
+                "attention_kernel_absent",
+                f"{candidate.name} needs the {candidate.distribution} distribution, which "
+                "this image does not install",
+            ) from exc
+        try:
+            import_module(candidate.distribution.replace("-", "_"))
+        except Exception as exc:
+            raise AttentionRefusal(
+                "attention_kernel_absent",
+                f"{candidate.distribution}=={installed} does not import: "
+                f"{type(exc).__name__}: {exc}",
+            ) from exc
+    return Ready(candidate, member)
+
+
+def for_device(device: DeviceFacts) -> list[Candidate]:
+    """The ranked table filtered by DEVICE alone — no import, no image. The pure half."""
+    return [
+        candidate
+        for candidate in CANDIDATES
+        if not candidate.min_sm or (device.kind == "cuda" and device.sm >= candidate.min_sm)
+    ]
+
+
+def available(device: DeviceFacts) -> list[Ready]:
+    """The RANKED kernels this device and this image can actually run, fastest first.
+
+    Never raises: the floor takes everything, so auto-selection has no refusal arm. A ranked
+    kernel this image does not ship is simply not in the answer, and an environment with no
+    diffusers at all offers nothing — which is right, because it holds no attention site.
+    """
+    ready: list[Ready] = []
+    for candidate in for_device(device):
+        try:
+            ready.append(_resolve(candidate))
+        except Exception:
+            # BROAD ON PURPOSE. Auto-selection has no refusal arm — the floor takes
+            # everything — so a kernel that fails to resolve for ANY reason must drop out of
+            # the ranking rather than fail the prepare that was only trying to go faster. A
+            # PIN is the opposite and keeps its typed refusals (`pinned`).
+            continue
+    return ready
+
+
+def pinned(name: str, device: DeviceFacts) -> list[Ready]:
+    """The single kernel the execution-path override names, or a typed refusal (cr-125).
+
+    A pin does not fall back. That is the whole point: a run that silently served another
+    kernel would make the A/B it was asked for meaningless.
+    """
+    candidate = BY_NAME.get(name)
+    if candidate is None:
+        raise AttentionRefusal(
+            "attention_kernel_unknown",
+            f"{name!r} is not an attention kernel this runtime knows; it knows {sorted(BY_NAME)}",
+        )
+    if candidate.min_sm and (device.kind != "cuda" or device.sm < candidate.min_sm):
+        raise AttentionRefusal(
+            "attention_kernel_unsupported",
+            f"{name} needs sm{candidate.min_sm} or better; this executor holds "
+            f"{device.kind} sm{device.sm}",
+        )
+    return [_resolve(candidate)]
+
+
+# ------------------------------------------------------------------------------ the pin
+
+
+def _sites(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any]]:
+    """(component, attention module, its processor) for every diffusers attention site.
+
+    The walk follows public attributes and mapping values three levels deep and stops at torch
+    module trees, where `modules()` finds the attention classes diffusers' own
+    `set_attention_backend` looks for. A component's label is the name the fill plane gave it.
+    """
+    try:
+        from diffusers.models.attention import AttentionModuleMixin
+        from diffusers.models.attention_processor import Attention, MochiAttention
+    except ImportError:
+        # No diffusers, no diffusers attention site. Nothing to pin, and not a refusal.
+        return
+
+    classes = (Attention, MochiAttention, AttentionModuleMixin)
+    seen: set[int] = set()
+    queue: deque[tuple[str, Any, int]] = deque(
+        (name, root, 0) for name, root in sorted(roots.items())
+    )
+    while queue:
+        label, value, depth = queue.popleft()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if callable(getattr(value, "modules", None)) and callable(
+            getattr(value, "parameters", None)
+        ):
+            for module in value.modules():
+                processor = getattr(module, "processor", None)
+                if isinstance(module, classes) and processor is not None:
+                    yield label, module, processor
+            continue
+        if depth >= 3:
+            continue
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                queue.append((str(key), item, depth + 1))
+        elif hasattr(value, "__dict__"):
+            for name, item in vars(value).items():
+                if not name.startswith("_"):
+                    queue.append((name, item, depth + 1))
+
+
+def _head_dim(module: Any) -> int:
+    """This site's per-head dimension, or 0 when the module does not say.
+
+    A site whose head dimension cannot be read is treated as unknown, which admits only the
+    unbounded floor — the runtime does not guess a shape into a kernel that would fault on it.
+    """
+    declared = getattr(module, "head_dim", None)
+    if isinstance(declared, int) and declared > 0:
+        return declared
+    heads = getattr(module, "heads", None)
+    inner = getattr(module, "inner_dim", None)
+    if inner is None:
+        to_q = getattr(module, "to_q", None)
+        inner = getattr(to_q, "out_features", None)
+    if isinstance(heads, int) and heads > 0 and isinstance(inner, int) and inner > 0:
+        return inner // heads
+    return 0
+
+
+def _dtype(module: Any) -> str:
+    for parameter in module.parameters():
+        return str(parameter.dtype).removeprefix("torch.")
+    return ""
+
+
+def _admits(candidate: Candidate, dtype: str, head_dim: int) -> bool:
+    if candidate.dtypes and dtype not in candidate.dtypes:
+        return False
+    return not (candidate.max_head_dim and (head_dim == 0 or head_dim > candidate.max_head_dim))
+
+
+@dataclass(frozen=True, slots=True)
+class Applied:
+    """What the runtime pinned, per component and per kernel. The BOOT record, and all of it."""
+
+    #: component -> kernel name -> attention sites pinned to it.
+    hosts: dict[str, dict[str, int]]
+    #: kernel name -> the baked variant directory it loaded from, when it loaded from one.
+    locations: dict[str, str]
+    #: the ranked kernels this image and device offered, fastest first.
+    offered: tuple[str, ...]
+    #: set when the caller PINNED one through the execution-path override (cr-125).
+    pin: str = ""
+
+    def totals(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for kernels in self.hosts.values():
+            for name, sites in kernels.items():
+                out[name] = out.get(name, 0) + sites
+        return out
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "kernels": self.totals(),
+            "hosts": {name: dict(kernels) for name, kernels in self.hosts.items()},
+            "offered": list(self.offered),
+            "locations": dict(self.locations),
+            "pin": self.pin,
+            # RENDERED HERE, not by the worker: one renderer for the one line, in the module
+            # that knows what it means.
+            "line": self.line(),
+        }
+
+    def line(self) -> str:
+        """The ONE line a pod prints at boot. It is the whole per-run attention record."""
+        totals = self.totals()
+        if not totals:
+            return "NONE — this construction holds no diffusers attention site"
+        chosen = ", ".join(f"{name} x{sites}" for name, sites in sorted(totals.items()))
+        where = "; ".join(
+            f"{component}: {'+'.join(sorted(kernels))}"
+            for component, kernels in sorted(self.hosts.items())
+        )
+        how = f"PINNED {self.pin}" if self.pin else f"auto over {list(self.offered)}"
+        return f"{chosen} ({how}) — {where}"
+
+
+def install(ready: list[Ready], roots: Mapping[str, Any], pin: str = "") -> Applied:
+    """Pin the fastest admitted kernel on every attention site of the constructed components.
+
+    Per SITE, not per model: `set_attention_backend` would also move diffusers' PROCESS-GLOBAL
+    active backend, which is what carried a DiT's kernel into an fp16 VAE decode once (cr-122).
+    Setting `processor._attention_backend` is the same pin without the propagation.
+
+    With a PIN (cr-125) `ready` holds exactly one kernel, and a site it does not admit is a
+    typed refusal rather than a quiet demotion.
+    """
+    hosts: dict[str, dict[str, int]] = {}
+    locations: dict[str, str] = {}
+    for component, module, processor in _sites(roots):
+        dtype, head_dim = _dtype(module), _head_dim(module)
+        for entry in ready:
+            if not _admits(entry.candidate, dtype, head_dim):
+                continue
+            processor._attention_backend = entry.member
+            hosts.setdefault(component, {})
+            hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
+            if entry.location:
+                locations[entry.name] = entry.location
+            break
+        else:
+            raise AttentionRefusal(
+                "attention_kernel_unsupported",
+                f"{ready[0].name if ready else 'no attention kernel'} does not serve "
+                f"{component}'s attention: "
+                f"{dtype or 'unknown'} activations at head dimension "
+                f"{head_dim or 'unknown'}. A pinned kernel is never quietly replaced",
+            )
+    return Applied(hosts, locations, tuple(entry.name for entry in ready), pin)
+
+
+def select(device: DeviceFacts, roots: Mapping[str, Any], pin: str = "") -> Applied:
+    """The whole decision, in one call: what this device and image offer, pinned on the sites."""
+    return install(pinned(pin, device) if pin else available(device), roots, pin)
+
+
+def image_kernels() -> str:
+    """What the image ships, for a refusal message. Discoverability is the point (cr-125)."""
+    shipped: list[str] = []
+    for candidate in (*CANDIDATES, *PINNABLE):
+        try:
+            _resolve(candidate)
+        except Exception:
+            continue
+        shipped.append(candidate.name)
+    return ", ".join(shipped) or "none"
+
+
+def baked_variants() -> dict[str, Any]:
+    """The baked snapshots under `IMAGE_KERNELS_DIR`, for the boot record and for triage."""
+    out: dict[str, Any] = {}
+    for candidate in (*CANDIDATES, *PINNABLE):
+        builds = IMAGE_KERNELS_DIR / candidate.baked / "build" if candidate.baked else None
+        if builds is None or not builds.is_dir():
+            continue
+        for variant in sorted(builds.iterdir()):
+            metadata_file = variant / "metadata.json"
+            if metadata_file.is_file():
+                out[candidate.name] = {
+                    "variant": variant.name,
+                    **json.loads(metadata_file.read_text()),
+                }
+    return out

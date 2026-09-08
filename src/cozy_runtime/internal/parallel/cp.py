@@ -157,7 +157,7 @@ def install_context_parallel(model: Any, *, degree: int, comms: CpComms | None) 
     refuse_unless_shard_invariant_quant(model, degree=int(degree))
     installed: list[str] = []
     for name, component in components:
-        refuse_unless_divisible(tokens=0, heads=_declared_heads(component), degree=int(degree))
+        refuse_unless_heads_divisible(heads=_declared_heads(component), degree=int(degree))
         _install_on_component(component, degree=int(degree), comms=comms)
         _install_gate_guard(component, name)
         installed.append(name)
@@ -201,7 +201,15 @@ def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> Non
         ) from exc
     attention_classes: tuple[type, ...] = (Attention, AttentionModuleMixin)
 
-    cp_config = ContextParallelConfig(ulysses_degree=int(degree))
+    # `ulysses_anything` is unconditional at degree > 1. H3 packs one sequence whose length
+    # is whatever the caller packed -- 37,763 / 73,439 / 106,932 / 109,308 rows measured --
+    # and diffusers' plain sharder asserts "Tensor size along dimension to be sharded must
+    # be divisible by mesh size" on every one of them. Verified both ways on the official
+    # and the AdaLN-pruned H3 DiT over gloo, 2026-09-08: a 37-row packed sequence refuses
+    # that assertion without this flag and shards with it, while a divisible length is
+    # unaffected either way. The config validates exactly this combination -- ulysses only,
+    # ring 1 -- and ring attention is never installed here.
+    cp_config = ContextParallelConfig(ulysses_degree=int(degree), ulysses_anything=True)
     config = ParallelConfig(context_parallel_config=cp_config)
     for module in component.modules():
         if not isinstance(module, attention_classes):
@@ -269,15 +277,16 @@ def _declared_heads(component: Any) -> int:
     return 0
 
 
-def refuse_unless_divisible(*, tokens: int, heads: int, degree: int) -> None:
-    """The diffusers #12536 assertion, checked BEFORE a device is committed."""
+def refuse_unless_heads_divisible(*, heads: int, degree: int) -> None:
+    """Checked BEFORE a device is committed. Sequence length is NOT checked: under
+    `ulysses_anything` the packed sequence is split by `tensor_split`, so any length shards
+    (H3 packs 37,763 / 73,439 / 106,932 / 109,308 rows and none of them divide). The head
+    count is the constraint that remains a CAPABILITY statement rather than a mechanical
+    one -- it is what `@sequence_parallel(degrees=...)` asserts, and a package that declares
+    a degree its heads do not divide is refused here rather than served ragged."""
     d = int(degree)
     if d <= 1:
         return
-    if int(tokens) % d:
-        raise ContextParallelUnavailable(
-            f"sequence length {tokens} is not divisible by ulysses_degree {d}"
-        )
     if int(heads) % d:
         raise ContextParallelUnavailable(
             f"attention head count {heads} is not divisible by ulysses_degree {d}"

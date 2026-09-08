@@ -1108,15 +1108,16 @@ def test_a_sharded_forward_outside_the_gate_refuses() -> None:
             assert cp.in_gated_call()
         assert cp.in_gated_call()
     assert not cp.in_gated_call()
-    cp.refuse_unless_divisible(tokens=64, heads=16, degree=4)
-    cp.refuse_unless_divisible(tokens=0, heads=0, degree=1)
+    cp.refuse_unless_heads_divisible(heads=16, degree=4)
+    cp.refuse_unless_heads_divisible(heads=0, degree=1)
     with pytest.raises(cp.ContextParallelUnavailable) as heads:
-        cp.refuse_unless_divisible(tokens=64, heads=6, degree=4)
+        cp.refuse_unless_heads_divisible(heads=6, degree=4)
     assert (
         heads.value.code == "context_parallel_unavailable" and "head count 6" in heads.value.message
     )
-    with pytest.raises(cp.ContextParallelUnavailable):
-        cp.refuse_unless_divisible(tokens=65, heads=16, degree=4)
+    # H3's 56 heads divide every declared degree; its packed sequence divides none of them,
+    # and `ulysses_anything` is why that is no longer a refusal.
+    cp.refuse_unless_heads_divisible(heads=56, degree=8)
     with pytest.raises(cp.ContextParallelUnavailable) as ring:
         cp._GroupMesh(None, 2, 0)["ring"].get_group()
     assert "Ulysses" in ring.value.message
