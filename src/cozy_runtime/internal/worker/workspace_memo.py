@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import secrets
+from collections.abc import Callable
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -449,25 +450,52 @@ def _missing_native_result(
     return False
 
 
+def _producer(source: dict[str, Any]) -> tuple[Any, ...]:
+    if source.get("kind") == "native":
+        return ("native", source["service_id"])
+    return ("attempt", source["request_id"], source["attempt_ordinal"], source["outcome_id"])
+
+
 def record(
     workspace: Workspace, owner: str, call: pb.RecordOperationResultCall
 ) -> pb.RecordOperationResultResult:
+    expected = {
+        "request_id": call.request_id,
+        "attempt_ordinal": call.attempt_ordinal,
+        "invocation_spec_digest": documents.spell(call.invocation_spec_digest),
+        "outcome_id": call.outcome_id,
+        "outcome_digest": documents.spell(call.outcome_digest),
+    }
+    return pb.RecordOperationResultResult(
+        computation_digest=call.computation_digest,
+        recorded=_record(
+            workspace, owner, call.computation_digest, expected, lambda db: _source(db, owner, call)
+        ),
+    )
+
+
+def _record(
+    workspace: Workspace,
+    owner: str,
+    key: bytes,
+    expected: dict[str, Any],
+    load: Callable[[Journal], dict[str, Any]],
+) -> bool:
     workspace.owner(owner)
-    if len(call.computation_digest) != 32:
+    if len(key) != 32:
         raise WorkspaceRefusal("memo key is not an exact computation digest")
-    answer = pb.RecordOperationResultResult(computation_digest=call.computation_digest)
     with workspace.locked() as db:
         _drain(workspace, db, owner)
         row = db.execute(
             "SELECT * FROM operation_cache WHERE owner=? AND key=?",
-            (owner, call.computation_digest),
+            (owner, key),
         ).fetchone()
         if row is None:
             try:
-                payload = _source(db, owner, call)
+                payload = load(db)
                 _comparison(payload, payload["schema"])
             except _Uncacheable:
-                return answer
+                return False
             count = db.execute(
                 "SELECT count(*) FROM operation_cache WHERE owner=? AND state<>'disabled'", (owner,)
             ).fetchone()[0]
@@ -480,28 +508,28 @@ def record(
                     (owner,),
                 ).fetchone()
                 if victim is None:
-                    return answer
+                    return False
                 db.execute("UPDATE operation_cache SET state='evicting' WHERE id=?", (victim[0],))
                 _drain(workspace, db, owner)
             identity = "memo-" + secrets.token_hex(16)
             for hold in payload["holds"]:
                 hold["retention_id"] = _hold_id(
-                    "cache", owner, identity, call.computation_digest, hold["transaction_id"]
+                    "cache", owner, identity, key, hold["transaction_id"]
                 )
             encoded = canonical_json.encode(payload)
             growth = (
-                _row_bytes(identity, owner, call.computation_digest, encoded)
+                _row_bytes(identity, owner, key, encoded)
                 + _CONTRADICTION_ALLOWANCE
                 + _hold_growth(db, owner, payload["holds"])
             )
             if metadata_bytes(db) + growth > MAX_METADATA_BYTES:
-                return answer
+                return False
             db.execute("BEGIN IMMEDIATE")
             try:
                 db.execute(
                     "INSERT INTO operation_cache(id,owner,key,body,state) "
                     "VALUES(?,?,?,?,'retaining')",
-                    (identity, owner, call.computation_digest, encoded),
+                    (identity, owner, key, encoded),
                 )
                 _reserve_holds(workspace, db, owner, payload["holds"])
                 db.commit()
@@ -510,23 +538,19 @@ def record(
                 raise
         else:
             if row["state"] == "disabled":
-                return answer
+                return False
             payload, identity = json.loads(row["body"]), row["id"]
             # Replays after the original ACK remain valid, but a different
             # producer must still prove its own exact successful terminal.
             source = payload["source"]
-            if (source["request_id"], source["attempt_ordinal"], source["outcome_id"]) != (
-                call.request_id,
-                call.attempt_ordinal,
-                call.outcome_id,
-            ):
+            if _producer(source) != _producer(expected):
                 try:
-                    candidate = _source(db, owner, call)
+                    candidate = load(db)
                     same = _comparison(payload, candidate["schema"]) == _comparison(
                         candidate, candidate["schema"]
                     )
                 except _Uncacheable:
-                    return answer
+                    return False
                 if not same:
                     payload = {
                         "source": _source_identity(payload["source"]),
@@ -538,10 +562,8 @@ def record(
                         (canonical_json.encode(payload), identity),
                     )
                     _drain(workspace, db, owner)
-                    return answer
-            elif source["invocation_spec_digest"] != documents.spell(
-                call.invocation_spec_digest
-            ) or source["outcome_digest"] != documents.spell(call.outcome_digest):
+                    return False
+            elif _source_identity(source) != expected:
                 raise WorkspaceRefusal("memo recording replay changed its original terminal")
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -558,36 +580,52 @@ def record(
         )
         if committed.rowcount != 1:
             raise WorkspaceRefusal("memo mapping was evicted during native acquisition")
-        answer.recorded = True
-        return answer
+        return True
 
 
 def lookup(
     workspace: Workspace, owner: str, call: pb.LookupOperationCall
 ) -> pb.LookupOperationResult:
-    workspace.owner(owner)
-    if len(call.computation_digest) != 32 or _ID.fullmatch(call.consumer_request_id) is None:
-        raise WorkspaceRefusal("memo lookup requires an exact key and bounded consumer identity")
     answer = pb.LookupOperationResult(
         computation_digest=call.computation_digest, consumer_request_id=call.consumer_request_id
     )
+    found = _lookup(workspace, owner, call.computation_digest, call.consumer_request_id, "attempt")
+    return _found(answer, *found) if found is not None else answer
+
+
+def _require_kind(payload: dict[str, Any], expected: str) -> None:
+    if payload["source"].get("kind", "attempt") != expected:
+        raise WorkspaceRefusal("memo result has another terminal kind")
+
+
+def _lookup(
+    workspace: Workspace,
+    owner: str,
+    key: bytes,
+    consumer: str,
+    kind: str,
+) -> tuple[dict[str, Any], list[pb.DerivedRetentionResult]] | None:
+    workspace.owner(owner)
+    if len(key) != 32 or _ID.fullmatch(consumer) is None:
+        raise WorkspaceRefusal("memo lookup requires an exact key and bounded consumer identity")
     with workspace.locked() as db:
         _drain(workspace, db, owner)
         row = db.execute(
             "SELECT * FROM operation_lookups WHERE owner=? AND consumer=?",
-            (owner, call.consumer_request_id),
+            (owner, consumer),
         ).fetchone()
         if row is not None:
-            if row["key"] != call.computation_digest or row["state"] == "released":
+            if row["key"] != key or row["state"] == "released":
                 raise WorkspaceRefusal("memo recipient was changed or released")
             if row["state"] == "acknowledged":
                 raise WorkspaceRefusal("memo result was delivered; use the owner's recorded result")
             if row["state"] == "miss":
-                return answer
+                return None
             if row["state"] == "missing":
-                _missing_cleanup(workspace, db, owner, call.consumer_request_id)
-                return answer
+                _missing_cleanup(workspace, db, owner, consumer)
+                return None
             payload = json.loads(row["body"])
+            _require_kind(payload, kind)
             db.execute("BEGIN IMMEDIATE")
             try:
                 _reserve_holds(workspace, db, owner, payload["holds"])
@@ -598,11 +636,12 @@ def lookup(
         else:
             cached = db.execute(
                 "SELECT * FROM operation_cache WHERE owner=? AND key=? AND state='ready'",
-                (owner, call.computation_digest),
+                (owner, key),
             ).fetchone()
             if cached is None:
-                return answer
+                return None
             payload = json.loads(cached["body"])
+            _require_kind(payload, kind)
             if not payload["holds"]:
                 # No native effect needs a recipient journal. Losing this reply
                 # may re-query the computation key or recompute after eviction;
@@ -612,21 +651,21 @@ def lookup(
                     "(SELECT coalesce(max(sequence),0)+1 FROM operation_cache) WHERE id=?",
                     (cached["id"],),
                 )
-                return _found(answer, payload, [])
+                return payload, []
             for hold in payload["holds"]:
                 hold["retention_id"] = _hold_id(
                     "consumer",
                     owner,
-                    call.consumer_request_id,
-                    call.computation_digest,
+                    consumer,
+                    key,
                     hold["transaction_id"],
                 )
             encoded = canonical_json.encode(payload)
-            growth = _row_bytes(
-                owner, call.consumer_request_id, call.computation_digest, cached["id"], encoded
-            ) + _hold_growth(db, owner, payload["holds"])
+            growth = _row_bytes(owner, consumer, key, cached["id"], encoded) + _hold_growth(
+                db, owner, payload["holds"]
+            )
             if metadata_bytes(db) + growth > MAX_METADATA_BYTES:
-                return answer
+                return None
             db.execute("BEGIN IMMEDIATE")
             try:
                 db.execute(
@@ -634,8 +673,8 @@ def lookup(
                     "VALUES(?,?,?,?,?,'retaining')",
                     (
                         owner,
-                        call.consumer_request_id,
-                        call.computation_digest,
+                        consumer,
+                        key,
                         cached["id"],
                         encoded,
                     ),
@@ -651,24 +690,22 @@ def lookup(
                 db.execute("ROLLBACK")
                 raise
         try:
-            retained = _retain(
-                workspace, db, owner, payload["holds"], consumer=call.consumer_request_id
-            )
+            retained = _retain(workspace, db, owner, payload["holds"], consumer=consumer)
         except Exception as exc:
             # Missing payloads can be recomputed. Integrity failures, I/O errors
             # and native release tombstones are distinct typed refusals.
-            if not _missing_native_result(workspace, db, owner, call.consumer_request_id, exc):
+            if not _missing_native_result(workspace, db, owner, consumer, exc):
                 raise
-            _missing_cleanup(workspace, db, owner, call.consumer_request_id)
-            return answer
+            _missing_cleanup(workspace, db, owner, consumer)
+            return None
         committed = db.execute(
             "UPDATE operation_lookups SET state='ready' WHERE owner=? AND consumer=? "
             "AND state IN ('retaining','ready')",
-            (owner, call.consumer_request_id),
+            (owner, consumer),
         )
         if committed.rowcount != 1:
             raise WorkspaceRefusal("memo consumer stopped before result exposure")
-        return _found(answer, payload, retained)
+        return payload, retained
 
 
 def _found(
