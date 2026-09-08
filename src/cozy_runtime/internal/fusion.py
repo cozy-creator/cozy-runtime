@@ -43,10 +43,12 @@ from typing import Any
 
 from cozy_runtime.internal.encoding.leaves import PreQuantized
 
-#: Where the built artifact lives: inside the installed package, the same place the
-#: cp312-abi3 wheel keeps `_C.abi3.so`, so a pod and a developer box resolve it identically
-#: with no path configuration. Not committed; `fusion_build.py` writes it.
+#: Where the built artifact lives, two fixed locations and no path configuration: a
+#: developer builds into the installed package (beside `_C.abi3.so`); the worker image's
+#: build stage writes the profile-owned artifact under `/opt/cozy/fusion`, the same shape
+#: as its other non-wheel artifacts. Neither is committed; `fusion_build.py` writes them.
 KERNELS_DIR = Path(__file__).resolve().parent.parent / "_kernels" / "fusion"
+IMAGE_KERNELS_DIR = Path("/opt/cozy/fusion")
 TRITON_VERSION = "3.7.1"
 WARP_SIZE = 32
 MANIFEST = "manifest.json"
@@ -477,18 +479,71 @@ class _Loaded:
             ) from None
 
 
-def _manifest(directory: Path) -> dict[str, Any]:
+def artifact_dir() -> Path:
+    """The first fixed location holding a manifest, or a typed absence naming both."""
+    for directory in (KERNELS_DIR, IMAGE_KERNELS_DIR):
+        if (directory / MANIFEST).is_file():
+            return directory
+    raise FusionUnavailable(
+        "fusion_kernels_absent",
+        f"no fused-kernel artifact at {KERNELS_DIR} or {IMAGE_KERNELS_DIR}: the worker "
+        "image's build stage (or a developer, once per box) runs "
+        "`python -m cozy_runtime.internal.fusion_build`",
+    )
+
+
+def check_artifact(directory: Path, arch: int) -> dict[str, Any]:
+    """The manifest, proven against THIS runtime's sources, Triton and `arch` — no device.
+
+    Every spec's key is recomputed and must equal the artifact's; the image build asserts
+    this after copying the artifact in, and `load` runs it before touching the device.
+    """
     path = directory / MANIFEST
     if not path.is_file():
+        raise FusionUnavailable("fusion_kernels_absent", f"no fused-kernel artifact at {directory}")
+    manifest = json.loads(path.read_text())
+    if not isinstance(manifest, dict):
+        raise FusionUnavailable("fusion_kernels_stale", f"{path} is not a manifest object")
+    triton = _kernels().triton
+    if triton.__version__ != TRITON_VERSION:
+        raise FusionUnavailable(
+            "fusion_kernels_stale",
+            f"the fused kernels are built for triton {TRITON_VERSION}; found {triton.__version__}",
+        )
+    if manifest.get("triton") != TRITON_VERSION or manifest.get("kernels") != source_digest():
+        raise FusionUnavailable(
+            "fusion_kernels_stale",
+            f"the artifact at {directory} was built for triton {manifest.get('triton')} and "
+            f"kernel sources {str(manifest.get('kernels'))[:12]}; this runtime carries triton "
+            f"{TRITON_VERSION} and sources {source_digest()[:12]} — rebuild it",
+        )
+    if manifest.get("utils") != utils_key():
+        raise FusionUnavailable(
+            "fusion_kernels_stale",
+            "the artifact's Triton launcher module was built for another platform or Triton",
+        )
+    targets = manifest.get("targets") or {}
+    entries = targets.get(f"sm{arch}")
+    if not isinstance(entries, dict):
         raise FusionUnavailable(
             "fusion_kernels_absent",
-            f"no fused-kernel artifact at {directory}: the worker image's build stage (or "
-            "a developer, once per box) runs `python -m cozy_runtime.internal.fusion_build`",
+            f"the artifact at {directory} holds {sorted(targets)} and this device is sm{arch}",
         )
-    document = json.loads(path.read_text())
-    if not isinstance(document, dict):
-        raise FusionUnavailable("fusion_kernels_stale", f"{path} is not a manifest object")
-    return document
+    for profile in PROFILES.values():
+        for spec in specs(**profile):
+            expected = cache_key(spec, arch)
+            if entries.get(spec.key) != expected:
+                raise FusionUnavailable(
+                    "fusion_kernels_stale",
+                    f"{spec.key} for sm{arch}: artifact holds {str(entries.get(spec.key))[:12]}, "
+                    f"this runtime's key is {expected[:12]} — the artifact was built from other "
+                    "sources",
+                )
+            if not (directory / f"sm{arch}" / expected / f"{spec.kernel}.json").is_file():
+                raise FusionUnavailable(
+                    "fusion_kernels_absent", f"{spec.key} for sm{arch}: entry files are missing"
+                )
+    return manifest
 
 
 def load(device: Any, directory: Path | None = None) -> _Loaded:
@@ -500,35 +555,15 @@ def load(device: Any, directory: Path | None = None) -> _Loaded:
     """
     import torch
 
-    directory = KERNELS_DIR if directory is None else directory
     loaded: dict[int, _Loaded] = getattr(load, "_cached", {})
     index = torch.device(device).index or 0
     if index in loaded:
         return loaded[index]
-    sources = _kernels()
-    triton = sources.triton
-    if triton.__version__ != TRITON_VERSION:
-        raise FusionUnavailable(
-            "fusion_kernels_stale",
-            f"the fused kernels are built for triton {TRITON_VERSION}; found {triton.__version__}",
-        )
-    manifest = _manifest(directory)
-    if manifest.get("triton") != TRITON_VERSION or manifest.get("kernels") != source_digest():
-        raise FusionUnavailable(
-            "fusion_kernels_stale",
-            f"the artifact at {directory} was built for triton {manifest.get('triton')} and "
-            f"kernel sources {str(manifest.get('kernels'))[:12]}; this runtime carries triton "
-            f"{TRITON_VERSION} and sources {source_digest()[:12]} — rebuild it",
-        )
+    directory = artifact_dir() if directory is None else directory
     major, minor = torch.cuda.get_device_capability(index)
     arch = major * 10 + minor
-    targets = manifest.get("targets") or {}
-    entries = targets.get(f"sm{arch}")
-    if not isinstance(entries, dict):
-        raise FusionUnavailable(
-            "fusion_kernels_absent",
-            f"the artifact at {directory} holds {sorted(targets)} and this device is sm{arch}",
-        )
+    manifest = check_artifact(directory, arch)
+    triton = _kernels().triton
     _place_utils(directory, manifest, triton)
     from triton.compiler.compiler import CompiledKernel
 
@@ -536,13 +571,6 @@ def load(device: Any, directory: Path | None = None) -> _Loaded:
     for profile in PROFILES.values():
         for spec in specs(**profile):
             expected = cache_key(spec, arch)
-            entry = entries.get(spec.key)
-            if entry != expected:
-                raise FusionUnavailable(
-                    "fusion_kernels_stale",
-                    f"{spec.key} for sm{arch}: artifact holds {str(entry)[:12]}, this runtime's "
-                    f"key is {expected[:12]} — the artifact was built from other sources",
-                )
             files = directory / f"sm{arch}" / expected
             group = {path.name: str(path) for path in files.iterdir() if path.is_file()}
             kernel = CompiledKernel(ast_source(spec), group, expected)
@@ -563,12 +591,7 @@ def _place_utils(directory: Path, manifest: dict[str, Any], triton: Any) -> None
     """Triton's launcher module goes into the imposed cache scope before the driver wakes."""
     from triton.runtime.cache import get_cache_manager
 
-    key = utils_key()
-    if manifest.get("utils") != key:
-        raise FusionUnavailable(
-            "fusion_kernels_stale",
-            "the artifact's Triton launcher module was built for another platform or Triton",
-        )
+    key = str(manifest["utils"])
     target = Path(get_cache_manager(key).cache_dir)
     source = directory / "utils" / key
     for path in source.iterdir():
