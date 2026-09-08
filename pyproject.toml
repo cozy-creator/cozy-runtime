@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.5.1"
+version = "0.5.2"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
@@ -128,6 +128,9 @@ module = [
     "huggingface_hub",
     "diffusers",
     "diffusers.*",
+    # `kernels` (cr-114): the image's loader for baked Hub kernels; in the executor's
+    # environment, never the checking venv.
+    "kernels",
     "safetensors",
     "safetensors.*",
     "PIL",
