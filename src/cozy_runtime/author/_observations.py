@@ -25,6 +25,15 @@ attempt into a failed one. Names are not inspected at all — the v1 name regex 
 on `output_tokens`, `tokens_per_second` and `eos_token`, which are the most ordinary fields
 an inference package emits.
 
+**An over-cap VALUE is TRUNCATED and counted, never raised** (cr-122). The same rule, for
+the same reason: a value is data, and data whose length the emitter cannot predict must not
+be able to fail the attempt that produced it. It did — a contract attestation rendered a
+1,744-character line, the refusal escaped device release, and the worker abandoned the
+attempt `EXECUTOR_INVALIDATED`, rebuilt and retried the same 30-step generation forever. So
+values and field values clip to `TEXT_CAP` with a marker and bump `truncated`; a lost tail
+is a fact on `caps()`, exactly like a shed row. NAMES and field KEYS still refuse typed: a
+name is a record's identity, and a clipped identity silently aliases two different records.
+
 This module is in the AUTHOR package on purpose — the caps must bite where the author code
 emits, and the worker imports the same implementation rather than a second one.
 """
@@ -73,7 +82,8 @@ class ObservationRefusal(CapabilityError):
     """A record the emit boundary will not admit. Typed, and never a silent drop."""
 
 
-def _text(value: str, cap: int, what: str) -> str:
+def _identifier(value: str, cap: int, what: str) -> str:
+    """An observation's NAME or field KEY. Over-cap refuses: clipping would alias records."""
     if len(value) > cap:
         raise ObservationRefusal(
             f"{what} is {len(value)} characters, over the {cap}-character cap: an "
@@ -85,6 +95,8 @@ def _text(value: str, cap: int, what: str) -> str:
 
 
 REDACTED = "<redacted>"
+#: What a clipped value ends with, so a bounded record says it was bounded.
+TRUNCATED = "…"
 
 
 # --------------------------------------------------------------------------- the record
@@ -144,6 +156,7 @@ class EventRing:
     dropped: int = 0
     refused: int = 0
     redactions: int = 0
+    truncated: int = 0
 
     def __len__(self) -> int:
         return len(self.events)
@@ -170,10 +183,9 @@ class EventRing:
                 "a schema change, never a new string",
                 code="observation_kind",
             )
-        _text(name, NAME_CAP, f"observation name {name[:40]!r}")
+        _identifier(name, NAME_CAP, f"observation name {name[:40]!r}")
         if isinstance(value, str):
-            _text(value, TEXT_CAP, f"observation value of {name!r}")
-            value = self._redact(value)
+            value = self._clip(self._redact(value))
         elif isinstance(value, float) and not math.isfinite(value):
             raise ObservationRefusal(
                 f"observation {name!r} carries {value!r}, which has no canonical spelling",
@@ -186,12 +198,18 @@ class EventRing:
             )
         clean: dict[str, Scalar] = {}
         for key, item in fields.items():
-            _text(key, KEY_CAP, f"observation field name {key[:40]!r}")
+            _identifier(key, KEY_CAP, f"observation field name {key[:40]!r}")
             if isinstance(item, str):
-                _text(item, TEXT_CAP, f"observation field {key!r}")
-                item = self._redact(item)
+                item = self._clip(self._redact(item))
             clean[key] = item
         return Observation(kind, name, value, clean, int(time.time() * 1000), 0)
+
+    def _clip(self, text: str) -> str:
+        """Bound one VALUE and count it. Never raises — see the module docstring."""
+        if len(text) <= TEXT_CAP:
+            return text
+        self.truncated += 1
+        return text[: TEXT_CAP - len(TRUNCATED)] + TRUNCATED
 
     def _redact(self, text: str) -> str:
         """Replace credential-shaped VALUE material and count it. Never raises.
@@ -230,6 +248,7 @@ class EventRing:
             "admitted": self.admitted,
             "dropped": self.dropped,
             "refused": self.refused,
+            "truncated": self.truncated,
             "redactions": self.redactions,
             "held_bytes": self.held,
             "max_events": self.max_events,

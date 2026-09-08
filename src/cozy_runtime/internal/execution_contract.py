@@ -542,17 +542,48 @@ class AppliedContract:
         }
 
 
-def _hosts(model: object) -> list[tuple[str, Any]]:
-    """Every OUTERMOST diffusers model reachable from the constructed model, labelled.
+def scope(contract: ExecutionContract, plan: Any, roots: Mapping[str, Any]) -> dict[str, Any]:
+    """The components this contract GOVERNS, and their constructed roots (cr-122).
 
-    The walk follows public attributes and mapping values three levels deep (`model.pipe
-    .components["fl2va_dit"]`) and stops at torch module trees, where `modules()` finds the
-    outermost object that answers `set_attention_backend`; a nested one is covered by its
-    parent's pin and is not counted twice.
+    ONE contract, ONE scope: the components whose tensors resolved on the contract's own
+    `weights.route`. The two clauses of an `execution` config describe the same components —
+    the producer refuses to stamp a contract whose route's byte layout is not true of the
+    components it binds (`h3_tables/job.py` `_attention_lane_targets`; its quantization plan
+    is `["dit"]`) — so the route is the contract's own statement of what it is about.
+
+    It was `every diffusers model reachable from the constructed model` before, which on a
+    real pipeline pinned the VIDEO VAE too: the H100 FA3 clip counted 1,812 calls against
+    1,560 predicted and failed `execution_contract_unobserved` on `call 1613: attention ran
+    on float16 activations`, because the fp16 decode's own 36 attention sites had been
+    substituted for a bf16 DiT kernel the contract never claimed for them.
+    """
+    route = contract.weights.route
+    governed = sorted({row.component for row in plan.tensors if row.route == route})
+    scoped = {name: roots[name] for name in governed if name in roots}
+    if not scoped:
+        raise ExecutionContractRefusal(
+            "execution_contract_unobserved",
+            f"the lane's execution contract binds weights.route={contract.weights.route!r}, "
+            f"whose tensors resolve on {governed or ['no component']}; this construction holds "
+            f"{sorted(roots) or ['no component']}. A contract that governs nothing cannot be "
+            "proven, and a lane that promises a kernel does not serve without one",
+        )
+    return scoped
+
+
+def _hosts(roots: Mapping[str, Any]) -> list[tuple[str, Any]]:
+    """Every OUTERMOST diffusers model under the GOVERNED component roots, labelled.
+
+    The walk follows public attributes and mapping values three levels deep and stops at
+    torch module trees, where `modules()` finds the outermost object that answers
+    `set_attention_backend`; a nested one is covered by its parent's pin and is not counted
+    twice. A host's label is its component name, because that is what the walk starts from.
     """
     found: list[tuple[str, Any]] = []
     seen: set[int] = set()
-    queue: deque[tuple[str, Any, int]] = deque([("model", model, 0)])
+    queue: deque[tuple[str, Any, int]] = deque(
+        (name, root, 0) for name, root in sorted(roots.items())
+    )
     while queue:
         label, value, depth = queue.popleft()
         if id(value) in seen:
@@ -608,8 +639,12 @@ def _profiled(
     return result, rows, "" if rows else "the profiler saw no CUDA kernel under the call"
 
 
-def apply(contract: ExecutionContract, kernel: Kernel, model: object) -> AppliedContract:
-    """Pin the backend on every diffusers model of the constructed pipeline and arm attestation.
+def apply(contract: ExecutionContract, kernel: Kernel, roots: Mapping[str, Any]) -> AppliedContract:
+    """Pin the backend on the GOVERNED components' diffusers models and arm attestation.
+
+    `roots` is `scope()`'s answer — component name -> constructed root — and nothing outside
+    it is touched: an ungoverned component keeps the attention it was built with, so the
+    registry proxy below counts the governed components' calls and only theirs.
 
     `set_attention_backend` marks every attention processor of a host; the registry entry for
     that backend is then replaced by a counting, verifying proxy around diffusers' own wrapper,
@@ -619,9 +654,10 @@ def apply(contract: ExecutionContract, kernel: Kernel, model: object) -> Applied
     from diffusers.models.attention_dispatch import AttentionBackendName, _AttentionBackendRegistry
 
     member = AttentionBackendName(kernel.backend)
+    active = _AttentionBackendRegistry._active_backend
     hosts: dict[str, int] = {}
     pinned: list[tuple[str, Any]] = []
-    for label, host in _hosts(model):
+    for label, host in _hosts(roots):
         try:
             host.set_attention_backend(kernel.backend)
         except Exception as exc:
@@ -637,11 +673,20 @@ def apply(contract: ExecutionContract, kernel: Kernel, model: object) -> Applied
         if sites:
             hosts[label] = sites
             pinned.append((label, host))
+    # `set_attention_backend` ALSO sets diffusers' PROCESS-GLOBAL active backend (0.40
+    # `modeling_utils.py`: "Important to set the active backend so that it propagates
+    # gracefully throughout"), and that propagation is exactly what a contract may not have:
+    # every processor the contract did NOT pin dispatches with `backend=None`, reads the
+    # active backend and lands on the contracted kernel anyway. On the H100 clip that carried
+    # the DiT's bf16 FA3 kernel into the fp16 video-VAE decode — 252 calls the pinned sites
+    # cannot predict, one of them the `float16 activations` mismatch the attempt died on. The
+    # pin is per-processor; the process default is restored to what it was.
+    _AttentionBackendRegistry.set_active_backend(active)
     if not hosts:
         raise ExecutionContractRefusal(
             "execution_contract_unobserved",
-            "no attention site reachable from the constructed model accepts backend "
-            f"{kernel.backend!r}; the contract cannot be applied, so it cannot be proven",
+            f"no attention site of {sorted(roots)} accepts backend {kernel.backend!r}; the "
+            "contract cannot be applied, so it cannot be proven",
         )
     applied = AppliedContract(
         contract,
@@ -692,6 +737,34 @@ def apply(contract: ExecutionContract, kernel: Kernel, model: object) -> Applied
 
         host.register_forward_pre_hook(forwarded)
     return applied
+
+
+#: The DURABLE confession is a BOUNDED record (cr-122). Its load-bearing facts are the
+#: contract's digest, the entry, the call counts and the observed CUDA symbol; the scheme
+#: prose — a long human sentence — and the full mangled symbol stay in the triage bundle's
+#: `plan.execution`, which has no cap and is where a reader goes for them. The line is
+#: composed under the observation cap rather than trimmed at the emit boundary, because the
+#: half a boundary would cut is the refusal, which is the half worth keeping.
+CONFESSION_CAP = 400
+HEAD_CAP = 260
+SYMBOL_CAP = 110
+
+
+def _clip(text: str, cap: int) -> str:
+    return text if len(text) <= cap else text[: cap - 1] + "…"
+
+
+def _confession(document: Mapping[str, Any]) -> str:
+    head = _clip(
+        f"{document['digest']} {document['entry']} {document['calls']}/"
+        f"{document['expected_calls']} calls, kernel "
+        f"{_clip(str(document['kernel_symbol']) or 'unobserved', SYMBOL_CAP)}",
+        HEAD_CAP,
+    )
+    refusal = str(document["refusal"])
+    if not refusal:
+        return head
+    return f"{head}; {_clip(refusal, CONFESSION_CAP - len(head) - 2)}"
 
 
 class Attestation:
@@ -749,7 +822,7 @@ class Attestation:
             if not profile and row.profiled:
                 profile = row.profile_document()
         first = self.applied[0].contract
-        return {
+        document: dict[str, Any] = {
             "digest": self.applied[0].contract.digest(),
             "entry": f"{first.attention.distribution}.{first.attention.entry}",
             "backend": self.applied[0].kernel.backend,
@@ -765,3 +838,6 @@ class Attestation:
             if refusals
             else "",
         }
+        # The one line the worker's typed `execution_contract` confession carries.
+        document["confession"] = _confession(document)
+        return document
