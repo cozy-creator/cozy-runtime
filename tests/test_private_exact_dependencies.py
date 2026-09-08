@@ -64,16 +64,17 @@ def _material(
     )
 
 
-def test_private_refuses_divergent_base_before_install(tmp_path: Path) -> None:
+@pytest.mark.parametrize("distribution", ["numpy", "setuptools"])
+def test_private_refuses_divergent_base_before_install(tmp_path: Path, distribution: str) -> None:
     base = environment.observe_base(Path(sys.executable))
     base = dataclasses.replace(
         base,
         distributions=(
-            *(row for row in base.distributions if row[0] != "numpy"),
-            ("numpy", "2.5.2"),
+            *(row for row in base.distributions if row[0] != distribution),
+            (distribution, "2.5.2"),
         ),
     )
-    project = _wheel(tmp_path, "private_pin", ("numpy==2.5.3",), b"VALUE=1\n")
+    project = _wheel(tmp_path, "private_pin", (f"{distribution}==2.5.3",), b"VALUE=1\n")
     material = _material(project, (), base)
     root = tmp_path / "refused"
     with pytest.raises(environment.EnvironmentRefusal) as caught:

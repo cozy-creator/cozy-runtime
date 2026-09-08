@@ -4,6 +4,7 @@
     "msgspec",
     "numpy",
     "pillow",
+    "setuptools",
     "tensorfs",
     "torch",
     "torchaudio",
