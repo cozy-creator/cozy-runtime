@@ -4700,6 +4700,7 @@ class Worker:
             delivery_rung=str(delivery.get("rung", "")),
             delivery_variant=str(delivery.get("variant", "")),
             weight_bytes=int(reply["facts"]["filled_bytes"]),
+            execution_contract=dict(reply["facts"].get("execution_contract") or {}),
         )
         executor.construction_key = construction_key
         executor.parameters = parameters
@@ -4791,6 +4792,20 @@ class Worker:
                 )
             ),
         )
+        _contract = reply["facts"].get("execution_contract")
+        if _contract:
+            # THE CONTRACT AS APPLIED (cr-109): which kernel, through which diffusers backend,
+            # on how many sites — the boot line a person reads before the first attempt attests.
+            _attention = _contract["contract"]["attention"]
+            self.note(
+                "boot",
+                f"{placement_id!r} execution contract {str(_contract.get('digest', ''))[:23]}…: "
+                f"{_attention['scheme']} — {_attention['distribution']}=="
+                f"{_contract.get('installed_version')}.{_attention['entry']} via diffusers "
+                f"{_contract.get('backend')} on {_contract.get('sites')} site(s) "
+                f"{dict(_contract.get('hosts') or {})}; weights.route="
+                f"{_contract['contract']['weights']['route']}",
+            )
         self.note(
             "boot",
             f"{placement_id!r} prepared {len(group)} binding(s) in {took:.0f} ms — "
@@ -4933,6 +4948,7 @@ class Worker:
                     for method, value in (reply.get("activation_peaks") or {}).items()
                 },
                 "resident_moved": bool(reply.get("resident_moved", False)),
+                "execution_contract": dict(reply.get("execution_contract") or {}),
                 "ms": round((time.perf_counter() - started) * 1000, 1),
             }
             outcome["demand_evidence"] = (
@@ -4949,6 +4965,17 @@ class Worker:
             )
             self.records.append("warm", dict(outcome))
             self.warm.append(outcome)
+            _attested = outcome["execution_contract"]
+            if _attested:
+                self.note(
+                    "warm",
+                    f"{binding.entrypoint}/{placement}: execution contract "
+                    f"{_attested.get('entry')} "
+                    f"x{_attested.get('calls')} of {_attested.get('expected_calls')} predicted, "
+                    f"kernel {_attested.get('kernel_symbol') or 'unobserved'} "
+                    f"{_attested.get('kernel_self_ms')} ms self"
+                    + (f" — {_attested['refusal']}" if _attested.get("refusal") else ""),
+                )
             self.note(
                 "warm",
                 f"{binding.entrypoint}/{placement}: {outcome['outcome']} "

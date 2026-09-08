@@ -649,6 +649,10 @@ class TensorCandidates:
     """(provider name, why) for candidates this tensor's own SHAPE ruled out (#549.5)."""
     unqualified: str = ""
     """The capability refusal, verbatim, if NO route qualified."""
+    routes_offered: frozenset[str] = frozenset()
+    """Every route this tensor's BYTES and SHAPE admit on some device, qualified here or
+    not. `by_route` minus this is what this card did not qualify — which is the fact a lane's
+    execution contract binds against (cr-109)."""
 
 
 class Selector:
@@ -730,6 +734,7 @@ class Selector:
                 [key],
             )
         records = self.capabilities.qualified(encoded.encoding, self.device, output_dtype, among)
+        offered = frozenset(str(provider.route) for provider in among.values())
         if not records:
             return TensorCandidates(
                 key,
@@ -744,6 +749,7 @@ class Selector:
                     self.aliases.get(encoded.encoding, "?"),
                     among,
                 ),
+                offered,
             )
         best: dict[str, Selection] = {}
         for record in self.capabilities.rank(records, among, self.objective):
@@ -752,7 +758,7 @@ class Selector:
                 continue
             reason = self._reason(provider, record, among, geometry)
             best[provider.route] = Selection(provider, record, encoded, reason)
-        return TensorCandidates(key, encoded, output_dtype, best, tuple(geometry), "")
+        return TensorCandidates(key, encoded, output_dtype, best, tuple(geometry), "", offered)
 
     def _reason(
         self,
