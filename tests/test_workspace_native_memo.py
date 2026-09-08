@@ -74,7 +74,11 @@ def accepted(workspace: Workspace, parent: str) -> pb.NativeSourceCommand:
 
 
 def completed(
-    workspace: Workspace, command: pb.NativeSourceCommand, data: bytes = b"weights"
+    workspace: Workspace,
+    command: pb.NativeSourceCommand,
+    data: bytes = b"weights",
+    *,
+    retain: bool = True,
 ) -> tuple[bytes, dict[str, Any]]:
     store = tensorfs.Store.open(str(workspace.store_root))
     digest = tensorfs.object_id(data)
@@ -106,7 +110,8 @@ def completed(
     workspace_sources.record_complete(
         workspace, "owner", command, value, b"k" * 32, root["receipt"]
     )
-    assert workspace_memo.retain_native_result(workspace, "owner", command.service_id) == value
+    if retain:
+        assert workspace_memo.retain_native_result(workspace, "owner", command.service_id) == value
     return value, dict(root)
 
 
@@ -194,3 +199,64 @@ def test_cancel_before_native_recipient_creation_prevents_late_tree_retain(tmp_p
     assert released is not None and released["released"]
     with pytest.raises(tensorfs.errors.Refusal):
         store.retain_tree_root(root["owner"], hold["retention_id"])
+
+
+def test_released_cache_consumer_cannot_reacquire_as_native_producer(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    first = accepted(workspace, "producer")
+    value, root = completed(workspace, first)
+    assert workspace_memo.record_native(workspace, "owner", first.service_id)
+    second = accepted(workspace, "recipient")
+    assert workspace_memo.lookup_native(workspace, "owner", second.service_id, b"k" * 32)
+    assert workspace_memo.record_reuse(workspace, "owner", second.service_id) == value
+    with workspace.locked() as db:
+        before = db.execute("SELECT count(*) FROM holds").fetchone()[0]
+        access = db.execute("SELECT * FROM source_access WHERE request='recipient'").fetchone()
+    # A lost reply/repeated completed command reuses the same already-owned recipient.
+    assert workspace_memo.retain_native_result(workspace, "owner", second.service_id) == value
+    with workspace.locked() as db:
+        assert db.execute("SELECT count(*) FROM holds").fetchone()[0] == before
+    workspace_memo.release_native_result(workspace, "owner", second.service_id)
+    with pytest.raises(WorkspaceRefusal):
+        workspace_memo.retain_native_result(workspace, "owner", second.service_id)
+    store = tensorfs.Store.open(str(workspace.store_root))
+    producer = store.tree_root(root["owner"])
+    assert producer is not None and not producer["released"]
+    with workspace.locked() as db:
+        assert db.execute("SELECT count(*) FROM holds").fetchone()[0] == before
+    recipient = store.tree_root(access["retention_id"])
+    assert recipient is not None and recipient["released"]
+    assert workspace_memo.prune(workspace, "owner").removed_entries == 0
+
+
+def test_release_before_first_native_result_retain_fences_late_recipient(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    first = accepted(workspace, "producer")
+    _, root = completed(workspace, first, retain=False)
+    workspace_memo.release_native_result(workspace, "owner", first.service_id)
+    with pytest.raises(WorkspaceRefusal):
+        workspace_memo.retain_native_result(workspace, "owner", first.service_id)
+    store = tensorfs.Store.open(str(workspace.store_root))
+    producer = store.tree_root(root["owner"])
+    assert producer is not None and not producer["released"]
+
+
+def test_recomputed_native_result_after_missing_cache_owns_new_recipient(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    first = accepted(workspace, "producer")
+    _, _ = completed(workspace, first)
+    assert workspace_memo.record_native(workspace, "owner", first.service_id)
+    second = accepted(workspace, "recipient")
+    assert workspace_memo.lookup_native(workspace, "owner", second.service_id, b"k" * 32)
+    # Drive the existing native missing-custody cleanup. The completed lookup is
+    # released before computation starts, so its old hold cannot receive new output.
+    with workspace.locked() as db:
+        workspace_memo._missing_cleanup(workspace, db, "owner", second.service_id)
+    value, root = completed(workspace, second, retain=False)
+    assert workspace_memo.retain_native_result(workspace, "owner", second.service_id) == value
+    workspace_memo.release_native_result(workspace, "owner", second.service_id)
+    with pytest.raises(WorkspaceRefusal):
+        workspace_memo.retain_native_result(workspace, "owner", second.service_id)
+    store = tensorfs.Store.open(str(workspace.store_root))
+    producer = store.tree_root(root["owner"])
+    assert producer is not None and not producer["released"]

@@ -176,9 +176,52 @@ def retain_native_result(workspace: Workspace, owner: str, service_id: str) -> b
         row = _row(db, owner, service_id)
         payload = _payload(db, owner, service_id)
         (hold,) = payload["holds"]
-        hold["retention_id"] = workspace_memo._hold_id(
-            "native-result", owner, service_id, row["computation_digest"], hold["transaction_id"]
-        )
+        access = db.execute(
+            "SELECT a.*,h.kind FROM source_access a LEFT JOIN holds h ON h.id=a.retention_id "
+            "WHERE a.owner=? AND a.request=? AND a.call_index=? AND a.producer=? "
+            "AND a.native_digest=?",
+            (
+                owner,
+                row["parent_request"],
+                row["call_index"],
+                hold["transaction_id"],
+                documents.raw(hold["native_receipt_digest"]),
+            ),
+        ).fetchone()
+        lookup = db.execute(
+            "SELECT * FROM operation_lookups WHERE owner=? AND consumer=?",
+            (owner, service_id),
+        ).fetchone()
+        if access is not None:
+            if access["state"] != "held" or access["kind"] != hold["kind"]:
+                raise WorkspaceRefusal("native source access was changed or released")
+            hold["retention_id"] = access["retention_id"]
+        elif lookup is not None and lookup["state"] != "miss":
+            if lookup["key"] != row["computation_digest"] or lookup["state"] not in (
+                "ready",
+                "acknowledged",
+            ):
+                raise WorkspaceRefusal("native result lookup was changed or released")
+            prior = canonical_json.decode(lookup["body"])
+            workspace_memo._require_kind(prior, "native")
+            (prior_hold,) = prior["holds"]
+            if any(prior_hold.get(key) != value for key, value in hold.items()):
+                raise WorkspaceRefusal("native result lookup changed its exact subject")
+            hold["retention_id"] = prior_hold["retention_id"]
+        else:
+            from .workspace_sources import native_owner
+
+            if hold["transaction_id"] != native_owner(owner, service_id) or (
+                lookup is not None and lookup["key"] != row["computation_digest"]
+            ):
+                raise WorkspaceRefusal("native result has no matching producer or owned lookup")
+            hold["retention_id"] = workspace_memo._hold_id(
+                "native-result",
+                owner,
+                service_id,
+                row["computation_digest"],
+                hold["transaction_id"],
+            )
         retained = workspace._change_hold(
             db, owner, workspace_memo._request(hold), kind=hold["kind"], release=False
         )
@@ -351,6 +394,9 @@ def release_native_lookup(workspace: Workspace, owner: str, service_id: str) -> 
 
 def release_native_result(workspace: Workspace, owner: str, service_id: str) -> None:
     """Release this call's recipient access; original producer/cache roots are separate."""
+    from . import workspace_memo
+    from .workspace_sources import native_owner
+
     release_native_lookup(workspace, owner, service_id)
     with workspace.locked() as db:
         row = _row(db, owner, service_id)
@@ -359,6 +405,24 @@ def release_native_result(workspace: Workspace, owner: str, service_id: str) -> 
             "WHERE a.owner=? AND a.request=? AND a.call_index=? AND a.state<>'released'",
             (owner, row["parent_request"], row["call_index"]),
         ).fetchall()
+        if (
+            not access
+            and row["state"] == "complete"
+            and row["native_owner"] == native_owner(owner, service_id)
+        ):
+            # A cancel may arrive before the first recipient is created. Fence its
+            # deterministic identity even when no source_access row exists yet.
+            (hold,) = _payload(db, owner, service_id)["holds"]
+            hold["retention_id"] = workspace_memo._hold_id(
+                "native-result",
+                owner,
+                service_id,
+                row["computation_digest"],
+                hold["transaction_id"],
+            )
+            workspace._change_hold(
+                db, owner, workspace_memo._request(hold), kind=hold["kind"], release=True
+            )
         for held in access:
             db.execute(
                 "UPDATE source_access SET state='releasing' WHERE retention_id=?",
