@@ -1693,6 +1693,24 @@ class Executor:
             for component, layout in (facts.get("paging") or {}).items()
         }
         pinned_rows = [facts.get("pinned") or {} for _, facts in facts_rows]
+        # WHAT EACH MODEL PINNED, MERGED (cr-124). A group prepare has one boot note, so a
+        # per-model `attention` fact would simply be dropped and the placement would report
+        # no kernel at all — the one fact the boot line exists to carry. Components are
+        # namespaced by their model's parameter, exactly as `resident` and `parked` are.
+        attention_hosts: dict[str, dict[str, int]] = {}
+        attention_kernels: dict[str, int] = {}
+        attention_offered: list[str] = []
+        attention_locations: dict[str, str] = {}
+        for parameter, facts in facts_rows:
+            row = facts.get("attention") or {}
+            for component, chosen in (row.get("hosts") or {}).items():
+                attention_hosts[f"{parameter}/{component}"] = dict(chosen)
+            for name, sites in (row.get("kernels") or {}).items():
+                attention_kernels[name] = attention_kernels.get(name, 0) + int(sites)
+            attention_locations.update(row.get("locations") or {})
+            for name in row.get("offered") or ():
+                if name not in attention_offered:
+                    attention_offered.append(name)
         routes: dict[str, int] = {}
         kernels: dict[str, int] = {}
         for _, _, reply in children:
@@ -1754,6 +1772,16 @@ class Executor:
                 "registered_bytes": sum(int(row.get("registered_bytes", 0)) for row in pinned_rows),
                 "in_flight_bytes": sum(int(row.get("in_flight_bytes", 0)) for row in pinned_rows),
             },
+            "attention": {
+                "kernels": attention_kernels,
+                "hosts": attention_hosts,
+                "offered": attention_offered,
+                "locations": attention_locations,
+                "pin": "",
+                "line": attention.line(attention_kernels, attention_hosts, attention_offered, ""),
+            }
+            if attention_kernels
+            else None,
             "gpu_name": str(last.get("gpu_name", "")),
             "torch_version": str(last.get("torch_version", "")),
             "cuda_version": str(last.get("cuda_version", "")),

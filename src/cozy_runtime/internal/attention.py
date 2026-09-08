@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import import_module, metadata
 from pathlib import Path
@@ -450,16 +450,25 @@ class Applied:
 
     def line(self) -> str:
         """The ONE line a pod prints at boot. It is the whole per-run attention record."""
-        totals = self.totals()
-        if not totals:
-            return "NONE — this construction holds no diffusers attention site"
-        chosen = ", ".join(f"{name} x{sites}" for name, sites in sorted(totals.items()))
-        where = "; ".join(
-            f"{component}: {'+'.join(sorted(kernels))}"
-            for component, kernels in sorted(self.hosts.items())
-        )
-        how = f"PINNED {self.pin}" if self.pin else f"auto over {list(self.offered)}"
-        return f"{chosen} ({how}) — {where}"
+        return line(self.totals(), self.hosts, list(self.offered), self.pin)
+
+
+def line(
+    totals: Mapping[str, int],
+    hosts: Mapping[str, Mapping[str, int]],
+    offered: Sequence[str],
+    pin: str,
+) -> str:
+    """The boot line, from the facts alone — so a GROUP prepare renders the same sentence from
+    its merged facts as a single one does from its own `Applied` (cr-124)."""
+    if not totals:
+        return "NONE — this construction holds no diffusers attention site"
+    chosen = ", ".join(f"{name} x{sites}" for name, sites in sorted(totals.items()))
+    where = "; ".join(
+        f"{component}: {'+'.join(sorted(kernels))}" for component, kernels in sorted(hosts.items())
+    )
+    how = f"PINNED {pin}" if pin else f"auto over {list(offered)}"
+    return f"{chosen} ({how}) — {where}"
 
 
 def install(ready: list[Ready], roots: Mapping[str, Any], pin: str = "") -> Applied:

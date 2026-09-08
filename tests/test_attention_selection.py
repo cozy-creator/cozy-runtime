@@ -145,6 +145,32 @@ def test_a_pin_this_device_cannot_serve_refuses_naming_the_device() -> None:
     )
 
 
+def test_the_group_boot_line_renders_from_merged_facts_alone() -> None:
+    """A GROUP prepare has ONE boot note, so its `attention` fact is merged from every
+    model's and rendered by the same function — not by an `Applied` it does not have. Same
+    sentence, namespaced components, offered set unioned in rank order."""
+    single = attention.Applied(
+        hosts={"dit": {"flash-attn3": 52}},
+        locations={},
+        offered=("flash-attn3", "sdpa"),
+    )
+    assert single.line() == attention.line(single.totals(), single.hosts, list(single.offered), "")
+    merged = attention.line(
+        {"flash-attn3": 104, "sdpa": 36},
+        {
+            "fl2va/dit": {"flash-attn3": 52},
+            "ref2va/dit": {"flash-attn3": 52},
+            "fl2va/vae": {"sdpa": 36},
+        },
+        ["flash-attn3", "sdpa"],
+        "",
+    )
+    assert merged.startswith("flash-attn3 x104, sdpa x36 (auto over ['flash-attn3', 'sdpa'])")
+    assert "fl2va/vae: sdpa" in merged and "ref2va/dit: flash-attn3" in merged
+    # A construction with no diffusers attention site says so rather than saying nothing.
+    assert attention.line({}, {}, [], "").startswith("NONE")
+
+
 # ------------------------------------------------------------------------------ the CUDA arm
 
 
