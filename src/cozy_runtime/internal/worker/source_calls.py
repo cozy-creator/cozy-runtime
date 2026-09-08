@@ -80,6 +80,12 @@ def implementation_digest(store: Any) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+class NativeSourceFailure(Exception):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 class SourceCalls:
     def __init__(
         self,
@@ -142,9 +148,27 @@ class SourceCalls:
             target=self._run, args=(owner, copied, row, done), daemon=True, name="native-source"
         ).start()
 
-    def cancel_parent(self, request_id: str) -> None:
+    def cancel_parent(
+        self,
+        request_id: str,
+        *,
+        ordinal: int | None = None,
+        spec: bytes | None = None,
+        through: int | None = None,
+    ) -> None:
         with self.lock:
             for service, parent in self.parents.items():
+                command = self.commands.get(service)
+                if command is None:
+                    continue
+                call = command.parent_call
+                if ordinal is not None and (
+                    call.parent_attempt_ordinal != ordinal
+                    or call.parent_invocation_spec_digest != spec
+                ):
+                    continue
+                if through is not None and call.parent_attempt_ordinal > through:
+                    continue
                 if parent == request_id:
                     self.canceled.add(service)
                     process = self.processes.get(service)
@@ -195,12 +219,14 @@ class SourceCalls:
 
         def finalize() -> None:
             try:
-                self.cancel_parent(copied.request_id)
+                self.cancel_parent(copied.request_id, through=copied.attempt_ordinal)
                 with self.lock:
                     tasks = [
                         done
                         for service, done in self.tasks.items()
                         if self.parents.get(service) == copied.request_id
+                        and self.commands[service].parent_call.parent_attempt_ordinal
+                        <= copied.attempt_ordinal
                     ]
                 for done in tasks:
                     done.wait()
@@ -404,7 +430,10 @@ class SourceCalls:
                 return
             answer = canonical_json.decode(output)
             if not answer.get("ok"):
-                raise WorkspaceRefusal(str(answer.get("code", "native_source_failed")))
+                code = answer.get("code")
+                if not isinstance(code, str) or code not in fill.tensorfs_module().errors.CODES:
+                    code = "native_source_failed"
+                raise NativeSourceFailure(code)
             if phase == "resolve":
                 resolved = _selection(answer["selection"])
                 workspace_sources.record_pin(self.workspace, owner, command, resolved)
@@ -432,16 +461,17 @@ class SourceCalls:
                 receipt=receipt,
                 computation=computation,
             )
-        except Exception:
-            # No arbitrary native exception text or source/credential data crosses control.
+        except Exception as exc:
+            # Only a known native refusal code crosses; arbitrary exception text stays private.
+            code = exc.code if isinstance(exc, NativeSourceFailure) else "native_source_failed"
             with self.workspace.locked() as db:
                 db.execute(
-                    "UPDATE native_calls SET state='failed',native_error='native_source_failed' "
+                    "UPDATE native_calls SET state='failed',native_error=? "
                     "WHERE owner=? AND service_id=? "
                     "AND state IN ('accepted','resolved','executing')",
-                    (owner, command.service_id),
+                    (code, owner, command.service_id),
                 )
-            self._status(command, pb.NATIVE_SOURCE_STATE_FAILED, code="native_source_failed")
+            self._status(command, pb.NATIVE_SOURCE_STATE_FAILED, code=code)
         finally:
             if not released:
                 with self.lock:

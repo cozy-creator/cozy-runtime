@@ -386,3 +386,129 @@ def test_permanent_ack_releases_native_producer_and_access_but_keeps_cache(tmp_p
     assert hit is not None and hit["result"] == result
     workspace_memo.record_reuse(workspace, "owner", consumer.service_id)
     assert not store.tree_root(workspace_sources.native_owner("owner", consumer.service_id))
+
+
+def test_native_source_child_stops_when_its_runtime_process_dies(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    waiting = threading.Event()
+    released = threading.Event()
+    data = b"retained worker lifetime proof"
+    digest = hashlib.sha256(data).hexdigest()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            waiting.set()
+            released.wait(30)
+            try:
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes 0-{len(data) - 1}/{len(data)}")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    origin = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=origin.serve_forever)
+    thread.start()
+    parent = None
+    try:
+        store = tensorfs.Store.ensure(tmp_path / "store")
+        native_owner = tensorfs.object_id(b"parent-death-source")
+        envelope = {
+            "store": store.root,
+            "operation": "download_huggingface",
+            "arguments": {},
+            "phase": "execute",
+            "native_owner": native_owner,
+            "service_id": "source-parent-death",
+            "allow_local": True,
+            "selection": {
+                "members": [
+                    [
+                        "weights.safetensors",
+                        "sha256:" + digest,
+                        len(data),
+                        f"http://127.0.0.1:{origin.server_port}/weights",
+                    ]
+                ],
+                "allowed_hosts": ["127.0.0.1"],
+                "credential_hosts": [],
+            },
+        }
+        wrapper = """
+import json,os,subprocess,sys,threading
+from cozy_runtime import canonical_json
+command=json.load(sys.stdin);command['parent_pid']=os.getpid()
+child=subprocess.Popen([sys.executable,'-m','cozy_runtime.internal.worker.source_worker'],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+child.stdin.write(canonical_json.encode(command));child.stdin.close()
+print(child.pid,flush=True)
+threading.Event().wait()
+"""
+        parent = subprocess.Popen(
+            [sys.executable, "-c", wrapper],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        assert parent.stdin is not None and parent.stdout is not None
+        parent.stdin.write(canonical_json.encode(envelope))
+        parent.stdin.close()
+        child_pid = int(parent.stdout.readline())
+        assert waiting.wait(30)
+        parent.kill()
+        parent.wait()
+        stopped = False
+        for _ in range(200):
+            try:
+                state = Path(f"/proc/{child_pid}/stat").read_text().rsplit(") ", 1)[1].split()[0]
+                stopped = state in ("Z", "X")
+            except FileNotFoundError:
+                stopped = True
+            if stopped:
+                break
+            threading.Event().wait(0.05)
+        assert stopped, "source subprocess outlived its Runtime process"
+        store.release_tree_root(native_owner)  # kernel writer fence has actually been released
+        assert store.tree_root(native_owner)["released"]
+    finally:
+        if parent is not None and parent.poll() is None:
+            parent.kill()
+            parent.wait()
+        released.set()
+        origin.shutdown()
+        origin.server_close()
+        thread.join()
+
+
+def test_stale_parent_cancel_cannot_kill_a_new_source_attempt(tmp_path: Path) -> None:
+    class Process:
+        kills = 0
+
+        def kill(self) -> None:
+            self.kills += 1
+
+    workspace = Workspace(tmp_path / "store")
+    calls = SourceCalls(workspace, lambda: "owner", lambda _: None, lambda _: True)
+    command = pb.NativeSourceCommand(
+        parent_call=pb.ChildCallRequest(
+            parent_request_id="parent",
+            parent_attempt_ordinal=2,
+            parent_invocation_spec_digest=b"n" * 32,
+        )
+    )
+    process = Process()
+    calls.parents["service"] = "parent"
+    calls.commands["service"] = command
+    calls.processes["service"] = process  # type: ignore[assignment]
+    calls.cancel_parent("parent", ordinal=1, spec=b"o" * 32)
+    calls.cancel_parent("parent", ordinal=2, spec=b"o" * 32)
+    calls.cancel_parent("parent", through=1)
+    assert process.kills == 0
+    calls.cancel_parent("parent", ordinal=2, spec=b"n" * 32)
+    assert process.kills == 1

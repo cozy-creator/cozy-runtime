@@ -2884,7 +2884,11 @@ class Worker:
             self.on_offer(inner)
         elif kind == "cancel_attempt":
             if self.source_calls is not None:
-                self.source_calls.cancel_parent(inner.request_id)
+                self.source_calls.cancel_parent(
+                    inner.request_id,
+                    ordinal=inner.attempt_ordinal,
+                    spec=inner.invocation_spec_digest,
+                )
             self.note("cancel", self.engine.cancel(inner))
         elif kind == "outcome_ack":
             self.on_outcome_ack(inner)
