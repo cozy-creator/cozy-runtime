@@ -16,6 +16,28 @@ class ChildCallState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CHILD_CALL_STATE_FAILED: _ClassVar[ChildCallState]
     CHILD_CALL_STATE_CANCELED: _ClassVar[ChildCallState]
 
+class NativeSourcePhase(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    NATIVE_SOURCE_PHASE_UNSPECIFIED: _ClassVar[NativeSourcePhase]
+    NATIVE_SOURCE_PHASE_RESOLVE: _ClassVar[NativeSourcePhase]
+    NATIVE_SOURCE_PHASE_EXECUTE: _ClassVar[NativeSourcePhase]
+    NATIVE_SOURCE_PHASE_CANCEL: _ClassVar[NativeSourcePhase]
+
+class NativeSourceOperation(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    NATIVE_SOURCE_OPERATION_UNSPECIFIED: _ClassVar[NativeSourceOperation]
+    NATIVE_SOURCE_OPERATION_HUGGINGFACE: _ClassVar[NativeSourceOperation]
+    NATIVE_SOURCE_OPERATION_CIVITAI: _ClassVar[NativeSourceOperation]
+    NATIVE_SOURCE_OPERATION_CONVERT: _ClassVar[NativeSourceOperation]
+
+class NativeSourceState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    NATIVE_SOURCE_STATE_UNSPECIFIED: _ClassVar[NativeSourceState]
+    NATIVE_SOURCE_STATE_RESOLVED: _ClassVar[NativeSourceState]
+    NATIVE_SOURCE_STATE_SUCCEEDED: _ClassVar[NativeSourceState]
+    NATIVE_SOURCE_STATE_FAILED: _ClassVar[NativeSourceState]
+    NATIVE_SOURCE_STATE_CANCELED: _ClassVar[NativeSourceState]
+
 class Posture(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     POSTURE_UNSPECIFIED: _ClassVar[Posture]
@@ -312,6 +334,19 @@ CHILD_CALL_STATE_SUCCEEDED: ChildCallState
 CHILD_CALL_STATE_REFUSED: ChildCallState
 CHILD_CALL_STATE_FAILED: ChildCallState
 CHILD_CALL_STATE_CANCELED: ChildCallState
+NATIVE_SOURCE_PHASE_UNSPECIFIED: NativeSourcePhase
+NATIVE_SOURCE_PHASE_RESOLVE: NativeSourcePhase
+NATIVE_SOURCE_PHASE_EXECUTE: NativeSourcePhase
+NATIVE_SOURCE_PHASE_CANCEL: NativeSourcePhase
+NATIVE_SOURCE_OPERATION_UNSPECIFIED: NativeSourceOperation
+NATIVE_SOURCE_OPERATION_HUGGINGFACE: NativeSourceOperation
+NATIVE_SOURCE_OPERATION_CIVITAI: NativeSourceOperation
+NATIVE_SOURCE_OPERATION_CONVERT: NativeSourceOperation
+NATIVE_SOURCE_STATE_UNSPECIFIED: NativeSourceState
+NATIVE_SOURCE_STATE_RESOLVED: NativeSourceState
+NATIVE_SOURCE_STATE_SUCCEEDED: NativeSourceState
+NATIVE_SOURCE_STATE_FAILED: NativeSourceState
+NATIVE_SOURCE_STATE_CANCELED: NativeSourceState
 POSTURE_UNSPECIFIED: Posture
 POSTURE_ACCEPTING: Posture
 POSTURE_DRAINING: Posture
@@ -1270,7 +1305,7 @@ class PrepareModelSourceResult(_message.Message):
     def __init__(self, outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ..., spent_members: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class RecordOwnerFrame(_message.Message):
-    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "weights_finalize_request", "weights_host_ack", "weights_transfer_request", "weights_read_request", "model_source_file_request", "model_source_prepare_request", "local_package_abort", "weights_upload_request", "local_package_fetch_request", "child_call_result")
+    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "weights_finalize_request", "weights_host_ack", "weights_transfer_request", "weights_read_request", "model_source_file_request", "model_source_prepare_request", "local_package_abort", "weights_upload_request", "local_package_fetch_request", "child_call_result", "native_source_command")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     DESIRED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_OFFER_FIELD_NUMBER: _ClassVar[int]
@@ -1288,6 +1323,7 @@ class RecordOwnerFrame(_message.Message):
     WEIGHTS_UPLOAD_REQUEST_FIELD_NUMBER: _ClassVar[int]
     LOCAL_PACKAGE_FETCH_REQUEST_FIELD_NUMBER: _ClassVar[int]
     CHILD_CALL_RESULT_FIELD_NUMBER: _ClassVar[int]
+    NATIVE_SOURCE_COMMAND_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     desired_state: DesiredWorkerState
     attempt_offer: AttemptOffer
@@ -1305,10 +1341,11 @@ class RecordOwnerFrame(_message.Message):
     weights_upload_request: WeightsUploadRequest
     local_package_fetch_request: LocalPackageFetchRequest
     child_call_result: ChildCallResult
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., weights_finalize_request: _Optional[_Union[WeightsFinalizeRequest, _Mapping]] = ..., weights_host_ack: _Optional[_Union[WeightsHostAck, _Mapping]] = ..., weights_transfer_request: _Optional[_Union[WeightsTransferRequest, _Mapping]] = ..., weights_read_request: _Optional[_Union[WeightsReadRequest, _Mapping]] = ..., model_source_file_request: _Optional[_Union[ModelSourceFileRequest, _Mapping]] = ..., model_source_prepare_request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ..., local_package_abort: _Optional[_Union[LocalPackageAbort, _Mapping]] = ..., weights_upload_request: _Optional[_Union[WeightsUploadRequest, _Mapping]] = ..., local_package_fetch_request: _Optional[_Union[LocalPackageFetchRequest, _Mapping]] = ..., child_call_result: _Optional[_Union[ChildCallResult, _Mapping]] = ...) -> None: ...
+    native_source_command: NativeSourceCommand
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., weights_finalize_request: _Optional[_Union[WeightsFinalizeRequest, _Mapping]] = ..., weights_host_ack: _Optional[_Union[WeightsHostAck, _Mapping]] = ..., weights_transfer_request: _Optional[_Union[WeightsTransferRequest, _Mapping]] = ..., weights_read_request: _Optional[_Union[WeightsReadRequest, _Mapping]] = ..., model_source_file_request: _Optional[_Union[ModelSourceFileRequest, _Mapping]] = ..., model_source_prepare_request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ..., local_package_abort: _Optional[_Union[LocalPackageAbort, _Mapping]] = ..., weights_upload_request: _Optional[_Union[WeightsUploadRequest, _Mapping]] = ..., local_package_fetch_request: _Optional[_Union[LocalPackageFetchRequest, _Mapping]] = ..., child_call_result: _Optional[_Union[ChildCallResult, _Mapping]] = ..., native_source_command: _Optional[_Union[NativeSourceCommand, _Mapping]] = ...) -> None: ...
 
 class WorkerFrame(_message.Message):
-    __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "weights_finalize_result", "weights_intent", "weights_receipt", "weights_read_result", "weights_transfer_status", "model_source_file_status", "model_source_prepared", "local_package_file_status", "local_package_abort_status", "weights_upload_result", "weights_checkpoint", "weights_transaction", "child_call_request", "child_call_cancel")
+    __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "weights_finalize_result", "weights_intent", "weights_receipt", "weights_read_result", "weights_transfer_status", "model_source_file_status", "model_source_prepared", "local_package_file_status", "local_package_abort_status", "weights_upload_result", "weights_checkpoint", "weights_transaction", "child_call_request", "child_call_cancel", "native_source_status")
     CLAIM_ACK_FIELD_NUMBER: _ClassVar[int]
     OBSERVED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ACCEPTED_FIELD_NUMBER: _ClassVar[int]
@@ -1331,6 +1368,7 @@ class WorkerFrame(_message.Message):
     WEIGHTS_TRANSACTION_FIELD_NUMBER: _ClassVar[int]
     CHILD_CALL_REQUEST_FIELD_NUMBER: _ClassVar[int]
     CHILD_CALL_CANCEL_FIELD_NUMBER: _ClassVar[int]
+    NATIVE_SOURCE_STATUS_FIELD_NUMBER: _ClassVar[int]
     claim_ack: ClaimAck
     observed_state: ObservedWorkerState
     attempt_accepted: AttemptAccepted
@@ -1353,7 +1391,8 @@ class WorkerFrame(_message.Message):
     weights_transaction: WeightsTransactionStatus
     child_call_request: ChildCallRequest
     child_call_cancel: ChildCallCancel
-    def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., weights_finalize_result: _Optional[_Union[WeightsFinalizeResult, _Mapping]] = ..., weights_intent: _Optional[_Union[WeightsIntentFrame, _Mapping]] = ..., weights_receipt: _Optional[_Union[WeightsReceiptFrame, _Mapping]] = ..., weights_read_result: _Optional[_Union[WeightsReadResult, _Mapping]] = ..., weights_transfer_status: _Optional[_Union[WeightsTransferStatus, _Mapping]] = ..., model_source_file_status: _Optional[_Union[ModelSourceFileStatus, _Mapping]] = ..., model_source_prepared: _Optional[_Union[ModelSourcePrepared, _Mapping]] = ..., local_package_file_status: _Optional[_Union[LocalPackageFileStatus, _Mapping]] = ..., local_package_abort_status: _Optional[_Union[LocalPackageAbortStatus, _Mapping]] = ..., weights_upload_result: _Optional[_Union[WeightsUploadResult, _Mapping]] = ..., weights_checkpoint: _Optional[_Union[WeightsCheckpointFrame, _Mapping]] = ..., weights_transaction: _Optional[_Union[WeightsTransactionStatus, _Mapping]] = ..., child_call_request: _Optional[_Union[ChildCallRequest, _Mapping]] = ..., child_call_cancel: _Optional[_Union[ChildCallCancel, _Mapping]] = ...) -> None: ...
+    native_source_status: NativeSourceStatus
+    def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., weights_finalize_result: _Optional[_Union[WeightsFinalizeResult, _Mapping]] = ..., weights_intent: _Optional[_Union[WeightsIntentFrame, _Mapping]] = ..., weights_receipt: _Optional[_Union[WeightsReceiptFrame, _Mapping]] = ..., weights_read_result: _Optional[_Union[WeightsReadResult, _Mapping]] = ..., weights_transfer_status: _Optional[_Union[WeightsTransferStatus, _Mapping]] = ..., model_source_file_status: _Optional[_Union[ModelSourceFileStatus, _Mapping]] = ..., model_source_prepared: _Optional[_Union[ModelSourcePrepared, _Mapping]] = ..., local_package_file_status: _Optional[_Union[LocalPackageFileStatus, _Mapping]] = ..., local_package_abort_status: _Optional[_Union[LocalPackageAbortStatus, _Mapping]] = ..., weights_upload_result: _Optional[_Union[WeightsUploadResult, _Mapping]] = ..., weights_checkpoint: _Optional[_Union[WeightsCheckpointFrame, _Mapping]] = ..., weights_transaction: _Optional[_Union[WeightsTransactionStatus, _Mapping]] = ..., child_call_request: _Optional[_Union[ChildCallRequest, _Mapping]] = ..., child_call_cancel: _Optional[_Union[ChildCallCancel, _Mapping]] = ..., native_source_status: _Optional[_Union[NativeSourceStatus, _Mapping]] = ...) -> None: ...
 
 class ChildCallRequest(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_request_id", "parent_attempt_ordinal", "parent_invocation_spec_digest", "call_index", "interface_digest", "module", "export", "request_canonical_bytes", "intent_digest")
@@ -1432,6 +1471,92 @@ class ChildCallResult(_message.Message):
     safe_code: str
     safe_detail: str
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_request_id: _Optional[str] = ..., parent_attempt_ordinal: _Optional[int] = ..., parent_invocation_spec_digest: _Optional[bytes] = ..., call_index: _Optional[int] = ..., intent_digest: _Optional[bytes] = ..., child_request_id: _Optional[str] = ..., state: _Optional[_Union[ChildCallState, str]] = ..., result_canonical_bytes: _Optional[bytes] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+
+class NativeSourceMember(_message.Message):
+    __slots__ = ("member", "object", "url")
+    MEMBER_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_FIELD_NUMBER: _ClassVar[int]
+    URL_FIELD_NUMBER: _ClassVar[int]
+    member: str
+    object: Ref
+    url: str
+    def __init__(self, member: _Optional[str] = ..., object: _Optional[_Union[Ref, _Mapping]] = ..., url: _Optional[str] = ...) -> None: ...
+
+class NativeSourceSelection(_message.Message):
+    __slots__ = ("canonical", "selection_digest", "content_manifest", "members", "allowed_hosts", "credential_hosts")
+    CANONICAL_FIELD_NUMBER: _ClassVar[int]
+    SELECTION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    MEMBERS_FIELD_NUMBER: _ClassVar[int]
+    ALLOWED_HOSTS_FIELD_NUMBER: _ClassVar[int]
+    CREDENTIAL_HOSTS_FIELD_NUMBER: _ClassVar[int]
+    canonical: str
+    selection_digest: bytes
+    content_manifest: Ref
+    members: _containers.RepeatedCompositeFieldContainer[NativeSourceMember]
+    allowed_hosts: _containers.RepeatedScalarFieldContainer[str]
+    credential_hosts: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, canonical: _Optional[str] = ..., selection_digest: _Optional[bytes] = ..., content_manifest: _Optional[_Union[Ref, _Mapping]] = ..., members: _Optional[_Iterable[_Union[NativeSourceMember, _Mapping]]] = ..., allowed_hosts: _Optional[_Iterable[str]] = ..., credential_hosts: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class NativeSourceCommand(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_call", "service_id", "operation", "phase", "selection", "credential")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_CALL_FIELD_NUMBER: _ClassVar[int]
+    SERVICE_ID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_FIELD_NUMBER: _ClassVar[int]
+    PHASE_FIELD_NUMBER: _ClassVar[int]
+    SELECTION_FIELD_NUMBER: _ClassVar[int]
+    CREDENTIAL_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    parent_call: ChildCallRequest
+    service_id: str
+    operation: NativeSourceOperation
+    phase: NativeSourcePhase
+    selection: NativeSourceSelection
+    credential: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_call: _Optional[_Union[ChildCallRequest, _Mapping]] = ..., service_id: _Optional[str] = ..., operation: _Optional[_Union[NativeSourceOperation, str]] = ..., phase: _Optional[_Union[NativeSourcePhase, str]] = ..., selection: _Optional[_Union[NativeSourceSelection, _Mapping]] = ..., credential: _Optional[str] = ...) -> None: ...
+
+class NativeSourceStatus(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_request_id", "parent_attempt_ordinal", "parent_invocation_spec_digest", "call_index", "intent_digest", "service_id", "state", "selection", "result_canonical_bytes", "safe_code", "safe_detail", "native_receipt_canonical_bytes", "computation_digest", "memo_hit")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    PARENT_INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CALL_INDEX_FIELD_NUMBER: _ClassVar[int]
+    INTENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    SERVICE_ID_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    SELECTION_FIELD_NUMBER: _ClassVar[int]
+    RESULT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    NATIVE_RECEIPT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    COMPUTATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    MEMO_HIT_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    parent_request_id: str
+    parent_attempt_ordinal: int
+    parent_invocation_spec_digest: bytes
+    call_index: int
+    intent_digest: bytes
+    service_id: str
+    state: NativeSourceState
+    selection: NativeSourceSelection
+    result_canonical_bytes: bytes
+    safe_code: str
+    safe_detail: str
+    native_receipt_canonical_bytes: bytes
+    computation_digest: bytes
+    memo_hit: bool
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_request_id: _Optional[str] = ..., parent_attempt_ordinal: _Optional[int] = ..., parent_invocation_spec_digest: _Optional[bytes] = ..., call_index: _Optional[int] = ..., intent_digest: _Optional[bytes] = ..., service_id: _Optional[str] = ..., state: _Optional[_Union[NativeSourceState, str]] = ..., selection: _Optional[_Union[NativeSourceSelection, _Mapping]] = ..., result_canonical_bytes: _Optional[bytes] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., native_receipt_canonical_bytes: _Optional[bytes] = ..., computation_digest: _Optional[bytes] = ..., memo_hit: bool = ...) -> None: ...
 
 class Claim(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "record_owner_id", "worker_id", "wire_minor", "proof")
