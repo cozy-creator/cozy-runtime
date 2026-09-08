@@ -440,6 +440,8 @@ def check_package_set_compatibility(
     package_name = str(selected_package.get("package", ""))
     release = str(selected_package.get("release", ""))
     application, slot_paths, inventory, locked = _request_facts(request, models)
+    if inventory is None:
+        raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
     installed = _compatibility_environment(
         package_name=package_name,
         release=release,
