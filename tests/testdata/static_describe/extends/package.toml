@@ -1,0 +1,2 @@
+[application]
+object = "probe_package:app"

@@ -28,6 +28,7 @@ from cozy_runtime.internal.static_interface import StaticRefusal
 ROOT = Path(__file__).resolve().parent.parent
 RICH = ROOT / "tests" / "testdata" / "static_describe" / "rich"
 SCRIPT = ROOT / "tests" / "testdata" / "static_describe" / "script"
+EXTENDS = ROOT / "tests" / "testdata" / "static_describe" / "extends"
 MARCO = ROOT / "examples" / "marco-polo"
 TIMEOUT = 600
 
@@ -353,3 +354,16 @@ def test_torch_free_venv_describes_refuses_and_conforms(torch_free: Path, tmp_pa
     assert "equal: imported rich_package:app (rich-package 0.1.0 in" in inside.stdout
     conformed = _run(str(cli), "--json", "--conformance", "--dir", str(RICH), "describe")
     assert conformed.stdout == described.stdout
+
+    # A package whose surface is built out of an INSTALLED cozy package's declarations: the
+    # reader reads that WHEEL's own source out of site-packages and nothing else there.
+    extending = _run(str(cli), "--json", "--dir", str(EXTENDS), "describe")
+    document = json.loads(extending.stdout)
+    slot = document["entrypoints"][0]["models"][0]
+    assert slot["class"] == "ProbeModel" and slot["encoded_leaves"] == "accept"
+    assert slot["fusion"] == "accept" and slot["sequence_parallel"] == {"degrees": [2, 4]}
+    assert slot["component_use"]["probe"] == ["vae"]
+    assert '"literal": [30, 40, 50]' in json.dumps(document), "the dependency's data asset too"
+    _run(uv, "pip", "install", "--python", str(python), "--no-deps", str(EXTENDS))
+    agreed = _run(str(cli), "--json", "--conformance", "--dir", str(EXTENDS), "describe")
+    assert agreed.stdout == extending.stdout

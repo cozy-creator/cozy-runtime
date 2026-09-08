@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import ast
 import enum
+import json
+import sysconfig
 import tomllib
 import types
 import typing
@@ -46,7 +48,7 @@ from cozy_runtime.author._script import (
 )
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import AssetsBinding, assets_binding, assets_payload
-from cozy_runtime.author._walker import is_struct, strip
+from cozy_runtime.author._walker import is_struct
 from cozy_runtime.internal.bindings import read_table
 from cozy_runtime.internal.canonical import Json
 
@@ -100,6 +102,24 @@ class Assigned:
 
 
 @dataclass(frozen=True, slots=True)
+class Installed:
+    """The source of the OTHER cozy packages installed beside this runtime.
+
+    A package may build its surface out of a dependency's declarations — a `Model` subclass,
+    a shared request struct — and that dependency's source ships in its wheel. So the reader
+    reads it, confined to distributions declaring a `cozy.application` entry point: the same
+    fact `discovery.py` calls an app. torch declares none, so torch is never in the tree, and
+    site-packages is never a root. Their modules are followed for TYPES only, never scanned
+    for registrations: another package's callables are its own.
+    """
+
+    roots: tuple[Path, ...]
+    """Editable installs: the source tree `direct_url.json` names."""
+    files: frozenset[Path]
+    """Wheel installs: exactly the `.py` files that distribution's RECORD lists."""
+
+
+@dataclass(frozen=True, slots=True)
 class Vocab:
     """One closed-vocabulary name: `author.ImageAsset`, `msgspec.Struct`, `typing.Literal`."""
 
@@ -133,6 +153,9 @@ _VOCAB_MODULES = {
     "cozy_runtime.author": "author",
 }
 _TRUSTED_ROOT = "cozy_runtime.derive"
+#: The entry-point group `discovery.py` reads. A distribution that declares one IS a cozy
+#: package; every other distribution beside it — torch included — is not, and is never read.
+_APPLICATION_GROUP = "[cozy.application]"
 _BUILTIN_TYPES: dict[str, object] = {
     "int": int,
     "str": str,
@@ -232,6 +255,7 @@ class Reader:
         self.project = project
         self.roots = (project / "src", project)
         self.runtime_root = Path(cozy_runtime.__file__).resolve().parent.parent
+        self.installed = _installed_packages(_site_packages(self.runtime_root))
         self.modules: dict[str, Module] = {}
         self.structs: dict[tuple[Path, str], type[msgspec.Struct] | None] = {}
         self.enums: dict[tuple[Path, str], type[enum.Enum]] = {}
@@ -252,6 +276,10 @@ class Reader:
             ):
                 if path.is_file():
                     return self._load(name, path, is_package, trusted)
+        if not trusted and (sibling := self._installed(parts)) is not None:
+            # `trusted` is the same rule cozy_runtime.derive gets: followed for types and
+            # constants, never scanned for registrations.
+            return self._load(name, sibling[0], sibling[1], True)
         detail = f"module {name!r} is not a file under {' or '.join(str(r) for r in roots)}"
         if where is not None:
             self.refuse(where[0], where[1], detail, "static_module")
@@ -271,6 +299,19 @@ class Reader:
             for bound in _bound_names(stmt):
                 module.bindings[bound] = stmt
         return module
+
+    def _installed(self, parts: Sequence[str]) -> tuple[Path, bool] | None:
+        """One module of another INSTALLED cozy package, or None. Never site-packages at large."""
+        for root in (*self.installed.roots, self.runtime_root):
+            for path, is_package in (
+                (root.joinpath(*parts).with_suffix(".py"), False),
+                (root.joinpath(*parts, "__init__.py"), True),
+            ):
+                if path.is_file() and (
+                    root in self.installed.roots or path in self.installed.files
+                ):
+                    return path, is_package
+        return None
 
     def application_module(self, name: str) -> Module:
         """The configured module, with the package `__init__`s Python would run first."""
@@ -323,7 +364,7 @@ class Reader:
         for root in self.roots:
             if (root / top).is_dir() or (root / f"{top}.py").is_file():
                 return {top}
-        return set()
+        return {top} if self._installed((top,)) is not None else set()
 
     def _import_base(self, module: Module, stmt: ast.ImportFrom) -> str | None:
         if stmt.level == 0:
@@ -896,6 +937,52 @@ def _is_classvar(reader: Reader, module: Module, annotation: ast.expr) -> bool:
     return isinstance(found, Vocab) and found.key == "typing.ClassVar"
 
 
+def _site_packages(runtime_root: Path) -> tuple[Path, ...]:
+    """Where THIS interpreter's distributions live. `sysconfig` reads build configuration;
+    it imports nothing and runs nothing. `runtime_root` is included because an editable
+    cozy-runtime resolves to its own `src/`, which is not where the packages are."""
+    found = [Path(sysconfig.get_paths()[key]) for key in ("purelib", "platlib")]
+    return tuple(dict.fromkeys([*found, runtime_root]))
+
+
+def _installed_packages(sites: Sequence[Path]) -> Installed:
+    """Every OTHER cozy package installed beside this runtime, and nothing else.
+
+    A distribution qualifies only by declaring a `cozy.application` entry point. An editable
+    install contributes the source tree its `direct_url.json` names; a wheel install
+    contributes exactly the `.py` files its RECORD lists. Reading a `dist-info` is reading
+    text — no importlib, no `sys.path`, no execution (#713).
+    """
+    roots: list[Path] = []
+    files: set[Path] = set()
+    for site in sites:
+        _read_site(site, roots, files)
+    return Installed(tuple(roots), frozenset(files))
+
+
+def _read_site(site: Path, roots: list[Path], files: set[Path]) -> None:
+    for info in sorted(site.glob("*.dist-info")):
+        entry_points = info / "entry_points.txt"
+        try:
+            if not entry_points.is_file() or _APPLICATION_GROUP not in entry_points.read_text():
+                continue
+            direct = info / "direct_url.json"
+            document = json.loads(direct.read_text()) if direct.is_file() else {}
+            url = document.get("url", "") if document.get("dir_info", {}).get("editable") else ""
+            if url.startswith("file://"):
+                roots.append(Path(url.removeprefix("file://")))
+                continue
+            record = info / "RECORD"
+            if not record.is_file():
+                continue
+            for line in record.read_text().splitlines():
+                relative = line.partition(",")[0]
+                if relative.endswith(".py") and not relative.startswith(("/", "..")):
+                    files.add(site / relative)
+        except (OSError, ValueError):
+            continue
+
+
 def _module_scope(body: Sequence[ast.stmt]) -> list[ast.stmt]:
     """Top-level statements, descending `if`/`try` blocks (`TYPE_CHECKING`, optional imports)."""
     out: list[ast.stmt] = []
@@ -1246,6 +1333,26 @@ def _registration(
     )
 
 
+def _alias_site(reader: Reader, module: Module, node: ast.expr) -> tuple[Module, ast.expr]:
+    """Follow a module-level type alias to the module and expression that WRITE it.
+
+    `translate` already follows an alias for a struct field; a handler PARAMETER is also
+    classified by its shape (`Assets`, a service, a `Model`, the request struct), and that
+    classification has to look at the same place.
+    """
+    seen: set[tuple[Path, int]] = set()
+    while isinstance(node, (ast.Name, ast.Attribute)):
+        try:
+            found = reader.resolve(module, node)
+        except StaticRefusal:
+            return module, node
+        if not isinstance(found, Assigned) or found.identity in seen:
+            return module, node
+        seen.add(found.identity)
+        module, node = found.module, found.value
+    return module, node
+
+
 def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
     if registration.invocable:
         return static_invocable.build(reader, registration)
@@ -1258,21 +1365,16 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
     for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
         if arg.annotation is None:
             reader.refuse(module, arg, "an unannotated handler parameter")
-        node = arg.annotation
+        # A parameter may name a module-level ALIAS of its type — `KeyframeAssets =
+        # Annotated[Assets[Image], AssetLimits(images=2)]` is one declaration used by two
+        # handlers. Classify where it is WRITTEN; refuse where it is USED.
+        site, node = _alias_site(reader, module, arg.annotation)
         target = node.value if isinstance(node, ast.Subscript) else node
         if isinstance(target, ast.Subscript):  # Annotated[Assets[...], AssetLimits(...)]
             target = target.value
         found = (
-            reader.resolve(module, target)
-            if isinstance(target, (ast.Name, ast.Attribute))
-            else None
+            reader.resolve(site, target) if isinstance(target, (ast.Name, ast.Attribute)) else None
         )
-        asset_annotation: object | None = None
-        if isinstance(found, Assigned):
-            translated = reader.translate(module, node)
-            base, _ = strip(translated)
-            if base is author.Assets or typing.get_origin(base) is author.Assets:
-                asset_annotation = translated
         if isinstance(found, Vocab):
             vocab_name = found.key.partition(".")[2]
             if found.key in ("author.Context", "author.Preflight") or vocab_name in (
@@ -1280,17 +1382,16 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 "Secrets",
             ):
                 if isinstance(node, ast.Subscript):
-                    reader.translate(module, node.slice)
+                    reader.translate(site, node.slice)
                 continue
             if vocab_name in {cls.__name__ for cls in SERVICES.values()}:
                 continue
             if vocab_name in ("Assets", "Annotated"):
-                asset_annotation = reader.translate(module, node)
-        if asset_annotation is not None:
-            if assets is not None:
-                reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
-            assets = assets_binding(arg.arg, asset_annotation)
-            continue
+                if assets is not None:
+                    reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
+                assets = assets_binding(arg.arg, reader.translate(site, node))
+                continue
+
         if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
             kind = reader.class_kind(found.module, found.node)
             if kind == "model":
@@ -1307,9 +1408,9 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 )
                 continue
             if kind == "struct":
-                payloads.append(reader.translate(module, node))
+                payloads.append(reader.translate(site, node))
                 continue
-        reader.refuse(module, node, f"parameter {arg.arg}: not an author surface type")
+        reader.refuse(module, arg.annotation, f"parameter {arg.arg}: not an author surface type")
     if len(payloads) != 1:
         reader.refuse(
             module, fn, f"exactly one typed request struct is required, found {len(payloads)}"
