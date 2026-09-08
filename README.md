@@ -503,6 +503,32 @@ A package whose signature declares `MediaDecoder` must install `cozy-runtime[med
 environment to check). The package interface publishes the hard per-field
 codec ceilings and the attempt-wide retained decoded-value ceiling.
 
+Decoded image inputs can opt into preparation through their argument annotation:
+
+```python
+from typing import Annotated
+from cozy_runtime.author import AssetLimits, Assets, Image, ImagePreparation
+
+Pictures = Annotated[
+    Assets[Image],
+    AssetLimits(images=3),
+    ImagePreparation(max_edge=4096, max_pixels=16_777_216),
+]
+```
+
+These example caps are package policy. Preparation preserves aspect ratio and never
+upscales. Creator can run the shared Runtime helper before upload; Runtime applies the
+same transform to originals sent by other clients. Small inputs keep their original
+carrier. Oversized inputs use one fast lossless encoding, or the original if it is
+smaller and admissible. Source files remain unchanged. Byte length, MIME and digest
+always describe the delivered carrier, so raw and prepared uploads can have different
+memo keys while decoding to identical pixels.
+
+The helper checks source byte/pixel limits before decoding and uses an isolated 2 GiB
+address-space limit. That process limit is never applied to a GPU executor. The
+`image-fit/1` profile qualifies the shared codec closure; missing local capability
+leaves preparation to Runtime. Fidelity remains an independent package-interpreted hint.
+
 A package that prepares, binds, or fills a model selects `cozy-runtime[model-execution]`.
 That Runtime capability owns `tensorfs>=0.2,<1` from PyPI; package code does not declare
 TensorFS directly. Every approved base worker image already owns the same distribution, so
