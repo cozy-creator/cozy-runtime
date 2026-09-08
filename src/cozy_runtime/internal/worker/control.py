@@ -30,8 +30,11 @@ import os
 import queue
 import threading
 from collections.abc import Callable, Iterator
+from concurrent import futures
 from pathlib import Path
 from typing import Any, Protocol
+
+import grpc
 
 from cozy_runtime.internal.worker.workspace_rpc import Service as WorkspaceService
 from cozy_runtime.internal.worker.workspace_rpc import WorkspaceRPC
@@ -88,6 +91,15 @@ class _Servicer:
     # only needs the two method names.
     def __init__(self, plane: ControlPlane) -> None:
         self.plane = plane
+        self._readers: list[threading.Thread] = []
+        self._readers_lock = threading.Lock()
+
+    def wait_closed(self) -> None:
+        """Called after RPC handlers stop, so no reader can register after this snapshot."""
+        with self._readers_lock:
+            readers = list(self._readers)
+        for reader in readers:
+            reader.join()
 
     def Control(self, request_iterator: Any, context: Any) -> Any:
         out: queue.Queue[pb.WorkerFrame | None] = queue.Queue()
@@ -95,10 +107,17 @@ class _Servicer:
         def conversation() -> None:
             try:
                 self.plane.serve_stream(request_iterator, out.put)
+            except grpc.RpcError:
+                if context.is_active():
+                    raise
             finally:
                 out.put(None)
 
-        threading.Thread(target=conversation, daemon=True, name="control-stream").start()
+        reader = threading.Thread(target=conversation, daemon=True, name="control-stream")
+        with self._readers_lock:
+            self._readers = [thread for thread in self._readers if thread.is_alive()]
+            self._readers.append(reader)
+            reader.start()
         while True:
             frame = out.get()
             if frame is None:
@@ -121,7 +140,6 @@ class _RuntimeWeightsServicer:
         self.weights = weights
 
     def Exchange(self, request_iterator: Any, context: Any) -> Any:
-        import grpc
 
         return context.abort(
             grpc.StatusCode.UNIMPLEMENTED, "Host writer acknowledgments were retired in wire 41"
@@ -215,12 +233,11 @@ class GrpcControlHost:
     def serve(self, plane: ControlPlane) -> None:
         # The worker is a serial machine behind one device lease; a small thread pool is
         # about stream lifetimes (control + watches), never about parallel dispatch.
-        from concurrent import futures
 
-        import grpc
-
-        self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
-        pb_grpc.add_WorkerControlServicer_to_server(_Servicer(plane), self.server)
+        executor = futures.ThreadPoolExecutor(max_workers=8)
+        control = _Servicer(plane)
+        self.server = grpc.server(executor)
+        pb_grpc.add_WorkerControlServicer_to_server(control, self.server)
         loopback_services = (
             self.workspace_service is not None
             or self.compatibility_checker is not None
@@ -284,21 +301,22 @@ class GrpcControlHost:
             port = self.server.add_insecure_port(self.listen)
             host = self.listen.rsplit(":", 1)[0]
             address = f"{host}:{port}"
-        self.server.start()
-        write_addr(self.addr_file, address)
-        if self.on_bound is not None:
-            try:
+        try:
+            self.server.start()
+            write_addr(self.addr_file, address)
+            if self.on_bound is not None:
                 self.on_bound(address)
-            except Exception:
-                self.server.stop(grace=0)
-                self.stopped.set()
-                raise
-        self.stopped.wait()
+            self.stopped.wait()
+        finally:
+            self.server.stop(grace=0).wait()
+            executor.shutdown(wait=True)
+            control.wait_closed()
+            self.stopped.set()
 
     def stop(self) -> None:
         if self.server is not None:
-            # The grace is zero because the worker's own shutdown already ended every
-            # conversation; what remains is transport teardown, which has no work to drain.
+            # A control reader may request stop. Only serve() joins readers and RPC
+            # handlers, after this caller can return and release its own conversation.
             self.server.stop(grace=0)
         self.stopped.set()
 
@@ -332,7 +350,6 @@ def _refuse(context: Any, exc: BaseException) -> Any:
     opposite default from a retry classifier and correct for the same reason: the safe
     default is the one whose mistake is recoverable.
     """
-    import grpc
 
     from . import package_prepare
 
@@ -407,7 +424,6 @@ class _PreparationServicer(WorkspaceRPC):
         )
 
     def NumericalEnvironment(self, _request: pb.NumericalEnvironmentRequest, context: Any) -> Any:
-        import grpc
 
         if self.numerical_environment is None:
             return context.abort(
@@ -427,8 +443,6 @@ class _PreparationServicer(WorkspaceRPC):
         self, request: pb.ValidateWeightsCheckpointRequest, context: Any
     ) -> Any:
         if self.weights_checkpoint_validator is None:
-            import grpc
-
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "weights checkpoint validation unavailable"
             )
@@ -436,8 +450,6 @@ class _PreparationServicer(WorkspaceRPC):
 
     def CheckpointPage(self, request: pb.CheckpointPageRequest, context: Any) -> Any:
         if self.checkpoint_pager is None:
-            import grpc
-
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "source checkpoint page unavailable"
             )
@@ -445,8 +457,6 @@ class _PreparationServicer(WorkspaceRPC):
 
     def CheckpointTransfer(self, request: pb.CheckpointTransferRequest, context: Any) -> Any:
         if self.checkpoint_transfer is None:
-            import grpc
-
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "source checkpoint transfer unavailable"
             )
@@ -457,8 +467,6 @@ class _PreparationServicer(WorkspaceRPC):
     ) -> Any:
         handler = self.compatibility_handler
         if handler is None:
-            import grpc
-
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "package compatibility checking is unavailable"
             )
@@ -470,8 +478,6 @@ class _PreparationServicer(WorkspaceRPC):
     def PreparePackageSet(self, request: pb.PreparePackageSetRequest, context: Any) -> Any:
         handler = self.package_handler
         if handler is None:
-            import grpc
-
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "package preparation is unavailable"
             )
@@ -483,8 +489,6 @@ class _PreparationServicer(WorkspaceRPC):
     def PrepareModelSource(self, request: pb.PrepareModelSourceRequest, context: Any) -> Any:
         handler = self.model_source_handler
         if handler is None:
-            import grpc
-
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "model source preparation is unavailable"
             )
@@ -494,7 +498,6 @@ class _PreparationServicer(WorkspaceRPC):
             return _refuse(context, exc)
 
     def ReleaseModelSource(self, request: pb.ReleaseModelSourceRequest, context: Any) -> Any:
-        import grpc
 
         if self.model_source_releaser is None:
             return context.abort(grpc.StatusCode.UNIMPLEMENTED, "source release is unavailable")
@@ -508,7 +511,6 @@ class _PreparationServicer(WorkspaceRPC):
         return self._derived_retention(request, context, False)
 
     def CollectStoreGarbage(self, _request: pb.CollectStoreGarbageRequest, context: Any) -> Any:
-        import grpc
 
         if self.store_collector is None:
             return context.abort(grpc.StatusCode.UNIMPLEMENTED, "store collection is unavailable")
@@ -520,7 +522,6 @@ class _PreparationServicer(WorkspaceRPC):
             )
 
     def ReleaseDerivedResult(self, request: pb.DerivedResultReleaseRequest, context: Any) -> Any:
-        import grpc
 
         if self.derived_result_releaser is None:
             return context.abort(
@@ -539,7 +540,6 @@ class _PreparationServicer(WorkspaceRPC):
     def _derived_retention(
         self, request: pb.DerivedRetentionRequest, context: Any, release: bool
     ) -> Any:
-        import grpc
 
         if self.derived_retainer is None:
             return context.abort(grpc.StatusCode.UNIMPLEMENTED, "derived retention is unavailable")
@@ -553,8 +553,6 @@ class _PreparationServicer(WorkspaceRPC):
     def PrepareLocalPackage(self, request: pb.PrepareLocalPackageRequest, context: Any) -> Any:
         handler = self.local_package_handler
         if handler is None:
-            import grpc
-
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "local package preparation is unavailable"
             )
@@ -568,8 +566,6 @@ class _PreparationServicer(WorkspaceRPC):
     ) -> Any:
         handler = self.private_placement_handler
         if handler is None:
-            import grpc
-
             return context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "private placement preparation is unavailable"
             )
