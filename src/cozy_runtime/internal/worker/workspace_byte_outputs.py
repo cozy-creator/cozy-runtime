@@ -27,6 +27,312 @@ CREATE TABLE byte_outputs (
 ) STRICT;
 """
 
+SCHEMA6 = """
+ALTER TABLE byte_outputs ADD COLUMN native_service_id TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX byte_outputs_native_service ON byte_outputs(owner,native_service_id)
+ WHERE native_service_id<>'';
+"""
+
+
+def migrate6(db: Journal) -> None:
+    """Preserve only exactly correlated development source views during the upgrade."""
+    db.executescript("BEGIN IMMEDIATE;" + SCHEMA6)
+    try:
+        rows = db.execute(
+            "SELECT * FROM byte_outputs WHERE slot LIKE 'runtime.source_files.%'"
+        ).fetchall()
+        for row in rows:
+            calls = db.execute(
+                "SELECT service_id FROM native_calls WHERE owner=? AND parent_request=? "
+                "AND operation='source_files' AND 'runtime.source_files.'||call_index=?",
+                (row["owner"], row["request"], row["slot"]),
+            ).fetchall()
+            candidate = dict(row)
+            if len(calls) != 1:
+                raise WorkspaceRefusal("existing native byte output has no unique accepted call")
+            candidate["native_service_id"] = calls[0]["service_id"]
+            if not recorded_native(db, candidate, complete=False):
+                raise WorkspaceRefusal("existing native byte output changed its accepted call")
+            db.execute(
+                "UPDATE byte_outputs SET native_service_id=? WHERE id=?",
+                (candidate["native_service_id"], row["id"]),
+            )
+        db.execute("PRAGMA user_version=6")
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+
+
+def native_slot(operation: str, index: int) -> str:
+    if operation not in ("source_files", "commit_file") or not 0 <= index < 1 << 32:
+        raise WorkspaceRefusal("unknown native byte operation")
+    return f"runtime.{operation}.{index}"
+
+
+def native_call(db: Journal, owner: str, command: pb.NativeSourceCommand) -> Any:
+    from . import workspace_sources
+
+    call = command.parent_call
+    workspace_sources._parent(db, owner, call)
+    row = db.execute(
+        "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, command.service_id)
+    ).fetchone()
+    if (
+        row is None
+        or row["operation"] not in ("source_files", "commit_file")
+        or row["operation"] != call.export
+        or row["parent_request"] != call.parent_request_id
+        or row["call_index"] != call.call_index
+        or row["parent_ordinal"] != call.parent_attempt_ordinal
+        or row["parent_spec"] != call.parent_invocation_spec_digest
+        or row["intent_digest"] != call.intent_digest
+        or row["state"] not in ("accepted", "executing", "complete")
+    ):
+        raise WorkspaceRefusal("native byte output has no exact current native call")
+    return row
+
+
+def native_value(row: Mapping[str, Any], operation: str, accepted: bytes) -> dict[str, Any]:
+    digest = documents.spell(hashlib.sha256(row["manifest_body"]).digest())
+    if operation == "source_files":
+        return {
+            "files": {
+                "asset_ref": digest,
+                "kind": "tree",
+                "digest": digest,
+                "size_bytes": row["content_bytes"],
+            }
+        }
+    if operation == "commit_file":
+        request = canonical_json.decode(accepted)
+        return {
+            "file": {
+                "asset_ref": request["digest"],
+                "kind": "file",
+                "digest": request["digest"],
+                "size_bytes": request["size_bytes"],
+                "media_type": request["media_type"],
+            }
+        }
+    raise WorkspaceRefusal("unknown native byte result")
+
+
+def recorded_native(
+    db: Journal, row: Mapping[str, Any], *, complete: bool, released: bool = False
+) -> bool:
+    service = row["native_service_id"]
+    if not service or row["id"] != identity(
+        row["owner"], row["request"], row["ordinal"], row["spec"], row["slot"]
+    ):
+        return False
+    call = db.execute(
+        "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (row["owner"], service)
+    ).fetchone()
+    if (
+        call is None
+        or call["operation"] not in ("source_files", "commit_file")
+        or call["parent_request"] != row["request"]
+        or native_slot(call["operation"], call["call_index"]) != row["slot"]
+    ):
+        return False
+    args = canonical_json.decode(call["accepted"])
+    if call["operation"] == "source_files":
+        if args["source"]["manifest"] != {
+            "digest": documents.spell(hashlib.sha256(row["manifest_body"]).digest()),
+            "length": len(row["manifest_body"]),
+        }:
+            return False
+    elif canonical_json.decode(row["manifest_body"]) != {
+        "entries": [
+            {
+                "path": "payload",
+                "kind": "file",
+                "blob": {
+                    "sha256": args["digest"].removeprefix("sha256:"),
+                    "length": args["size_bytes"],
+                },
+            }
+        ]
+    }:
+        return False
+    if not complete:
+        return True
+    states = ("complete", "releasing", "released") if released else ("complete",)
+    return (
+        row["state"] in states
+        and call["state"] in states
+        and call["native_receipt"] == row["receipt"]
+        and call["result"]
+        == canonical_json.encode(native_value(row, call["operation"], call["accepted"]))
+    )
+
+
+def reserve_native(
+    workspace: Workspace,
+    owner: str,
+    command: pb.NativeSourceCommand,
+    manifest_body: bytes,
+    max_bytes: int,
+) -> dict[str, Any]:
+    """Reserve once by accepted native call; later attempts keep the real producer."""
+    members = manifest_members(manifest_body, max_bytes)
+    total = sum(member["blob"]["length"] for member in members)
+    with workspace.locked() as db:
+        call = native_call(db, owner, command)
+        slot = native_slot(call["operation"], call["call_index"])
+        row = db.execute(
+            "SELECT * FROM byte_outputs WHERE owner=? AND native_service_id=?",
+            (owner, command.service_id),
+        ).fetchone()
+        if row is None:
+            count = db.execute(
+                "SELECT count(*) FROM byte_outputs WHERE owner=? AND request=? AND ordinal=?",
+                (owner, call["parent_request"], call["parent_ordinal"]),
+            ).fetchone()[0]
+            if count >= MAX_RESULTS:
+                raise WorkspaceRefusal("native byte output exceeds the parent output inventory")
+            root = identity(
+                owner, call["parent_request"], call["parent_ordinal"], call["parent_spec"], slot
+            )
+            candidate = dict(
+                id=root,
+                owner=owner,
+                request=call["parent_request"],
+                ordinal=call["parent_ordinal"],
+                spec=call["parent_spec"],
+                slot=slot,
+                manifest_body=manifest_body,
+                content_bytes=total,
+                native_service_id=command.service_id,
+            )
+            if not recorded_native(db, candidate, complete=False):
+                raise WorkspaceRefusal("native byte manifest differs from its accepted call")
+            db.execute(
+                "INSERT INTO byte_outputs(id,owner,request,ordinal,spec,slot,manifest_body,"
+                "content_bytes,state,native_service_id) VALUES(?,?,?,?,?,?,?,?,'intent',?)",
+                (
+                    root,
+                    owner,
+                    call["parent_request"],
+                    call["parent_ordinal"],
+                    call["parent_spec"],
+                    slot,
+                    manifest_body,
+                    total,
+                    command.service_id,
+                ),
+            )
+            row = db.execute("SELECT * FROM byte_outputs WHERE id=?", (root,)).fetchone()
+        if (
+            row["state"] not in ("intent", "complete")
+            or row["manifest_body"] != manifest_body
+            or row["content_bytes"] != total
+            or not recorded_native(db, row, complete=False)
+        ):
+            raise WorkspaceRefusal("native byte output changed or was permanently released")
+        return dict(row)
+
+
+def complete_native(
+    workspace: Workspace,
+    owner: str,
+    command: pb.NativeSourceCommand,
+    result: bytes,
+    computation: bytes,
+    receipt: bytes,
+    root_id: str,
+) -> tuple[pb.NativeByteTreeRef, int, bytes]:
+    """Verify native custody under current authority without rewriting producer history."""
+    with workspace.locked() as db:
+        call = native_call(db, owner, command)
+        row = db.execute(
+            "SELECT * FROM byte_outputs WHERE owner=? AND native_service_id=? AND id=?",
+            (owner, command.service_id, root_id),
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] not in ("intent", "complete")
+            or not recorded_native(db, row, complete=False)
+            or result
+            != canonical_json.encode(native_value(row, call["operation"], call["accepted"]))
+            or len(computation) != 32
+            or call["computation_digest"] != computation
+            or not 0 < len(receipt) <= 1 << 20
+        ):
+            raise WorkspaceRefusal("native byte completion differs from its accepted intent")
+        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        observed = db.native(lambda: store.tree_root(root_id))
+        if (
+            not observed
+            or not observed["complete"]
+            or observed["released"]
+            or observed["producer"] != root_id
+            or observed["receipt"] != receipt
+            or observed["manifest_digest"]
+            != documents.spell(hashlib.sha256(row["manifest_body"]).digest())
+            or observed["manifest_length"] != len(row["manifest_body"])
+            or observed["receipt_digest"] != documents.spell(hashlib.sha256(receipt).digest())
+        ):
+            raise WorkspaceRefusal("native byte completion has no matching native receipt")
+        native_call(db, owner, command)
+        current = db.execute("SELECT * FROM byte_outputs WHERE id=?", (root_id,)).fetchone()
+        if current["state"] not in ("intent", "complete") or current["receipt"] not in (
+            b"",
+            receipt,
+        ):
+            raise WorkspaceRefusal("native byte producer changed during completion")
+        db.execute(
+            "UPDATE byte_outputs SET state='complete',receipt=?,native_digest=? WHERE id=?",
+            (receipt, hashlib.sha256(receipt).digest(), root_id),
+        )
+        db.execute(
+            "UPDATE native_calls SET state='complete',result=?,native_receipt=?,native_error='' "
+            "WHERE owner=? AND service_id=?",
+            (result, receipt, owner, command.service_id),
+        )
+        current = db.execute("SELECT * FROM byte_outputs WHERE id=?", (root_id,)).fetchone()
+        return reference(dict(current)), int(current["ordinal"]), bytes(current["spec"])
+
+
+def replay_native(
+    workspace: Workspace, owner: str, command: pb.NativeSourceCommand
+) -> tuple[pb.NativeByteTreeRef, int, bytes]:
+    with workspace.locked() as db:
+        call = native_call(db, owner, command)
+        row = db.execute(
+            "SELECT * FROM byte_outputs WHERE owner=? AND native_service_id=?",
+            (owner, command.service_id),
+        ).fetchone()
+        if row is None or not recorded_native(db, row, complete=True):
+            raise WorkspaceRefusal("native byte replay has no completed producer")
+        result, computation, receipt, root_id = (
+            call["result"],
+            call["computation_digest"],
+            call["native_receipt"],
+            row["id"],
+        )
+    return complete_native(workspace, owner, command, result, computation, receipt, root_id)
+
+
+def release_native(workspace: Workspace, owner: str, service_id: str) -> None:
+    with workspace.locked() as db:
+        row = db.execute(
+            "SELECT * FROM byte_outputs WHERE owner=? AND native_service_id=?", (owner, service_id)
+        ).fetchone()
+        if row is None or row["state"] == "released":
+            return
+        if not recorded_native(db, row, complete=False):
+            raise WorkspaceRefusal("native byte release has no accepted producer")
+        call = db.execute(
+            "SELECT state FROM native_calls WHERE owner=? AND service_id=?", (owner, service_id)
+        ).fetchone()
+        if call["state"] not in ("failed", "stopped", "releasing", "released"):
+            raise WorkspaceRefusal("native byte release has no permanent stop intent")
+        db.execute("UPDATE byte_outputs SET state='releasing' WHERE id=?", (row["id"],))
+        root_id = row["id"]
+    release(workspace, owner, root_id)
+
 
 def identity(owner: str, request: str, ordinal: int, spec: bytes, slot: str) -> str:
     return documents.spell(
@@ -85,10 +391,8 @@ def commit(
     files: Sequence[tuple[str, Path]],
     max_bytes: int,
 ) -> pb.NativeByteTreeRef:
-    from . import source_views
-
-    if slot.startswith(source_views.PREFIX):
-        raise WorkspaceRefusal("author outputs cannot enter the native source view namespace")
+    if slot.startswith(("runtime.source_files.", "runtime.commit_file.")):
+        raise WorkspaceRefusal("author outputs cannot enter the native byte namespace")
     entries = manifest_members(manifest_body, max_bytes)
     content_bytes = sum(entry["blob"]["length"] for entry in entries)
     root_id = identity(owner, request, ordinal, spec, slot)
@@ -118,7 +422,11 @@ def commit(
                 "content_bytes,state) VALUES(?,?,?,?,?,?,?,?,'intent')",
                 (root_id, owner, request, ordinal, spec, slot, manifest_body, content_bytes),
             )
-        elif row["manifest_body"] != manifest_body or row["state"] in ("releasing", "released"):
+        elif (
+            row["native_service_id"]
+            or row["manifest_body"] != manifest_body
+            or row["state"] in ("releasing", "released")
+        ):
             raise WorkspaceRefusal("ordinary output changed or was permanently released")
 
         def produce() -> dict[str, Any]:
@@ -174,11 +482,7 @@ def owned(db: Journal, owner: str, source: pb.NativeByteTreeRef, *, released: bo
         ("complete", "releasing", "released") if released else ("complete",)
     ):
         return False
-    from . import source_views
-
-    if row["slot"].startswith(source_views.PREFIX) and not source_views.recorded(
-        db, row, complete=True, released=released
-    ):
+    if row["native_service_id"] and not recorded_native(db, row, complete=True, released=released):
         return False
     return reference(dict(row)) == source
 
