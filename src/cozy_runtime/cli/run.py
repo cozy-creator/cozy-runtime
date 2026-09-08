@@ -25,7 +25,7 @@ from cozy_runtime.author import ConformanceError
 from cozy_runtime.cli import payload as payload_grammar
 from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.internal import bindings as binding_table
-from cozy_runtime.internal import package_interface
+from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import RuntimeConfig
 from cozy_runtime.internal.discovery import discover
@@ -363,53 +363,35 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
     It resolves and reports; it constructs nothing, touches no device and loads no weights.
     """
     project = Path(opts.dir).expanduser().resolve()
-    slots: Sequence[binding_table.BindingSlot]
-    if opts.package_interface:
-        try:
+    try:
+        if opts.package_interface:
             body = package_interface.read_bytes(
                 Path(opts.package_interface).expanduser().resolve().read_bytes(),
                 "package bindings interface",
             )
-            table = binding_table.read_table(project / "package.toml")
-            interface_slots = _interface_slots(body)
-            slots = interface_slots
-            optional = frozenset(slot.path for slot in interface_slots if slot.job)
-        except (OSError, ConformanceError) as exc:
-            raise CliError(
-                "validation",
-                str(exc),
-                "supply the exact release package interface and itstoon package.toml",
-                Exit.validation,
-            ) from exc
-        visible = list(body.get("entrypoints", []))
-    else:
-        try:
-            found = discover(project)
-        except ConformanceError as exc:
-            raise CliError(
-                "validation",
-                str(exc),
-                "a package's surface must be valid before its bindings can resolve (§1.0)",
-                Exit.validation,
-            ) from exc
-        slots = [slot for surface in found.surfaces for slot in surface.model_bindings]
-        optional = frozenset(
-            slot.path
-            for surface in found.surfaces
-            if surface.kind == "job"
-            for slot in surface.model_bindings
-        )
-        table = found.bindings
-        visible = [
-            surface
-            for surface in found.surfaces
-            if surface.kind == "entrypoint" and not surface.hidden
-        ]
+        else:
+            body = static_interface.build(
+                project,
+                environment_python=Path(opts.environment_python)
+                if opts.environment_python
+                else None,
+            )
+        table = binding_table.read_table(project / "package.toml")
+        slots = _interface_slots(body)
+        optional = frozenset(slot.path for slot in slots if slot.job)
+    except (OSError, ConformanceError) as exc:
+        raise CliError(
+            "validation",
+            str(exc),
+            "supply package.toml and the exact package source or interface",
+            Exit.validation,
+        ) from exc
+    visible = list(body.get("entrypoints", []))
     if not slots:
         plans = (
             list(
                 development_placement_documents(
-                    package_interface.build(found),
+                    body,
                     package="local/development-package",
                     release="0.0.0",
                     source_digest=development_source_digest(project),

@@ -238,7 +238,7 @@ def test_refuses_a_type_imported_inside_a_function(tmp_path: Path) -> None:
     )
 
 
-def test_refuses_registration_by_call(tmp_path: Path) -> None:
+def test_explicit_registration_by_call_matches_decorators(tmp_path: Path) -> None:
     project = _variant(
         tmp_path,
         {
@@ -250,9 +250,7 @@ def test_refuses_registration_by_call(tmp_path: Path) -> None:
     )
     init = project / "rich_package" / "__init__.py"
     init.write_text(init.read_text() + "\n\napp.job(gate, publishes=True)\n")
-    refusal = _refusal(project)
-    assert refusal.code == "static_unsupported"
-    assert "`app.job(gate, publishes=True)`" in str(refusal)
+    assert _static(project) == _static(RICH)
 
 
 @pytest.fixture(scope="module")

@@ -8,9 +8,9 @@ and its own reads show up as the worker's work. A wedge observed from in there n
 still. So the arm puts the worker where the pod puts it: below the observer.
 
 argv: <root> <activity-path> <mode>, where mode is `plain` or `wedge`. One JSON line goes to
-stdout at the end — the run's terminal, and for `wedge` the publisher's own tick at SIGSTOP
-and at SIGCONT, which is how the arm bounds the frozen window without a wall clock ever
-entering the document.
+stdout at the end — the run's terminal, and for `wedge` the publisher's fresh-sample
+boundary after confirmed SIGSTOP and its tick at SIGCONT. A reading already in progress
+when the executor stops is outside the frozen window.
 """
 
 from __future__ import annotations
@@ -123,18 +123,28 @@ def _freeze_on_admit(window: list[int]) -> Any:
         admit = worker.admit
 
         def resume_after(pid: int) -> None:
-            # NOTHING here reads the published file: this process is the one being measured.
-            time.sleep(FROZEN_TICKS * TICK)
-            assert worker.activity_file is not None
-            window.append(worker.activity_file.sequence)
-            os.kill(pid, signal.SIGCONT)
+            # This fixture's clock-only helper is not the subject's work, just like
+            # the production reporter/watchdog threads excluded from the meter.
+            tid = threading.get_native_id()
+            worker.pollers.add(tid)
+            try:
+                time.sleep(FROZEN_TICKS * TICK)
+                assert worker.activity_file is not None
+                window.append(worker.activity_file.sequence)
+                os.kill(pid, signal.SIGCONT)
+            finally:
+                worker.pollers.discard(tid)
 
         def stop_after_admit(attempt: Any) -> bool:
             accepted = admit(attempt)
             if accepted and executors and not window:
                 os.kill(executors[0], signal.SIGSTOP)
+                stopped = os.waitid(os.P_PID, executors[0], os.WSTOPPED | os.WEXITED | os.WNOWAIT)
+                assert stopped is not None and stopped.si_code == os.CLD_STOPPED
                 assert worker.activity_file is not None
-                window.append(worker.activity_file.sequence)
+                # meter() runs before publish() increments sequence. The next
+                # published tick may therefore carry a pre-stop reading.
+                window.append(worker.activity_file.sequence + 1)
                 threading.Thread(
                     target=resume_after, args=(executors[0],), daemon=True, name="resume"
                 ).start()

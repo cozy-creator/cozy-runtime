@@ -8,13 +8,17 @@ import importlib
 import importlib.util
 import inspect
 from pathlib import Path
+from typing import Any
 
 import msgspec
 
 from cozy_runtime.author._app import App
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._script_metadata import declarations, main_definition
+from cozy_runtime.author._script_types import annotation, parameter_type
 from cozy_runtime.author._services import Telemetry
+from cozy_runtime.author._signature import _classify
 
 
 class ScriptContext:
@@ -53,14 +57,6 @@ class _ScriptCompleted(msgspec.Struct):
     pass
 
 
-def _contains_yield(node: ast.AST) -> bool:
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-        return False  # A nested generator does not make main itself a generator.
-    if isinstance(node, (ast.Yield, ast.YieldFrom)):
-        return True
-    return any(_contains_yield(child) for child in ast.iter_child_nodes(node))
-
-
 def script_app(module: str) -> App:
     """Creator's generated adapter. Discovery reads syntax without executing the script.
 
@@ -80,65 +76,99 @@ def script_app(module: str) -> App:
         tree = ast.parse(raw, filename=found.origin)
     except SyntaxError as exc:
         raise ConformanceError("script syntax is invalid", code="script_syntax") from exc
-    mains = [
-        node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main"
-    ]
-    if len(mains) != 1:
-        raise ConformanceError(
-            "script must define one main() or main(ctx)", code="script_main_missing"
-        )
-    if any(_contains_yield(statement) for statement in mains[0].body):
-        raise ConformanceError(
-            "script main must execute normally, not yield a generator",
-            code="script_main_signature",
-        )
-    args = mains[0].args
+    definition = main_definition(tree)
+    args = definition.args
     positional = [*args.posonlyargs, *args.args]
     parameters = [*positional, *args.kwonlyargs]
-    if (
-        args.vararg
-        or args.kwarg
-        or len(parameters) > 1
-        or (parameters and parameters[0].arg != "ctx")
-    ):
+    types: dict[str, Any] = {}
+    try:
+        models, weights = declarations(raw)
+        for parameter in parameters:
+            if parameter.arg == "ctx":
+                continue
+            if parameter.annotation is None:
+                raise ValueError("injected parameters need a type")
+            value = parameter_type(parameter.annotation, tree)
+            if _classify(parameter.arg, value, "script main").role not in {"model", "service"}:
+                raise ValueError("script parameter must declare a model or service")
+            types[parameter.arg] = value
+        if set(models) - {
+            name
+            for name, value in types.items()
+            if _classify(name, value, "script main").role == "model"
+        }:
+            raise ValueError("model default names an undeclared model parameter")
+        returned = annotation(definition.returns, tree) if definition.returns else type(None)
+    except Exception as exc:
         raise ConformanceError(
-            "script entrypoint must be main() or main(ctx)", code="script_main_signature"
-        )
-    with_context = bool(parameters)
-    keyword_context = bool(args.kwonlyargs)
+            "script main types or tool.cozy declarations are invalid",
+            code="script_main_signature",
+        ) from exc
+    result_type = (
+        msgspec.defstruct("_ScriptResult", [("value", returned)], module=__name__)
+        if returned is not type(None)
+        else _ScriptCompleted
+    )
+    telemetry_name = next(
+        (name for name, value in types.items() if value is Telemetry), "_script_telemetry"
+    )
+    emits_media = any(
+        _classify(name, value, "script main").capability == "save" for name, value in types.items()
+    )
     app = App()
 
-    @app.job
-    def main(ctx: Context, payload: _ScriptRequest, telemetry: Telemetry) -> _ScriptCompleted:
+    def main(**injected: Any) -> Any:
+        ctx, telemetry = injected.pop("_script_context"), injected[telemetry_name]
+        if telemetry_name == "_script_telemetry":
+            injected.pop(telemetry_name)
+        injected.pop("_script_request")
         ctx.raise_if_cancelled()
+        result: Any = None
         try:
             function = getattr(importlib.import_module(module), "main", None)
             if not callable(function):
                 raise ConformanceError("script main is not callable", code="script_main_signature")
             context = ScriptContext(ctx, telemetry)
-            if with_context:
-                result = function(ctx=context) if keyword_context else function(context)
+            if positional:
+                result = function(context, **injected)
             else:
-                result = function()
+                if any(p.arg == "ctx" for p in parameters):
+                    injected["ctx"] = context
+                result = function(**injected)
             if inspect.isgenerator(result) or inspect.isasyncgen(result):
                 raise ConformanceError(
                     "script main returned an unexecuted generator", code="script_main_signature"
                 )
             if inspect.isawaitable(result):
+                pending = result
 
-                async def wait() -> None:
-                    await result
+                async def wait() -> Any:
+                    return await pending
 
-                asyncio.run(wait())
+                result = asyncio.run(wait())
         except SystemExit as exc:
-            # A script's deliberate exit is its outcome, not a worker crash to retry.
             if exc.code is not None and exc.code != 0:
                 raise ConformanceError(
                     "script exited with a nonzero status", code="script_exit"
                 ) from exc
         ctx.raise_if_cancelled()
-        return _ScriptCompleted()
+        return result_type(result) if returned is not type(None) else result_type()
 
+    # Reuse normal signature analysis, injection, grants and output validation.
+    # No custom invocation path or authority is introduced by a plain script.
+    types = {
+        "_script_context": Context,
+        "_script_request": _ScriptRequest,
+        telemetry_name: Telemetry,
+        **types,
+    }
+    main.__annotations__ = {**types, "return": result_type}
+    main.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        [
+            inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY, annotation=value)
+            for name, value in types.items()
+        ],
+        return_annotation=result_type,
+    )
+    app.job(weights=weights, emits_media=emits_media)(main)
     return app

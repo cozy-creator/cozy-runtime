@@ -255,7 +255,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
     """Internal Creator plumbing for one honest source-checkout PlacementSet."""
 
     from cozy_runtime.author import ConformanceError
-    from cozy_runtime.internal import local, package_interface
+    from cozy_runtime.internal import local, static_interface
     from cozy_runtime.internal.discovery import discover
     from cozy_runtime.internal.worker.session import SEMVER
     from cozy_runtime.protocol import documents
@@ -264,7 +264,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
     values: dict[str, str] = {}
     rest = list(args)
     required = {"--package", "--release", "--source-digest", "--tensorfs-root"}
-    allowed = set(required)
+    allowed = set(required) | {"--environment-python"}
     while rest:
         flag = rest.pop(0)
         if flag not in allowed or not rest:
@@ -303,9 +303,21 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
         )
     project = Path(opts.dir).expanduser().resolve()
     try:
-        found = discover(project)
+        interface = static_interface.build(
+            project,
+            environment_python=Path(values["--environment-python"])
+            if "--environment-python" in values
+            else None,
+        )
+        entries = interface["entrypoints"]
+        assert isinstance(entries, list)
+        # Job-only and weightless placement use only the closed interface. Serving
+        # models still follow the existing construction path until their preparation
+        # is moved behind the admitted worker boundary.
+        modeled = any(isinstance(entry, dict) and entry.get("models") for entry in entries)
+        found = discover(project) if modeled else None
         development = local.development_placement_documents(
-            package_interface.build(found),
+            interface,
             package=package,
             release=release,
             source_digest=source_digest,

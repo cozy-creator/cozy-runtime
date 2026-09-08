@@ -34,9 +34,11 @@ import msgspec
 
 import cozy_runtime
 import cozy_runtime.internal.package_interface as package_interface
+import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._model import Model
+from cozy_runtime.author._script_metadata import declarations, main_definition
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import AssetsBinding, assets_binding, assets_payload
 from cozy_runtime.author._walker import is_struct
@@ -213,9 +215,10 @@ class ModelSpec:
 class Reader:
     """One package tree, read lazily. Every method resolves by NAME, never by execution."""
 
-    def __init__(self, project: Path) -> None:
+    def __init__(self, project: Path, *, dependency_roots: Sequence[Path] = ()) -> None:
         self.project = project
-        self.roots = (project / "src", project)
+        self.project_roots = (project / "src", project)
+        self.roots = (*self.project_roots, *dependency_roots)
         self.runtime_root = Path(cozy_runtime.__file__).resolve().parent.parent
         self.modules: dict[str, Module] = {}
         self.structs: dict[tuple[Path, str], type[msgspec.Struct] | None] = {}
@@ -296,7 +299,12 @@ class Reader:
         return []
 
     def _module_or_none(self, name: str) -> Module | None:
-        if name in _VOCAB_MODULES or name.split(".")[0] not in self._tree_tops(name):
+        top = name.split(".")[0]
+        # Dependency source is followed when a declared type needs it. Importing
+        # torch at module scope must not scan its entire tree for app registrations.
+        if name in _VOCAB_MODULES or not any(
+            (root / top).is_dir() or (root / f"{top}.py").is_file() for root in self.project_roots
+        ):
             return None
         try:
             return self.module(name)
@@ -396,6 +404,10 @@ class Reader:
         if not (base.startswith(_TRUSTED_ROOT) or self._tree_tops(base)):
             return External(f"{base}.{name}")
         source = self.module(base, where=(module, stmt))
+        if source.bindings.get(name) is stmt:
+            # `from . import operations` in the package __init__ binds the child
+            # module, not this same import statement recursively.
+            return ModuleRef(self.module(f"{base}.{name}", where=(module, stmt)))
         if name in source.bindings:
             return self.lookup(source, name, stmt, origin=module)
         return ModuleRef(self.module(f"{base}.{name}", where=(module, stmt)))
@@ -752,11 +764,22 @@ class Reader:
             if isinstance(callee, Vocab) and callee.key == "msgspec.field":
                 options = {k.arg: k.value for k in value.keywords if k.arg is not None}
                 wire = str(self.fold(module, options["name"])) if "name" in options else None
-                if "default" in options or "default_factory" in options:
+                if "default" in options:
+                    try:
+                        default = self.fold(module, options["default"])
+                    except StaticRefusal:
+                        return name, annotation, msgspec.field(default_factory=_unfolded, name=wire)
+                    return name, annotation, msgspec.field(default=default, name=wire)
+                if "default_factory" in options:
                     return name, annotation, msgspec.field(default_factory=_unfolded, name=wire)
                 return name, annotation, msgspec.field(name=wire)
-        # The default's VALUE is never interface content — only that one exists.
-        return name, annotation, msgspec.field(default_factory=_unfolded)
+        # Invocable metadata carries exact scalar defaults. Ordinary request
+        # schemas only need omission, and can retain an unevaluated default.
+        try:
+            default = self.fold(module, value)
+        except StaticRefusal:
+            return name, annotation, msgspec.field(default_factory=_unfolded)
+        return name, annotation, default
 
     def model(self, module: Module, node: ast.ClassDef) -> ModelSpec:
         key = (module.path, node.name)
@@ -806,13 +829,29 @@ class Reader:
         self.models[key] = spec
         return spec
 
+    def model_annotation(self, module: Module, node: ast.expr) -> ModelSpec | None:
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            return None
+        found = self.resolve(module, node)
+        if (
+            isinstance(found, Definition)
+            and isinstance(found.node, ast.ClassDef)
+            and self.class_kind(found.module, found.node) == "model"
+        ):
+            return self.model(found.module, found.node)
+        return None
+
     # ---------------------------------------------------------------- errors
 
     def spell(self, path: Path) -> str:
         try:
             return str(path.relative_to(self.project))
         except ValueError:
-            return str(path.relative_to(self.runtime_root))
+            return (
+                str(path.relative_to(self.runtime_root))
+                if path.is_relative_to(self.runtime_root)
+                else str(path)
+            )
 
     def refuse(
         self, module: Module, node: ast.AST, why: str, code: Code = "static_unresolvable"
@@ -929,16 +968,22 @@ class Registration:
     name: str
     publishes: bool
     weights: tuple[author.WeightsOutput, ...]
+    invocable: bool = False
+    memoize: bool = False
 
 
-def build(project: Path) -> dict[str, Json]:
+def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
     """The package interface from source alone. Executes nothing of the package."""
     project = project.resolve()
     application = read_application(project)
-    reader = Reader(project)
+    reader = Reader(
+        project, dependency_roots=environment_roots(environment_python, project=project)
+    )
     module_name, _, attribute = application.partition(":")
     entry = reader.application_module(module_name)
     app = reader.lookup(entry, attribute, entry.tree)
+    if isinstance(app, Assigned) and _is_script_call(reader, app):
+        return package_interface.assemble(application, [("job", _script_doc(reader, app))], {})
     if not (isinstance(app, Assigned) and _is_app_call(reader, app)):
         raise StaticRefusal(
             f"{application}: {attribute!r} is not `{attribute} = App()` at module scope of "
@@ -972,28 +1017,53 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
     found: list[Registration] = []
     for module in modules:
         for stmt in _module_scope(module.tree.body):
-            if (
-                isinstance(stmt, ast.Expr)
-                and isinstance(stmt.value, ast.Call)
-                and _app_method(reader, module, stmt.value.func, app) is not None
-            ):
-                reader.refuse(
-                    module,
-                    stmt,
-                    "registration by call is not a declaration; use the decorator",
-                    "static_unsupported",
-                )
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                call = stmt.value
+                target = call.func
+                keywords = call.keywords
+                if isinstance(target, ast.Call):
+                    method = _app_method(reader, module, target.func, app)
+                    if method is not None:
+                        if target.args or call.keywords:
+                            reader.refuse(
+                                module,
+                                call,
+                                "computed App registration arguments",
+                                "static_unsupported",
+                            )
+                        keywords = target.keywords
+                else:
+                    method = _app_method(reader, module, target, app)
+                if method is not None:
+                    if len(call.args) != 1 or not isinstance(
+                        call.args[0], (ast.Name, ast.Attribute)
+                    ):
+                        reader.refuse(
+                            module,
+                            call,
+                            "App registration must name one function defined in the tree",
+                            "static_unsupported",
+                        )
+                    function = reader.resolve(module, call.args[0])
+                    if not (
+                        isinstance(function, Definition)
+                        and isinstance(function.node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    ):
+                        reader.refuse(
+                            module,
+                            call.args[0],
+                            "App registration target is not a function defined in the tree",
+                        )
+                    registration = _registration(
+                        reader, function.module, function.node, method, keywords, declaration=module
+                    )
+                    if registration is not None:
+                        found.append(registration)
+                continue
             if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for decorator in stmt.decorator_list:
                 target = decorator.func if isinstance(decorator, ast.Call) else decorator
-                if _is_invocable(reader, module, target):
-                    reader.refuse(
-                        module,
-                        decorator,
-                        "@invocable exports are described by the conformance oracle only",
-                        "static_unsupported",
-                    )
                 method = _app_method(reader, module, target, app)
                 if method is None:
                     continue
@@ -1002,7 +1072,9 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                     reader.refuse(
                         module, decorator, "positional decorator arguments", "static_unsupported"
                     )
-                registration = _registration(reader, module, stmt, method, keywords)
+                registration = _registration(
+                    reader, module, stmt, method, keywords, decorator=decorator
+                )
                 if registration is not None:
                     found.append(registration)
     return found
@@ -1036,7 +1108,50 @@ def _registration(
     fn: ast.FunctionDef | ast.AsyncFunctionDef,
     method: str,
     keywords: Sequence[ast.keyword],
+    *,
+    declaration: Module | None = None,
+    decorator: ast.expr | None = None,
 ) -> Registration | None:
+    function_module = module
+    invocable, memoize = False, False
+    for index, export in enumerate(fn.decorator_list):
+        target = export.func if isinstance(export, ast.Call) else export
+        if not _is_invocable(reader, function_module, target):
+            continue
+        if invocable or (decorator is not None and index < fn.decorator_list.index(decorator)):
+            reader.refuse(
+                function_module,
+                export,
+                "@invocable must occur once, inside the App decorator",
+                "static_unsupported",
+            )
+        invocable = True
+        if isinstance(export, ast.Call):
+            if export.args or any(keyword.arg != "memoize" for keyword in export.keywords):
+                reader.refuse(
+                    function_module,
+                    export,
+                    "@invocable accepts only memoize=",
+                    "static_unsupported",
+                )
+            for keyword in export.keywords:
+                value = reader.fold(function_module, keyword.value)
+                if type(value) is not bool:
+                    reader.refuse(
+                        function_module, keyword.value, "invocable memoize must be a boolean"
+                    )
+                memoize = value
+    if invocable:
+        for export in fn.decorator_list:
+            target = export.func if isinstance(export, ast.Call) else export
+            if export is not decorator and not _is_invocable(reader, function_module, target):
+                reader.refuse(
+                    function_module,
+                    export,
+                    "an invocable decorator outside the closed vocabulary",
+                    "static_unsupported",
+                )
+    module = declaration or module
     allowed = _ENTRYPOINT_KEYWORDS if method == "entrypoint" else _JOB_KEYWORDS
     name = fn.name
     publishes = False
@@ -1073,11 +1188,20 @@ def _registration(
             assert isinstance(value, tuple)
             weights = tuple(value)
     return Registration(
-        module, fn, typing.cast(package_interface.Kind, method), name, publishes, weights
+        function_module,
+        fn,
+        typing.cast(package_interface.Kind, method),
+        name,
+        publishes,
+        weights,
+        invocable,
+        memoize,
     )
 
 
 def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
+    if registration.invocable:
+        return static_invocable.build(reader, registration)
     module, fn = registration.module, registration.fn
     if fn.args.vararg or fn.args.kwarg:
         reader.refuse(module, fn, "*args/**kwargs on a handler", "static_unsupported")
@@ -1156,4 +1280,162 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         assets=assets,
         publishes=registration.publishes,
         weights_outputs=registration.weights,
+    )
+
+
+def environment_roots(python: Path | None, *, project: Path) -> tuple[Path, ...]:
+    """Read the caller's explicit venv layout; never launch its Python or execute .pth."""
+    if python is None:
+        return ()
+    prefix = python.absolute().parent.parent  # Do not resolve the Python symlink to the base.
+    if not python.is_file() or not (prefix / "pyvenv.cfg").is_file():
+        raise StaticRefusal(
+            "--environment-python must name a venv Python", code="static_environment"
+        )
+    roots: list[Path] = []
+    for directory in sorted((prefix / "lib").glob("python*/site-packages")):
+        roots.append(directory.resolve())
+        for path in sorted(directory.glob("*.pth")):
+            if path.stat().st_size > 1 << 20:
+                raise StaticRefusal("venv .pth exceeds source bound", code="static_environment")
+            for line in path.read_text().splitlines():
+                if not line or line.startswith(("#", "import ", "import\t")):
+                    continue  # Executable finder/setup lines are never interpreted.
+                target = (directory / line.rstrip()).resolve()
+                if target.is_dir():
+                    if not (
+                        target.is_relative_to(prefix.parent.resolve())
+                        or target.is_relative_to(project.resolve())
+                    ):
+                        raise StaticRefusal(
+                            "venv editable source escapes the retained install/project root",
+                            code="static_environment",
+                        )
+                    roots.append(target)
+    if not roots or len(roots) > 128:
+        raise StaticRefusal(
+            "venv source roots are absent or exceed the bound", code="static_environment"
+        )
+    return tuple(dict.fromkeys(roots))
+
+
+def _is_script_call(reader: Reader, app: Assigned) -> bool:
+    if not isinstance(app.value, ast.Call):
+        return False
+    found = reader.resolve(app.module, app.value.func)
+    return isinstance(found, Vocab) and found.key == "author.script_app"
+
+
+def _script_annotation(reader: Reader, module: Module, node: ast.expr) -> ast.expr:
+    """Use the same imported-type spelling as the execution adapter, without importing."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        node = ast.parse(node.value, mode="eval").body
+    imported = {
+        alias.asname or (alias.name.split(".")[0] if isinstance(stmt, ast.Import) else alias.name)
+        for stmt in module.tree.body
+        if isinstance(stmt, (ast.Import, ast.ImportFrom))
+        for alias in stmt.names
+    }
+    for part in ast.walk(node):
+        if isinstance(part, ast.Name) and part.id not in {*_BUILTIN_TYPES, *imported}:
+            reader.refuse(module, part, "script types must be explicitly imported or builtin")
+        if isinstance(part, ast.Call):
+            reader.refuse(module, part, "a call in a script annotation", "static_computed")
+    return node
+
+
+def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
+    call = app.value
+    assert isinstance(call, ast.Call)
+    if (
+        len(call.args) != 1
+        or call.keywords
+        or not isinstance(call.args[0], ast.Constant)
+        or not isinstance(call.args[0].value, str)
+        or not call.args[0].value.isidentifier()
+    ):
+        reader.refuse(app.module, call, "script_app requires one literal module name")
+    module = reader.module(call.args[0].value, where=(app.module, call))
+    if len(module.source.encode()) > 32 << 20:
+        reader.refuse(module, module.tree, "script exceeds its source bound")
+    fn = main_definition(module.tree)
+    try:
+        defaults, weights = declarations(module.source.encode())
+    except (ValueError, TypeError) as exc:
+        reader.refuse(module, fn, f"invalid script metadata: {exc}")
+    models: list[dict[str, Json]] = []
+    model_names: set[str] = set()
+    services: set[str] = set()
+    for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
+        if arg.arg == "ctx":
+            continue
+        if arg.annotation is None:
+            reader.refuse(module, arg, "script injected parameters require a type")
+        node = _script_annotation(reader, module, arg.annotation)
+        target = node.value if isinstance(node, ast.Subscript) else node
+        found = reader.resolve(module, target)
+        spec: ModelSpec | None = None
+        if isinstance(found, Vocab):
+            if found.key == "author.Model":
+                if isinstance(node, ast.Subscript):
+                    reader.translate(module, node.slice)
+                spec = ModelSpec("_ScriptSource", "refuse", "refuse", (), {})
+            else:
+                service = next(
+                    (key for key, cls in SERVICES.items() if found.key == "author." + cls.__name__),
+                    None,
+                )
+                if service is not None:
+                    if service in services:
+                        reader.refuse(module, arg, "script requests a service twice")
+                    if service in ("settings", "secrets"):
+                        if not isinstance(node, ast.Subscript):
+                            reader.refuse(module, arg, "script typed service needs its schema")
+                        reader.translate(module, node.slice)
+                    services.add(service)
+                    continue
+        if (
+            isinstance(found, Definition)
+            and isinstance(found.node, ast.ClassDef)
+            and reader.class_kind(found.module, found.node) == "model"
+        ):
+            spec = reader.model(found.module, found.node)
+        if spec is None:
+            reader.refuse(module, arg, "script parameters must be declared models or services")
+        model_names.add(arg.arg)
+        models.append(
+            package_interface.model_slot(
+                f"main.models.{arg.arg}",
+                spec.name,
+                spec.encoded_leaves,
+                spec.fusion,
+                spec.components,
+                spec.sequence_parallel,
+            )
+        )
+    if set(defaults) - model_names:
+        reader.refuse(module, fn, "script model default names an undeclared model")
+    if bool(weights) != ("weights" in services):
+        reader.refuse(module, fn, "script weights declarations and WeightsSink must agree")
+    if weights and (not models or "save" in services):
+        reader.refuse(module, fn, "script weights need a model and cannot mix with media outputs")
+    returned = (
+        reader.translate(module, _script_annotation(reader, module, fn.returns))
+        if fn.returns
+        else type(None)
+    )
+    result = (
+        msgspec.defstruct("_ScriptResult", [("value", typing.cast(type, returned))])
+        if returned is not type(None)
+        else msgspec.defstruct("_ScriptCompleted", [])
+    )
+    return package_interface.callable_doc(
+        name="main",
+        kind="job",
+        payload_type=msgspec.defstruct("_ScriptRequest", []),
+        result_type=result,
+        models=models,
+        assets=None,
+        publishes=False,
+        weights_outputs=weights,
     )
