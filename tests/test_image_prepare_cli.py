@@ -44,7 +44,9 @@ def run(body: dict[str, Any], *, expect: int = 0) -> dict[str, Any]:
     )
     assert result.returncode == expect, (result.stdout, result.stderr)
     assert not result.stderr if expect == 0 else not result.stdout
-    return json.loads(result.stdout if expect == 0 else result.stderr)
+    document = json.loads(result.stdout if expect == 0 else result.stderr)
+    assert isinstance(document, dict)
+    return document
 
 
 def test_cli_image_handoff_and_raw_paths(tmp_path: Path) -> None:
