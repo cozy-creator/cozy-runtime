@@ -270,6 +270,9 @@ class PreparedModel:
     """What the fill COMMITTED, measured. Distinct from the deployment's declared
     `model_weight_bytes` and from the ledger's live resident map — three different facts
     that were all called some form of "vram bytes"."""
+    execution_contract: dict[str, Any] = dataclasses.field(default_factory=dict)
+    """The lane's execution contract AS APPLIED by the prepare (cr-109): digest, backend,
+    pinned sites. Empty for a lane whose header carries no `execution` config."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,8 +632,8 @@ class PlanChooser:
             # observation read out of its conditions, and it gets its own provenance. An
             # uncalibrated number may not refuse; it MAY deepen, because with no serve
             # behind it the deeper rung is the only conservative answer available, and
-            # cr-063 measured what happens without one (an all-resident warm pass that
-            # OOMs on an 8 GB card where the staged rung serves).
+            # cr-063 measured what happens without one (an all-resident first attempt
+            # that OOMs on an 8 GB card where the staged rung serves).
             terms.append(
                 Coefficient("activations", UNCALIBRATED_ACTIVATION_BYTES, "uncalibrated", "")
             )

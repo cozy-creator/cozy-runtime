@@ -7,9 +7,11 @@ worker protocol, TensorFS, Varena or any RecordOwner; it cannot read environment
 it names no device, allocator, compile or ingest surface. `checks/architecture.py` proves it.
 
 A handler's SIGNATURE is its capability declaration: `Context` says where it runs, and
-everything it DOES rides a typed service parameter it named. The surface below is the
-complete set of things a package author touches, minus the codec plane (cr-017). Per-service
-fakes live in `cozy_runtime.author.fakes`.
+everything it DOES rides a typed service parameter it named. A `Model` has exactly three
+lifecycle methods — `load(loader)`, optional `warm(ctx)`, `unload(loader)` — and the runtime
+owns when each runs (model-lifecycle.md, #708). The surface below is the complete set of
+things a package author touches, minus the codec plane (cr-017). Per-service fakes live in
+`cozy_runtime.author.fakes`.
 """
 
 from cozy_runtime import canonical_json
@@ -17,8 +19,11 @@ from cozy_runtime.author._app import App, Registration, RegistrationError
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef, SourceArtifact
 from cozy_runtime.author._assets import (
     Asset,
+    AssetInfo,
+    Assets,
     AudioAsset,
     FileAsset,
+    Image,
     ImageAsset,
     Tree,
     VideoAsset,
@@ -46,6 +51,7 @@ from cozy_runtime.author._decode import (
     DecoderUnavailable,
     MediaDecodeError,
     MediaDecoder,
+    Mixed,
 )
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, decode_request
 from cozy_runtime.author._demand import RequestFeatures
@@ -91,6 +97,7 @@ from cozy_runtime.author._loader import (
 )
 from cozy_runtime.author._markers import (
     AssetBound,
+    AssetLimits,
     Bound,
     ModelDefault,
     Preflight,
@@ -165,6 +172,9 @@ __all__ = [
     "Artifact",
     "Asset",
     "AssetBound",
+    "AssetInfo",
+    "AssetLimits",
+    "Assets",
     "AudioAsset",
     "AuthorError",
     "Backend",
@@ -207,6 +217,7 @@ __all__ = [
     "EgressResponse",
     "FileAsset",
     "Fit",
+    "Image",
     "ImageAsset",
     "ImageFrame",
     "InvalidRequest",
@@ -215,6 +226,7 @@ __all__ = [
     "Loader",
     "MediaDecodeError",
     "MediaDecoder",
+    "Mixed",
     "Model",
     "ModelArtifact",
     "SourceArtifact",

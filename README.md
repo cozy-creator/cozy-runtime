@@ -36,6 +36,8 @@ runner whose own cgroup is not delegated) and name that host fact as the reason.
 CI runs the build, ruff, mypy, the reproducible-wheel check and `checks/architecture.py`'s
 AST import scans, and nothing else. Hardware is verified by hand on a rented card.
 
+For labelled model-ready input media, see [Ordered media inputs](docs/assets.md).
+
 ## Layout
 
 | package | role | may import |
@@ -361,11 +363,18 @@ another environment. Local `serve`
 receives the same `--environment-python`; `--install-root` is reserved for rental
 materialization and the two flags are mutually exclusive.
 
-The local boot warm pass is also capacity evidence. A typed device OOM falsifies only that
-executor epoch's attempted placement rung and normalized shape cell. Runtime retries the same
-synthetic request through the existing component-staged rung and publishes DISPATCHABLE only when
-that fallback is viable; if every proven rung fails capacity, activation stays offline with a typed
-fault. Other optional warm failures remain degraded observations rather than placement decisions.
+A model has exactly three lifecycle methods — `load(loader)`, optional `warm(ctx)`,
+`unload(loader)` (model-lifecycle.md, #708). `warm` is the author's one place for post-fill,
+pre-serving work: the runtime calls it once per construction fill, after the fill and its
+verification and before the placement is DISPATCHABLE, on every worker including dynamic
+placements, with the device lease held and real tensors in place — never again on a component
+stage or evict, and again only when the construction is rebuilt. Whether to compile at all is
+the author's choice; inside `warm` the runtime refuses only the name-renaming
+`torch.compile(module)` spelling (the in-place `module.compile()` is allowed), the `Context`
+carries the device, the fill's deadline and cancellation and can reserve no package call, and
+a raise is a typed construction failure (`warm_failed`, naming the exception) that keeps the
+placement OFFLINE. Its wall time is the `warm` leg of the prepare, on the fill's boot record.
+There is no entrypoint-level warm pass and no `ctx.boot_warmup`.
 
 Source-checkout development is an explicit, same-user lane rather than a partially qualified
 published package. Creator privately asks Runtime to author a `Placement.development` carrying

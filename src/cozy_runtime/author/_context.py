@@ -110,13 +110,16 @@ def derive_seed(request_id: str) -> int:
 
 @dataclass(slots=True)
 class Context:
-    """The request-scoped execution surface. Injected when the signature names it."""
+    """The execution surface: where and under what conditions this code runs.
+
+    Injected into a handler when its signature names it, and handed to `Model.warm` by
+    the runtime. Under `warm` there is no attempt: `request_id` is empty, the adapter
+    stack is empty, and no package-call broker is bound (model-lifecycle.md, cr-110).
+    """
 
     request_id: str
     deadline: float
     """Monotonic-clock instant the attempt must not outlive."""
-    boot_warmup: bool = False
-    """True only during the boot warm pass — cheapen the body off it (cr-007)."""
     device: Device = field(default_factory=Device)
     _cancel: Callable[[], bool] = field(default=lambda: False, repr=False)
     _adapters: tuple[AdapterRef, ...] = field(default=(), repr=False)

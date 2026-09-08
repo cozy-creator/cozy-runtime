@@ -40,11 +40,14 @@ from cozy_runtime.author import (
     CapabilityError,
     ConformanceError,
     Context,
+    Device,
     FileAsset,
     InvalidRequest,
+    Invocation,
     Model,
     ModelRegistry,
     decode_request,
+    invocable,
     uses_components,
 )
 from cozy_runtime.author._loader import (
@@ -55,8 +58,14 @@ from cozy_runtime.author._loader import (
     Scheduler,
     census,
 )
-from cozy_runtime.author._model import _derive_model
-from cozy_runtime.author.fakes import fake_attempt, fake_input, fake_outputs
+from cozy_runtime.author._model import _derive_model, _public_methods
+from cozy_runtime.author.fakes import (
+    fake_attempt,
+    fake_context,
+    fake_input,
+    fake_outputs,
+    warm_with_fakes,
+)
 
 MANIFEST = "sha256:" + "ab" * 32
 
@@ -96,6 +105,7 @@ class Pipeline:
             "transformer": Component(),
             "scheduler": Sampler(),
         }
+        self.seen: Context | None = None
 
 
 class Denoiser(Model[Pipeline]):
@@ -271,3 +281,89 @@ def test_a_model_may_not_name_an_artifact_identifier() -> None:
     with pytest.raises(ConformanceError) as derived:
         _derive_model(Denoiser, "stabilityai/stable-diffusion-xl-base-1.0")
     assert derived.value.code == "derive_model_manifest_invalid"
+
+
+# --------------------------------------------------------------------------- warm (cr-110)
+
+
+class Warmed(Model[Pipeline]):
+    """A model whose `warm` takes ONE dry step through its declared scope (model-lifecycle.md)."""
+
+    pipeline: Pipeline
+
+    def load(self, loader: Loader) -> None:
+        self.pipeline = loader.construct(Pipeline, factory=lambda config: Pipeline())
+
+    def warm(self, ctx: Context) -> None:
+        self.pipeline.seen = ctx  # on the pipeline: the model itself stays immutable
+        self.denoise()
+
+    @uses_components("transformer")
+    def denoise(self) -> str:
+        component = self.pipeline.components["transformer"]
+        assert callable(component)
+        return str(component())
+
+
+@invocable
+async def child(ctx: Context, *, seed: int) -> int:
+    """A package call: reservable only under an admitted attempt's broker."""
+    return seed
+
+
+def test_warm_is_a_lifecycle_member_and_not_a_scope() -> None:
+    """`warm` sits beside `load`/`unload`: `@uses_components` refuses it, and the base
+    class's is a no-op so declaring one is the author's choice."""
+    with pytest.raises(ConformanceError) as refused:
+
+        class Scoped(Model[Pipeline]):
+            @uses_components("transformer")
+            def warm(self, ctx: Context) -> None:
+                return None
+
+    assert refused.value.code == "component_placement"
+    Model().warm(fake_context())  # the base is a no-op: declaring one is the author's choice
+    assert "warm" not in [name for name, _ in _public_methods(Warmed)]
+
+
+def test_warm_runs_under_a_context_with_no_attempt_behind_it() -> None:
+    """The Context `warm` receives has a device, a deadline and cancellation and nothing
+    request-shaped: no id, no adapters, no `boot_warmup` flag anywhere on the surface —
+    and an invocable called inside it refuses because no broker is bound, not because a
+    flag says so."""
+    model = Warmed.for_test(pipeline=Pipeline())
+
+    ctx = warm_with_fakes(model, device=Device("cuda", 0))
+
+    assert ctx.request_id == "" and str(ctx.device) == "cuda:0" and not ctx.cancelled
+    assert ctx._adapters == ()
+    assert not hasattr(ctx, "boot_warmup") and not hasattr(Invocation, "boot_warmup")
+    # The dry step opened its declared scope exactly as a handler would, and the harness
+    # recorded it — which is how a package test proves what its warm touches.
+    model.harness.assert_scopes("denoise")
+    assert model.pipeline.seen is ctx
+
+    class Calling(Model[Pipeline]):
+        pipeline: Pipeline
+
+        def warm(self, ctx: Context) -> None:
+            child(seed=1)
+
+    with pytest.raises(CapabilityError) as refused:
+        warm_with_fakes(Calling.for_test(pipeline=Pipeline()))
+    assert refused.value.code == "child_broker_absent"
+
+
+def test_warm_may_not_grow_the_model() -> None:
+    """The generation stays immutable through `warm`: in-place work on the modules is the
+    whole point, new state on the model is the fence `load` already answers (§1.3)."""
+
+    class Growing(Model[Pipeline]):
+        pipeline: Pipeline
+
+        def warm(self, ctx: Context) -> None:
+            self.tables = object()
+
+    with pytest.raises(CapabilityError) as refused:
+        warm_with_fakes(Growing.for_test(pipeline=Pipeline()))
+    assert refused.value.code == "persistent_allocation"

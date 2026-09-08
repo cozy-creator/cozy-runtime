@@ -359,7 +359,7 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
     with _workspace() as root:
         worker = Worker(
             _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0,1", no_warm=True),
+            WorkerOptions(root=root / "worker", devices="0,1"),
             InMemoryControlHost(),
         )
         try:
@@ -436,7 +436,7 @@ def test_a_pin_through_the_worker_fuses_and_bumps_the_admission_epoch() -> None:
     with _workspace() as root:
         worker = Worker(
             _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0,1", no_warm=True),
+            WorkerOptions(root=root / "worker", devices="0,1"),
             InMemoryControlHost(),
         )
         try:
@@ -485,7 +485,7 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
     with _workspace() as root:
         worker = Worker(
             _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0,1", no_warm=True),
+            WorkerOptions(root=root / "worker", devices="0,1"),
             InMemoryControlHost(),
         )
         try:
@@ -554,7 +554,7 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
     with _workspace() as root:
         worker = Worker(
             _config(root / "home"),
-            WorkerOptions(root=root / "worker", devices="0", no_warm=True),
+            WorkerOptions(root=root / "worker", devices="0"),
             InMemoryControlHost(),
         )
         try:
@@ -753,7 +753,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
         config = _config(root / "home")
         worker = Worker(
             config,
-            WorkerOptions(root=root / "worker", devices="0,1", no_warm=True),
+            WorkerOptions(root=root / "worker", devices="0,1"),
             InMemoryControlHost(),
         )
         found = discover(PACKAGE)
@@ -819,7 +819,7 @@ def test_degree_one_is_a_plain_executor() -> None:
         config = _config(root / "home")
         worker = Worker(
             config,
-            WorkerOptions(root=root / "worker", devices="0", no_warm=True),
+            WorkerOptions(root=root / "worker", devices="0"),
             InMemoryControlHost(),
         )
         found = discover(PACKAGE)

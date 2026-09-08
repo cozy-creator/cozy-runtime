@@ -1,4 +1,4 @@
-"""The attempt engine: offer -> prepare -> accept -> execute -> terminal, and the warm pass.
+"""The attempt engine: offer -> prepare -> accept -> execute -> terminal.
 
 Everything the worker may CLAIM about an attempt passes through here, in the one order
 worker-protocol/02 fixes:
@@ -366,6 +366,9 @@ class AttemptRecord:
     traceback: str = ""
     #: what the component-use plane actually did: stages, evictions, leases, resident set
     residency: dict[str, Any] = dataclasses_field(default_factory=dict)
+    #: the lane's execution contract as ATTESTED by this attempt (cr-109): calls of the
+    #: contracted entry against the pinned sites x forwards, and the profiled kernel symbol
+    execution_contract: dict[str, Any] = dataclasses_field(default_factory=dict)
 
     #: the record the plan was PRICED against, resolved once by the executor's kernel
     prepared: PreparedRequest | None = None
@@ -430,6 +433,7 @@ class AttemptRecord:
         self.reconciliation = {}
         self.caps = {}
         self.residency = {}
+        self.execution_contract = {}
         self.publication = {}
         self.weights_receipts = {}
         self.weights_work_fingerprint = ""
@@ -503,9 +507,6 @@ class AttemptEngine:
         self.owner_scope = owner_scope
         self.tensorfs_root = tensorfs_root
         self.work_fingerprint = work_fingerprint
-        #: binding digests whose boot warm pass FAILED. Every attempt served under one
-        #: carries a per-request confession: the first-call tax was never paid for it.
-        self.degraded: dict[str, str] = {}
         #: the demand falsifier. It ships first, it counts, and it decides nothing — the
         #: `timing-decides-nothing` fence proves the module it lives in cannot reach the
         #: planner, the ledger or the fill plane.
@@ -748,6 +749,17 @@ class AttemptEngine:
                     "request_id": f"{attempt.request_id}#{attempt.attempt}",
                     "entrypoint": declared.entrypoint,
                     "payload": attempt.payload,
+                    "input_metadata": {
+                        name: {
+                            "input_id": name,
+                            "media_type": item.kind_mime,
+                            "digest": documents.spell(item.digest),
+                            "length": item.length,
+                            "order": item.order,
+                        }
+                        for name, item in attempt.grant.inputs.items()
+                        if name != "payload"
+                    },
                 },
                 timeout=None,
             )
@@ -1698,7 +1710,6 @@ class AttemptEngine:
             "request_id": key,
             "entrypoint": attempt.declared.entrypoint,
             "deadline_s": seconds,
-            "boot_warmup": False,
             "spool": str(spool),
             "placement": attempt.plan.placement,
             "headroom_bytes": attempt.plan.headroom_bytes,
@@ -1728,6 +1739,19 @@ class AttemptEngine:
         attempt.await_reclaim_before_finalizing()
         attempt.resulted_at = time.perf_counter()
         self.monitor.end(key, "returned")
+        attempt.execution_contract = dict(reply.get("execution_contract") or {})
+        if attempt.execution_contract:
+            # THE SCHEME THAT RAN, as a typed row every reader of confessions keys on (cr-109):
+            # the throughput table and the gate read the lane by what attested, never by the
+            # contract's promise.
+            _a = attempt.execution_contract
+            attempt.confess(
+                "execution_contract",
+                f"{_a.get('scheme')}: {_a.get('entry')} x{_a.get('calls')} of "
+                f"{_a.get('expected_calls')} predicted, kernel "
+                f"{_a.get('kernel_symbol') or 'unobserved'}"
+                + (f"; {_a['refusal']}" if _a.get("refusal") else ""),
+            )
         # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
         # whatever came back, success or fault: a failed attempt's activation peak is
         # exactly the number an operator needs, and dropping it on the failure path would
@@ -1872,6 +1896,10 @@ class AttemptEngine:
             cause = CAUSE.CAUSE_CODE_EXECUTOR_FAULT
         if outcome["terminal"] == "failed" and outcome["code"] in GROUP_FAULT_CODES:
             cause = CAUSE.CAUSE_CODE_EXECUTOR_FAULT
+        if outcome["terminal"] == "failed" and outcome["code"] == "execution_contract_unobserved":
+            # The kernel the lane promises was not what ran (cr-109): a capability the
+            # contract named was unavailable to this attempt, from the runtime's side.
+            cause = CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE
         if outcome["terminal"] == "refused" and outcome["code"] in (
             "unsupported_input",
             "tree_ungranted",
@@ -2041,14 +2069,6 @@ class AttemptEngine:
                 "substituted" if str(row.get("reason", "")).startswith("adjusted") else "degraded",
                 f"{row.get('field')}: requested {row.get('requested')}, served "
                 f"{row.get('applied')} - {row.get('reason')}",
-            )
-        plan_id = attempt.declared.entrypoint_binding_digest if attempt.declared else ""
-        why = self.degraded.get(plan_id)
-        if why:
-            attempt.confess(
-                "degraded",
-                f"served by a binding whose boot warm pass FAILED ({why}): the first-call "
-                "tax was never paid on boot, so this request paid it",
             )
 
     def bank_demand(self, attempt: AttemptRecord, metrics: Mapping[str, Any], moved: bool) -> None:
@@ -2394,6 +2414,12 @@ class AttemptEngine:
         attempt.subject_id = attempt.subject_id or triage.mint_subject()
         key = f"{attempt.request_id}#{attempt.attempt}"
         plan = attempt.plan
+        plan_document = plan.document() if plan is not None else {}
+        contract = attempt.prepared_model.execution_contract if attempt.prepared_model else {}
+        if contract or attempt.execution_contract:
+            # `plan.execution` (cr-109): the contract as applied by the prepare beside what
+            # this attempt attested. Outside `AttemptPlan.document()`, which is an identity.
+            plan_document["execution"] = {**contract, **attempt.execution_contract}
         assembly = triage.Assembly(
             subject_id=attempt.subject_id,
             attempt={
@@ -2407,7 +2433,7 @@ class AttemptEngine:
                 "executions": attempt.executions,
                 "replays": attempt.replays,
             },
-            plan=plan.document() if plan is not None else {},
+            plan=plan_document,
             posture=self.posture(),
             terminal={
                 "status": pb.OutcomeStatus.Name(status),

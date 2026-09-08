@@ -510,7 +510,6 @@ def _drive(
     options = WorkerOptions(
         root=workspace / "worker",
         devices=DEVICE,
-        no_warm=True,
         instance_id="ins-shared-lane",
         tensorfs_root=staged.tensorfs_root,
         artifact_cache=staged.artifact_cache,
@@ -792,7 +791,6 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
         options = WorkerOptions(
             root=root / "worker",
             devices="0,1",
-            no_warm=True,
             tensorfs_root=staged.tensorfs_root,
             artifact_cache=staged.artifact_cache,
             development_project=PACKAGE,

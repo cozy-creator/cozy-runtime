@@ -44,7 +44,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.author._assets import GrantedInput
+from cozy_runtime.author._assets import GrantedInput, InputMetadata
 from cozy_runtime.author._context import Device
 from cozy_runtime.author._errors import CapabilityError, Outcome, classify
 from cozy_runtime.author._invoke import (
@@ -60,6 +60,7 @@ from cozy_runtime.internal import (
     accel,
     canonical,
     child_env,
+    execution_contract,
     model_config,
     package_interface,
     sandbox,
@@ -360,7 +361,10 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.derive",
     "cozy_runtime.internal.encoding",
     "cozy_runtime.internal.fill",
+    "cozy_runtime.internal.fusion",
+    "cozy_runtime.internal.fusion_install",
     "cozy_runtime.internal.planfacts",
+    "cozy_runtime.internal.warm",
     "cozy_runtime.internal.probe",
     "cozy_runtime.internal.residency",
     "cozy_runtime.internal.resolution",
@@ -410,6 +414,9 @@ class Executor:
         self._prepare_consumed = False
         self.poisoned = ""
         self.constructed_model_digest = ""
+        #: The lane's execution contract, pinned on this generation and attested per attempt
+        #: (cr-109). None when the header carries no `execution` config.
+        self.attestation: execution_contract.Attestation | None = None
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
@@ -876,6 +883,7 @@ class Executor:
             dtype_name,
             tensor_schema_of,
         )
+        from cozy_runtime.internal.fusion_install import FusionRefusal, apply_fusion_plan
         from cozy_runtime.internal.planfacts import PlanFacts
         from cozy_runtime.internal.probe import qualified
         from cozy_runtime.internal.residency import ComponentResidency
@@ -885,6 +893,7 @@ class Executor:
             Variant,
             resolve,
         )
+        from cozy_runtime.internal.warm import WarmFailed, warm_generation
 
         stage("runtime_imports")
         refused = self._initialize_device(torch)
@@ -1020,6 +1029,20 @@ class Executor:
         if not isinstance(config_document, dict):
             raise RuntimeError("the CozyTensors construction config is not an object")
         stage("construction_config")
+        # THE LANE'S EXECUTION CONTRACT (cr-109), read where the construction config is read
+        # and refused BEFORE a plan is resolved or a byte is reserved: the device class first,
+        # then the kernel this environment can bind. There is no fallback on this axis; a
+        # refusal replaces the executor and the hub walks the ladder to the next rung.
+        kernel: execution_contract.Kernel | None = None
+        try:
+            contract = execution_contract.read(config_checkpoint.header.get("configs"))
+            if contract is not None:
+                execution_contract.check_device(contract, device_facts)
+                kernel = execution_contract.resolve_kernel(contract)
+        except execution_contract.ExecutionContractRefusal as exc:
+            self.poisoned = f"execution contract refused: {exc.code}"
+            return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
+        stage("execution_contract")
         construction = ConstructionFacts(
             release=str(binding["release"]),
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
@@ -1046,6 +1069,7 @@ class Executor:
                 encoded_leaves=consent,
                 steps_basis=int(binding.get("steps_basis") or 20),
                 dtype_name=dtype_name,
+                route=contract.weights.route if contract is not None else "",
             )
         except PlanRefusal as exc:
             self.poisoned = f"plan refused: {exc.code}"
@@ -1242,7 +1266,22 @@ class Executor:
                 application=str(binding["application"]),
                 model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
             )
+            # THE FUSED GLUE (h3a-015), under the class's `fusion="accept"` only: a
+            # substitution of forwards after fill, refused typed when Triton is absent.
+            fused = (
+                apply_fusion_plan(model, torch=torch, device=self._rank_device(torch))
+                if getattr(model_cls, "__fusion__", "refuse") == "accept"
+                else None
+            )
             stage("execution_plan")
+            # THE CONTRACT'S KERNEL, PINNED POST-FILL (cr-109) on every diffusers model of the
+            # constructed pipeline, before any warm step: a warm dry step then attests it.
+            applied = (
+                execution_contract.apply(contract, kernel, model)
+                if contract is not None and kernel is not None
+                else None
+            )
+            stage("execution_contract_apply")
         except ModelFitRefused as exc:
             # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
             # loader asked before `materialize`, so the only thing to undo is the read
@@ -1262,9 +1301,20 @@ class Executor:
                 "state": backend.state,
                 "envelope": envelope,
             }
-        except AnimaOptimizationRefusal as exc:
+        except (AnimaOptimizationRefusal, FusionRefusal) as exc:
             backend.poison(())
             self.poisoned = f"execution plan refused: {exc.code}"
+            return {
+                "ok": False,
+                "code": exc.code,
+                "detail": str(exc)[:900],
+                "state": backend.state,
+                "envelope": envelope,
+                "poison": backend.poison_report,
+            }
+        except execution_contract.ExecutionContractRefusal as exc:
+            backend.poison(())
+            self.poisoned = f"execution contract refused: {exc.code}"
             return {
                 "ok": False,
                 "code": exc.code,
@@ -1343,12 +1393,19 @@ class Executor:
         # fence are deleted whole (model-code-fit D12) — its only consumer was a fence the
         # planner had already disabled.
         self.plan = plan
+        self.attestation = (
+            execution_contract.Attestation([applied]) if applied is not None else None
+        )
         constructed_preimage = canonical.write(
             {
                 "plan_digest": plan.digest(),
                 # THE APPLIED CEILING, derived from the card (cl-027).
                 "resident_budget_bytes": resident_budget,
                 "execution_optimization": optimization.document() if optimization else None,
+                # THE CONTRACT enters the generation's identity (cr-109): demand and residency
+                # measured under 8-bit attention are keyed apart from the same bytes without it.
+                "execution_contract": contract.digest() if contract is not None else None,
+                "execution_fusion": fused.identity_document() if fused is not None else None,
             }
         )
         self.constructed_model_digest = (
@@ -1399,6 +1456,37 @@ class Executor:
         refused = self._install_group(torch, model, binding["model_parameter_name"])
         if refused is not None:
             return refused
+        stage("install")
+        # THE AUTHOR'S ONE WARM MOMENT (cr-110, model-lifecycle.md): after the fill, its
+        # verification, the execution plan, the residency install and the group mirror;
+        # before this generation is Ready, so a placement is never DISPATCHABLE over a cold
+        # generation. Rank 0 only under a group — its component-use scopes are mirrored to
+        # the followers exactly as a handler's are, and the spool is what carries their
+        # arguments. Every other rung of the ladder (cr-109's attention contract, h3a-018's
+        # entrypoint reuse) hooks THIS call, never a second one.
+        warm_ms = 0.0
+        if self.rank == 0:
+            self._attempt_spool = self.root / "warm"
+            try:
+                warm_ms = warm_generation(
+                    model, device=self._device(), cancel=lambda: bool(self.poisoned)
+                )
+            except WarmFailed as exc:
+                # A CONSTRUCTION FAILURE, typed on the author's exception: the executor is
+                # poisoned and replaced like every other prepare refusal, and the binding
+                # faults instead of serving a generation whose warm did not complete.
+                backend.poison(())
+                self.poisoned = f"warm failed: {exc}"[:200]
+                return {
+                    "ok": False,
+                    "code": exc.code,
+                    "detail": str(exc)[:900],
+                    "state": backend.state,
+                    "envelope": envelope,
+                }
+            finally:
+                self._attempt_spool = None
+        stage("warm")
         group_facts = dict(self.facts)
         memory = accel.allocation(torch, self.device_kind)
         self.ready = True
@@ -1427,10 +1515,14 @@ class Executor:
             "execution_optimization_refusal": (
                 "" if optimization else fused_anima_capability_refusal()
             ),
+            # The fused-glue plan's record (h3a-015): None where the class did not consent,
+            # else what was substituted (or why nothing was) on this device.
+            "execution_fusion": fused.document() if fused is not None else None,
             # An all-inline checkpoint commits without opening the object stream. No stream
             # wall was measured in that case, and zero is the exact value rather than an
             # absent-stat KeyError after a successful construction.
             "fill_ms": backend.stats.get("fill_ms", 0),
+            "warm_ms": round(warm_ms, 2),
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
             "device_free_bytes": memory["driver_free_bytes"],
@@ -1482,6 +1574,9 @@ class Executor:
             # `mixed(...)` as what it IS.
             "delivery": plan.wire_document(),
             "execution_optimization": optimization.document() if optimization else None,
+            # THE CONTRACT AS APPLIED (cr-109): digest, backend, the sites pinned per host. The
+            # kernel symbol lands here after the first attested call profiles it.
+            "execution_contract": applied.document() if applied is not None else None,
         }
         return {
             "ok": True,
@@ -1574,6 +1669,13 @@ class Executor:
             if child.residency is not None
         }
         self.residency = _CompositeResidency(residencies)
+        applied = [
+            row
+            for _, child, _ in children
+            if child.attestation is not None
+            for row in child.attestation.applied
+        ]
+        self.attestation = execution_contract.Attestation(applied) if applied else None
 
         constructed = [
             {"parameter": parameter, "digest": str(reply["constructed_model_digest"])}
@@ -1658,6 +1760,7 @@ class Executor:
                 for i in range(3)
             ],
             "fill_ms": sum(float(facts.get("fill_ms", 0)) for _, facts in facts_rows),
+            "warm_ms": sum(float(facts.get("warm_ms", 0)) for _, facts in facts_rows),
             "filled": sum(int(facts.get("filled", 0)) for _, facts in facts_rows),
             "filled_bytes": sum(int(facts.get("filled_bytes", 0)) for _, facts in facts_rows),
             "device_free_bytes": int(last.get("device_free_bytes", -1)),
@@ -1790,7 +1893,14 @@ class Executor:
             }
         registration = self.discovered.app.get(command["entrypoint"])
         try:
-            prepared = prepare(registration, command["payload"])
+            prepared = prepare(
+                registration,
+                command["payload"],
+                input_metadata={
+                    name: InputMetadata(**row)
+                    for name, row in command.get("input_metadata", {}).items()
+                },
+            )
         except Exception as exc:
             outcome = classify(exc)
             return {
@@ -1871,6 +1981,8 @@ class Executor:
             )
         if torch is not None:
             accel.reset_peak(torch, self.device_kind)
+        if self.attestation is not None:
+            self.attestation.open()
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
@@ -1880,7 +1992,6 @@ class Executor:
                 request_id=command["request_id"],
                 spool=spool,
                 deadline=deadline,
-                boot_warmup=bool(command.get("boot_warmup")),
                 device=self._device(),
                 cancel=lambda: _cancelled(self.root, command["request_id"]),
                 models=self.models,
@@ -1918,12 +2029,33 @@ class Executor:
         # host frames, so `device_lease_ms` is device time and the encode is the worker's.
         lease_ms = (time.perf_counter() - lease_acquired) * 1000
         quiescent = self._quiescent() if torch is not None else True
+        attested = self.attestation.close() if self.attestation is not None else None
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
         # A typed refusal before handler entry leaves a Ready executor untouched. This is
         # an observed phase bit, not a refusal-code allowlist that drifts as validation grows.
         if outcome.terminal != "succeeded" and record.entered:
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
+        terminal = {
+            "terminal": outcome.terminal,
+            "origin": outcome.origin,
+            "code": outcome.code,
+            "message": outcome.message[:2048],
+            "fields": list(outcome.fields),
+            "traceback": outcome.traceback,
+        }
+        if attested is not None and attested["refusal"] and outcome.terminal == "succeeded":
+            # THE CONTRACT WAS NOT OBSERVED (cr-109). The handler returned, and the kernel the
+            # lane promises did not run the number of times the pinned sites predict, or ran
+            # under another scheme. A result computed by some other attention is not this
+            # lane's result, and the generation that let it happen is replaced.
+            terminal.update(
+                terminal="failed",
+                origin="runtime",
+                code="execution_contract_unobserved",
+                message=attested["refusal"][:2048],
+            )
+            self.poisoned = "execution_contract_unobserved"
         # THE RESIDENCY PLANE'S POISON IS THIS PROCESS'S POISON (#613). A mid-mutation
         # failure or an accounting violation there can fire BEFORE handler entry (admission
         # runs at scope enter), so the phase bit above cannot see it — and the transaction
@@ -1942,14 +2074,8 @@ class Executor:
             "observation_caps": record.ring.caps(),
             "attribution": record.attribution.document(),
             "position": record.position,
-            "outcome": {
-                "terminal": outcome.terminal,
-                "origin": outcome.origin,
-                "code": outcome.code,
-                "message": outcome.message[:2048],
-                "fields": list(outcome.fields),
-                "traceback": outcome.traceback,
-            },
+            "outcome": terminal,
+            "execution_contract": attested,
             "quiescent": quiescent,
             **_env_document(),
             "poisoned": self.poisoned,
@@ -2493,83 +2619,6 @@ class Executor:
 
         return progress
 
-    # ------------------------------------------------------------------ warm
-
-    def warm(self, command: dict[str, Any]) -> dict[str, Any]:
-        """One attempted warm case for one entrypoint, through ORDINARY dispatch.
-
-        It runs HERE, in the disposable process, for one reason that is not convenience:
-        synthesizing a payload needs the entrypoint's schema, and reading that schema in the
-        worker would mean importing package code into the long-lived no-CUDA process.
-        A package whose module scope touches torch would then contaminate the worker
-        forever. The executor already imported it and is already disposable.
-        """
-        from cozy_runtime.internal import schema, warm
-
-        surface = self.surface_names.get(command["entrypoint"])
-        if surface is None:
-            return {
-                "ok": True,
-                "outcome": "skipped",
-                "reason": f"{command['entrypoint']!r} is not an entrypoint of this release",
-            }
-        spool = Path(command["spool"])
-        payload, reason = warm.synthesize(schema.render(surface.payload_type), spool)
-        if reason:
-            return {"ok": True, "outcome": "skipped", "reason": reason, "payload": {}}
-        # THROUGH ORDINARY DISPATCH means through both halves in order. The warm pass has no
-        # worker to prepare for it, so it prepares its own request and then invokes the
-        # record — the same two calls a served attempt makes across the seam.
-        ready = self.prepare_request({**command, "payload": payload})
-        if not ready.get("ok"):
-            return {
-                "ok": True,
-                "outcome": "failed",
-                "code": str(ready.get("code", "request_unresolvable")),
-                "payload": payload,
-                "reason": f"{ready.get('code')}: {str(ready.get('detail'))[:200]}",
-            }
-        reply = self.invoke({**command, "boot_warmup": True})
-        succeeded = reply.get("ok") and reply["outcome"]["terminal"] == "succeeded"
-        if succeeded:
-            return {
-                "ok": True,
-                "outcome": "warmed",
-                "code": "",
-                "reason": "",
-                "features": dict(ready.get("features") or {}),
-                "payload": payload,
-                "boot_warmup_observed": bool(_read_result(spool).get("warm")),
-                "handler_ms": reply.get("metrics", {}).get("handler_ms", 0),
-                "activation_peak_bytes": int(
-                    reply.get("metrics", {}).get("activation_peak_bytes", 0)
-                ),
-                "activation_peaks": dict(reply.get("metrics", {}).get("activation_peaks") or {}),
-                "resident_moved": bool(
-                    int(reply.get("residency", {}).get("attempt_stages", 0))
-                    or int(reply.get("residency", {}).get("attempt_evictions", 0))
-                ),
-            }
-        # Generic warm failures do not brick the worker. The worker separately consumes the
-        # typed capacity code below: an allocator OOM IS evidence against this placement rung
-        # and may only be followed by a proven fallback, never the same accepted envelope.
-        self.poisoned = ""
-        code = str(reply.get("code") or reply["outcome"]["code"])
-        return {
-            "ok": True,
-            "outcome": "failed",
-            "code": code,
-            "features": dict(ready.get("features") or {}),
-            "payload": payload,
-            "activation_peak_bytes": int(reply.get("metrics", {}).get("activation_peak_bytes", 0)),
-            "activation_peaks": dict(reply.get("metrics", {}).get("activation_peaks") or {}),
-            "resident_moved": bool(
-                int(reply.get("residency", {}).get("attempt_stages", 0))
-                or int(reply.get("residency", {}).get("attempt_evictions", 0))
-            ),
-            "reason": f"{code}: {(reply.get('detail') or reply['outcome']['message'])[:200]}",
-        }
-
     def _result_schema_digest(self, surface: Any) -> str:
         """The identity of the DECLARED annotated result surface — never of the value.
 
@@ -2802,15 +2851,6 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
     )
 
 
-def _read_result(spool: Path) -> dict[str, Any]:
-    """The document this process just spooled, read back in-process (the warm pass's half)."""
-    path = spool / RESULT_DOCUMENT
-    if not path.is_file():
-        return {}
-    value = canonical.parse(path.read_bytes())
-    return value if isinstance(value, dict) else {}
-
-
 def _serialize_result(
     envelope: Any, spool: Path
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int]:
@@ -2985,8 +3025,6 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.invoke(command)
             elif name == "run_job":
                 reply = executor.run_job(command)
-            elif name == "warm":
-                reply = executor.warm(command)
             elif name == "probe":
                 reply = executor.probe()
             elif name == "vacate":

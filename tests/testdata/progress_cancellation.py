@@ -51,7 +51,6 @@ with tempfile.TemporaryDirectory(prefix="runtime-watch-starvation-") as director
         WorkerOptions(
             root=root / "worker",
             tensorfs_root=root / "store",
-            no_warm=True,
             worker_id="test-worker",
             worker_boot_id="same-boot",
             worker_tls_certificate_digest="sha256:" + "a" * 64,

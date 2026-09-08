@@ -43,7 +43,6 @@ def _worker(root: Path, *, owns: bool, required: bool = False) -> Worker:
         WorkerOptions(
             root=root / "worker",
             tensorfs_root=root / "store",
-            no_warm=True,
             worker_boot_id="source-restart-boot",
             ownership_required=required,
             owns_tensorfs_store=owns,

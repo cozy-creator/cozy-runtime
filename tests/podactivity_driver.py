@@ -87,7 +87,6 @@ def main(argv: list[str]) -> int:
             options=WorkerOptions(
                 root=workspace / "worker",
                 release_id=digest,
-                no_warm=True,
                 activity_path=path,
             ),
             record_owner_hook=hook,

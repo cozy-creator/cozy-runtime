@@ -204,7 +204,6 @@ class SliceOutcome:
     reconciliation: dict[str, Any] = field(default_factory=dict)
     attempt_records: list[dict[str, Any]] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
-    warm: list[dict[str, Any]] = field(default_factory=list)
     faults: list[dict[str, str]] = field(default_factory=list)
     progress: int = 0
     executions: int = 0
@@ -352,7 +351,7 @@ class LocalRecordOwner:
         which killed a run whose worker was still downloading or loading a large model,
         and the person in front of it got a hang report for a boot that was working. There
         is no number of seconds a boot may take. What there is, is observation: the
-        worker's own boot cursors (`SilenceMonitor`: download, load, warm positions) and
+        worker's own boot cursors (`SilenceMonitor`: download and load positions) and
         the measured work of everything the boot runs — this process's working threads,
         its executor, a `uv` install, a native-wheel probe — which `_boot_meter` folds into
         one reading. The run ends `worker_wedged` when that reading has not changed for
@@ -1541,7 +1540,6 @@ def _collect(
         if outcome.reconciliation
         else ledger.measurement()
     )
-    outcome.warm = list(worker.warm)
     outcome.faults = [
         {"reason": fault.reason, "detail": fault.detail} for fault in worker.engine.faults
     ]

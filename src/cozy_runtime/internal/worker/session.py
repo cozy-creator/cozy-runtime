@@ -112,20 +112,13 @@ from cozy_runtime.internal.worker.lanes import (
     fold_memory,
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
-from cozy_runtime.internal.worker.plan import (
-    UNCALIBRATED_ACTIVATION_BYTES,
-    DeclaredBinding,
-    JobBinding,
-    PreparedModel,
-    shape_cell,
-)
+from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding, PreparedModel
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
 PROGRESS_QUEUE = 256
-WARM_CAPACITY_CODES = frozenset({"device_out_of_memory", "device_shortfall"})
 
 #: Report cadence. Report is DURABLE and carries the applied baseline, so the owner can
 #: always see a directive it issued but the worker did not apply.
@@ -309,7 +302,6 @@ class WorkerOptions:
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
     grace: float = GRACE_SECONDS
-    no_warm: bool = False
     claim_ready: bool = True
     """False only for fixed product-host boot until listener/readiness proof commits."""
     executor_uid: int = -1
@@ -1259,7 +1251,6 @@ class Worker:
         )
         self.exit_code: int = int(Exit.ok)
         self.boot_at = time.perf_counter()
-        self.warm: list[dict[str, Any]] = []
         self.job_caps = pb.ResourceCaps()
         self.reclaim_on_terminal = False
         self.boot_fatal: pb.BootFailure | None = None
@@ -3652,8 +3643,7 @@ class Worker:
 
         The serving edge is the hosted placement's own; the worker-level latch is not
         touched — a hosted placement that cannot prepare latches itself and the others keep
-        serving. No boot warm pass runs for a hosted placement: package execution begins
-        with its first attempt, as it does for every dynamic placement.
+        serving. The author's `Model.warm` ran inside its prepare, as for every placement.
         """
         placement = hosted.placement
         self._hosted_set_serving(
@@ -4763,6 +4753,7 @@ class Worker:
             delivery_rung=str(delivery.get("rung", "")),
             delivery_variant=str(delivery.get("variant", "")),
             weight_bytes=int(reply["facts"]["filled_bytes"]),
+            execution_contract=dict(reply["facts"].get("execution_contract") or {}),
         )
         executor.construction_key = construction_key
         executor.parameters = parameters
@@ -4783,6 +4774,7 @@ class Worker:
             destinations=int(reply["facts"]["filled"]),
             bytes=int(reply["facts"]["filled_bytes"]),
             fill_ms=float(reply["facts"]["fill_ms"]),
+            warm_ms=float(reply["facts"].get("warm_ms", 0)),
             custody=str(reply["facts"].get("custody", "canonical")),
             ignored_extra_keys=", ".join(reply["facts"].get("ignored_extra_keys", ())),
         )
@@ -4854,6 +4846,32 @@ class Worker:
                 )
             ),
         )
+        _contract = reply["facts"].get("execution_contract")
+        if _contract:
+            # THE CONTRACT AS APPLIED (cr-109): which kernel, through which diffusers backend,
+            # on how many sites — the boot line a person reads before the first attempt attests.
+            _attention = _contract["contract"]["attention"]
+            self.note(
+                "boot",
+                f"{placement_id!r} execution contract {str(_contract.get('digest', ''))[:23]}…: "
+                f"{_attention['scheme']} — {_attention['distribution']}=="
+                f"{_contract.get('installed_version')}.{_attention['entry']} via diffusers "
+                f"{_contract.get('backend')} on {_contract.get('sites')} site(s) "
+                f"{dict(_contract.get('hosts') or {})}; weights.route="
+                f"{_contract['contract']['weights']['route']}",
+            )
+        _fused = reply["facts"].get("execution_fusion")
+        if _fused is not None:
+            self.note(
+                "boot",
+                f"{placement_id!r} fused glue: "
+                + (
+                    f"APPLIED {_fused.get('identity', '?')} sites={_fused.get('sites')} "
+                    f"fp8_sites={_fused.get('fp8_sites')} warm={_fused.get('warm_ms')}ms"
+                    if _fused.get("applied")
+                    else f"NOT APPLIED ({_fused.get('reason')})"
+                ),
+            )
         self.note(
             "boot",
             f"{placement_id!r} prepared {len(group)} binding(s) in {took:.0f} ms — "
@@ -4923,10 +4941,14 @@ class Worker:
         ).start()
 
     def _finish_activation(self) -> None:
-        """Run optional warm work, then publish the activation edge or its typed failure."""
+        """Publish the activation edge, or its typed failure when the executor was lost.
 
-        if not self.run_warm_pass():
-            self.latched = self.latched or "executor_lost_during_warm"
+        No entrypoint-level warm pass runs here any more (cr-110): the author's `Model.warm`
+        ran INSIDE the prepare, on every worker, before the executor reported Ready.
+        """
+        executor = self.supervision.current
+        if executor is None or not self.supervision.owns(executor):
+            self.latched = self.latched or "executor_lost_during_activation"
             self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
             self._settle()
             return
@@ -4935,174 +4957,6 @@ class Worker:
             # what keeps this honest, and the ORDER is what keeps it consistent.
             self.accepted.converged_revision = self.accepted.accepted_desired_state_revision
         self.set_serving(pb.ServingState.SERVING_STATE_DISPATCHABLE)
-
-    def run_warm_pass(self) -> bool:
-        """One attempted warm case per WARMABLE entrypoint, through ORDINARY dispatch."""
-        # Dynamic placement workers execute package source only for a real invocation,
-        # after the placement is DISPATCHABLE. Their environment root is the structural
-        # identity of that mode; the fixed worker's `no_warm` remains a belt, but correctness
-        # cannot depend on one argv translation surviving every launch layer. A real pod
-        # proved why: its model prepared successfully, then a synthetic warm handler blocked
-        # forever in its first CUDA scalar read and kept the placement ACTIVATING.
-        if self.options.install_root is not None:
-            self.note(
-                "warm",
-                "dynamic placement worker: boot warm pass disabled; package execution "
-                "begins only after DISPATCHABLE",
-            )
-            executor = self.supervision.current
-            return executor is not None and self.supervision.owns(executor)
-        if self.options.no_warm:
-            self.note("warm", "boot warm pass disabled by launch option")
-            executor = self.supervision.current
-            return executor is not None and self.supervision.owns(executor)
-        executor = self.supervision.current
-        if executor is None:
-            return False
-
-        def run_one(binding: DeclaredBinding, placement: str) -> dict[str, Any]:
-            spool = self.root / "warm" / binding.entrypoint / placement
-            spool.mkdir(parents=True, exist_ok=True)
-            started = time.perf_counter()
-            reply = executor.call(
-                {
-                    "cmd": "warm",
-                    "request_id": f"warm-{binding.entrypoint}-{placement}",
-                    "entrypoint": binding.entrypoint,
-                    "placement": placement,
-                    # The same labelled bound the first request's chooser will use. It does
-                    # not decide the fallback: the observed OOM above does. The staged retry
-                    # proves whether this existing rung can actually serve the synthesized case.
-                    "headroom_bytes": UNCALIBRATED_ACTIVATION_BYTES,
-                    # NO TIME BOUND: warm is a BOOT STEP and boot is silence-bounded (§3.3).
-                    "deadline_s": None,
-                    "spool": str(spool),
-                },
-                timeout=None,
-            )
-            outcome: dict[str, Any] = {
-                "entrypoint": binding.entrypoint,
-                "placement": placement,
-                "shape_cell": shape_cell(
-                    {str(k): int(v) for k, v in (reply.get("features") or {}).items()}
-                ),
-                "outcome": str(reply.get("outcome", "failed")),
-                "code": str(reply.get("code", "")),
-                "reason": str(reply.get("reason", ""))[:200],
-                "boot_warmup_observed": bool(reply.get("boot_warmup_observed", False)),
-                "activation_peak_bytes": int(reply.get("activation_peak_bytes", 0)),
-                "activation_peaks": {
-                    str(method): int(value)
-                    for method, value in (reply.get("activation_peaks") or {}).items()
-                },
-                "resident_moved": bool(reply.get("resident_moved", False)),
-                "ms": round((time.perf_counter() - started) * 1000, 1),
-            }
-            outcome["demand_evidence"] = (
-                outcome["code"] in WARM_CAPACITY_CODES or int(outcome["activation_peak_bytes"]) > 0
-            )
-            self.boot.step(
-                "warm",
-                str(outcome["outcome"]),
-                float(outcome["ms"]),
-                entrypoint=binding.entrypoint,
-                placement=placement,
-                benchmark_override=True,
-                reason=str(outcome["reason"])[:200],
-            )
-            self.records.append("warm", dict(outcome))
-            self.warm.append(outcome)
-            self.note(
-                "warm",
-                f"{binding.entrypoint}/{placement}: {outcome['outcome']} "
-                f"({outcome['ms']} ms) {outcome['reason']}"[:200],
-            )
-            return outcome
-
-        for plan_id, binding in self.bindings.items():
-            if plan_id not in executor.ready_bindings:
-                continue
-            try:
-                outcome = run_one(binding, "all_resident")
-                if outcome["outcome"] == "failed" and outcome["code"] in WARM_CAPACITY_CODES:
-                    self._primary_row().refuse_placement(
-                        "all_resident",
-                        str(outcome["reason"]),
-                    )
-                    self.note(
-                        "warm",
-                        f"{binding.entrypoint}: observed all_resident capacity failure; "
-                        "proving component_staged before admission",
-                    )
-                    outcome = run_one(binding, "component_staged")
-                    if outcome["outcome"] == "failed" and outcome["code"] in WARM_CAPACITY_CODES:
-                        self._primary_row().refuse_placement(
-                            "component_staged",
-                            str(outcome["reason"]),
-                        )
-                        self.latched = (
-                            "warm_capacity_unsatisfied: every proven placement rung failed "
-                            f"for {binding.entrypoint}"
-                        )
-                        self.engine.fault(
-                            pb.Fault(
-                                kind=pb.FaultKind.FAULT_KIND_BINDING_DEGRADED,
-                                subject=plan_id,
-                                reason="warm_capacity_unsatisfied",
-                                detail=f"boot warm capacity failed for every proven rung: "
-                                f"{outcome['reason']}",
-                            )
-                        )
-                        return False
-            except ExecutorGone as exc:
-                self.supervision.invalidate(executor, "executor died during warmup")
-                try:
-                    self.supervision.retire_current(executor, "executor died during warmup")
-                except ExecutorGone as reclaim:
-                    self.note("recovery", f"warmup reclaim failed: {reclaim}")
-                self.note("warm", f"{binding.entrypoint}: executor lost: {exc}"[:200])
-                return False
-            if outcome["outcome"] == "warmed" and int(outcome["activation_peak_bytes"]) > 0:
-                self._primary_row().observe_attempt(
-                    {
-                        "activation_peak_bytes": int(outcome["activation_peak_bytes"]),
-                        "activation_peaks": dict(outcome["activation_peaks"]),
-                    },
-                    resident_moved=bool(outcome["resident_moved"]),
-                    cell=str(outcome["shape_cell"]),
-                    # A COMPLETED warm pass, so this peak is a measurement and may
-                    # calibrate later generations (cr-097). The failed branch below never
-                    # reaches here, which is the point.
-                    succeeded=True,
-                )
-            if outcome["outcome"] == "failed":
-                self.engine.degraded[plan_id] = str(outcome["reason"])[:160]
-                self.engine.fault(
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_BINDING_DEGRADED,
-                        subject=plan_id,
-                        reason="serve_degrade",
-                        detail=f"boot warm pass failed for {binding.entrypoint}: "
-                        f"{outcome['reason']} - the worker still serves",
-                    )
-                )
-        if self.warm and executor.alive():
-            row = self._primary_row()
-            try:
-                # The probe waits behind the warm pass's device sync backlog; a healthy
-                # executor is not retired for answering slowly (xs-007 row 20).
-                with executor.watched("probe"):
-                    row.observe_probe(executor.call({"cmd": "probe"}, timeout=None))
-            except ExecutorGone:
-                self.supervision.invalidate(executor, "executor died during warmup probe")
-                try:
-                    self.supervision.retire_current(executor, "executor died during warmup probe")
-                except ExecutorGone as reclaim:
-                    self.note("recovery", f"warmup probe reclaim failed: {reclaim}")
-                return False
-            shift = row.rebaseline("boot warm pass")
-            self.note("warm", f"the resident device baseline moved {shift:+d} B on the warm pass")
-        return self.supervision.owns(executor)
 
     def imposed(self, lane: DeviceLane) -> dict[str, str]:
         """The IMPOSE half of the seal, for ONE lane. Every name is in the reviewed allowlist.
@@ -6449,7 +6303,6 @@ class Worker:
                     "hub_calls_refused": len(self.authorizer.refusals),
                     "seam": seam,
                     "lanes": [lane.summary() for lane in self.lanes],
-                    "warm": self.warm,
                     "rss_bytes": read_vmrss(os.getpid()),
                 }
             ),
@@ -6512,7 +6365,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--grace", type=float, default=GRACE_SECONDS)
-    parser.add_argument("--no-warm", action="store_true")
     parser.add_argument("--executor-uid", type=int, default=-1, help=argparse.SUPPRESS)
     parser.add_argument("--executor-gid", type=int, default=-1, help=argparse.SUPPRESS)
     parser.add_argument("--tls-cert", default="", help="PEM cert for a non-loopback listener")
@@ -6594,7 +6446,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,
-        no_warm=args.no_warm,
         executor_uid=args.executor_uid,
         executor_gid=args.executor_gid,
     )

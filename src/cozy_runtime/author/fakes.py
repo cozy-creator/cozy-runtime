@@ -15,7 +15,8 @@ the executor feeds it.
 
 `invoke_with_fakes()` runs a registered handler through the REAL kernel with fakes standing
 in for the runtime's side of the contract: same decode, same overlay, same preflight, same
-injection, same return validation, same output transaction.
+injection, same return validation, same output transaction. `warm_with_fakes()` runs a
+`for_test` model's `warm` under the Context the executor builds for it (cr-110).
 
 `StagedBackend`/`ResidentBackend` are the weightless fill doubles a `Model` constructs
 against with no store and no device.
@@ -38,7 +39,7 @@ from cozy_runtime.author._defaults import Clamp, Recipe
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._invoke import Invocation, InvocationResult, invoke, prepare
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec
-from cozy_runtime.author._model import Model
+from cozy_runtime.author._model import Model, warm_context
 from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
@@ -79,6 +80,7 @@ def fake_input[AssetT: Asset](
     *,
     attempt: str,
     input_id: str = "input",
+    order: int = 0,
     max_decoded_bytes: int = 0,
 ) -> AssetT:
     """`source`'s bytes as a fresh INPUT handle hydrated into `attempt`.
@@ -102,6 +104,7 @@ def fake_input[AssetT: Asset](
         media_type=source.media_type,
         digest=source.digest,
         length=source.size_bytes,
+        order=order,
     )
     bound = type(source)(source.ref)
     bind(
@@ -113,6 +116,7 @@ def fake_input[AssetT: Asset](
         length=granted.length,
         max_decoded_bytes=max_decoded_bytes,
         input_id=granted.input_id,
+        order=granted.order,
     )
     return bound
 
@@ -121,19 +125,31 @@ def fake_context(
     *,
     request_id: str = "fake-attempt",
     seconds: float = 300.0,
-    boot_warmup: bool = False,
     device: Device | None = None,
     cancelled: bool = False,
 ) -> Context:
-    """A real `Context`. `boot_warmup` is a real fact, so a handler's warm-pass branch is
-    exercised the same way the boot warm pass exercises it (cr-007)."""
-    return Context(
-        request_id,
-        time.monotonic() + seconds,
-        boot_warmup,
-        device or Device(),
-        lambda: cancelled,
+    """A real `Context` for a handler: the attempt's id, deadline, device and cancellation."""
+    return Context(request_id, time.monotonic() + seconds, device or Device(), lambda: cancelled)
+
+
+def warm_with_fakes(
+    model: Model[Any],
+    *,
+    device: Device | None = None,
+    seconds: float = 300.0,
+    cancelled: bool = False,
+) -> Context:
+    """Run a `for_test` model's `warm` under the Context the executor hands it, and return
+    that Context. Same constructor as the executor's (`warm_context`): no request id, no
+    adapters, no package-call broker — an invocable called inside refuses
+    `child_broker_absent`. The harness records every component-use scope the warm body
+    opens, exactly as it records a handler's. What no fake supplies is torch, so the
+    `torch.compile(module)` refusal is the executor's alone (`internal/warm.py`)."""
+    ctx = warm_context(
+        device or Device(), deadline=time.monotonic() + seconds, cancel=lambda: cancelled
     )
+    model.warm(ctx)
+    return ctx
 
 
 class OutputsRecorder(Outputs):
@@ -222,7 +238,6 @@ def invoke_with_fakes(
     recipes: Sequence[Recipe] = (),
     clamps: Sequence[Clamp] = (),
     adapters: tuple[AdapterRef, ...] = (),
-    boot_warmup: bool = False,
     seconds: float = 300.0,
     cancelled: bool = False,
     egress_broker: Callable[..., Any] | None = None,
@@ -235,12 +250,18 @@ def invoke_with_fakes(
     spool = spool or _spool(request_id)
     spool.mkdir(parents=True, exist_ok=True)
     return invoke(
-        prepare(registration, wire, recipes=recipes, clamps=clamps, settings=settings),
+        prepare(
+            registration,
+            wire,
+            recipes=recipes,
+            clamps=clamps,
+            settings=settings,
+            input_metadata=assets or {},
+        ),
         Invocation(
             request_id=request_id,
             spool=spool,
             deadline=time.monotonic() + seconds,
-            boot_warmup=boot_warmup,
             cancel=lambda: cancelled,
             models=models or {},
             recipes=recipes,

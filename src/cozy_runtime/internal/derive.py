@@ -134,45 +134,48 @@ def _wrapped(tensor: object) -> tuple[object, ...]:
 
 
 @contextmanager
-def _refuse_compile() -> Iterator[None]:
-    """`torch.compile` during construction REFUSES, naming itself.
+def refuse_compile(*, lazy: bool) -> Iterator[None]:
+    """`torch.compile(module)` REFUSES, naming itself; `lazy` refuses `nn.Module.compile` too.
 
-    It wraps the module in an `OptimizedModule` whose every `state_dict` key gains an
-    `_orig_mod.` prefix, so the derived tensor requirements would demand `blk._orig_mod.weight`
-    from checkpoints that carry `blk.weight` — a construction that no artifact on earth
-    satisfies. v1 could not refuse (its h3 package compiled the VAE decoder for a real
-    1.68x serve win) so it neutered compile to eager for the drive (pgw#1659, after a
-    compiled callable handed fake tensors read a fake data pointer, launched a real kernel,
-    and killed the CUDA context process-wide while the drive finished green against the
-    corpse). v2 has no graph-mint consumer that needs the call to survive, so the honest
-    answer is the refusal: the fix lane is the package deleting the call.
+    The wrapping spelling returns an `OptimizedModule` whose every `state_dict` key gains an
+    `_orig_mod.` prefix. Under CONSTRUCTION (`lazy=True`) the derived tensor requirements
+    would then demand `blk._orig_mod.weight` from checkpoints that carry `blk.weight` — a
+    construction no artifact satisfies — and the lazy `nn.Module.compile` is refused there
+    too, for a different reason: derive is derive-by-execution, so the callable it installs
+    would trace under fake tensors and launch real kernels on fake pointers (pgw#1659, the
+    day v1's neutered-to-eager compile killed a CUDA context process-wide).
 
-    READ THIS NARROWLY (cr-086). It refuses compilation DURING CONSTRUCTION, and nothing
-    more. Both spellings are refused, but for two different reasons: `torch.compile(module)`
-    renames destinations as described above, while `nn.Module.compile` renames nothing and
-    is refused because it is LAZY — derive is derive-by-execution, so the callable it
-    installs would trace under fake tensors and launch real kernels on fake pointers, which
-    is the pgw#1659 scar verbatim. Neither reason reaches the INVOCATION path, which this
-    context manager does not cover: a package that wants diffusers' regional
-    `compile_repeated_blocks(fullgraph=True)` calls it on a filled module at invocation or
-    under `ctx.boot_warmup`, where the destinations are already materialized and the tensors
-    are real. This is not a ruling that `torch.compile` cannot ship.
+    Under `Model.warm` (`lazy=False`, cr-110) the tensors are real and the destinations
+    filled, so only the wrapping spelling is refused: the object the author's code would then
+    call is not the one the construction record and the residency plane hold. The in-place
+    spellings (`module.compile()`, diffusers' `compile_repeated_blocks`) move no key,
+    parameter or storage and are allowed (#702). Neither refusal reaches the invocation
+    path, and neither is a ruling that `torch.compile` cannot ship.
     """
     torch = torch_module()
     original = torch.compile
     original_method = torch.nn.Module.compile
+    why = (
+        "compiling during construction renames every destination with an `_orig_mod.` "
+        "prefix, so the derived tensor requirements matches no checkpoint. Compilation is a "
+        "runtime plan decision, never a construction fact — delete the call from load()"
+        if lazy
+        else "torch.compile(module) wraps the module and prefixes every state_dict key with "
+        "`_orig_mod.`, so what warm() then calls is not the object the fill and residency "
+        "planes hold — use the in-place spelling, module.compile(), which moves no key"
+    )
 
     def refuse(*args: object, **kwargs: object) -> object:
-        raise ConstructionFault(
-            "torch.compile",
-            "compiling during construction renames every destination with an `_orig_mod.` "
-            "prefix, so the derived tensor requirements matches no checkpoint. Compilation is a "
-            "runtime plan decision, never a construction fact — delete the call from load()",
-            site=_author_site(),
-        )
+        target = args[0] if args else kwargs.get("model")
+        if not lazy and not isinstance(target, torch.nn.Module):
+            # A function or a bound method: nothing is wrapped and no key moves. This is
+            # the call `nn.Module.compile` itself makes, over `_call_impl`.
+            return original(*args, **kwargs)
+        raise ConstructionFault("torch.compile", why, site=_author_site())
 
     torch.compile = refuse  # type: ignore[assignment,attr-defined]
-    torch.nn.Module.compile = refuse  # type: ignore[assignment,method-assign]
+    if lazy:
+        torch.nn.Module.compile = refuse  # type: ignore[assignment,method-assign]
     try:
         yield
     finally:
@@ -473,7 +476,7 @@ def meta_substrate(variant: str, seen: Observations) -> Iterator[_Capability]:
         torch.__future__.set_swap_module_params_on_conversion(False)
         stack.callback(torch.__future__.set_swap_module_params_on_conversion, swap)
         stack.enter_context(torch.device("meta"))
-        stack.enter_context(_refuse_compile())
+        stack.enter_context(refuse_compile(lazy=True))
         stack.enter_context(_capability(cap))
         stack.enter_context(_track_registrations(seen))
         stack.enter_context(_guard_mode(seen))
@@ -532,7 +535,7 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         stack.callback(setattr, nn.Module, "register_parameter", original)
         nn.Module.register_buffer = register_buffer
         stack.callback(setattr, nn.Module, "register_buffer", original_buffer)
-        stack.enter_context(_refuse_compile())
+        stack.enter_context(refuse_compile(lazy=True))
         stack.enter_context(_capability(cap))
         stack.enter_context(_guard_mode(seen))
         yield cap

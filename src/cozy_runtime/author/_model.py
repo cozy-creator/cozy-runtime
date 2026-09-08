@@ -84,6 +84,17 @@ ENCODED_LEAVES: Mapping[str, str] = {
     "linear op may be replaced by a module whose weight is the stored role set",
 }
 
+#: The second class keyword, same shape and same reason (h3a-015): the runtime's fused glue
+#: plan replaces a known module's FORWARD with a fused kernel of the same arithmetic. It
+#: moves no tensor, but a package that reads a module's class name or an intermediate the
+#: fused chain no longer materializes would notice, and only the author knows it does not.
+FUSION: Mapping[str, str] = {
+    "refuse": "the runtime runs every module's own forward; no fused plan is installed",
+    "accept": "this package's code depends on no module's class identity and on no "
+    "intermediate between a norm and the GEMM it feeds, so the runtime may substitute its "
+    "fused glue kernels for the modules it has exact-source matches for",
+}
+
 #: Keyword names an author-facing model method may not declare. Every one of them names a
 #: residency, placement or conversion decision the runtime owns (§1.1/§7).
 EXCLUDED_KEYWORDS: Mapping[str, str] = {
@@ -106,7 +117,7 @@ EXCLUDED_KEYWORDS: Mapping[str, str] = {
 }
 
 _RUNTIME_MEMBERS = frozenset(
-    {"load", "unload", "for_request", "for_test", "checkpoint_ref", "harness"}
+    {"load", "warm", "unload", "for_request", "for_test", "checkpoint_ref", "harness"}
 )
 
 
@@ -378,10 +389,12 @@ def _refuse_lazy(method: str, result: object) -> None:
 class Model[PipelineT]:
     """Base of a package's reusable model class — the ONE long-lived model boundary.
 
-    The author owns WHAT the model is (`load`/`unload`, declared persistent state, the
-    component-touching methods handlers call); the runtime owns WHEN they run and where
-    every byte lives. A bare typed parameter is the whole declaration, and its presence in
-    a signature is what derives `gpu`.
+    The author owns WHAT the model is: the three lifecycle methods `load` (construct under
+    fake tensors, then fill), optional `warm` (post-fill, pre-serving work with real
+    tensors) and `unload` (release when the construction leaves the worker), the declared
+    persistent state, and the component-touching methods handlers call. The runtime owns
+    WHEN they run and where every byte lives (model-lifecycle.md). A bare typed parameter
+    is the whole declaration, and its presence in a signature is what derives `gpu`.
     """
 
     __sequence_parallel__: tuple[int, ...] = ()
@@ -395,6 +408,10 @@ class Model[PipelineT]:
     written before the native rung existed cannot have thought about whether its code
     survives leaf replacement, and reading its silence as "yes" would be the runtime
     deciding a question only the author can answer."""
+
+    __fusion__: str = "refuse"
+    """The class's `fusion=` declaration (h3a-015), defaulted the same way for the same
+    reason: silence is not consent to a substituted forward."""
 
     checkpoint_ref: str = ""
     """The pinned-ref REPRODUCTION FACT for result structs — an observation, never catalog
@@ -415,28 +432,34 @@ class Model[PipelineT]:
     """Runtime-installed under a group lane only (cr-068): the sequence-parallel mirror."""
 
     def __init_subclass__(cls, /, **keywords: str) -> None:
-        """The class-keyword plane is exactly `encoded_leaves` (model-code-fit §1).
+        """The class-keyword plane is exactly `encoded_leaves` and `fusion` (model-code-fit
+        §1, h3a-015): two closed consents about what the runtime may substitute.
 
         Anything else refuses typed: the open stamp vocabulary (`task=`, `objective=`),
         `structure=` and `self_loading=` are deleted (D1), and a keyword the runtime does not
         read is not a fact anyone else would look for.
         """
         super().__init_subclass__()
-        if "encoded_leaves" in keywords:
-            value = keywords.pop("encoded_leaves")
-            if value not in ENCODED_LEAVES:
-                raise ConformanceError(
-                    f"class {cls.__name__}(encoded_leaves={value!r}): the vocabulary is CLOSED — "
-                    + " | ".join(f"{k!r}: {why}" for k, why in ENCODED_LEAVES.items()),
-                    code="encoded_leaves_value",
-                )
-            cls.__encoded_leaves__ = value
+        for keyword, vocabulary, attribute in (
+            ("encoded_leaves", ENCODED_LEAVES, "__encoded_leaves__"),
+            ("fusion", FUSION, "__fusion__"),
+        ):
+            if keyword in keywords:
+                value = keywords.pop(keyword)
+                if value not in vocabulary:
+                    raise ConformanceError(
+                        f"class {cls.__name__}({keyword}={value!r}): the vocabulary is CLOSED — "
+                        + " | ".join(f"{k!r}: {why}" for k, why in vocabulary.items()),
+                        code=f"{keyword}_value",
+                    )
+                setattr(cls, attribute, value)
         if keywords:
             names = ", ".join(f"{key}=…" for key in keywords)
             raise ConformanceError(
-                f"class {cls.__name__}({names}): a Model class carries exactly one keyword, "
-                "encoded_leaves — stamps, task=, objective= and structure= are deleted "
-                "(model-code-fit D1); a semantic twin is a component name or a config fact",
+                f"class {cls.__name__}({names}): a Model class carries exactly two keywords, "
+                "encoded_leaves and fusion — stamps, task=, objective= and structure= are "
+                "deleted (model-code-fit D1); a semantic twin is a component name or a config "
+                "fact",
                 code="class_keyword",
                 fields=sorted(keywords),
             )
@@ -450,6 +473,24 @@ class Model[PipelineT]:
             "loader.construct(T, factory=…) — the one construction primitive (§1.1)",
             code="no_load",
         )
+
+    def warm(self, ctx: Context) -> None:
+        """Optional post-fill, pre-serving work — the ONE place for it (cr-110, #708).
+
+        The runtime calls it once per construction fill: after the fill and its
+        verification, before the placement reports DISPATCHABLE, on every worker, with the
+        device lease held and real tensors in place. Never again on a component stage or
+        evict — module objects survive residency, only bytes move — and again only when the
+        construction is rebuilt. What goes here is the author's choice: an in-place
+        `module.compile()` or `compile_repeated_blocks`, Triton/kernel loading, autotune,
+        a dry step at the canonical shape, or nothing. `torch.compile(module)` is refused
+        here as under derive: it wraps the module and renames every state_dict key, so the
+        object the code then calls is not the one the fill and residency planes hold.
+        `ctx` carries the device, the fill's deadline and cancellation; it has no request
+        and can reserve no package call. A raise is a construction failure naming the
+        exception, and the generation never serves.
+        """
+        return None
 
     def unload(self, loader: Loader) -> None:
         """Release declared state. The runtime drains before calling this."""
@@ -577,6 +618,14 @@ class Model[PipelineT]:
                 fields=[name],
             )
         object.__delattr__(self, name)
+
+
+def warm_context(where: Device, *, deadline: float, cancel: Callable[[], bool]) -> Context:
+    """The Context `Model.warm` receives: where it runs, how long the fill may take, and
+    whether the generation is still wanted. No request id and no adapters, because there
+    is no attempt; the package-call broker only `invoke` binds is absent, so an invocable
+    called here refuses `child_broker_absent` by construction (cr-110)."""
+    return Context("", deadline, where, cancel)
 
 
 def _carries_view(value: object) -> bool:

@@ -217,3 +217,29 @@ def test_the_worker_imposes_the_jit_scope_for_every_executor(tmp_path: Path) -> 
     # An absolute path is what makes torch's `os.path.abspath` rewrite a no-op; a relative
     # one would be normalized under the executor and move the sealed value.
     assert all(os.path.abspath(value) == value for value in imposed.values())
+
+
+def test_warm_refuses_only_the_wrapping_spelling() -> None:
+    """`Model.warm`'s guard (cr-110): `torch.compile(module)` refuses, naming the site in the
+    author's frame; the in-place `module.compile()` runs and moves no key."""
+    import torch
+    from torch import nn
+
+    from cozy_runtime.internal.derive import ConstructionFault, refuse_compile
+
+    with torch.device("meta"):
+        block = nn.Sequential(nn.Linear(8, 8), nn.SiLU(), nn.Linear(8, 8))
+    keys = sorted(block.state_dict())
+
+    with refuse_compile(lazy=False):
+        with pytest.raises(ConstructionFault) as refused:
+            torch.compile(block)
+        block.compile()
+    assert refused.value.construct == "torch.compile"
+    assert "module.compile()" in refused.value.message
+    assert __file__ in refused.value.site
+    assert sorted(block.state_dict()) == keys
+
+    # Construction's guard still refuses both, because there the lazy one traces fake tensors.
+    with refuse_compile(lazy=True), pytest.raises(ConstructionFault):
+        block.compile()

@@ -33,10 +33,18 @@ import msgspec
 
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._assets import Asset, GrantedInput, Tree, bind, bind_tree
+from cozy_runtime.author._assets import (
+    Asset,
+    Assets,
+    GrantedInput,
+    InputMetadata,
+    Tree,
+    bind,
+    bind_tree,
+)
 from cozy_runtime.author._calls import _Broker, _current
 from cozy_runtime.author._context import AdapterRef, Context, Device
-from cozy_runtime.author._decode import MediaDecoder
+from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, MediaDecoder
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
 from cozy_runtime.author._demand import RequestFeatures, normalize
 from cozy_runtime.author._describe import check
@@ -88,7 +96,6 @@ class Invocation:
     request_id: str
     spool: Path
     deadline: float
-    boot_warmup: bool = False
     device: Device = field(default_factory=Device)
     cancel: Callable[[], bool] = field(default=lambda: False)
     models: Mapping[str, Model[Any]] = field(default_factory=dict)
@@ -177,6 +184,7 @@ class PreparedRequest:
     features: RequestFeatures
     facts: object
     facts_digest: str | None
+    asset_bounds: Mapping[str, AssetBound | None] = field(default_factory=dict)
 
     def digests(self) -> dict[str, str]:
         """What a worker can hold, record and price against — never the payload."""
@@ -194,6 +202,7 @@ def prepare(
     recipes: Sequence[Recipe] = (),
     clamps: Sequence[Clamp] = (),
     settings: object = None,
+    input_metadata: Mapping[str, InputMetadata] = {},
 ) -> PreparedRequest:
     """The pre-admission half. Raises typed refusals; hydrates nothing; enters nothing."""
     surface = surface_of(registration)
@@ -204,6 +213,7 @@ def prepare(
         clamps=clamps,
         model_params=surface.model_params,
     )
+    asset_bounds = _prepare_assets(surface, overlay.payload, input_metadata)
     facts, facts_digest = _preflight(surface, overlay, settings)
     return PreparedRequest(
         surface=surface,
@@ -211,6 +221,7 @@ def prepare(
         features=normalize(overlay.payload),
         facts=facts,
         facts_digest=facts_digest,
+        asset_bounds=asset_bounds,
     )
 
 
@@ -226,13 +237,11 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     inv.spool.mkdir(parents=True, exist_ok=True)
 
     # Hydration is EAGER and happens only now: a refused request downloads nothing (§1.3).
-    _hydrate(overlay.payload, inv)
+    _hydrate(overlay.payload, inv, prepared.asset_bounds, record)
 
     attempt = record
     attempt.rows.extend(overlay.rows)
-    ctx = Context(
-        inv.request_id, inv.deadline, inv.boot_warmup, inv.device, inv.cancel, inv.adapters
-    )
+    ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)
 
     attempt.entered = True
@@ -278,12 +287,14 @@ def run_prepared(
         raise
     except Exception as exc:
         return None, classify(exc), record
+    finally:
+        record.closed = True
 
 
 def attempt(
     registration: Registration, wire: Mapping[str, object], inv: Invocation
 ) -> tuple[InvocationResult | None, Outcome, Attempt]:
-    """PREPARE then RUN, for the doors that do both at once — a job, and the warm pass.
+    """PREPARE then RUN, for the door that does both at once — a job.
 
     A serving attempt prepares BEFORE the worker admits it, which is the whole point of
     the split; a job is accept-then-prepare by design (cr-009) and has nothing to price a
@@ -291,7 +302,12 @@ def attempt(
     """
     try:
         prepared = prepare(
-            registration, wire, recipes=inv.recipes, clamps=inv.clamps, settings=inv.settings
+            registration,
+            wire,
+            recipes=inv.recipes,
+            clamps=inv.clamps,
+            settings=inv.settings,
+            input_metadata=inv.assets,
         )
     except (KeyboardInterrupt, SystemExit):
         raise
@@ -311,9 +327,17 @@ def _preflight(surface: Surface, overlay: Overlay, settings: object) -> tuple[ob
     spec = surface.preflight
     if spec is None:
         return None, None
-    args: list[object] = [overlay.payload]
-    if spec.settings_type is not None:
-        args.append(_settings_value(spec.settings_type, settings, "preflight settings"))
+    args: list[object] = [_payload_value(surface, overlay.payload)]
+    for role in spec.argument_order:
+        if role == "assets":
+            args.append(
+                Assets._from_bound(
+                    (row.asset for row in getattr(overlay.payload, str(spec.assets_parameter))),
+                    decoded=bool(surface.assets_binding and surface.assets_binding.decoded),
+                )
+            )
+        else:
+            args.append(_settings_value(spec.settings_type, settings, "preflight settings"))
     try:
         facts = spec.fn(*args)
     except AuthorError:
@@ -330,6 +354,70 @@ def _preflight(surface: Surface, overlay: Overlay, settings: object) -> tuple[ob
         )
     canonical = msgspec.json.encode(facts)
     return facts, "blake2b:" + hashlib.blake2b(canonical, digest_size=16).hexdigest()
+
+
+def _payload_value(surface: Surface, payload: object) -> object:
+    if surface.assets_binding is None or surface.invocable:
+        return payload
+    annotation = next(p.annotation for p in surface.params if p.role == "payload")
+    cls: Any = annotation
+    return cls(**{f.name: getattr(payload, f.name) for f in msgspec.structs.fields(cls)})
+
+
+def _prepare_assets(
+    surface: Surface, payload: object, metadata: Mapping[str, InputMetadata]
+) -> dict[str, AssetBound | None]:
+    binding = surface.assets_binding
+    if binding is None:
+        return {}
+    values = getattr(payload, binding.parameter)
+    bounds: dict[str, AssetBound | None] = {}
+    counts: dict[str, int] = {}
+    limits = dict(binding.counts)
+    for position, value in enumerate(values):
+        input_id = f"{binding.parameter}.{position}.asset"
+        row = metadata.get(input_id)
+        if row is None or row.input_id != input_id or value.asset.ref != row.digest:
+            raise InvalidRequest(
+                "Assets occurrence has no matching input binding",
+                code="asset_ungranted",
+                fields=[input_id],
+            )
+        options = [
+            (cls, bound)
+            for cls, bound in binding.kinds
+            if cls.kind != "file" and admits(cls.kind, row.media_type)
+        ]
+        if not options:
+            options = [(cls, bound) for cls, bound in binding.kinds if cls.kind == "file"]
+        if len(options) != 1:
+            raise InvalidRequest(
+                "Assets occurrence has an unsupported media type",
+                code="asset_media_type",
+                fields=[input_id],
+            )
+        cls, bound = options[0]
+        counts[cls.kind] = counts.get(cls.kind, 0) + 1
+        if cls.kind in limits and counts[cls.kind] > limits[cls.kind]:
+            raise InvalidRequest(
+                "Assets media kind count exceeds its declared limit",
+                code="asset_count",
+                fields=[binding.parameter],
+            )
+        asset = cls(
+            value.asset.ref, media_type=row.media_type, size_bytes=row.length, digest=row.digest
+        )
+        _check_input(asset, row, bound, bound.max_bytes or 0 if bound else 0, position)
+        asset._input_id, asset._position = input_id, position
+        asset._label = value.label
+        asset._fidelity = value.fidelity
+        value.asset = asset
+        bounds[input_id] = bound
+    try:
+        Assets._from_bound(value.asset for value in values)
+    except ValueError as exc:
+        raise InvalidRequest(str(exc), code="asset_labels", fields=[binding.parameter]) from exc
+    return bounds
 
 
 _CARRIES: dict[tuple[object, str], bool] = {}
@@ -517,16 +605,15 @@ def asset_inputs(payload: object) -> list[AssetInput]:
 
 def _check_input(
     asset: Asset,
-    granted: GrantedInput,
+    granted: InputMetadata,
     bound: AssetBound | None,
     cap: int,
     expected_order: int,
 ) -> None:
     """The typed gate every input passes before the entrypoint exists to it.
 
-    MEDIA-TYPE HONESTY is the first check and it is about the BYTES: `granted.media_type`
-    is what the worker sniffed, not what the caller declared, so a `.png` that is a
-    zip refuses here rather than inside a decoder the package did not agree to run.
+    Before hydration these are the binding's declarations; the same check runs
+    again on the worker's byte-verified metadata before handler entry.
     """
     if granted.order != expected_order:
         raise InvalidRequest(
@@ -540,9 +627,8 @@ def _check_input(
         raise InvalidRequest(
             f"input {granted.input_id!r} is {granted.media_type or 'of no recognised type'} "
             f"and the field is a {type(asset).__name__}, which admits "
-            f"{list(KIND_MEDIA.get(kind, ())) or 'any recognised type'}. The type comes "
-            "from the BYTES, not from the declaration: a mislabelled upload refuses at the "
-            "field rather than inside a decoder this package never agreed to run",
+            f"{list(KIND_MEDIA.get(kind, ())) or 'any recognised type'}. Input binding "
+            "metadata must satisfy the declared type; hydration also verifies its bytes",
             code="asset_media_type",
             fields=[granted.input_id],
         )
@@ -564,7 +650,12 @@ def _check_input(
         )
 
 
-def _hydrate(payload: object, inv: Invocation) -> None:
+def _hydrate(
+    payload: object,
+    inv: Invocation,
+    assets_bounds: Mapping[str, AssetBound | None] = {},
+    record: Attempt | None = None,
+) -> None:
     """Bind every declared input asset to the bytes the GRANT already materialized (§1.3).
 
     Symmetric with `_materialize_trees` and for the same reason: an ungranted ref is a
@@ -589,7 +680,18 @@ def _hydrate(payload: object, inv: Invocation) -> None:
                 code="asset_ungranted",
                 fields=[item.input_id],
             )
-        _check_input(item.asset, granted, item.bound, inv.max_input_bytes, item.order)
+        bound = assets_bounds.get(item.input_id, item.bound)
+        if item.input_id in assets_bounds and (
+            item.asset.digest,
+            item.asset.media_type,
+            item.asset.size_bytes,
+        ) != (granted.digest, granted.media_type, granted.length):
+            raise InvalidRequest(
+                "Assets metadata changed during hydration",
+                code="asset_binding_changed",
+                fields=[item.input_id],
+            )
+        _check_input(item.asset, granted, bound, inv.max_input_bytes, item.order)
         bind(
             item.asset,
             local=granted.local,
@@ -597,8 +699,12 @@ def _hydrate(payload: object, inv: Invocation) -> None:
             media_type=granted.media_type,
             digest=granted.digest,
             length=granted.length,
-            max_decoded_bytes=(item.bound.max_decoded_bytes or 0) if item.bound is not None else 0,
+            max_decoded_bytes=(bound.max_decoded_bytes or 0)
+            if bound is not None
+            else (DEFAULT_DECODE_LIMITS.max_decoded_bytes if item.input_id in assets_bounds else 0),
             input_id=item.input_id,
+            order=item.order,
+            read_guard=(lambda: record.check_open("Asset.read_bytes")) if record else None,
         )
 
 
@@ -616,11 +722,29 @@ def _inject(
     """Build the call kwargs. A service absent from the signature is never constructed —
     which is precisely why a handler without `Outputs` structurally cannot save."""
     kwargs: dict[str, object] = {}
+    # Both the implicit decoded view and an explicitly requested service share one budget.
+    decoder = (
+        MediaDecoder(
+            attempt,
+            active=lambda: any(model._cozy_active is not None for model in inv.models.values()),
+        )
+        if "media_decode" in surface.capabilities
+        else None
+    )
     for param in surface.params:
         if param.role == "context":
             kwargs[param.name] = ctx
         elif param.role == "payload":
-            kwargs[param.name] = overlay.payload
+            kwargs[param.name] = _payload_value(surface, overlay.payload)
+        elif param.role == "assets":
+            binding = surface.assets_binding
+            assert binding is not None
+            kwargs[param.name] = Assets._from_bound(
+                (row.asset for row in getattr(overlay.payload, param.name)),
+                decoded=binding.decoded,
+                project=decoder.value if decoder is not None else None,
+                guard=lambda: attempt.check_open("Assets"),
+            )
         elif param.role == "wire":
             kwargs[param.name] = getattr(overlay.payload, param.name)
         elif param.role == "preflight":
@@ -638,6 +762,9 @@ def _inject(
                     fields=[param.name],
                 )
             kwargs[param.name] = model
+        elif param.capability == "media_decode":
+            assert decoder is not None
+            kwargs[param.name] = decoder
         else:
             kwargs[param.name] = _service(param, attempt, ctx, inv, surface)
     return kwargs
@@ -686,11 +813,6 @@ def _service(
                 source_structure=inv.weights_source_structure,
                 source_config=inv.weights_source_config,
                 cancel=inv.cancel,
-            )
-        case "media_decode":
-            return MediaDecoder(
-                attempt,
-                active=lambda: any(model._cozy_active is not None for model in inv.models.values()),
             )
     raise ConformanceError(f"no injector for capability {param.capability!r}")
 
