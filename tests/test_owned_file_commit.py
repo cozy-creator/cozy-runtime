@@ -125,10 +125,13 @@ def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
     assert submitted == (0 if fault in ("foreign", "wrong_attempt") else 1)
 
 
-def pending(tmp_path: Path) -> tuple[Workspace, pb.NativeSourceCommand, Path, bytes]:
+def pending(
+    tmp_path: Path, data: bytes | None = None
+) -> tuple[Workspace, pb.NativeSourceCommand, Path, bytes]:
     workspace = Workspace(tmp_path / "store")
     source = accepted(workspace, "script")
-    data = canonical_json.encode({"report": "observed" * 12000})
+    if data is None:
+        data = canonical_json.encode({"report": "observed" * 12000})
     spool = tmp_path / "spool" / opaque_key("attempt-input-spool", "script", 1)
     spool.mkdir(parents=True)
     path = spool / "file-0001"
@@ -398,10 +401,11 @@ def test_interrupted_commit_reattaches_original_file_and_producer(
 
 
 @pytest.mark.parametrize("tree", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
 def test_explicit_reexport_retains_final_bytes_before_parent_service_release(
-    tmp_path: Path, tree: bool
+    tmp_path: Path, tree: bool, empty: bool
 ) -> None:
-    workspace, command, path, data = pending(tmp_path)
+    workspace, command, path, data = pending(tmp_path, b"" if empty else None)
     frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
     calls = SourceCalls(
         workspace, lambda: "owner", frames.put, lambda _: True, spool_root=tmp_path / "spool"
