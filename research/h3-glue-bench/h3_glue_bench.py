@@ -47,12 +47,14 @@ class BenchRequest(msgspec.Struct, forbid_unknown_fields=True):
 
 
 class Variant(msgspec.Struct):
+    name: str
     forward_ms: float
     block_ms: float
     step_s: float
 
 
 class Distance(msgspec.Struct):
+    pair: str
     max_abs: float
     max_abs_over_range: float
 
@@ -76,8 +78,8 @@ class BenchResult(msgspec.Struct):
     rows: int
     layers: int
     fp8: bool
-    variants: dict[str, Variant]
-    distance: dict[str, Distance]
+    variants: list[Variant]
+    distance: list[Distance]
     cold: Cold
     kernels: list[KernelShare]
 
@@ -161,9 +163,9 @@ def _time(transformer: Any, inputs: dict[str, Any], iterations: int) -> float:
     return float(statistics.median(samples))
 
 
-def _distance(reference: Any, actual: Any) -> Distance:
+def _distance(pair: str, reference: Any, actual: Any) -> Distance:
     gap = (reference[0].float() - actual[0].float()).abs().max().item()
-    return Distance(gap, gap / max(reference[0].float().abs().max().item(), 1e-30))
+    return Distance(pair, gap, gap / max(reference[0].float().abs().max().item(), 1e-30))
 
 
 def _category(name: str) -> str:
@@ -193,10 +195,15 @@ def _profile(variant: str, transformer: Any, inputs: dict[str, Any]) -> list[Ker
     return [KernelShare(variant, category, round(ms, 2)) for category, ms in sorted(shares.items())]
 
 
-def _record(variants: dict[str, Variant], name: str, forward_ms: float, layers: int) -> None:
+def _record(variants: list[Variant], name: str, forward_ms: float, layers: int) -> None:
     block_ms = forward_ms / layers
-    variants[name] = Variant(
-        round(forward_ms, 2), round(block_ms, 2), round(block_ms * BLOCKS_PER_STEP / 1000, 3)
+    variants.append(
+        Variant(
+            name,
+            round(forward_ms, 2),
+            round(block_ms, 2),
+            round(block_ms * BLOCKS_PER_STEP / 1000, 3),
+        )
     )
 
 
@@ -222,8 +229,8 @@ def run(request: BenchRequest, device: Any) -> BenchResult:
         artifact_source = f"self-built ({absent})"
     artifact_load_ms = (time.perf_counter() - started) * 1000
 
-    variants: dict[str, Variant] = {}
-    distance: dict[str, Distance] = {}
+    variants: list[Variant] = []
+    distance: list[Distance] = []
     kernels: list[KernelShare] = []
     torch_compile_ms = 0.0
     with torch.no_grad():
@@ -237,7 +244,7 @@ def run(request: BenchRequest, device: Any) -> BenchResult:
         fused = copy.deepcopy(eager)
         applied = fusion_install.apply_fusion_plan(_Holder(fused), torch=torch, device=device)
         assert applied.applied, applied.reason
-        distance["fused_vs_eager"] = _distance(reference, fused(**inputs))
+        distance.append(_distance("fused_vs_eager", reference, fused(**inputs)))
         arms.append(("fused", fused))
         for name, module in arms:
             _record(variants, name, _time(module, inputs, request.iterations), request.layers)
@@ -253,7 +260,7 @@ def run(request: BenchRequest, device: Any) -> BenchResult:
             eager(**inputs)
             torch.cuda.synchronize()
             torch_compile_ms = (time.perf_counter() - started) * 1000
-            distance["compiled_vs_eager"] = _distance(reference, eager(**inputs))
+            distance.append(_distance("compiled_vs_eager", reference, eager(**inputs)))
             _record(
                 variants,
                 "compiled",
