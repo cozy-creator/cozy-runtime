@@ -62,7 +62,7 @@ def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
 
     def exchange(kind: str, body: dict[str, Any]) -> dict[str, Any]:
         nonlocal submitted
-        if kind == "child_submit":
+        if kind == "child_call":
             submitted += 1
             assert body["export"] == "commit_file"
             args = canonical_json.decode(body["payload"].encode())
