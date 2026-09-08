@@ -9,14 +9,18 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping, Sequence
-from typing import NoReturn, cast
+from typing import TYPE_CHECKING, Literal, NoReturn, cast
 
-from cozy_runtime.author import ConformanceError, ModelBinding, Surface
+from cozy_runtime.author import ConformanceError, Surface, WeightsOutput
 from cozy_runtime.author._media import KIND_MEDIA
-from cozy_runtime.author._signature import AssetInputValue
+from cozy_runtime.author._signature import AssetInputValue, AssetsBinding
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
-from cozy_runtime.internal.discovery import Discovered
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal.discovery import Discovered
+
+Kind = Literal["entrypoint", "job"]
 
 SCHEMA = "cozy.package.interface/1"
 DIGEST_KEY = "package_interface_digest"
@@ -43,22 +47,27 @@ class StalePackageInterface(ConformanceError):
 
 
 def build(found: Discovered) -> dict[str, Json]:
-    """Derive one package interface from the frozen application."""
-    entrypoints: list[Json] = []
-    jobs: list[Json] = []
-    for surface in found.surfaces:
-        if surface.hidden:
-            continue
-        doc = _callable(surface)
-        (jobs if surface.kind == "job" else entrypoints).append(doc)
+    """Derive one package interface from the frozen (imported) application."""
+    docs = [(surface.kind, _callable(surface)) for surface in found.surfaces if not surface.hidden]
+    return assemble(found.application, docs, found.bindings)
+
+
+def assemble(
+    application: str,
+    docs: Sequence[tuple[Kind, dict[str, Json]]],
+    bindings: Mapping[str, Mapping[str, object]],
+) -> dict[str, Json]:
+    """One package interface from its callable documents, whichever reader produced them."""
+    entrypoints: list[Json] = [doc for kind, doc in docs if kind == "entrypoint"]
+    jobs: list[Json] = [doc for kind, doc in docs if kind == "job"]
     body: dict[str, Json] = {
         "format": SCHEMA,
-        "application": found.application,
+        "application": application,
         "entrypoints": sorted(entrypoints, key=_by_name),
         "jobs": sorted(jobs, key=_by_name),
     }
     assert set(body) == TOP_LEVEL_KEYS, sorted(set(body) ^ TOP_LEVEL_KEYS)
-    _fixed_point(body, _binding_values(found.bindings))
+    _fixed_point(body, _binding_values(bindings))
     return body
 
 
@@ -70,28 +79,62 @@ def _by_name(doc: Json) -> str:
 
 
 def _callable(surface: Surface) -> dict[str, Json]:
-    doc: dict[str, Json] = {
-        "name": surface.name,
-        "request": schema.render(surface.payload_type),
-        "result": schema.render(surface.result_type),
-    }
+    doc = callable_doc(
+        name=surface.name,
+        kind=surface.kind,
+        payload_type=surface.payload_type,
+        result_type=surface.result_type,
+        models=[
+            model_slot(
+                binding.path,
+                binding.class_key,
+                binding.encoded_leaves,
+                binding.fusion,
+                binding.components,
+                binding.sequence_parallel,
+            )
+            for binding in surface.model_bindings
+        ],
+        assets=surface.assets_binding,
+        publishes=surface.publishes,
+        weights_outputs=surface.weights_outputs,
+    )
     if surface.invocable:
         from cozy_runtime.internal import invocable_interface
 
         doc["invocable"] = invocable_interface.metadata(surface)
-    models = [_model(binding) for binding in surface.model_bindings]
+    return doc
+
+
+def callable_doc(
+    *,
+    name: str,
+    kind: Kind,
+    payload_type: object,
+    result_type: object,
+    models: Sequence[dict[str, Json]],
+    assets: AssetsBinding | None,
+    publishes: bool,
+    weights_outputs: Sequence[WeightsOutput],
+) -> dict[str, Json]:
+    """One callable's document from plain facts — the import and static readers meet here."""
+    doc: dict[str, Json] = {
+        "name": name,
+        "request": schema.render(payload_type),
+        "result": schema.render(result_type),
+    }
     if models:
-        doc["models"] = models
-    if binding := surface.assets_binding:
+        doc["models"] = list(models)
+    if assets:
         kinds: list[Json] = []
-        for cls, bound in binding.kinds:
+        for cls, bound in assets.kinds:
             row: dict[str, Json] = {
                 "kind": cls.kind,
                 "media_types": list(
                     bound.media_types if bound and bound.media_types else KIND_MEDIA[cls.kind]
                 ),
             }
-            counts = dict(binding.counts)
+            counts = dict(assets.counts)
             if cls.kind in counts:
                 row["max_count"] = counts[cls.kind]
             if bound and bound.max_bytes is not None:
@@ -99,15 +142,15 @@ def _callable(surface: Surface) -> dict[str, Json]:
             if bound and bound.max_decoded_bytes is not None:
                 row["max_decoded_bytes"] = bound.max_decoded_bytes
             kinds.append(row)
-        slot: dict[str, Json] = {"parameter": binding.parameter, "kinds": kinds}
-        if binding.decoded:
+        slot: dict[str, Json] = {"parameter": assets.parameter, "kinds": kinds}
+        if assets.decoded:
             slot["view"] = "decoded"
         doc["assets"] = slot
-    if surface.kind == "job":
-        doc["publishes"] = surface.publishes
-        if surface.weights_outputs:
+    if kind == "job":
+        doc["publishes"] = publishes
+        if weights_outputs:
             outputs: list[Json] = []
-            for output in sorted(surface.weights_outputs, key=lambda row: row.name):
+            for output in sorted(weights_outputs, key=lambda row: row.name):
                 declared: dict[str, Json] = {
                     "output_id": output.name,
                     "mime_type": "application/vnd.cozy.model-manifest",
@@ -118,27 +161,32 @@ def _callable(surface: Surface) -> dict[str, Json]:
     return doc
 
 
-def _model(binding: ModelBinding) -> dict[str, Json]:
+def model_slot(
+    path: str,
+    class_name: str,
+    encoded_leaves: str,
+    fusion: str,
+    components: Mapping[str, Sequence[str]],
+    sequence_parallel: Sequence[int],
+) -> dict[str, Json]:
     """One model slot. The PATH is the binding point, the CLASS carries `encoded_leaves`,
     and the per-public-method component sets are the ComponentUseContracts. Which artifact
     ever satisfies it is a binding-clock fact and is not here (model-code-fit §1)."""
     doc: dict[str, Json] = {
-        "path": binding.path,
-        "class": binding.class_key,
-        "encoded_leaves": binding.encoded_leaves,
+        "path": path,
+        "class": class_name,
+        "encoded_leaves": encoded_leaves,
         # Declaration order encodes no control flow and no residency choice (§1.1), so the
         # contract sorts — a reordered method body is not a surface change.
-        "component_use": {
-            method: sorted(names) for method, names in sorted(binding.components.items())
-        },
+        "component_use": {method: sorted(names) for method, names in sorted(components.items())},
     }
-    if binding.sequence_parallel:
+    if sequence_parallel:
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
-        doc["sequence_parallel"] = {"degrees": list(binding.sequence_parallel)}
-    if binding.fusion != "refuse":
+        doc["sequence_parallel"] = {"degrees": list(sequence_parallel)}
+    if fusion != "refuse":
         # The fused-glue consent (h3a-015); the conservative default is the absent key.
-        doc["fusion"] = binding.fusion
+        doc["fusion"] = fusion
     return doc
 
 

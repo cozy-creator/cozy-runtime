@@ -265,10 +265,32 @@ against the line taken before its envelope was granted, and the record is record
 
 ## The package interface
 
-`internal/discovery.py` is the isolation boundary: it imports exactly the ONE `App` export
-package.toml names, freezes it, and stops. Importing a module never registers anything, so
-there is no recursive discovery, no dependency stubbing and no source parser — a red arm
-plants a self-registering sibling module and proves describe cannot see it.
+`internal/static_interface.py` derives the interface from SOURCE (cr-114, decision #713 —
+package code is untrusted). `cozy-runtime describe` runs it by default: `ast` over the module
+package.toml's `[application] object` names, following module-scope imports inside the tree
+(and cozy-runtime's own `cozy_runtime.derive.*` source), a constant folder over literals,
+names and integer arithmetic, and a CLOSED vocabulary — `msgspec.Struct` classes with their
+`tag`/`tag_field`/`kw_only` keywords and `msgspec.field(name=…)`, `Annotated` carrying
+`msgspec.Meta`/`AssetBound`/`ModelDefault`/`Preflight`, `Literal`, `Enum`/`IntEnum`/`StrEnum`,
+unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Assets[...]` with
+`AssetLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`/`fusion=`,
+`@sequence_parallel`, `@uses_components`), and `@app.entrypoint`/`@app.job` with literal
+keywords and `WeightsOutput(...)` tuples. Each declaration is rebuilt as a real type
+(`msgspec.defstruct`, `enum.Enum`) and rendered by the SAME `internal/schema.py` the import
+path uses, so the two readings cannot drift. Nothing of the package is imported, executed or
+evaluated — `checks/architecture.py`'s `static-describe-executes-nothing` fence holds the
+reader's import list to that — and anything outside the vocabulary (a call or comprehension in
+an interface position, a type from outside the tree, a star import, `@invocable`, registration
+by call, a function-local import of an interface name) is a typed refusal naming `file:line`
+and the construct: `static_unresolvable`, `static_computed`, `static_unsupported`,
+`static_module`. Never a guess.
+
+`internal/discovery.py` is the import path and the static reader's ORACLE: it imports exactly
+the ONE `App` export package.toml names, freezes it, and stops. `cozy-runtime --conformance
+describe` runs both and refuses unless they are byte-identical — and refuses outright unless
+the running interpreter is the package's own locked environment (its distribution, at
+pyproject's version, resolves there), because importing package code is running it. That is
+the check a package's own CI runs from its locked venv; publish runs the static reader alone.
 
 `internal/package_interface.py` is the schema home for `PackageInterface`/`JobDescriptor`: only
 the launch and invocation facts with current readers. It carries no Runtime-global service
@@ -297,18 +319,19 @@ no `model_productions` graph, compatibility reader, or second scheduler.
 corpus in `vectors/es6-numbers.txt`.
 
 The package interface is derived, not committed to the source tree. `cozy-runtime --json --dir
-PROJECT describe` writes canonical bytes to stdout. Creator places those exact bytes at
-`metadata/package-interface.json` in the ordinary uploaded package file tree; Tensorhub derives
-the same interface from the installed project wheel and compares it. `package_interface_digest`
-is SHA-256 over those canonical bytes.
+PROJECT describe` writes canonical bytes to stdout from source alone — no torch, no venv, no
+package import. Creator places those exact bytes at `metadata/package-interface.json` in the
+ordinary uploaded package file tree, and `cozy package publish` refuses when its own static
+describe disagrees with them. `package_interface_digest` is SHA-256 over those canonical bytes.
 
 ## Commands
 
     uv sync
     uv run cozy-runtime version          # tag, commit, wire + python semvers
     uv run cozy-runtime new <name>       # scaffold a minimal valid package
-    uv run cozy-runtime describe              # human-readable surface summary
+    uv run cozy-runtime describe              # the surface, from source alone
     uv run cozy-runtime --json describe       # canonical publication bytes on stdout
+    uv run --locked cozy-runtime --conformance describe   # + import the app here; equal or refuse
     uv run python checks/architecture.py # AST import/dependency scans over the boundaries
     uv run pytest                        # the end-to-end suite: two real runs, no mocks
 
@@ -469,7 +492,8 @@ same TensorFS fit, discards the transient rows, and returns `checkpoint_incompat
 mismatch. A resident model skips this extra construction and follows the ordinary load path.
 
 A package whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
-`describe` refuses the release if PyAV is absent. The package interface publishes the hard per-field
+`--conformance describe` refuses the release if PyAV is absent (the static reader has no
+environment to check). The package interface publishes the hard per-field
 codec ceilings and the attempt-wide retained decoded-value ceiling.
 
 A package that prepares, binds, or fills a model selects `cozy-runtime[model-execution]`.

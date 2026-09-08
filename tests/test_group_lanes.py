@@ -33,6 +33,7 @@ from typing import Any
 
 import pytest
 
+from cozy_runtime.author._signature import ModelBinding
 from cozy_runtime.internal import accel, canonical, package_interface, spawn
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
@@ -632,6 +633,17 @@ def test_the_prepare_command_carries_the_degree_only_above_one() -> None:
 # ------------------------------------------------------------------------ the opt-in
 
 
+def _slot_document(slot: ModelBinding) -> dict[str, object]:
+    return package_interface.model_slot(
+        slot.path,
+        slot.class_key,
+        slot.encoded_leaves,
+        slot.fusion,
+        slot.components,
+        slot.sequence_parallel,
+    )
+
+
 def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
     """`@sequence_parallel(degrees=...)` on the Model class -> `ModelBinding.sequence_parallel`
     -> the interface slot `sequence_parallel: {degrees}` -> `DeclaredBinding` degrees.
@@ -661,9 +673,9 @@ def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
         components={},
         sequence_parallel=Sharded.__sequence_parallel__,
     )
-    document = package_interface._model(slot)
+    document = _slot_document(slot)
     assert document["sequence_parallel"] == {"degrees": [2, 4]}
-    assert "sequence_parallel" not in package_interface._model(
+    assert "sequence_parallel" not in _slot_document(
         dataclasses.replace(slot, model_class=Plain, sequence_parallel=())
     )
     # the real PackageInterface of the marco-polo example carries no key (nothing declared)
