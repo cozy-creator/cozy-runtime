@@ -138,9 +138,17 @@ def test_source_view_replays_one_producer_and_retained_child_survives_parent_ack
     value, _ = completed(workspace, source, b"metadata bytes")
     command = view_call(source, value)
     frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
-    calls = SourceCalls(workspace, lambda: "owner", frames.put, lambda _: True)
+    detached_before_reply: list[bool] = []
+
+    def receive(frame: pb.WorkerFrame) -> None:
+        with calls.lock:
+            detached_before_reply.append(command.service_id not in calls.tasks)
+        frames.put(frame)
+
+    calls = SourceCalls(workspace, lambda: "owner", receive, lambda _: True)
     calls.handle(command)
     first = frames.get(timeout=30).native_source_status
+    assert detached_before_reply == [True]
     assert first.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, first.safe_code
     assert first.HasField("byte_output")
     assert first.byte_output_attempt_ordinal == 1

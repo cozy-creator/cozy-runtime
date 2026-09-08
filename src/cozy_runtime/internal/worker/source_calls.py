@@ -335,7 +335,24 @@ class SourceCalls:
             workspace_memo,
         )
 
-        released = False
+        def finish() -> None:
+            # A retry can arrive immediately after the terminal frame. Detach this
+            # exact completed task first, and never erase a new task's registration.
+            with self.lock:
+                if self.tasks.get(command.service_id) is done:
+                    self.processes.pop(command.service_id, None)
+                    self.parents.pop(command.service_id, None)
+                    self.commands.pop(command.service_id, None)
+                    self.process_owners.pop(command.service_id, None)
+                    self.tasks.pop(command.service_id, None)
+            done.set()
+
+        def terminal(
+            current: pb.NativeSourceCommand, state: pb.NativeSourceState, **fields: Any
+        ) -> None:
+            finish()
+            self._status(current, state, **fields)
+
         view = command.operation == pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES
         file = command.operation == pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE
         native_bytes = view or file
@@ -350,7 +367,7 @@ class SourceCalls:
                 )
                 if not native_bytes:
                     workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
-                self._status(
+                terminal(
                     command,
                     pb.NATIVE_SOURCE_STATE_SUCCEEDED,
                     result=row["result"],
@@ -444,7 +461,7 @@ class SourceCalls:
                 )
                 if hit is not None:
                     workspace_memo.record_reuse(self.workspace, owner, command.service_id)
-                    self._status(
+                    terminal(
                         command,
                         pb.NATIVE_SOURCE_STATE_SUCCEEDED,
                         result=hit["result"],
@@ -500,7 +517,7 @@ class SourceCalls:
                         "AND service_id=? AND state IN ('accepted','resolved','executing')",
                         (owner, command.service_id),
                     )
-                self._status(command, pb.NATIVE_SOURCE_STATE_CANCELED)
+                terminal(command, pb.NATIVE_SOURCE_STATE_CANCELED)
                 return
             if process.returncode or len(output) > 2 << 20:
                 raise WorkspaceRefusal("native source execution ended without bounded result")
@@ -516,15 +533,7 @@ class SourceCalls:
             if phase == "resolve":
                 resolved = _selection(answer["selection"])
                 workspace_sources.record_pin(self.workspace, owner, command, resolved)
-                with self.lock:
-                    self.processes.pop(command.service_id, None)
-                    self.parents.pop(command.service_id, None)
-                    self.commands.pop(command.service_id, None)
-                    self.process_owners.pop(command.service_id, None)
-                    self.tasks.pop(command.service_id, None)
-                done.set()
-                released = True
-                self._status(command, pb.NATIVE_SOURCE_STATE_RESOLVED, selection=resolved)
+                terminal(command, pb.NATIVE_SOURCE_STATE_RESOLVED, selection=resolved)
                 return
             result = canonical_json.encode(answer["result"])
             receipt = base64.b64decode(answer["native_receipt"], validate=True)
@@ -555,7 +564,7 @@ class SourceCalls:
                 )
                 workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
                 workspace_memo.record_native(self.workspace, owner, command.service_id)
-            self._status(
+            terminal(
                 command,
                 pb.NATIVE_SOURCE_STATE_SUCCEEDED,
                 result=result,
@@ -575,7 +584,7 @@ class SourceCalls:
                     "AND state IN ('accepted','resolved','executing')",
                     (code, owner, command.service_id),
                 )
-            self._status(command, pb.NATIVE_SOURCE_STATE_FAILED, code=code)
+            terminal(command, pb.NATIVE_SOURCE_STATE_FAILED, code=code)
         finally:
             if view:
                 try:
@@ -583,11 +592,4 @@ class SourceCalls:
                 except Exception:
                     # Durable release intent is retried by the ordinary parent ACK path.
                     _LOG.warning("Native source view cleanup deferred to parent release")
-            if not released:
-                with self.lock:
-                    self.processes.pop(command.service_id, None)
-                    self.parents.pop(command.service_id, None)
-                    self.commands.pop(command.service_id, None)
-                    self.process_owners.pop(command.service_id, None)
-                    self.tasks.pop(command.service_id, None)
-            done.set()
+            finish()
