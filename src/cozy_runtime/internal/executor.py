@@ -835,7 +835,20 @@ class Executor:
             _mark[0] = now
 
         self._stages = stages
+        pin = str(command.get("attention_pin", ""))
         if not binding.get("model_class"):
+            if pin:
+                # A PIN IS NEVER SILENTLY IGNORED (cr-125). A weightless binding constructs
+                # nothing and therefore holds no attention site, so there is nowhere to put
+                # the kernel that was named — and a run that reported success while serving
+                # no pin at all is the same lie as one that quietly served another kernel.
+                self.poisoned = "attention pin on a weightless binding"
+                return {
+                    "ok": False,
+                    "code": "attention_kernel_unsupported",
+                    "detail": f"{pin} was pinned on a binding that declares no model; a "
+                    "weightless package holds no attention site and a pin is never ignored",
+                }
             return self._prepare_weightless(binding, started)
         if "authorized_device_limit_bytes" not in command:
             # NO SELF-DERIVED CEILING (cr-025/cr-066): the worker assigns one before every
@@ -1272,7 +1285,14 @@ class Executor:
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
             # per attention SITE and before any warm step. No checkpoint is consulted:
             # attention is weightless, so the choice is (device, image) and nothing else.
-            applied = attention.select(device_facts, {**backend.components, **backend.parked})
+            # `pin` is the execution-path override (cr-125) and is empty on every serving
+            # worker; when it is set it names ONE kernel and refuses rather than falling
+            # back. HERE is the only place it can act: `warm` may compile the module in
+            # place and a group installs its collectives next, and cp.py's ordering is
+            # forced — set the backend, then parallelism, then compile. A pin applied after
+            # either is a field nobody reads, which is why this is a construction fact and
+            # not a per-attempt one.
+            applied = attention.select(device_facts, {**backend.components, **backend.parked}, pin)
             stage("attention_pin")
         except ModelFitRefused as exc:
             # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
@@ -1627,6 +1647,9 @@ class Executor:
                     **row,
                     "devices": command.get("devices", ""),
                     "authorized_device_limit_bytes": max(authorized - held, 0),
+                    # One construction, one execution path: every model of a set takes the
+                    # same pin (cr-125), exactly as they share one device authorization.
+                    "attention_pin": command.get("attention_pin", ""),
                 }
             )
             if reply.get("ok"):

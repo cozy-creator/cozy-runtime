@@ -303,6 +303,19 @@ class WorkerOptions:
     """Exact launch facts the development Placement must echo."""
     development_binding_overrides: Mapping[str, str] = field(default_factory=dict)
     """One-shot local resolver inputs; long-lived Creator launches use package.toml."""
+    attention_pin: str = ""
+    """THE EXECUTION-PATH OVERRIDE (cr-125): one attention kernel by name, or empty.
+
+    Empty is the whole product. A serving worker picks the fastest kernel this device and
+    image support by itself (cr-124) and has no knob at all — `_SERVE_FLAGS` is a closed
+    set and this is deliberately not in it, so the guard is the absence of a way to say it
+    rather than a condition somebody could get wrong. Only the ephemeral worker
+    `cozy-runtime run` builds in memory can carry one, which is exactly the dev mode the
+    A/B needs: two runs, two pins, one honest comparison.
+
+    It reaches `attention.select` at PREPARE, which is the only moment it can act — a pin
+    applied after `warm` compiled the module or after a group installed its collectives is
+    a field nobody reads. So this is a construction fact and never a per-request one."""
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
@@ -901,6 +914,7 @@ def executor_prepare_command(
     authorized_device_limit_bytes: int = 0,
     sequence_parallel_degree: int = 1,
     parameter_names: Sequence[Sequence[str]] = (),
+    attention_pin: str = "",
 ) -> dict[str, Any]:
     """Translate one resolved callable binding into the executor's closed prepare shape.
 
@@ -912,7 +926,8 @@ def executor_prepare_command(
     a group lane's K, the ONE new fact its executor receives; a plain prepare is unchanged.
     `parameter_names[i]` is every parameter name the i-th model is bound under across the
     bindings that share this construction (h3a-018); absent, the model binds under this
-    binding's own name.
+    binding's own name. `attention_pin` rides the same way, and only when a dev-mode
+    override named a kernel (cr-125): a serving prepare carries no such key at all.
     """
 
     models = []
@@ -954,6 +969,8 @@ def executor_prepare_command(
     }
     if sequence_parallel_degree > 1:
         command["sequence_parallel_degree"] = int(sequence_parallel_degree)
+    if attention_pin:
+        command["attention_pin"] = attention_pin
     if not models:
         command.update(
             {
@@ -4681,6 +4698,7 @@ class Worker:
                     authorized_device_limit_bytes=authorized,
                     sequence_parallel_degree=lane.degree if lane.group else 1,
                     parameter_names=_parameter_names_by_model(group),
+                    attention_pin=self.options.attention_pin,
                 ),
                 timeout=None,
                 on_progress=lambda frame: self.monitor.advance(
