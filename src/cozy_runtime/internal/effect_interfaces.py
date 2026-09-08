@@ -27,7 +27,7 @@ class Publish(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     expected_revision: int | None = None
 
 
-_TYPES = {
+_TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
     "upload_checkpoint": (Upload, CheckpointRef),
     "publish_release": (Publish, ReleaseReceipt),
 }

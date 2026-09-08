@@ -2380,7 +2380,17 @@ class Executor:
         bindings: dict[tuple[str, str, str], _CallType] = {}
         for row in rows:
             interface, module, export = row["interface_digest"], row["module"], row["export"]
-            if row.get("self"):
+            if row.get("native_effect"):
+                from cozy_runtime.internal import effect_interfaces
+
+                binding = effect_interfaces.bindings().get((interface, module, export))
+                if binding is None:
+                    raise CapabilityError(
+                        "native effect interface differs from the fixed service",
+                        code="child_interface",
+                    )
+                bindings[("", module, export)] = binding
+            elif row.get("self"):
                 assert self.discovered is not None
                 surface = next(
                     (

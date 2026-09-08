@@ -17,6 +17,7 @@ class CheckpointRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     checkpoint: str
     manifest: ObjectRef
     publication: str
+    observation: str
 
 
 class ReleaseReceipt(msgspec.Struct, frozen=True, forbid_unknown_fields=True):

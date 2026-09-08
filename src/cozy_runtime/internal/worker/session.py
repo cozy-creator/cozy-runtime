@@ -1191,6 +1191,23 @@ class Worker:
             self.send, lambda: self.fence.control_stream_epoch, lambda: self.fence.wire_minor
         )
         self.engine.calls = self.calls
+        from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
+
+        self.artifact_transfers = (
+            NativeArtifactTransfers(
+                self.workspace,
+                lambda: self.fence.record_owner_id,
+                self.send,
+                lambda command: (
+                    command.record_owner_epoch == self.fence.record_owner_epoch
+                    and command.control_stream_epoch == self.fence.control_stream_epoch
+                    and command.worker_boot_id == self.fence.worker_boot_id
+                ),
+            )
+            if self.workspace is not None
+            else None
+        )
+
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
         #: claim installs a FRESH queue under `claim_lock`, so the superseded stream's sender
         #: keeps draining its own (now unread) queue and can never consume a frame authored
@@ -2912,6 +2929,9 @@ class Worker:
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
         elif kind == "weights_host_ack":
             self.note("artifact", "retired Host writer acknowledgment ignored")
+        elif kind == "native_artifact_transfer":
+            if self.artifact_transfers is not None and self.fence.wire_minor >= 42:
+                self.artifact_transfers.handle(inner)
         elif kind == "child_call_result":
             if not self.calls.absorb(inner):
                 self.note("child", "dropped stale or invalid child-call result")
@@ -6338,6 +6358,8 @@ class Worker:
         ]
         self.request_stop()
         self.weights.close()
+        if self.artifact_transfers is not None:
+            self.artifact_transfers.close()
         self.convergences.put(None)
         self.watches.end_all()
         self.host.stop()
