@@ -1,7 +1,8 @@
 # Authored model defaults
 
 Owner: `/root/input_runtime`; branch: `authored-model-defaults`.
-Base: `edccecff8f0d74d414a436c229742a2da88723c8` (`origin/master`).
+Initial base: `edccecff8f0d74d414a436c229742a2da88723c8`.
+Rebased base: `12a05e9fb1c7db0c3f9bdc36d3fb091fde3aaf80` (`origin/master`), preserving the native integrity fixes and TensorFS 0.3.26 pin.
 
 Runtime 0.10.0 lets a package author supply an ordered default ladder on an injected Model argument:
 
