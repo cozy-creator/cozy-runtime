@@ -14,7 +14,9 @@ torch.compile's first call); optionally the CUDA kernel self-time by category.
 
 from __future__ import annotations
 
+import argparse
 import copy
+import json
 import statistics
 import tempfile
 import time
@@ -22,8 +24,13 @@ from pathlib import Path
 from typing import Any
 
 import msgspec
+import torch
+from diffusers import MiniMaxH3Transformer3DModel
+from torch.profiler import ProfilerActivity, profile
 
 from cozy_runtime.author import App, Config, Context, Loader, Model
+from cozy_runtime.internal import fusion, fusion_build, fusion_install
+from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf
 
 HIDDEN, FFN, HEADS, HEAD_DIM, ROTARY = 5376, 14336, 56, 128, 96
 TEXT_ROWS, AUDIO_ROWS = 950, 1150
@@ -54,6 +61,7 @@ class Cold(msgspec.Struct):
     artifact_load_ms: float
     jit_build_ms: float
     torch_compile_ms: float
+    artifact_source: str
 
 
 class KernelShare(msgspec.Struct):
@@ -99,9 +107,7 @@ class _Holder:
         self.pipe = type("Pipe", (), {"components": {"dit": transformer}})()
 
 
-def _transformer(torch: Any, layers: int, device: Any) -> Any:
-    from diffusers import MiniMaxH3Transformer3DModel
-
+def _transformer(layers: int, device: Any) -> Any:
     torch.manual_seed(0)
     transformer = MiniMaxH3Transformer3DModel(num_layers=layers, num_refiner_layers=1)
     with torch.no_grad():
@@ -112,7 +118,7 @@ def _transformer(torch: Any, layers: int, device: Any) -> Any:
     return transformer.to(device).eval()
 
 
-def _inputs(torch: Any, device: Any, rows: int) -> dict[str, Any]:
+def _inputs(device: Any, rows: int) -> dict[str, Any]:
     torch.manual_seed(1)
     video = rows - TEXT_ROWS - AUDIO_ROWS
     return {
@@ -136,9 +142,7 @@ def _inputs(torch: Any, device: Any, rows: int) -> dict[str, Any]:
     }
 
 
-def _encode_leaves(torch: Any, transformer: Any) -> None:
-    from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf
-
+def _encode_leaves(transformer: Any) -> None:
     provider = RowwiseNativeLeaf(encoding="fp8-rowwise/1")
     for block in transformer.transformer_blocks:
         sites = [
@@ -162,7 +166,7 @@ def _encode_leaves(torch: Any, transformer: Any) -> None:
                 setattr(owner, attribute, leaf)
 
 
-def _time(torch: Any, transformer: Any, inputs: dict[str, Any], iterations: int) -> float:
+def _time(transformer: Any, inputs: dict[str, Any], iterations: int) -> float:
     for _ in range(2):
         transformer(**inputs)
     torch.cuda.synchronize()
@@ -197,11 +201,7 @@ def _category(name: str) -> str:
     return "eager_glue"
 
 
-def _profile(
-    torch: Any, variant: str, transformer: Any, inputs: dict[str, Any]
-) -> list[KernelShare]:
-    from torch.profiler import ProfilerActivity, profile
-
+def _profile(variant: str, transformer: Any, inputs: dict[str, Any]) -> list[KernelShare]:
     with profile(activities=[ProfilerActivity.CUDA]) as trace:
         transformer(**inputs)
         torch.cuda.synchronize()
@@ -221,30 +221,36 @@ def _record(variants: dict[str, Variant], name: str, forward_ms: float, layers: 
 
 
 def run(request: BenchRequest, device: Any) -> BenchResult:
-    import torch
-
-    from cozy_runtime.internal import fusion, fusion_build, fusion_install
-
     device = torch.device(str(device))
     major, minor = torch.cuda.get_device_capability(device)
     arch = major * 10 + minor
+    # The runtime's own artifact when the image carries one; otherwise the same build the
+    # image stage runs, here and now, so the yardstick measures on a pod whose image predates
+    # the cubin bake. Either way the JIT cost is measured from scratch.
+    scratch = tempfile.TemporaryDirectory(prefix="h3-glue-bench-jit-")
     started = time.perf_counter()
-    fusion.load(device)
+    fusion_build.build(Path(scratch.name), (arch,))
+    jit_build_ms = (time.perf_counter() - started) * 1000
+    started = time.perf_counter()
+    try:
+        fusion.load(device)
+        artifact_source = str(fusion.artifact_dir())
+    except fusion.FusionUnavailable as absent:
+        if absent.code != "fusion_kernels_absent":
+            raise
+        fusion.load(device, Path(scratch.name))
+        artifact_source = f"self-built ({absent})"
     artifact_load_ms = (time.perf_counter() - started) * 1000
-    with tempfile.TemporaryDirectory(prefix="h3-glue-bench-jit-") as scratch:
-        started = time.perf_counter()
-        fusion_build.build(Path(scratch), (arch,))
-        jit_build_ms = (time.perf_counter() - started) * 1000
 
     variants: dict[str, Variant] = {}
     distance: dict[str, Distance] = {}
     kernels: list[KernelShare] = []
     torch_compile_ms = 0.0
     with torch.no_grad():
-        eager = _transformer(torch, request.layers, device)
+        eager = _transformer(request.layers, device)
         if request.fp8:
-            _encode_leaves(torch, eager)
-        inputs = _inputs(torch, device, request.rows)
+            _encode_leaves(eager)
+        inputs = _inputs(device, request.rows)
         reference = eager(**inputs)
 
         arms: list[tuple[str, Any]] = [("eager", eager)]
@@ -254,11 +260,9 @@ def run(request: BenchRequest, device: Any) -> BenchResult:
         distance["fused_vs_eager"] = _distance(reference, fused(**inputs))
         arms.append(("fused", fused))
         for name, module in arms:
-            _record(
-                variants, name, _time(torch, module, inputs, request.iterations), request.layers
-            )
+            _record(variants, name, _time(module, inputs, request.iterations), request.layers)
             if request.profile:
-                kernels += _profile(torch, name, module, inputs)
+                kernels += _profile(name, module, inputs)
         del fused, arms
         torch.cuda.empty_cache()
         if request.compile and not request.fp8:
@@ -273,11 +277,11 @@ def run(request: BenchRequest, device: Any) -> BenchResult:
             _record(
                 variants,
                 "compiled",
-                _time(torch, eager, inputs, request.iterations),
+                _time(eager, inputs, request.iterations),
                 request.layers,
             )
             if request.profile:
-                kernels += _profile(torch, "compiled", eager, inputs)
+                kernels += _profile("compiled", eager, inputs)
     return BenchResult(
         device=torch.cuda.get_device_name(device),
         arch=f"sm{arch}",
@@ -286,7 +290,12 @@ def run(request: BenchRequest, device: Any) -> BenchResult:
         fp8=request.fp8,
         variants=variants,
         distance=distance,
-        cold=Cold(round(artifact_load_ms, 1), round(jit_build_ms, 1), round(torch_compile_ms, 1)),
+        cold=Cold(
+            round(artifact_load_ms, 1),
+            round(jit_build_ms, 1),
+            round(torch_compile_ms, 1),
+            artifact_source,
+        ),
         kernels=kernels,
     )
 
@@ -301,9 +310,6 @@ def bench(payload: BenchRequest, model: BenchModel, ctx: Context) -> BenchResult
 
 
 if __name__ == "__main__":
-    import argparse
-    import json
-
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--rows", type=int, default=4096)
     parser.add_argument("--layers", type=int, default=1)
