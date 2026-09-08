@@ -1,18 +1,19 @@
 """A package-free, bounded seat for the shared image preparation core.
 
-Only local input/output paths and declared policy cross stdin. The returned file has
-no digest here: Creator's existing fingerprint/staging path owns delivered-byte identity.
+Only the local source path and declared policy cross stdin. A required derivative is
+written once under the system temporary directory; the source is never copied unchanged.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import signal
 import stat
 import sys
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from types import FrameType
 from typing import Literal
@@ -44,6 +45,7 @@ from cozy_runtime.author._markers import IMAGE_PREPARATION_PROFILE, ImagePrepara
 from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, sniff
 from cozy_runtime.cli.io import CliError, Result
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.host_paths import input_media_root
 
 _INPUT_LIMIT = 16 << 10
 
@@ -56,7 +58,6 @@ class _Policy(msgspec.Struct, forbid_unknown_fields=True):
 
 class _Request(msgspec.Struct, forbid_unknown_fields=True):
     source_path: str
-    output_directory: str
     prepare: _Policy
     media_types: list[str]
     max_bytes: int
@@ -82,7 +83,6 @@ def _request() -> _Request:
     request = msgspec.json.decode(raw, type=_Request)
     if (
         not Path(request.source_path).is_absolute()
-        or not Path(request.output_directory).is_absolute()
         or not request.prepare.profile
         or len(request.prepare.profile) > 64
         or request.max_bytes <= 0
@@ -164,25 +164,40 @@ def _prepare(request: _Request) -> Result:
         return _raw(source, source_length, source_mime, request.max_bytes)
     if len(encoded) > request.max_bytes:
         return _raw(source, source_length, source_mime, request.max_bytes)
-    directory = Path(request.output_directory).resolve(strict=True)
-    if not directory.is_dir():
-        raise ValueError("image preparation output must be an existing owned temporary directory")
-    descriptor, filename = tempfile.mkstemp(
-        prefix="image-prepared-",
-        suffix=".webp" if carrier == "image/webp" else ".png",
-        dir=directory,
-    )
-    target = Path(filename)
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            if output.write(encoded) != len(encoded):
-                raise OSError("temporary image write was incomplete")
-        result = _document("prepared", target, carrier, target.stat().st_size)
-        result.update(width=image.width, height=image.height)
-        return Result(document=result)
-    except BaseException:
-        target.unlink(missing_ok=True)
-        raise
+    directory = input_media_root()
+    directory.mkdir(mode=0o755, exist_ok=True)
+    facts = directory.lstat()
+    if not stat.S_ISDIR(facts.st_mode) or facts.st_mode & 0o022:
+        raise ValueError(
+            "temporary media directory must not be a symlink or writable by other users"
+        )
+    digest = hashlib.sha256(encoded).hexdigest()
+    target = directory / (digest + (".webp" if carrier == "image/webp" else ".png"))
+    if not target.exists():
+        descriptor, filename = tempfile.mkstemp(prefix=".image-", dir=directory)
+        temporary = Path(filename)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                if output.write(encoded) != len(encoded):
+                    raise OSError("temporary image write was incomplete")
+                output.flush()
+                os.fchmod(output.fileno(), 0o444)
+            with suppress(FileExistsError):
+                os.link(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as existing:
+        facts = os.fstat(existing.fileno())
+        if (
+            not stat.S_ISREG(facts.st_mode)
+            or facts.st_size != len(encoded)
+            or hashlib.file_digest(existing, "sha256").hexdigest() != digest
+        ):
+            raise ValueError("temporary image file differs from its content hash")
+    result = _document("prepared", target, carrier, len(encoded))
+    result.update(width=image.width, height=image.height)
+    return Result(document=result)
 
 
 @contextmanager

@@ -15,3 +15,16 @@ Native retained byte/tree results retain their existing workspace and checkout o
 
 Validation covers actual paths/inodes, size/hash/media refusals, changes after verification,
 cleanup preservation, isolated execution, and temporary derivative reuse.
+
+The file handoff records device, inode, size, modification time and change time after
+SHA-256, length and media verification. Reads and media decoding check those facts around
+consumption; a disappeared or changed source raises a typed refusal. This does not lock out
+another process editing the original, so it is not a filesystem immutability guarantee.
+Raw-byte reads are bounded by the verified length. Existing decoder limits remain in force.
+
+The image-prepare stdin request no longer accepts `output_directory`; its `prepared` result
+names the one hash-addressed temporary derivative. Small images return the original path.
+Existing derivative bytes must match the hash before reuse; publication never replaces an
+existing inode. Attempt cleanup leaves temporary shared media in place for other readers.
+The host or user can reclaim those disposable files when idle. Runtime 0.8.3 is the client
+helper version boundary for this change.
