@@ -991,6 +991,7 @@ def prepare_package(
             python=python,
             base=observed_base,
             dependency_python=dependency_python,
+            exact_dependencies=True,
         )
     except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
         code = getattr(exc, "code", "package_environment_install_failed")
