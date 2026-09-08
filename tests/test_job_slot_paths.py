@@ -211,6 +211,9 @@ def test_a_job_shaped_selection_prepares(
     placement = json.loads(result.placement_set.placement_set_canonical_bytes)["placements"][0]
     assert placement["entrypoints"] == []
     assert [row["repo"] for row in placement["models"]] == [PACKAGE]
+    from cozy_runtime.internal.worker.session import read_placement_set
+
+    assert read_placement_set(result.placement_set)[0] == placement
     assert placement["models"][0].get("version", "") == ("" if checkpoint_only else RELEASE)
     assert placement["models"][0].get("lane", "") == ("" if checkpoint_only else LANE)
     # The job plan the JobDirective will resolve against exists.

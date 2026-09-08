@@ -783,10 +783,11 @@ def _placement_profile(entry: dict[str, Any]) -> None:
     model_ids: list[str] = []
     for index, value in enumerate(models):
         model = _closed_document(value, {"id", "repo", "version", "lane", "manifest"}, "Model")
-        _required(model, {"id", "repo", "version", "manifest"}, "Model")
+        _required(model, {"id", "repo", "manifest"}, "Model")
         model_ids.append(_identifier(model["id"], f"models[{index}].id"))
-        for name in ("repo", "version"):
-            _identifier(model[name], f"models[{index}].{name}")
+        _identifier(model["repo"], f"models[{index}].repo")
+        if "version" in model:
+            _identifier(model["version"], f"models[{index}].version")
         if "lane" in model:
             _identifier(model["lane"], f"models[{index}].lane")
         _exact_ref(model["manifest"], f"models[{index}].manifest")
