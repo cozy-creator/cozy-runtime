@@ -39,7 +39,7 @@ class SourceFiles(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
 
 class CommitFile(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    handle: str
+    slot: str
     digest: str
     size_bytes: int
     media_type: str

@@ -28,6 +28,9 @@ async def commit(attempt: Attempt, pending: FileAsset) -> FileAsset:
         raise OutputError(
             "commit requires this Outputs instance's pending FileAsset", code="output_owner"
         )
+    prefix = f"attempt:{attempt.request_id}/"
+    if pending._attempt != attempt.request_id or not pending.ref.startswith(prefix + "file/"):
+        raise OutputError("pending file belongs to another attempt", code="output_owner")
     if ready := attempt.committed_files.get(pending.ref):
         return ready
     path = attempt.spool / f"file-{pending.ref.rsplit('/', 1)[-1]}"
@@ -48,7 +51,7 @@ async def commit(attempt: Attempt, pending: FileAsset) -> FileAsset:
         await _call(
             "commit_file",
             {
-                "handle": pending.ref,
+                "slot": pending.ref.removeprefix(prefix),
                 "digest": "sha256:" + digest.hexdigest(),
                 "size_bytes": length,
                 "media_type": pending.media_type,

@@ -33,7 +33,9 @@ class Empty(msgspec.Struct):
     pass
 
 
-@pytest.mark.parametrize("fault", ["", "foreign", "unreturned", "return_committed"])
+@pytest.mark.parametrize(
+    "fault", ["", "foreign", "wrong_attempt", "unreturned", "return_committed"]
+)
 def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
     tmp_path: Path, fault: str
 ) -> None:
@@ -49,6 +51,8 @@ def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
         saved = out.save_bytes(data, media_type="application/json")
         if fault == "foreign":
             await out.commit(FileAsset(saved.ref))
+        if fault == "wrong_attempt":
+            saved._attempt = "another#1"
         ready = await out.commit(saved)
         assert ready.read_bytes() == data
         assert await out.commit(saved) is ready
@@ -68,7 +72,7 @@ def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
             assert body["export"] == "commit_file"
             args = canonical_json.decode(body["payload"].encode())
             assert args["digest"] == digest and args["size_bytes"] == len(data)
-            assert args["handle"] == "attempt:script#1/file/0001"
+            assert args["slot"] == "file/0001"
             return {"ok": True}
         if kind == "child_forget":
             return {"ok": True}
@@ -111,13 +115,14 @@ def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
             outcome.code
             == {
                 "foreign": "output_owner",
+                "wrong_attempt": "output_owner",
                 "unreturned": "unreturned_handle",
                 "return_committed": "result_schema",
             }[fault]
         ), outcome
     else:
         assert outcome.terminal == "succeeded", outcome
-    assert submitted == (0 if fault == "foreign" else 1)
+    assert submitted == (0 if fault in ("foreign", "wrong_attempt") else 1)
 
 
 def pending(tmp_path: Path) -> tuple[Workspace, pb.NativeSourceCommand, Path, bytes]:
@@ -129,7 +134,7 @@ def pending(tmp_path: Path) -> tuple[Workspace, pb.NativeSourceCommand, Path, by
     path = spool / "file-0001"
     path.write_bytes(data)
     arguments = {
-        "handle": "attempt:script#1/file/0001",
+        "slot": "file/0001",
         "digest": documents.spell(hashlib.sha256(data).digest()),
         "size_bytes": len(data),
         "media_type": "application/json",
@@ -282,6 +287,48 @@ def test_cancel_before_import_releases_only_after_permanent_stop(tmp_path: Path)
         assert row["state"] == "released"
 
 
+def replace_arguments(command: pb.NativeSourceCommand, arguments: dict[str, Any]) -> None:
+    call = command.parent_call
+    call.request_canonical_bytes = canonical_json.encode(arguments)
+    call.intent_digest = hashlib.sha256(
+        canonical_json.encode(
+            {
+                "interface_digest": source_interfaces.DIGEST,
+                "module": source_interfaces.MODULE,
+                "export": "commit_file",
+                "request": arguments,
+            }
+        )
+    ).digest()
+
+
+@pytest.mark.parametrize("slot", ["../file-0001", "attempt:other#1/file/0001", "file/00001"])
+def test_native_file_slot_cannot_override_current_parent_scope(tmp_path: Path, slot: str) -> None:
+    workspace, command, _, _ = pending(tmp_path)
+    args = canonical_json.decode(command.parent_call.request_canonical_bytes)
+    args["slot"] = slot
+    replace_arguments(command, args)
+    workspace_sources.accepted(workspace, "owner", command)
+    with pytest.raises(WorkspaceRefusal, match="own pending file"):
+        commit_files.prepare(workspace, "owner", command, b"k" * 32, tmp_path / "spool")
+    with workspace.locked() as db:
+        assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 0
+
+
+def test_accepted_slot_cannot_reuse_a_result_for_changed_bytes(tmp_path: Path) -> None:
+    workspace, command, _, _ = pending(tmp_path)
+    workspace_sources.accepted(workspace, "owner", command)
+    plan = commit_files.prepare(workspace, "owner", command, b"k" * 32, tmp_path / "spool")
+    args = canonical_json.decode(command.parent_call.request_canonical_bytes)
+    args["digest"] = "sha256:" + "00" * 32
+    replace_arguments(command, args)
+    with pytest.raises(WorkspaceRefusal, match="another native source intent"):
+        workspace_sources.accepted(workspace, "owner", command)
+    with workspace.locked() as db:
+        rows = db.execute("SELECT id,state FROM byte_outputs").fetchall()
+        assert len(rows) == 1 and rows[0]["id"] == plan["view_owner"]
+
+
 def test_file_completion_fenced_after_native_import(tmp_path: Path) -> None:
     workspace, command, _, _ = pending(tmp_path)
     workspace_sources.accepted(workspace, "owner", command)
@@ -328,6 +375,9 @@ def test_interrupted_commit_reattaches_original_file_and_producer(
             "UPDATE native_calls SET state='failed' WHERE service_id=?", (command.service_id,)
         )
     retry = reattach(workspace, command)
+    spool = tmp_path / "spool" / opaque_key("attempt-input-spool", "script", 2)
+    spool.mkdir(parents=True)
+    (spool / "file-0001").write_bytes(data)
     frames: queue.Queue[pb.WorkerFrame] = queue.Queue()
     restarted = Workspace(workspace.store_root)
     calls = SourceCalls(
