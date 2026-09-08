@@ -83,7 +83,8 @@ def attach_assessment(
 ) -> Awaitable[AssessmentRef]:
     """Attach a verified assessment and workload sidecar to a published checkpoint.
 
-    Both files must be received native child results. The owner verifies their
+    Both files must be completed native results, including owned files completed
+    with ``await out.commit(...)``. The owner verifies their
     retained render/capture provenance and current destination authority before
     publication; report bytes never travel inside the managed call payload.
     """
