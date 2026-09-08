@@ -1214,6 +1214,7 @@ class _InterfaceSlot:
 
     path: str
     class_key: str
+    sequence_parallel: tuple[int, ...] = ()
 
     @property
     def param(self) -> str:
@@ -1223,7 +1224,11 @@ class _InterfaceSlot:
 def _interface_slots(interface: Mapping[str, Any], kind: str) -> list[_InterfaceSlot]:
     """A hidden callable is already absent from the document, so nothing is filtered here."""
     return [
-        _InterfaceSlot(str(slot["path"]), str(slot["class"]))
+        _InterfaceSlot(
+            str(slot["path"]),
+            str(slot["class"]),
+            tuple((slot.get("sequence_parallel") or {}).get("degrees", ())),
+        )
         for doc in interface.get(kind) or ()
         for slot in doc.get("models") or ()
     ]
