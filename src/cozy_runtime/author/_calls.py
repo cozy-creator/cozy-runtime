@@ -134,6 +134,25 @@ class _Call[R](Awaitable[R]):
         return self.task.__await__()
 
 
+def _input_ref(value: object, request_id: str) -> str:
+    """Forward only a verified input of this attempt; Creator rechecks its custody."""
+    import re
+
+    from cozy_runtime.author._assets import Asset
+
+    if (
+        isinstance(value, Asset)
+        and value.hydrated
+        and value._attempt == request_id
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", value.digest)
+    ):
+        return value.digest
+    raise CapabilityError(
+        "child media must be a verified input granted to this parent attempt",
+        code="child.asset_ungranted",
+    )
+
+
 class _Broker:
     """Memory-only per-attempt reservations. The RecordOwner owns every durable fact."""
 
@@ -176,7 +195,11 @@ class _Broker:
             raise CapabilityError("direct package call bound exceeded", code="child_fanout")
         try:
             request = msgspec.convert(dict(arguments), type=binding.request, strict=True)
-            payload = canonical_json.encode(msgspec.to_builtins(request))
+            payload = canonical_json.encode(
+                msgspec.to_builtins(
+                    request, enc_hook=lambda value: _input_ref(value, ctx.request_id)
+                )
+            )
         except (TypeError, ValueError, msgspec.ValidationError) as exc:
             raise ConformanceError(
                 "package call arguments do not match its interface", code="child_arguments"
