@@ -713,6 +713,7 @@ def prepare_local_package(
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
+    dependency_python: Path | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Prepare one exact local wheel revision without inventing Hub provenance."""
@@ -748,6 +749,7 @@ def prepare_local_package(
         job_plan_root=job_plan_root,
         base=base,
         development=package,
+        dependency_python=dependency_python,
         materialized=materialized,
     )
 
@@ -853,6 +855,7 @@ def prepare_package(
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
     base: base_observation.Observation | None = None,
+    dependency_python: Path | None = None,
     job_plan_root: Path | None = None,
     development: pb.DevelopmentPackage | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
@@ -963,6 +966,7 @@ def prepare_package(
             install_root,
             python=python,
             base=observed_base,
+            dependency_python=dependency_python,
         )
     except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
         code = getattr(exc, "code", "package_environment_install_failed")
