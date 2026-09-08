@@ -1,0 +1,16 @@
+"""Module-level constants an interface reaches through names, arithmetic and sibling imports."""
+
+from __future__ import annotations
+
+from typing import Annotated
+
+import msgspec
+
+from cozy_runtime.author import AssetBound
+
+_MIB = 1 << 20
+MAX_EDGE = 2048
+LANE_BYTES = 16 << 30
+IMAGE_BOUND = AssetBound(max_bytes=64 * _MIB, max_decoded_bytes=256 * _MIB)
+AUDIO_BOUND = AssetBound(max_bytes=128 * _MIB, media_types=("audio/wav",))
+Prompt = Annotated[str, msgspec.Meta(min_length=1, max_length=4096)]

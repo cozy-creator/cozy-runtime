@@ -28,6 +28,7 @@ from pathlib import Path
 from types import FrameType, ModuleType
 
 from cozy_runtime.author import App, ConformanceError, Surface, describe
+from cozy_runtime.internal.static_interface import read_application
 
 #: Author top-level code runs inside the boundary. It may import heavy dependencies; it may
 #: not EXECUTE them at module scope (§1.0), so a generous ceiling still catches a module
@@ -55,39 +56,46 @@ class Discovered:
     bindings: Mapping[str, Mapping[str, object]]
 
 
-def read_application(project: Path) -> str:
-    """`[application] object` from package.toml, or the zero/ambiguous refusal."""
-    path = project / "package.toml"
-    if not path.is_file():
-        raise DiscoveryError(
-            f"{path} does not exist: a package repository has package.toml naming its "
-            'one app export ([application] object = "my_package:app")',
-            code="no_package_toml",
-        )
-    try:
-        data = tomllib.loads(path.read_text())
-    except tomllib.TOMLDecodeError as exc:
-        raise DiscoveryError(f"{path} is not valid TOML: {exc}", code="package_toml") from exc
-    application = data.get("application", {})
-    obj = application.get("object") if isinstance(application, dict) else None
-    if not isinstance(obj, str) or not obj:
-        raise DiscoveryError(
-            f"{path} names no [application] object — discovery imports exactly ONE configured "
-            "export and nothing else, so zero named apps is ambiguous by construction",
-            code="zero_application",
-        )
-    if obj.count(":") != 1 or not all(part.strip() for part in obj.split(":")):
-        raise DiscoveryError(
-            f'[application] object = "{obj}" is not <module>:<attribute>', code="application_path"
-        )
-    return obj
-
-
 def discover(project: Path, *, seconds: float = IMPORT_SECONDS) -> Discovered:
     """Import the one configured export inside this environment and freeze it."""
     project = project.resolve()
     application = read_application(project)
     return _discover(application, project, _bindings(project), seconds=seconds, add=project)
+
+
+def assert_locked_environment(project: Path) -> str:
+    """Refuse unless THIS interpreter is the package's own locked environment (#713).
+
+    Importing package code is running it, and package code runs only where it is already
+    allowed to run: the venv its lock describes. The proof is the package's own
+    distribution, at pyproject's version, resolving from the running interpreter — a
+    publisher's host or a hub never has that.
+    """
+    path = project / "pyproject.toml"
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise DiscoveryError(f"{path}: {exc}", code="pyproject") from exc
+    meta = data.get("project", {})
+    name, version = meta.get("name"), meta.get("version")
+    if not isinstance(name, str) or not isinstance(version, str):
+        raise DiscoveryError(f"{path} names no [project] name and version", code="pyproject")
+    try:
+        installed = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise DiscoveryError(
+            f"{name} is not installed in {sys.executable}: the conformance oracle imports "
+            "package code, which runs only inside the package's own locked environment — "
+            "run it from that venv (`uv run --locked cozy-runtime describe --conformance`)",
+            code="conformance_environment",
+        ) from exc
+    if installed != version:
+        raise DiscoveryError(
+            f"{sys.executable} has {name} {installed}, but {path} declares {version}: not "
+            "this tree's locked environment",
+            code="conformance_environment",
+        )
+    return f"{name} {version} in {sys.executable}"
 
 
 def discover_installed(application: str, *, seconds: float = IMPORT_SECONDS) -> Discovered:

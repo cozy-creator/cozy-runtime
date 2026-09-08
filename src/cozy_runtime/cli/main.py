@@ -43,7 +43,7 @@ verbs:
   run <fn> [<primary>] [k=v …]   one-shot inference: payload in, outputs to disk, exit
   job <fn> [k=v …]               run one @app.job to completion, same attempt kernel
   serve --socket <path> <mode>   speak the worker protocol for a RecordOwner
-  describe [<fn>]                the PackageInterface, without loading weights
+  describe [<fn>]                the PackageInterface, from source alone (no package code runs)
   bindings                       the RESOLVED binding records this project selects
   doctor                         this host's device/driver/credential facts
   capability [--out <path>]      the OBSERVED (encoding, device) qualification of this card
@@ -83,6 +83,8 @@ global flags:
   --dir <path>     package project root (default: cwd)
   --package-interface <path>
                    exact PackageInterface input for describe/bindings (no package import)
+  --conformance    describe only: also IMPORT the app in this interpreter — which must be
+                   the package's own locked venv — and refuse unless it matches the source
   -h, --help       this text
 """
 
@@ -103,7 +105,7 @@ _OWNS_ARGS = (
 
 def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
     """Split argv into (verb, args, options, help). Unknown flags refuse with exit 2."""
-    as_json = full = want_help = False
+    as_json = full = want_help = conformance = False
     fields: tuple[str, ...] = ()
     directory = "."
     package_interface = ""
@@ -124,6 +126,8 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
             as_json = True
         elif item == "--full":
             full = True
+        elif item == "--conformance":
+            conformance = True
         elif item.startswith("--") and item.split("=")[0] in _VALUE_FLAGS:
             flag, _, inline = item.partition("=")
             if not inline:
@@ -152,7 +156,12 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
             Exit.usage,
             next=("cozy-runtime --help",),
         )
-    return verb, args, Options(as_json, full, fields, directory, package_interface), want_help
+    return (
+        verb,
+        args,
+        Options(as_json, full, fields, directory, package_interface, conformance),
+        want_help,
+    )
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
@@ -164,13 +173,20 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             "cozy-runtime describe or bindings",
             Exit.usage,
         )
+    if opts.conformance and verb != "describe":
+        raise CliError(
+            "usage",
+            "--conformance belongs only to describe",
+            "cozy-runtime --conformance describe, from the package's locked venv",
+            Exit.usage,
+        )
     if verb == "describe":
         if len(args) > 1:
             raise CliError(
                 "usage",
                 f"describe takes at most one function name, got {len(args)}",
-                "cozy-runtime [--json] [--dir <path>] "
-                "[--package-interface <path>] describe [<function>]",
+                "cozy-runtime [--json] [--dir <path>] [--package-interface <path>] "
+                "[--conformance] describe [<function>]",
                 Exit.usage,
             )
         return describe_verb.run(args[0] if args else None, opts)

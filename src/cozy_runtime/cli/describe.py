@@ -1,11 +1,16 @@
-"""`cozy-runtime describe` — emit the PackageInterface without loading weights.
+"""`cozy-runtime describe` — the PackageInterface from SOURCE, executing no package code.
 
 Always read-only. Full `--json` output is the canonical publication input; there is no
 committed interface projection and therefore no writer or staleness-check mode.
 
-Weights are structurally unreachable here, not merely unrequested: discovery imports the app
-and freezes it, and a model parameter is a TYPE. Nothing on this path constructs a `Loader`,
-so no census, no fill and no backend call can happen.
+The default reader is `internal/static_interface.py`: `ast` over the package tree, a closed
+vocabulary, typed refusals (decision #713 — package code is untrusted). Weights are
+structurally unreachable: nothing here imports the package, let alone constructs a `Loader`.
+
+`--conformance` is the locked-environment ORACLE: it additionally imports the app in THIS
+interpreter — which must be the package's own locked venv — and refuses unless the two
+derivations are byte-identical. That is what a package's own CI runs; publish runs the
+static reader alone.
 """
 
 from __future__ import annotations
@@ -15,14 +20,14 @@ from pathlib import Path
 
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import package_interface
+from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.canonical import Json
-from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.exits import Exit
 
 
 def run(function: str | None, opts: Options) -> Result:
     project = Path(opts.dir).expanduser()
+    rows: tuple[tuple[str, str], ...] = ()
     try:
         if opts.package_interface:
             interface = Path(opts.package_interface).expanduser()
@@ -35,8 +40,9 @@ def run(function: str | None, opts: Options) -> Result:
                 ) from exc
             body = package_interface.read_bytes(raw, str(interface))
         else:
-            found = discover(project)
-            body = package_interface.build(found)
+            body = static_interface.build(project)
+            if opts.conformance:
+                rows = (("conformance", _conformance(project, body)),)
     except ConformanceError as exc:
         raise CliError(
             "validation",
@@ -46,7 +52,20 @@ def run(function: str | None, opts: Options) -> Result:
         ) from exc
     if function is not None:
         return _one(body, function)
-    return _list(body)
+    listed = _list(body)
+    return Result(
+        rows + listed.rows, next=listed.next, document=body, canonical_json=listed.canonical_json
+    )
+
+
+def _conformance(project: Path, static: Mapping[str, Json]) -> str:
+    """Import the app here and refuse unless it agrees with the source reading."""
+    from cozy_runtime.internal.discovery import assert_locked_environment, discover
+
+    environment = assert_locked_environment(project)
+    imported = package_interface.build(discover(project))
+    package_interface.compare(static, imported, ("the source reading", "the imported app"))
+    return f"equal: imported {static['application']} ({environment})"
 
 
 def _list(body: Mapping[str, Json]) -> Result:
