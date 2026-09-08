@@ -320,6 +320,30 @@ def _source(db: Journal, owner: str, call: pb.RecordOperationResultCall) -> dict
     if blob := body.get("result", {}).get("result_blob"):
         outputs.append(blob)
     for output in outputs:
+        if native := output.get("native_tree"):
+            from .workspace_byte_outputs import reference as byte_reference
+
+            original = db.execute(
+                "SELECT * FROM byte_outputs WHERE owner=? AND request=? AND ordinal=? "
+                "AND slot=? AND state='complete'",
+                (owner, call.request_id, call.attempt_ordinal, output["output_id"]),
+            ).fetchone()
+            if original is None or documents.body(byte_reference(dict(original))) != native:
+                raise _Uncacheable("memo byte output has no exact original native receipt")
+            holds.append(
+                {
+                    "kind": "tree",
+                    "transaction_id": native["producer_root_id"],
+                    "native_receipt_digest": native["receipt_digest"],
+                    "manifest_digest": native["manifest"]["digest"],
+                    "manifest_length": native["manifest"]["length"],
+                    "content_bytes": native.get("content_bytes", 0),
+                    "output_id": output["output_id"],
+                }
+            )
+            if len(holds) > 32:
+                raise _Uncacheable("memo result exceeds its native output count bound")
+            continue
         if not any(
             output["digest"] == hold["manifest_digest"]
             and output["length"] == hold["manifest_length"]
@@ -763,7 +787,24 @@ def _found(
             ),
         )
     )
-    answer.retentions.extend(retained)
+    holds = {hold["retention_id"]: hold for hold in payload["holds"]}
+    for result in retained:
+        hold = holds[result.retention_id]
+        if hold.get("kind") == "tree":
+            answer.byte_retentions.append(
+                pb.NativeByteRetentionResult(
+                    source=pb.NativeByteTreeRef(
+                        producer_root_id=result.weights_transaction_id,
+                        receipt_digest=result.tensorfs_receipt_digest,
+                        manifest=result.manifest,
+                        content_bytes=hold["content_bytes"],
+                    ),
+                    retention_id=result.retention_id,
+                    released=result.released,
+                )
+            )
+        else:
+            answer.retentions.append(result)
     answer.found = True
     return answer
 

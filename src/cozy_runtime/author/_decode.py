@@ -714,6 +714,7 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
                 "a decoded media stream may be entered once", code="media_stream_used"
             )
         self._attempt.check_open("MediaDecoder.stream")
+        self._asset._check_file()
         self._acquire()
         try:
             self._source = self._open_source()
@@ -756,10 +757,17 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
             raise StopIteration
         self._attempt.check_open("MediaDecoder.stream")
         try:
-            return next(self._events)
+            self._asset._check_file()
+            event = next(self._events)
+            self._asset._check_file()
+            return event
+        except RuntimeFailure:
+            self._close()
+            raise
         except StopIteration:
             self._exhausted = True
             self._close()
+            self._asset._check_file()
             raise
         except MediaDecodeError as exc:
             self._close()
@@ -782,6 +790,7 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         incomplete = exc_type is None and not self._exhausted
         self._close()
+        self._asset._check_file()
         if incomplete:
             error = MediaDecodeError(
                 "decoded media stream exited before every event was consumed",
@@ -953,6 +962,8 @@ class MediaDecoder:
                 code="media_malformed",
                 fields=[asset._input_id] if asset._input_id else (),
             ) from exc
+        finally:
+            asset._check_file()
 
     def decode_audio(self, asset: AudioAsset) -> DecodedAudio:
         av, budget, path = self._start(asset, AudioAsset, "decode_audio")
@@ -979,6 +990,8 @@ class MediaDecoder:
                 code="media_malformed",
                 fields=[asset._input_id] if asset._input_id else (),
             ) from exc
+        finally:
+            asset._check_file()
 
     def decode_video(self, asset: VideoAsset) -> DecodedVideo:
         av, budget, path = self._start(asset, VideoAsset, "decode_video")
@@ -1021,6 +1034,8 @@ class MediaDecoder:
                 code="media_malformed",
                 fields=[asset._input_id] if asset._input_id else (),
             ) from exc
+        finally:
+            asset._check_file()
 
     def stream_audio(self, asset: AudioAsset) -> DecodedMediaStream:
         av, budget, path = self._start(asset, AudioAsset, "stream_audio", retained=False)
@@ -1113,6 +1128,7 @@ class MediaDecoder:
             scope="retained decoded" if retained else "streamed decoded",
             cumulative=retained,
         )
+        asset._check_file()
         assert asset._local is not None
         return av, budget, asset._local
 

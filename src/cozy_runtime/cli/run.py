@@ -16,12 +16,15 @@ import contextlib
 import json
 import shutil
 import sys
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.author import ConformanceError
+import msgspec
+
+from cozy_runtime.author import ActivationCapture, ConformanceError, InvalidRequest
 from cozy_runtime.cli import payload as payload_grammar
 from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.internal import bindings as binding_table
@@ -50,8 +53,15 @@ VALUE_FLAGS = (
     "--input",
     "--org",
     "--tensorfs-root",
+    "--capture",
 )
 BOOL_FLAGS = ("--offline", "--stream", "--strict-keys")
+
+#: THE EXECUTION-PATH OVERRIDE's reserved run keys (cr-125). `kernel.` is a dotted namespace
+#: claimed BEFORE the payload grammar sees a term, exactly as `--model` claims the weights
+#: off the owner's ladder, so `kernel.attention` can never land on a package's own field. One
+#: axis: attention. A GEMM or fusion pin is not here because no measurement has asked for one.
+KERNEL_AXES = ("attention",)
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -85,7 +95,12 @@ class Refusal(CliError):
 
 
 def split_flags(args: Sequence[str]) -> tuple[list[str], dict[str, list[str]]]:
-    """Separate payload terms from the verb's flags. `--model` is REPEATABLE."""
+    """Separate payload terms from the verb's flags. `--model` is REPEATABLE.
+
+    A `kernel.<axis>=<value>` term is CLAIMED here and returned under its own key, so the
+    reserved namespace is resolved before any payload field is; an axis this runtime does
+    not have refuses rather than becoming a field named `kernel.gemm`.
+    """
     terms: list[str] = []
     flags: dict[str, list[str]] = {}
     rest = list(args)
@@ -102,6 +117,17 @@ def split_flags(args: Sequence[str]) -> tuple[list[str], dict[str, list[str]]]:
             flags.setdefault(name, []).append(inline)
         elif item in BOOL_FLAGS:
             flags.setdefault(item, []).append("")
+        elif name.startswith("kernel."):
+            axis = name.removeprefix("kernel.")
+            if axis not in KERNEL_AXES or not eq or not inline:
+                raise CliError(
+                    "usage",
+                    f"{item!r} is not an execution-path override",
+                    "the reserved namespace is "
+                    + ", ".join(f"kernel.{a}=<name>" for a in KERNEL_AXES),
+                    Exit.usage,
+                )
+            flags.setdefault(name, []).append(inline)
         elif item.startswith("--"):
             raise CliError(
                 "usage",
@@ -197,6 +223,22 @@ def run(
             "model:<parameter> bindings and never guesses a local model or loads one",
             Exit.structural,
         )
+    capture = None
+    if flags.get("--capture"):
+        from cozy_runtime.probe._capture import validate_components
+
+        try:
+            capture = msgspec.json.decode(flags["--capture"][-1], type=ActivationCapture)
+            validate_components(capture, [slot.model_class for slot in slots])
+            if kind != "entrypoint":
+                raise InvalidRequest("capture is an entrypoint option", code="capture_mode")
+        except (ValueError, msgspec.DecodeError, InvalidRequest) as exc:
+            raise CliError(
+                "capture",
+                str(exc),
+                "pass --capture as an ActivationCapture JSON object",
+                Exit.validation,
+            ) from exc
     overrides = _overrides(flags.get("--model") or [], slots)
     tensorfs_root: Path | None = None
     if slots:
@@ -230,7 +272,9 @@ def run(
     out_dir = Path((flags.get("--out") or ["outputs"])[0]).expanduser().resolve()
     workspace = out_dir / ".run"
     if workspace.exists():
-        shutil.rmtree(workspace, ignore_errors=True)
+        from cozy_runtime.internal.worker.byte_inputs import remove_checkout
+
+        remove_checkout(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     package_code_digest = development_source_digest(project)
     if kind == "job":
@@ -257,8 +301,9 @@ def run(
     request = LocalRequest(
         entrypoint=function,
         payload=document,
+        capture=capture,
         outputs=outputs,
-        request_id=f"cli-{function}",
+        request_id=f"cli-{function}-{uuid.uuid4().hex}",
         timeout_ms=_timeout((flags.get("--timeout") or [""])[0]),
         kind=kind if kind == "job" else "entrypoint",
         job_descriptor_id=descriptor_id,
@@ -291,6 +336,10 @@ def run(
             options=WorkerOptions(
                 root=workspace / "worker",
                 release_id=package_code_digest,
+                # THE EXECUTION-PATH OVERRIDE (cr-125), and the only entrance it has: this
+                # ephemeral worker. `serve` takes no such flag, so a serving deployment
+                # cannot be pinned and keeps choosing the fastest kernel by itself.
+                attention_pin=(flags.get("kernel.attention") or [""])[-1],
             ),
         )
     return _render(outcome, out_dir, warnings, opts, verb=verb, stream="--stream" in flags)
@@ -556,6 +605,7 @@ def _render(
     document: dict[str, Any] = {
         "status": status,
         "result": outcome.result,
+        "observation": terminal.get("observation"),
         "outputs": saved,
         "invocation": outcome.invocation,
         "accepted": accepted,
@@ -671,10 +721,24 @@ def _save(outcome: SliceOutcome, out_dir: Path) -> dict[str, str]:
     saved: dict[str, str] = {}
     for name, path in sorted(outcome.outputs.items()):
         source = Path(path)
-        if not source.is_file():
+        label = name.replace(".", "_")
+        if not label or Path(label).name != label:
+            raise CliError(
+                "output_path",
+                "output ID is not a local filename",
+                "use named result fields",
+                Exit.failed,
+            )
+        target = out_dir / f"{label}{_extension(outcome, name)}"
+        if source.is_dir():
+            from cozy_runtime.internal.worker.byte_inputs import remove_checkout
+
+            remove_checkout(target)
+            shutil.copytree(source, target)
+        elif source.is_file():
+            shutil.copyfile(source, target)
+        else:
             continue
-        target = out_dir / f"{name.replace('.', '_')}{_extension(outcome, name)}"
-        shutil.copyfile(source, target)
         saved[name] = str(target)
     return saved
 

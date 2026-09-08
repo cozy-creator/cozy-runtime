@@ -326,16 +326,22 @@ inventory, diagnostics, config UI metadata, or tensor requirements, and
 machine path or mutable binding reached it. A slot is `{path, class, component_use,
 encoded_leaves}`. Deleted members are simply unknown fields; there is no legacy decoder or
 empty-value compatibility shim.
-Packages declare no GPU count, VRAM floor, accelerator class, placement, or free-form hardware
-predicate. Those facts come from the selected model lane and its concrete tensor schema/encoding,
-RecordOwner placement, qualification measurements, and the worker's observed machine. The
+Packages declare no GPU count or VRAM floor. Authored default ladders associate GPU selectors
+with preferred model lanes. Actual resource demand comes from the selected lane's tensor
+schema/encoding, qualification measurements and the worker's observed machine; the RecordOwner
+owns placement. The
 interface reader rejects the retired `resources` key as an unknown field; format `/1` has one
 current grammar and no compatibility decoder.
 An ordinary `@app.job` may opt into source-first model production without introducing another
-workflow language. A slot's entire declaration is its class annotation (cr-077); selection defaults live
-in `package.toml [bindings."<callable>.models.<param>"]` (the slot path is the one binding
-grammar; the class-keyed spelling refuses `binding_class_key_retired`), and the actual
-binding is dispatch. The retired `source_profiles=` decorator field refuses with the typed
+workflow language. A slot's capability is its class annotation (cr-077). Authors may attach
+an ordered model default ladder through `@invocable(defaults={"model": [...]})` or
+`@app.entrypoint(defaults={"model": [...]})`; both publish the same per-slot `default_ladder`
+metadata. Each rung names a GPU selector and full `org/model@release/lane` reference, and
+one slot's rungs share its model and release. The invocation override wins over the owner's
+mutable Hub binding, which wins over the published default. Selection resolves before
+dispatch; the executor receives exact artifacts. See [authored defaults](docs/authored-model-defaults.md).
+The existing `package.toml [bindings."<callable>.models.<param>"]` remains the explicit local
+development binding; it is not copied into a package's published default. The retired `source_profiles=` decorator field refuses with the typed
 code `source_profiles_retired`. Each `WeightsOutput` declares only its name and new-byte ceiling;
 the produced CozyTensors header is the sole tensor-schema and encoding authority. The
 executor still receives only verified model capabilities, never the foreign source credential or

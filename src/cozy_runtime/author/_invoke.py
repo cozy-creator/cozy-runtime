@@ -262,7 +262,8 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt.closed = True
     return InvocationResult(
         result=result,
-        outputs=tuple(a.row() for a in attempt.pending.values()),
+        outputs=tuple(a.row() for a in attempt.pending.values())
+        + tuple(tree.row() for tree in attempt.pending_trees.values()),
         adjustments=tuple(attempt.rows),
         features=prepared.features,
         overlay_digest=overlay.digest,
@@ -698,6 +699,7 @@ def _hydrate(
         bind(
             item.asset,
             local=granted.local,
+            source_state=granted.file_state,
             attempt=inv.request_id,
             media_type=granted.media_type,
             digest=granted.digest,
@@ -914,8 +916,10 @@ def _validate_result(surface: Surface, result: object, attempt: Attempt) -> None
             )
 
     returned: list[str] = []
-    for asset in assets_in(result) if declares_assets(surface.result_type) else ():
-        if asset._attempt != attempt.request_id or asset.ref not in attempt.pending:
+    output_handles: list[Asset | Tree] = [*assets_in(result), *trees_in(result)]
+    pending_handles = set(attempt.pending) | set(attempt.pending_trees)
+    for asset in output_handles:
+        if asset._attempt != attempt.request_id or asset.ref not in pending_handles:
             raise OutputError(
                 f"output handle {asset.ref!r} does not belong to attempt "
                 f"{attempt.request_id!r}: a foreign or escaped handle is a typed failure, "
@@ -928,7 +932,7 @@ def _validate_result(surface: Surface, result: object, attempt: Attempt) -> None
             )
         returned.append(asset.ref)
 
-    unreturned = sorted(set(attempt.pending) - set(returned))
+    unreturned = sorted(pending_handles - set(returned))
     if unreturned:
         raise OutputError(
             f"saved but never returned: {', '.join(unreturned)} — an unreturned pending "

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import time
 from pathlib import Path
 
@@ -10,6 +11,8 @@ import pytest
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import Attempt, ProgressFrame, Telemetry
+from cozy_runtime.internal.executor import Executor
+from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.worker.session import _progress_document
 
 
@@ -117,4 +120,74 @@ def test_invalid_or_regressing_progress_is_omitted_and_diagnosed(tmp_path: Path)
         "stage_fraction must be a finite number in 0..1",
         "overall_fraction must be a finite number in 0..1",
         "stage must be 1..120 printable characters",
+    }
+
+
+def test_author_observation_details_cross_the_real_executor_seam(tmp_path: Path) -> None:
+    left, right = socket.socketpair()
+    with left, right:
+        executor = Executor(Channel(left), tmp_path)
+        peer = Channel(right)
+        attempt = Attempt("public-events", tmp_path, sink=executor._progress_sink("public-events"))
+        telemetry = Telemetry(attempt, Context("public-events", time.monotonic() + 30))
+
+        telemetry.log(
+            "reference geometry",
+            label="woman",
+            normalized="1024x1360",
+            source="Bearer " + "x" * 32,
+            detail="x" * 500,
+        )
+        frame = peer.recv(timeout=1)
+        assert frame is not None
+        document = _progress_document(frame)
+        assert document["type"] == "log"
+        payload = document["payload"]
+        assert isinstance(payload, dict)
+        assert payload["name"] == "reference geometry"
+        assert payload["value"] == "info"
+        assert payload["fields"] == {
+            "label": "woman",
+            "normalized": "1024x1360",
+            "source": "<redacted>",
+            "detail": "x" * 399 + "…",
+        }
+        assert payload["at_unix_ms"] > 0
+        assert "event" not in payload and "request_id" not in payload and "kind" not in payload
+        assert "Bearer" not in str(document)
+        assert attempt.ring.redactions == 1 and attempt.ring.truncated == 1
+
+        telemetry.metric("resident_bytes", 1234, unit="bytes")
+        frame = peer.recv(timeout=1)
+        assert frame is not None
+        metric = _progress_document(frame)
+        assert metric["payload"]["name"] == "resident_bytes"
+        assert metric["payload"]["value"] == 1234
+        assert metric["payload"]["fields"] == {"unit": "bytes"}
+
+        with telemetry.stage("conditioning"):
+            pass
+        entered = peer.recv(timeout=1)
+        elapsed = peer.recv(timeout=1)
+        assert entered is not None and elapsed is not None
+        assert _progress_document(entered)["type"] == "progress"
+        stage = _progress_document(elapsed)
+        assert stage["type"] == "stage"
+        assert stage["payload"]["name"] == "conditioning"
+        assert stage["payload"]["value"] >= 0
+
+
+def test_load_progress_preserves_component_and_measured_position() -> None:
+    assert _progress_document(
+        {
+            "event": "progress",
+            "request_id": "prepare:text_encoder",
+            "kind": "load",
+            "name": "text_encoder",
+            "value": None,
+            "position": 4096,
+        }
+    ) == {
+        "type": "load",
+        "payload": {"name": "text_encoder", "value": None, "position": 4096},
     }

@@ -208,6 +208,21 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
                 _registered_method=True)
+        self.WorkspaceRetainByteTree = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/WorkspaceRetainByteTree',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
+                _registered_method=True)
+        self.WorkspaceReleaseByteTree = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseByteTree',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
+                _registered_method=True)
+        self.WorkspaceReadByteTreeObject = channel.unary_stream(
+                '/cozy.worker.v1.RuntimePreparation/WorkspaceReadByteTreeObject',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.FromString,
+                _registered_method=True)
         self.WorkspaceWeightsIntentReady = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
@@ -345,6 +360,25 @@ class RuntimePreparationServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def WorkspaceReleaseDerivedResult(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def WorkspaceRetainByteTree(self, request, context):
+        """MINOR43. Ordinary byte-tree custody uses the same authenticated Workspace.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def WorkspaceReleaseByteTree(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def WorkspaceReadByteTreeObject(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -490,6 +524,21 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.WorkspaceReleaseDerivedResult,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.SerializeToString,
+            ),
+            'WorkspaceRetainByteTree': grpc.unary_unary_rpc_method_handler(
+                    servicer.WorkspaceRetainByteTree,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.SerializeToString,
+            ),
+            'WorkspaceReleaseByteTree': grpc.unary_unary_rpc_method_handler(
+                    servicer.WorkspaceReleaseByteTree,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.SerializeToString,
+            ),
+            'WorkspaceReadByteTreeObject': grpc.unary_stream_rpc_method_handler(
+                    servicer.WorkspaceReadByteTreeObject,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.SerializeToString,
             ),
             'WorkspaceWeightsIntentReady': grpc.unary_unary_rpc_method_handler(
                     servicer.WorkspaceWeightsIntentReady,
@@ -795,6 +844,87 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseDerivedResult',
             cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WorkspaceRetainByteTree(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/WorkspaceRetainByteTree',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WorkspaceReleaseByteTree(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseByteTree',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WorkspaceReadByteTreeObject(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/WorkspaceReadByteTreeObject',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1463,6 +1593,21 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
                 _registered_method=True)
+        self.RetainByteTree = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/RetainByteTree',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
+                _registered_method=True)
+        self.ReleaseByteTree = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/ReleaseByteTree',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
+                _registered_method=True)
+        self.ReadByteTreeObject = channel.unary_stream(
+                '/cozy.worker.v1.PodHost/ReadByteTreeObject',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.FromString,
+                _registered_method=True)
         self.RecordOperationResult = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/RecordOperationResult',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.SerializeToString,
@@ -1622,6 +1767,24 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RetainByteTree(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseByteTree(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReadByteTreeObject(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def RecordOperationResult(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -1750,6 +1913,21 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.ReleaseDerivedResult,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.SerializeToString,
+            ),
+            'RetainByteTree': grpc.unary_unary_rpc_method_handler(
+                    servicer.RetainByteTree,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.SerializeToString,
+            ),
+            'ReleaseByteTree': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseByteTree,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.SerializeToString,
+            ),
+            'ReadByteTreeObject': grpc.unary_stream_rpc_method_handler(
+                    servicer.ReadByteTreeObject,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.SerializeToString,
             ),
             'RecordOperationResult': grpc.unary_unary_rpc_method_handler(
                     servicer.RecordOperationResult,
@@ -2156,6 +2334,87 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/ReleaseDerivedResult',
             cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.DerivedResultReleaseResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RetainByteTree(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/RetainByteTree',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseByteTree(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ReleaseByteTree',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReadByteTreeObject(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/ReadByteTreeObject',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.FromString,
             options,
             channel_credentials,
             insecure,

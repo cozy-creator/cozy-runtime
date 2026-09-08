@@ -15,7 +15,6 @@ from cozy_runtime.cli import image_prepare as image_prepare_verb
 from cozy_runtime.cli import interface_wheel as interface_wheel_verb
 from cozy_runtime.cli import new as new_verb
 from cozy_runtime.cli import package_prepare as package_prepare_verbs
-from cozy_runtime.cli import probe as probe_verb
 from cozy_runtime.cli import run as run_verb
 from cozy_runtime.cli import version as version_verb
 from cozy_runtime.cli.io import CliError, Options, Result, emit, emit_error
@@ -31,7 +30,6 @@ BUILT = (
     "doctor",
     "capability",
     "hostfacts",
-    "probe",
     "new",
     "version",
 )
@@ -55,7 +53,6 @@ verbs:
   doctor                         this host's device/driver/credential facts
   capability [--out <path>]      the OBSERVED (encoding, device) qualification of this card
   hostfacts [<fn>] [k=v …]       this host's capacity facts (exact with a payload)
-  probe <fn> [k=v …]             teacher-forced activation diff of two lanes (report/1)
   new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and the two independent semvers
 
@@ -66,19 +63,15 @@ run/job flags:
   --org <name>          publishing org; a job's writes land in <org>/_job-<request-id>
   --out <dir>           output directory (default ./outputs)
   --seed <n>            deterministic RNG
+  --capture <json>      activation capture: {"components":["unet"],"steps":[0,1]}
   --in <file>           whole payload as JSON, key=value merged on top
   key=@/absolute/file   stage a local file only at a declared Asset field
+  kernel.attention=<k>  DEV: pin one attention kernel for this run instead of the fastest
+                        one this device and image support; refuses if it cannot serve
   --offline             CAS-only; a miss is exit 8, never a fetch
   --timeout <dur>       attempt deadline (<n>ms|s|m|h)
   --strict-keys         a local bind's unknown extra keys refuse instead of confessing
   --stream              typed deltas as NDJSON
-
-probe flags (both lanes bind the entrypoint's one constructing model slot):
-  --component <name>        the pipeline component to tap (e.g. unet)
-  --reference [label=]<dir> the reference lane's local weights tree
-  --candidate [label=]<dir> the candidate lane's local weights tree
-  --zoom <tap>              rerun one block subdivided when the map needs detail
-  --out <file>              also write the canonical report/1 document here
 
 serve storage:
   --tensorfs-root <dir>    serve selected model Manifests from one explicit local Store
@@ -104,7 +97,6 @@ _OWNS_ARGS = (
     "run",
     "job",
     "hostfacts",
-    "probe",
     "capability",
     "serve",
     "development-placement",
@@ -246,8 +238,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         return image_prepare_verb.profile(args)
     if verb == "hostfacts":
         return hostfacts_verb.run(args, opts, config)
-    if verb == "probe":
-        return probe_verb.run(args, opts)
     if verb == "capability":
         return host_verbs.capability(config, args, opts)
     if verb == "doctor":

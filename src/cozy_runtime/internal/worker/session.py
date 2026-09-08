@@ -165,9 +165,14 @@ def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
 
     Stage-local and overall fractions stay separate. Optional coordinates are omitted when
     the package does not know them; no layer fabricates whole-invocation completion.
+    Other events retain the executor's public record, already bounded and redacted at
+    emission. Only seam routing fields are removed; a log's scalar value is its level,
+    not its message, and a load's value may be None beside a measured position.
     """
     kind = frame.get("kind", "progress")
-    payload: Any = frame.get("value")
+    payload: Any = {
+        key: value for key, value in frame.items() if key not in {"event", "request_id", "kind"}
+    }
     if kind == "progress":
         payload = {
             "stage": str(frame.get("stage", ""))[:120],
@@ -298,6 +303,19 @@ class WorkerOptions:
     """Exact launch facts the development Placement must echo."""
     development_binding_overrides: Mapping[str, str] = field(default_factory=dict)
     """One-shot local resolver inputs; long-lived Creator launches use package.toml."""
+    attention_pin: str = ""
+    """THE EXECUTION-PATH OVERRIDE (cr-125): one attention kernel by name, or empty.
+
+    Empty is the whole product. A serving worker picks the fastest kernel this device and
+    image support by itself (cr-124) and has no knob at all — `_SERVE_FLAGS` is a closed
+    set and this is deliberately not in it, so the guard is the absence of a way to say it
+    rather than a condition somebody could get wrong. Only the ephemeral worker
+    `cozy-runtime run` builds in memory can carry one, which is exactly the dev mode the
+    A/B needs: two runs, two pins, one honest comparison.
+
+    It reaches `attention.select` at PREPARE, which is the only moment it can act — a pin
+    applied after `warm` compiled the module or after a group installed its collectives is
+    a field nobody reads. So this is a construction fact and never a per-request one."""
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
@@ -896,6 +914,7 @@ def executor_prepare_command(
     authorized_device_limit_bytes: int = 0,
     sequence_parallel_degree: int = 1,
     parameter_names: Sequence[Sequence[str]] = (),
+    attention_pin: str = "",
 ) -> dict[str, Any]:
     """Translate one resolved callable binding into the executor's closed prepare shape.
 
@@ -907,7 +926,8 @@ def executor_prepare_command(
     a group lane's K, the ONE new fact its executor receives; a plain prepare is unchanged.
     `parameter_names[i]` is every parameter name the i-th model is bound under across the
     bindings that share this construction (h3a-018); absent, the model binds under this
-    binding's own name.
+    binding's own name. `attention_pin` rides the same way, and only when a dev-mode
+    override named a kernel (cr-125): a serving prepare carries no such key at all.
     """
 
     models = []
@@ -949,6 +969,8 @@ def executor_prepare_command(
     }
     if sequence_parallel_degree > 1:
         command["sequence_parallel_degree"] = int(sequence_parallel_degree)
+    if attention_pin:
+        command["attention_pin"] = attention_pin
     if not models:
         command.update(
             {
@@ -1180,7 +1202,11 @@ class Worker:
         from cozy_runtime.internal.worker.calls import Calls
 
         self.calls = Calls(
-            self.send, lambda: self.fence.control_stream_epoch, lambda: self.fence.wire_minor
+            self.send,
+            lambda: self.fence.control_stream_epoch,
+            lambda: self.fence.wire_minor,
+            workspace=self.workspace,
+            owner=lambda: self.fence.record_owner_id,
         )
         self.engine.calls = self.calls
         from cozy_runtime.internal.worker.source_calls import SourceCalls
@@ -4672,6 +4698,7 @@ class Worker:
                     authorized_device_limit_bytes=authorized,
                     sequence_parallel_degree=lane.degree if lane.group else 1,
                     parameter_names=_parameter_names_by_model(group),
+                    attention_pin=self.options.attention_pin,
                 ),
                 timeout=None,
                 on_progress=lambda frame: self.monitor.advance(
@@ -4766,7 +4793,7 @@ class Worker:
             delivery_rung=str(delivery.get("rung", "")),
             delivery_variant=str(delivery.get("variant", "")),
             weight_bytes=int(reply["facts"]["filled_bytes"]),
-            execution_contract=dict(reply["facts"].get("execution_contract") or {}),
+            attention=dict(reply["facts"].get("attention") or {}),
         )
         executor.construction_key = construction_key
         executor.parameters = parameters
@@ -4859,20 +4886,14 @@ class Worker:
                 )
             ),
         )
-        _contract = reply["facts"].get("execution_contract")
-        if _contract:
-            # THE CONTRACT AS APPLIED (cr-109): which kernel, through which diffusers backend,
-            # on how many sites — the boot line a person reads before the first attempt attests.
-            _attention = _contract["contract"]["attention"]
-            self.note(
-                "boot",
-                f"{placement_id!r} execution contract {str(_contract.get('digest', ''))[:23]}…: "
-                f"{_attention['scheme']} — {_attention['distribution']}=="
-                f"{_contract.get('installed_version')}.{_attention['entry']} via diffusers "
-                f"{_contract.get('backend')} on {_contract.get('sites')} site(s) "
-                f"{dict(_contract.get('hosts') or {})}; weights.route="
-                f"{_contract['contract']['weights']['route']}",
-            )
+        _attention = reply["facts"].get("attention")
+        if _attention:
+            # WHAT THE RUNTIME PINNED (cr-124), ONE LINE, ONCE PER POD. This is the whole
+            # per-run attention record and it can be, because selection is a static rule over
+            # (device, image): there is no per-attempt CHOICE to audit, and the per-attempt
+            # observation this replaces is what faulted an executor on its own telemetry
+            # (cr-122). The uncapped map rides `plan.attention` in triage.
+            self.note("boot", f"{placement_id!r} attention: {_attention.get('line', '?')}")
         _fused = reply["facts"].get("execution_fusion")
         if _fused is not None:
             self.note(
@@ -5397,28 +5418,30 @@ class Worker:
             return
         if (
             self.workspace is not None
-            and "job" in attempt.spec
+            and ("job" in attempt.spec or self.fence.wire_minor >= 43)
             and attempt.state not in ("outcome", "closed")
         ):
-            descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
-            # Execution attaches attempt.job later. The prepared engine binding
-            # is available on both local and placement-hosted paths at offer time.
-            binding = self.engine.jobs.get(descriptor)
-            if binding is None:
-                self.refuse(
-                    offered,
-                    "job_binding_unavailable",
-                    "the selected job is not prepared",
-                    CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-                )
-                return
-            try:
-                declaration = self.engine._job_declaration(binding, descriptor)
-            except AttemptRefusal as exc:
-                self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
-                return
-            result_schema = canonical.write(declaration["result"])
-            memoize = declaration.get("invocable", {}).get("memoize", False) is True
+            result_schema, memoize = b"", False
+            if "job" in attempt.spec:
+                descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
+                # Execution attaches attempt.job later. The prepared engine binding
+                # is available on both local and placement-hosted paths at offer time.
+                binding = self.engine.jobs.get(descriptor)
+                if binding is None:
+                    self.refuse(
+                        offered,
+                        "job_binding_unavailable",
+                        "the selected job is not prepared",
+                        CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                    )
+                    return
+                try:
+                    declaration = self.engine._job_declaration(binding, descriptor)
+                except AttemptRefusal as exc:
+                    self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
+                    return
+                result_schema = canonical.write(declaration["result"])
+                memoize = declaration.get("invocable", {}).get("memoize", False) is True
             replay = self.workspace.accept(
                 self.fence.record_owner_id,
                 offered,

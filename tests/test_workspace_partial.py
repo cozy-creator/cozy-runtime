@@ -218,6 +218,7 @@ def test_native_commit_before_journal_result_replays_original_adoption(tmp_path:
 def test_schema_two_migrates_conservatively_and_future_schema_refuses(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     with workspace.locked() as db:
+        db.execute("DROP TABLE byte_outputs")
         db.execute("DROP TABLE native_calls")
         db.execute("DROP TABLE source_access")
         db.execute("ALTER TABLE holds DROP COLUMN kind")
@@ -226,7 +227,7 @@ def test_schema_two_migrates_conservatively_and_future_schema_refuses(tmp_path: 
             db.execute(f"ALTER TABLE weights DROP COLUMN {column}")
         db.execute("PRAGMA user_version=2")
     with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
         assert "memoize" in {row[1] for row in db.execute("PRAGMA table_info(attempts)")}
     with sqlite3.connect(workspace.directory / "journal.sqlite3") as db:
         db.execute("PRAGMA user_version=99")

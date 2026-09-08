@@ -40,6 +40,7 @@ import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._model import Model
+from cozy_runtime.author._model_defaults import DefaultLadder, check_model_arguments, model_defaults
 from cozy_runtime.author._script_metadata import declarations, main_definition
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import AssetsBinding, assets_binding, assets_payload
@@ -227,8 +228,8 @@ _SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
 #: A fold carries no local names unless a comprehension binds its own target.
 _NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
-_ENTRYPOINT_KEYWORDS = frozenset({"name", "preflight", "demand", "hidden"})
-_JOB_KEYWORDS = frozenset({"name", "publishes", "emits_media", "weights", "demand"})
+_ENTRYPOINT_KEYWORDS = frozenset({"name", "preflight", "demand", "hidden", "defaults"})
+_JOB_KEYWORDS = frozenset({"name", "publishes", "emits_media", "weights", "demand", "defaults"})
 
 
 # -------------------------------------------------------------------------- the reader
@@ -1072,6 +1073,7 @@ class Registration:
     weights: tuple[author.WeightsOutput, ...]
     invocable: bool = False
     memoize: bool = False
+    model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
 
 
 def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
@@ -1219,6 +1221,7 @@ def _registration(
 ) -> Registration | None:
     function_module = module
     invocable, memoize = False, False
+    default_models: dict[str, DefaultLadder] = {}
     for index, export in enumerate(fn.decorator_list):
         target = export.func if isinstance(export, ast.Call) else export
         if not _is_invocable(reader, function_module, target):
@@ -1232,15 +1235,20 @@ def _registration(
             )
         invocable = True
         if isinstance(export, ast.Call):
-            if export.args or any(keyword.arg != "memoize" for keyword in export.keywords):
+            if export.args or any(
+                keyword.arg not in {"memoize", "defaults"} for keyword in export.keywords
+            ):
                 reader.refuse(
                     function_module,
                     export,
-                    "@invocable accepts only memoize=",
+                    "@invocable accepts only memoize= and defaults=",
                     "static_unsupported",
                 )
             for keyword in export.keywords:
                 value = reader.fold(function_module, keyword.value)
+                if keyword.arg == "defaults":
+                    default_models = model_defaults(value)
+                    continue
                 if type(value) is not bool:
                     reader.refuse(
                         function_module, keyword.value, "invocable memoize must be a boolean"
@@ -1283,7 +1291,14 @@ def _registration(
             reader.fold(module, keyword.value)
             continue
         value = reader.fold(module, keyword.value)
-        if keyword.arg == "name":
+        if keyword.arg == "defaults":
+            declared_defaults = model_defaults(value)
+            if default_models and declared_defaults:
+                reader.refuse(
+                    module, keyword, "declare defaults once, on invocable or App registration"
+                )
+            default_models = declared_defaults or default_models
+        elif keyword.arg == "name":
             name = str(value)
         elif keyword.arg == "hidden" and value is True:
             return None
@@ -1301,6 +1316,7 @@ def _registration(
         weights,
         invocable,
         memoize,
+        default_models,
     )
 
 
@@ -1376,6 +1392,7 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                         spec.fusion,
                         spec.components,
                         spec.sequence_parallel,
+                        defaults=registration.model_defaults.get(arg.arg, ()),
                     )
                 )
                 continue
@@ -1383,6 +1400,10 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 payloads.append(reader.translate(module, arg.annotation))
                 continue
         reader.refuse(module, arg.annotation, f"parameter {arg.arg}: not an author surface type")
+    check_model_arguments(
+        registration.model_defaults,
+        [str(slot["path"]).rsplit(".", 1)[-1] for slot in models],
+    )
     if len(payloads) != 1:
         reader.refuse(
             module, fn, f"exactly one typed request struct is required, found {len(payloads)}"

@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._assets import GrantedInput, InputMetadata
+from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import Device
 from cozy_runtime.author._errors import CapabilityError, Outcome, classify
 from cozy_runtime.author._invoke import (
@@ -55,12 +56,13 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._model import _derive_model
+from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import (
     accel,
+    attention,
     canonical,
     child_env,
-    execution_contract,
     model_config,
     package_interface,
     sandbox,
@@ -175,11 +177,12 @@ def _deadline(seconds: float | None) -> float:
 
 
 def _granted_inputs(command: Mapping[str, Any]) -> dict[str, GrantedInput]:
-    """Verified worker-spooled inputs, projected identically into either execution lane."""
+    """Verified input paths, projected identically into either execution lane."""
     return {
         input_id: GrantedInput(
             input_id=input_id,
             local=Path(row["local"]),
+            file_state=tuple(row["file_state"]) if row.get("file_state") else None,
             media_type=str(row["media_type"]),
             digest=str(row["digest"]),
             length=int(row["length"]),
@@ -414,9 +417,9 @@ class Executor:
         self._prepare_consumed = False
         self.poisoned = ""
         self.constructed_model_digest = ""
-        #: The lane's execution contract, pinned on this generation and attested per attempt
-        #: (cr-109). None when the header carries no `execution` config.
-        self.attestation: execution_contract.Attestation | None = None
+        #: What the runtime pinned on this generation's attention sites (cr-124). One BOOT
+        #: line, not a per-attempt record: the choice is a function of device and image.
+        self.attention: attention.Applied | None = None
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
@@ -833,7 +836,20 @@ class Executor:
             _mark[0] = now
 
         self._stages = stages
+        pin = str(command.get("attention_pin", ""))
         if not binding.get("model_class"):
+            if pin:
+                # A PIN IS NEVER SILENTLY IGNORED (cr-125). A weightless binding constructs
+                # nothing and therefore holds no attention site, so there is nowhere to put
+                # the kernel that was named — and a run that reported success while serving
+                # no pin at all is the same lie as one that quietly served another kernel.
+                self.poisoned = "attention pin on a weightless binding"
+                return {
+                    "ok": False,
+                    "code": "attention_kernel_unsupported",
+                    "detail": f"{pin} was pinned on a binding that declares no model; a "
+                    "weightless package holds no attention site and a pin is never ignored",
+                }
             return self._prepare_weightless(binding, started)
         if "authorized_device_limit_bytes" not in command:
             # NO SELF-DERIVED CEILING (cr-025/cr-066): the worker assigns one before every
@@ -1029,20 +1045,6 @@ class Executor:
         if not isinstance(config_document, dict):
             raise RuntimeError("the CozyTensors construction config is not an object")
         stage("construction_config")
-        # THE LANE'S EXECUTION CONTRACT (cr-109), read where the construction config is read
-        # and refused BEFORE a plan is resolved or a byte is reserved: the device class first,
-        # then the kernel this environment can bind. There is no fallback on this axis; a
-        # refusal replaces the executor and the hub walks the ladder to the next rung.
-        kernel: execution_contract.Kernel | None = None
-        try:
-            contract = execution_contract.read(config_checkpoint.header.get("configs"))
-            if contract is not None:
-                execution_contract.check_device(contract, device_facts)
-                kernel = execution_contract.resolve_kernel(contract)
-        except execution_contract.ExecutionContractRefusal as exc:
-            self.poisoned = f"execution contract refused: {exc.code}"
-            return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
-        stage("execution_contract")
         construction = ConstructionFacts(
             release=str(binding["release"]),
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
@@ -1069,7 +1071,6 @@ class Executor:
                 encoded_leaves=consent,
                 steps_basis=int(binding.get("steps_basis") or 20),
                 dtype_name=dtype_name,
-                route=contract.weights.route if contract is not None else "",
             )
         except PlanRefusal as exc:
             self.poisoned = f"plan refused: {exc.code}"
@@ -1282,22 +1283,18 @@ class Executor:
                 else None
             )
             stage("execution_plan")
-            # THE CONTRACT'S KERNEL, PINNED POST-FILL (cr-109) on the components the contract
-            # GOVERNS (cr-122) — the ones whose tensors resolved on its own `weights.route`,
-            # read off the fill plane's component roots rather than guessed by walking the
-            # constructed object — before any warm step: a warm dry step then attests it.
-            applied = (
-                execution_contract.apply(
-                    contract,
-                    kernel,
-                    execution_contract.scope(
-                        contract, plan, {**backend.components, **backend.parked}
-                    ),
-                )
-                if contract is not None and kernel is not None
-                else None
-            )
-            stage("execution_contract_apply")
+            # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
+            # per attention SITE and before any warm step. No checkpoint is consulted:
+            # attention is weightless, so the choice is (device, image) and nothing else.
+            # `pin` is the execution-path override (cr-125) and is empty on every serving
+            # worker; when it is set it names ONE kernel and refuses rather than falling
+            # back. HERE is the only place it can act: `warm` may compile the module in
+            # place and a group installs its collectives next, and cp.py's ordering is
+            # forced — set the backend, then parallelism, then compile. A pin applied after
+            # either is a field nobody reads, which is why this is a construction fact and
+            # not a per-attempt one.
+            applied = attention.select(device_facts, {**backend.components, **backend.parked}, pin)
+            stage("attention_pin")
         except ModelFitRefused as exc:
             # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
             # loader asked before `materialize`, so the only thing to undo is the read
@@ -1328,9 +1325,9 @@ class Executor:
                 "envelope": envelope,
                 "poison": backend.poison_report,
             }
-        except execution_contract.ExecutionContractRefusal as exc:
+        except attention.AttentionRefusal as exc:
             backend.poison(())
-            self.poisoned = f"execution contract refused: {exc.code}"
+            self.poisoned = f"attention refused: {exc.code}"
             return {
                 "ok": False,
                 "code": exc.code,
@@ -1409,18 +1406,13 @@ class Executor:
         # fence are deleted whole (model-code-fit D12) — its only consumer was a fence the
         # planner had already disabled.
         self.plan = plan
-        self.attestation = (
-            execution_contract.Attestation([applied]) if applied is not None else None
-        )
+        self.attention = applied
         constructed_preimage = canonical.write(
             {
                 "plan_digest": plan.digest(),
                 # THE APPLIED CEILING, derived from the card (cl-027).
                 "resident_budget_bytes": resident_budget,
                 "execution_optimization": optimization.document() if optimization else None,
-                # THE CONTRACT enters the generation's identity (cr-109): demand and residency
-                # measured under 8-bit attention are keyed apart from the same bytes without it.
-                "execution_contract": contract.digest() if contract is not None else None,
                 "execution_fusion": fused.identity_document() if fused is not None else None,
             }
         )
@@ -1564,6 +1556,7 @@ class Executor:
             "leases": backend.leases.document(),
             "store": backend.stats.get("store", {}),
             "gpu_name": accel.device_identity(torch, self.device_kind)["name"],
+            "device_driver": device_facts.driver,
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda or "",
             # THE CONFESSION (§1.1). "Loudly ignored, never silently" is only true if the
@@ -1590,9 +1583,8 @@ class Executor:
             # `mixed(...)` as what it IS.
             "delivery": plan.wire_document(),
             "execution_optimization": optimization.document() if optimization else None,
-            # THE CONTRACT AS APPLIED (cr-109): digest, backend, the sites pinned per host. The
-            # kernel symbol lands here after the first attested call profiles it.
-            "execution_contract": applied.document() if applied is not None else None,
+            # WHAT THE RUNTIME PINNED (cr-124): kernel per component, and what it chose among.
+            "attention": applied.document() if applied is not None else None,
         }
         return {
             "ok": True,
@@ -1656,6 +1648,9 @@ class Executor:
                     **row,
                     "devices": command.get("devices", ""),
                     "authorized_device_limit_bytes": max(authorized - held, 0),
+                    # One construction, one execution path: every model of a set takes the
+                    # same pin (cr-125), exactly as they share one device authorization.
+                    "attention_pin": command.get("attention_pin", ""),
                 }
             )
             if reply.get("ok"):
@@ -1685,13 +1680,6 @@ class Executor:
             if child.residency is not None
         }
         self.residency = _CompositeResidency(residencies)
-        applied = [
-            row
-            for _, child, _ in children
-            if child.attestation is not None
-            for row in child.attestation.applied
-        ]
-        self.attestation = execution_contract.Attestation(applied) if applied else None
 
         constructed = [
             {"parameter": parameter, "digest": str(reply["constructed_model_digest"])}
@@ -1732,6 +1720,24 @@ class Executor:
             for component, layout in (facts.get("paging") or {}).items()
         }
         pinned_rows = [facts.get("pinned") or {} for _, facts in facts_rows]
+        # WHAT EACH MODEL PINNED, MERGED (cr-124). A group prepare has one boot note, so a
+        # per-model `attention` fact would simply be dropped and the placement would report
+        # no kernel at all — the one fact the boot line exists to carry. Components are
+        # namespaced by their model's parameter, exactly as `resident` and `parked` are.
+        attention_hosts: dict[str, dict[str, int]] = {}
+        attention_kernels: dict[str, int] = {}
+        attention_offered: list[str] = []
+        attention_locations: dict[str, str] = {}
+        for parameter, facts in facts_rows:
+            row = facts.get("attention") or {}
+            for component, chosen in (row.get("hosts") or {}).items():
+                attention_hosts[f"{parameter}/{component}"] = dict(chosen)
+            for name, sites in (row.get("kernels") or {}).items():
+                attention_kernels[name] = attention_kernels.get(name, 0) + int(sites)
+            attention_locations.update(row.get("locations") or {})
+            for name in row.get("offered") or ():
+                if name not in attention_offered:
+                    attention_offered.append(name)
         routes: dict[str, int] = {}
         kernels: dict[str, int] = {}
         for _, _, reply in children:
@@ -1793,6 +1799,16 @@ class Executor:
                 "registered_bytes": sum(int(row.get("registered_bytes", 0)) for row in pinned_rows),
                 "in_flight_bytes": sum(int(row.get("in_flight_bytes", 0)) for row in pinned_rows),
             },
+            "attention": {
+                "kernels": attention_kernels,
+                "hosts": attention_hosts,
+                "offered": attention_offered,
+                "locations": attention_locations,
+                "pin": "",
+                "line": attention.line(attention_kernels, attention_hosts, attention_offered, ""),
+            }
+            if attention_kernels
+            else None,
             "gpu_name": str(last.get("gpu_name", "")),
             "torch_version": str(last.get("torch_version", "")),
             "cuda_version": str(last.get("cuda_version", "")),
@@ -1909,6 +1925,7 @@ class Executor:
             }
         registration = self.discovered.app.get(command["entrypoint"])
         try:
+            self._capture_options(command, registration.surface)
             prepared = prepare(
                 registration,
                 command["payload"],
@@ -1997,31 +2014,42 @@ class Executor:
             )
         if torch is not None:
             accel.reset_peak(torch, self.device_kind)
-        if self.attestation is not None:
-            self.attestation.open()
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
-        envelope, outcome, record = run_prepared(
-            prepared,
-            Invocation(
-                request_id=command["request_id"],
-                spool=spool,
-                deadline=deadline,
-                device=self._device(),
-                cancel=lambda: _cancelled(self.root, command["request_id"]),
-                models=self.models,
-                progress=progress,
-                # cr-012: the inputs the WORKER already fetched, verified and spooled.
-                # Every value is a path inside this attempt's own spool: this process is
-                # never HANDED an address, and `main` installs `sandbox.refuse_network` so a
-                # handler that dials one anyway is refused rather than merely unexpected.
-                # That fence is Python-level (cr-042) — it bounds a buggy package, not a
-                # hostile one, and there is no netns or seccomp under it.
-                assets=_granted_inputs(command),
-                max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
-            ),
-        )
+        capture = None
+        capture_result: dict[str, Any] | None = None
+        record: AuthorAttempt | None = None
+        try:
+            capture = self._capture_session(command, surface)
+            with capture if capture is not None else contextlib.nullcontext():
+                envelope, outcome, record = run_prepared(
+                    prepared,
+                    Invocation(
+                        request_id=command["request_id"],
+                        spool=spool,
+                        deadline=deadline,
+                        device=self._device(),
+                        cancel=lambda: _cancelled(self.root, command["request_id"]),
+                        models=self.models,
+                        progress=progress,
+                        # cr-012: the inputs the WORKER already fetched, verified and spooled.
+                        # Every value is a path inside this attempt's own spool: this process is
+                        # never HANDED an address, and `main` installs `sandbox.refuse_network` so a
+                        # handler that dials one anyway is refused rather than merely unexpected.
+                        # That fence is Python-level (cr-042) — it bounds a buggy package, not a
+                        # hostile one, and there is no netns or seccomp under it.
+                        assets=_granted_inputs(command),
+                        max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
+                    ),
+                )
+            if capture is not None and outcome.terminal == "succeeded":
+                capture_result = capture.write(spool)
+        except Exception as exc:
+            envelope, outcome = None, classify(exc)
+            if record is None:
+                record = AuthorAttempt(command["request_id"], spool, 0, sink=progress)
+        assert record is not None
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
         self._attempt_spool = None
         if self.group is not None and self.group.broken and not self.poisoned:
@@ -2045,7 +2073,6 @@ class Executor:
         # host frames, so `device_lease_ms` is device time and the encode is the worker's.
         lease_ms = (time.perf_counter() - lease_acquired) * 1000
         quiescent = self._quiescent() if torch is not None else True
-        attested = self.attestation.close() if self.attestation is not None else None
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
         # A typed refusal before handler entry leaves a Ready executor untouched. This is
@@ -2060,18 +2087,6 @@ class Executor:
             "fields": list(outcome.fields),
             "traceback": outcome.traceback,
         }
-        if attested is not None and attested["refusal"] and outcome.terminal == "succeeded":
-            # THE CONTRACT WAS NOT OBSERVED (cr-109). The handler returned, and the kernel the
-            # lane promises did not run the number of times the pinned sites predict, or ran
-            # under another scheme. A result computed by some other attention is not this
-            # lane's result, and the generation that let it happen is replaced.
-            terminal.update(
-                terminal="failed",
-                origin="runtime",
-                code="execution_contract_unobserved",
-                message=attested["refusal"][:2048],
-            )
-            self.poisoned = "execution_contract_unobserved"
         # THE RESIDENCY PLANE'S POISON IS THIS PROCESS'S POISON (#613). A mid-mutation
         # failure or an accounting violation there can fire BEFORE handler entry (admission
         # runs at scope enter), so the phase bit above cannot see it — and the transaction
@@ -2091,7 +2106,8 @@ class Executor:
             "attribution": record.attribution.document(),
             "position": record.position,
             "outcome": terminal,
-            "execution_contract": attested,
+            "execution_observation": self._execution_observation(),
+            "capture": capture_result,
             "quiescent": quiescent,
             **_env_document(),
             "poisoned": self.poisoned,
@@ -2126,6 +2142,56 @@ class Executor:
                 "started_unix": started_wall,
                 "gpu_count": self.world if torch is not None else 0,
             },
+        }
+
+    @staticmethod
+    def _capture_options(command: Mapping[str, Any], surface: Any) -> ActivationCapture | None:
+        import msgspec
+
+        from cozy_runtime.probe._capture import validate_components
+
+        raw = command.get("capture")
+        if raw is None:
+            return None
+        options = msgspec.convert(raw, type=ActivationCapture, strict=True)
+        validate_components(options, [binding.model_class for binding in surface.model_bindings])
+        return options
+
+    def _capture_session(self, command: Mapping[str, Any], surface: Any) -> Any:
+        from cozy_runtime.author._errors import InvalidRequest
+        from cozy_runtime.probe._capture import CaptureSession
+
+        options = self._capture_options(command, surface)
+        if options is None:
+            return None
+        roots: dict[str, Any] = {}
+        for executor in self.model_executors or [self]:
+            if executor.backend is None:
+                continue
+            for name, root in {**executor.backend.components, **executor.backend.parked}.items():
+                if name not in options.components:
+                    continue
+                if name in roots and roots[name] is not root:
+                    raise InvalidRequest(
+                        f"capture component {name!r} occurs in more than one bound model",
+                        code="capture_component_ambiguous",
+                    )
+                roots[name] = root
+        return CaptureSession(options, roots)
+
+    def _execution_observation(self) -> dict[str, Any]:
+        from cozy_runtime import __version__
+
+        # Observed generation facts; image and boot identity are added by the worker.
+        # Optional kernel/lane fields stay absent until their execution is observed.
+        return {
+            "runtime_version": __version__,
+            "accelerator": str(self.facts.get("gpu_name") or "CPU"),
+            "cuda": str(self.facts.get("cuda_version") or ""),
+            "driver": str(self.facts.get("device_driver") or ""),
+            "execution_lane": "",  # no generic eager/compiled observation exists yet
+            "execution_contract_digest": "",
+            "kernel_symbol": "",
         }
 
     # ------------------------------------------------------------------ job
@@ -2214,6 +2280,14 @@ class Executor:
         3. **Quiescence is proven by what exists.** A torch-free job has no stream that
            could still be moving, so the proof is structural rather than a device query.
         """
+        if command.get("capture") is not None:
+            return {
+                "ok": False,
+                "code": "capture_mode",
+                "detail": "activation capture requires an ordinary serving invocation",
+                "terminal": "refused",
+                "origin": "request",
+            }
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         budget = command.get("budget") or {}
@@ -2477,6 +2551,7 @@ class Executor:
             "kind": "job",
             "shortfall": None,
             "residency": {},
+            "execution_observation": self._execution_observation(),
             "observations": record.ring.rows(),
             "observation_caps": {**record.ring.caps(), "metrics_dropped": record.metrics_dropped},
             "attribution": record.attribution.document(),
@@ -2771,6 +2846,8 @@ _MINIMAL_KEYS = frozenset(
         "code",
         "detail",
         "outcome",
+        "execution_observation",
+        "capture",
         "quiescent",
         "env_intact",
         "env_changed",
@@ -2893,13 +2970,13 @@ def _serialize_result(
     """
     import msgspec
 
-    from cozy_runtime.author._assets import Asset
+    from cozy_runtime.author._assets import Asset, Tree
 
     if envelope is None:
         return None, [], 0
 
     def hook(value: object) -> object:
-        if isinstance(value, Asset):
+        if isinstance(value, (Asset, Tree)):
             row = value.row()
             return {"asset_ref": row.pop("ref"), **row}
         raise TypeError(f"{type(value).__name__} has no wire spelling in a result")

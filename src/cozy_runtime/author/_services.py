@@ -15,6 +15,8 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import shutil
+import stat
 import time
 from collections.abc import Buffer, Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -29,9 +31,11 @@ from cozy_runtime.author._assets import (
     AudioAsset,
     FileAsset,
     ImageAsset,
+    Tree,
     VideoAsset,
     digest_bytes,
 )
+from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import (
     DecodedAudioChunk,
@@ -133,6 +137,7 @@ class Attempt:
     """Whether the package handler itself was entered. Pre-entry refusals never poison a
     healthy executor; one structural bit is safer than duplicating refusal-code lists."""
     pending: dict[str, Asset] = field(default_factory=dict)
+    pending_trees: dict[str, Tree] = field(default_factory=dict)
     rows: list[AdjustmentRow] = field(default_factory=list)
     ring: EventRing = field(default_factory=EventRing)
     """The BOUNDED observation record (cr-011). It replaced an unbounded list: a 4,096-step
@@ -632,6 +637,54 @@ class Outputs(_Bound):
     def save_bytes(self, data: bytes, *, media_type: str) -> FileAsset:
         return self._register(data, FileAsset, media_type)
 
+    def save_tree(self, path: Path | str) -> Tree:
+        """Snapshot regular files now; native retention commits after the handler returns."""
+        self._attempt.check_open("Outputs.save_tree")
+        source = Path(path)
+        if source.is_symlink() or not source.is_dir():
+            raise OutputError("output tree must be a regular directory", code="output_tree")
+        handle = self._attempt.next_handle("tree")
+        target = self._attempt.spool / f"tree-{handle.rsplit('/', 1)[-1]}"
+        target.mkdir()
+        available = self._attempt.max_output_bytes - self._pending_bytes()
+        count, total = 0, 0
+        try:
+            for directory, dirs, files in os.walk(source, followlinks=False):
+                current = Path(directory)
+                if any((current / name).is_symlink() for name in dirs):
+                    raise OutputError("output tree cannot contain symlinks", code="output_tree")
+                for name in sorted(files):
+                    count += 1
+                    if count > 8192:
+                        raise OutputError("output tree exceeds its file bound", code="output_tree")
+                    original = current / name
+                    fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    with os.fdopen(fd, "rb") as reader:
+                        if not stat.S_ISREG(os.fstat(reader.fileno()).st_mode):
+                            raise OutputError(
+                                "output tree requires regular files", code="output_tree"
+                            )
+                        dest = target / original.relative_to(source)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        with dest.open("xb") as writer:
+                            while chunk := reader.read(min(1 << 20, available - total + 1)):
+                                total += len(chunk)
+                                if total > available:
+                                    raise OutputError(
+                                        "output tree exceeds its byte grant",
+                                        code="output_too_large",
+                                    )
+                                writer.write(chunk)
+            if not count:
+                raise OutputError("output tree must contain at least one file", code="output_tree")
+            tree = Tree(handle, root=target, attempt=self._attempt.request_id)
+            tree.size_bytes = total
+            self._attempt.pending_trees[handle] = tree
+            return tree
+        except Exception:
+            shutil.rmtree(target)
+            raise
+
     def save_file(
         self, path: Path | str, *, media_type: str = "application/octet-stream"
     ) -> FileAsset:
@@ -706,8 +759,10 @@ class Outputs(_Bound):
         return asset
 
     def _pending_bytes(self) -> int:
-        return sum(asset.size_bytes for asset in self._attempt.pending.values()) + sum(
-            frame.charge for frame in self._attempt.frames.values()
+        return (
+            sum(asset.size_bytes for asset in self._attempt.pending.values())
+            + sum(tree.size_bytes for tree in self._attempt.pending_trees.values())
+            + sum(frame.charge for frame in self._attempt.frames.values())
         )
 
     @staticmethod
@@ -789,6 +844,9 @@ class Telemetry(_Bound):
         # too. Starting it at the first call would silently drop step 0 from the count — and
         # on a one-step request that is the whole measurement.
         attempt._step_mark = time.perf_counter()
+        capture = _capture_clock.get()
+        if capture is not None:
+            capture.schedule(total)
 
         def on_step(step: int) -> None:
             self._ctx.raise_if_cancelled()
@@ -810,6 +868,8 @@ class Telemetry(_Bound):
                 elif valid_total and isinstance(step, int) and not 0 <= step < total:
                     self._diagnose("step must be within the declared total")
                 return
+            if capture is not None:
+                capture.completed(step)
             raw_fraction = (step + 1) / total
             fraction = round(raw_fraction, 6)
             overall = None

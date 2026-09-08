@@ -5,17 +5,19 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
-from collections.abc import Awaitable, Callable, Generator, Mapping
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Concatenate, ParamSpec, TypeVar, cast, overload
 
 import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
+from cozy_runtime.author._capture import ActivationCapture, ExecutionObservation
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
+from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -38,18 +40,23 @@ class _Export:
     module: str
     name: str
     memoize: bool = False
+    defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
 
 
 @overload
 def invocable[**P, R](
-    fn: Callable[Concatenate[Context, P], Awaitable[R]], /, *, memoize: bool = False
-) -> Callable[P, Awaitable[R]]: ...
+    fn: Callable[Concatenate[Context, P], Awaitable[R]],
+    /,
+    *,
+    memoize: bool = False,
+    defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+) -> Callable[P, PendingCall[R]]: ...
 
 
 @overload
 def invocable[**P, R](
-    *, memoize: bool = False
-) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, Awaitable[R]]]: ...
+    *, memoize: bool = False, defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None
+) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]: ...
 
 
 def invocable[**P, R](
@@ -57,9 +64,10 @@ def invocable[**P, R](
     /,
     *,
     memoize: bool = False,
+    defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
 ) -> (
-    Callable[P, Awaitable[R]]
-    | Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, Awaitable[R]]]
+    Callable[P, PendingCall[R]]
+    | Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]
 ):
     """Mark an asynchronous implementation; explicitly register it on the package App.
 
@@ -72,14 +80,14 @@ def invocable[**P, R](
             "invocable memoization declaration must be a boolean", code="invocable_memoize"
         )
     if fn is None:
-        return lambda target: invocable(target, memoize=memoize)
+        return lambda target: invocable(target, memoize=memoize, defaults=defaults)
     if not inspect.iscoroutinefunction(fn) or "<locals>" in fn.__qualname__:
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
-    export = _Export(fn, fn.__module__, fn.__name__, memoize)
+    export = _Export(fn, fn.__module__, fn.__name__, memoize, model_defaults(defaults))
 
-    def proxy(*args: P.args, **kwargs: P.kwargs) -> Awaitable[R]:
+    def proxy(*args: P.args, **kwargs: P.kwargs) -> PendingCall[R]:
         if args:
             raise ConformanceError(
                 "an invocable takes only named operation arguments",
@@ -90,7 +98,13 @@ def invocable[**P, R](
             raise CapabilityError(
                 "package call has no admitted attempt", code="child_broker_absent"
             )
-        return cast(Awaitable[R], broker.reserve("", export.module, export.name, kwargs))
+        arguments = dict(kwargs)
+        capture = arguments.pop("capture", None)
+        if capture is not None and not isinstance(capture, ActivationCapture):
+            raise ConformanceError("capture needs ActivationCapture", code="capture_option")
+        call = broker.reserve("", export.module, export.name, arguments)
+        call.capture = capture
+        return cast(PendingCall[R], call)
 
     proxy.__name__ = fn.__name__
     proxy.__qualname__ = fn.__qualname__
@@ -122,13 +136,18 @@ class _CallType:
     result: type[msgspec.Struct]
 
 
-class _Call[R](Awaitable[R]):
+class PendingCall[R](Awaitable[R]):
+    """Awaiting returns R unchanged; observation is available after the call settles."""
+
     def __init__(
         self, broker: _Broker, index: int, binding: _CallType, payload: bytes, ctx: Context
     ):
         self.broker, self.index, self.binding, self.payload = broker, index, binding, payload
         self.ctx = ctx
+        self.request_id = ""
         self.task: asyncio.Task[R] | None = None
+        self.capture: ActivationCapture | None = None
+        self.observation: ExecutionObservation | None = None
 
     def __await__(self) -> Generator[Any, None, R]:
         if self.task is None:
@@ -144,7 +163,7 @@ def _input_ref(value: object, request_id: str) -> str:
         and value._attempt == request_id
         and re.fullmatch(r"sha256:[0-9a-f]{64}", value.digest)
     ):
-        if isinstance(value, Asset) and value._read_guard is not None:
+        if value._read_guard is not None:
             value._read_guard()
         return value.digest
     raise CapabilityError(
@@ -163,7 +182,7 @@ class _Broker:
         exchange: Callable[[str, dict[str, Any]], dict[str, Any]],
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
-        self.calls: list[_Call[Any]] = []
+        self.calls: list[PendingCall[Any]] = []
         self.closed = False
         self.activated: set[int] = set()
         self.context: Context | None = None
@@ -179,7 +198,7 @@ class _Broker:
         module: str,
         export: str,
         arguments: Mapping[str, object],
-    ) -> _Call[Any]:
+    ) -> PendingCall[Any]:
         ctx = self.context
         if self.closed or ctx is None or ctx.request_id != self.request_id:
             raise CapabilityError("package call escaped its attempt", code="escaped_handle")
@@ -219,11 +238,11 @@ class _Broker:
             ) from exc
         if len(payload) > MAX_CALL_BYTES:
             raise CapabilityError("package call exceeds inline bound", code="child_payload_bound")
-        call = _Call[Any](self, len(self.calls), binding, payload, ctx)
+        call = PendingCall[Any](self, len(self.calls), binding, payload, ctx)
         self.calls.append(call)
         return call
 
-    async def run(self, call: _Call[R]) -> R:
+    async def run(self, call: PendingCall[R]) -> R:
         # All tasks in an ordinary gather become ready before activation. Flush
         # them by reserved index, regardless of scheduling/completion order.
         await asyncio.sleep(0)
@@ -235,9 +254,11 @@ class _Broker:
                 for ready in self.calls:
                     if ready.task is not None and ready.index not in self.activated:
                         answer = self.exchange("child_call", self._intent(ready))
+                        self._observe(ready, answer)
                         self._check(answer, ready.index)
                         self.activated.add(ready.index)
                 answer = self.exchange("child_poll", {"call_index": call.index})
+                self._observe(call, answer)
                 self._check(answer, call.index)
                 if answer.get("state") == "succeeded":
                     raw = str(answer.get("result", "")).encode()
@@ -247,9 +268,24 @@ class _Broker:
                         )
                     try:
                         value = canonical_json.decode(raw)
-                        return cast(
-                            R, msgspec.convert(value, type=call.binding.result, strict=True)
+                        from cozy_runtime.author._call_results import decode
+
+                        def guard() -> None:
+                            if self.closed:
+                                raise CapabilityError(
+                                    "child result escaped its attempt", code="escaped_handle"
+                                )
+                            call.ctx.raise_if_cancelled()
+
+                        result, call.observation = decode(
+                            value,
+                            call.binding.result,
+                            answer.get("byte_grants", []),
+                            request_id=self.request_id,
+                            guard=guard,
+                            observation=call.observation,
                         )
+                        return cast(R, result)
                     except (ValueError, TypeError, msgspec.ValidationError) as exc:
                         raise ChildCallError(
                             "child_result_invalid",
@@ -263,13 +299,41 @@ class _Broker:
             raise
 
     @staticmethod
-    def _intent(call: _Call[Any]) -> dict[str, Any]:
+    def _observe(call: PendingCall[Any], answer: Mapping[str, Any]) -> None:
+        child_id = answer.get("child_request_id")
+        if child_id:
+            if (
+                not isinstance(child_id, str)
+                or len(child_id) > 256
+                or call.request_id not in ("", child_id)
+            ):
+                raise ChildCallError(
+                    "child_identity_changed", "child request identity changed", call.index
+                )
+            call.request_id = child_id
+        if answer.get("observation") is None:
+            return
+        try:
+            call.observation = msgspec.convert(
+                answer["observation"],
+                type=ExecutionObservation,
+                dec_hook=asset_dec_hook,
+                strict=True,
+            )
+        except (ValueError, TypeError, msgspec.ValidationError) as exc:
+            raise ChildCallError(
+                "child_observation_invalid", "child observation is invalid", call.index
+            ) from exc
+
+    @staticmethod
+    def _intent(call: PendingCall[Any]) -> dict[str, Any]:
         return {
             "call_index": call.index,
             "interface_digest": call.binding.interface_digest,
             "module": call.binding.module,
             "export": call.binding.export,
             "payload": call.payload.decode(),
+            **({"capture": call.capture.document()} if call.capture is not None else {}),
         }
 
     @staticmethod
@@ -295,9 +359,18 @@ _current: ContextVar[_Broker | None] = ContextVar("cozy_package_call_attempt", d
 
 
 def _invoke_proxy(
-    interface_digest: str, module: str, export: str, arguments: Mapping[str, object]
-) -> Awaitable[Any]:
+    interface_digest: str,
+    module: str,
+    export: str,
+    arguments: Mapping[str, object],
+    *,
+    capture: ActivationCapture | None = None,
+) -> PendingCall[Any]:
     broker = _current.get()
     if broker is None:
         raise CapabilityError("package call has no admitted attempt", code="child_broker_absent")
-    return broker.reserve(interface_digest, module, export, arguments)
+    if capture is not None and not isinstance(capture, ActivationCapture):
+        raise ConformanceError("capture needs ActivationCapture", code="capture_option")
+    call = broker.reserve(interface_digest, module, export, arguments)
+    call.capture = capture
+    return call
