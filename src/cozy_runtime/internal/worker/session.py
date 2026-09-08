@@ -5401,28 +5401,30 @@ class Worker:
             return
         if (
             self.workspace is not None
-            and "job" in attempt.spec
+            and ("job" in attempt.spec or self.fence.wire_minor >= 43)
             and attempt.state not in ("outcome", "closed")
         ):
-            descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
-            # Execution attaches attempt.job later. The prepared engine binding
-            # is available on both local and placement-hosted paths at offer time.
-            binding = self.engine.jobs.get(descriptor)
-            if binding is None:
-                self.refuse(
-                    offered,
-                    "job_binding_unavailable",
-                    "the selected job is not prepared",
-                    CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-                )
-                return
-            try:
-                declaration = self.engine._job_declaration(binding, descriptor)
-            except AttemptRefusal as exc:
-                self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
-                return
-            result_schema = canonical.write(declaration["result"])
-            memoize = declaration.get("invocable", {}).get("memoize", False) is True
+            result_schema, memoize = b"", False
+            if "job" in attempt.spec:
+                descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
+                # Execution attaches attempt.job later. The prepared engine binding
+                # is available on both local and placement-hosted paths at offer time.
+                binding = self.engine.jobs.get(descriptor)
+                if binding is None:
+                    self.refuse(
+                        offered,
+                        "job_binding_unavailable",
+                        "the selected job is not prepared",
+                        CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                    )
+                    return
+                try:
+                    declaration = self.engine._job_declaration(binding, descriptor)
+                except AttemptRefusal as exc:
+                    self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
+                    return
+                result_schema = canonical.write(declaration["result"])
+                memoize = declaration.get("invocable", {}).get("memoize", False) is True
             replay = self.workspace.accept(
                 self.fence.record_owner_id,
                 offered,
