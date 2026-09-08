@@ -54,7 +54,9 @@ def metadata(surface: Surface) -> dict[str, Any]:
     walk(surface.payload_type, "request")
     walk(surface.result_type, "result")
     parameters = [
-        parameter.name for parameter in surface.params if parameter.role in ("wire", "model")
+        parameter.name
+        for parameter in surface.params
+        if parameter.role in ("wire", "model", "assets")
     ]
     signature = inspect.signature(surface.fn)
     for name in parameters:

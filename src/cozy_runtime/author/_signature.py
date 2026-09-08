@@ -7,24 +7,38 @@ parameter types, so there is no second document to drift (§1.0/§1.3/§1.7).
 
 from __future__ import annotations
 
+import enum
 import inspect
+import math
+import types
 import typing
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, get_args, get_origin
 
 import msgspec
 
 from cozy_runtime.author._artifacts import ModelArtifact
+from cozy_runtime.author._assets import (
+    Asset,
+    Assets,
+    AudioAsset,
+    Fidelity,
+    FileAsset,
+    ImageAsset,
+    Tree,
+    VideoAsset,
+)
 from cozy_runtime.author._context import Context
+from cozy_runtime.author._decode import DECODED_ASSET_TYPES, DEFAULT_DECODE_LIMITS
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import Bound, _PreflightMarker
+from cozy_runtime.author._markers import AssetBound, AssetLimits, Bound, _PreflightMarker
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.author._weights import WeightsOutput
 
-Role = Literal["context", "payload", "wire", "preflight", "model", "service"]
+Role = Literal["context", "payload", "wire", "assets", "preflight", "model", "service"]
 Kind = Literal["entrypoint", "job"]
 
 _PARAMETERIZED = {"settings": Settings, "secrets": Secrets}
@@ -49,6 +63,114 @@ class PreflightSpec:
     payload_type: object
     settings_type: object | None
     result_type: object
+    assets_parameter: str | None = None
+    argument_order: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AssetsBinding:
+    parameter: str
+    annotation: object
+    kinds: tuple[tuple[type[Asset], AssetBound | None], ...]
+    decoded: bool = False
+    counts: tuple[tuple[str, int], ...] = ()
+    max_length: int | None = None
+
+    @property
+    def wire_type(self) -> object:
+        _, declared = strip(self.annotation)
+        markers = tuple(marker for marker in declared if not isinstance(marker, AssetLimits))
+        if self.max_length is not None and not any(
+            isinstance(marker, msgspec.Meta) and marker.max_length is not None for marker in markers
+        ):
+            markers += (msgspec.Meta(max_length=self.max_length),)
+        return (
+            typing.Annotated[(list[AssetInputValue], *markers)]
+            if markers
+            else list[AssetInputValue]
+        )
+
+
+class AssetInputValue(msgspec.Struct, forbid_unknown_fields=True):
+    """Ordinary payload representation of one explicitly forwarded occurrence."""
+
+    asset: FileAsset
+    label: str = ""
+    fidelity: Fidelity = "auto"
+
+
+def assets_binding(name: str, annotation: object) -> AssetsBinding:
+    base, metadata = strip(annotation)
+    args = get_args(base)
+    item = args[0] if args else ImageAsset | VideoAsset | AudioAsset | FileAsset
+    inner, _ = strip(item)
+    options = get_args(inner) if get_origin(inner) in (typing.Union, types.UnionType) else (item,)
+    kinds: dict[str, tuple[type[Asset], AssetBound | None]] = {}
+    decoded: bool | None = None
+    for option in options:
+        cls, markers = strip(option)
+        if any(isinstance(marker, AssetLimits) for marker in markers):
+            raise ConformanceError(
+                "AssetLimits annotates the Assets collection", code="asset_limits"
+            )
+        value_type = cls in DECODED_ASSET_TYPES
+        if decoded is not None and value_type != decoded:
+            raise ConformanceError(
+                "Assets cannot mix decoded values and raw handles in one view",
+                code="assets_element",
+            )
+        decoded = value_type
+        if value_type:
+            cls = DECODED_ASSET_TYPES[typing.cast(type, cls)]
+        if cls not in (ImageAsset, VideoAsset, AudioAsset, FileAsset):
+            raise ConformanceError(
+                "Assets elements must be media values or typed assets", code="assets_element"
+            )
+        cls = typing.cast(type[Asset], cls)
+        if cls.kind in kinds:
+            raise ConformanceError("Assets repeats a media kind", code="assets_element")
+        bound = next((marker for marker in markers if isinstance(marker, AssetBound)), None)
+        if value_type:
+            if bound is None:
+                bound = AssetBound(max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes)
+            elif bound.max_decoded_bytes is None:
+                bound = replace(bound, max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes)
+        if bound is not None:
+            bound.check_kind(cls.kind)
+        kinds[cls.kind] = cls, bound
+    limits = [marker for marker in metadata if isinstance(marker, AssetLimits)]
+    if limits and any(marker != limits[0] for marker in limits[1:]):
+        raise ConformanceError("conflicting AssetLimits markers", code="asset_limits")
+    counts = limits[0].counts if limits else {}
+    if set(counts) - set(kinds):
+        raise ConformanceError("AssetLimits names an undeclared media kind", code="asset_limits")
+    totals = {
+        marker.max_length
+        for marker in metadata
+        if isinstance(marker, msgspec.Meta) and marker.max_length is not None
+    }
+    if limits and limits[0].total is not None:
+        totals.add(limits[0].total)
+    if len(totals) > 1:
+        raise ConformanceError("conflicting Assets total/max_length", code="asset_limits")
+    max_length = next(iter(totals), None)
+    if max_length is None and counts and set(counts) == set(kinds):
+        max_length = sum(counts.values())
+    if max_length is not None and any(
+        isinstance(marker, msgspec.Meta)
+        and marker.min_length is not None
+        and marker.min_length > max_length
+        for marker in metadata
+    ):
+        raise ConformanceError("Assets minimum exceeds its total limit", code="asset_limits")
+    return AssetsBinding(
+        name,
+        annotation,
+        tuple(kinds[key] for key in sorted(kinds)),
+        bool(decoded),
+        tuple(sorted(counts.items())),
+        max_length,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +227,12 @@ class Surface:
     memoize: bool = False
 
     @property
+    def assets_binding(self) -> AssetsBinding | None:
+        return next(
+            (assets_binding(p.name, p.annotation) for p in self.params if p.role == "assets"), None
+        )
+
+    @property
     def model_params(self) -> tuple[str, ...]:
         return tuple(p.name for p in self.params if p.role == "model")
 
@@ -151,6 +279,9 @@ def _classify(name: str, annotation: object, where: str) -> Param:
     if base is Context:
         return Param(name, "context", base)
     origin = get_origin(base)
+    if base is Assets or origin is Assets:
+        binding = assets_binding(name, annotation)
+        return Param(name, "assets", annotation, "media_decode" if binding.decoded else None)
     for capability, service in _PARAMETERIZED.items():
         if base is service or origin is service:
             args = get_args(base)
@@ -231,6 +362,30 @@ def analyze(
                 fields=[parameter.name],
             )
         annotation = hints[parameter.name]
+        base, markers = strip(annotation)
+        if any(isinstance(marker, AssetLimits) for marker in markers) and not (
+            base is Assets or get_origin(base) is Assets
+        ):
+            raise ConformanceError("AssetLimits annotates an Assets input", code="asset_limits")
+        if base is Assets or get_origin(base) is Assets:
+            if parameter.default is not parameter.empty:
+                raise ConformanceError("Assets inputs cannot have defaults", code="assets_default")
+            if invocable and parameter.kind is not parameter.KEYWORD_ONLY:
+                raise ConformanceError(
+                    "invocable Assets must be keyword-only", code="invocable_signature"
+                )
+            binding = assets_binding(parameter.name, annotation)
+            params.append(
+                Param(
+                    parameter.name,
+                    "assets",
+                    annotation,
+                    "media_decode" if binding.decoded else None,
+                )
+            )
+            if invocable:
+                wire_fields.append((parameter.name, binding.wire_type))
+            continue
         if invocable:
             base, _ = strip(annotation)
             injected = (
@@ -275,6 +430,11 @@ def analyze(
         params.append(_classify(parameter.name, annotation, where))
 
     payloads = [p for p in params if p.role == "payload"]
+    assets_params = [p for p in params if p.role == "assets"]
+    if len(assets_params) > 1:
+        raise ConformanceError(
+            "one Assets input slot is supported per callable", code="assets_arity"
+        )
     if invocable:
         declared = list(signature.parameters.values())
         if (
@@ -302,6 +462,23 @@ def analyze(
         )
     else:
         payload_type = payloads[0].annotation
+        if assets_params:
+            binding = assets_binding(assets_params[0].name, assets_params[0].annotation)
+            original = typing.cast(type[msgspec.Struct], payload_type)
+            if any(
+                f.encode_name == binding.parameter or f.name == binding.parameter
+                for f in msgspec.structs.fields(original)
+            ):
+                raise ConformanceError(
+                    "Assets parameter collides with a payload field", code="assets_field_collision"
+                )
+            payload_type = msgspec.defstruct(
+                f"{fn.__name__}Request",
+                [(binding.parameter, typing.cast(Any, binding.wire_type))],
+                bases=(original,),
+                module=fn.__module__,
+                kw_only=True,
+            )
     contexts = [p for p in params if p.role == "context"]
     if len(contexts) > 1:
         raise ConformanceError(f"{where}: Context is injected at most once", code="context_arity")
@@ -326,7 +503,9 @@ def analyze(
 
     spec: PreflightSpec | None = None
     if preflight is not None:
-        spec = analyze_preflight(preflight, payloads[0].annotation)
+        spec = analyze_preflight(
+            preflight, payloads[0].annotation, assets_params[0] if assets_params else None
+        )
 
     return Surface(
         name=name,
@@ -352,11 +531,8 @@ def _wire_default(value: object) -> None:
     """Only immutable canonical values can change omission into an exact intent."""
     if value is None or type(value) in (str, bool, int):
         return
-    if type(value) is float:
-        import math
-
-        if math.isfinite(value):
-            return
+    if type(value) is float and math.isfinite(value):
+        return
     raise ConformanceError(
         "invocable defaults must be immutable canonical scalars", code="invocable_default"
     )
@@ -364,11 +540,6 @@ def _wire_default(value: object) -> None:
 
 def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
     """Refuse interpreter-local values before an interface is generated."""
-    import enum
-    import types
-
-    from cozy_runtime.author._assets import Asset, Tree
-
     base, _ = strip(annotation)
     if base in (str, int, float, bool, type(None)):
         return
@@ -412,7 +583,9 @@ def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
 BYTE_ACCESS = frozenset({"read_bytes", "open", "tobytes", "read"})
 
 
-def analyze_preflight(fn: Callable[..., object], payload_type: object) -> PreflightSpec:
+def analyze_preflight(
+    fn: Callable[..., object], payload_type: object, assets: Param | None = None
+) -> PreflightSpec:
     """The ONE pre-admission author hook: pure `(payload[, settings]) -> frozen facts`.
 
     Narrow by construction — no Context, Model, network, device, output, secret or service
@@ -421,7 +594,7 @@ def analyze_preflight(fn: Callable[..., object], payload_type: object) -> Prefli
     where = f"{fn.__module__}:{fn.__qualname__}"
     hints = _hints(fn)
     positional = [p for p in inspect.signature(fn).parameters]
-    if not 1 <= len(positional) <= 2:
+    if not 1 <= len(positional) <= (3 if assets else 2):
         raise ConformanceError(
             f"preflight {where}: takes (payload) or (payload, settings), "
             f"got {len(positional)} parameters",
@@ -472,5 +645,24 @@ def analyze_preflight(fn: Callable[..., object], payload_type: object) -> Prefli
             "the facts record is hashed into admission and handed to the handler unchanged",
             code="preflight_result",
         )
-    settings_type = strip(hints.get(positional[1], object))[0] if len(positional) == 2 else None
-    return PreflightSpec(fn, where, payload_type, settings_type, result)
+    settings_type = None
+    assets_parameter = None
+    argument_order = []
+    for name in positional[1:]:
+        annotation = hints.get(name, object)
+        base, _ = strip(annotation)
+        if base is Assets or get_origin(base) is Assets:
+            if assets is None or annotation != assets.annotation or assets_parameter is not None:
+                raise ConformanceError(
+                    "preflight Assets differs from its input slot", code="preflight_assets"
+                )
+            assets_parameter = assets.name
+            argument_order.append("assets")
+        elif settings_type is None:
+            settings_type = base
+            argument_order.append("settings")
+        else:
+            raise ConformanceError("preflight settings repeated", code="preflight_signature")
+    return PreflightSpec(
+        fn, where, payload_type, settings_type, result, assets_parameter, tuple(argument_order)
+    )

@@ -12,6 +12,8 @@ from collections.abc import Mapping, Sequence
 from typing import NoReturn, cast
 
 from cozy_runtime.author import ConformanceError, ModelBinding, Surface
+from cozy_runtime.author._media import KIND_MEDIA
+from cozy_runtime.author._signature import AssetInputValue
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
@@ -80,6 +82,27 @@ def _callable(surface: Surface) -> dict[str, Json]:
     models = [_model(binding) for binding in surface.model_bindings]
     if models:
         doc["models"] = models
+    if binding := surface.assets_binding:
+        kinds: list[Json] = []
+        for cls, bound in binding.kinds:
+            row: dict[str, Json] = {
+                "kind": cls.kind,
+                "media_types": list(
+                    bound.media_types if bound and bound.media_types else KIND_MEDIA[cls.kind]
+                ),
+            }
+            counts = dict(binding.counts)
+            if cls.kind in counts:
+                row["max_count"] = counts[cls.kind]
+            if bound and bound.max_bytes is not None:
+                row["max_bytes"] = bound.max_bytes
+            if bound and bound.max_decoded_bytes is not None:
+                row["max_decoded_bytes"] = bound.max_decoded_bytes
+            kinds.append(row)
+        slot: dict[str, Json] = {"parameter": binding.parameter, "kinds": kinds}
+        if binding.decoded:
+            slot["view"] = "decoded"
+        doc["assets"] = slot
     if surface.kind == "job":
         doc["publishes"] = surface.publishes
         if surface.weights_outputs:
@@ -333,7 +356,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
         for index, row in enumerate(rows):
             path = f"{collection}[{index}]"
             required = {"name", "request", "result"}
-            optional = {"models", "invocable"}
+            optional = {"models", "invocable", "assets"}
             if kind == "job":
                 required.add("publishes")
                 optional.add("weights_outputs")
@@ -344,6 +367,8 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
             names.add(name)
             _schema(item["request"], source, f"{path}.request")
             _schema(item["result"], source, f"{path}.result")
+            if "assets" in item:
+                _assets_slot(item["assets"], item["request"], source, f"{path}.assets")
             if "invocable" in item:
                 from cozy_runtime.internal import invocable_interface
 
@@ -439,6 +464,56 @@ def _portable_name(value: Json, source: str, path: str) -> str:
     if not isinstance(value, str) or _PORTABLE_NAME.fullmatch(value) is None:
         _invalid(source, path, "must be a portable lowercase name")
     return value
+
+
+def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
+    slot = _closed(value, {"parameter", "kinds"}, {"view"}, source, path)
+    if "view" in slot and slot["view"] != "decoded":
+        _invalid(source, f"{path}.view", "must be decoded when present")
+    parameter = slot["parameter"]
+    if not isinstance(parameter, str) or not parameter.isidentifier():
+        _invalid(source, path, "assets parameter must be an identifier")
+    fields = request.get("fields", []) if isinstance(request, dict) else []
+    selected = [f for f in fields if isinstance(f, dict) and f.get("name") == parameter]
+    occurrence = schema.render(list[AssetInputValue])
+    if len(selected) != 1 or selected[0].get("type") != occurrence:
+        _invalid(source, path, "assets parameter must name the declared occurrence records")
+    kinds = slot["kinds"]
+    if not isinstance(kinds, list) or not 1 <= len(kinds) <= 4:
+        _invalid(source, path, "assets kinds must be a nonempty bounded list")
+    seen: set[str] = set()
+    media: set[str] = set()
+    for value in kinds:
+        row = _closed(
+            value,
+            {"kind", "media_types"},
+            {"max_bytes", "max_decoded_bytes", "max_count"},
+            source,
+            path,
+        )
+        kind = row["kind"]
+        if kind not in ("image", "video", "audio", "file") or str(kind) in seen:
+            _invalid(source, path, "assets kinds must be recognized and unique")
+        if slot.get("view") == "decoded" and kind == "file":
+            _invalid(source, path, "decoded Assets does not include generic file handles")
+        if "max_count" in row and (type(row["max_count"]) is not int or row["max_count"] < 0):
+            _invalid(source, path, "assets kind max_count must be a nonnegative integer")
+        seen.add(str(kind))
+        types = row["media_types"]
+        if not isinstance(types, list) or (not types and kind != "file"):
+            _invalid(source, path, "a media kind needs explicit MIME types")
+        for mime in types:
+            if (
+                not isinstance(mime, str)
+                or mime != mime.strip().lower()
+                or "/" not in mime
+                or mime in media
+            ):
+                _invalid(source, path, "assets MIME types must be distinct and canonical")
+            media.add(mime)
+        for limit in ("max_bytes", "max_decoded_bytes"):
+            if limit in row and (type(row[limit]) is not int or cast(int, row[limit]) <= 0):
+                _invalid(source, path, "assets byte limits must be positive integers")
 
 
 def _schema(value: Json, source: str, path: str, union_tag_field: str | None = None) -> None:

@@ -749,6 +749,17 @@ class AttemptEngine:
                     "request_id": f"{attempt.request_id}#{attempt.attempt}",
                     "entrypoint": declared.entrypoint,
                     "payload": attempt.payload,
+                    "input_metadata": {
+                        name: {
+                            "input_id": name,
+                            "media_type": item.kind_mime,
+                            "digest": documents.spell(item.digest),
+                            "length": item.length,
+                            "order": item.order,
+                        }
+                        for name, item in attempt.grant.inputs.items()
+                        if name != "payload"
+                    },
                 },
                 timeout=None,
             )

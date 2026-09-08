@@ -213,26 +213,37 @@ def _media_decode_bounds(surface: Surface) -> None:
     if "media_decode" not in surface.capabilities:
         return
     reached = 0
-    for node in walk(surface.payload_type):
-        kinds = asset_kinds(node.annotation) & {"image", "video", "audio"}
+    fields = (
+        [
+            (node.path, asset_kinds(node.annotation), node.marker(AssetBound))
+            for node in walk(surface.payload_type)
+        ]
+        if any(p.role == "service" and p.capability == "media_decode" for p in surface.params)
+        else []
+    )
+    if binding := surface.assets_binding:
+        fields.extend(
+            (binding.parameter, frozenset({cls.kind}), bound) for cls, bound in binding.kinds
+        )
+    for path, kinds, bound in fields:
+        kinds = kinds & {"image", "video", "audio"}
         if not kinds:
             continue
         reached += 1
-        bound = node.marker(AssetBound)
         if not isinstance(bound, AssetBound) or bound.max_decoded_bytes is None:
             raise ConformanceError(
-                f"{surface.name}.{node.path} is decoded by MediaDecoder but declares no "
+                f"{surface.name}.{path} is decoded by MediaDecoder but declares no "
                 "AssetBound(max_decoded_bytes=...): compressed and decoded size are separate "
                 "limits, and the decoder has no unbounded overload",
                 code="asset_decode_unbounded",
-                fields=[node.path],
+                fields=[path],
             )
         if bound.max_decoded_bytes > DEFAULT_DECODE_LIMITS.max_decoded_bytes:
             raise ConformanceError(
-                f"{surface.name}.{node.path} declares {bound.max_decoded_bytes} decoded bytes, "
+                f"{surface.name}.{path} declares {bound.max_decoded_bytes} decoded bytes, "
                 f"above Runtime's {DEFAULT_DECODE_LIMITS.max_decoded_bytes}-byte hard ceiling",
                 code="asset_decode_limit",
-                fields=[node.path],
+                fields=[path],
             )
     if not reached:
         raise ConformanceError(

@@ -1,8 +1,8 @@
 """Typed assets — the ONE asset type, both directions (§1.3/§3.4).
 
-Input assets are ordinary typed REQUEST FIELDS that arrive digest-verified; output assets
-are what `out.save_*` returns and what the result struct declares. There is no separate
-Inputs capability, no second asset type, and no author-managed fetch.
+Input assets are ordinary typed request fields or an explicit ordered Assets input.
+Their bytes arrive digest-verified; output assets are what `out.save_*` returns and
+what the result struct declares. Both use the same handles and granted reader.
 
 `Asset` is deliberately NOT a msgspec-native type. The only way one comes into existence
 from the wire is `asset_dec_hook`, which accepts a REF STRING and nothing else — so
@@ -13,13 +13,19 @@ paths cannot enter a schema, a digest, or serialized output.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Final, get_args
+from typing import Any, ClassVar, Final, Literal, Self, cast, get_args, overload
+
+from PIL.Image import Image as Image
 
 from cozy_runtime.author._errors import CapabilityError, PreflightViolation
+from cozy_runtime.author._walker import strip, unwrap_optional
 
 _UNBOUND: Final = ""
+Fidelity = Literal["auto", "low", "medium", "high"]
 
 
 class Asset:
@@ -27,9 +33,13 @@ class Asset:
 
     __slots__ = (
         "_attempt",
+        "_fidelity",
         "_input_id",
+        "_label",
         "_local",
         "_max_decoded_bytes",
+        "_position",
+        "_read_guard",
         "digest",
         "media_type",
         "ref",
@@ -55,6 +65,10 @@ class Asset:
         self._local = local
         self._attempt = attempt
         self._input_id = ""
+        self._fidelity: Fidelity = "auto"
+        self._label = ""
+        self._position = -1
+        self._read_guard: Callable[[], None] | None = None
         self._max_decoded_bytes = 0
 
     def __repr__(self) -> str:
@@ -65,6 +79,41 @@ class Asset:
 
     def __hash__(self) -> int:
         return hash((type(self).__name__, self.ref))
+
+    @property
+    def id(self) -> str:
+        """This input occurrence's request-local ID; empty before it is bound."""
+        return self._input_id
+
+    @property
+    def position(self) -> int:
+        """The input binding's order; -1 before an occurrence is assigned."""
+        return self._position
+
+    @property
+    def label(self) -> str:
+        """An optional caller-supplied name for this occurrence; empty when omitted."""
+        return self._label
+
+    @property
+    def fidelity(self) -> Fidelity:
+        """Per-occurrence model hint; the generic loader never resizes because of it."""
+        return self._fidelity
+
+    def with_fidelity(self, fidelity: Fidelity) -> Self:
+        if fidelity not in get_args(Fidelity):
+            raise ValueError("asset fidelity must be auto, low, medium or high")
+        result = copy(self)
+        result._fidelity = fidelity
+        return result
+
+    def with_label(self, label: str) -> Self:
+        """Name a copy of this handle without changing its bytes or the original."""
+        if not isinstance(label, str):
+            raise TypeError("an asset label must be a string")
+        result = copy(self)
+        result._label = label
+        return result
 
     @property
     def hydrated(self) -> bool:
@@ -79,6 +128,8 @@ class Asset:
                 "kinds and typed metadata only — bytes exist after hydration (§1.3)",
                 code="asset_bytes_unavailable",
             )
+        if self._read_guard is not None:
+            self._read_guard()
         return self._local.read_bytes()
 
     def row(self) -> dict[str, Any]:
@@ -108,6 +159,166 @@ class FileAsset(Asset):
     kind: ClassVar[str] = "file"
 
 
+@dataclass(frozen=True, slots=True)
+class AssetInfo:
+    """Readonly declared input metadata; accessing it never reads or decodes bytes."""
+
+    id: str
+    position: int
+    label: str
+    fidelity: Fidelity
+    kind: str
+    media_type: str
+    size_bytes: int
+    digest: str
+
+
+class Assets[T](Sequence[T]):
+    """Ordered granted inputs, accessed by position or an optional unique label.
+
+    ``Assets[Image]`` yields real PIL images; ``Assets[Mixed]`` yields decoded image,
+    video or audio values. Decode is lazy and uses the attempt's shared decoder.
+    ``info(key)`` exposes metadata without decoding, including during preflight.
+    Explicit ``Assets[ImageAsset]`` and other handle types remain a raw input view.
+    Construction holds references for forwarding; value access starts at injection.
+    """
+
+    __slots__ = ("_cache", "_decoded", "_guard", "_items", "_project")
+
+    def __init__(self, values: Iterable[Asset] = ()) -> None:
+        items: list[Asset] = []
+        for position, value in enumerate(values):
+            if not isinstance(value, Asset):
+                raise TypeError("Assets construction accepts granted asset handles")
+            item = copy(value)
+            item._input_id = f"assets.{position}.asset"
+            item._position = position
+            items.append(item)
+        self._items = tuple(items)
+        self._project: Callable[[Asset], object] | None = None
+        self._decoded = True
+        self._cache: dict[int, object] = {}
+        self._guard: Callable[[], None] | None = None
+        self._check_labels()
+
+    @classmethod
+    def _from_bound(
+        cls,
+        values: Iterable[Asset],
+        *,
+        decoded: bool = False,
+        project: Callable[[Asset], object] | None = None,
+        guard: Callable[[], None] | None = None,
+    ) -> Assets[T]:
+        """Retain exact slot IDs/order after binding; no byte acquisition or decode."""
+        result = cls()
+        items: list[Asset] = []
+        seen: set[str] = set()
+        for position, value in enumerate(values):
+            if not isinstance(value, Asset):
+                raise TypeError("Assets accepts typed asset handles")
+            if not value.id or value.id in seen or value.position != position:
+                raise ValueError("bound Assets requires distinct input IDs in binding order")
+            seen.add(value.id)
+            items.append(copy(value))
+        result._items = tuple(items)
+        result._project = project
+        result._decoded = decoded
+        result._guard = guard
+        result._check_labels()
+        return result
+
+    def _check_labels(self) -> None:
+        labels = [item.label for item in self._items if item.label]
+        if len(labels) != len(set(labels)):
+            raise ValueError("nonempty asset labels must be unique within the collection")
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self) -> Iterator[T]:
+        return (self[index] for index in range(len(self)))
+
+    def _index(self, key: int | str) -> int:
+        if isinstance(key, str):
+            if key:
+                for index, item in enumerate(self._items):
+                    if item.label == key:
+                        return index
+            raise KeyError(key)
+        index = key if key >= 0 else len(self) + key
+        if not 0 <= index < len(self):
+            raise IndexError(key)
+        return index
+
+    @overload
+    def __getitem__(self, key: int | str) -> T: ...
+
+    @overload
+    def __getitem__(self, key: slice) -> Assets[T]: ...
+
+    def __getitem__(self, key: int | str | slice) -> T | Assets[T]:
+        if isinstance(key, slice):
+            return self.select(*range(len(self))[key])
+        index = self._index(key)
+        if not self._decoded:
+            return cast(T, self._items[index])
+        if self._guard is not None:
+            self._guard()
+        if self._project is None:
+            raise PreflightViolation(
+                "Assets values are available after hydration; use info(key) for metadata",
+                code="asset_bytes_unavailable",
+            )
+        if index not in self._cache:
+            self._cache[index] = self._project(self._items[index])
+        return cast(T, self._cache[index])
+
+    @overload
+    def get(self, key: int | str, default: None = None) -> T | None: ...
+
+    @overload
+    def get[D](self, key: int | str, default: D) -> T | D: ...
+
+    def get(self, key: int | str, default: object = None) -> object:
+        """Read an optional occurrence, returning default only when the key is absent."""
+        try:
+            index = self._index(key)
+        except (IndexError, KeyError):
+            return default
+        return self[index]
+
+    def info(self, key: int | str) -> AssetInfo:
+        item = self._items[self._index(key)]
+        return AssetInfo(
+            item.id,
+            item.position,
+            item.label,
+            item.fidelity,
+            item.kind,
+            item.media_type,
+            item.size_bytes,
+            item.digest,
+        )
+
+    def select(self, *keys: int | str) -> Assets[T]:
+        """Select/reorder occurrences without decoding or changing their granted bytes."""
+        result: Assets[T] = Assets(self._items[self._index(key)] for key in keys)
+        result._decoded = self._decoded
+        result._project = self._project
+        result._guard = self._guard
+        return result
+
+    def by_id(self, input_id: str) -> T:
+        for index, item in enumerate(self._items):
+            if item.id == input_id:
+                return self[index]
+        raise KeyError(input_id)
+
+    def by_label(self, label: str) -> T:
+        return self[label]
+
+
 def asset_kinds(annotation: object) -> frozenset[str]:
     """Asset kinds reached through containers/unions, stopping at nested records.
 
@@ -116,8 +327,6 @@ def asset_kinds(annotation: object) -> frozenset[str]:
     own asset field. Stopping at records keeps tagged-union reference schemas from growing
     a second, lossy path-based authority over their leaf fields.
     """
-    from cozy_runtime.author._walker import strip, unwrap_optional
-
     base, _ = strip(annotation)
     base, _ = unwrap_optional(base)
     if isinstance(base, type):
@@ -207,7 +416,18 @@ def digest_bytes(data: bytes) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class GrantedInput:
+class InputMetadata:
+    """Identity and declared metadata from one input binding, before byte hydration."""
+
+    input_id: str
+    media_type: str
+    digest: str
+    length: int
+    order: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GrantedInput(InputMetadata):
     """ONE input the worker already fetched, verified and spooled (cr-012).
 
     Everything on it was established BEFORE acceptance: the bytes were read under the
@@ -216,15 +436,7 @@ class GrantedInput:
     matches this against the FIELD it is about to fill, which is the half only it knows.
     """
 
-    input_id: str
-    """The payload field PATH, list index included — worker-protocol/01's stable identity.
-    Inputs are IDENTIFIED, ORDERED subjects, never a digest-sorted anonymous list."""
     local: Path
-    media_type: str
-    """What the BYTES are, from the sniff — not what the caller declared them to be."""
-    digest: str
-    length: int
-    order: int = 0
 
 
 def bind(
@@ -237,6 +449,8 @@ def bind(
     length: int,
     max_decoded_bytes: int = 0,
     input_id: str = "",
+    order: int = 0,
+    read_guard: Callable[[], None] | None = None,
 ) -> None:
     """Hydrate an asset in place. Runtime-only: author code has no path into this.
 
@@ -253,6 +467,8 @@ def bind(
     asset._local = local
     asset._attempt = attempt
     asset._input_id = input_id
+    asset._position = order
+    asset._read_guard = read_guard
     asset.media_type = media_type
     asset.size_bytes = length
     asset.digest = digest

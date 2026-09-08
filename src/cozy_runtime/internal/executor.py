@@ -44,7 +44,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.author._assets import GrantedInput
+from cozy_runtime.author._assets import GrantedInput, InputMetadata
 from cozy_runtime.author._context import Device
 from cozy_runtime.author._errors import CapabilityError, Outcome, classify
 from cozy_runtime.author._invoke import (
@@ -1893,7 +1893,14 @@ class Executor:
             }
         registration = self.discovered.app.get(command["entrypoint"])
         try:
-            prepared = prepare(registration, command["payload"])
+            prepared = prepare(
+                registration,
+                command["payload"],
+                input_metadata={
+                    name: InputMetadata(**row)
+                    for name, row in command.get("input_metadata", {}).items()
+                },
+            )
         except Exception as exc:
             outcome = classify(exc)
             return {

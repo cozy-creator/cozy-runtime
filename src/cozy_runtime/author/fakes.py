@@ -80,6 +80,7 @@ def fake_input[AssetT: Asset](
     *,
     attempt: str,
     input_id: str = "input",
+    order: int = 0,
     max_decoded_bytes: int = 0,
 ) -> AssetT:
     """`source`'s bytes as a fresh INPUT handle hydrated into `attempt`.
@@ -103,6 +104,7 @@ def fake_input[AssetT: Asset](
         media_type=source.media_type,
         digest=source.digest,
         length=source.size_bytes,
+        order=order,
     )
     bound = type(source)(source.ref)
     bind(
@@ -114,6 +116,7 @@ def fake_input[AssetT: Asset](
         length=granted.length,
         max_decoded_bytes=max_decoded_bytes,
         input_id=granted.input_id,
+        order=granted.order,
     )
     return bound
 
@@ -247,7 +250,14 @@ def invoke_with_fakes(
     spool = spool or _spool(request_id)
     spool.mkdir(parents=True, exist_ok=True)
     return invoke(
-        prepare(registration, wire, recipes=recipes, clamps=clamps, settings=settings),
+        prepare(
+            registration,
+            wire,
+            recipes=recipes,
+            clamps=clamps,
+            settings=settings,
+            input_metadata=assets or {},
+        ),
         Invocation(
             request_id=request_id,
             spool=spool,
