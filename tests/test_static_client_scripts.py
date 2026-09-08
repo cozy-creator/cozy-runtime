@@ -43,9 +43,14 @@ def project(root: Path, code: str) -> Path:
 )
 def test_static_main_equals_execution_adapter(tmp_path: Path, body: str) -> None:
     root = project(tmp_path, body)
-    for name in ("cozy_script", "cozy_script_entry"):
-        sys.modules.pop(name, None)
-    expected = package_interface.build(discover(root))
+    modules = ("cozy_script", "cozy_script_entry")
+    previous = {name: sys.modules.pop(name) for name in modules if name in sys.modules}
+    try:
+        expected = package_interface.build(discover(root))
+    finally:
+        for name in modules:
+            sys.modules.pop(name, None)
+        sys.modules.update(previous)
     actual = static_interface.build(root)
     assert package_interface.canonical_bytes(actual) == package_interface.canonical_bytes(expected)
 
