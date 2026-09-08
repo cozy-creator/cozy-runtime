@@ -35,6 +35,7 @@ from cozy_runtime.author._context import (
     Device,
     RequestView,
 )
+from cozy_runtime.author._data import data_values
 from cozy_runtime.author._decode import (
     DEFAULT_DECODE_LIMITS,
     DecodedAudio,
@@ -282,6 +283,7 @@ __all__ = [
     "attempt",
     "canonical_json",
     "classify",
+    "data_values",
     "decode_request",
     "describe",
     "invocable",

@@ -16,6 +16,7 @@ from cozy_runtime.author import (
     Shape,
     Tree,
     VideoAsset,
+    data_values,
 )
 from cozy_runtime.derive import QuantizeResult
 
@@ -45,7 +46,10 @@ class AudioReference(msgspec.Struct, tag="audio", tag_field="type", forbid_unkno
 
 
 Reference = ImageReference | AudioReference
-Steps = Annotated[Literal[30, 40, 50], msgspec.Meta(description="denoise steps")]
+#: The admitted values are the committed plan's, read as data and never computed (cr-115).
+STEPS = data_values(__file__, "plan.json", "schedules", "transformer_evaluations")
+LANES = data_values(__file__, "plan.json", "lanes")
+Steps = Annotated[Literal[STEPS], msgspec.Meta(description="denoise steps")]  # type: ignore[valid-type]
 
 
 class Common(msgspec.Struct, kw_only=True):
@@ -79,7 +83,7 @@ class RenderResult(msgspec.Struct):
 
 
 class QuantizeRequest(msgspec.Struct, forbid_unknown_fields=True):
-    lanes: Annotated[tuple[Literal["fp8", "mxfp8"], ...], msgspec.Meta(min_length=1)] = (
+    lanes: Annotated[tuple[Literal[LANES], ...], msgspec.Meta(min_length=1)] = (  # type: ignore[valid-type]
         "fp8",
         "mxfp8",
     )

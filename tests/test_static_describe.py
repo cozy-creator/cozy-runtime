@@ -73,6 +73,7 @@ def test_rich_fixture_spells_the_whole_vocabulary() -> None:
         '"wire": "omissible"',
         '"constraints": {"ge": 256, "le": 2048}',
         '"literal": [30, 40, 50]',
+        '"literal": ["fp8", "mxfp8"]',
         '"literal": ["16:9", "1:1"]',
         '"map"',
         '"kind_of"',
@@ -133,24 +134,65 @@ def test_refuses_an_annotation_outside_the_vocabulary(tmp_path: Path) -> None:
 
 
 def test_refuses_a_computed_decorator_argument(tmp_path: Path) -> None:
+    """A comprehension folds only over a CONSTANT; a call in its iterable still refuses."""
+    project = _variant(
+        tmp_path,
+        {"__init__.py": ("for lane in LANE_ENCODINGS)", "for lane in _lanes())")},
+    )
+    init = project / "rich_package" / "__init__.py"
+    init.write_text(
+        init.read_text().replace(
+            "app = App()\n",
+            'app = App()\n\n\ndef _lanes() -> tuple[str, ...]:\n    return ("fp8", "mxfp8")\n',
+        )
+    )
+    refusal = _refusal(project)
+    assert refusal.code == "static_computed"
+    assert "rich_package/__init__.py:" in str(refusal)
+    assert "`_lanes()`" in str(refusal)
+    assert "a call: its value exists only at run time" in str(refusal)
+
+
+def test_refuses_a_filtered_comprehension(tmp_path: Path) -> None:
     project = _variant(
         tmp_path,
         {
             "__init__.py": (
-                "    weights=(\n"
-                '        WeightsOutput("fp8", max_new_bytes=LANE_BYTES),\n'
-                '        WeightsOutput("mxfp8", max_new_bytes=LANE_BYTES),\n'
-                "    ),\n",
-                "    weights=tuple(WeightsOutput(l, max_new_bytes=LANE_BYTES) "
-                'for l in ("fp8", "mxfp8")),\n',
+                "for lane in LANE_ENCODINGS)",
+                'for lane in LANE_ENCODINGS if lane != "fp8")',
             )
         },
     )
     refusal = _refusal(project)
     assert refusal.code == "static_computed"
-    assert "rich_package/__init__.py:" in str(refusal)
-    assert "`tuple(WeightsOutput(l, max_new_bytes=LANE_BYTES) for l in" in str(refusal)
-    assert "a call: its value exists only at run time" in str(refusal)
+    assert "a filtered, async or unpacking comprehension" in str(refusal)
+
+
+def test_refuses_a_data_asset_outside_the_module(tmp_path: Path) -> None:
+    project = _variant(
+        tmp_path,
+        {
+            "schemas.py": (
+                'data_values(__file__, "plan.json"',
+                'data_values(__file__, "../plan.json"',
+            )
+        },
+    )
+    refusal = _refusal(project)
+    assert refusal.code == "static_unsupported"
+    assert "rich_package/schemas.py:" in str(refusal)
+    assert "resolves outside" in str(refusal)
+    assert "ships beside the module naming it" in str(refusal)
+
+
+def test_refuses_a_data_asset_path_that_is_not_there(tmp_path: Path) -> None:
+    project = _variant(
+        tmp_path,
+        {"schemas.py": ('"schedules", "transformer_evaluations"', '"schedules", "denoise_steps"')},
+    )
+    refusal = _refusal(project)
+    assert refusal.code == "static_unsupported"
+    assert "data asset 'plan.json' has no schedules.denoise_steps" in str(refusal)
 
 
 def test_refuses_a_call_inside_a_literal(tmp_path: Path) -> None:
@@ -158,7 +200,7 @@ def test_refuses_a_call_inside_a_literal(tmp_path: Path) -> None:
         tmp_path,
         {
             "schemas.py": (
-                "Steps = Annotated[Literal[30, 40, 50], ",
+                "Steps = Annotated[Literal[STEPS], ",
                 "def _steps() -> tuple[int, ...]:\n    return (30, 40, 50)\n\n\n"
                 "Steps = Annotated[Literal[_steps()], ",
             )
