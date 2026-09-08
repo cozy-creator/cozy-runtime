@@ -228,7 +228,7 @@ _SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
 #: A fold carries no local names unless a comprehension binds its own target.
 _NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
-_ENTRYPOINT_KEYWORDS = frozenset({"name", "preflight", "demand", "hidden"})
+_ENTRYPOINT_KEYWORDS = frozenset({"name", "preflight", "demand", "hidden", "memoize"})
 _JOB_KEYWORDS = frozenset({"name", "publishes", "emits_media", "weights", "demand"})
 
 
@@ -1314,6 +1314,10 @@ def _registration(
             return None
         elif keyword.arg == "publishes":
             publishes = bool(value)
+        elif keyword.arg == "memoize":
+            if type(value) is not bool:
+                reader.refuse(module, keyword.value, "entrypoint memoize must be a boolean")
+            memoize = value
         elif keyword.arg == "weights":
             assert isinstance(value, tuple)
             weights = tuple(value)
@@ -1458,6 +1462,7 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
             export=fn.name,
             context=contexts[0] if contexts else "",
             capabilities=sorted(capabilities),
+            memoize=registration.memoize,
         )
     return doc
 

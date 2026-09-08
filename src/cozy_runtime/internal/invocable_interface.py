@@ -27,6 +27,7 @@ def metadata(surface: Surface) -> dict[str, Any]:
             export=surface.fn.__name__,
             context=next((p.name for p in surface.params if p.role == "context"), ""),
             capabilities=sorted(surface.capabilities),
+            memoize=surface.memoize,
         )
     parameters = [
         parameter.name
@@ -60,6 +61,7 @@ def serving_metadata(
     export: str,
     context: str,
     capabilities: Sequence[str],
+    memoize: bool = False,
 ) -> dict[str, Any]:
     """Caller names over the existing serving wire schema; never change its handler."""
     return from_types(
@@ -73,7 +75,7 @@ def serving_metadata(
             for field in msgspec.structs.fields(typing.cast(type[msgspec.Struct], payload_type))
         ],
         parameter_defaults={},
-        memoize=False,
+        memoize=memoize,
         capabilities=capabilities,
         serving=True,
     )
@@ -182,8 +184,6 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
         raise ConformanceError(
             "invocable memoization declaration must be a boolean", code="invocable_interface"
         )
-    if kind == "entrypoint" and value["memoize"]:
-        raise ConformanceError("serving inference is not memoized", code="invocable_memoize")
     capabilities = value["capabilities"]
     if (
         not isinstance(capabilities, list)

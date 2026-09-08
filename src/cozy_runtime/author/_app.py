@@ -122,6 +122,7 @@ class App:
         demand: Bound | None = None,
         source_profiles: Mapping[str, str] | None = None,
         hidden: bool = False,
+        memoize: bool = False,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def entrypoint(
@@ -134,16 +135,22 @@ class App:
         demand: Bound | None = None,
         source_profiles: Mapping[str, str] | None = None,
         hidden: bool = False,
+        memoize: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a request-serving callable. BARE is the common case (§1.2).
 
         `hidden=True` declares a surface that is real but NOT READY: it is omitted from the
         published interface and gets no binding staged and no traffic (§1.2, #572d).
 
+        `memoize=True` explicitly admits deterministic measurement results to the managed
+        operation cache. Ordinary generation remains nonmemoized by default.
+
         ``source_profiles`` is RETIRED (cr-077): capability is the slot's class annotation,
         and the publish-time slot facts are derived from the class itself. Passing it
         refuses with the typed code ``source_profiles_retired``."""
         _refuse_source_profiles(source_profiles)
+        if type(memoize) is not bool:
+            raise RegistrationError("entrypoint memoize must be a boolean")
         return self._register(
             "entrypoint",
             fn,
@@ -153,6 +160,7 @@ class App:
             preflight=preflight,
             demand=demand,
             hidden=hidden,
+            memoize=memoize,
         )
 
     @overload
@@ -230,6 +238,7 @@ class App:
         demand: Bound | None,
         emits_media: bool = False,
         hidden: bool = False,
+        memoize: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             if self._frozen:
@@ -247,7 +256,7 @@ class App:
                 kind=kind,
                 fn=export.implementation if (export := _export(target)) else target,
                 invocable=export is not None,
-                memoize=export.memoize if export is not None else False,
+                memoize=export.memoize if export is not None else memoize,
                 publishes=publishes,
                 emits_media=emits_media,
                 weights_outputs=weights_outputs,
