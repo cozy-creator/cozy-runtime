@@ -27,6 +27,7 @@ from cozy_runtime.internal.static_interface import StaticRefusal
 
 ROOT = Path(__file__).resolve().parent.parent
 RICH = ROOT / "tests" / "testdata" / "static_describe" / "rich"
+SCRIPT = ROOT / "tests" / "testdata" / "static_describe" / "script"
 MARCO = ROOT / "examples" / "marco-polo"
 TIMEOUT = 600
 
@@ -57,9 +58,16 @@ def _run(*argv: str, cwd: Path | str = "/", expect: int = 0) -> subprocess.Compl
     return result
 
 
-@pytest.mark.parametrize("project", [RICH, MARCO], ids=["rich", "marco-polo"])
+@pytest.mark.parametrize("project", [RICH, MARCO, SCRIPT], ids=["rich", "marco-polo", "script"])
 def test_source_reading_equals_imported_app(project: Path) -> None:
     assert _static(project) == _imported(project)
+
+
+def test_generated_script_app_is_read_not_imported() -> None:
+    """Creator generates `app = script_app("cozy_script")`; the adapter's one job is
+    fixed, so the surface is fixed and only the script's `main` needs reading."""
+    doc = static_interface.build(SCRIPT)
+    assert doc["entrypoints"] == [] and [j["name"] for j in doc["jobs"]] == ["main"]
 
 
 def test_rich_fixture_spells_the_whole_vocabulary() -> None:
@@ -236,6 +244,35 @@ def test_refuses_a_type_imported_inside_a_function(tmp_path: Path) -> None:
     assert "imports it inside `def _facts` — every import goes at the top of the file" in str(
         refusal
     )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "def other():\n    pass\n",
+        "def main(value):\n    pass\n",
+        "def main(*args):\n    pass\n",
+        "def main():\n    yield 1\n",
+    ],
+    ids=["no-main", "wrong-parameter", "varargs", "generator"],
+)
+def test_refuses_a_script_whose_main_is_not_the_declared_shape(tmp_path: Path, body: str) -> None:
+    project = tmp_path / "script"
+    shutil.copytree(SCRIPT, project, ignore=shutil.ignore_patterns("__pycache__"))
+    (project / "cozy_script.py").write_text(body)
+    refusal = _refusal(project)
+    assert refusal.code == "static_unresolvable"
+    assert "cozy_script.py:" in str(refusal)
+    assert "script_main" in str(refusal)
+
+
+def test_refuses_an_export_that_is_neither_an_app_nor_a_script(tmp_path: Path) -> None:
+    project = tmp_path / "script"
+    shutil.copytree(SCRIPT, project, ignore=shutil.ignore_patterns("__pycache__"))
+    (project / "cozy_script_entry.py").write_text("app = 1\n")
+    refusal = _refusal(project)
+    assert refusal.code == "not_an_app"
+    assert "`app = App()` or `app = script_app" in str(refusal)
 
 
 def test_explicit_registration_by_call_matches_decorators(tmp_path: Path) -> None:

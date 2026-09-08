@@ -285,7 +285,7 @@ def run(
             workspace=workspace,
             package_code_digest=package_code_digest,
             package_interface_document=body if kind == "entrypoint" else None,
-            found=found,
+            project=project,
             development_tensorfs_root=tensorfs_root,
             development_binding_overrides=overrides,
             options=WorkerOptions(

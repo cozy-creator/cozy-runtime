@@ -490,7 +490,7 @@ def _drive(
         source_digest=source_digest,
         artifact_cache=workspace / "artifact-cache",
         tensorfs_root=store.root,
-        found=found,
+        project=package,
     )
     placements = []
     for placement_id in dict.fromkeys(turn.placement_id for turn in turns):
@@ -786,7 +786,7 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
             source_digest=source_digest,
             artifact_cache=root / "artifact-cache",
             tensorfs_root=store.root,
-            found=found,
+            project=PACKAGE,
         )
         options = WorkerOptions(
             root=root / "worker",

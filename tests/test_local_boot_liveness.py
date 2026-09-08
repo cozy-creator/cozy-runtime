@@ -119,7 +119,7 @@ def _run(root: Path, hook: Any) -> tuple[SliceOutcome, float]:
             workspace=workspace,
             package_code_digest=digest,
             package_interface_document=body,
-            found=found,
+            project=PACKAGE,
             development_tensorfs_root=home / "tensorfs",
             options=WorkerOptions(root=workspace / "worker", release_id=digest),
             record_owner_hook=hook,

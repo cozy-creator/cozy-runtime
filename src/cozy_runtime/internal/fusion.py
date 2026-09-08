@@ -18,11 +18,15 @@ NOTHING COMPILES AT RUNTIME. The `@triton.jit` functions below are the kernel SO
 time — in the worker image's build stage, or once on a developer's box — into a plain
 directory of Triton cache entries plus a manifest. `load()` resolves each spec to its cubin
 by recomputing Triton's own cache key from the sources, the pinned Triton and the device
-architecture, and refuses typed (`fusion_kernels_absent` / `fusion_kernels_stale`) when the
-artifact does not hold exactly that key. The key covers kernel source (including the
-kernel's line position in this file), signature and architecture only: a LoRA, a component
-swap, a step count or a reference count cannot invalidate it, because none of them enters
-the kernel.
+architecture. Three typed codes, and the difference is what a consenting package does with
+them (`fusion_install.py`): `fusion_kernels_absent` and `fusion_kernels_stale` mean this
+image was never given kernels for this runtime and device, so `fusion="accept"` records
+them and serves eager; `fusion_kernels_corrupt` means the artifact IS keyed to this runtime
+and still does not work — a bad bake, which refuses under either consent rather than hiding.
+
+The key covers kernel source (including the kernel's line position in this file), signature
+and architecture only: a LoRA, a component swap, a step count or a reference count cannot
+invalidate it, because none of them enters the kernel.
 
 Adapted from NVlabs/Sana `sol-engine` `models/minimax_h3/{GB200,GB10}/fusions.py`
 (Apache-2.0): the per-row program shape, the table-row gather inside the kernel, the
@@ -535,7 +539,7 @@ def check_artifact(directory: Path, arch: int) -> dict[str, Any]:
         raise FusionUnavailable("fusion_kernels_absent", f"no fused-kernel artifact at {directory}")
     manifest = json.loads(path.read_text())
     if not isinstance(manifest, dict):
-        raise FusionUnavailable("fusion_kernels_stale", f"{path} is not a manifest object")
+        raise FusionUnavailable("fusion_kernels_corrupt", f"{path} is not a manifest object")
     if triton.__version__ != TRITON_VERSION:
         raise FusionUnavailable(
             "fusion_kernels_stale",
@@ -572,8 +576,12 @@ def check_artifact(directory: Path, arch: int) -> dict[str, Any]:
                 )
             entry_file = f"{_KERNELS[spec.kernel].__name__}.json"
             if not (directory / f"sm{arch}" / expected / entry_file).is_file():
+                # THE MANIFEST NAMES THIS RUNTIME'S OWN KEY and the files are not there:
+                # a bad bake, not an image that was never given the kernels.
                 raise FusionUnavailable(
-                    "fusion_kernels_absent", f"{spec.key} for sm{arch}: entry files are missing"
+                    "fusion_kernels_corrupt",
+                    f"{spec.key} for sm{arch}: the manifest names key {expected[:12]} and "
+                    f"{directory / f'sm{arch}' / expected / entry_file} is missing",
                 )
     return manifest
 
@@ -607,7 +615,7 @@ def load(device: Any, directory: Path | None = None) -> _Loaded:
                 kernel._init_handles()
             except Exception as exc:
                 raise FusionUnavailable(
-                    "fusion_kernels_absent", f"{spec.key} does not load on sm{arch}: {exc}"
+                    "fusion_kernels_corrupt", f"{spec.key} does not load on sm{arch}: {exc}"
                 ) from exc
             compiled[spec.key] = kernel
     result = _Loaded(arch, compiled)
@@ -621,6 +629,14 @@ def _place_utils(directory: Path, manifest: dict[str, Any]) -> None:
     key = str(manifest["utils"])
     target = Path(get_cache_manager(key).cache_dir)
     source = directory / "utils" / key
+    if not source.is_dir():
+        # `check_artifact` already agreed the manifest's key is this platform's, so an
+        # artifact without the module it names was built wrong (a `--check`-shaped build,
+        # or a `build_utils()` whose `cuda_utils` never linked against `libcuda.so.1`).
+        raise FusionUnavailable(
+            "fusion_kernels_corrupt",
+            f"the artifact names launcher module {key[:12]} and {source} is not there",
+        )
     for path in source.iterdir():
         if path.is_file() and not (target / path.name).exists():
             shutil.copy2(path, target / path.name)

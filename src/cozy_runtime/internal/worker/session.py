@@ -3733,19 +3733,18 @@ class Worker:
                 return None
             try:
                 from cozy_runtime.internal import local as development_local
-                from cozy_runtime.internal import package_interface
-                from cozy_runtime.internal.discovery import discover
+                from cozy_runtime.internal import static_interface
 
-                found = discover(self.options.development_project)
+                # A SOURCE reading (#713): the session supervises, the executor imports.
                 staged = development_local.stage_development_placement(
                     self.config.cozy_home,
-                    package_interface.build(found),
+                    static_interface.build(self.options.development_project),
                     package=self.options.development_package,
                     release=self.options.development_release,
                     source_digest=self.options.development_source_digest,
                     artifact_cache=self.options.artifact_cache,
                     tensorfs_root=self.options.tensorfs_root,
-                    found=found,
+                    project=self.options.development_project,
                     binding_overrides=self.options.development_binding_overrides,
                 )
                 return acquire.preinstalled_development(
@@ -4875,7 +4874,7 @@ class Worker:
                     f"APPLIED {_fused.get('identity', '?')} sites={_fused.get('sites')} "
                     f"fp8_sites={_fused.get('fp8_sites')} warm={_fused.get('warm_ms')}ms"
                     if _fused.get("applied")
-                    else f"NOT APPLIED ({_fused.get('reason')})"
+                    else f"NOT APPLIED [{_fused.get('code')}] {_fused.get('reason')}"
                 ),
             )
         self.note(

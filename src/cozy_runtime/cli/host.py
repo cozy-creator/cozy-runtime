@@ -181,21 +181,21 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         )
     if all(development.values()):
         from cozy_runtime.author import ConformanceError
-        from cozy_runtime.internal import local, package_interface
-        from cozy_runtime.internal.discovery import discover
+        from cozy_runtime.internal import local, static_interface
 
         project = Path(development["--development-project"]).expanduser().resolve()
         try:
-            found = discover(project)
+            # A SOURCE reading, here as everywhere: the host launches the worker and never
+            # runs the package (#713). The executor imports it, in its own process.
             staged = local.stage_development_placement(
                 config.cozy_home,
-                package_interface.build(found),
+                static_interface.build(project),
                 package=development["--development-package"],
                 release=development["--development-release"],
                 source_digest=development["--development-source-digest"],
                 artifact_cache=Path(values["--artifact-cache"]).expanduser().resolve(),
                 tensorfs_root=Path(values["--tensorfs-root"]).expanduser().resolve(),
-                found=found,
+                project=project,
             )
         except ConformanceError as exc:
             raise CliError(
@@ -256,7 +256,6 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
 
     from cozy_runtime.author import ConformanceError
     from cozy_runtime.internal import local, static_interface
-    from cozy_runtime.internal.discovery import discover
     from cozy_runtime.internal.worker.session import SEMVER
     from cozy_runtime.protocol import documents
     from cozy_runtime.protocol import worker_pb2 as pb
@@ -309,19 +308,12 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
             if "--environment-python" in values
             else None,
         )
-        entries = interface["entrypoints"]
-        assert isinstance(entries, list)
-        # Job-only and weightless placement use only the closed interface. Serving
-        # models still follow the existing construction path until their preparation
-        # is moved behind the admitted worker boundary.
-        modeled = any(isinstance(entry, dict) and entry.get("models") for entry in entries)
-        found = discover(project) if modeled else None
         development = local.development_placement_documents(
             interface,
             package=package,
             release=release,
             source_digest=source_digest,
-            found=found,
+            project=project,
             cozy_home=config.cozy_home,
             tensorfs_root=Path(values["--tensorfs-root"]).expanduser().resolve(),
         )

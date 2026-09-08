@@ -147,7 +147,7 @@ def _slice(
             workspace=workspace,
             package_code_digest=revision,
             package_interface_document=body if kind == "entrypoint" else None,
-            found=found,
+            project=PACKAGE,
             development_tensorfs_root=config.cozy_home / "tensorfs",
             options=WorkerOptions(root=workspace / "worker", devices=devices),
             record_owner_hook=capture,

@@ -1266,11 +1266,19 @@ class Executor:
                 application=str(binding["application"]),
                 model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
             )
-            # THE FUSED GLUE (h3a-015), under the class's `fusion="accept"` only: a
-            # substitution of forwards after fill, refused typed when Triton is absent.
+            # THE FUSED GLUE (h3a-015), under the class's `fusion=` consent only: a
+            # substitution of forwards after fill. `accept` is CONSENT, not a requirement —
+            # an image without the built kernels serves eager and the record says so;
+            # only `require` refuses the placement typed.
+            consent = str(getattr(model_cls, "__fusion__", "refuse"))
             fused = (
-                apply_fusion_plan(model, torch=torch, device=self._rank_device(torch))
-                if getattr(model_cls, "__fusion__", "refuse") == "accept"
+                apply_fusion_plan(
+                    model,
+                    torch=torch,
+                    device=self._rank_device(torch),
+                    required=consent == "require",
+                )
+                if consent in ("accept", "require")
                 else None
             )
             stage("execution_plan")

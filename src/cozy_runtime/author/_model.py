@@ -91,8 +91,11 @@ ENCODED_LEAVES: Mapping[str, str] = {
 FUSION: Mapping[str, str] = {
     "refuse": "the runtime runs every module's own forward; no fused plan is installed",
     "accept": "this package's code depends on no module's class identity and on no "
-    "intermediate between a norm and the GEMM it feeds, so the runtime may substitute its "
-    "fused glue kernels for the modules it has exact-source matches for",
+    "intermediate between a norm and the GEMM it feeds, so the runtime MAY substitute its "
+    "fused glue kernels for the modules it has exact-source matches for — a device without "
+    "the built kernels serves the eager forward and the prepare records why",
+    "require": "the same consent, and this package will not serve without it: a device "
+    "whose fused kernels are absent or stale refuses the placement typed",
 }
 
 #: Keyword names an author-facing model method may not declare. Every one of them names a
@@ -411,7 +414,8 @@ class Model[PipelineT]:
 
     __fusion__: str = "refuse"
     """The class's `fusion=` declaration (h3a-015), defaulted the same way for the same
-    reason: silence is not consent to a substituted forward."""
+    reason: silence is not consent to a substituted forward. Nothing defaults to
+    `require` — a requirement is only ever spelled out."""
 
     checkpoint_ref: str = ""
     """The pinned-ref REPRODUCTION FACT for result structs — an observation, never catalog

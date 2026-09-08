@@ -983,10 +983,13 @@ def build(project: Path, *, environment_python: Path | None = None) -> dict[str,
     entry = reader.application_module(module_name)
     app = reader.lookup(entry, attribute, entry.tree)
     if isinstance(app, Assigned) and _is_script_call(reader, app):
-        return package_interface.assemble(application, [("job", _script_doc(reader, app))], {})
+        return package_interface.assemble(
+            application, [("job", _script_doc(reader, app))], read_table(project / "package.toml")
+        )
     if not (isinstance(app, Assigned) and _is_app_call(reader, app)):
         raise StaticRefusal(
-            f"{application}: {attribute!r} is not `{attribute} = App()` at module scope of "
+            f"{application}: {attribute!r} is not `{attribute} = App()` or "
+            f'`{attribute} = script_app("<module>")` at module scope of '
             f"{reader.spell(entry.path)}",
             code="not_an_app",
         )
@@ -1358,7 +1361,10 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
     module = reader.module(call.args[0].value, where=(app.module, call))
     if len(module.source.encode()) > 32 << 20:
         reader.refuse(module, module.tree, "script exceeds its source bound")
-    fn = main_definition(module.tree)
+    try:
+        fn = main_definition(module.tree)
+    except author.ConformanceError as exc:
+        reader.refuse(module, module.tree.body[0] if module.tree.body else call, str(exc))
     try:
         defaults, weights = declarations(module.source.encode())
     except (ValueError, TypeError) as exc:
