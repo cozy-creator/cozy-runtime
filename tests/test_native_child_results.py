@@ -128,8 +128,10 @@ def retained(tmp_path: Path) -> tuple[Workspace, pb.ChildCallResult, bytes]:
     return Workspace(workspace.store_root), result, data
 
 
+@pytest.mark.parametrize("legacy_prefix", [False, True])
 def test_result_materializes_after_ack_and_gc_then_forwards_as_native_inputs(
     tmp_path: Path,
+    legacy_prefix: bool,
 ) -> None:
     workspace, reply, data = retained(tmp_path)
     rows = child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
@@ -157,7 +159,7 @@ def test_result_materializes_after_ack_and_gc_then_forwards_as_native_inputs(
     source = reply.byte_result_grants[0].source
     input_hold = pb.NativeByteRetentionRequest(source=source, retention_id="sha256:" + "03" * 32)
     outputs.change_hold(workspace, "owner", input_hold, release=False)
-    tree_id = "tree:" + result.bundle.digest
+    tree_id = "tree:" + result.bundle.digest if legacy_prefix else "bundle"
     spec = pb.InvocationSpec(
         job=pb.JobInvocationSpec(),
         inputs=[
@@ -425,3 +427,31 @@ def test_encoded_png_refuses_a_wrong_kind_or_mime(tmp_path: Path, kind: str, mim
     reply.result_canonical_bytes = canonical_json.encode(value)
     with pytest.raises(WorkspaceRefusal, match="media type"):
         child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
+
+
+def test_abort_reclaims_readonly_projections_without_following_storage_links(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "native-storage"
+    original.mkdir()
+    source = original / "payload"
+    source.write_bytes(b"native bytes must survive")
+    source.chmod(0o444)
+    original.chmod(0o555)
+    spool = tmp_path / "attempt"
+    projected = spool / "child-results" / "0" / "0"
+    nested = projected / "nested"
+    nested.mkdir(parents=True)
+    copy = nested / "payload"
+    copy.write_bytes(source.read_bytes())
+    copy.chmod(0o444)
+    nested.chmod(0o555)
+    projected.chmod(0o555)
+    (spool / "storage-link").symlink_to(original, target_is_directory=True)
+    (spool / "file-link").symlink_to(source)
+    assert grants.abort_outputs(spool) == 3
+    assert spool.is_dir() and list(spool.iterdir()) == []
+    assert source.read_bytes() == b"native bytes must survive"
+    assert source.stat().st_mode & 0o777 == 0o444
+    assert original.stat().st_mode & 0o777 == 0o555
+    original.chmod(0o755)  # the test's own fixture cleanup

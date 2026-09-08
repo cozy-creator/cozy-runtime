@@ -244,6 +244,14 @@ class BoundInput:
     native_tree: pb.NativeByteRetentionRequest | None = None
 
 
+def _tree_input(entry: BoundInput) -> bool:
+    from cozy_runtime.internal.worker.workspace_byte_outputs import TREE_MIME
+
+    return entry.input_id.startswith(TREE_PREFIX) or (
+        entry.native_tree is not None and entry.kind_mime == TREE_MIME
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class BoundOutput:
     """One output destination: contract from the SPEC, presigned/granted URL from the GRANT."""
@@ -320,7 +328,12 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             raise GrantRefusal(
                 "grant_input_identity", f"input {input_id!r} has malformed numeric facts"
             ) from exc
-        is_tree = input_id.startswith(TREE_PREFIX)
+        from cozy_runtime.internal.worker.workspace_byte_outputs import TREE_MIME
+
+        native = native_inputs.get(input_id)
+        is_tree = input_id.startswith(TREE_PREFIX) or (
+            native is not None and row.get("kind_mime") == TREE_MIME
+        )
         is_model = input_id.startswith(MODEL_PREFIX)
         if not is_tree and (
             not spelled.startswith("sha256:")
@@ -360,7 +373,6 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
                     "grant_model_identity",
                     f"input {input_id!r} is not one exact host-local Model Manifest capability",
                 )
-        native = native_inputs.get(input_id)
         if native is not None:
             from cozy_runtime.internal.worker.byte_inputs import validate_source
 
@@ -375,7 +387,10 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             if is_tree and (
                 digest != native.source.manifest.digest
                 or carried_length != native.source.manifest.length
-                or input_id[len(TREE_PREFIX) :] != "sha256:" + digest.hex()
+                or (
+                    input_id.startswith(TREE_PREFIX)
+                    and input_id[len(TREE_PREFIX) :] != "sha256:" + digest.hex()
+                )
             ):
                 raise GrantRefusal(
                     "grant_native_identity", "native tree input differs from its manifest"
@@ -687,13 +702,13 @@ def hydrate_inputs(
         e
         for e in sorted(grant.inputs.values(), key=lambda e: (e.order, e.input_id))
         if e.input_id != PAYLOAD_INPUT
-        and not e.input_id.startswith(TREE_PREFIX)
+        and not _tree_input(e)
         and not e.input_id.startswith(MODEL_PREFIX)
     ]
     declared_total = sum(int(e.length) for e in entries) + sum(
         e.native_tree.source.content_bytes
         for e in grant.inputs.values()
-        if e.input_id.startswith(TREE_PREFIX) and e.native_tree is not None
+        if _tree_input(e) and e.native_tree is not None
     )
     if declared_total > max_total_bytes:
         raise GrantRefusal(
@@ -862,9 +877,13 @@ def read_trees(
         raise GrantRefusal("grant_expired", "the delivery grant expired before the tree read")
     out: dict[str, tuple[Path, str]] = {}
     for position, entry in enumerate(sorted(grant.inputs.values(), key=lambda e: e.input_id)):
-        if not entry.input_id.startswith(TREE_PREFIX):
+        if not _tree_input(entry):
             continue
-        ref = entry.input_id[len(TREE_PREFIX) :]
+        ref = (
+            entry.input_id[len(TREE_PREFIX) :]
+            if entry.input_id.startswith(TREE_PREFIX)
+            else "sha256:" + entry.digest.hex()
+        )
         if entry.native_tree is not None:
             if workspace is None or spool is None:
                 raise GrantRefusal("grant_native_unavailable", "native tree input has no workspace")
@@ -1144,9 +1163,6 @@ def _output_media_type(output_id: str, bound: str, produced: str) -> str:
 def abort_outputs(spool: Path) -> int:
     """Abort an attempt's uncommitted outputs. Bytes written under the grant are the
     RecordOwner's problem only once a terminal claims them; the spool is ours."""
-    removed = 0
-    for path in sorted(spool.rglob("*")):
-        if path.is_file():
-            path.unlink()
-            removed += 1
-    return removed
+    from cozy_runtime.internal.worker.byte_inputs import remove_checkout
+
+    return remove_checkout(spool, keep_root=True)
