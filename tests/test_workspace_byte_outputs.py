@@ -266,3 +266,51 @@ def test_real_native_tree_rpc_stream_is_membership_checked(tmp_path: Path) -> No
     finally:
         server.stop(0).wait()
         pool.shutdown()
+
+
+@pytest.mark.parametrize("fault", ["corrupt", "directory"])
+def test_native_integrity_fault_is_permanent_rpc_refusal(tmp_path: Path, fault: str) -> None:
+    workspace, spec, manifest, path = producing(tmp_path)
+    data = path.read_bytes()
+    source = outputs.commit(
+        workspace, "owner", "producer", 1, spec, "report", manifest, [("payload", path)], 200000
+    )
+    digest = hashlib.sha256(data).hexdigest()
+    blob = workspace.store_root / "blobs" / digest[:2] / digest[2:4] / digest
+    blob.unlink()
+    if fault == "directory":
+        blob.mkdir()
+        expected = "NOT_REGULAR_FILE"
+    else:
+        blob.write_bytes(b"x" * len(data))
+        expected = "OBJECT_CORRUPT"
+
+    class Handler(WorkspaceRPC, rpc.RuntimePreparationServicer):  # type: ignore[misc] # generated gRPC base
+        pass
+
+    handler = Handler()
+    handler.workspace_service = Service(workspace, lambda _: "owner", lambda _: pb.WeightsHostAck())
+    pool = ThreadPoolExecutor(max_workers=2)
+    server = grpc.server(pool)
+    rpc.add_RuntimePreparationServicer_to_server(handler, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    try:
+        with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
+            client = rpc.RuntimePreparationStub(channel)
+            with pytest.raises(grpc.RpcError) as refused:
+                client.WorkspaceRetainByteTree(
+                    pb.NativeByteRetentionCall(
+                        claim=pb.Claim(worker_id="worker"),
+                        request=pb.NativeByteRetentionRequest(
+                            source=source, retention_id="sha256:" + "ee" * 32
+                        ),
+                    ),
+                    timeout=10,
+                )
+            assert refused.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+            assert refused.value.details() == f"workspace integrity refused: {expected}"
+            assert str(tmp_path) not in refused.value.details()
+    finally:
+        server.stop(0).wait()
+        pool.shutdown(wait=True)
