@@ -383,6 +383,45 @@ class Workspace:
                 )
             ]
 
+    @contextmanager
+    def held_model(
+        self, owner: str, source: pb.DerivedRetentionRequest, manifest: pb.Ref
+    ) -> Iterator[None]:
+        """Lease an exact retained model while preparation reads its native closure."""
+        self.owner(owner)
+        if len(manifest.digest) != 32 or not manifest.length:
+            raise WorkspaceRefusal("native model manifest is incomplete")
+
+        def verify(db: Journal) -> None:
+            row = db.execute(
+                "SELECT * FROM holds WHERE id=? AND owner=?", (source.retention_id, owner)
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "held"
+                or row["transaction_id"] != source.weights_transaction_id
+                or row["native_digest"] != source.tensorfs_receipt_digest
+                or row["manifest"] != manifest.digest
+                or row["manifest_length"] != manifest.length
+            ):
+                raise WorkspaceRefusal("native model has no exact retained owner obligation")
+
+        store = fill.tensorfs_module().Store.open(str(self.store_root))
+        lease = None
+        try:
+            with self.locked() as db:
+                verify(db)
+                lease = db.native(
+                    lambda: store.acquire_cozytensors(documents.spell(manifest.digest))
+                )
+                verify(db)
+            yield
+            with self.locked() as db:
+                verify(db)
+        finally:
+            if lease is not None:
+                lease.release()
+
     def retain(
         self, owner: str, request: pb.DerivedRetentionRequest, *, release: bool = False
     ) -> pb.DerivedRetentionResult:

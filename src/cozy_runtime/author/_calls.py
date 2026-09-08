@@ -21,7 +21,8 @@ from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
 
 P = ParamSpec("P")
 R = TypeVar("R")
-MAX_DIRECT_CALLS = 32
+MAX_ACTIVE_CALLS = 32
+MAX_CALL_INDEX = (1 << 32) - 1
 MAX_CALL_BYTES = 48 * 1024
 
 
@@ -182,7 +183,8 @@ class _Broker:
         exchange: Callable[[str, dict[str, Any]], dict[str, Any]],
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
-        self.calls: list[PendingCall[Any]] = []
+        self.calls: dict[int, PendingCall[Any]] = {}
+        self.next_index = 0
         self.closed = False
         self.activated: set[int] = set()
         self.context: Context | None = None
@@ -208,8 +210,10 @@ class _Broker:
             raise CapabilityError(
                 "export is not an exact locked dependency", code="child_undeclared"
             )
-        if len(self.calls) >= MAX_DIRECT_CALLS:
-            raise CapabilityError("direct package call bound exceeded", code="child_fanout")
+        if len(self.calls) >= MAX_ACTIVE_CALLS:
+            raise CapabilityError("active package call bound exceeded", code="child_fanout")
+        if self.next_index > MAX_CALL_INDEX:
+            raise CapabilityError("package call index is exhausted", code="child_index_exhausted")
         try:
 
             def asset_value(value: object) -> object:
@@ -238,8 +242,9 @@ class _Broker:
             ) from exc
         if len(payload) > MAX_CALL_BYTES:
             raise CapabilityError("package call exceeds inline bound", code="child_payload_bound")
-        call = PendingCall[Any](self, len(self.calls), binding, payload, ctx)
-        self.calls.append(call)
+        call = PendingCall[Any](self, self.next_index, binding, payload, ctx)
+        self.next_index += 1
+        self.calls[call.index] = call
         return call
 
     async def run(self, call: PendingCall[R]) -> R:
@@ -251,7 +256,7 @@ class _Broker:
                 call.ctx.raise_if_cancelled()
                 if self.closed:
                     raise ChildCallError("escaped_handle", "parent attempt closed", call.index)
-                for ready in self.calls:
+                for ready in tuple(self.calls.values()):
                     if ready.task is not None and ready.index not in self.activated:
                         answer = self.exchange("child_call", self._intent(ready))
                         self._observe(ready, answer)
@@ -297,6 +302,13 @@ class _Broker:
             if call.index in self.activated and not self.closed:
                 self.exchange("child_cancel", {"call_index": call.index})
             raise
+        finally:
+            try:
+                if call.index in self.activated and not self.closed:
+                    self.exchange("child_forget", {"call_index": call.index})
+            finally:
+                self.activated.discard(call.index)
+                self.calls.pop(call.index, None)
 
     @staticmethod
     def _observe(call: PendingCall[Any], answer: Mapping[str, Any]) -> None:
@@ -348,7 +360,7 @@ class _Broker:
 
     def finish(self) -> None:
         self.closed = True
-        missing = [call.index for call in self.calls if call.task is None]
+        missing = list(self.calls)
         if missing:
             raise ChildCallError(
                 "unawaited_child_call", "reserved package call was never awaited", missing[0]

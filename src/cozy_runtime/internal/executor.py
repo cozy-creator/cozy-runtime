@@ -2650,6 +2650,12 @@ class Executor:
                         code="child_interface",
                     )
                 binding = candidate
+                # Source-preserving caller wheels retain ordinary @invocable job
+                # wrappers, whose lookup is by their exact module/export pair.
+                prior = bindings.get(("", module, export))
+                if prior is not None and prior != binding:
+                    raise CapabilityError("ambiguous managed export", code="child_interface")
+                bindings[("", module, export)] = binding
             bindings[(interface, module, export)] = binding
         return _Broker(str(command["request_id"]), bindings, self._durable)
 

@@ -73,22 +73,120 @@ def _material(
     )
 
 
-def test_private_refuses_divergent_base_before_install(tmp_path: Path) -> None:
+@pytest.mark.parametrize("distribution", ["numpy", "setuptools"])
+def test_private_refuses_divergent_base_before_install(tmp_path: Path, distribution: str) -> None:
     base = environment.observe_base(Path(sys.executable))
     base = dataclasses.replace(
         base,
         distributions=(
-            *(row for row in base.distributions if row[0] != "numpy"),
-            ("numpy", "2.5.2"),
+            *(row for row in base.distributions if row[0] != distribution),
+            (distribution, "2.5.2"),
         ),
     )
-    project = _wheel(tmp_path, "private_pin", ("numpy==2.5.3",), b"VALUE=1\n")
+    project = _wheel(tmp_path, "private_pin", (f"{distribution}==2.5.3",), b"VALUE=1\n")
     material = _material(project, (), base)
     root = tmp_path / "refused"
     with pytest.raises(environment.EnvironmentRefusal) as caught:
         environment.materialize(material, root, base=base, exact_dependencies=True)
     assert caught.value.code == "package_environment_dependency_base_conflict"
     assert not root.exists()
+
+
+@pytest.mark.parametrize("damage", ["bytes", "symlink"])
+def test_dependency_share_resource_installs_and_reuse_verifies_bytes(
+    tmp_path: Path, damage: str
+) -> None:
+    base = environment.observe_base(Path(sys.executable))
+    dependency = _wheel(
+        tmp_path,
+        "documented",
+        (),
+        b"VALUE=641\n",
+        resources={"documented-1.0.data/data/share/man/man1/example.1": b"manual bytes\n"},
+    )
+    project = _wheel(tmp_path, "document_user", ("documented==1.0",), b"import documented\n")
+    material = _material(project, (dependency,), base)
+    installed = environment.materialize(
+        material, tmp_path / "installed", base=base, exact_dependencies=True
+    )
+    resource = installed.generation / "share/man/man1/example.1"
+    assert resource.read_bytes() == b"manual bytes\n"
+    assert not (installed.site_packages / "share").exists()
+    assert environment.materialize(
+        material, tmp_path / "installed", base=base, exact_dependencies=True
+    ).reused
+    if damage == "bytes":
+        resource.chmod(0o644)
+        resource.write_bytes(b"changed text\n")
+    else:
+        other = tmp_path / "outside-manual"
+        other.write_bytes(b"manual bytes\n")
+        resource.parent.chmod(0o755)
+        resource.unlink()
+        resource.symlink_to(other)
+    with pytest.raises(environment.EnvironmentRefusal, match="installed_resource_changed"):
+        environment.materialize(
+            material, tmp_path / "installed", base=base, exact_dependencies=True
+        )
+
+
+def test_share_resource_admission_keeps_project_and_native_scheme_refusals(tmp_path: Path) -> None:
+    base = environment.observe_base(Path(sys.executable))
+    resource = "resource-1.0.data/data/share/man/manual"
+    for owner, content in (("project", b"manual\n"), ("custom", b"\x7fELFpretend native")):
+        wheel = _wheel(tmp_path, "resource", (), b"VALUE=1\n", resources={resource: content})
+        with pytest.raises(environment.EnvironmentRefusal):
+            environment.measure_wheel(wheel, owner, base)
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "resource-1.0.data/data/share/../../outside",
+        "resource-1.0.data/scripts/start",
+        "resource-1.0.data/headers/api.h",
+        "resource-1.0.data/data/lib/inject.py",
+    ],
+)
+def test_dependency_share_resource_keeps_closed_install_schemes(
+    tmp_path: Path, member: str
+) -> None:
+    base = environment.observe_base(Path(sys.executable))
+    wheel = _wheel(tmp_path, "resource", (), b"VALUE=1\n", resources={member: b"resource\n"})
+    with pytest.raises(environment.EnvironmentRefusal):
+        environment.measure_wheel(wheel, "custom", base)
+
+
+@pytest.mark.parametrize("other", ["share/man/manual", "share/man/manual/page"])
+def test_dependency_share_resource_collisions_refuse_before_install(
+    tmp_path: Path, other: str
+) -> None:
+    base = environment.observe_base(Path(sys.executable))
+    a = _wheel(
+        tmp_path,
+        "resource_a",
+        (),
+        b"VALUE=1\n",
+        resources={"resource_a-1.0.data/data/share/man/manual": b"one"},
+    )
+    b = _wheel(
+        tmp_path,
+        "resource_b",
+        (),
+        b"VALUE=2\n",
+        resources={f"resource_b-1.0.data/data/{other}": b"two"},
+    )
+    project = _wheel(
+        tmp_path, "resource_user", ("resource_a==1.0", "resource_b==1.0"), b"VALUE=3\n"
+    )
+    with pytest.raises(environment.EnvironmentRefusal, match="resource_collision"):
+        environment.materialize(
+            _material(project, (a, b), base),
+            tmp_path / "refused",
+            base=base,
+            exact_dependencies=True,
+        )
+    assert not (tmp_path / "refused").exists()
 
 
 def test_private_missing_wheel_refuses_then_real_install_and_reopen_verify(tmp_path: Path) -> None:
