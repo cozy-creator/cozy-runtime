@@ -10,6 +10,13 @@ from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+_INTEGRITY_CODES = (
+    "OBJECT_CORRUPT",
+    "OBJECT_ID_MISMATCH",
+    "LENGTH_MISMATCH",
+    "NOT_REGULAR_FILE",
+)
+
 
 class Service:
     def __init__(
@@ -43,7 +50,14 @@ class WorkspaceRPC:
                 return operation(service, service.authorize(request.claim))
         except WorkspaceRefusal as exc:
             return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
-        except Exception:
+        except Exception as exc:
+            # Retrying a corrupt object cannot establish custody. Keep native
+            # paths/details private; the owner needs only the permanent code.
+            code = getattr(exc, "code", None)
+            if code in _INTEGRITY_CODES:
+                return context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION, f"workspace integrity refused: {code}"
+                )
             return context.abort(grpc.StatusCode.UNAVAILABLE, "workspace custody operation failed")
 
     def RecordOperationResult(self, request: pb.RecordOperationResultCall, context: Any) -> Any:
@@ -158,8 +172,14 @@ class WorkspaceRPC:
                     offset += size
         except WorkspaceRefusal as exc:
             context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
-        except Exception:
-            context.abort(grpc.StatusCode.UNAVAILABLE, "ordinary artifact read failed")
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            if code in _INTEGRITY_CODES:
+                context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION, f"workspace integrity refused: {code}"
+                )
+            else:
+                context.abort(grpc.StatusCode.UNAVAILABLE, "ordinary artifact read failed")
 
     def WorkspaceWeightsIntentReady(self, request: pb.WeightsIntentReadyCall, context: Any) -> Any:
         return self._workspace_call(request, context, lambda s, _: s.ready(request))
