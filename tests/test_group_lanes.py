@@ -1138,3 +1138,149 @@ def test_two_real_cards_form_an_nccl_group_under_one_executor() -> None:
     fill the same plan, and the reclaim proves both devices ABSENT with one epoch bump.
     This body is the arm; it needs a second card to run and says so when it cannot."""
     raise AssertionError("two driver-readable cards found: write the live H3 arm here")
+
+
+@needs_torch
+def test_the_offload_guard_refuses_a_wrapped_forward_and_admits_a_parked_encoder() -> None:
+    """h3a-019: what diffusers #12533 actually forbids, and what it does not.
+
+    The issue's mechanism is the maintainer's own: `accelerate` saves `module._old_forward`
+    before wrapping `module.forward` and RESTORES it after every pipeline run, and diffusers
+    installs the context-parallel hooks by assigning `module.forward` too -- so an offload
+    wrapped around a sharded component takes the split hooks away on the second call. The
+    reproduction below is that mechanism verbatim, not a mock of it: save the forward,
+    assign a new one, put it back.
+
+    Three facts, in order: a forward-wrapping offload ON THE SHARDED COMPONENT refuses; a
+    device map that scatters one refuses; and an offloaded, parked or paged component that
+    is NOT sharded -- the text encoder and the VAE, which never enter a collective -- is
+    admitted, which the previous whole-model guard refused.
+    """
+    import torch
+
+    class Block(torch.nn.Module):
+        def forward(self, x: Any) -> Any:  # pragma: no cover - identity only
+            return x
+
+    class Sharded(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block = Block()
+            self._cp_plan = {"": {}}
+
+        def enable_parallelism(self) -> None:  # pragma: no cover - marker only
+            return None
+
+        def forward(self, x: Any) -> Any:  # pragma: no cover - identity only
+            return x
+
+    # A sharded component whose own forward is untouched is admitted.
+    dit = Sharded()
+    cp._refuse_if_forward_wrapped([("fl2va_dit", dit)])
+
+    # An OFFLOADED text encoder beside it is admitted too: it carries no `_cp_plan`, so it
+    # is not a sharding candidate, and nothing it does is a collective. This is the case
+    # the old whole-model guard refused and h3a-019 is about.
+    encoder = Block()
+    encoder._hf_hook = object()
+    encoder.hf_device_map = {"": "cpu"}
+    cp._refuse_if_forward_wrapped([("fl2va_dit", dit)])
+    assert cp.sharding_candidates(object()) == []
+
+    # A forward-wrapping offload ON the sharded component refuses, and names the mechanism.
+    wrapped = Sharded()
+    wrapped.block._old_forward = wrapped.block.forward
+    with pytest.raises(cp.ContextParallelUnavailable) as offloaded:
+        cp._refuse_if_forward_wrapped([("fl2va_dit", wrapped)])
+    assert "fl2va_dit.block carries '_old_forward'" in offloaded.value.message
+    assert "12533" in offloaded.value.message
+
+    # One device, however spelled, is not a scatter; more than one, or host/disk, is.
+    assert cp._scattered_devices({"a": "cuda:0", "b": "cuda:0"}) == set()
+    assert cp._scattered_devices(None) == set()
+    scattered = Sharded()
+    scattered.hf_device_map = {"block": "cuda:0", "block.inner": "cpu"}
+    with pytest.raises(cp.ContextParallelUnavailable) as mapped:
+        cp._refuse_if_forward_wrapped([("fl2va_dit", scattered)])
+    assert "all-to-all cannot span" in mapped.value.message
+
+
+@needs_torch
+def test_a_stripped_context_parallel_hook_refuses_instead_of_running_unsharded() -> None:
+    """The loud half of #12533. A hook that was installed and then taken back is the
+    silently-wrong case: the rank runs the FULL sequence while its peers all-to-all over
+    shards, and upstream that surfaces as a shape error deep in the attention. Here the
+    next forward inside the gate refuses by name, before the collective.
+
+    `to_empty(device="meta")` and the re-fill that follows it -- this runtime's whole
+    staging mechanism -- are exercised in between, because that is the movement h3a-019
+    needs to compose with CP: it replaces parameter STORAGE and leaves methods alone, so
+    the recorded forward identity survives it and the hooks are still in force.
+    """
+    import torch
+
+    class Registry:
+        """diffusers' `HookRegistry` reduced to the one field this reads."""
+
+        def __init__(self) -> None:
+            self.hooks = {"cp_input---": object()}
+
+    class Dit(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+
+        def forward(self, x: Any) -> Any:  # pragma: no cover - identity only
+            return x
+
+    dit = Dit()
+    dit._diffusers_hook = Registry()
+    original = dit.forward
+    dit.forward = lambda *a, **k: original(*a, **k)  # what `register_hook` does
+    cp._record_cp_hooks(dit, "fl2va_dit")
+    cp.refuse_if_cp_hooks_stripped(dit, "fl2va_dit")
+
+    # A park and a re-stage: storage replaced, methods untouched, hooks still in force.
+    dit.to_empty(device=torch.device("meta"), recurse=True)
+    dit.to_empty(device=torch.device("cpu"), recurse=True)
+    cp.refuse_if_cp_hooks_stripped(dit, "fl2va_dit")
+
+    # diffusers' OWN group offloading registers through the same `HookRegistry` and
+    # re-wraps `forward` legitimately, chaining beneath what is there. A changed identity
+    # with the CP hook still registered and no accelerate wrapper is adopted, not refused
+    # -- this is the composition h3a-019 needs to keep working.
+    chained = dit.forward
+    dit._diffusers_hook.hooks["group_offloading"] = object()
+    dit.forward = lambda *a, **k: chained(*a, **k)
+    cp.refuse_if_cp_hooks_stripped(dit, "fl2va_dit")
+    cp.refuse_if_cp_hooks_stripped(dit, "fl2va_dit")
+
+    # accelerate's restore, verbatim: `module.forward = module._old_forward`. THE SECOND
+    # CALL is where #12533 lands -- the first is sharded and the next is not -- so the
+    # check has to survive an unchanged first call and fire on the changed second one.
+    dit._old_forward = original
+    dit.forward = dit._old_forward
+    with pytest.raises(cp.ContextParallelUnavailable) as stripped:
+        cp.refuse_if_cp_hooks_stripped(dit, "fl2va_dit")
+    assert "acquired '_old_forward'" in stripped.value.message and "12533" in (
+        stripped.value.message
+    )
+
+    # A CP hook removed from the registry outright is the other half of the same fault.
+    removed = Dit()
+    removed._diffusers_hook = Registry()
+    removed.forward = lambda *a, **k: None
+    cp._record_cp_hooks(removed, "fl2va_dit")
+    removed._diffusers_hook.hooks.clear()
+    with pytest.raises(cp.ContextParallelUnavailable) as gone:
+        cp.refuse_if_cp_hooks_stripped(removed, "fl2va_dit")
+    assert "was REMOVED from its registry" in gone.value.message
+
+    # A component that carries no recorded hooks is not accused of losing them.
+    cp.refuse_if_cp_hooks_stripped(Dit(), "ref2va_dit")
+
+    # And `apply_context_parallel` installing nothing is itself a refusal, because an
+    # unsharded forward under a formed group is silently wrong output.
+    with pytest.raises(cp.ContextParallelUnavailable) as none_found:
+        cp._record_cp_hooks(Dit(), "fl2va_dit")
+    assert "installed no hook" in none_found.value.message
