@@ -8,6 +8,7 @@ from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._call_results import result_at
+from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, admits, normalize, sniff
 from cozy_runtime.internal.worker import byte_inputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
@@ -56,7 +57,7 @@ def materialize(
             digest = documents.spell(grant.source.manifest.digest)
             length = grant.source.manifest.length
         else:
-            if not isinstance(node, dict) or node.get("kind") not in ("file", "tree"):
+            if not isinstance(node, dict) or node.get("kind") not in (*KIND_MEDIA, "tree"):
                 raise WorkspaceRefusal("native grant no longer names a typed byte result")
             kind = node["kind"]
             digest, length = node.get("digest"), node.get("size_bytes")
@@ -75,7 +76,7 @@ def materialize(
                 media_type = byte_inputs.TREE_MIME
             else:
                 media_type = node.get("media_type")
-                if not isinstance(media_type, str):
+                if not isinstance(media_type, str) or not admits(kind, normalize(media_type)):
                     raise WorkspaceRefusal("native child file omitted its media type")
         destination = spool / "child-results" / str(result.call_index) / str(index)
         held = pb.NativeByteRetentionRequest(source=grant.source, retention_id=grant.retention_id)
@@ -85,8 +86,14 @@ def materialize(
             held,
             destination,
             max_bytes=max_bytes,
-            expected_blob=(digest, length) if kind == "file" else None,
+            expected_blob=(digest, length) if kind != "tree" else None,
         )
+        if kind != "tree":
+            with (destination / "payload").open("rb") as stream:
+                actual = sniff(stream.read(SNIFF_BYTES))
+            declared = normalize(media_type)
+            if (actual and declared != actual) or (kind != "file" and not actual):
+                raise WorkspaceRefusal("native child media type differs from its encoded bytes")
         if capture:
             if {member["path"] for member in members} != {"capture.json", "sketches.f32"}:
                 raise WorkspaceRefusal("capture tree does not contain exactly its two files")
@@ -105,7 +112,7 @@ def materialize(
                 "length": length,
                 "content_bytes": grant.source.content_bytes,
                 "media_type": media_type,
-                "local": str(destination / "payload" if kind == "file" else destination),
+                "local": str(destination / "payload" if kind != "tree" else destination),
             }
         )
     return rows

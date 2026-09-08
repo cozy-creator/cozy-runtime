@@ -15,7 +15,7 @@ from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-TREE_MIME = "application/vnd.cozy.tree-manifest"
+TREE_MIME = workspace_byte_outputs.TREE_MIME
 MAX_BYTES = 256 << 20
 
 
