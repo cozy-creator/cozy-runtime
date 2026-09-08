@@ -13,6 +13,9 @@ import tensorfs
 
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal.weights_writer import StoreProxy, WriterBroker
+from cozy_runtime.internal.worker.grants import MODEL_PREFIX
+from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
 
 
 def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_head(
@@ -134,3 +137,82 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
         }
         for frame in frames
     )
+
+
+def test_parent_broker_spends_zero_protobuf_output_grant_on_native_graft(tmp_path: Path) -> None:
+    store = tensorfs.Store.init(tmp_path / "store")
+    plain = dict(tensorfs.seed_digests())["plain/1"]
+    source_writer = store.begin_derived(
+        "sha256:" + "81" * 32,
+        1,
+        {},
+        {
+            "model": {
+                "drop": [],
+                "add": {
+                    "weight": {
+                        "logical_dtype": "f32",
+                        "shape": [2],
+                        "encoding": plain,
+                        "parts": {"value": {"dtype": "f32", "shape": [2]}},
+                    }
+                },
+            }
+        },
+        {},
+        [("model", "weight")],
+        8,
+        work_fingerprint="sha256:" + "82" * 32,
+    )
+    source_writer.add_part("model", "weight", "value", io.BytesIO(bytes(8)))
+    manifest = source_writer.commit()["manifest"]
+    source = "sha256:" + manifest["sha256"], manifest["length"]
+    sources = {"source": source}
+    targets = {"model": {"source": "source", "source_component": "model", "drop": [], "add": {}}}
+    order = [("model", "weight")]
+    fingerprint = "sha256:" + "83" * 32
+    declaration = store.derived_declaration(
+        sources, targets, {}, order, 0, work_fingerprint=fingerprint
+    )
+    spec = documents.body(
+        pb.InvocationSpec(
+            inputs=[
+                pb.InputBinding(
+                    input_id=MODEL_PREFIX + "source", digest=source[0], length=source[1]
+                )
+            ],
+            outputs=[
+                pb.OutputBinding(
+                    output_id="model", max_bytes=0, mime_type="application/vnd.cozy.model-manifest"
+                )
+            ],
+        )
+    )
+    assert "max_bytes" not in spec["outputs"][0]
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    attempt = SimpleNamespace(
+        request_id="graft",
+        attempt=1,
+        state="running",
+        canceling="",
+        spool=spool,
+        weights_work_fingerprint=fingerprint,
+        spec=spec,
+    )
+    broker = WriterBroker(lambda: store)
+    transaction = "sha256:" + "84" * 32
+    broker.authorize(attempt, transaction, 1, hashlib.sha256(declaration).digest(), "model")
+    proxy = StoreProxy(store, spool, lambda _kind, frame: broker.handle(attempt, frame))
+    with pytest.raises(CapabilityError) as excess:
+        proxy.begin_derived(
+            transaction, 1, sources, targets, {}, order, 1, work_fingerprint=fingerprint
+        )
+    assert excess.value.code == "weights_writer_ungranted"
+    writer = proxy.begin_derived(
+        transaction, 1, sources, targets, {}, order, 0, work_fingerprint=fingerprint
+    )
+    receipt = writer.commit()
+    assert receipt["added_objects"] == []
+    assert receipt["manifest"] == manifest
+    broker.close_attempt(attempt)
