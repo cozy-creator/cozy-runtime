@@ -156,6 +156,19 @@ def test_real_tree_commit_replay_retention_gc_and_release(tmp_path: Path) -> Non
         outputs.change_hold(reopened, "owner", hold, release=False)
     with pytest.raises(WorkspaceRefusal), outputs.leased(reopened, "owner", hold):
         pytest.fail("released bytes became readable")
+    # A fresh script must receive a miss if a retained cache result lost bytes.
+    # Do not disguise this with an implementation-key change or a second store.
+    object_id = hashlib.sha256(data).hexdigest()
+    blob = workspace.store_root / "blobs" / object_id[:2] / object_id[2:4] / object_id
+    blob.unlink()
+    missing = workspace_memo.lookup(
+        Workspace(workspace.store_root),
+        "owner",
+        pb.LookupOperationCall(
+            computation_digest=computation, consumer_request_id="after-storage-loss"
+        ),
+    )
+    assert not missing.found and not missing.byte_retentions
 
 
 def test_changed_output_and_unowned_retention_refuse(tmp_path: Path) -> None:
