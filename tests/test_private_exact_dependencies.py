@@ -7,6 +7,7 @@ import csv
 import dataclasses
 import hashlib
 import io
+import struct
 import subprocess
 import sys
 import zipfile
@@ -48,7 +49,7 @@ def _wheel(
     csv.writer(record).writerows([*rows, (f"{info}/RECORD", "", "")])
     members[f"{info}/RECORD"] = record.getvalue().encode()
     path = root / f"{name}-1.0-py3-none-any.whl"
-    with zipfile.ZipFile(path, "w") as archive:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for member, body in members.items():
             archive.writestr(member, body)
     return path
@@ -133,6 +134,7 @@ def test_prebuilt_dependency_source_resources_are_installed_without_building(
         "resource_helper/data/wrapper.cc": b"not compilable C++\n",
         "resource_helper/data/include.h": b"not compilable C\n",
         "resource_helper/data/setup.py": b"raise RuntimeError('build must never run')\n",
+        "resource_helper/data/statistics.dat": b"1.2500000  2.7500000\n" * 30_000,
     }
     helper = _wheel(tmp_path, "resource_helper", (), b"VALUE=37\n", resources=resources)
     project = _wheel(
@@ -164,3 +166,40 @@ def test_project_native_build_resources_still_refuse(tmp_path: Path, member: str
     with pytest.raises(environment.EnvironmentRefusal) as caught:
         environment.measure_wheel(project, "project", base)
     assert caught.value.code == "package_environment_native_build_input_forbidden"
+
+
+@pytest.mark.parametrize(
+    "fault", ["total-expansion", "lying-size", "truncated", "oversized-metadata"]
+)
+def test_prebuilt_dependency_zip_bounds_remain_enforced(tmp_path: Path, fault: str) -> None:
+    base = environment.observe_base(Path(sys.executable))
+    wheel = _wheel(
+        tmp_path, "bounded", (), b"VALUE=1\n", resources={"one.dat": b"a\n", "two.dat": b"b\n"}
+    )
+    raw = bytearray(wheel.read_bytes())
+    if fault == "truncated":
+        del raw[-10:]
+    else:
+        offset = raw.index(b"PK\x01\x02")
+        while raw[offset : offset + 4] == b"PK\x01\x02":
+            name_len, extra_len, comment_len = struct.unpack_from("<HHH", raw, offset + 28)
+            name = raw[offset + 46 : offset + 46 + name_len].decode()
+            if fault == "oversized-metadata" and name.endswith(".dist-info/METADATA"):
+                struct.pack_into("<I", raw, offset + 24, environment.MAX_METADATA_BYTES + 1)
+            elif fault != "oversized-metadata" and name in {"one.dat", "two.dat"}:
+                struct.pack_into(
+                    "<I", raw, offset + 24, (1 << 32) - 2 if fault == "total-expansion" else 3
+                )
+            offset += 46 + name_len + extra_len + comment_len
+    wheel.write_bytes(raw)
+    with pytest.raises(environment.EnvironmentRefusal) as caught:
+        environment.measure_wheel(wheel, "custom", base)
+    if fault == "total-expansion":
+        assert caught.value.code == "package_environment_wheel_expansion_cap"
+    elif fault == "oversized-metadata":
+        assert caught.value.code == "package_environment_wheel_metadata_oversized"
+    else:
+        assert caught.value.code in {
+            "package_environment_wheel_invalid",
+            "package_environment_wheel_record_mismatch",
+        }
