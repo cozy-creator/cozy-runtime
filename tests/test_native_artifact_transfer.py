@@ -65,3 +65,64 @@ def test_native_artifact_inventory_upload_replay_and_exact_grant(tmp_path: Path)
         workspace.retain("owner", source, release=True)
         assert transfers.execute(command).outcome == pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
     transfers.pool.shutdown(wait=True)
+
+
+def test_native_upload_lost_http_response_retries_same_bytes(tmp_path: Path) -> None:
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    _store, workspace, receipt = produced(tmp_path)
+    source = pb.DerivedRetentionRequest(
+        weights_transaction_id=receipt.weights_transaction_id,
+        tensorfs_receipt_digest=documents.raw(receipt.tensorfs_receipt_digest),
+        retention_id="sha256:" + "e" * 64,
+    )
+    held = workspace.retain("owner", source)
+    transfers = NativeArtifactTransfers(
+        workspace, lambda: "owner", lambda _: None, lambda _: True, allow_private_egress=True
+    )
+    command = pb.NativeArtifactTransfer(
+        effect_id="lost-response", source=source, manifest=held.manifest, command_id=1, limit=128
+    )
+    inventory = transfers.execute(command)
+    row = next(
+        row for row in inventory.objects if row.object_id != documents.spell(held.manifest.digest)
+    )
+    bodies: list[bytes] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_PUT(self) -> None:
+            bodies.append(self.rfile.read(int(self.headers["Content-Length"])))
+            if len(bodies) == 1:
+                self.connection.shutdown(2)
+                self.connection.close()
+                return
+            self.send_response(412)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        command.grant.CopyFrom(
+            pb.WeightsUploadGrant(
+                object_id=row.object_id,
+                length=row.length,
+                url=f"http://127.0.0.1:{server.server_port}/object",
+                expires_at_unix=200,
+            )
+        )
+        command.grant_revision = 1
+        command.server_time_unix = 100
+        result = transfers.execute(command)
+        assert result.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_ALREADY_PRESENT
+        assert len(bodies) == 2 and bodies[0] == bodies[1] and len(bodies[0]) == row.length
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        transfers.close()
