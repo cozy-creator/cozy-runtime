@@ -93,6 +93,41 @@ def commit(
     )
 
 
+def reexport(
+    workspace: Workspace,
+    owner: str,
+    request: str,
+    ordinal: int,
+    spec: bytes,
+    output_id: str,
+    retained: pb.NativeByteRetentionRequest,
+    *,
+    tree: bool,
+    max_bytes: int,
+    media_type: str,
+) -> pb.OutputEntry:
+    """An explicit return creates ordinary output custody over a live received input."""
+    with workspace_byte_outputs.leased(workspace, owner, retained) as (store, _, members):
+        body = bytes(store.manifest(documents.spell(retained.source.manifest.digest))["manifest"])
+        if not tree and (len(members) != 1 or members[0]["path"] != "payload"):
+            raise WorkspaceRefusal("returned FileAsset has no single native payload")
+    source = workspace_byte_outputs.commit(
+        workspace, owner, request, ordinal, spec, output_id, body, [], max_bytes, retained=retained
+    )
+    if tree:
+        digest, length = source.manifest.digest, source.manifest.length
+    else:
+        blob = members[0]["blob"]
+        digest, length = bytes.fromhex(blob["sha256"]), blob["length"]
+    return pb.OutputEntry(
+        output_id=output_id,
+        digest=digest,
+        length=length,
+        mime_type=TREE_MIME if tree else media_type,
+        native_tree=source,
+    )
+
+
 def settle_result(value: Any, outputs: list[pb.OutputEntry]) -> bytes:
     """Rewrite only declared output leaves using the post phase's verified identities."""
     replacements = {entry.output_id: entry for entry in outputs if entry.HasField("native_tree")}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -35,11 +36,14 @@ def test_probe_uses_selected_interpreter_and_ignores_install_location(
     for name in ("first", "relocated"):
         prefix = tmp_path / name
         python = prefix / "bin/python"
+        copied_wheel = tmp_path / (name + "-wheels") / wheel.name
+        copied_wheel.parent.mkdir()
+        shutil.copyfile(wheel, copied_wheel)
         subprocess.run(
             ["uv", "venv", str(prefix), "--python", sys.executable], check=True, capture_output=True
         )
         subprocess.run(
-            ["uv", "pip", "install", "--offline", "--python", str(python), str(wheel)],
+            ["uv", "pip", "install", "--offline", "--python", str(python), str(copied_wheel)],
             check=True,
             capture_output=True,
         )

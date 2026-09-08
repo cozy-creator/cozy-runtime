@@ -222,8 +222,15 @@ class Executor:
                         f"the executor wedged during {what!r}: "
                         f"{pace.verdict(liveness.noise_floor())}"
                     )
-                    with contextlib.suppress(ProcessLookupError, OSError):
+                    with (
+                        contextlib.suppress(ProcessLookupError, OSError),
+                        contextlib.closing(proctree.observe_process_exit(self.process)) as exited,
+                    ):
                         proctree.signal_process(self.process, signal.SIGKILL)
+                        # Socket EOF can precede process exit. Finish this
+                        # exact-birth observation before returning the wedge;
+                        # retirement still owns reaping and driver reclaim.
+                        exited.wait()
                     return
 
         thread = threading.Thread(target=watch, name=f"watch-{what}", daemon=True)
@@ -283,6 +290,7 @@ class ExecutorSupervision:
         executor_gid: int = -1,
         jit_pod_scope: str = "",
         device_process: Callable[[int], accel.ProcessMemory] | None = None,
+        socket_path: Path | None = None,
     ) -> None:
         self.root = root
         self.python = python
@@ -312,7 +320,7 @@ class ExecutorSupervision:
         self.epoch = 1
         self.current: Executor | None = None
         self.spawns = 0
-        self.socket_path = str(root / "executor.sock")
+        self.socket_path = str(socket_path if socket_path is not None else root / "executor.sock")
         self.cancel_path = root / "executor.cancel"
         #: the seal's `CUDA_VISIBLE_DEVICES` entries of the current spawn: the devices a
         #: reclaim proves absence on, one row each (cr-068)

@@ -180,7 +180,7 @@ class Workspace:
                     + _MIGRATION_3
                     + "PRAGMA user_version=3; COMMIT;"
                 )
-            elif version not in (3, 4, 5):
+            elif version not in (3, 4, 5, 6):
                 raise WorkspaceRefusal("workspace journal schema is not supported")
             if version <= 3:
                 from .workspace_sources import SCHEMA4
@@ -190,6 +190,10 @@ class Workspace:
                 from .workspace_byte_outputs import SCHEMA5
 
                 db.executescript("BEGIN IMMEDIATE;" + SCHEMA5 + "PRAGMA user_version=5; COMMIT;")
+            if version <= 5:
+                from .workspace_byte_outputs import migrate6
+
+                migrate6(db)
             if (
                 not allow_frozen
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
@@ -480,7 +484,7 @@ class Workspace:
                 raise WorkspaceRefusal("outcome has no unchanged accepted execution")
             if row["state"] == "released":
                 return
-            from .workspace_byte_outputs import reference
+            from .workspace_byte_outputs import recorded_native, reference
 
             output_rows = db.execute(
                 "SELECT * FROM byte_outputs WHERE owner=? AND request=? AND ordinal=?",
@@ -488,16 +492,25 @@ class Workspace:
             ).fetchall()
             body = documents.read(raw, pb.AttemptOutcomeBody)
             if body["status"] == pb.OUTCOME_STATUS_SUCCEEDED:
+                returned_rows = []
+                for output in output_rows:
+                    if output["native_service_id"]:
+                        if not recorded_native(db, output, complete=True):
+                            raise WorkspaceRefusal(
+                                "terminal source view has no completed native call"
+                            )
+                    else:
+                        returned_rows.append(output)
                 native = {
                     item["output_id"]: item["native_tree"]
                     for item in body.get("output_manifest", {}).get("outputs", [])
                     if "native_tree" in item
                 }
-                if set(native) != {output["slot"] for output in output_rows}:
+                if set(native) != {output["slot"] for output in returned_rows}:
                     raise WorkspaceRefusal(
                         "terminal native byte outputs do not match completed intents"
                     )
-                for output in output_rows:
+                for output in returned_rows:
                     expected = documents.body(reference(dict(output)))
                     if output["state"] != "complete" or expected != native[output["slot"]]:
                         raise WorkspaceRefusal(

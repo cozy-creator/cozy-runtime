@@ -23,19 +23,60 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
     store = fill.tensorfs_module().Store.open(command["store"])
     operation = command["operation"]
     args = command["arguments"]
+    if operation == "commit_file":
+        from cozy_runtime.internal.worker.commit_files import execute as commit_file
+
+        return commit_file(store, command)
+    if operation == "source_files":
+        from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
+        from cozy_runtime.internal.worker.workspace_byte_outputs import manifest_members
+
+        source = store.tree_root(command["source_owner"])
+        manifest = command["view_manifest"]
+        if (
+            not source
+            or not source["complete"]
+            or source["released"]
+            or source["manifest_digest"] != manifest["digest"]
+            or source["manifest_length"] != manifest["length"]
+            or source["receipt_digest"] != args["source"]["tensorfs_receipt_digest"]
+        ):
+            raise ValueError("source view lost its exact native source")
+        body = bytes(store.manifest(manifest["digest"])["manifest"])
+        members = manifest_members(body, SOURCE_FILES_MAX_BYTES)
+        size = sum(member["blob"]["length"] for member in members)
+        if size != command["view_bytes"]:
+            raise ValueError("source view content bound changed")
+        produced = store.create_tree_root(
+            command["view_owner"], manifest["digest"], manifest["length"]
+        )
+        return {
+            "result": {
+                "files": {
+                    "asset_ref": manifest["digest"],
+                    "kind": "tree",
+                    "digest": manifest["digest"],
+                    "size_bytes": size,
+                }
+            },
+            "native_receipt": base64.b64encode(produced["receipt"]).decode(),
+        }
     if command["phase"] == "resolve":
         if operation == "download_huggingface":
             uri = f"hf://{args['repository']}@{args['revision']}"
             carriers, profiles = args.get("carriers", []), args.get("profiles", [])
+            files = args.get("files", [])
         elif operation == "download_civitai":
             uri = f"civitai://{args['version']}"
             carriers, profiles = [args["file"]] if args.get("file") else [], []
+            files = []
         else:
             raise ValueError("conversion does not resolve a foreign source")
         selection = store.resolve_source(
             uri,
             carriers,
             profiles=profiles,
+            files=files,
             credential=command.get("credential", ""),
             huggingface=command.get("huggingface"),
             civitai=command.get("civitai"),
