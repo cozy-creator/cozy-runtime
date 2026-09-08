@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import re
 from collections.abc import Awaitable, Callable, Generator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -13,7 +12,6 @@ from typing import Any, Concatenate, ParamSpec, TypeVar, cast, overload
 import msgspec
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author._assets import Asset, Assets, asset_dec_hook
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 
@@ -138,14 +136,16 @@ class _Call[R](Awaitable[R]):
 
 def _input_ref(value: object, request_id: str) -> str:
     """Forward only a verified input of this attempt; Creator rechecks its custody."""
+    import re
+
+    from cozy_runtime.author._assets import Asset
+
     if (
         isinstance(value, Asset)
         and value.hydrated
         and value._attempt == request_id
         and re.fullmatch(r"sha256:[0-9a-f]{64}", value.digest)
     ):
-        if value._read_guard is not None:
-            value._read_guard()
         return value.digest
     raise CapabilityError(
         "child media must be a verified input granted to this parent attempt",
@@ -184,6 +184,8 @@ class _Broker:
         if self.closed or ctx is None or ctx.request_id != self.request_id:
             raise CapabilityError("package call escaped its attempt", code="escaped_handle")
         ctx.raise_if_cancelled()
+        if ctx.boot_warmup:
+            raise CapabilityError("warmup cannot reserve package calls", code="child_warmup")
         binding = self.bindings.get((interface_digest, module, export))
         if binding is None:
             raise CapabilityError(
@@ -192,25 +194,10 @@ class _Broker:
         if len(self.calls) >= MAX_DIRECT_CALLS:
             raise CapabilityError("direct package call bound exceeded", code="child_fanout")
         try:
-
-            def asset_value(value: object) -> object:
-                if isinstance(value, Assets):
-                    return [
-                        {"asset": item, "label": item.label, "fidelity": item.fidelity}
-                        for item in value._items
-                    ]
-                return _input_ref(value, ctx.request_id)
-
-            plain = msgspec.to_builtins(dict(arguments), enc_hook=asset_value)
-            request = msgspec.convert(
-                plain, type=binding.request, dec_hook=asset_dec_hook, strict=True
-            )
+            request = msgspec.convert(dict(arguments), type=binding.request, strict=True)
             payload = canonical_json.encode(
                 msgspec.to_builtins(
-                    request,
-                    enc_hook=lambda value: (
-                        value.ref if isinstance(value, Asset) else asset_value(value)
-                    ),
+                    request, enc_hook=lambda value: _input_ref(value, ctx.request_id)
                 )
             )
         except (TypeError, ValueError, msgspec.ValidationError) as exc:

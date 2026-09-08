@@ -1183,6 +1183,39 @@ class Worker:
             self.send, lambda: self.fence.control_stream_epoch, lambda: self.fence.wire_minor
         )
         self.engine.calls = self.calls
+        from cozy_runtime.internal.worker.source_calls import SourceCalls
+
+        self.source_calls = (
+            SourceCalls(
+                self.workspace,
+                lambda: self.fence.record_owner_id,
+                self.send,
+                lambda command: (
+                    command.record_owner_epoch == self.fence.record_owner_epoch
+                    and command.control_stream_epoch == self.fence.control_stream_epoch
+                    and command.worker_boot_id == self.fence.worker_boot_id
+                ),
+            )
+            if self.workspace is not None
+            else None
+        )
+        from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
+
+        self.artifact_transfers = (
+            NativeArtifactTransfers(
+                self.workspace,
+                lambda: self.fence.record_owner_id,
+                self.send,
+                lambda command: (
+                    command.record_owner_epoch == self.fence.record_owner_epoch
+                    and command.control_stream_epoch == self.fence.control_stream_epoch
+                    and command.worker_boot_id == self.fence.worker_boot_id
+                ),
+            )
+            if self.workspace is not None
+            else None
+        )
+
         #: The durable lane's outbound queue, and it belongs to ONE accepted stream. A new
         #: claim installs a FRESH queue under `claim_lock`, so the superseded stream's sender
         #: keeps draining its own (now unread) queue and can never consume a frame authored
@@ -2583,6 +2616,8 @@ class Worker:
                     "the next control stream could not be durably recorded",
                 )
             superseded = self.fence.control_stream_epoch
+            if self.source_calls is not None:
+                self.source_calls.fence_owner(claim.record_owner_id)
             self.fence.record_owner_epoch = claim.record_owner_epoch
             self.fence.record_owner_id = claim.record_owner_id
             self.fence.record_owner_recorded = True
@@ -2888,6 +2923,8 @@ class Worker:
         if kind == "attempt_offer":
             self.on_offer(inner)
         elif kind == "cancel_attempt":
+            if self.source_calls is not None:
+                self.source_calls.cancel_parent(inner.request_id)
             self.note("cancel", self.engine.cancel(inner))
         elif kind == "outcome_ack":
             self.on_outcome_ack(inner)
@@ -2903,6 +2940,17 @@ class Worker:
             self.send(pb.WorkerFrame(checkpoint_ack=ack))
         elif kind == "weights_host_ack":
             self.note("artifact", "retired Host writer acknowledgment ignored")
+        elif kind == "native_source_command":
+            if self.source_calls is None or self.fence.wire_minor < 42:
+                self.note("source", "native source service is unavailable")
+            else:
+                try:
+                    self.source_calls.handle(inner)
+                except Exception:
+                    self.note("source", "native source command was refused")
+        elif kind == "native_artifact_transfer":
+            if self.artifact_transfers is not None and self.fence.wire_minor >= 42:
+                self.artifact_transfers.handle(inner)
         elif kind == "child_call_result":
             if not self.calls.absorb(inner):
                 self.note("child", "dropped stale or invalid child-call result")
@@ -2943,7 +2991,9 @@ class Worker:
             else:
                 self.send(pb.WorkerFrame(weights_finalize_result=result))
 
-    def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:
+    def on_outcome_ack(
+        self, acked: pb.AttemptOutcomeAck, *, native_finalized: bool = False
+    ) -> None:
         """A closed outcome leaves the lane's RELEASED set — a SLOT COUNT change when the
         device was waiting on it (cr-079 D3), not a change in admission MEANING, so it does
         NOT bump `admission_epoch` (§6).
@@ -2957,6 +3007,19 @@ class Worker:
         `available_attempt_slots` is the field that carries this, and it is recomputed on
         every tick.
         """
+        if not native_finalized and self.source_calls is not None:
+
+            def finished() -> None:
+                with self.control_lock:
+                    if not self.fenced(acked):
+                        self.on_outcome_ack(acked, native_finalized=True)
+
+            try:
+                if self.source_calls.acknowledge(acked, finished):
+                    return
+            except ValueError:
+                self.note("source", "native source finalization was refused")
+                return
         if self.workspace is not None and self.workspace.contains(
             self.fence.record_owner_id, acked.request_id, acked.attempt_ordinal
         ):
@@ -5324,18 +5387,31 @@ class Worker:
             and "job" in attempt.spec
             and attempt.state not in ("outcome", "closed")
         ):
-            result_schema = b""
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
-            for slot in self.job_slots.values():
-                if slot.binding.job_descriptor_id == descriptor:
-                    declaration = self.engine._job_declaration(slot.binding, descriptor)
-                    result_schema = canonical.write(declaration["result"])
-                    break
+            # Execution attaches attempt.job later. The prepared engine binding
+            # is available on both local and placement-hosted paths at offer time.
+            binding = self.engine.jobs.get(descriptor)
+            if binding is None:
+                self.refuse(
+                    offered,
+                    "job_binding_unavailable",
+                    "the selected job is not prepared",
+                    CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                )
+                return
+            try:
+                declaration = self.engine._job_declaration(binding, descriptor)
+            except AttemptRefusal as exc:
+                self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
+                return
+            result_schema = canonical.write(declaration["result"])
+            memoize = declaration.get("invocable", {}).get("memoize", False) is True
             replay = self.workspace.accept(
                 self.fence.record_owner_id,
                 offered,
                 result_schema=result_schema,
                 worker_boot=self.fence.worker_boot_id,
+                memoize=memoize,
             )
             if replay is not None:
                 self.send(pb.WorkerFrame(attempt_outcome=replay))
@@ -6192,6 +6268,8 @@ class Worker:
         ]
         self.request_stop()
         self.weights.close()
+        if self.artifact_transfers is not None:
+            self.artifact_transfers.close()
         self.convergences.put(None)
         self.watches.end_all()
         self.host.stop()

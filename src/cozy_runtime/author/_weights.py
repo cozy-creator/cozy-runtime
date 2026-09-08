@@ -65,12 +65,40 @@ class WeightsOutput:
 
 
 @dataclass(frozen=True, slots=True)
+class WeightsPartSource:
+    """Inherit one exact encoded role from a declared source without moving bytes."""
+
+    source: str
+    component: str
+    tensor: str
+    role: str
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str) or not value
+            for value in (self.source, self.component, self.tensor, self.role)
+        ):
+            raise CapabilityError(
+                "a weights part source names source, component, tensor and role",
+                code="weights_part_source",
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class WeightsPart:
     dtype: str
     shape: tuple[int, ...]
     data: WeightsBytes | None = None
+    source: WeightsPartSource | None = None
 
     def __post_init__(self) -> None:
+        if self.source is not None and (
+            not isinstance(self.source, WeightsPartSource) or self.data is not None
+        ):
+            raise CapabilityError(
+                "a weights part inherits a declared source or accepts bytes, never both",
+                code="weights_part_source",
+            )
         if not self.dtype or any(dimension <= 0 for dimension in self.shape):
             raise CapabilityError(
                 "a weights part needs a dtype and positive dimensions",
@@ -221,6 +249,7 @@ class WeightsSourceTensor:
     logical_dtype: str
     shape: tuple[int, ...]
     parts: tuple[WeightsSourcePart, ...]
+    encoding: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +410,11 @@ class WeightsTransaction:
                 f"weights part {component}/{key}#{role} is undeclared",
                 code="weights_part_ungranted",
             )
+        if tensor.parts[role].source is not None:
+            self._fail(
+                f"weights part {component}/{key}#{role} inherits a source and cannot accept bytes",
+                code="weights_part_source",
+            )
         self._call(lambda: self._host.add_part(component, key, role, data), "weights part")
 
     def add_config(self, name: str, data: WeightsBytes) -> None:
@@ -471,6 +505,7 @@ class WeightsSink:
         "_models",
         "_open",
         "_outputs",
+        "_source_config",
         "_source_structure",
         "_spent",
     )
@@ -483,8 +518,10 @@ class WeightsSink:
         open_transaction: Callable[[WeightsCommit], WeightsHostTransaction] | None,
         source_structure: Callable[[str], WeightsSource] | None = None,
         cancel: Callable[[], bool] = lambda: False,
+        source_config: Callable[[str, str], bytes] | None = None,
     ) -> None:
         self._attempt = attempt
+        self._source_config = source_config
         self._models = dict(models)
         self._outputs = dict(outputs)
         self._open = open_transaction
@@ -497,6 +534,37 @@ class WeightsSink:
         """This job's granted model inputs by parameter name — the exact objects
         `structure` and `open` accept as sources (read-only copy)."""
         return dict(self._models)
+
+    def config(self, source: Model[object], name: str) -> bytes:
+        """Read one bounded inline config from an exact model input granted to this job."""
+        from cozy_runtime.author._services import Attempt
+
+        attempt = self._attempt
+        assert isinstance(attempt, Attempt)
+        attempt.check_open("WeightsSink.config")
+        if not any(source is model for model in self._models.values()):
+            raise CapabilityError(
+                "weights config source is not a granted model input",
+                code="weights_source_ungranted",
+            )
+        if not source.checkpoint_ref.startswith("sha256:") or not isinstance(name, str) or not name:
+            raise CapabilityError(
+                "weights config requires an exact manifest and config name",
+                code="weights_source_identity",
+            )
+        if self._cancel():
+            raise Cancelled("weights config read was canceled")
+        if self._source_config is None:
+            raise CapabilityError(
+                "this attempt has no weights config reader",
+                code="weights_source_config_unavailable",
+            )
+        data = self._source_config(source.checkpoint_ref, name)
+        if not isinstance(data, bytes) or not 0 < len(data) <= MAX_WEIGHTS_SOURCE_READ:
+            raise CapabilityError(
+                "weights config exceeds its byte bound", code="weights_source_config_invalid"
+            )
+        return data
 
     def structure(self, source: Model[object]) -> WeightsSource:
         """Return bounded tensor geometry for one exact source already granted to this job."""
@@ -671,6 +739,8 @@ class WeightsSink:
             for component, target in sorted(targets.items()):
                 for key, tensor in sorted(target.add.items()):
                     for role, part in sorted(tensor.parts.items()):
+                        if part.source is not None:
+                            continue
                         if part.data is None:
                             transaction.fence()
                             raise CapabilityError(

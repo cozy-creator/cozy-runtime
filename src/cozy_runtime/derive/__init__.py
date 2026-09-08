@@ -7,6 +7,12 @@ resident worker planes. numpy is required at module import and is the consumer's
 dependency — the base Runtime package stays numpy-free.
 """
 
-from cozy_runtime.derive.facade import QuantizePlan, QuantizeResult, plan, quantize
+from cozy_runtime.derive.facade import (
+    QuantizePlan,
+    QuantizeResult,
+    plan,
+    quantize,
+    quantize_artifact,
+)
 
-__all__ = ["QuantizePlan", "QuantizeResult", "plan", "quantize"]
+__all__ = ["QuantizePlan", "QuantizeResult", "plan", "quantize", "quantize_artifact"]

@@ -1,0 +1,69 @@
+"""Explicit publication effects delegated to the admitted private script owner."""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Mapping
+from typing import cast
+
+import msgspec
+
+from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
+from cozy_runtime.author._calls import _current
+from cozy_runtime.author._errors import CapabilityError
+
+
+class CheckpointRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    destination: str
+    checkpoint: str
+    manifest: ObjectRef
+    publication: str
+    observation: str
+
+
+class ReleaseReceipt(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    destination: str
+    release: str
+    revision: int
+    lanes: dict[str, str]
+    observation: str
+
+
+def _call(operation: str, arguments: dict[str, object]) -> Awaitable[object]:
+    broker = _current.get()
+    if broker is None:
+        raise CapabilityError("publication has no admitted attempt", code="child_broker_absent")
+    return broker.reserve("", __name__, operation, arguments)
+
+
+def upload_checkpoint(artifact: ModelArtifact, *, destination: str) -> Awaitable[CheckpointRef]:
+    """Explicitly retain this artifact at the destination; no script or memo history uploads."""
+    return cast(
+        Awaitable[CheckpointRef],
+        _call("upload_checkpoint", {"artifact": artifact, "destination": destination}),
+    )
+
+
+def publish_release(
+    *,
+    destination: str,
+    release: str,
+    lanes: Mapping[str, CheckpointRef],
+    expected_revision: int | None = None,
+) -> Awaitable[ReleaseReceipt]:
+    """Publish lane changes under one frozen revision, preserving unmentioned lanes.
+
+    Omitted revision observes and freezes the current revision. Zero requires absence.
+    A CheckpointRef is inert data and never grants destination write permission.
+    """
+    return cast(
+        Awaitable[ReleaseReceipt],
+        _call(
+            "publish_release",
+            {
+                "destination": destination,
+                "release": release,
+                "lanes": dict(lanes),
+                "expected_revision": expected_revision,
+            },
+        ),
+    )

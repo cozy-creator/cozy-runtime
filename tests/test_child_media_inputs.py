@@ -94,11 +94,11 @@ def test_broker_serializes_verified_nested_media_and_refuses_unhydrated_forgery(
                         time.monotonic() + 30,
                         assets={
                             "media.image": GrantedInput(
-                                input_id="media.image",
-                                local=media,
-                                media_type="image/png",
-                                digest=digest,
-                                length=len(raw),
+                                "media.image",
+                                media,
+                                "image/png",
+                                digest,
+                                len(raw),
                             )
                         },
                     ),
@@ -130,15 +130,7 @@ def test_broker_serializes_verified_nested_media_and_refuses_unhydrated_forgery(
             "parent",
             tmp_path / str(forged),
             time.monotonic() + 30,
-            assets={
-                "image": GrantedInput(
-                    input_id="image",
-                    local=media,
-                    media_type="image/png",
-                    digest=digest,
-                    length=len(raw),
-                )
-            },
+            assets={"image": GrantedInput("image", media, "image/png", digest, len(raw))},
             calls=broker,
         ),
     )

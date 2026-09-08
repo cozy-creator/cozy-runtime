@@ -2278,6 +2278,7 @@ class Executor:
 
         weights_open = None
         weights_source_structure = None
+        weights_source_config = None
         if surface.weights_outputs:
             from cozy_runtime.internal import weights_sink
 
@@ -2370,6 +2371,7 @@ class Executor:
             )
             weights_open = weights_host.open
             weights_source_structure = weights_host.structure
+            weights_source_config = weights_host.config
 
         from cozy_runtime.author._services import (
             BudgetFacts,
@@ -2435,6 +2437,7 @@ class Executor:
                 checkpoints=durable_checkpoint,
                 weights=weights_open,
                 weights_source_structure=weights_source_structure,
+                weights_source_config=weights_source_config,
                 budget=BudgetFacts(
                     gpu_rate_usd_per_hour=int(budget.get("gpu_rate_micro_usd_per_hour", 0)) / 1e6,
                     gpu_count=int(budget.get("gpu_count", 0)),
@@ -2506,7 +2509,24 @@ class Executor:
         bindings: dict[tuple[str, str, str], _CallType] = {}
         for row in rows:
             interface, module, export = row["interface_digest"], row["module"], row["export"]
-            if row.get("self"):
+            if row.get("native_source"):
+                from cozy_runtime.internal import source_interfaces
+
+                if interface != source_interfaces.DIGEST or module != source_interfaces.MODULE:
+                    raise CapabilityError("native source interface changed", code="child_interface")
+                binding = source_interfaces.bindings()[(interface, module, export)]
+                bindings[("", module, export)] = binding
+            elif row.get("native_effect"):
+                from cozy_runtime.internal import effect_interfaces
+
+                binding = effect_interfaces.bindings().get((interface, module, export))
+                if binding is None:
+                    raise CapabilityError(
+                        "native effect interface differs from the fixed service",
+                        code="child_interface",
+                    )
+                bindings[("", module, export)] = binding
+            elif row.get("self"):
                 assert self.discovered is not None
                 surface = next(
                     (
