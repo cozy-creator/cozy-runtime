@@ -402,6 +402,11 @@
       "sha256": "a10bb3dfe4aef0be88e4c203ef5b10ccf59cae6a0f0839ffb4b322bc429e8761",
       "type": "cozy.worker.v1.NativeByteRetentionResult"
     },
+    "native_commit_file_execute": {
+      "bytes": 409,
+      "sha256": "11e070aaa38101979ebf2d6d7fbd1b6858444857455a1055694e915205d56f59",
+      "type": "cozy.worker.v1.RecordOwnerFrame"
+    },
     "native_source_empty_file_resolve": {
       "bytes": 341,
       "sha256": "116eb3d1f890aa10ef97aad6e5700e8e69775ef077cc0e1aac1f3181e0472568",
