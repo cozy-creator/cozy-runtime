@@ -8,6 +8,7 @@ from typing import cast
 import msgspec
 
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
+from cozy_runtime.author._assets import FileAsset
 from cozy_runtime.author._calls import _current
 from cozy_runtime.author._errors import CapabilityError
 
@@ -17,6 +18,14 @@ class CheckpointRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     checkpoint: str
     manifest: ObjectRef
     publication: str
+    observation: str
+
+
+class AssessmentRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    destination: str
+    checkpoint: str
+    report: ObjectRef
+    verdict: str
     observation: str
 
 
@@ -65,5 +74,23 @@ def publish_release(
                 "lanes": dict(lanes),
                 "expected_revision": expected_revision,
             },
+        ),
+    )
+
+
+def attach_assessment(
+    checkpoint: CheckpointRef, *, report: FileAsset, workloads: FileAsset
+) -> Awaitable[AssessmentRef]:
+    """Attach a verified assessment and workload sidecar to a published checkpoint.
+
+    Both files must be received native child results. The owner verifies their
+    retained render/capture provenance and current destination authority before
+    publication; report bytes never travel inside the managed call payload.
+    """
+    return cast(
+        Awaitable[AssessmentRef],
+        _call(
+            "attach_assessment",
+            {"checkpoint": checkpoint, "report": report, "workloads": workloads},
         ),
     )

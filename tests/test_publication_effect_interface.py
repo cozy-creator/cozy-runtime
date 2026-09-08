@@ -10,10 +10,13 @@ import pytest
 
 from cozy_runtime.author import (
     App,
+    CheckpointRef,
     Context,
+    FileAsset,
     Invocation,
     ModelArtifact,
     ObjectRef,
+    attach_assessment,
     attempt,
     publish_release,
     upload_checkpoint,
@@ -64,3 +67,26 @@ def test_effect_reservations_use_existing_parent_index_and_refuse_unknown_inputs
         "upload_checkpoint",
         "publish_release",
     ]
+
+
+def test_assessment_refuses_files_without_received_custody(tmp_path: Path) -> None:
+    app = App()
+    digest = "sha256:" + "1" * 64
+    checkpoint = CheckpointRef(
+        "alice/model", digest, ObjectRef(digest, 100), "upload", "acknowledged"
+    )
+
+    @app.job
+    async def script(ctx: Context, payload: Empty) -> Empty:
+        await attach_assessment(checkpoint, report=FileAsset(digest), workloads=FileAsset(digest))
+        return Empty()
+
+    def exchange(*_: object) -> dict[str, object]:
+        raise AssertionError("unreceived artifact must not reach the effect owner")
+
+    broker = _Broker("parent", bindings(), exchange)
+    _, outcome, _ = attempt(
+        app.get("script"), {}, Invocation("parent", tmp_path, time.monotonic() + 10, calls=broker)
+    )
+    assert outcome.code == "child.asset_ungranted"
+    assert not broker.calls
