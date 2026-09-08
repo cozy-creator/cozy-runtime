@@ -480,6 +480,7 @@ class Workspace:
                 raise WorkspaceRefusal("outcome has no unchanged accepted execution")
             if row["state"] == "released":
                 return
+            from . import source_views
             from .workspace_byte_outputs import reference
 
             output_rows = db.execute(
@@ -488,16 +489,25 @@ class Workspace:
             ).fetchall()
             body = documents.read(raw, pb.AttemptOutcomeBody)
             if body["status"] == pb.OUTCOME_STATUS_SUCCEEDED:
+                returned_rows = []
+                for output in output_rows:
+                    if output["slot"].startswith(source_views.PREFIX):
+                        if not source_views.recorded(db, output, complete=True):
+                            raise WorkspaceRefusal(
+                                "terminal source view has no completed native call"
+                            )
+                    else:
+                        returned_rows.append(output)
                 native = {
                     item["output_id"]: item["native_tree"]
                     for item in body.get("output_manifest", {}).get("outputs", [])
                     if "native_tree" in item
                 }
-                if set(native) != {output["slot"] for output in output_rows}:
+                if set(native) != {output["slot"] for output in returned_rows}:
                     raise WorkspaceRefusal(
                         "terminal native byte outputs do not match completed intents"
                     )
-                for output in output_rows:
+                for output in returned_rows:
                     expected = documents.body(reference(dict(output)))
                     if output["state"] != "complete" or expected != native[output["slot"]]:
                         raise WorkspaceRefusal(

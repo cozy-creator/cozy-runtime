@@ -29,6 +29,7 @@ class NativeSourceOperation(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     NATIVE_SOURCE_OPERATION_HUGGINGFACE: _ClassVar[NativeSourceOperation]
     NATIVE_SOURCE_OPERATION_CIVITAI: _ClassVar[NativeSourceOperation]
     NATIVE_SOURCE_OPERATION_CONVERT: _ClassVar[NativeSourceOperation]
+    NATIVE_SOURCE_OPERATION_SOURCE_FILES: _ClassVar[NativeSourceOperation]
 
 class NativeSourceState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -342,6 +343,7 @@ NATIVE_SOURCE_OPERATION_UNSPECIFIED: NativeSourceOperation
 NATIVE_SOURCE_OPERATION_HUGGINGFACE: NativeSourceOperation
 NATIVE_SOURCE_OPERATION_CIVITAI: NativeSourceOperation
 NATIVE_SOURCE_OPERATION_CONVERT: NativeSourceOperation
+NATIVE_SOURCE_OPERATION_SOURCE_FILES: NativeSourceOperation
 NATIVE_SOURCE_STATE_UNSPECIFIED: NativeSourceState
 NATIVE_SOURCE_STATE_RESOLVED: NativeSourceState
 NATIVE_SOURCE_STATE_SUCCEEDED: NativeSourceState
@@ -1537,7 +1539,7 @@ class NativeSourceCommand(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_call: _Optional[_Union[ChildCallRequest, _Mapping]] = ..., service_id: _Optional[str] = ..., operation: _Optional[_Union[NativeSourceOperation, str]] = ..., phase: _Optional[_Union[NativeSourcePhase, str]] = ..., selection: _Optional[_Union[NativeSourceSelection, _Mapping]] = ..., credential: _Optional[str] = ...) -> None: ...
 
 class NativeSourceStatus(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_request_id", "parent_attempt_ordinal", "parent_invocation_spec_digest", "call_index", "intent_digest", "service_id", "state", "selection", "result_canonical_bytes", "safe_code", "safe_detail", "native_receipt_canonical_bytes", "computation_digest", "memo_hit")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_request_id", "parent_attempt_ordinal", "parent_invocation_spec_digest", "call_index", "intent_digest", "service_id", "state", "selection", "result_canonical_bytes", "safe_code", "safe_detail", "native_receipt_canonical_bytes", "computation_digest", "memo_hit", "byte_output", "byte_output_attempt_ordinal", "byte_output_invocation_spec_digest")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1555,6 +1557,9 @@ class NativeSourceStatus(_message.Message):
     NATIVE_RECEIPT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     COMPUTATION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     MEMO_HIT_FIELD_NUMBER: _ClassVar[int]
+    BYTE_OUTPUT_FIELD_NUMBER: _ClassVar[int]
+    BYTE_OUTPUT_ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    BYTE_OUTPUT_INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -1572,7 +1577,10 @@ class NativeSourceStatus(_message.Message):
     native_receipt_canonical_bytes: bytes
     computation_digest: bytes
     memo_hit: bool
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_request_id: _Optional[str] = ..., parent_attempt_ordinal: _Optional[int] = ..., parent_invocation_spec_digest: _Optional[bytes] = ..., call_index: _Optional[int] = ..., intent_digest: _Optional[bytes] = ..., service_id: _Optional[str] = ..., state: _Optional[_Union[NativeSourceState, str]] = ..., selection: _Optional[_Union[NativeSourceSelection, _Mapping]] = ..., result_canonical_bytes: _Optional[bytes] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., native_receipt_canonical_bytes: _Optional[bytes] = ..., computation_digest: _Optional[bytes] = ..., memo_hit: bool = ...) -> None: ...
+    byte_output: NativeByteTreeRef
+    byte_output_attempt_ordinal: int
+    byte_output_invocation_spec_digest: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_request_id: _Optional[str] = ..., parent_attempt_ordinal: _Optional[int] = ..., parent_invocation_spec_digest: _Optional[bytes] = ..., call_index: _Optional[int] = ..., intent_digest: _Optional[bytes] = ..., service_id: _Optional[str] = ..., state: _Optional[_Union[NativeSourceState, str]] = ..., selection: _Optional[_Union[NativeSourceSelection, _Mapping]] = ..., result_canonical_bytes: _Optional[bytes] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., native_receipt_canonical_bytes: _Optional[bytes] = ..., computation_digest: _Optional[bytes] = ..., memo_hit: bool = ..., byte_output: _Optional[_Union[NativeByteTreeRef, _Mapping]] = ..., byte_output_attempt_ordinal: _Optional[int] = ..., byte_output_invocation_spec_digest: _Optional[bytes] = ...) -> None: ...
 
 class Claim(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "record_owner_id", "worker_id", "wire_minor", "proof")

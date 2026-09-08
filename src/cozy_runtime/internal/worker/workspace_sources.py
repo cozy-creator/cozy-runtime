@@ -83,6 +83,7 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
         "download_huggingface": pb.NATIVE_SOURCE_OPERATION_HUGGINGFACE,
         "download_civitai": pb.NATIVE_SOURCE_OPERATION_CIVITAI,
         "convert_cozytensors": pb.NATIVE_SOURCE_OPERATION_CONVERT,
+        "source_files": pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES,
     }.get(call.export)
     if expected_operation is None or command.operation != expected_operation:
         raise WorkspaceRefusal("native source operation differs from its fixed interface")
@@ -412,10 +413,15 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
         if row["state"] != "releasing":
             raise WorkspaceRefusal("native cleanup has no permanent release intent")
         row = dict(row)
-    workspace_memo.release_native_result(workspace, owner, service_id)
-    workspace_memo.release_native_lookup(workspace, owner, service_id)
+    if row["operation"] != "source_files":
+        workspace_memo.release_native_result(workspace, owner, service_id)
+        workspace_memo.release_native_lookup(workspace, owner, service_id)
     store = fill.tensorfs_module().Store.open(str(workspace.store_root))
-    if row["native_owner"] == native_owner(owner, service_id):
+    if row["operation"] == "source_files":
+        from . import source_views
+
+        source_views.release_service(workspace, owner, row)
+    elif row["native_owner"] == native_owner(owner, service_id):
         if row["operation"] == "convert_cozytensors":
             state = store.derived_lookup(row["native_owner"])
             if state.get("state") == "committed":

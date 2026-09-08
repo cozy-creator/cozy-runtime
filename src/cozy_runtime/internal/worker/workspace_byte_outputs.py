@@ -85,6 +85,10 @@ def commit(
     files: Sequence[tuple[str, Path]],
     max_bytes: int,
 ) -> pb.NativeByteTreeRef:
+    from . import source_views
+
+    if slot.startswith(source_views.PREFIX):
+        raise WorkspaceRefusal("author outputs cannot enter the native source view namespace")
     entries = manifest_members(manifest_body, max_bytes)
     content_bytes = sum(entry["blob"]["length"] for entry in entries)
     root_id = identity(owner, request, ordinal, spec, slot)
@@ -168,6 +172,12 @@ def owned(db: Journal, owner: str, source: pb.NativeByteTreeRef, *, released: bo
     ).fetchone()
     if row is None or row["state"] not in (
         ("complete", "releasing", "released") if released else ("complete",)
+    ):
+        return False
+    from . import source_views
+
+    if row["slot"].startswith(source_views.PREFIX) and not source_views.recorded(
+        db, row, complete=True, released=released
     ):
         return False
     return reference(dict(row)) == source
