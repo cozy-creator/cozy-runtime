@@ -5,19 +5,20 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 
-from cozy_runtime.internal import canonical, execution_contract
+from cozy_runtime.internal import canonical
 
 
 class ModelConfigRefusal(Exception):
     pass
 
 
-#: Inline header config names that are NOT construction configs (cr-121). `execution` is the
-#: lane's execution contract (cr-109, attention-quantization.md §2): a closed msgspec schema
-#: with its own reader, `execution_contract.read`, over the header's own bytes. It never joins
-#: the constructor document and never reaches a factory — where its binding `weights.route`
-#: would read as a source carrier and the §1.1 ban would refuse the whole lane.
-RESERVED = frozenset({execution_contract.CONFIG_NAME})
+#: Inline header config names that are NOT construction configs and are SKIPPED here (cr-121).
+#: `execution` is the RETIRED lane execution contract (cr-124 deleted its reader). Checkpoints
+#: minted while it existed still carry the config in their headers, and it must stay skipped
+#: rather than deleted: folded into the constructor document its `weights` key reads as a
+#: source carrier and the §1.1 ban refuses the whole lane, which is exactly the 42-second
+#: prepare death cr-121 was opened for. Inert, not fatal.
+RESERVED = frozenset({"execution"})
 
 
 def construction_config(configs: object) -> bytes:

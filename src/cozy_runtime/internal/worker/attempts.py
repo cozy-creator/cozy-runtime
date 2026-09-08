@@ -366,10 +366,6 @@ class AttemptRecord:
     traceback: str = ""
     #: what the component-use plane actually did: stages, evictions, leases, resident set
     residency: dict[str, Any] = dataclasses_field(default_factory=dict)
-    #: the lane's execution contract as ATTESTED by this attempt (cr-109): calls of the
-    #: contracted entry against the pinned sites x forwards, and the profiled kernel symbol
-    execution_contract: dict[str, Any] = dataclasses_field(default_factory=dict)
-
     #: the record the plan was PRICED against, resolved once by the executor's kernel
     prepared: PreparedRequest | None = None
     #: cr-009's typed publication record, once the output transaction committed one
@@ -433,7 +429,6 @@ class AttemptRecord:
         self.reconciliation = {}
         self.caps = {}
         self.residency = {}
-        self.execution_contract = {}
         self.publication = {}
         self.weights_receipts = {}
         self.weights_work_fingerprint = ""
@@ -1739,17 +1734,6 @@ class AttemptEngine:
         attempt.await_reclaim_before_finalizing()
         attempt.resulted_at = time.perf_counter()
         self.monitor.end(key, "returned")
-        attempt.execution_contract = dict(reply.get("execution_contract") or {})
-        if attempt.execution_contract:
-            # WHAT ATTESTED, as a typed row every reader of confessions keys on (cr-109): the
-            # throughput table and the gate read the lane by what ran, never by the contract's
-            # promise. The line is the attestation's own BOUNDED rendering (cr-122) — digest,
-            # entry, counts, kernel symbol — because an observation is a bounded record and
-            # the scheme prose this used to inline blew the 400-character cap, faulting the
-            # executor on its own telemetry. The prose is in `plan.execution`.
-            attempt.confess(
-                "execution_contract", str(attempt.execution_contract.get("confession", ""))
-            )
         # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
         # whatever came back, success or fault: a failed attempt's activation peak is
         # exactly the number an operator needs, and dropping it on the failure path would
@@ -1894,10 +1878,6 @@ class AttemptEngine:
             cause = CAUSE.CAUSE_CODE_EXECUTOR_FAULT
         if outcome["terminal"] == "failed" and outcome["code"] in GROUP_FAULT_CODES:
             cause = CAUSE.CAUSE_CODE_EXECUTOR_FAULT
-        if outcome["terminal"] == "failed" and outcome["code"] == "execution_contract_unobserved":
-            # The kernel the lane promises was not what ran (cr-109): a capability the
-            # contract named was unavailable to this attempt, from the runtime's side.
-            cause = CAUSE.CAUSE_CODE_CAPABILITY_UNAVAILABLE
         if outcome["terminal"] == "refused" and outcome["code"] in (
             "unsupported_input",
             "tree_ungranted",
@@ -2413,11 +2393,11 @@ class AttemptEngine:
         key = f"{attempt.request_id}#{attempt.attempt}"
         plan = attempt.plan
         plan_document = plan.document() if plan is not None else {}
-        contract = attempt.prepared_model.execution_contract if attempt.prepared_model else {}
-        if contract or attempt.execution_contract:
-            # `plan.execution` (cr-109): the contract as applied by the prepare beside what
-            # this attempt attested. Outside `AttemptPlan.document()`, which is an identity.
-            plan_document["execution"] = {**contract, **attempt.execution_contract}
+        pinned = attempt.prepared_model.attention if attempt.prepared_model else {}
+        if pinned:
+            # `plan.attention` (cr-124): what the prepare pinned, uncapped, for triage. The
+            # boot note carries the one-line version; this is where the full map lives.
+            plan_document["attention"] = pinned
         assembly = triage.Assembly(
             subject_id=attempt.subject_id,
             attempt={

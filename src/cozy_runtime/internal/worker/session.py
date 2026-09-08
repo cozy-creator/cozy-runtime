@@ -4766,7 +4766,7 @@ class Worker:
             delivery_rung=str(delivery.get("rung", "")),
             delivery_variant=str(delivery.get("variant", "")),
             weight_bytes=int(reply["facts"]["filled_bytes"]),
-            execution_contract=dict(reply["facts"].get("execution_contract") or {}),
+            attention=dict(reply["facts"].get("attention") or {}),
         )
         executor.construction_key = construction_key
         executor.parameters = parameters
@@ -4859,20 +4859,14 @@ class Worker:
                 )
             ),
         )
-        _contract = reply["facts"].get("execution_contract")
-        if _contract:
-            # THE CONTRACT AS APPLIED (cr-109): which kernel, through which diffusers backend,
-            # on how many sites — the boot line a person reads before the first attempt attests.
-            _attention = _contract["contract"]["attention"]
-            self.note(
-                "boot",
-                f"{placement_id!r} execution contract {str(_contract.get('digest', ''))[:23]}…: "
-                f"{_attention['scheme']} — {_attention['distribution']}=="
-                f"{_contract.get('installed_version')}.{_attention['entry']} via diffusers "
-                f"{_contract.get('backend')} on {_contract.get('sites')} site(s) "
-                f"{dict(_contract.get('hosts') or {})}; weights.route="
-                f"{_contract['contract']['weights']['route']}",
-            )
+        _attention = reply["facts"].get("attention")
+        if _attention:
+            # WHAT THE RUNTIME PINNED (cr-124), ONE LINE, ONCE PER POD. This is the whole
+            # per-run attention record and it can be, because selection is a static rule over
+            # (device, image): there is no per-attempt CHOICE to audit, and the per-attempt
+            # observation this replaces is what faulted an executor on its own telemetry
+            # (cr-122). The uncapped map rides `plan.attention` in triage.
+            self.note("boot", f"{placement_id!r} attention: {_attention.get('line', '?')}")
         _fused = reply["facts"].get("execution_fusion")
         if _fused is not None:
             self.note(
