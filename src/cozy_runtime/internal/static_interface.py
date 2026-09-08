@@ -37,7 +37,7 @@ from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import AssetsBinding, assets_binding, assets_payload
-from cozy_runtime.author._walker import is_struct
+from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.internal.bindings import read_table
 from cozy_runtime.internal.canonical import Json
 
@@ -1046,6 +1046,12 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
             if isinstance(target, (ast.Name, ast.Attribute))
             else None
         )
+        asset_annotation: object | None = None
+        if isinstance(found, Assigned):
+            translated = reader.translate(module, node)
+            base, _ = strip(translated)
+            if base is author.Assets or typing.get_origin(base) is author.Assets:
+                asset_annotation = translated
         if isinstance(found, Vocab):
             vocab_name = found.key.partition(".")[2]
             if found.key in ("author.Context", "author.Preflight") or vocab_name in (
@@ -1058,10 +1064,12 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
             if vocab_name in {cls.__name__ for cls in SERVICES.values()}:
                 continue
             if vocab_name in ("Assets", "Annotated"):
-                if assets is not None:
-                    reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
-                assets = assets_binding(arg.arg, reader.translate(module, node))
-                continue
+                asset_annotation = reader.translate(module, node)
+        if asset_annotation is not None:
+            if assets is not None:
+                reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
+            assets = assets_binding(arg.arg, asset_annotation)
+            continue
         if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
             kind = reader.class_kind(found.module, found.node)
             if kind == "model":

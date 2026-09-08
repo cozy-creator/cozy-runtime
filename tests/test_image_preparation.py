@@ -175,7 +175,10 @@ def test_source_pixels_do_not_hide_behind_small_prepared_output(tmp_path: Path) 
         )
 
 
-def test_image_preparation_static_reader_never_imports_package(tmp_path: Path) -> None:
+@pytest.mark.parametrize("named_alias", [False, True])
+def test_image_preparation_static_reader_never_imports_package(
+    tmp_path: Path, named_alias: bool
+) -> None:
     (tmp_path / "package.toml").write_text('[application]\nobject="image_preparation:app"\n')
     (tmp_path / "image_preparation.py").write_text("""
 from typing import Annotated
@@ -194,6 +197,16 @@ def render(
 ) -> Result:
     return Result(assets[0].width)
 """)
+    if named_alias:
+        module = tmp_path / "image_preparation.py"
+        annotation = (
+            "Annotated[Assets[Image], AssetLimits(images=2), ImagePreparation(max_edge=512)]"
+        )
+        source = module.read_text().replace(
+            "class Request(msgspec.Struct):",
+            "PictureInputs = " + annotation + "\nclass Request(msgspec.Struct):",
+        )
+        module.write_text(source.replace("assets: " + annotation, "assets: PictureInputs"))
     body = static_interface.build(tmp_path)
     assert body["entrypoints"][0]["assets"]["kinds"][0]["prepare"] == {
         "profile": "image-fit/1",
