@@ -58,6 +58,28 @@ visible, and it is deliberately NOT the check. It would need a per-device peak t
 maintain and would say nothing about a kernel that is merely wrong at a plausible speed. The
 numeric check catches the same failure with three orders of magnitude of margin (rel L2 311
 against a 0.2 budget) and no device-specific constant.
+
+AND THE CHECK ABOVE CANNOT RUN IF THE PROCESS IS ALREADY DEAD. A kernel with no device image
+for the card does not raise: FlashAttention-3's `flash_fwd_launch_template.h` prints
+`no kernel image is available for execution on the device` and calls `exit(1)`. h3a-022 measured
+exactly that on an sm_120 RTX PRO 6000 with the snapshot THIS image bakes, and there is no
+Python exception at any point — `_computes` never gets to run, `available`'s broad `except`
+never sees anything, and the pod dies at prepare with no typed refusal. A C++ abort is not
+recoverable, so it has to be UNREACHABLE. Admission is therefore bounded ABOVE as well as
+below, and a device outside a kernel's range is refused by name before the kernel is ever
+called.
+
+THE UPPER BOUND IS READ FROM THE BINARY, NOT DECLARED BESIDE IT. `kernels` writes a
+`metadata.json` next to every built variant whose `backend.archs` is the artifact's own
+statement of what it carries — the baked flash-attn3 snapshot says `["8.0", "9.0a"]`, and
+`9.0a` is architecture-CONDITIONAL, so it has an image for sm_90 and for nothing else. A static
+`max_sm` beside it would be a second copy of that list, and a second copy drifts: this table
+already said "sm90 and up" while the binary carried sm_90a, which is the whole defect. So a
+BAKED candidate declares no ceiling at all and is bounded by the metadata of the variant that
+was actually loaded; a candidate with no such artifact — torch's own backends, and a
+distribution whose diffusers backend names its architecture in its own name — carries a static
+`max_sm` with the reason it is not a guess. A baked artifact that declares no archs is a
+REFUSAL, not a pass: a check that reads nothing must not look like a check that read.
 """
 
 from __future__ import annotations
@@ -104,12 +126,24 @@ class Candidate:
     name: str
     #: diffusers' backend member value at `DIFFUSERS_VERSION`.
     backend: str
-    #: The lowest CUDA compute capability, as `DeviceFacts.sm` spells it (90 = sm90).
+    #: The lowest CUDA compute capability, as `DeviceFacts.sm` spells it (90 = sm90). This is a
+    #: FUNCTIONAL floor and it is allowed to be stricter than the binary: the baked flash-attn3
+    #: snapshot carries an sm_80 cubin, but FlashAttention-3's kernels are Hopper's and h3a-012
+    #: measured it on sm90, so sm90 is where the entry starts.
     min_sm: int
     #: Activation dtypes the kernel takes. Empty = any (torch's own dispatch).
     dtypes: frozenset[str]
     #: The largest per-head dimension the kernel serves. 0 = unbounded.
     max_head_dim: int
+    #: The highest CUDA compute capability this candidate's binary has an image for; 0 = not
+    #: bounded here. A BAKED candidate MUST leave this 0 — its ceiling is read from the
+    #: artifact's own `metadata.json` (`_baked_archs`), because a static copy of a binary's
+    #: arch list is the drift that killed a Blackwell pod. 0 on a NON-baked candidate is a
+    #: CLAIM, not an omission: torch's in-tree backends are bounded by torch, they raise a
+    #: Python exception when they have no plan for a card (h3a-022 measured cuDNN doing exactly
+    #: that on sm_100 and computing fine on sm_120), and the floor may never be bounded at all
+    #: because a device it refused would hold no attention kernel whatsoever.
+    max_sm: int = 0
     #: A `kernels` Hub snapshot the image BAKES, by distribution directory name; empty for a
     #: kernel that is installed as an ordinary distribution or is torch's own.
     baked: str = ""
@@ -135,6 +169,12 @@ CANDIDATES: tuple[Candidate, ...] = (
         min_sm=90,
         dtypes=frozenset({"bfloat16", "float16"}),
         max_head_dim=256,
+        # NO `max_sm`. This is the one entry whose ceiling is a BINARY's, and the binary says
+        # it: the baked snapshot's `metadata.json` declares `["8.0", "9.0a"]`, so the ceiling
+        # is sm_90 and it is read at resolution rather than restated here. Restating it is
+        # what broke: this row said sm90-and-up while the `.so` carried `sm_90a`, and h3a-022
+        # measured the consequence — `exit(1)` from C++ on an sm_120 card, before any check
+        # this module owns could run.
         baked="flash-attn3",
         rel_l2_max=2e-2,
         why=(
@@ -151,6 +191,13 @@ CANDIDATES: tuple[Candidate, ...] = (
         min_sm=0,
         dtypes=frozenset(),
         max_head_dim=0,
+        # UNBOUNDED IN BOTH DIRECTIONS, and that is the one bound this module may not add. A
+        # ceiling here would leave a card with no attention kernel at all, and there is
+        # nothing to protect it from: torch's chooser owns its own fallback down to the math
+        # backend, and its failures are Python exceptions the numeric self-check already
+        # catches (h3a-022 measured torch's own dispatch computing correctly on sm_120 at
+        # 365.0 TF/s).
+        max_sm=0,
         rel_l2_max=2e-2,
         why=(
             "torch's own `scaled_dot_product_attention` dispatch, and the FLOOR: it takes "
@@ -172,6 +219,14 @@ PINNABLE: tuple[Candidate, ...] = (
         min_sm=80,
         dtypes=frozenset({"bfloat16", "float16"}),
         max_head_dim=128,
+        # NO CEILING, and it is a claim rather than an oversight. This is torch's in-tree
+        # cuDNN frontend, not a binary of ours: it is built for whatever the image's cuDNN
+        # supports, and when it has no plan for a card it RAISES — v1's B200 screen got
+        # `cuDNN Frontend error: No valid execution plans built` on sm_100, which auto drops
+        # and a pin surfaces typed. h3a-022 then measured cuDNN 9.20 serving sm_120 at
+        # 373.6 TF/s, the fastest exact arm on that card, so a ceiling would be wrong as well
+        # as unnecessary.
+        max_sm=0,
         rel_l2_max=2e-2,
         why=(
             "MEASURED SLOWER than the floor it duplicates (h3a-012): 34.99 s against 34.70 s, "
@@ -186,6 +241,15 @@ PINNABLE: tuple[Candidate, ...] = (
         min_sm=90,
         dtypes=frozenset({"bfloat16", "float16"}),
         max_head_dim=128,
+        # sm90 AND ONLY sm90, and this ceiling cannot drift because the architecture is IN THE
+        # BACKEND NAME: `_sage_qk_int8_pv_fp8_cuda_sm90` reaches
+        # `sageattention._qattn_sm90`, which the image builds as
+        # `arch=compute_90a,code=sm_90a` — architecture-conditional, so it has an image for
+        # sm_90 and for nothing above or below it. h3a-022 measured
+        # `cudaErrorNoKernelImageForDevice` from this extension on sm_120. A future image that
+        # bakes an sm_120 SageAttention adds a NEW row for its own sm_120 entry point; it does
+        # not widen this one.
+        max_sm=90,
         distribution="sageattention",
         rel_l2_max=2e-1,
         why=(
@@ -244,12 +308,107 @@ def _member(backend: str) -> Any:
     return AttentionBackendName(backend)
 
 
-def _load_baked(candidate: Candidate) -> tuple[Any, str]:
+def _capability(declared: str) -> tuple[int, int, str] | None:
+    """One architecture as an artifact spells it — `"9.0a"`, `"8.0"`, `"sm_120"` — or None.
+
+    None is "this runtime cannot read what the artifact declared", and every caller treats it
+    as NOT covered, because the alternative is calling a kernel we could not check.
+    """
+    entry = declared.strip().lower().removeprefix("sm_").removeprefix("compute_")
+    suffix = entry[-1] if entry[-1:] in ("a", "f") else ""
+    digits = entry.removesuffix(suffix) if suffix else entry
+    major, _, minor = digits.partition(".")
+    if not minor:
+        major, minor = digits[:-1], digits[-1:]
+    if not (major.isdigit() and minor.isdigit()):
+        return None
+    return int(major), int(minor), suffix
+
+
+def _covers(declared: str, sm: int) -> bool:
+    """Does device code built for `declared` have an image for a device of capability `sm`?
+
+    NVIDIA's binary-compatibility rule and nothing more: a cubin built for X.y runs on X.z
+    where z >= y, and NEVER across a major generation — so sm_90a code has no image on sm_100
+    or sm_120 however close the numbers look. An ACCELERATED target (the `a` suffix) is
+    architecture-CONDITIONAL — Hopper's `wgmma` and Blackwell's `tcgen05` are only reachable
+    through it — and runs on exactly the architecture it was built for, so it does not even
+    carry forward to a higher minor. A FAMILY target (`f`, CUDA 13) does.
+    """
+    parsed = _capability(declared)
+    if parsed is None:
+        return False
+    major, minor, suffix = parsed
+    if (major, minor) == (sm // 10, sm % 10):
+        return True
+    return suffix != "a" and major == sm // 10 and minor <= sm % 10
+
+
+def _declared_archs(variant: Path) -> list[str]:
+    """The architectures a `kernels` build variant says it carries, from its own metadata.
+
+    `build/<variant>/metadata.json` is written by kernel-builder beside the `.so` it describes,
+    so this is the artifact's statement about itself and not a second copy of it. An empty
+    answer is a refusal at the call site, never an admission.
+    """
+    try:
+        document = json.loads((variant / "metadata.json").read_text())
+        archs = document["backend"]["archs"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    return [str(arch) for arch in archs] if isinstance(archs, list) else []
+
+
+def _baked_archs(candidate: Candidate) -> dict[str, list[str]]:
+    """Every baked variant of this candidate, and the architectures each one declares."""
+    builds = IMAGE_KERNELS_DIR / candidate.baked / "build" if candidate.baked else None
+    if builds is None or not builds.is_dir():
+        return {}
+    return {
+        variant.name: _declared_archs(variant)
+        for variant in sorted(builds.iterdir())
+        if (variant / "metadata.json").is_file()
+    }
+
+
+def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: DeviceFacts) -> None:
+    """Refuse a card that none of these baked variants has device code for.
+
+    Silence is NOT admission: a variant present but declaring no architecture is refused, the
+    same as one declaring the wrong ones — a check that read nothing must not look like a
+    check that passed. The one quiet case is no baked snapshot at all, which is `_load_baked`'s
+    `attention_kernel_absent` to report and not this function's business.
+    """
+    if device.kind != "cuda" or not archs:
+        return
+    if any(_covers(arch, device.sm) for declared in archs.values() for arch in declared):
+        return
+    raise AttentionRefusal(
+        "attention_kernel_unsupported",
+        f"{candidate.name} is baked as {archs} and none of those builds carries device code "
+        f"for {device.name} (sm{device.sm}). This is a REFUSAL rather than an attempt because "
+        "the attempt is not survivable: FlashAttention-3's launcher prints `no kernel image is "
+        "available for execution on the device` and exits the process from C++, so neither the "
+        "numeric self-check nor auto-selection's own fallback would ever run (h3a-022 measured "
+        "it on an sm_120 RTX PRO 6000 with this exact snapshot). Only a worker image baking a "
+        "build that carries this architecture changes the answer",
+    )
+
+
+def _load_baked(candidate: Candidate, device: DeviceFacts) -> tuple[Any, str]:
     """Load the image's baked snapshot into diffusers' Hub slot so nothing is fetched.
 
     diffusers resolves a Hub kernel over the network on first use; filling `kernel_fn` and the
     wrapped forward/backward slots makes `_maybe_download_kernel_for_backend` a no-op, which
     is the only reason a pod without egress can run FlashAttention-3 at all.
+
+    `_resolve` has already refused a card no baked variant claims. This repeats the check
+    against the variant `kernels` ACTUALLY resolved, which is the authoritative one — the
+    resolution is by torch ABI and CUDA version, not by architecture, so an image baking two
+    variants could pass the first check on one of them and load the other. Loading is safe on
+    any card (a `.so` full of Hopper cubins still dlopens on Blackwell); CALLING it is not, so
+    the check sits after the load and before diffusers' registry is touched, and a refused
+    kernel leaves no half-filled slot behind.
     """
     if KERNELS_ABSENT:
         raise AttentionRefusal(
@@ -279,6 +438,7 @@ def _load_baked(candidate: Candidate) -> tuple[Any, str]:
             f"{candidate.name} does not load from {location}: {type(exc).__name__}: {exc}",
         ) from exc
     loaded = Path(str(getattr(module, "__file__", ""))).resolve().parent
+    _admit_arch(candidate, {loaded.name: _declared_archs(loaded)}, device)
     from diffusers.models.attention_dispatch import _HUB_KERNELS_REGISTRY
 
     member = _member(candidate.backend)
@@ -385,7 +545,13 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
 
     Present is not enough: an import and an extension file were both true of a kernel that
     returned uninitialized memory (h3a-013), so resolution ends with `_computes`.
+
+    IT BEGINS WITH THE ARCHITECTURE, before diffusers or the loader is asked anything. The
+    artifact's own `metadata.json` needs neither, and a card it has no image for must be
+    refused wherever this runs — a dev box, a CI runner, a pod — not only where the rest of
+    the stack happens to be installed.
     """
+    _admit_arch(candidate, _baked_archs(candidate), device)
     registry = _registry()
     member = _member(candidate.backend)
     if member not in registry._backends:
@@ -394,7 +560,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
             f"diffusers=={DIFFUSERS_VERSION} registers no backend {candidate.backend!r}",
         )
     if candidate.baked:
-        loaded_member, location = _load_baked(candidate)
+        loaded_member, location = _load_baked(candidate, device)
         ready = Ready(candidate, loaded_member, location)
         _computes(ready, device)
         return ready
@@ -420,13 +586,42 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
     return ready
 
 
+def _device_admits(candidate: Candidate, device: DeviceFacts) -> str:
+    """Empty when this DEVICE is inside the candidate's DECLARED range, else why it is not.
+
+    Both ends, and the ceiling is the one this module was missing: an open-ended range is a
+    claim that the kernel serves every architecture ever built, which is false of every entry
+    that is a compiled binary rather than a dispatcher. A candidate whose ceiling belongs to a
+    baked artifact declares none here and is bounded by `_admit_arch` at resolution instead.
+    """
+    if candidate.min_sm and (device.kind != "cuda" or device.sm < candidate.min_sm):
+        return (
+            f"{candidate.name} needs sm{candidate.min_sm} or better; this executor holds "
+            f"{device.kind} sm{device.sm}"
+        )
+    if candidate.max_sm and device.kind == "cuda" and device.sm > candidate.max_sm:
+        serves = (
+            f"sm{candidate.max_sm} only"
+            if candidate.min_sm == candidate.max_sm
+            else f"sm{candidate.min_sm} through sm{candidate.max_sm}"
+        )
+        return (
+            f"{candidate.name} serves {serves}; this executor holds sm{device.sm}, and the "
+            "binary behind it carries no device code for that architecture. Calling it anyway "
+            "returns `cudaErrorNoKernelImageForDevice` or kills the process from C++ rather "
+            "than raising something this runtime could recover from (h3a-022)"
+        )
+    return ""
+
+
 def for_device(device: DeviceFacts) -> list[Candidate]:
-    """The ranked table filtered by DEVICE alone — no import, no image. The pure half."""
-    return [
-        candidate
-        for candidate in CANDIDATES
-        if not candidate.min_sm or (device.kind == "cuda" and device.sm >= candidate.min_sm)
-    ]
+    """The ranked table filtered by DEVICE alone — no import, no image. The pure half.
+
+    Pure means it can only apply the bounds the TABLE declares. A baked kernel's real ceiling
+    is in its artifact, so it is applied one step later, at resolution — which is why this
+    list can still name a kernel that `available` then drops.
+    """
+    return [candidate for candidate in CANDIDATES if not _device_admits(candidate, device)]
 
 
 def available(device: DeviceFacts) -> list[Ready]:
@@ -464,11 +659,15 @@ def pinned(name: str, device: DeviceFacts) -> list[Ready]:
             "attention_kernel_unknown",
             f"{name!r} is not an attention kernel this runtime knows; it knows {sorted(BY_NAME)}",
         )
-    if candidate.min_sm and (device.kind != "cuda" or device.sm < candidate.min_sm):
+    unsupported = _device_admits(candidate, device)
+    if unsupported:
+        # THE REFUSAL IS THE DISCOVERABILITY. A developer pinning a kernel this card cannot
+        # run is told, in the same sentence, what this image and this card actually offer —
+        # which is what `image_kernels` is for, and it lists what COMPUTES rather than what
+        # imports (cr-127) so the answer never points at another trap.
         raise AttentionRefusal(
             "attention_kernel_unsupported",
-            f"{name} needs sm{candidate.min_sm} or better; this executor holds "
-            f"{device.kind} sm{device.sm}",
+            f"{unsupported}. This image runs {image_kernels(device)} on {device.name}",
         )
     return [_resolve(candidate, device)]
 
@@ -650,10 +849,14 @@ def image_kernels(device: DeviceFacts) -> str:
     Device-filtered first, so a card the entry does not claim is never probed; and it lists
     what computes, not what imports — naming a kernel here that returns garbage would send a
     developer straight at the trap the refusal was meant to steer them away from.
+
+    The filter is the FULL declared range, not just the floor. On a card above a kernel's
+    ceiling that is the difference between an answer and a dead process: probing means calling,
+    and calling a kernel with no image for the device exits from C++ (h3a-022).
     """
     shipped: list[str] = []
     for candidate in (*CANDIDATES, *PINNABLE):
-        if candidate.min_sm and (device.kind != "cuda" or device.sm < candidate.min_sm):
+        if _device_admits(candidate, device):
             continue
         try:
             _resolve(candidate, device)
