@@ -222,8 +222,15 @@ class Executor:
                         f"the executor wedged during {what!r}: "
                         f"{pace.verdict(liveness.noise_floor())}"
                     )
-                    with contextlib.suppress(ProcessLookupError, OSError):
+                    with (
+                        contextlib.suppress(ProcessLookupError, OSError),
+                        contextlib.closing(proctree.observe_process_exit(self.process)) as exited,
+                    ):
                         proctree.signal_process(self.process, signal.SIGKILL)
+                        # Socket EOF can precede process exit. Finish this
+                        # exact-birth observation before returning the wedge;
+                        # retirement still owns reaping and driver reclaim.
+                        exited.wait()
                     return
 
         thread = threading.Thread(target=watch, name=f"watch-{what}", daemon=True)
