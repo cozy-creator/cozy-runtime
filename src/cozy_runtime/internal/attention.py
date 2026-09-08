@@ -217,11 +217,25 @@ def _load_baked(candidate: Candidate) -> tuple[Any, str]:
             f"{candidate.name} is not baked under {builds}; the worker image bakes it there "
             "and this executor has no network to fetch it",
         )
-    module = get_local_kernel(location)
+    try:
+        module = get_local_kernel(location)
+    except Exception as exc:
+        # A snapshot this torch cannot load is an ABSENT kernel, not a crash: the image
+        # baked a variant built for another ABI, and the floor still serves.
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"{candidate.name} does not load from {location}: {type(exc).__name__}: {exc}",
+        ) from exc
     loaded = Path(str(getattr(module, "__file__", ""))).resolve().parent
     from diffusers.models.attention_dispatch import _HUB_KERNELS_REGISTRY
 
     member = _member(candidate.backend)
+    if member not in _HUB_KERNELS_REGISTRY:
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"diffusers=={DIFFUSERS_VERSION} does not resolve {candidate.backend!r} through "
+            "its Hub-kernel registry, so a baked snapshot cannot be placed in its slot",
+        )
     config = _HUB_KERNELS_REGISTRY[member]
     config.kernel_fn = _lookup(module, config.function_attr, candidate.name)
     for attr, slot in (
@@ -295,7 +309,11 @@ def available(device: DeviceFacts) -> list[Ready]:
     for candidate in for_device(device):
         try:
             ready.append(_resolve(candidate))
-        except AttentionRefusal:
+        except Exception:
+            # BROAD ON PURPOSE. Auto-selection has no refusal arm — the floor takes
+            # everything — so a kernel that fails to resolve for ANY reason must drop out of
+            # the ranking rather than fail the prepare that was only trying to go faster. A
+            # PIN is the opposite and keeps its typed refusals (`pinned`).
             continue
     return ready
 
@@ -489,7 +507,7 @@ def image_kernels() -> str:
     for candidate in (*CANDIDATES, *PINNABLE):
         try:
             _resolve(candidate)
-        except AttentionRefusal:
+        except Exception:
             continue
         shipped.append(candidate.name)
     return ", ".join(shipped) or "none"

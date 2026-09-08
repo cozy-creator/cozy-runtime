@@ -104,6 +104,32 @@ def test_the_device_alone_decides_which_ranked_kernels_are_even_candidates() -> 
         assert offered == [name for name in ranked if name in offered]
 
 
+def test_a_candidate_that_fails_to_resolve_for_any_reason_drops_out_of_auto() -> None:
+    """PLANTED RED ARM. Auto-selection has no refusal arm — the floor takes everything — so a
+    kernel that fails to resolve for ANY reason, not only a typed one, must drop out of the
+    ranking rather than fail a prepare that was only trying to go faster. The plant is the
+    shape that would really happen: a baked snapshot built for another ABI, whose loader
+    raises whatever it raises. A PIN is the opposite and keeps its typed refusal."""
+    broken = attention.BY_NAME["flash-attn3"]
+    real = attention._resolve
+
+    def planted(candidate: attention.Candidate) -> attention.Ready:
+        if candidate is broken:
+            raise RuntimeError("ImportError: undefined symbol: _ZN3c105ErrorC1E")
+        return real(candidate)
+
+    attention._resolve = planted  # type: ignore[assignment]
+    try:
+        assert "flash-attn3" not in [entry.name for entry in attention.available(_device(90))]
+        assert "flash-attn3" not in attention.image_kernels()
+        # The pin does NOT swallow it: a caller who named it is told, not quietly served
+        # something else.
+        with pytest.raises(RuntimeError, match="undefined symbol"):
+            attention.pinned("flash-attn3", _device(90))
+    finally:
+        attention._resolve = real  # type: ignore[assignment]
+
+
 def test_a_pin_this_runtime_does_not_know_refuses_and_names_what_it_knows() -> None:
     refused = _refusal(lambda: attention.pinned("flash_attention_2", _device(90)))
     assert refused.code == "attention_kernel_unknown"
