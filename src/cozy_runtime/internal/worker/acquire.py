@@ -701,7 +701,8 @@ class Acquirer:
                         sequence_parallel_degrees=degrees,
                         # The manifest is identity; lane remains the human repo pointer the
                         # desired download set carried beside it.
-                        model=f"{reference['repo']}@{reference['version']}"
+                        model=str(reference["repo"])
+                        + (f"@{reference['version']}" if reference.get("version") else "")
                         + (f"/{reference['lane']}" if reference.get("lane") else ""),
                     )
                 )
