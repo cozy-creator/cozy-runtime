@@ -132,10 +132,7 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
         else:
             if row["state"] in ("releasing", "released"):
                 raise WorkspaceRefusal("native source call was permanently released")
-            if (
-                row["state"] in ("stopped", "failed")
-                and call.parent_attempt_ordinal > row["parent_ordinal"]
-            ):
+            if row["state"] == "failed" and call.parent_attempt_ordinal > row["parent_ordinal"]:
                 db.execute(
                     "UPDATE native_calls SET state=?,native_error='' "
                     "WHERE owner=? AND service_id=?",

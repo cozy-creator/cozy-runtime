@@ -192,7 +192,8 @@ def test_source_view_replays_one_producer_and_retained_child_survives_parent_ack
     )
     tensorfs.gc(str(workspace.store_root))
     store = tensorfs.Store.open(str(workspace.store_root))
-    assert store.tree_root(first.byte_output.producer_root_id)["released"]
+    observed = store.tree_root(first.byte_output.producer_root_id)
+    assert observed is not None and observed["released"]
     with byte_outputs.leased(workspace, "owner", recipient) as (_, lease, members):
         data = bytearray(len(b"metadata bytes"))
         lease.read_into("sha256:" + members[0]["blob"]["sha256"], len(data), 0, len(data), data)
@@ -226,7 +227,7 @@ def test_author_cannot_forge_source_view_namespace(tmp_path: Path) -> None:
             "script",
             1,
             source.parent_call.parent_invocation_spec_digest,
-            source_views.slot(1),
+            byte_outputs.native_slot("source_files", 1),
             b"{}",
             [],
             64 << 20,
@@ -259,7 +260,8 @@ def test_source_view_lost_reply_reattaches_without_rebinding_original_producer(
     finish_parent(restarted, retried, retain=False)
     tensorfs.gc(str(workspace.store_root))
     store = tensorfs.Store.open(str(workspace.store_root))
-    assert store.tree_root(first.byte_output.producer_root_id)["released"]
+    observed = store.tree_root(first.byte_output.producer_root_id)
+    assert observed is not None and observed["released"]
     with byte_outputs.leased(restarted, "owner", recipient) as (_, lease, members):
         data = bytearray(len(b"original metadata"))
         lease.read_into("sha256:" + members[0]["blob"]["sha256"], len(data), 0, len(data), data)
@@ -306,4 +308,56 @@ def test_source_view_stop_before_journal_completion_releases_native_root(tmp_pat
         )
     source_views.abort_unfinished(workspace, "owner", command)
     tensorfs.gc(str(workspace.store_root))
-    assert store.tree_root(envelope["view_owner"])["released"]
+    observed = store.tree_root(envelope["view_owner"])
+    assert observed is not None and observed["released"]
+
+
+def test_source_view_failed_completion_retries_original_intent_and_native_root(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace(tmp_path / "store")
+    source = accepted(workspace, "script")
+    data, _ = completed(workspace, source)
+    command = view_call(source, data)
+    workspace_sources.accepted(workspace, "owner", command)
+    envelope = source_views.prepare(workspace, "owner", command, b"k" * 32)
+    store = tensorfs.Store.open(str(workspace.store_root))
+    manifest = envelope["view_manifest"]
+    native = store.create_tree_root(envelope["view_owner"], manifest["digest"], manifest["length"])
+    with workspace.locked() as db:
+        db.execute(
+            "UPDATE native_calls SET state='failed' WHERE service_id=?", (command.service_id,)
+        )
+    source_views.abort_unfinished(workspace, "owner", command)
+    observed = store.tree_root(envelope["view_owner"])
+    assert observed is not None and not observed["released"]
+    retried = reattach(workspace, command)
+    result = run_view(Workspace(workspace.store_root), retried)
+    assert result.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, result.safe_code
+    assert result.parent_attempt_ordinal == 2
+    assert result.byte_output_attempt_ordinal == 1
+    assert result.byte_output.producer_root_id == envelope["view_owner"]
+    assert result.native_receipt_canonical_bytes == native["receipt"]
+    with workspace.locked() as db:
+        assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 1
+
+
+def test_source_view_explicit_cancel_cannot_restart_same_logical_call(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    source = accepted(workspace, "script")
+    data, _ = completed(workspace, source)
+    command = view_call(source, data)
+    workspace_sources.accepted(workspace, "owner", command)
+    envelope = source_views.prepare(workspace, "owner", command, b"k" * 32)
+    workspace_sources.stopped(workspace, "owner", command)
+    source_views.abort_unfinished(workspace, "owner", command)
+    retried = reattach(workspace, command)
+    result = run_view(workspace, retried)
+    assert result.state == pb.NATIVE_SOURCE_STATE_CANCELED
+    with workspace.locked() as db:
+        assert (
+            db.execute(
+                "SELECT state FROM byte_outputs WHERE id=?", (envelope["view_owner"],)
+            ).fetchone()[0]
+            == "released"
+        )
