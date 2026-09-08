@@ -54,6 +54,7 @@ def prepare_package_set(
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
+    preinstalled_python: Path | None = None,
 ) -> pb.PreparePackageSetResult:
     """Parse the desired download set plus the request's release facts (wire 30) and prepare.
 
@@ -87,7 +88,16 @@ def prepare_package_set(
         raise PreparationRefusal("package_prepare_download_set_invalid", "package row")
     package_name = str(selected.get("package", ""))
     release = str(selected.get("release", ""))
-    application, slot_paths, inventory, locked = _request_facts(request, models)
+    application, slot_paths, inventory, locked = _request_facts(
+        request, models, preinstalled=preinstalled_python is not None
+    )
+    installed = None
+    if preinstalled_python is not None:
+        # This path is selected only by the local worker's launch configuration.
+        # RPC callers cannot choose an interpreter or claim an image inventory.
+        installed = package_environment.open_existing_environment(
+            preinstalled_python, canonical.digest({"locked_requirements": locked.digest})
+        )
     return _prepare_published(
         package_name=package_name,
         release=release,
@@ -107,6 +117,7 @@ def prepare_package_set(
         verified=verified,
         job_plan_root=job_plan_root,
         base=base,
+        installed_environment=installed,
     )
 
 
@@ -153,8 +164,10 @@ def prepare_published_local(
 
 
 def _request_facts(
-    request: pb.PreparePackageSetRequest, models: Sequence[Any]
-) -> tuple[str, tuple[str, ...], image_inventory.Inventory, package_environment.LockedRequirements]:
+    request: pb.PreparePackageSetRequest, models: Sequence[Any], *, preinstalled: bool = False
+) -> tuple[
+    str, tuple[str, ...], image_inventory.Inventory | None, package_environment.LockedRequirements
+]:
     """Admit the wire-30 release facts: the two facts, the inventory, and the lock."""
 
     application = request.application
@@ -171,16 +184,24 @@ def _request_facts(
         slot = str(row.get("slot", "")) if isinstance(row, Mapping) else ""
         if slot not in slot_paths:
             raise PreparationRefusal("package_prepare_model_slot_unknown", slot)
-    if not request.HasField("image_inventory"):
-        raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
-    try:
-        inventory = image_inventory.from_wire(
-            request.image_inventory.profile,
-            request.image_inventory.python,
-            request.image_inventory.distributions,
-        )
-    except image_inventory.ImageInventoryRefusal as exc:
-        raise PreparationRefusal("package_prepare_image_inventory_invalid", exc.detail) from exc
+    inventory = None
+    if preinstalled:
+        if request.HasField("image_inventory"):
+            raise PreparationRefusal(
+                "package_prepare_local_inventory_invalid",
+                "local prepared environment has no managed image inventory",
+            )
+    else:
+        if not request.HasField("image_inventory"):
+            raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
+        try:
+            inventory = image_inventory.from_wire(
+                request.image_inventory.profile,
+                request.image_inventory.python,
+                request.image_inventory.distributions,
+            )
+        except image_inventory.ImageInventoryRefusal as exc:
+            raise PreparationRefusal("package_prepare_image_inventory_invalid", exc.detail) from exc
     try:
         locked = package_environment.read_locked_requirements(bytes(request.locked_requirements))
     except package_environment.EnvironmentRefusal as exc:
@@ -419,6 +440,8 @@ def check_package_set_compatibility(
     package_name = str(selected_package.get("package", ""))
     release = str(selected_package.get("release", ""))
     application, slot_paths, inventory, locked = _request_facts(request, models)
+    if inventory is None:
+        raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
     installed = _compatibility_environment(
         package_name=package_name,
         release=release,
@@ -692,6 +715,7 @@ def prepare_local_package(
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
+    dependency_python: Path | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Prepare one exact local wheel revision without inventing Hub provenance."""
@@ -727,6 +751,7 @@ def prepare_local_package(
         job_plan_root=job_plan_root,
         base=base,
         development=package,
+        dependency_python=dependency_python,
         materialized=materialized,
     )
 
@@ -832,6 +857,7 @@ def prepare_package(
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
     base: base_observation.Observation | None = None,
+    dependency_python: Path | None = None,
     job_plan_root: Path | None = None,
     development: pb.DevelopmentPackage | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
@@ -942,6 +968,7 @@ def prepare_package(
             install_root,
             python=python,
             base=observed_base,
+            dependency_python=dependency_python,
         )
     except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
         code = getattr(exc, "code", "package_environment_install_failed")

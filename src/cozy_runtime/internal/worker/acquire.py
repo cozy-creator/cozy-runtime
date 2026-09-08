@@ -635,7 +635,6 @@ class Acquirer:
                     model_parameter_name="",
                     application=application,
                     interface_path=str(interface_path),
-                    development=bool(development),
                 )
                 continue
             described_by_path = {
@@ -726,7 +725,6 @@ class Acquirer:
                 components=first.components,
                 snapshots=first.snapshots,
                 model_weight_bytes=sum(member.model_weight_bytes for member in model_set),
-                development=bool(development),
                 package=(
                     f"{development['package']}@{development['release']}"
                     if development
