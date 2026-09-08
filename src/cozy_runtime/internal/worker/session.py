@@ -4806,6 +4806,18 @@ class Worker:
                 f"{dict(_contract.get('hosts') or {})}; weights.route="
                 f"{_contract['contract']['weights']['route']}",
             )
+        _fused = reply["facts"].get("execution_fusion")
+        if _fused is not None:
+            self.note(
+                "boot",
+                f"{placement_id!r} fused glue: "
+                + (
+                    f"APPLIED {_fused.get('identity', '?')} sites={_fused.get('sites')} "
+                    f"fp8_sites={_fused.get('fp8_sites')} warm={_fused.get('warm_ms')}ms"
+                    if _fused.get("applied")
+                    else f"NOT APPLIED ({_fused.get('reason')})"
+                ),
+            )
         self.note(
             "boot",
             f"{placement_id!r} prepared {len(group)} binding(s) in {took:.0f} ms — "

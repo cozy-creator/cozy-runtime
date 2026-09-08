@@ -40,6 +40,21 @@ from cozy_runtime.internal.encoding.formats import (
 ACT_SCALE_FLOOR = 1e-12
 
 
+@dataclass(frozen=True, slots=True)
+class PreQuantized:
+    """An activation already in the rowwise leaf's operand geometry (h3a-015).
+
+    A fused glue kernel that holds the row in registers quantizes it there instead of
+    writing bf16 for the leaf to read back; the leaf then skips `quantize_activation_rowwise`
+    and feeds the payload and per-row scale straight to the GEMM. `shape` is the bf16
+    activation's, so the leaf's output reshape is the same expression either way.
+    """
+
+    payload: Any
+    scale: Any
+    shape: tuple[int, ...]
+
+
 def _triton_rowwise_kernel() -> Any:
     """The FUSED spelling of `quantize_activation_rowwise`, compiled once, lazily.
 
@@ -118,6 +133,8 @@ def quantize_activation_rowwise(torch: Any, x: Any) -> tuple[Any, Any]:
     NOT a probe-only helper, despite the family resemblance to `instruments.py`'s two: this
     one runs inside every forward pass of a rowwise encoded leaf.
     """
+    if isinstance(x, PreQuantized):
+        return x.payload, x.scale
     flat = x.reshape(-1, x.shape[-1])
     if flat.is_cuda and flat.numel() and flat.stride(-1) == 1:
         kernel = _triton_rowwise_kernel()
