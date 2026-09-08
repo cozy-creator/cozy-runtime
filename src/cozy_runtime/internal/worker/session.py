@@ -46,7 +46,7 @@ import threading
 import time
 import traceback
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -72,6 +72,7 @@ from cozy_runtime.internal.worker import (
     lane_wire,
     model_source_prepare,
     observe,
+    page_warm,
     triage,
     weights,
 )
@@ -873,12 +874,36 @@ def _placement_profile(entry: dict[str, Any]) -> None:
         )
 
 
+def _group_parameters(group: Sequence[DeclaredBinding]) -> frozenset[str]:
+    """Every model parameter name the group's bindings spell (h3a-018)."""
+    return frozenset(
+        model.model_parameter_name for binding in group for model in binding.model_bindings()
+    )
+
+
+def _parameter_names_by_model(group: Sequence[DeclaredBinding]) -> list[list[str]]:
+    """Per model position, the parameter names the group binds it under. Bindings of one
+    construction hold their models in the same order (the key sorts them by path)."""
+    width = max((len(binding.model_bindings()) for binding in group), default=0)
+    return [
+        sorted(
+            {
+                binding.model_bindings()[index].model_parameter_name
+                for binding in group
+                if index < len(binding.model_bindings())
+            }
+        )
+        for index in range(width)
+    ]
+
+
 def executor_prepare_command(
     binding: DeclaredBinding,
     *,
     devices: str,
     authorized_device_limit_bytes: int = 0,
     sequence_parallel_degree: int = 1,
+    parameter_names: Sequence[Sequence[str]] = (),
 ) -> dict[str, Any]:
     """Translate one resolved callable binding into the executor's closed prepare shape.
 
@@ -888,10 +913,16 @@ def executor_prepare_command(
     (cr-025/cr-066); the executor fits under the smaller of it and what it measures, and
     never derives one of its own. `sequence_parallel_degree` rides only when > 1 (cr-068):
     a group lane's K, the ONE new fact its executor receives; a plain prepare is unchanged.
+    `parameter_names[i]` is every parameter name the i-th model is bound under across the
+    bindings that share this construction (h3a-018); absent, the model binds under this
+    binding's own name.
     """
 
     models = []
-    for model in binding.model_bindings():
+    for index, model in enumerate(binding.model_bindings()):
+        names = {model.model_parameter_name}
+        if index < len(parameter_names):
+            names.update(parameter_names[index])
         models.append(
             {
                 "binding": {
@@ -901,6 +932,7 @@ def executor_prepare_command(
                     "model_class": model.model_class,
                     "model_binding_path": model.model_binding_path,
                     "model_parameter_name": model.model_parameter_name,
+                    "model_parameter_names": sorted(names),
                     "component": model.components[0] if model.components else "",
                     "components": list(model.components),
                     "snapshots": dict(model.snapshots),
@@ -4360,14 +4392,19 @@ class Worker:
             return "multiple_constructions_unsupported", False
 
         construction_key, group = next(iter(by_construction.items()))
-        binding_set = frozenset(binding.entrypoint_binding_digest for binding in group)
+        # THE GENERATION IS THE CONSTRUCTION, NOT THE BINDING SET (h3a-018). A desired set
+        # that adds an entrypoint over bytes this process already holds reuses the process:
+        # the prepared model serves every binding of the construction, provided the
+        # executor bound it under each parameter name the new set spells. Equality on the
+        # binding set rebuilt the executor for a placement that changed nothing it fills.
+        parameters = _group_parameters(group)
         executor = tenant.supervision.current
         if (
             executor is not None
             and executor.alive()
             and not executor.poisoned
             and executor.construction_key == construction_key
-            and executor.prepared_binding_set == binding_set
+            and parameters <= executor.parameters
             and executor.prepared_model is not None
         ):
             executor.ready_bindings.clear()
@@ -4398,7 +4435,7 @@ class Worker:
         if not first.weightless:
             self._preconstruct(tenant, owned, first)
         with lock:
-            return self._prepare_construction(tenant, group, construction_key, binding_set, owned)
+            return self._prepare_construction(tenant, group, construction_key, parameters, owned)
 
     def _own_executor(self, tenant: Tenant, group: list[DeclaredBinding]) -> child.Executor | str:
         """Spawn, keep or replace this tenant's executor. Returns it, or a latch string.
@@ -4511,7 +4548,7 @@ class Worker:
         tenant: Tenant,
         group: list[DeclaredBinding],
         construction_key: str,
-        binding_set: frozenset[str],
+        parameters: frozenset[str],
         executor: child.Executor,
     ) -> tuple[str, bool]:
         """The device half of `_prepare_generation`, under the lane's device lock."""
@@ -4568,6 +4605,7 @@ class Worker:
                     devices=lane.devices,
                     authorized_device_limit_bytes=authorized,
                     sequence_parallel_degree=lane.degree if lane.group else 1,
+                    parameter_names=_parameter_names_by_model(group),
                 ),
                 timeout=None,
                 on_progress=lambda frame: self.monitor.advance(
@@ -4664,7 +4702,7 @@ class Worker:
             weight_bytes=int(reply["facts"]["filled_bytes"]),
         )
         executor.construction_key = construction_key
-        executor.prepared_binding_set = binding_set
+        executor.parameters = parameters
         executor.prepared_model = resolved
         for binding in group:
             executor.ready_bindings.add(binding.entrypoint_binding_digest)
@@ -4768,7 +4806,58 @@ class Worker:
             self.note("delivery", _delivery_observation(delivery))
         if not executor.ready_bindings:
             return "prepare refused: every binding", False
+        self._warm_parked_pages(placement_id, first, reply["facts"])
         return "", False
+
+    def _warm_parked_pages(
+        self, placement_id: str, first: DeclaredBinding, facts: Mapping[str, Any]
+    ) -> None:
+        """Read every PARKED component's stored bytes once, in the background (h3a-018).
+
+        A parked component is filled on its first declared use, from the store. Measured on
+        an H100 pod, that stage runs at 23-33 GB/s when its pages are cached and at
+        0.73 GB/s when they are not: a 40 GB DiT nobody had touched cost 55 s on the first
+        request that named it. The read here is the same store stream the fill performs,
+        into host buffers that are dropped, so the first stage of each parked component
+        finds its pages warm. It moves no device byte, holds no lane lock, and reports what
+        it read and whether the block layer served it -- it decides nothing.
+        """
+        parked = set(facts.get("parked") or ())
+        work = [
+            (model.store, model.snapshot_for(name), name)
+            for model in first.model_bindings()
+            for name in model.components
+            if name in parked
+        ]
+        if not work:
+            return
+
+        def run() -> None:
+            for store, manifest, name in work:
+                try:
+                    report = page_warm.warm_component(store, manifest, name)
+                except Exception as exc:
+                    self.note(
+                        "residency",
+                        f"{placement_id!r} page warm of {name!r} failed: "
+                        f"{type(exc).__name__}: {exc}"[:256],
+                    )
+                    continue
+                if report.get("skipped"):
+                    self.note(
+                        "residency",
+                        f"{placement_id!r} page warm skipped {name!r}: {report['skipped']}"[:256],
+                    )
+                    continue
+                self.note("residency", f"{placement_id!r} {page_warm.describe(report)}"[:256])
+
+        # A LANE like every other worker thread (cr-061's fence): `run` reports every
+        # failure it can see; the wrap turns the one it cannot into WORKER_PHASE_FAILED.
+        threading.Thread(
+            target=self._lane(f"page-warm:{placement_id}", run),
+            name=f"page-warm:{placement_id}",
+            daemon=True,
+        ).start()
 
     def _finish_activation(self) -> None:
         """Run optional warm work, then publish the activation edge or its typed failure."""

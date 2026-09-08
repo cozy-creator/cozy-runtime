@@ -48,6 +48,7 @@ PACKAGE = "cozytest/tenant"
 RELEASE = "1"
 LANE = "bf16"
 ENTRYPOINT_SLOT = "touch.models.model"
+RETOUCH_SLOT = "retouch.models.model"
 JOB_SLOT = "prune.models.source"
 
 # One model-bound job beside the corpus tenant's `touch` entrypoint: the two shapes in one
@@ -160,8 +161,12 @@ def test_the_release_declares_both_collections_slots(interface: dict[str, Any]) 
     """The set the hub must send. Reading `entrypoints` alone loses the job's slot
     entirely -- and for a release with no entrypoint at all, loses everything."""
 
-    assert _slot_paths(interface, "entrypoints", "jobs") == {ENTRYPOINT_SLOT, JOB_SLOT}
-    assert _slot_paths(interface, "entrypoints") == {ENTRYPOINT_SLOT}
+    assert _slot_paths(interface, "entrypoints", "jobs") == {
+        ENTRYPOINT_SLOT,
+        RETOUCH_SLOT,
+        JOB_SLOT,
+    }
+    assert _slot_paths(interface, "entrypoints") == {ENTRYPOINT_SLOT, RETOUCH_SLOT}
     assert _slot_paths(interface, "jobs") == {JOB_SLOT}
 
 
@@ -186,7 +191,7 @@ def test_a_job_shaped_selection_prepares(
         package_name=PACKAGE,
         release=RELEASE,
         application=str(interface["application"]),
-        model_slot_paths=tuple(sorted((ENTRYPOINT_SLOT, JOB_SLOT))),
+        model_slot_paths=tuple(sorted((ENTRYPOINT_SLOT, RETOUCH_SLOT, JOB_SLOT))),
         inventory=None,
         locked=package_environment.read_locked_requirements(
             b"--index-url https://pypi.org/simple\ntenant==1 --hash=sha256:" + b"a" * 64 + b"\n"
@@ -300,7 +305,7 @@ def test_an_entrypoints_only_facts_request_refuses_and_names_the_gap(
             package_name=PACKAGE,
             release=RELEASE,
             application=str(interface["application"]),
-            model_slot_paths=(ENTRYPOINT_SLOT,),
+            model_slot_paths=(ENTRYPOINT_SLOT, RETOUCH_SLOT),
             inventory=None,
             locked=package_environment.read_locked_requirements(
                 b"--index-url https://pypi.org/simple\ntenant==1 --hash=sha256:" + b"a" * 64 + b"\n"
@@ -341,7 +346,7 @@ def test_the_bound_slots_are_a_subset_of_the_declared_ones() -> None:
     """
 
     # sorted unique: the wire bound the hub already honours.
-    declared = sorted([ENTRYPOINT_SLOT, JOB_SLOT])
+    declared = sorted([ENTRYPOINT_SLOT, RETOUCH_SLOT, JOB_SLOT])
     for bound in ([], [JOB_SLOT], [ENTRYPOINT_SLOT], declared):
         _, slot_paths, _, _ = _request_facts(
             _facts_request(declared), [_selection(slot, "sha256:" + "b" * 64) for slot in bound]

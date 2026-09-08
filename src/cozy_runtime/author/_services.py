@@ -16,7 +16,7 @@ import hashlib
 import math
 import os
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Buffer, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -334,7 +334,7 @@ class Outputs(_Bound):
         return self._register_frame(
             ImageAsset,
             format,
-            frame.rgb,
+            (frame.rgb,),
             {"width": frame.width, "height": frame.height},
             charge=len(frame.rgb),
         )
@@ -354,9 +354,9 @@ class Outputs(_Bound):
         return self._register_frame(
             AudioAsset,
             "flac",
-            planar.data,
+            (planar.data,),
             {"channels": channels, "samples": samples, "sample_rate": sample_rate},
-            charge=len(planar.data),
+            charge=len(planar),
         )
 
     def save_video(
@@ -392,15 +392,15 @@ class Outputs(_Bound):
         facts: dict[str, Any] = {
             "shape": list(video.shape),
             "fps": float(fps),
-            "video_bytes": len(video.data),
+            "video_bytes": len(video),
             "audio_channels": planar.shape[0] if planar is not None else 0,
             "audio_samples": planar.shape[1] if planar is not None else 0,
             "sample_rate": int(sample_rate or 0),
         }
-        raw = video.data + (planar.data if planar is not None else b"")
+        parts = (video.data,) if planar is None else (video.data, planar.data)
         # h264/aac are lossy: the raw snapshot bounds nothing about the container, so the
         # registration charges nothing and the post phase bounds the encoded bytes.
-        return self._register_frame(VideoAsset, "mp4", raw, facts, charge=0)
+        return self._register_frame(VideoAsset, "mp4", parts, facts, charge=0)
 
     def save_video_stream(self, events: Iterator[DecodedMediaEvent]) -> SavedVideo:
         """Consume one canonical event stream into one bounded, probed, atomic MP4."""
@@ -672,11 +672,18 @@ class Outputs(_Bound):
         return asset
 
     def _register_frame(
-        self, kind: type[A], codec: str, raw: bytes, facts: dict[str, Any], *, charge: int
+        self,
+        kind: type[A],
+        codec: str,
+        parts: tuple[Buffer, ...],
+        facts: dict[str, Any],
+        *,
+        charge: int,
     ) -> A:
         """REGISTER a host frame: the raw snapshot lands in the spool, the aggregate ceiling
         is charged now, and the codec runs later — in the worker's post phase, or here
-        when the attempt settles at the save."""
+        when the attempt settles at the save. `parts` are written back to back: the spool
+        write is the one host copy, never a concatenation before it."""
         self._attempt.check_open("Outputs.save")
         if self._pending_bytes() + charge > self._attempt.max_output_bytes:
             raise OutputError(
@@ -686,8 +693,11 @@ class Outputs(_Bound):
             )
         handle = self._attempt.next_handle(kind.kind)
         path = self._attempt.spool / f"{kind.kind}-{handle.rsplit('/', 1)[-1]}.raw"
-        path.write_bytes(raw)
-        frame = HostFrame(handle, codec, path, len(raw), charge, facts)
+        raw_bytes = 0
+        with path.open("wb") as spool:
+            for part in parts:
+                raw_bytes += spool.write(part)
+        frame = HostFrame(handle, codec, path, raw_bytes, charge, facts)
         asset = kind(handle, media_type=frame.media_type, attempt=self._attempt.request_id)
         self._attempt.pending[handle] = asset
         self._attempt.frames[handle] = frame

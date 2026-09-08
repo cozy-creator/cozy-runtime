@@ -9,3 +9,8 @@ object = "tiny_tenant:app"
 model = "cozytest/tenant"
 release = "1"
 lane = "bf16"
+
+[bindings."retouch.models.model"]
+model = "cozytest/tenant"
+release = "1"
+lane = "bf16"

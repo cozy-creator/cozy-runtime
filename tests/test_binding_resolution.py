@@ -63,6 +63,7 @@ def test_a_bound_job_slot_resolves_beside_the_entrypoints(tmp_path: Path) -> Non
     assert plans == []
     assert [(r["model_binding_path"], r["ref"], r["lane"]) for r in records] == [
         ("prune.models.source", "cozytest/tenant@1", "bf16"),
+        ("retouch.models.model", "cozytest/tenant@1", "bf16"),
         ("touch.models.model", "cozytest/tenant@1", "bf16"),
     ]
 
@@ -71,7 +72,10 @@ def test_an_unbound_job_slot_is_legal_and_absent(tmp_path: Path) -> None:
     """The source binds per invocation: no package.toml default is not a refusal."""
     project = _package(tmp_path, "tenant_unbound", job_binding=False)
     records, _ = resolved_bindings(Options(dir=str(project)))
-    assert [r["model_binding_path"] for r in records] == ["touch.models.model"]
+    assert [r["model_binding_path"] for r in records] == [
+        "retouch.models.model",
+        "touch.models.model",
+    ]
 
 
 def test_a_genuinely_unknown_path_still_refuses(tmp_path: Path) -> None:
@@ -95,5 +99,6 @@ def test_the_interface_arm_reads_the_jobs_array(tmp_path: Path) -> None:
     records, _ = resolved_bindings(Options(dir=str(project), package_interface=str(interface)))
     assert [(r["model_binding_path"], r["ref"]) for r in records] == [
         ("prune.models.source", "cozytest/tenant@1"),
+        ("retouch.models.model", "cozytest/tenant@1"),
         ("touch.models.model", "cozytest/tenant@1"),
     ]

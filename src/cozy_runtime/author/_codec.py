@@ -5,17 +5,24 @@ what the wheel-only packaging rule admits; a system ffmpeg binary never was). Th
 package stays free of it: `av` is imported inside a function, and an absent wheel is the
 same typed `encoder_unavailable` refusal this release always had.
 
-Determinism is a pinned property, not a hope: every encoder runs with `thread_count=1`,
-fixed settings, and `fflags +bitexact` on the container, so one (input, wheel version,
-settings) triple produces one byte sequence — proven by the repeat-digest arms in
-`scripts/media-live.py`, and held across machines by the locked wheel. The PRE-ENCODE
-tensors remain the cross-platform bit-grade artifacts (H3 banks those digests itself);
-the container digest is bit-grade per pinned wheel.
+Determinism is a pinned property, not a hope: every encoder runs with fixed settings, a
+fixed thread count and `fflags +bitexact` on the container, so one (input, wheel version,
+settings, x264 threads) tuple produces one byte sequence, held across machines by the
+locked wheel. x264's thread count is `x264_threads()`: the host's CPU count under
+`X264_THREAD_CEILING`. Frame-threaded x264 restricts motion search to what earlier threads
+have finished, so the bitstream — and therefore the DECODED pixels of a lossy codec — is a
+function of the thread count. The ceiling is what makes that a plan fact rather than
+drift: every qualified pod has at least that many vCPUs and so encodes identically; a
+smaller host (a laptop, a CI runner) encodes with fewer threads and a different digest.
+Any test that pins a container digest is pinned to a thread count and must be updated
+deliberately with it. The PRE-ENCODE tensors remain the cross-platform bit-grade
+artifacts (H3 banks those digests itself); the container digest is not an output identity.
 
 Tensor input is duck-typed — a torch tensor is drained through `.detach().cpu().numpy()`
-and an ndarray through `.tobytes()` — so this module imports neither torch nor numpy and
-the snapshot it takes IS the §3.4 immutable CPU copy: by the time a save returns, the
-output bytes are source-independent and mutating the author's tensor changes nothing.
+and an ndarray through the buffer protocol — so this module imports neither torch nor
+numpy. The snapshot is a zero-copy view of the drained host array; the ONE host copy is
+the registration's spool write, which completes before the save returns, so the output
+bytes are source-independent and mutating the author's tensor afterwards changes nothing.
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ import io
 import math
 import os
 from array import array
-from collections.abc import Mapping
+from collections.abc import Buffer, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
@@ -45,6 +52,12 @@ SNAPSHOT_FACTOR = 16
 #: container digest, so a change here is deliberate, never drift.
 _X264 = {"crf": "17", "preset": "veryfast"}
 
+#: The most x264 frame threads any host gets. It is the smallest vCPU count of a qualified
+#: H3 pod class (h3a-017), so every pod encodes with the same count and the same bytes; it
+#: also bounds x264's per-thread frame contexts on a host whose CPU count is large. Raising
+#: it changes every pod's container digest — deliberate, never drift.
+X264_THREAD_CEILING = 8
+
 #: Pinned AAC bitrate — set explicitly so a wheel-default change cannot move the output.
 _AAC_BIT_RATE = 192_000
 
@@ -52,12 +65,24 @@ _FLAC_CHUNK = 4096
 AAC_FRAME_SAMPLES = 1024
 
 
+def x264_threads() -> int:
+    """The x264 thread count on THIS host: its CPU count, under the ceiling."""
+    return max(1, min(X264_THREAD_CEILING, os.cpu_count() or 1))
+
+
 @dataclass(frozen=True, slots=True)
 class Planar:
-    """An immutable CPU snapshot of a tensor-like: raw bytes plus the shape they claim."""
+    """An immutable CPU snapshot of a tensor-like: a raw byte buffer (bytes, or a zero-copy
+    view of a host array the registration writes out) plus the shape it claims."""
 
-    data: bytes
+    data: Buffer
     shape: tuple[int, ...]
+
+    def view(self) -> memoryview:
+        return memoryview(self.data).cast("B")
+
+    def __len__(self) -> int:
+        return self.view().nbytes
 
 
 def _av() -> Any:
@@ -159,10 +184,13 @@ def snapshot_video(frames: object, max_output_bytes: int) -> Planar:
             f"({SNAPSHOT_FACTOR}x the attempt output ceiling)",
             code="output_too_large",
         )
-    data = bytes(arr.tobytes())  # type: ignore[attr-defined]
-    if len(data) != t * h * w * 3:
+    view = memoryview(arr)  # type: ignore[arg-type]
+    if not view.c_contiguous:
+        view = memoryview(arr.copy())  # type: ignore[attr-defined]
+    data = view.cast("B")
+    if data.nbytes != t * h * w * 3:
         raise OutputError(
-            f"video frames yielded {len(data)} bytes for shape {shape}", code="frame_shape"
+            f"video frames yielded {data.nbytes} bytes for shape {shape}", code="frame_shape"
         )
     return Planar(data, shape)
 
@@ -262,7 +290,7 @@ def _audio_frames(
             inter[0::2] = pcm[:samples]
             inter[1::2] = pcm[samples:]
             pcm = inter
-        raw, unit = pcm.tobytes(), 2 * channels
+        raw, unit = memoryview(pcm.tobytes()), 2 * channels
     else:  # flt
         if channels == 2:
             floats = array("f")
@@ -270,9 +298,9 @@ def _audio_frames(
             inter_f = array("f", bytes(len(floats) * 4))
             inter_f[0::2] = floats[:samples]
             inter_f[1::2] = floats[samples:]
-            raw, unit = inter_f.tobytes(), 4 * channels
+            raw, unit = memoryview(inter_f.tobytes()), 4 * channels
         else:
-            raw, unit = planar.data, 4 * channels
+            raw, unit = planar.view(), 4 * channels
 
     def gen() -> Any:
         pts = start_pts
@@ -315,7 +343,7 @@ def encode_mp4(video: Planar, fps: float, audio: Planar | None, sample_rate: int
         vstream.height = h
         vstream.pix_fmt = "yuv420p"
         vcodec = vstream.codec_context
-        vcodec.thread_count = 1
+        vcodec.thread_count = x264_threads()
         vcodec.options = dict(_X264)
 
         astream = None
@@ -329,10 +357,11 @@ def encode_mp4(video: Planar, fps: float, audio: Planar | None, sample_rate: int
             acodec.bit_rate = _AAC_BIT_RATE
 
         stride = h * w * 3
+        pixels = video.view()
         for index in range(t):
             frame = av.VideoFrame(w, h, "rgb24")
             plane = frame.planes[0]
-            raw = video.data[index * stride : (index + 1) * stride]
+            raw = pixels[index * stride : (index + 1) * stride]
             if plane.line_size == w * 3:
                 plane.update(raw)
             else:
@@ -381,11 +410,14 @@ def encode_frame(codec: str, facts: Mapping[str, Any], raw: bytes) -> bytes:
         return encode_flac(planar, int(facts["sample_rate"]))
     if codec == "mp4":
         split = int(facts["video_bytes"])
-        video = Planar(raw[:split], tuple(int(d) for d in facts["shape"]))
+        view = memoryview(raw)
+        video = Planar(view[:split], tuple(int(d) for d in facts["shape"]))
         audio = None
         sample_rate = None
         if int(facts.get("audio_channels", 0)):
-            audio = Planar(raw[split:], (int(facts["audio_channels"]), int(facts["audio_samples"])))
+            audio = Planar(
+                view[split:], (int(facts["audio_channels"]), int(facts["audio_samples"]))
+            )
             sample_rate = int(facts["sample_rate"])
         return encode_mp4(video, float(facts["fps"]), audio, sample_rate)
     raise OutputError(f"{codec!r} is not a registered-frame codec", code="encoder_unavailable")
@@ -534,7 +566,7 @@ class StreamingMP4Encoder:
             self._video.pix_fmt = "yuv420p"
             self._video.sample_aspect_ratio = pixel_aspect_ratio
             vcodec = self._video.codec_context
-            vcodec.thread_count = 1
+            vcodec.thread_count = x264_threads()
             vcodec.gop_size = max(1, round(float(frame_rate)))
             vcodec.max_b_frames = 0
             vcodec.color_primaries = color_primaries
