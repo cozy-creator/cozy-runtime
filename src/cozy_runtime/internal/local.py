@@ -42,7 +42,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.internal import bindings as binding_table
@@ -68,6 +68,9 @@ from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal.worker.workspace import Workspace
 
 #: The one local deployment's owner-minted routing key (#446). Routing, never identity:
 #: the InvocationSpec digest deliberately excludes it.
@@ -300,6 +303,8 @@ class LocalRecordOwner:
         self.package_code_digest = package_code_digest
         self.placement = placement
         self.auto_ack = auto_ack
+        self.native_workspace: Workspace | None = None
+        self._native_exported: bytes = b""
         self.ended = "unstarted"
         self.error = ""
         self.host = InMemoryControlHost()
@@ -637,6 +642,7 @@ class LocalRecordOwner:
         self.marks["terminal"] = time.perf_counter()
         if not self.auto_ack:
             return
+        self._export_native(outcome)
         self._send(
             pb.RecordOwnerFrame(
                 outcome_ack=self._env(
@@ -652,6 +658,75 @@ class LocalRecordOwner:
         )
         self.done.set()
         self.host.close()
+
+    def _export_native(self, outcome: pb.AttemptOutcome) -> None:
+        """Preserve local native results before ACK releases their producer roots."""
+        if len(outcome.outcome_digest) != 32:
+            raise LocalBindingError("native output outcome has no complete digest")
+        if self._native_exported == outcome.outcome_digest:
+            return
+        if hashlib.sha256(outcome.outcome_canonical_bytes).digest() != outcome.outcome_digest:
+            raise LocalBindingError("native output outcome digest changed")
+        body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        rows = (body.get("output_manifest") or {}).get("outputs") or []
+        for row in rows:
+            native = row.get("native_tree")
+            if native is None:
+                continue
+            if self.native_workspace is None:
+                raise LocalBindingError("native local output has no configured workspace")
+            from cozy_runtime.internal.worker import byte_inputs, workspace_byte_outputs
+
+            source = pb.NativeByteTreeRef(
+                producer_root_id=native["producer_root_id"],
+                receipt_digest=documents.raw(native["receipt_digest"]),
+                manifest=pb.Ref(
+                    digest=documents.raw(native["manifest"]["digest"]),
+                    length=native["manifest"]["length"],
+                ),
+                content_bytes=native.get("content_bytes", 0),
+            )
+            output_id = row["output_id"]
+            hold = pb.NativeByteRetentionRequest(
+                source=source,
+                retention_id=documents.spell(
+                    hashlib.sha256(
+                        canonical.write(
+                            [
+                                "local-output",
+                                outcome.outcome_digest.hex(),
+                                output_id,
+                            ]
+                        )
+                    ).digest()
+                ),
+            )
+            destination = self.destination(output_id)
+            staging = self.output_dir / (
+                ".native-" + hashlib.sha256(output_id.encode()).hexdigest()
+            )
+            tree = row.get("mime_type") == workspace_byte_outputs.TREE_MIME
+            workspace_byte_outputs.change_hold(
+                self.native_workspace, "local-run", hold, release=False
+            )
+            try:
+                byte_inputs.copy_retained(
+                    self.native_workspace,
+                    "local-run",
+                    hold,
+                    staging,
+                    expected_blob=(row["digest"], row.get("length", 0)) if not tree else None,
+                )
+                if tree:
+                    os.rename(staging, destination)
+                else:
+                    shutil.copyfile(staging / "payload", destination)
+            finally:
+                byte_inputs.remove_checkout(staging)
+                workspace_byte_outputs.change_hold(
+                    self.native_workspace, "local-run", hold, release=True
+                )
+        self._native_exported = outcome.outcome_digest
 
     # ------------------------------------------------------------------ documents
 
@@ -1214,6 +1289,7 @@ class _InterfaceSlot:
 
     path: str
     class_key: str
+    sequence_parallel: tuple[int, ...] = ()
 
     @property
     def param(self) -> str:
@@ -1223,7 +1299,11 @@ class _InterfaceSlot:
 def _interface_slots(interface: Mapping[str, Any], kind: str) -> list[_InterfaceSlot]:
     """A hidden callable is already absent from the document, so nothing is filtered here."""
     return [
-        _InterfaceSlot(str(slot["path"]), str(slot["class"]))
+        _InterfaceSlot(
+            str(slot["path"]),
+            str(slot["class"]),
+            tuple((slot.get("sequence_parallel") or {}).get("degrees", ())),
+        )
         for doc in interface.get(kind) or ()
         for slot in doc.get("models") or ()
     ]
@@ -1534,6 +1614,7 @@ def run_slice(
     if not options.instance_id:
         options = dataclasses.replace(options, instance_id=f"ins-{uuid.uuid4().hex[:16]}")
     worker = Worker(config, options, record_owner.host)
+    record_owner.native_workspace = worker.workspace
     worker.watches.tap = record_owner.tap_progress
     record_owner.watch(worker)
     if record_owner_hook is not None:
@@ -1626,7 +1707,7 @@ def _collect(
         )
         for row in outcome.manifest:
             path = record_owner.destination(str(row.get("output_id", "")))
-            if path.is_file():
+            if path.is_file() or path.is_dir():
                 outcome.outputs[str(row["output_id"])] = str(path)
 
     outcome.placement_set_digest = _spell(record_owner.placement_set_digest)

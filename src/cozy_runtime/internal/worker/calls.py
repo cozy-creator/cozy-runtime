@@ -210,6 +210,8 @@ class Calls:
         if frame.get("capture") is not None:
             if self.minor() < 43:
                 raise ValueError("owner does not support capture")
+            if allowed.get("native_source") or allowed.get("native_effect"):
+                raise ValueError("activation capture requires an ordinary serving invocation")
             capture = msgspec.convert(frame["capture"], type=ActivationCapture, strict=True)
         digest = hashlib.sha256(
             canonical.write(
