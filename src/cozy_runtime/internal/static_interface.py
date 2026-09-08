@@ -1218,6 +1218,26 @@ def _registration(
     )
 
 
+def _alias_site(reader: Reader, module: Module, node: ast.expr) -> tuple[Module, ast.expr]:
+    """Follow a module-level type alias to the module and expression that WRITE it.
+
+    `translate` already follows an alias for a struct field; a handler PARAMETER is also
+    classified by its shape (`Assets`, a service, a `Model`, the request struct), and that
+    classification has to look at the same place.
+    """
+    seen: set[tuple[Path, int]] = set()
+    while isinstance(node, (ast.Name, ast.Attribute)):
+        try:
+            found = reader.resolve(module, node)
+        except StaticRefusal:
+            return module, node
+        if not isinstance(found, Assigned) or found.identity in seen:
+            return module, node
+        seen.add(found.identity)
+        module, node = found.module, found.value
+    return module, node
+
+
 def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
     module, fn = registration.module, registration.fn
     if fn.args.vararg or fn.args.kwarg:
@@ -1228,14 +1248,15 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
     for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
         if arg.annotation is None:
             reader.refuse(module, arg, "an unannotated handler parameter")
-        node = arg.annotation
+        # A parameter may name a module-level ALIAS of its type — `KeyframeAssets =
+        # Annotated[Assets[Image], AssetLimits(images=2)]` is one declaration used by two
+        # handlers. Classify where it is WRITTEN; refuse where it is USED.
+        site, node = _alias_site(reader, module, arg.annotation)
         target = node.value if isinstance(node, ast.Subscript) else node
         if isinstance(target, ast.Subscript):  # Annotated[Assets[...], AssetLimits(...)]
             target = target.value
         found = (
-            reader.resolve(module, target)
-            if isinstance(target, (ast.Name, ast.Attribute))
-            else None
+            reader.resolve(site, target) if isinstance(target, (ast.Name, ast.Attribute)) else None
         )
         if isinstance(found, Vocab):
             vocab_name = found.key.partition(".")[2]
@@ -1244,14 +1265,14 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 "Secrets",
             ):
                 if isinstance(node, ast.Subscript):
-                    reader.translate(module, node.slice)
+                    reader.translate(site, node.slice)
                 continue
             if vocab_name in {cls.__name__ for cls in SERVICES.values()}:
                 continue
             if vocab_name in ("Assets", "Annotated"):
                 if assets is not None:
                     reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
-                assets = assets_binding(arg.arg, reader.translate(module, node))
+                assets = assets_binding(arg.arg, reader.translate(site, node))
                 continue
         if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
             kind = reader.class_kind(found.module, found.node)
@@ -1269,9 +1290,9 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 )
                 continue
             if kind == "struct":
-                payloads.append(reader.translate(module, node))
+                payloads.append(reader.translate(site, node))
                 continue
-        reader.refuse(module, node, f"parameter {arg.arg}: not an author surface type")
+        reader.refuse(module, arg.annotation, f"parameter {arg.arg}: not an author surface type")
     if len(payloads) != 1:
         reader.refuse(
             module, fn, f"exactly one typed request struct is required, found {len(payloads)}"

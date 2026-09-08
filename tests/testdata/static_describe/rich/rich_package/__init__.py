@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Annotated
-
 from cozy_runtime.author import (
     App,
-    AssetLimits,
-    Assets,
     Context,
-    ImageAsset,
     Outputs,
     Preflight,
     Telemetry,
@@ -17,7 +12,7 @@ from cozy_runtime.author import (
     WeightsSink,
 )
 
-from .bounds import IMAGE_BOUND, LANE_BYTES, LANE_ENCODINGS
+from .bounds import LANE_BYTES, LANE_ENCODINGS, Stills
 from .models import RenderModel, SourceModel
 from .schemas import (
     Facts,
@@ -44,7 +39,7 @@ def render(
     model: RenderModel,
     out: Outputs,
     tel: Telemetry,
-    stills: Annotated[Assets[Annotated[ImageAsset, IMAGE_BOUND]], AssetLimits(images=2)],
+    stills: Stills,
 ) -> RenderResult:
     raise NotImplementedError
 
