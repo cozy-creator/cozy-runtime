@@ -14,7 +14,7 @@ from cozy_runtime.author import App, AssetLimits, Assets, Context, Image, invoca
 
 
 class Sizes(msgspec.Struct):
-    values: list[tuple[int, int]]
+    values: list[list[int]]
 
 
 @invocable
@@ -23,7 +23,7 @@ async def inspect_images(
     *,
     assets: Annotated[Assets[Image], AssetLimits(images=2)],
 ) -> Sizes:
-    return Sizes([image.size for image in assets])
+    return Sizes([list(image.size) for image in assets])
 
 
 app = App()
