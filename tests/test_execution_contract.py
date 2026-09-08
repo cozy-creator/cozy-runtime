@@ -18,6 +18,12 @@ from typing import Any
 
 import pytest
 
+from cozy_runtime.author._observations import (
+    NAME_CAP,
+    TEXT_CAP,
+    EventRing,
+    ObservationRefusal,
+)
 from cozy_runtime.internal import canonical, execution_contract
 from cozy_runtime.internal.encoding import (
     SPEC_PLAIN,
@@ -37,6 +43,7 @@ from cozy_runtime.internal.encoding.selection import (
 )
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.resolution import ConstructionFacts, PlanRefusal, Variant, resolve
+from cozy_runtime.internal.worker.attempts import AttemptRecord
 
 CONTRACT: dict[str, Any] = {
     "device": "sm90",
@@ -252,26 +259,49 @@ def test_a_wrong_version_or_missing_entry_refuses_kernel_absent() -> None:
 
 
 class _Row:
-    def __init__(self, key: str, dtype: str, shape: tuple[int, ...], encoded: Encoded) -> None:
+    def __init__(
+        self,
+        key: str,
+        dtype: str,
+        shape: tuple[int, ...],
+        encoded: Encoded,
+        component: str = "dit",
+    ) -> None:
         self.key, self.component, self.dtype, self.shape, self.encoded = (
             key,
-            "dit",
+            component,
             dtype,
             shape,
             encoded,
         )
 
 
-def _rows() -> list[_Row]:
-    rowwise = Encoded(
+def _rowwise() -> Encoded:
+    return Encoded(
         SPEC_ROWWISE,
         "fp8-rowwise/1",
         (RolePart("data", "f8_e4m3fn", (64, 64), 4096), RolePart("scale", "f32", (64,), 256)),
     )
-    plain = Encoded(SPEC_PLAIN, "plain/1", (RolePart("value", "bf16", (64,), 128),))
+
+
+def _plain() -> Encoded:
+    return Encoded(SPEC_PLAIN, "plain/1", (RolePart("value", "bf16", (64,), 128),))
+
+
+def _rows() -> list[_Row]:
     return [
-        _Row("dit.proj.weight", "bf16", (64, 64), rowwise),
-        _Row("dit.norm.weight", "bf16", (64,), plain),
+        _Row("dit.proj.weight", "bf16", (64, 64), _rowwise()),
+        _Row("dit.norm.weight", "bf16", (64,), _plain()),
+    ]
+
+
+def _pipeline_rows() -> list[_Row]:
+    """The real H3 shape: the fp8 route's bytes exist on the DiT and nowhere else. The
+    producer refuses to stamp the contract otherwise (`h3_tables/job.py`)."""
+    return [
+        *_rows(),
+        _Row("video_vae.decoder.attn.weight", "bf16", (64,), _plain(), "video_vae"),
+        _Row("audio_vae.norm.weight", "bf16", (64,), _plain(), "audio_vae"),
     ]
 
 
@@ -296,11 +326,12 @@ def _resolve(
     encoded_leaves: str = "accept",
     rows: list[_Row] | None = None,
 ) -> Any:
+    resolved = _rows() if rows is None else rows
     return resolve(
         variants=[
             Variant(name="ref", store="store", snapshot="sha256:" + "1" * 64, reference=True)
         ],
-        rows_for={"ref": _rows() if rows is None else rows},
+        rows_for={"ref": resolved},
         providers=launch_providers(),
         capabilities=capabilities,
         device=_device(89),
@@ -308,7 +339,9 @@ def _resolve(
             release="0.4.1", source_digest="sha256:" + "2" * 64, torch_build="2.13.0"
         ),
         construction=ConstructionFacts(
-            release="0.4.1", model_class="h3:H3Model", components=("dit",)
+            release="0.4.1",
+            model_class="h3:H3Model",
+            components=tuple(sorted({row.component for row in resolved})),
         ),
         facts=PlanFacts(),
         encoded_leaves=encoded_leaves,
@@ -373,6 +406,92 @@ def test_a_route_no_tensor_stores_bytes_for_refuses_unsupported() -> None:
     assert plan.route_census() == {"decoded_float": 1, "verbatim": 1}
 
 
+# ------------------------------------------------------------- the scope the contract has
+
+
+def _governed(rows: list[_Row] | None = None) -> Any:
+    qualified = _floor_only()
+    qualified.add(_record(RowwiseNativeLeaf(SPEC_ROWWISE), SPEC_ROWWISE))
+    return _resolve(qualified, route="encoded_gemm", rows=rows)
+
+
+def test_the_contract_governs_the_components_its_weights_route_bound() -> None:
+    """cr-122. The H100 FA3 clip pinned every diffusers model of the pipeline and then
+    counted 1,812 calls against 1,560 predicted, one of them on the fp16 video VAE. One
+    contract, one scope: the components whose tensors resolved on its own weights route."""
+    contract = execution_contract.read(_configs(CONTRACT))
+    assert contract is not None
+    plan = _governed(_pipeline_rows())
+    roots = {"dit": object(), "video_vae": object(), "audio_vae": object()}
+    assert sorted(execution_contract.scope(contract, plan, roots)) == ["dit"]
+    assert execution_contract.scope(contract, plan, roots)["dit"] is roots["dit"]
+    # A parked component the construction does not hold is simply not in the scope.
+    assert sorted(execution_contract.scope(contract, plan, {"dit": roots["dit"]})) == ["dit"]
+
+
+def test_a_contract_that_governs_no_constructed_component_refuses_typed() -> None:
+    contract = execution_contract.read(_configs(CONTRACT))
+    assert contract is not None
+    plan = _governed(_pipeline_rows())
+    refused = _refusal(lambda: execution_contract.scope(contract, plan, {"video_vae": object()}))
+    assert refused.code == "execution_contract_unobserved"
+    assert "'encoded_gemm'" in str(refused) and "video_vae" in str(refused)
+
+
+# ----------------------------------------------------- the durable record is BOUNDED
+
+
+def test_an_over_cap_observation_truncates_and_never_faults_the_attempt() -> None:
+    """cr-122 RED ARM. This exact value faulted the executor on the H100: the emit
+    boundary raised `observation_too_large`, the refusal escaped device release, the
+    worker abandoned the attempt EXECUTOR_INVALIDATED, rebuilt and ran the same 30-step
+    generation again — three complete attempts before an operator cancelled the fourth.
+    A record that cannot be held is truncated and counted. It is never a fault."""
+    ring = EventRing(subject="req#1")
+    row = ring.emit("confession", "execution_contract", "x" * 1744, subject="req#1")
+    assert isinstance(row.value, str)
+    assert len(row.value) == TEXT_CAP and row.value.endswith("…")
+    assert ring.caps()["truncated"] == 1 and ring.caps()["refused"] == 0
+    assert ring.caps()["kept"] == 1 and ring.caps()["admitted"] == 1
+    # Field values are payload too, and a field of 8 KiB is the same defect wearing a hat.
+    ring.emit("log", "note", "short", detail="y" * 8192)
+    assert len(str(ring.events[-1].fields["detail"])) == TEXT_CAP
+    assert ring.caps()["truncated"] == 2 and ring.caps()["refused"] == 0
+    # A NAME still refuses: it is the record's identity, and clipping one would make two
+    # different records the same record.
+    with pytest.raises(ObservationRefusal) as refused:
+        ring.emit("log", "n" * (NAME_CAP + 1))
+    assert refused.value.code == "observation_too_large"
+
+
+def test_the_attempt_confession_of_a_huge_attestation_is_admitted() -> None:
+    """The real worker record, through the real `confess` the release path calls."""
+    attempt = AttemptRecord(request_id="req", attempt=1, digest=b"", spec={})
+    attempt.confess("execution_contract", "z" * 4096)
+    assert attempt.ring.caps()["refused"] == 0 and attempt.ring.caps()["truncated"] == 1
+    assert [row["kind"] for row in attempt.confessions] == ["execution_contract"]
+    assert len(str(attempt.ring.events[-1].value)) == TEXT_CAP
+
+
+def test_the_attestation_renders_one_bounded_confession_line() -> None:
+    """The observation carries the DIGEST, the entry, the counts and the symbol. The
+    scheme prose and the full mangled symbol stay in the triage bundle, uncapped."""
+    document: dict[str, Any] = {
+        "digest": "sha256:" + "a" * 64,
+        "entry": "flash-attn3.flash_attn_func",
+        "calls": 1812,
+        "expected_calls": 1560,
+        "kernel_symbol": "void cutlass::device_kernel<flash::enable_sm90<" + "T" * 900 + ">>>",
+        "refusal": "execution_contract_unobserved: " + "detail " * 200,
+    }
+    line = execution_contract._confession(document)
+    assert len(line) <= execution_contract.CONFESSION_CAP <= TEXT_CAP
+    assert str(document["digest"]) in line and "1812/1560 calls" in line
+    assert "cutlass::device_kernel" in line and "execution_contract_unobserved" in line
+    clean = execution_contract._confession({**document, "refusal": "", "kernel_symbol": ""})
+    assert clean.endswith("kernel unobserved") and "1812/1560" in clean
+
+
 # ------------------------------------------------------------------------- the CUDA arm
 
 
@@ -419,10 +538,17 @@ def test_the_contract_is_pinned_and_attested_on_a_real_card() -> None:
     assert "per_thread" in out["kernel_absent"]["kwarg_default"]["detail"]
     assert "no_such_kwarg" in out["kernel_absent"]["kwarg_unknown"]["detail"]
     assert out["hosts"] == {"fl2va_dit": 3} and out["pinned_processors"] == 3
+    # cr-122: the ungoverned component is not pinned, and diffusers' process-global active
+    # backend is put back, so its own attention never reaches the contracted kernel.
+    assert out["vae_sites_pinned"] == 0
     green = out["green"]
     assert green["refusal"] == "", green
+    # A real fp16 `AutoencoderKLMiniMaxH3.decode()` ran inside every bracketed step and the
+    # count is still exactly the DiT's sites x forwards.
     assert green["calls"] == green["expected_calls"] == 3 * out["steps"]
     assert green["forwards"] == {"fl2va_dit": out["steps"]}
+    assert green["confession"].startswith(green["digest"])
+    assert out["confession_length"] <= 400
     assert "qk_int_sv_f8_attn_kernel" in green["kernel_symbol"], green["kernels"]
     assert green["kernel_self_ms"] > 0
     assert out["prepare_facts_after"]["kernel_symbol"] == green["kernel_symbol"]
@@ -432,3 +558,12 @@ def test_the_contract_is_pinned_and_attested_on_a_real_card() -> None:
     assert "is_causal=True" in out["scheme_mismatch"]["refusal"]
     assert "float16 activations" in out["activations_mismatch"]["refusal"]
     assert out["registry_slot_is_proxy"] is True
+    # RED (cr-122): govern the VAE too — what `apply` did before — and the same attempt
+    # fails exactly as the H100 clip did: calls the pinned sites cannot account for, and
+    # the fp16 decode under a bf16 contract.
+    assert out["unscoped_hosts"] == {"fl2va_dit": 3, "video_vae": 2}
+    unscoped = out["unscoped"]
+    assert unscoped["calls"] > unscoped["expected_calls"] == 3 * out["steps"]
+    assert unscoped["forwards"]["video_vae"] == 0
+    assert unscoped["refusal"].startswith("execution_contract_unobserved")
+    assert "float16 activations" in unscoped["refusal"]

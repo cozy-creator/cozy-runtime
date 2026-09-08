@@ -14,7 +14,6 @@ Prints one JSON document on the last line.
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from typing import Any
 
 from cozy_runtime.internal import canonical, execution_contract
@@ -81,6 +80,60 @@ def refusal(run: Any) -> dict[str, str]:
     except execution_contract.ExecutionContractRefusal as exc:
         return {"code": exc.code, "detail": str(exc)}
     return {"code": "", "detail": "no refusal"}
+
+
+def _dit() -> Any:
+    """A tiny real MiniMax-H3 DiT: 2 blocks + 1 refiner = 3 pinned attention sites, bf16."""
+    import torch
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+
+    return (
+        MiniMaxH3Transformer3DModel(
+            num_attention_heads=2,
+            attention_head_dim=64,
+            hidden_size=128,
+            num_layers=2,
+            num_refiner_layers=1,
+            ffn_dim=256,
+            in_channels=4,
+            audio_in_channels=8,
+            patch_size=(1, 2, 2),
+            text_dim=32,
+            freq_dim=32,
+            time_embed_hidden_dim=128,
+            time_embed_dim=64,
+            rope_freq_dim=8,
+        )
+        .to("cuda", torch.bfloat16)
+        .eval()
+    )
+
+
+def _vae() -> Any:
+    """A tiny real MiniMax-H3 video VAE: attention in the decoder, fp16, entered by `decode`."""
+    import torch
+    from diffusers import AutoencoderKLMiniMaxH3
+
+    return (
+        AutoencoderKLMiniMaxH3(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=4,
+            block_out_channels=(8, 8),
+            layers_per_block=1,
+            spatial_downsample_factors=(2, 1),
+            temporal_downsample_factors=(1, 1),
+            norm_num_groups=2,
+            decoder_num_layers=2,
+            decoder_num_attention_heads=2,
+            decoder_attention_head_dim=16,
+            decoder_num_register_tokens=1,
+            decoder_ffn_mult=2,
+            clip_length=4,
+        )
+        .to("cuda", torch.float16)
+        .eval()
+    )
 
 
 def main() -> None:
@@ -155,32 +208,9 @@ def main() -> None:
         _AttentionBackendRegistry,
         dispatch_attention_fn,
     )
-    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
     torch.manual_seed(7)
-    dit = (
-        MiniMaxH3Transformer3DModel(
-            num_attention_heads=2,
-            attention_head_dim=64,
-            hidden_size=128,
-            num_layers=2,
-            num_refiner_layers=1,
-            ffn_dim=256,
-            in_channels=4,
-            audio_in_channels=8,
-            patch_size=(1, 2, 2),
-            text_dim=32,
-            freq_dim=32,
-            time_embed_hidden_dim=128,
-            time_embed_dim=64,
-            rope_freq_dim=8,
-        )
-        .to("cuda", torch.bfloat16)
-        .eval()
-    )
-
-    # The H3 package's shape: `H3Model.pipe.components["fl2va_dit"]` is the diffusers model.
-    model_like = SimpleNamespace(pipe=SimpleNamespace(components={"fl2va_dit": dit}))
+    dit = _dit()
 
     text, video, audio = 128, 1792, 128
     seq = text + video + audio
@@ -215,13 +245,35 @@ def main() -> None:
         return_dict=False,
     )
 
+    # The fill plane's component roots, the shape `apply` is given: name -> constructed root.
+    # `video_vae` is the REAL `AutoencoderKLMiniMaxH3`, in fp16 and entered through `decode()`
+    # rather than `forward()` — the component the H100 clip's 252 unaccounted calls came from.
+    vae = _vae()
+    roots = {"fl2va_dit": dit, "video_vae": vae}
+    latent = torch.randn(1, 4, 8, 4, 4, device=device, dtype=torch.float16)
+
+    def decode() -> Any:
+        with torch.inference_mode():
+            return vae.decode(latent).sample
+
+    bf16_inputs = dict(inputs)
+
     def forward() -> Any:
         with torch.inference_mode():
             return dit(**inputs)[0]
 
     reference = forward().float()
-    applied = execution_contract.apply(standin, kernel, model_like)
+    decode()
+    # THE SCOPE (cr-122): the contract governs the components its own `weights.route` bound.
+    # Only those are pinned; `video_vae` keeps the attention it was built with.
+    applied = execution_contract.apply(standin, kernel, {"fl2va_dit": roots["fl2va_dit"]})
     out["hosts"] = dict(applied.hosts)
+    out["vae_sites_pinned"] = sum(
+        1
+        for module in vae.modules()
+        if getattr(getattr(module, "processor", None), "_attention_backend", None)
+        == AttentionBackendName(kernel.backend)
+    )
     out["prepare_facts"] = applied.document()
     member = AttentionBackendName(kernel.backend)
     out["pinned_processors"] = sum(
@@ -232,8 +284,13 @@ def main() -> None:
     attestation = execution_contract.Attestation([applied])
 
     steps = 3
-    attested_output, green = attestation.observe(lambda: [forward() for _ in range(steps)][-1])
+    # The VAE decodes INSIDE the bracket: an ungoverned component's attention runs during the
+    # attempt and contributes nothing to the count, because it was never routed to the kernel.
+    attested_output, green = attestation.observe(
+        lambda: [(forward(), decode())[0] for _ in range(steps)][-1]
+    )
     out["green"] = green
+    out["confession_length"] = len(green["confession"])
     out["steps"] = steps
     out["max_abs_diff_vs_native"] = float((attested_output.float() - reference).abs().max())
     out["prepare_facts_after"] = applied.document()
@@ -274,6 +331,30 @@ def main() -> None:
     out["registry_slot_is_proxy"] = (
         _AttentionBackendRegistry._backends[member] is not kernel.wrapper
     )
+
+    # RED (cr-122), the H100 defect reproduced: govern the VAE too — what `apply` did when it
+    # pinned every diffusers model it could reach — and the same attempt fails, on calls the
+    # DiT's sites x forwards cannot account for and on fp16 activations under a bf16 contract.
+    stray_dit, stray_vae = _dit(), _vae()
+    stray = execution_contract.apply(
+        standin, kernel, {"fl2va_dit": stray_dit, "video_vae": stray_vae}
+    )
+    out["unscoped_hosts"] = dict(stray.hosts)
+
+    def stray_attempt() -> Any:
+        with torch.inference_mode():
+            for _ in range(steps):
+                stray_dit(**bf16_inputs)
+            return stray_vae.decode(latent).sample
+
+    _, unscoped = execution_contract.Attestation([stray]).observe(stray_attempt)
+    out["unscoped"] = {
+        "calls": unscoped["calls"],
+        "expected_calls": unscoped["expected_calls"],
+        "forwards": unscoped["forwards"],
+        "sites": unscoped["sites"],
+        "refusal": unscoped["refusal"],
+    }
     print(json.dumps(out))
 
 

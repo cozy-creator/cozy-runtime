@@ -1742,16 +1742,14 @@ class AttemptEngine:
         self.monitor.end(key, "returned")
         attempt.execution_contract = dict(reply.get("execution_contract") or {})
         if attempt.execution_contract:
-            # THE SCHEME THAT RAN, as a typed row every reader of confessions keys on (cr-109):
-            # the throughput table and the gate read the lane by what attested, never by the
-            # contract's promise.
-            _a = attempt.execution_contract
+            # WHAT ATTESTED, as a typed row every reader of confessions keys on (cr-109): the
+            # throughput table and the gate read the lane by what ran, never by the contract's
+            # promise. The line is the attestation's own BOUNDED rendering (cr-122) — digest,
+            # entry, counts, kernel symbol — because an observation is a bounded record and
+            # the scheme prose this used to inline blew the 400-character cap, faulting the
+            # executor on its own telemetry. The prose is in `plan.execution`.
             attempt.confess(
-                "execution_contract",
-                f"{_a.get('scheme')}: {_a.get('entry')} x{_a.get('calls')} of "
-                f"{_a.get('expected_calls')} predicted, kernel "
-                f"{_a.get('kernel_symbol') or 'unobserved'}"
-                + (f"; {_a['refusal']}" if _a.get("refusal") else ""),
+                "execution_contract", str(attempt.execution_contract.get("confession", ""))
             )
         # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
         # whatever came back, success or fault: a failed attempt's activation peak is
