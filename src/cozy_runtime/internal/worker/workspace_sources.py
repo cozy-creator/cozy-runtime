@@ -249,6 +249,16 @@ def record_complete(
 
         db.native(validate_native)
         _parent(db, owner, command.parent_call)
+        row = db.execute(
+            "SELECT * FROM native_calls WHERE owner=? AND service_id=?",
+            (owner, command.service_id),
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] == "canceled"
+            or row["intent_digest"] != command.parent_call.intent_digest
+        ):
+            raise WorkspaceRefusal("source call changed during native result validation")
         if row["result"] and (
             row["result"] != result
             or row["computation_digest"] != computation
