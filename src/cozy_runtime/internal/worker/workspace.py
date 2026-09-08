@@ -180,8 +180,12 @@ class Workspace:
                     + _MIGRATION_3
                     + "PRAGMA user_version=3; COMMIT;"
                 )
-            elif version != 3:
+            elif version not in (3, 4):
                 raise WorkspaceRefusal("workspace journal schema is not supported")
+            if version <= 3:
+                from .workspace_sources import SCHEMA4
+
+                db.executescript("BEGIN IMMEDIATE;" + SCHEMA4 + "PRAGMA user_version=4; COMMIT;")
             if (
                 not allow_frozen
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
@@ -839,8 +843,11 @@ class Workspace:
         request: pb.DerivedRetentionRequest,
         *,
         release: bool = False,
+        kind: str = "derived",
     ) -> None:
         self.owner(owner)
+        if kind not in ("derived", "tree"):
+            raise WorkspaceRefusal("unknown native retention kind")
         if (
             _DIGEST.fullmatch(request.weights_transaction_id) is None
             or _DIGEST.fullmatch(request.retention_id) is None
@@ -850,7 +857,9 @@ class Workspace:
         row = db.execute("SELECT * FROM holds WHERE id=?", (request.retention_id,)).fetchone()
         subject = (owner, request.weights_transaction_id, request.tensorfs_receipt_digest)
         if row is not None:
-            if (row["owner"], row["transaction_id"], row["native_digest"]) != subject:
+            if (row["owner"], row["transaction_id"], row["native_digest"]) != subject or row[
+                "kind"
+            ] != kind:
                 raise WorkspaceRefusal("retention identity already belongs to another subject")
             if not release and row["state"] in ("releasing", "released"):
                 raise WorkspaceRefusal("released retention cannot be recreated")
@@ -862,9 +871,15 @@ class Workspace:
             ).fetchone()
             retained = db.execute(
                 "SELECT 1 FROM holds WHERE owner=? AND transaction_id=? "
-                "AND native_digest=? AND state='held'",
-                subject,
+                "AND native_digest=? AND kind=? AND state='held'",
+                (*subject, kind),
             ).fetchone()
+            if original is not None and kind != "derived":
+                raise WorkspaceRefusal("weights receipt cannot authorize a source-tree hold")
+            if original is None:
+                from .workspace_native_memo import native_receipt_owned
+
+                original = native_receipt_owned(db, owner, request, kind)
             pending_release = False
             if release and original is None and retained is None:
                 # Durable memo/lookup intent authorizes cancellation of a root
@@ -887,8 +902,9 @@ class Workspace:
             if original is None and retained is None and not pending_release:
                 raise WorkspaceRefusal("native result has no receipt owned by this workspace owner")
             db.execute(
-                "INSERT INTO holds(id,owner,transaction_id,native_digest,state) VALUES(?,?,?,?,?)",
-                (request.retention_id, *subject, "releasing" if release else "retaining"),
+                "INSERT INTO holds(id,owner,transaction_id,native_digest,state,kind) "
+                "VALUES(?,?,?,?,?,?)",
+                (request.retention_id, *subject, "releasing" if release else "retaining", kind),
             )
 
     def _change_hold(
@@ -899,8 +915,9 @@ class Workspace:
         *,
         release: bool,
         cancel_lookup: bool = True,
+        kind: str = "derived",
     ) -> pb.DerivedRetentionResult:
-        self.reserve_hold(db, owner, request, release=release)
+        self.reserve_hold(db, owner, request, release=release, kind=kind)
         if release:
             db.execute("UPDATE holds SET state='releasing' WHERE id=?", (request.retention_id,))
         if release and cancel_lookup:
@@ -912,20 +929,14 @@ class Workspace:
             )
         # The intent above is durable before entering native code. A crash on
         # either side of this call leaves the same idempotent intent to replay.
-        result = db.native(
-            lambda: derived_retention.change(
-                request, tensorfs_root=self.store_root, release=release
-            )
-        )
+        from .workspace_native_memo import change_native_hold
+
+        result = change_native_hold(self, db, owner, request, kind, release=release)
         current = db.execute(
             "SELECT state FROM holds WHERE id=?", (request.retention_id,)
         ).fetchone()
         if not release and current["state"] in ("releasing", "released"):
-            db.native(
-                lambda: derived_retention.change(
-                    request, tensorfs_root=self.store_root, release=True
-                )
-            )
+            change_native_hold(self, db, owner, request, kind, release=True)
             raise WorkspaceRefusal("retention was released during native acquisition")
         manifest = result.manifest if result.HasField("manifest") else None
         db.execute(
