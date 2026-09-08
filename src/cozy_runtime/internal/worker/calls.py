@@ -40,10 +40,11 @@ class Calls:
     def bindings(attempt: AttemptRecord) -> list[dict[str, Any]]:
         if attempt.job is None:
             return []
-        from cozy_runtime.internal import source_interfaces
+        from cozy_runtime.internal import effect_interfaces, source_interfaces
 
         result = [dict(row) for row in attempt.job.call_interfaces]
         result.extend(source_interfaces.rows())
+        result.extend(effect_interfaces.rows())
         raw = Path(attempt.job.package_interface).read_bytes()
         interface = package_interface.read_bytes(raw)
         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
