@@ -117,10 +117,12 @@ class SourceCalls:
         *,
         endpoints: dict[str, str] | None = None,
         native_registry: bytes | None = None,
+        spool_root: Path | None = None,
     ):
         self.workspace, self.owner, self.send, self.current = workspace, owner, send, current
         self.endpoints = endpoints or {}
         self.native_registry = native_registry
+        self.spool_root = spool_root
         self.lock = threading.Lock()
         self.processes: dict[str, subprocess.Popen[bytes] | None] = {}
         self.tasks: dict[str, threading.Event] = {}
@@ -141,7 +143,8 @@ class SourceCalls:
                     process.kill()
             return
         if (
-            command.operation == pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES
+            command.operation
+            in (pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES, pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE)
             and command.phase != pb.NATIVE_SOURCE_PHASE_EXECUTE
         ):
             raise WorkspaceRefusal("source view has no foreign resolution phase")
@@ -326,14 +329,26 @@ class SourceCalls:
         row: dict[str, Any],
         done: threading.Event,
     ) -> None:
-        from cozy_runtime.internal.worker import workspace_memo
+        from cozy_runtime.internal.worker import (
+            commit_files,
+            workspace_byte_outputs,
+            workspace_memo,
+        )
 
         released = False
         view = command.operation == pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES
+        file = command.operation == pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE
+        native_bytes = view or file
         try:
             if row["state"] == "complete":
-                view_fact = source_views.replay(self.workspace, owner, command) if view else None
-                if not view:
+                view_fact = (
+                    workspace_byte_outputs.replay_native(self.workspace, owner, command)
+                    if file
+                    else source_views.replay(self.workspace, owner, command)
+                    if view
+                    else None
+                )
+                if not native_bytes:
                     workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
                 self._status(
                     command,
@@ -370,7 +385,11 @@ class SourceCalls:
             }
             computation = b""
             if phase == "execute":
-                if view:
+                if file:
+                    effective = {
+                        key: arguments[key] for key in ("digest", "size_bytes", "media_type")
+                    }
+                elif view:
                     effective = {
                         "source": arguments["source"]["manifest"],
                         "max_bytes": SOURCE_FILES_MAX_BYTES,
@@ -418,7 +437,7 @@ class SourceCalls:
                 ).digest()
                 hit = (
                     None
-                    if view
+                    if native_bytes
                     else workspace_memo.lookup_native(
                         self.workspace, owner, command.service_id, computation
                     )
@@ -434,7 +453,13 @@ class SourceCalls:
                         memo_hit=True,
                     )
                     return
-                if view:
+                if file:
+                    envelope.update(
+                        commit_files.prepare(
+                            self.workspace, owner, command, computation, self.spool_root
+                        )
+                    )
+                elif view:
                     envelope.update(
                         source_views.prepare(self.workspace, owner, command, computation)
                     )
@@ -502,7 +527,17 @@ class SourceCalls:
             result = canonical_json.encode(answer["result"])
             receipt = base64.b64decode(answer["native_receipt"], validate=True)
             view_fact = None
-            if view:
+            if file:
+                view_fact = workspace_byte_outputs.complete_native(
+                    self.workspace,
+                    owner,
+                    command,
+                    result,
+                    computation,
+                    receipt,
+                    str(envelope["view_owner"]),
+                )
+            elif view:
                 view_fact = source_views.complete(
                     self.workspace,
                     owner,

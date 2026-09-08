@@ -23,6 +23,10 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
     store = fill.tensorfs_module().Store.open(command["store"])
     operation = command["operation"]
     args = command["arguments"]
+    if operation == "commit_file":
+        from cozy_runtime.internal.worker.commit_files import execute as commit_file
+
+        return commit_file(store, command)
     if operation == "source_files":
         from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
         from cozy_runtime.internal.worker.workspace_byte_outputs import manifest_members

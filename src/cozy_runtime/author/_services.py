@@ -137,6 +137,7 @@ class Attempt:
     """Whether the package handler itself was entered. Pre-entry refusals never poison a
     healthy executor; one structural bit is safer than duplicating refusal-code lists."""
     pending: dict[str, Asset] = field(default_factory=dict)
+    committed_files: dict[str, FileAsset] = field(default_factory=dict)
     pending_trees: dict[str, Tree] = field(default_factory=dict)
     rows: list[AdjustmentRow] = field(default_factory=list)
     ring: EventRing = field(default_factory=EventRing)
@@ -636,6 +637,12 @@ class Outputs(_Bound):
 
     def save_bytes(self, data: bytes, *, media_type: str) -> FileAsset:
         return self._register(data, FileAsset, media_type)
+
+    async def commit(self, pending: FileAsset) -> FileAsset:
+        """Complete an owned pending file now, for reading or forwarding to another call."""
+        from cozy_runtime.author._output_commit import commit
+
+        return await commit(self._attempt, pending)
 
     def save_tree(self, path: Path | str) -> Tree:
         """Snapshot regular files now; native retention commits after the handler returns."""
