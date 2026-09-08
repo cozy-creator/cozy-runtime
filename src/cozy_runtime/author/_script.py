@@ -15,7 +15,8 @@ import msgspec
 from cozy_runtime.author._app import App
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._script_types import annotation, declarations, parameter_type
+from cozy_runtime.author._script_metadata import declarations, main_definition
+from cozy_runtime.author._script_types import annotation, parameter_type
 from cozy_runtime.author._services import Telemetry
 from cozy_runtime.author._signature import _classify
 
@@ -56,14 +57,6 @@ class _ScriptCompleted(msgspec.Struct):
     pass
 
 
-def _contains_yield(node: ast.AST) -> bool:
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-        return False  # A nested generator does not make main itself a generator.
-    if isinstance(node, (ast.Yield, ast.YieldFrom)):
-        return True
-    return any(_contains_yield(child) for child in ast.iter_child_nodes(node))
-
-
 def script_app(module: str) -> App:
     """Creator's generated adapter. Discovery reads syntax without executing the script.
 
@@ -83,37 +76,10 @@ def script_app(module: str) -> App:
         tree = ast.parse(raw, filename=found.origin)
     except SyntaxError as exc:
         raise ConformanceError("script syntax is invalid", code="script_syntax") from exc
-    mains = [
-        node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main"
-    ]
-    if len(mains) != 1:
-        raise ConformanceError(
-            "script must define one main() or main(ctx)", code="script_main_missing"
-        )
-    if any(_contains_yield(statement) for statement in mains[0].body):
-        raise ConformanceError(
-            "script main must execute normally, not yield a generator",
-            code="script_main_signature",
-        )
-    definition = mains[0]
+    definition = main_definition(tree)
     args = definition.args
     positional = [*args.posonlyargs, *args.args]
     parameters = [*positional, *args.kwonlyargs]
-    if (
-        args.vararg
-        or args.kwarg
-        or args.defaults
-        or any(args.kw_defaults)
-        or len(positional) > 1
-        or (positional and positional[0].arg != "ctx")
-        or any(p.arg.startswith("_script_") for p in parameters)
-    ):
-        raise ConformanceError(
-            "script main accepts optional ctx and typed keyword-only injected parameters",
-            code="script_main_signature",
-        )
     types: dict[str, Any] = {}
     try:
         models, weights = declarations(raw)
