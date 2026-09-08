@@ -118,7 +118,7 @@ def test_a_candidate_that_fails_to_resolve_for_any_reason_drops_out_of_auto() ->
             raise RuntimeError("ImportError: undefined symbol: _ZN3c105ErrorC1E")
         return real(candidate)
 
-    attention._resolve = planted  # type: ignore[assignment]
+    attention._resolve = planted
     try:
         assert "flash-attn3" not in [entry.name for entry in attention.available(_device(90))]
         assert "flash-attn3" not in attention.image_kernels()
@@ -127,7 +127,7 @@ def test_a_candidate_that_fails_to_resolve_for_any_reason_drops_out_of_auto() ->
         with pytest.raises(RuntimeError, match="undefined symbol"):
             attention.pinned("flash-attn3", _device(90))
     finally:
-        attention._resolve = real  # type: ignore[assignment]
+        attention._resolve = real
 
 
 def test_a_pin_this_runtime_does_not_know_refuses_and_names_what_it_knows() -> None:

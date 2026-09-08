@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._assets import GrantedInput, InputMetadata
+from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import Device
 from cozy_runtime.author._errors import CapabilityError, Outcome, classify
 from cozy_runtime.author._invoke import (
@@ -55,6 +56,7 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._model import _derive_model
+from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import (
     accel,
@@ -1533,6 +1535,7 @@ class Executor:
             "leases": backend.leases.document(),
             "store": backend.stats.get("store", {}),
             "gpu_name": accel.device_identity(torch, self.device_kind)["name"],
+            "device_driver": device_facts.driver,
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda or "",
             # THE CONFESSION (§1.1). "Loudly ignored, never silently" is only true if the
@@ -1898,6 +1901,7 @@ class Executor:
             }
         registration = self.discovered.app.get(command["entrypoint"])
         try:
+            self._capture_options(command, registration.surface)
             prepared = prepare(
                 registration,
                 command["payload"],
@@ -1989,26 +1993,39 @@ class Executor:
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
-        envelope, outcome, record = run_prepared(
-            prepared,
-            Invocation(
-                request_id=command["request_id"],
-                spool=spool,
-                deadline=deadline,
-                device=self._device(),
-                cancel=lambda: _cancelled(self.root, command["request_id"]),
-                models=self.models,
-                progress=progress,
-                # cr-012: the inputs the WORKER already fetched, verified and spooled.
-                # Every value is a path inside this attempt's own spool: this process is
-                # never HANDED an address, and `main` installs `sandbox.refuse_network` so a
-                # handler that dials one anyway is refused rather than merely unexpected.
-                # That fence is Python-level (cr-042) — it bounds a buggy package, not a
-                # hostile one, and there is no netns or seccomp under it.
-                assets=_granted_inputs(command),
-                max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
-            ),
-        )
+        capture = None
+        capture_result: dict[str, Any] | None = None
+        record: AuthorAttempt | None = None
+        try:
+            capture = self._capture_session(command, surface)
+            with capture if capture is not None else contextlib.nullcontext():
+                envelope, outcome, record = run_prepared(
+                    prepared,
+                    Invocation(
+                        request_id=command["request_id"],
+                        spool=spool,
+                        deadline=deadline,
+                        device=self._device(),
+                        cancel=lambda: _cancelled(self.root, command["request_id"]),
+                        models=self.models,
+                        progress=progress,
+                        # cr-012: the inputs the WORKER already fetched, verified and spooled.
+                        # Every value is a path inside this attempt's own spool: this process is
+                        # never HANDED an address, and `main` installs `sandbox.refuse_network` so a
+                        # handler that dials one anyway is refused rather than merely unexpected.
+                        # That fence is Python-level (cr-042) — it bounds a buggy package, not a
+                        # hostile one, and there is no netns or seccomp under it.
+                        assets=_granted_inputs(command),
+                        max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
+                    ),
+                )
+            if capture is not None and outcome.terminal == "succeeded":
+                capture_result = capture.write(spool)
+        except Exception as exc:
+            envelope, outcome = None, classify(exc)
+            if record is None:
+                record = AuthorAttempt(command["request_id"], spool, 0, sink=progress)
+        assert record is not None
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
         self._attempt_spool = None
         if self.group is not None and self.group.broken and not self.poisoned:
@@ -2065,6 +2082,8 @@ class Executor:
             "attribution": record.attribution.document(),
             "position": record.position,
             "outcome": terminal,
+            "execution_observation": self._execution_observation(),
+            "capture": capture_result,
             "quiescent": quiescent,
             **_env_document(),
             "poisoned": self.poisoned,
@@ -2099,6 +2118,56 @@ class Executor:
                 "started_unix": started_wall,
                 "gpu_count": self.world if torch is not None else 0,
             },
+        }
+
+    @staticmethod
+    def _capture_options(command: Mapping[str, Any], surface: Any) -> ActivationCapture | None:
+        import msgspec
+
+        from cozy_runtime.probe._capture import validate_components
+
+        raw = command.get("capture")
+        if raw is None:
+            return None
+        options = msgspec.convert(raw, type=ActivationCapture, strict=True)
+        validate_components(options, [binding.model_class for binding in surface.model_bindings])
+        return options
+
+    def _capture_session(self, command: Mapping[str, Any], surface: Any) -> Any:
+        from cozy_runtime.author._errors import InvalidRequest
+        from cozy_runtime.probe._capture import CaptureSession
+
+        options = self._capture_options(command, surface)
+        if options is None:
+            return None
+        roots: dict[str, Any] = {}
+        for executor in self.model_executors or [self]:
+            if executor.backend is None:
+                continue
+            for name, root in {**executor.backend.components, **executor.backend.parked}.items():
+                if name not in options.components:
+                    continue
+                if name in roots and roots[name] is not root:
+                    raise InvalidRequest(
+                        f"capture component {name!r} occurs in more than one bound model",
+                        code="capture_component_ambiguous",
+                    )
+                roots[name] = root
+        return CaptureSession(options, roots)
+
+    def _execution_observation(self) -> dict[str, Any]:
+        from cozy_runtime import __version__
+
+        # Observed generation facts; image and boot identity are added by the worker.
+        # Optional kernel/lane fields stay absent until their execution is observed.
+        return {
+            "runtime_version": __version__,
+            "accelerator": str(self.facts.get("gpu_name") or "CPU"),
+            "cuda": str(self.facts.get("cuda_version") or ""),
+            "driver": str(self.facts.get("device_driver") or ""),
+            "execution_lane": "",  # no generic eager/compiled observation exists yet
+            "execution_contract_digest": "",
+            "kernel_symbol": "",
         }
 
     # ------------------------------------------------------------------ job
@@ -2187,6 +2256,14 @@ class Executor:
         3. **Quiescence is proven by what exists.** A torch-free job has no stream that
            could still be moving, so the proof is structural rather than a device query.
         """
+        if command.get("capture") is not None:
+            return {
+                "ok": False,
+                "code": "capture_mode",
+                "detail": "activation capture requires an ordinary serving invocation",
+                "terminal": "refused",
+                "origin": "request",
+            }
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         budget = command.get("budget") or {}
@@ -2450,6 +2527,7 @@ class Executor:
             "kind": "job",
             "shortfall": None,
             "residency": {},
+            "execution_observation": self._execution_observation(),
             "observations": record.ring.rows(),
             "observation_caps": {**record.ring.caps(), "metrics_dropped": record.metrics_dropped},
             "attribution": record.attribution.document(),
@@ -2744,6 +2822,8 @@ _MINIMAL_KEYS = frozenset(
         "code",
         "detail",
         "outcome",
+        "execution_observation",
+        "capture",
         "quiescent",
         "env_intact",
         "env_changed",
@@ -2866,13 +2946,13 @@ def _serialize_result(
     """
     import msgspec
 
-    from cozy_runtime.author._assets import Asset
+    from cozy_runtime.author._assets import Asset, Tree
 
     if envelope is None:
         return None, [], 0
 
     def hook(value: object) -> object:
-        if isinstance(value, Asset):
+        if isinstance(value, (Asset, Tree)):
             row = value.row()
             return {"asset_ref": row.pop("ref"), **row}
         raise TypeError(f"{type(value).__name__} has no wire spelling in a result")

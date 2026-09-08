@@ -159,8 +159,21 @@ wheels = [
 ]
 
 [[package]]
+name = "cozy-eval"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "msgspec" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/47/be8ded1dbc4d520d588a8770a0c7e597c7edd42d8949eb3006a7df5a1e45/cozy_eval-0.4.0.tar.gz", hash = "sha256:6f1193f3984222415b8db404a8d601cda58d14e903138f6818811493bc3d90ff", size = 1834890, upload-time = "2026-09-08T06:21:58.108Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/6d/e5f9de8ef070302df96e300eada3a4047c9299d72618832d9e061438420a/cozy_eval-0.4.0-py3-none-any.whl", hash = "sha256:4442b4ad918e9233263598bd60655620fb01d6118afc23bc7a8b06b380df4d07", size = 337794, upload-time = "2026-09-08T06:21:56.473Z" },
+]
+
+[[package]]
 name = "cozy-runtime"
-version = "0.7.3"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -191,6 +204,7 @@ model-execution = [
 [package.dev-dependencies]
 dev = [
     { name = "av" },
+    { name = "cozy-eval" },
     { name = "mypy" },
     { name = "numpy" },
     { name = "pytest" },
@@ -209,8 +223,8 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "pillow", specifier = ">=12,<13" },
     { name = "protobuf", specifier = ">=6.31" },
-    { name = "tensorfs", specifier = ">=0.3.22,<0.3.23" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.22,<0.3.23" },
+    { name = "tensorfs", specifier = ">=0.3.24,<0.3.25" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.24,<0.3.25" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
@@ -220,11 +234,12 @@ provides-extras = ["derive", "corpus", "media", "model-execution"]
 [package.metadata.requires-dev]
 dev = [
     { name = "av", specifier = ">=18.1,<19" },
+    { name = "cozy-eval", specifier = "==0.4.0" },
     { name = "mypy", specifier = ">=1.13" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=8.4" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.3.22,<0.3.23" },
+    { name = "tensorfs", specifier = ">=0.3.24,<0.3.25" },
     { name = "types-protobuf", specifier = ">=6.30" },
 ]
 
@@ -1007,11 +1022,11 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.3.22"
+version = "0.3.24"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/bb/55/7b91b178ddff23a38ec633e5418d8cc9b5dec66bf73c92a46dfd5afd2688/tensorfs-0.3.22.tar.gz", hash = "sha256:861c819885b63a3e51438b9791828d15578aea1a57866107f1ce4735a766fc5a", size = 703505, upload-time = "2026-09-08T02:16:13.188Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1f/d8/1bcebe871671a0891e1d430d1dd9a4e7f351126b6594b004383c00388154/tensorfs-0.3.24.tar.gz", hash = "sha256:e5619101a3073e48d78c27593db0035d1fd6ac757adeea64e649487beabca6ee", size = 706667, upload-time = "2026-09-08T11:08:58.145Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/27/f6/30f1b7a594b6839e9db4f2abedf7a34b0e7034118818b49b83e7fb5c3721/tensorfs-0.3.22-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:60c87e03d7174e0a06f92cc93f9babe1acb47f0ddcaf0ce8f686f873b93079e8", size = 7601347, upload-time = "2026-09-08T02:16:11.304Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/42/eca631d4a61fba8566361a7f7d93a34b1db2d744170a213fe0cf3d93a10d/tensorfs-0.3.24-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:790e159ff1028a16667e418f864c5444b57e948700efbc9493ae61eb3c060b44", size = 7620505, upload-time = "2026-09-08T11:08:56.267Z" },
 ]
 
 [[package]]

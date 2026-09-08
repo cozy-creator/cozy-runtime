@@ -83,10 +83,11 @@ def test_graft_is_native_declared_granted_and_retained(tmp_path: Path) -> None:
     assert facts["added_objects"] == []
     assert facts["inherit_observation"] == {"bytes": 4096, "hashes": 0, "objects": 2, "reads": 0}
     assert host.open(request).commit().tensorfs_receipt == receipt.tensorfs_receipt
-    bank_header = tensorfs.parse_header(bytes(store.manifest(bank)["header"]))
-    header = tensorfs.parse_header(
-        bytes(store.manifest("sha256:" + facts["manifest"]["sha256"])["header"])
-    )
+    bank_bytes = store.manifest(bank)["header"]
+    result_bytes = store.manifest("sha256:" + facts["manifest"]["sha256"])["header"]
+    assert bank_bytes is not None and result_bytes is not None
+    bank_header = tensorfs.parse_header(bank_bytes)
+    header = tensorfs.parse_header(result_bytes)
     assert header["components"]["model"]["table"] == bank_header["components"]["model"]["weight"]
 
     with pytest.raises(CapabilityError, match="immutable grant"):

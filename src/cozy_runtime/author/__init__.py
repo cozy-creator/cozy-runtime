@@ -28,7 +28,13 @@ from cozy_runtime.author._assets import (
     Tree,
     VideoAsset,
 )
-from cozy_runtime.author._calls import ChildCallError, invocable
+from cozy_runtime.author._calls import ChildCallError, PendingCall, invocable
+from cozy_runtime.author._capture import (
+    ActivationCapture,
+    ActivationCaptureResult,
+    ExecutionEnvironment,
+    ExecutionObservation,
+)
 from cozy_runtime.author._context import (
     AdapterRef,
     Context,
@@ -114,7 +120,6 @@ from cozy_runtime.author._model import (
     sequence_parallel,
     uses_components,
 )
-from cozy_runtime.author._probe import probe_activations
 from cozy_runtime.author._script import ScriptContext, script_app
 from cozy_runtime.author._services import (
     JOB_ONLY,
@@ -167,6 +172,8 @@ __all__ = [
     "JOB_ONLY",
     "NEUTRAL_ERROR_SET",
     "SERVING_ONLY",
+    "ActivationCapture",
+    "ActivationCaptureResult",
     "AdapterRef",
     "AdjustmentRow",
     "Adjustments",
@@ -217,6 +224,8 @@ __all__ = [
     "Device",
     "Egress",
     "EgressResponse",
+    "ExecutionEnvironment",
+    "ExecutionObservation",
     "FileAsset",
     "Fit",
     "Image",
@@ -244,6 +253,7 @@ __all__ = [
     "OutputError",
     "Outputs",
     "Overlay",
+    "PendingCall",
     "Preflight",
     "PreflightViolation",
     "PreparedRequest",
@@ -291,7 +301,6 @@ __all__ = [
     "invocable",
     "invoke",
     "prepare",
-    "probe_activations",
     "publish_release",
     "register_adapter",
     "registered_adapters",

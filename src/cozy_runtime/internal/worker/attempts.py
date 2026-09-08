@@ -39,6 +39,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclasses_field
+from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -63,6 +64,7 @@ from cozy_runtime.internal.worker.plan import (
 )
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.weights import WeightsExchange
+from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -366,6 +368,9 @@ class AttemptRecord:
     traceback: str = ""
     #: what the component-use plane actually did: stages, evictions, leases, resident set
     residency: dict[str, Any] = dataclasses_field(default_factory=dict)
+    execution_observation: dict[str, Any] = dataclasses_field(default_factory=dict)
+    capture_result: dict[str, Any] = dataclasses_field(default_factory=dict)
+
     #: the record the plan was PRICED against, resolved once by the executor's kernel
     prepared: PreparedRequest | None = None
     #: cr-009's typed publication record, once the output transaction committed one
@@ -557,6 +562,13 @@ class AttemptEngine:
                 cause=CAUSE.CAUSE_CODE_PROTOCOL,
             ) from exc
 
+        if spec.get("capture") is not None and spec.get("job") is not None:
+            raise AttemptRefusal(
+                "capture_mode",
+                "activation capture requires an ordinary serving invocation",
+                cause=CAUSE.CAUSE_CODE_INVALID_REQUEST,
+            )
+
         # The (attempt, digest) fence binds the ORDINAL, not the current state: an attempt
         # is one execution of one spec whether it is running, recorded or already closed.
         known = self.history.get((offered.request_id, offered.attempt_ordinal))
@@ -744,6 +756,7 @@ class AttemptEngine:
                     "request_id": f"{attempt.request_id}#{attempt.attempt}",
                     "entrypoint": declared.entrypoint,
                     "payload": attempt.payload,
+                    **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
                     "input_metadata": {
                         name: {
                             "input_id": name,
@@ -814,6 +827,8 @@ class AttemptEngine:
                 spool=spool,
                 max_bytes=binding.max_input_bytes if binding else 64 << 20,
                 max_total_bytes=binding.max_inputs_total_bytes if binding else 256 << 20,
+                workspace=Workspace(self.tensorfs_root) if self.tensorfs_root is not None else None,
+                owner=self.owner_scope(),
             )
             supervision = self.supervision_for(attempt)
             if getattr(supervision, "isolated", False):
@@ -1017,8 +1032,15 @@ class AttemptEngine:
         attempt.executor_pid = executor.pid
         attempt.placement_id = ""  # job attempts are not placement-routed
         self._fetch_payload(attempt)
+        self._hydrate_inputs(attempt)
         try:
-            attempt.trees = grants.read_trees(attempt.grant, self.authorizer)
+            attempt.trees = grants.read_trees(
+                attempt.grant,
+                self.authorizer,
+                workspace=Workspace(self.tensorfs_root) if self.tensorfs_root is not None else None,
+                owner=self.owner_scope(),
+                spool=attempt.spool,
+            )
         except grants.GrantRefusal as exc:
             raise AttemptRefusal(
                 exc.code,
@@ -1027,10 +1049,6 @@ class AttemptEngine:
                 if exc.code == "grant_expired"
                 else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             ) from exc
-        # Assets follow the same eager grant path as serving: verified and spooled before
-        # acceptance, then projected into the executor command. A job is a lifecycle mode,
-        # not a second input plane.
-        self._hydrate_inputs(attempt)
 
         caps = attempt.spec.get("resource_caps") or {}
         plan = AttemptPlan.for_job(
@@ -1702,6 +1720,7 @@ class AttemptEngine:
         assert attempt.declared is not None and attempt.plan is not None
         return {
             "cmd": "invoke",
+            **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
             "request_id": key,
             "entrypoint": attempt.declared.entrypoint,
             "deadline_s": seconds,
@@ -1734,6 +1753,8 @@ class AttemptEngine:
         attempt.await_reclaim_before_finalizing()
         attempt.resulted_at = time.perf_counter()
         self.monitor.end(key, "returned")
+        attempt.execution_observation = dict(reply.get("execution_observation") or {})
+        attempt.capture_result = dict(reply.get("capture") or {})
         # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
         # whatever came back, success or fault: a failed attempt's activation peak is
         # exactly the number an operator needs, and dropping it on the failure path would
@@ -1933,6 +1954,25 @@ class AttemptEngine:
                     tail_error,
                     metrics=reply.get("metrics", {}),
                 )
+            if inline is not None and manifest is not None:
+                from .byte_outputs import settle_result
+
+                try:
+                    inline = dataclasses_replace(
+                        inline,
+                        canonical=settle_result(
+                            canonical.parse(inline.canonical), list(manifest.outputs)
+                        ),
+                    )
+                except ValueError as exc:
+                    return self.outcome(
+                        attempt,
+                        STATUS.OUTCOME_STATUS_FAILED,
+                        CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                        ORIGIN.CAUSE_ORIGIN_WORKER,
+                        f"native_output_result: {exc}",
+                        metrics=reply.get("metrics", {}),
+                    )
         else:
             grants.abort_outputs(spool)
         origin = _ORIGIN[outcome["origin"]]
@@ -2136,7 +2176,7 @@ class AttemptEngine:
         if not weights_outputs <= set(attempt.grant.outputs):
             return None, "weights_receipt_set_mismatch: a weights output has no granted destination"
         spool = attempt.spool
-        if not rows and not granted:
+        if not rows and not granted and not reply.get("capture"):
             return None, None
         if spool is None:
             return None, "the attempt has no spool to read outputs from"
@@ -2154,9 +2194,53 @@ class AttemptEngine:
             grants.abort_outputs(spool)
             return None, encode_error
         entries = []
+        native = (
+            self.tensorfs_root is not None and self.calls is not None and self.calls.minor() >= 43
+        )
         try:
+            if len(rows) + bool(reply.get("capture")) > 32:
+                raise grants.GrantRefusal(
+                    "output_count", "native outputs and capture exceed 32 slots"
+                )
+            if grants.expired(attempt.grant):
+                raise grants.GrantRefusal(
+                    "grant_expired", "output grant expired before post processing"
+                )
             for output_id in sorted(produced):
                 row = produced[output_id]
+                if row.get("kind") == "tree":
+                    if not native:
+                        raise grants.GrantRefusal(
+                            "native_tree_unsupported", "tree outputs require wire43 native custody"
+                        )
+                    from . import byte_outputs
+                    from .workspace import Workspace
+                    from .workspace_byte_outputs import TREE_MIME
+
+                    root = self._blob_path(spool, str(row["asset_ref"]))
+                    if root is None or self.tensorfs_root is None:
+                        raise grants.GrantRefusal(
+                            "output_spool_io", "tree output has no owned spool"
+                        )
+                    destination = attempt.grant.outputs[output_id]
+                    media_type = grants._output_media_type(
+                        output_id, destination.mime_type, TREE_MIME
+                    )
+                    entries.append(
+                        byte_outputs.commit(
+                            Workspace(self.tensorfs_root),
+                            self.owner_scope(),
+                            attempt.request_id,
+                            attempt.attempt,
+                            attempt.digest,
+                            output_id,
+                            root,
+                            tree=True,
+                            max_bytes=destination.max_bytes or (256 << 20),
+                            media_type=media_type,
+                        )
+                    )
+                    continue
                 blob = self._blob(spool, str(row["asset_ref"]))
                 if blob is None:
                     return None, (f"output {output_id} has no bytes in the attempt spool")
@@ -2172,9 +2256,82 @@ class AttemptEngine:
                         media_type=str(row.get("media_type") or ""),
                     )
                 )
+                if native:
+                    from . import byte_outputs
+                    from .workspace import Workspace
+
+                    assert self.tensorfs_root is not None
+                    committed = byte_outputs.commit(
+                        Workspace(self.tensorfs_root),
+                        self.owner_scope(),
+                        attempt.request_id,
+                        attempt.attempt,
+                        attempt.digest,
+                        output_id,
+                        blob,
+                        tree=False,
+                        max_bytes=attempt.grant.outputs[output_id].max_bytes or (256 << 20),
+                        media_type=entries[-1].mime_type,
+                    )
+                    if (
+                        committed.digest != entries[-1].digest
+                        or committed.length != entries[-1].length
+                    ):
+                        raise grants.GrantRefusal(
+                            "output_changed",
+                            "output changed between granted write and native import",
+                        )
+                    entries[-1].native_tree.CopyFrom(committed.native_tree)
+            if capture := reply.get("capture"):
+                if not native or not attempt.spec.get("capture") or "runtime.capture" in produced:
+                    raise grants.GrantRefusal(
+                        "capture_ungranted", "capture output has no exact requested slot"
+                    )
+                from . import byte_outputs
+                from .workspace import Workspace
+                from .workspace_byte_outputs import TREE_MIME
+
+                assert self.tensorfs_root is not None
+                root = spool / "runtime.capture"
+                if (
+                    capture.get("root") != str(root)
+                    or capture.get("output_id") != "runtime.capture"
+                ):
+                    raise grants.GrantRefusal(
+                        "capture_output", "capture output changed its owned spool"
+                    )
+                entry = byte_outputs.commit(
+                    Workspace(self.tensorfs_root),
+                    self.owner_scope(),
+                    attempt.request_id,
+                    attempt.attempt,
+                    attempt.digest,
+                    "runtime.capture",
+                    root,
+                    tree=True,
+                    max_bytes=128 << 20,
+                    media_type=TREE_MIME,
+                )
+                if entry.native_tree.content_bytes != capture.get("length"):
+                    raise grants.GrantRefusal(
+                        "capture_output", "capture output changed its measured length"
+                    )
+                content = hashlib.sha256()
+                for name in ("capture.json", "sketches.f32"):
+                    with (root / name).open("rb") as member:
+                        while block := member.read(1 << 20):
+                            content.update(block)
+                if documents.spell(content.digest()) != capture.get("content_digest"):
+                    raise grants.GrantRefusal(
+                        "capture_output", "capture semantic digest differs from retained bytes"
+                    )
+                entries.append(entry)
         except grants.GrantRefusal as exc:
             grants.abort_outputs(spool)
             return None, f"{exc.code}: {exc.detail}"
+        except (OSError, ValueError) as exc:
+            grants.abort_outputs(spool)
+            return None, f"native_output_refused: {exc}"
         receipt = self._publication(attempt, entries)
         self.records.append("publication", receipt.document())
         attempt.publication = receipt.document()
@@ -2323,8 +2480,23 @@ class AttemptEngine:
             # mint `attempt_ordinal + 1` and send it elsewhere with no cooldown.
             execution_started=attempt.executions > 0,
         )
+        if attempt.execution_observation:
+            from cozy_runtime.internal.capture_observation import environment
+
+            body.observation.environment.CopyFrom(
+                environment(attempt.execution_observation, boot_id=self.boot_id)
+            )
         if manifest is not None:
             body.output_manifest.CopyFrom(manifest)
+            if attempt.capture_result and any(
+                row.output_id == "runtime.capture" for row in manifest.outputs
+            ):
+                body.observation.capture.CopyFrom(
+                    pb.ActivationCaptureResult(
+                        output_id="runtime.capture",
+                        content_digest=documents.raw(attempt.capture_result["content_digest"]),
+                    )
+                )
         if shortfall is not None:
             body.cause.shortfall.CopyFrom(
                 pb.ResourceShortfall(
