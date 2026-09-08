@@ -67,7 +67,9 @@ def test_broker_serializes_verified_nested_media_and_refuses_unhydrated_forgery(
     @parent.job
     async def main(ctx: Context, payload: ParentInput) -> DigestResult:
         asset = ImageAsset(digest) if payload.forge else payload.image
-        return await score(media=ImageInput(asset))
+        # Generated client interfaces omit injected capabilities; this fixture shares
+        # the implementation module so the type checker still sees its decoder.
+        return await score(media=ImageInput(asset))  # type: ignore[call-arg]
 
     calls: list[dict[str, Any]] = []
     response = ""
