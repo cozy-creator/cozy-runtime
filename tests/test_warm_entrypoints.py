@@ -83,7 +83,7 @@ class _Booted:
             source_digest=development_source_digest(PACKAGE),
             artifact_cache=root / "artifact-cache",
             tensorfs_root=store.root,
-            found=found,
+            project=PACKAGE,
         )
         options = WorkerOptions(
             root=root / "worker",

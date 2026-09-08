@@ -294,6 +294,16 @@ or a function-local import of an interface name) is a typed refusal naming `file
 and the construct: `static_unresolvable`, `static_computed`, `static_unsupported`,
 `static_module`. Never a guess.
 
+A generated SCRIPT app — Creator's `app = script_app("<module>")` adapter — is read the same
+way: the adapter's one job is fixed, so all that varies is whether the script has a valid
+`main`, and `author/_script.py`'s `script_signature` is the ONE definition of that shape, run
+by the adapter and the reader over the same parsed tree.
+
+The reader is also what the DEVELOPMENT placement is built from (`cozy-runtime host
+--development-project`, `host development-placement`, the worker session's own staging): they
+supervise, they do not execute, so they read the source and take their model slots off the
+interface document. `cozy-runtime run` still imports — it is about to run the package.
+
 `internal/discovery.py` is the import path and the static reader's ORACLE: it imports exactly
 the ONE `App` export package.toml names, freezes it, and stops. `cozy-runtime --conformance
 describe` runs both and refuses unless they are byte-identical — and refuses outright unless
