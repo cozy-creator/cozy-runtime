@@ -3,7 +3,7 @@
 Owner: `/root/input_runtime`; branch: `authored-model-defaults`.
 Base: `edccecff8f0d74d414a436c229742a2da88723c8` (`origin/master`).
 
-A package author can supply an ordered default ladder on an injected Model argument:
+Runtime 0.10.0 lets a package author supply an ordered default ladder on an injected Model argument:
 
 ```python
 H3 = [
@@ -11,9 +11,9 @@ H3 = [
     {"gpu": "5090", "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-adaln-pruned"},
 ]
 
+
 @invocable(defaults={"model": H3})
-async def ref2va(ctx: Context, *, model: H3Model, prompt: str) -> VideoAsset:
-    ...
+async def ref2va(ctx: Context, *, model: H3Model, prompt: str) -> VideoResult: ...
 ```
 
 The immutable package interface carries the ordered array at
@@ -26,3 +26,16 @@ Resolution precedence is the invocation override, the owner's mutable Hub overri
 the function's published default. Creator and Hub resolve names before dispatch; Runtime's
 executor receives resolved artifacts. Static inspection never imports package code and uses
 the same declaration validator as imported description and stored-interface validation.
+
+Existing synchronous entrypoints can use the same declaration directly:
+
+```python
+@app.entrypoint(defaults={"model": H3})
+def ref2va(payload: Request, model: H3Model) -> VideoResult: ...
+```
+
+`app.job` also accepts the same keyword. Declare defaults on only one registration layer;
+putting nonempty defaults on both `invocable` and its App registration refuses. The package
+can share one literal ladder constant between its functions. Model references are metadata,
+never executor-side lookups. A ladder admits 1 through 32 GPU selectors, with an optional
+catch-all `*` only last. Each target explicitly names a published release and portable lane.

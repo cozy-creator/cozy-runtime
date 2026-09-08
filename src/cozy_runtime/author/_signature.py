@@ -13,7 +13,7 @@ import math
 import types
 import typing
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, get_args, get_origin
 
 import msgspec
@@ -40,6 +40,7 @@ from cozy_runtime.author._markers import (
     _PreflightMarker,
 )
 from cozy_runtime.author._model import Model, component_use
+from cozy_runtime.author._model_defaults import DefaultLadder, check_model_arguments
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.author._weights import WeightsOutput
@@ -244,6 +245,7 @@ class Surface:
     are absent from the package interface, so no binding is staged and no request reaches them."""
     invocable: bool = False
     memoize: bool = False
+    model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
 
     @property
     def assets_binding(self) -> AssetsBinding | None:
@@ -350,6 +352,7 @@ def analyze(
     hidden: bool = False,
     invocable: bool = False,
     memoize: bool = False,
+    model_defaults: Mapping[str, DefaultLadder] | None = None,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal."""
     where = f"{fn.__module__}:{fn.__qualname__}"
@@ -519,6 +522,7 @@ def analyze(
             preflight, payloads[0].annotation, assets_params[0] if assets_params else None
         )
 
+    check_model_arguments(model_defaults or {}, [p.name for p in params if p.role == "model"])
     return Surface(
         name=name,
         kind=kind,
@@ -536,6 +540,7 @@ def analyze(
         hidden=hidden,
         invocable=invocable,
         memoize=memoize,
+        model_defaults=model_defaults or {},
     )
 
 
