@@ -1877,6 +1877,9 @@ class Worker:
             verified=mark_verified,
             job_plan_root=self.config.cozy_home / "job-plans",
             base=self.base,
+            preinstalled_python=Path(self.options.environment_python)
+            if self.options.environment_python is not None
+            else None,
         )
 
     def numerical_environment(self) -> bytes:
