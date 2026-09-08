@@ -1055,16 +1055,20 @@ class LocalPackageWheel(_message.Message):
     def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., length: _Optional[int] = ..., path: _Optional[str] = ...) -> None: ...
 
 class PreparePrivatePlacementRequest(_message.Message):
-    __slots__ = ("operation_id", "local_revision_digest", "download_delegation", "download_delegation_signature")
+    __slots__ = ("operation_id", "local_revision_digest", "download_delegation", "download_delegation_signature", "native_models", "claim")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     LOCAL_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
+    NATIVE_MODELS_FIELD_NUMBER: _ClassVar[int]
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     local_revision_digest: bytes
     download_delegation: bytes
     download_delegation_signature: bytes
-    def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ...) -> None: ...
+    native_models: _containers.RepeatedCompositeFieldContainer[NativeModelBinding]
+    claim: Claim
+    def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ..., claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
 
 class LocalModelSourceFile(_message.Message):
     __slots__ = ("member", "object_id", "length", "path", "header_path", "verified")
@@ -1777,16 +1781,30 @@ class DesiredLocalPackageSet(_message.Message):
     def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ...) -> None: ...
 
 class DesiredPrivatePlacementSet(_message.Message):
-    __slots__ = ("operation_id", "local_revision_digest", "download_delegation", "download_delegation_signature")
+    __slots__ = ("operation_id", "local_revision_digest", "download_delegation", "download_delegation_signature", "native_models")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     LOCAL_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
+    NATIVE_MODELS_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     local_revision_digest: bytes
     download_delegation: bytes
     download_delegation_signature: bytes
-    def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ...) -> None: ...
+    native_models: _containers.RepeatedCompositeFieldContainer[NativeModelBinding]
+    def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ...) -> None: ...
+
+class NativeModelBinding(_message.Message):
+    __slots__ = ("slot", "model", "manifest", "retention")
+    SLOT_FIELD_NUMBER: _ClassVar[int]
+    MODEL_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    RETENTION_FIELD_NUMBER: _ClassVar[int]
+    slot: str
+    model: str
+    manifest: Ref
+    retention: DerivedRetentionRequest
+    def __init__(self, slot: _Optional[str] = ..., model: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., retention: _Optional[_Union[DerivedRetentionRequest, _Mapping]] = ...) -> None: ...
 
 class LocalPackageFileRef(_message.Message):
     __slots__ = ("digest", "filename", "length")
@@ -1813,14 +1831,16 @@ class LocalPackageRevision(_message.Message):
     def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., package_interface: _Optional[_Union[Ref, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ...) -> None: ...
 
 class DesiredPlacementSet(_message.Message):
-    __slots__ = ("placement_set_digest", "placement_set_canonical_bytes", "device_pins")
+    __slots__ = ("placement_set_digest", "placement_set_canonical_bytes", "device_pins", "orchestration_parent")
     PLACEMENT_SET_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PLACEMENT_SET_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     DEVICE_PINS_FIELD_NUMBER: _ClassVar[int]
+    ORCHESTRATION_PARENT_FIELD_NUMBER: _ClassVar[int]
     placement_set_digest: bytes
     placement_set_canonical_bytes: bytes
     device_pins: _containers.RepeatedCompositeFieldContainer[PlacementDevicePin]
-    def __init__(self, placement_set_digest: _Optional[bytes] = ..., placement_set_canonical_bytes: _Optional[bytes] = ..., device_pins: _Optional[_Iterable[_Union[PlacementDevicePin, _Mapping]]] = ...) -> None: ...
+    orchestration_parent: JobDirective
+    def __init__(self, placement_set_digest: _Optional[bytes] = ..., placement_set_canonical_bytes: _Optional[bytes] = ..., device_pins: _Optional[_Iterable[_Union[PlacementDevicePin, _Mapping]]] = ..., orchestration_parent: _Optional[_Union[JobDirective, _Mapping]] = ...) -> None: ...
 
 class PlacementDevicePin(_message.Message):
     __slots__ = ("placement_id", "device_ordinals")
@@ -3247,12 +3267,14 @@ class OutputBinding(_message.Message):
     def __init__(self, output_id: _Optional[str] = ..., mime_type: _Optional[str] = ..., max_bytes: _Optional[int] = ...) -> None: ...
 
 class ServingInvocationSpec(_message.Message):
-    __slots__ = ("entrypoint_binding_digest", "attempt_binding_id")
+    __slots__ = ("entrypoint_binding_digest", "attempt_binding_id", "bindings_digest")
     ENTRYPOINT_BINDING_DIGEST_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_BINDING_ID_FIELD_NUMBER: _ClassVar[int]
+    BINDINGS_DIGEST_FIELD_NUMBER: _ClassVar[int]
     entrypoint_binding_digest: str
     attempt_binding_id: str
-    def __init__(self, entrypoint_binding_digest: _Optional[str] = ..., attempt_binding_id: _Optional[str] = ...) -> None: ...
+    bindings_digest: str
+    def __init__(self, entrypoint_binding_digest: _Optional[str] = ..., attempt_binding_id: _Optional[str] = ..., bindings_digest: _Optional[str] = ...) -> None: ...
 
 class JobInvocationSpec(_message.Message):
     __slots__ = ("build_id", "job_descriptor_id", "publication_contract")

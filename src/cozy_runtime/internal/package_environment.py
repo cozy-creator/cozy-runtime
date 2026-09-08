@@ -436,6 +436,7 @@ def materialize(
             python=python,
         )
         _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+        _verify_prefix_resources(installed.generation, inspected)
         if exact_dependencies:
             _verify_installed_requirements(installed.site_packages, inspected, observed)
         return installed
@@ -461,6 +462,7 @@ def materialize(
                 base=observed,
             )
             _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
+            _verify_prefix_resources(staging, inspected)
             if exact_dependencies:
                 _verify_installed_requirements(staged.site_packages, inspected, observed)
             _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
@@ -489,6 +491,7 @@ def materialize(
     )
     if reused:
         _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+        _verify_prefix_resources(installed.generation, inspected)
     if exact_dependencies:
         _verify_installed_requirements(installed.site_packages, inspected, observed)
     return installed
@@ -1331,7 +1334,21 @@ def _verify_grants(
             )
         )
     root_owners: dict[str, str] = {}
+    resource_files: set[PurePosixPath] = set()
+    resource_directories: set[PurePosixPath] = set()
     for item in inspected:
+        for member in item.members:
+            resource = _prefix_resource(member.filename)
+            if member.is_dir() or resource is None:
+                continue
+            if (
+                resource in resource_files
+                or resource in resource_directories
+                or any(parent in resource_files for parent in resource.parents)
+            ):
+                raise EnvironmentRefusal("package_environment_resource_collision", str(resource))
+            resource_files.add(resource)
+            resource_directories.update(resource.parents)
         for root in item.import_roots:
             prior = root_owners.get(root)
             if prior is not None:
@@ -1406,7 +1423,8 @@ def _inspect(
                 if member.is_dir():
                     continue
                 installed = _install_path(name)
-                if installed is None and ".data/" in name:
+                prefix_resource = wheel.owner == "custom" and _prefix_resource(name) is not None
+                if installed is None and ".data/" in name and not prefix_resource:
                     raise EnvironmentRefusal(
                         "package_environment_wheel_install_scheme_forbidden", name
                     )
@@ -1430,6 +1448,10 @@ def _inspect(
                     )
                 magic = archive.open(member).read(4)
                 native = suffix in _NATIVE_SUFFIXES or magic == b"\x7fELF"
+                if native and prefix_resource:
+                    raise EnvironmentRefusal(
+                        "package_environment_native_install_scheme_forbidden", name
+                    )
                 if wheel.owner == "project" and native:
                     raise EnvironmentRefusal("package_environment_project_wheel_native", name)
                 if native:
@@ -1802,6 +1824,46 @@ def _install_path(name: str) -> PurePosixPath | None:
             return None
         return PurePosixPath(*path.parts[2:])
     return path
+
+
+def _prefix_resource(name: str) -> PurePosixPath | None:
+    """Dependency documentation/data belongs to the venv share tree, outside imports."""
+    parts = PurePosixPath(name).parts
+    if len(parts) > 3 and parts[0].endswith(".data") and parts[1:3] == ("data", "share"):
+        return PurePosixPath(*parts[2:])
+    return None
+
+
+def _verify_prefix_resources(generation: Path, inspected: Sequence[_Inspected]) -> None:
+    for item in inspected:
+        resources = [
+            (member, resource)
+            for member in item.members
+            if not member.is_dir() and (resource := _prefix_resource(member.filename)) is not None
+        ]
+        if not resources:
+            continue
+        with zipfile.ZipFile(item.path) as archive:
+            for member, resource in resources:
+                target = generation / resource
+                try:
+                    info = target.lstat()
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or target.resolve() != target
+                        or info.st_size != member.file_size
+                    ):
+                        raise OSError("resource path or size changed")
+                    digest = hashlib.sha256()
+                    with archive.open(member) as source:
+                        while chunk := source.read(1 << 20):
+                            digest.update(chunk)
+                    if _hash_file(target) != "sha256:" + digest.hexdigest():
+                        raise OSError("resource bytes changed")
+                except OSError as exc:
+                    raise EnvironmentRefusal(
+                        "package_environment_installed_resource_changed", str(resource)
+                    ) from exc
 
 
 def _uv_binary() -> Path:

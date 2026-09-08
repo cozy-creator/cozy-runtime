@@ -19,6 +19,16 @@ from cozy_runtime.internal import canonical, schema
 
 
 def metadata(surface: Surface) -> dict[str, Any]:
+    if surface.kind == "entrypoint":
+        return serving_metadata(
+            surface.payload_type,
+            surface.result_type,
+            module=surface.fn.__module__,
+            export=surface.fn.__name__,
+            context=next((p.name for p in surface.params if p.role == "context"), ""),
+            capabilities=sorted(surface.capabilities),
+            memoize=surface.memoize,
+        )
     parameters = [
         parameter.name
         for parameter in surface.params
@@ -43,6 +53,34 @@ def metadata(surface: Surface) -> dict[str, Any]:
     )
 
 
+def serving_metadata(
+    payload_type: object,
+    result_type: object,
+    *,
+    module: str,
+    export: str,
+    context: str,
+    capabilities: Sequence[str],
+    memoize: bool = False,
+) -> dict[str, Any]:
+    """Caller names over the existing serving wire schema; never change its handler."""
+    return from_types(
+        payload_type,
+        result_type,
+        module=module,
+        export=export,
+        context=context,
+        parameters=[
+            field.encode_name
+            for field in msgspec.structs.fields(typing.cast(type[msgspec.Struct], payload_type))
+        ],
+        parameter_defaults={},
+        memoize=memoize,
+        capabilities=capabilities,
+        serving=True,
+    )
+
+
 def from_types(
     payload_type: object,
     result_type: object,
@@ -54,6 +92,7 @@ def from_types(
     parameter_defaults: Mapping[str, object],
     memoize: bool,
     capabilities: Sequence[str],
+    serving: bool = False,
 ) -> dict[str, Any]:
     """Portable names/defaults from resolved types, shared by both interface readers."""
     defaults: dict[str, Any] = {}
@@ -68,21 +107,36 @@ def from_types(
         if isinstance(base, type) and is_struct(base):
             names[path] = base.__name__
             for field in msgspec.structs.fields(base):
-                if field.name != field.encode_name or not _identifier(field.name):
+                if (not serving and field.name != field.encode_name) or not _identifier(
+                    field.encode_name
+                ):
                     raise ConformanceError(
                         "invocable struct fields need portable Python names", code="invocable_field"
                     )
-                nested = path + "/" + field.name
+                nested = path + "/" + field.encode_name
                 walk(field.type, nested)
                 if field.default is not msgspec.NODEFAULT:
-                    canonical.write(field.default)
-                    defaults[nested] = field.default
+                    default = msgspec.to_builtins(field.default)
+                    canonical.write(default)
+                    defaults[nested] = default
+                elif serving and field.default_factory in (list, dict):
+                    defaults[nested] = field.default_factory()
         elif isinstance(base, type) and issubclass(base, enum.Enum):
             names[path] = base.__name__
             members = sorted(base, key=lambda member: canonical.write(member.value))
             enums[path] = [member.name for member in members]
         elif origin is list:
             walk(get_args(base)[0], path + "/[]")
+        elif serving and origin is dict:
+            walk(get_args(base)[0], path + "/map/key")
+            walk(get_args(base)[1], path + "/map/value")
+        elif serving and origin is tuple:
+            args = get_args(base)
+            if len(args) == 2 and args[1] is Ellipsis:
+                walk(args[0], path + "/[]")
+            else:
+                for index, arg in enumerate(args):
+                    walk(arg, path + f"/tuple/{index}")
         elif origin in (types.UnionType, typing.Union):
             for index, member in enumerate(
                 sorted(get_args(base), key=lambda item: canonical.write(schema.render(item)))
@@ -109,7 +163,7 @@ def _identifier(value: object) -> bool:
     return isinstance(value, str) and value.isidentifier() and not keyword.iskeyword(value)
 
 
-def validate(value: object, request: Any, result: Any) -> dict[str, Any]:
+def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> dict[str, Any]:
     """Validate every token the pure generator can turn into Python source."""
     keys = {
         "module",
@@ -148,7 +202,7 @@ def validate(value: object, request: Any, result: Any) -> dict[str, Any]:
         not isinstance(value["module"], str)
         or not all(_identifier(part) for part in value["module"].split("."))
         or not _identifier(value["export"])
-        or not _identifier(value["context"])
+        or not (_identifier(value["context"]) or (kind == "entrypoint" and value["context"] == ""))
     ):
         raise ConformanceError(
             "invocable export is not a Python module function", code="invocable_interface"
@@ -198,6 +252,14 @@ def validate(value: object, request: Any, result: Any) -> dict[str, Any]:
             elif "union" in node:
                 for index, member in enumerate(node["union"]):
                     walk(member, path + f"/union/{index}")
+            elif kind == "entrypoint" and "map" in node:
+                walk(node["map"]["key"], path + "/map/key")
+                walk(node["map"]["value"], path + "/map/value")
+            elif kind == "entrypoint" and "tuple" in node:
+                for index, member in enumerate(node["tuple"]):
+                    walk(member, path + f"/tuple/{index}")
+            elif kind == "entrypoint" and "opaque" in node:
+                pass
             elif "opaque" in node or "map" in node or "tuple" in node:
                 raise ConformanceError(
                     "invocable schema is not a supported wire type", code="invocable_interface"
@@ -230,7 +292,10 @@ def validate(value: object, request: Any, result: Any) -> dict[str, Any]:
                 "invocable enumeration names differ from its values", code="invocable_interface"
             )
     for path, default in value["defaults"].items():
-        if path not in nodes or not (default is None or type(default) in (str, int, float, bool)):
+        allowed = (
+            (str, int, float, bool, list, dict) if kind == "entrypoint" else (str, int, float, bool)
+        )
+        if path not in nodes or not (default is None or type(default) in allowed):
             raise ConformanceError(
                 "invocable default is not a canonical immutable field value",
                 code="invocable_interface",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import grpc
 import pytest
@@ -14,6 +15,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker import workspace_memo
 from cozy_runtime.internal.worker.artifact_transfer import NativeArtifactTransfers
+from cozy_runtime.internal.worker.attempts import AttemptEngine
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_rpc import Service, WorkspaceRPC
 from cozy_runtime.protocol import documents
@@ -59,6 +61,46 @@ def producing(tmp_path: Path) -> tuple[Workspace, bytes, bytes, Path]:
         }
     )
     return workspace, digest, manifest, path
+
+
+def test_reserved_capture_grant_commits_native_tree_without_author_asset(tmp_path: Path) -> None:
+    workspace, digest, _, _ = producing(tmp_path)
+    spool = tmp_path / "spool"
+    captured = spool / "runtime.capture"
+    captured.mkdir(parents=True)
+    metadata, sketches = b'{"capture":"observed"}', b"\0" * 16
+    (captured / "capture.json").write_bytes(metadata)
+    (captured / "sketches.f32").write_bytes(sketches)
+    capture = {
+        "root": str(captured),
+        "output_id": "runtime.capture",
+        "length": len(metadata) + len(sketches),
+        "content_digest": "sha256:" + hashlib.sha256(metadata + sketches).hexdigest(),
+    }
+    attempt = SimpleNamespace(
+        job=None,
+        weights_receipts={},
+        grant=SimpleNamespace(outputs={"runtime.capture": object()}, expires_at_unix=0),
+        spec={"capture": {"components": ["model"], "steps": [0]}},
+        spool=spool,
+        request_id="producer",
+        attempt=1,
+        digest=digest,
+    )
+    engine = SimpleNamespace(
+        tensorfs_root=workspace.store_root,
+        calls=SimpleNamespace(minor=lambda: 43),
+        owner_scope=lambda: "owner",
+        _encode_frames=lambda *args: None,
+        _publication=lambda *args: SimpleNamespace(document=lambda: {}, digest=lambda: b"r" * 32),
+        records=SimpleNamespace(append=lambda *args: None),
+    )
+    result, error = AttemptEngine._tail(engine, attempt, {"outputs": [], "capture": capture})
+    assert error is None and result is not None
+    assert [entry.output_id for entry in result.outputs] == ["runtime.capture"]
+    assert result.outputs[0].native_tree.content_bytes == len(metadata) + len(sketches)
+    missing, error = AttemptEngine._tail(engine, attempt, {"outputs": []})
+    assert missing is None and error is not None and error.startswith("capture_output_absent:")
 
 
 def test_real_tree_commit_replay_retention_gc_and_release(tmp_path: Path) -> None:

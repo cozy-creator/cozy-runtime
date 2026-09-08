@@ -35,11 +35,14 @@ _UV_VERSION = re.compile(r"uv ([0-9]+(?:\.[0-9]+){1,3})(?: \([^\n]+\))?")
 # (`pillow>=12,<13`), so a package copy of either is loaded by image code, not only by the
 # package. Membership is narrow on purpose: it does not promote other incidental image
 # packages, which stay package-owned.
+# Torch requires setuptools at runtime. Its distutils startup hook belongs to
+# the trusted interpreter prefix; package wheels may not replace that hook.
 _PROTECTED_IMPORT_ROOTS = {
     "cozy-runtime": ("cozy", "cozy_runtime"),
     "msgspec": ("msgspec",),
     "numpy": ("numpy",),
     "pillow": ("PIL",),
+    "setuptools": ("_distutils_hack", "setuptools"),
     "tensorfs": ("tensorfs",),
     "torch": ("torch",),
     "torchaudio": ("torchaudio",),

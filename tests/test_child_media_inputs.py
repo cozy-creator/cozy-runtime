@@ -108,6 +108,8 @@ def test_broker_serializes_verified_nested_media_and_refuses_unhydrated_forgery(
             assert result is not None
             response = msgspec.json.encode(result.result).decode()
             return {"ok": True}
+        if kind == "child_forget":
+            return {"ok": True}
         assert kind == "child_poll"
         return {"ok": True, "state": "succeeded", "result": response}
 
@@ -217,6 +219,8 @@ def test_broker_forwards_only_this_attempts_verified_tree(tmp_path: Path, forwar
             assert outcome.terminal == "succeeded", outcome
             assert result is not None
             response = msgspec.json.encode(result.result).decode()
+            return {"ok": True}
+        if kind == "child_forget":
             return {"ok": True}
         assert kind == "child_poll"
         return {"ok": True, "state": "succeeded", "result": response}

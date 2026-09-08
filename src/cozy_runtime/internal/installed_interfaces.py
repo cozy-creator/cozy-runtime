@@ -40,6 +40,7 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
             continue
         if (
             generator != interface_wheel.GENERATOR_ABI
+            or metadata.get("Cozy-Interface-Layout") not in {"overlay", "generated"}
             or implementation is None
             or not canonical.DIGEST_RE.fullmatch(implementation)
         ):
@@ -52,12 +53,45 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
         if len(body) > canonical.DOC_MAX_BYTES:
             raise ConformanceError("installed interface exceeds its bound", code="child_interface")
         descriptor = package_interface.read_bytes(body)
-        # A hostile dependency cannot turn a metadata header into invoke authority:
-        # its ordinary code must equal the trusted deterministic generator's output.
-        for relative, expected in interface_wheel.generate(body).items():
+        # The sealed implementation keeps ordinary library source. Only the generated
+        # private caller code and terminal export replacement confer invoke authority.
+        if metadata.get("Cozy-Interface-Layout") == "overlay":
+            modules = {
+                entry["invocable"]["module"]
+                for entry in [*descriptor["entrypoints"], *descriptor["jobs"]]
+                if "invocable" in entry
+            }
+            available = {
+                candidate
+                for module in modules
+                for candidate in (
+                    module.replace(".", "/") + ".py",
+                    module.replace(".", "/") + "/__init__.py",
+                )
+                if (installed.site_packages / candidate).is_file()
+            }
+            sources = interface_wheel.overlay_sources(body, available)
+            expected_files = {}
+            for relative_module, (companion, expected, suffix) in sources.items():
+                try:
+                    with (installed.site_packages / relative_module).open("rb") as stream:
+                        stream.seek(-len(suffix), 2)
+                        if stream.read() != suffix:
+                            raise ValueError("terminal caller exports changed")
+                except (OSError, ValueError) as exc:
+                    raise ConformanceError(
+                        "installed caller exports changed", code="child_interface"
+                    ) from exc
+                expected_files[companion] = expected
+        else:
+            expected_files = interface_wheel.generate(body)
+        for relative, expected in expected_files.items():
             target = installed.site_packages / relative
-            with target.open("rb") as stream:
-                actual = stream.read(len(expected) + 1)
+            try:
+                with target.open("rb") as stream:
+                    actual = stream.read(len(expected) + 1)
+            except OSError as exc:
+                raise ConformanceError("installed proxy is absent", code="child_interface") from exc
             if actual != expected:
                 raise ConformanceError(
                     "installed proxy differs from trusted generator", code="child_interface"
