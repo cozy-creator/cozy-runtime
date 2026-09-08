@@ -12,7 +12,9 @@ The worker image's cu130 build stage runs this after installing the runtime whee
 the package's own `_kernels/fusion` (the default `--out`), so a pod loads and never
 compiles. A developer runs the same command once per box for their card. `--check`
 rebuilds into a scratch directory and proves the build is deterministic and that the
-loader's key recomputation matches — what CI runs, with no GPU.
+loader's key recomputation matches — what CI runs, with no GPU. `--verify` proves an
+existing artifact (the image's `/opt/cozy/fusion`) matches the installed runtime — what
+the image build asserts after copying it in, also with no GPU.
 """
 
 from __future__ import annotations
@@ -112,10 +114,20 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--arch", type=int, action="append", required=True, help="e.g. 90")
     parser.add_argument("--out", type=Path, default=fusion.KERNELS_DIR)
     parser.add_argument("--check", action="store_true", help="prove determinism, write nothing")
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="prove the artifact at --out matches this runtime for every --arch, write nothing",
+    )
     args = parser.parse_args(argv)
     archs = tuple(args.arch)
     if args.check:
         check(archs)
+        return
+    if args.verify:
+        for arch in archs:
+            fusion.check_artifact(args.out, arch)
+        print(f"fusion_build: {args.out} matches this runtime for {archs}")
         return
     manifest = build(args.out, archs)
     entries = sum(len(v) for v in manifest["targets"].values())
