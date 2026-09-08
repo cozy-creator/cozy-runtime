@@ -20,7 +20,7 @@ SageAttention2 sm90 is 1.12x rank 1, and flash-attn3's OWN fp8-e4m3 path — the
 this image already ships — is 1.31x. Neither is ranked, and the reason is not the speed:
 
   An EXACT kernel needs no quality evidence to be promoted. flash-attn3 became rank 1 over
-  cuDNN on a speed measurement alone because the two agree to max abs 1.2e-7, three orders
+  cuDNN on a speed measurement alone because the two agree to max abs 1.2e-7, FOUR orders
   BELOW bf16's own 2.3e-3 representation floor — the same computation, reordered. The
   generated video still moved (26.5 dB PSNR, 0.873 SSIM against the paired control), because a
   30-step sampler amplifies any perturbation; that is a property of the sampler, not a defect
