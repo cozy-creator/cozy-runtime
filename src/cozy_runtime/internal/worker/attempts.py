@@ -273,6 +273,7 @@ class AttemptSlot:
     devices: str = ""
     job_device_count: int = 0
     orchestration: bool = False
+    bindings_digest: str = ""
 
 
 @dataclass(slots=True)
@@ -1128,6 +1129,12 @@ class AttemptEngine:
         slot = self.slot_of(attempt)
         declared = slot.bindings.get(plan_id)
         prepared_model = slot.prepared_models.get(plan_id)
+        if not slot.bindings_digest or serving.get("bindings_digest") != slot.bindings_digest:
+            raise AttemptRefusal(
+                "model_bindings_changed",
+                "serving invocation differs from the exact activated model bindings",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
         if declared is None or prepared_model is None:
             raise AttemptRefusal(
                 "unknown_binding",
@@ -1468,7 +1475,7 @@ class AttemptEngine:
     def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Dispatch the existing executor control request lane by typed operation."""
         kind = str(frame.get("kind", ""))
-        if kind in ("child_call", "child_poll", "child_cancel"):
+        if kind in ("child_call", "child_poll", "child_cancel", "child_forget"):
             if self.calls is None:
                 return {
                     "ok": False,
@@ -2168,6 +2175,11 @@ class AttemptEngine:
                 "a host-acknowledged receipt",
             )
         granted = set(attempt.grant.outputs) - weights_outputs
+        if attempt.spec.get("capture"):
+            if not reply.get("capture"):
+                return None, "capture_output_absent: requested activation capture was not produced"
+            # Runtime writes this reserved native tree after normal author outputs.
+            granted.discard("runtime.capture")
         if not weights_outputs <= set(attempt.grant.outputs):
             return None, "weights_receipt_set_mismatch: a weights output has no granted destination"
         spool = attempt.spool

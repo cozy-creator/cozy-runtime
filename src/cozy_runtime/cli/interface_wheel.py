@@ -32,6 +32,8 @@ def run(args: list[str]) -> Result:
             "version",
             "implementation_digest",
             "output_directory",
+            "implementation_wheel",
+            "implementation_wheel_digest",
         }
         if (
             not isinstance(request, dict)
@@ -46,11 +48,21 @@ def run(args: list[str]) -> Result:
             interface = stream.read(canonical.DOC_MAX_BYTES + 1)
         if len(interface) > canonical.DOC_MAX_BYTES:
             raise ValueError("interface input exceeds its document bound")
+        source = Path(request["implementation_wheel"])
+        with source.open("rb") as stream:
+            implementation = stream.read(interface_wheel.MAX_IMPLEMENTATION_WHEEL + 1)
+        if (
+            len(implementation) > interface_wheel.MAX_IMPLEMENTATION_WHEEL
+            or "sha256:" + hashlib.sha256(implementation).hexdigest()
+            != request["implementation_wheel_digest"]
+        ):
+            raise ValueError("implementation wheel changed or exceeds its bound")
         filename, wheel = interface_wheel.build(
             interface,
             distribution=request["distribution"],
             version=request["version"],
             implementation_digest=request["implementation_digest"],
+            implementation_wheel=implementation,
         )
         output = Path(request["output_directory"]).resolve()
         output.mkdir(parents=True, exist_ok=True)

@@ -119,6 +119,7 @@ class App:
         /,
         *,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+        memoize: bool = False,
     ) -> Callable[P, R]: ...
 
     @overload
@@ -132,6 +133,7 @@ class App:
         source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         hidden: bool = False,
+        memoize: bool = False,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def entrypoint(
@@ -145,16 +147,22 @@ class App:
         source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         hidden: bool = False,
+        memoize: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a request-serving callable. BARE is the common case (§1.2).
 
         `hidden=True` declares a surface that is real but NOT READY: it is omitted from the
         published interface and gets no binding staged and no traffic (§1.2, #572d).
 
+        `memoize=True` explicitly admits deterministic measurement results to the managed
+        operation cache. Ordinary generation remains nonmemoized by default.
+
         ``source_profiles`` is RETIRED (cr-077): capability is the slot's class annotation,
         and the publish-time slot facts are derived from the class itself. Passing it
         refuses with the typed code ``source_profiles_retired``."""
         _refuse_source_profiles(source_profiles)
+        if type(memoize) is not bool:
+            raise RegistrationError("entrypoint memoize must be a boolean")
         return self._register(
             "entrypoint",
             fn,
@@ -164,6 +172,7 @@ class App:
             preflight=preflight,
             demand=demand,
             hidden=hidden,
+            memoize=memoize,
             defaults=defaults,
         )
 
@@ -246,6 +255,7 @@ class App:
         demand: Bound | None,
         emits_media: bool = False,
         hidden: bool = False,
+        memoize: bool = False,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         declared_defaults = model_defaults(defaults)
@@ -271,7 +281,7 @@ class App:
                 kind=kind,
                 fn=export.implementation if export is not None else target,
                 invocable=export is not None,
-                memoize=export.memoize if export is not None else False,
+                memoize=export.memoize if export is not None else memoize,
                 model_defaults=declared_defaults or (export.defaults if export is not None else {}),
                 publishes=publishes,
                 emits_media=emits_media,

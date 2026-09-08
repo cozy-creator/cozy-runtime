@@ -364,7 +364,7 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
 
     workspace, reply, data = retained(tmp_path)
     sent: list[pb.WorkerFrame] = []
-    worker = Calls(sent.append, lambda: 1, lambda: 43, workspace=workspace, owner=lambda: "owner")
+    worker = Calls(sent.append, lambda: 1, lambda: 44, workspace=workspace, owner=lambda: "owner")
     request = pb.ChildCallRequest(
         parent_request_id="parent",
         parent_attempt_ordinal=1,
@@ -386,10 +386,15 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
     assert first["ok"], first
     assert Path(first["byte_grants"][0]["local"]).read_bytes() == data
     assert worker.handle(parent, {"kind": "child_poll", "call_index": 0}) == first
+    assert worker.handle(parent, {"kind": "child_forget", "call_index": 0})["ok"]
+    assert not worker.pending
+    assert worker.materialized[("parent", 1)][1] > 0
+    assert Path(first["byte_grants"][0]["local"]).read_bytes() == data
     assert not sent
     worker.close("parent", 1)
     assert not Path(first["byte_grants"][0]["local"]).exists()
     assert not worker.pending
+    assert not worker.materialized
 
 
 class ImageResult(msgspec.Struct):

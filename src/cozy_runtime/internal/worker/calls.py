@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 
-from cozy_runtime.author._calls import MAX_CALL_BYTES, MAX_DIRECT_CALLS
+from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_BYTES, MAX_CALL_INDEX
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.internal import canonical, package_interface
@@ -34,6 +34,7 @@ class _Pending:
     result: pb.ChildCallResult | None = None
     byte_grants: list[dict[str, Any]] | None = None
     spool: Path | None = None
+    forgotten: bool = False
 
 
 class Calls:
@@ -49,6 +50,7 @@ class Calls:
         self.send, self.stream, self.minor = send, stream, minor
         self.workspace, self.owner = workspace, owner
         self.pending: dict[tuple[str, int, int], _Pending] = {}
+        self.materialized: dict[tuple[str, int], tuple[Path, int]] = {}
         self.lock = threading.RLock()
 
     @staticmethod
@@ -63,7 +65,7 @@ class Calls:
         raw = Path(attempt.job.package_interface).read_bytes()
         interface = package_interface.read_bytes(raw)
         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-        for entry in [*interface["entrypoints"], *interface["jobs"]]:
+        for entry in interface["jobs"]:
             declaration = entry.get("invocable")
             if declaration is not None:
                 result.append(
@@ -81,14 +83,24 @@ class Calls:
     def handle(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         with self.lock:
             try:
-                if self.minor() < 40 or attempt.state != "running" or attempt.canceling:
+                if self.minor() < 44 or attempt.state != "running" or attempt.canceling:
                     raise ValueError("parent call is not active under a capable owner")
                 index = frame.get("call_index")
-                if type(index) is not int or not 0 <= index < MAX_DIRECT_CALLS:
+                if type(index) is not int or not 0 <= index <= MAX_CALL_INDEX:
                     raise ValueError("parent call index exceeds its bound")
                 key = (attempt.request_id, attempt.attempt, index)
                 kind = frame.get("kind")
                 pending = self.pending.get(key)
+                if kind == "child_forget":
+                    if pending is not None:
+                        if (
+                            pending.result is None
+                            or pending.result.state == pb.CHILD_CALL_STATE_PENDING
+                        ):
+                            pending.forgotten = True
+                        else:
+                            del self.pending[key]
+                    return {"ok": True}
                 if kind == "child_call":
                     request = self._request(attempt, frame, index)
                     if (
@@ -97,6 +109,8 @@ class Calls:
                     ):
                         raise ValueError("an existing parent call index changed its exact intent")
                     if pending is None:
+                        if sum(k[:2] == key[:2] for k in self.pending) >= MAX_ACTIVE_CALLS:
+                            raise ValueError("active parent call bound exceeded")
                         pending = self.pending[key] = _Pending(request, self.stream())
                         self.send(pb.WorkerFrame(child_call_request=request))
                 if pending is None:
@@ -276,6 +290,10 @@ class Calls:
             held = pb.ChildCallResult()
             held.CopyFrom(result)
             pending.result = held
+            if pending.forgotten and result.state != pb.CHILD_CALL_STATE_PENDING:
+                del self.pending[
+                    (result.parent_request_id, result.parent_attempt_ordinal, result.call_index)
+                ]
             return True
 
     def _materialize(self, attempt: AttemptRecord, pending: _Pending) -> list[dict[str, Any]]:
@@ -285,21 +303,24 @@ class Calls:
             return []
         if self.workspace is None or attempt.spool is None:
             raise ValueError("parent has no native result workspace")
-        held_bytes = sum(
-            int(row["content_bytes"])
-            for key, earlier in self.pending.items()
-            if key[:2] == (attempt.request_id, attempt.attempt)
-            for row in (earlier.byte_grants or [])
-        )
+        parent = (attempt.request_id, attempt.attempt)
+        spool, held_bytes = self.materialized.get(parent, (attempt.spool, 0))
+        if spool != attempt.spool:
+            raise ValueError("parent artifact spool changed")
         pending.spool = attempt.spool / "child-results" / str(result.call_index)
         try:
-            return child_byte_results.materialize(
+            granted = child_byte_results.materialize(
                 self.workspace,
                 self.owner(),
                 result,
                 attempt.spool,
                 max_bytes=byte_inputs.MAX_BYTES - held_bytes,
             )
+            self.materialized[parent] = (
+                spool,
+                held_bytes + sum(int(row["content_bytes"]) for row in granted),
+            )
+            return granted
         except Exception as exc:
             byte_inputs.remove_checkout(pending.spool)
             if isinstance(exc, (ValueError, OSError)):
@@ -308,6 +329,8 @@ class Calls:
 
     def close(self, request_id: str, attempt: int) -> None:
         with self.lock:
+            if held := self.materialized.pop((request_id, attempt), None):
+                byte_inputs.remove_checkout(held[0] / "child-results")
             for key in list(self.pending):
                 if key[:2] == (request_id, attempt):
                     if self.pending[key].spool is not None:

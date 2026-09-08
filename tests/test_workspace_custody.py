@@ -190,3 +190,34 @@ print(result.manifest.digest.hex())
     refused = subprocess.run(command, capture_output=True, text=True, timeout=20)
     assert refused.returncode != 0
     assert "released retention cannot be recreated" in refused.stderr
+
+
+def test_native_serving_lease_rechecks_owner_identity_and_release(tmp_path: Path) -> None:
+    store, workspace, receipt = produced(tmp_path)
+    source = retention(receipt, 17)
+    held = workspace.retain("owner", source)
+    with workspace.held_model("owner", source, held.manifest):
+        with pytest.raises(tensorfs.errors.StoreBusy):
+            tensorfs.gc(str(store.root))
+        assert store.manifest(documents.spell(held.manifest.digest))["manifest"]
+    with (
+        pytest.raises(WorkspaceRefusal, match="exact retained"),
+        workspace.held_model("foreign", source, held.manifest),
+    ):
+        pass
+    wrong = pb.Ref(digest=held.manifest.digest, length=held.manifest.length + 1)
+    with (
+        pytest.raises(WorkspaceRefusal, match="exact retained"),
+        workspace.held_model("owner", source, wrong),
+    ):
+        pass
+    with (
+        pytest.raises(WorkspaceRefusal, match="exact retained"),
+        workspace.held_model("owner", source, held.manifest),
+    ):
+        workspace.retain("owner", source, release=True)
+    with (
+        pytest.raises(WorkspaceRefusal, match="exact retained"),
+        workspace.held_model("owner", source, held.manifest),
+    ):
+        pass
