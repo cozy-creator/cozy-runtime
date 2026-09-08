@@ -27,6 +27,11 @@ TORCH_VERSION_MAX_BYTES = 64 * 1024
 @dataclass(frozen=True, slots=True)
 class HostFacts:
     gpu_name: str = ""
+    gpu_count: int = 0
+    """HOW MANY cards this host holds, counted from the driver's own rows — never
+    inferred from the presence of a name. A rental is billed by width, and the paid
+    width is read back against this number, so a wide pod that reports one card is
+    refused as a billing fault (Creator `rental.accelerator_count_mismatch`)."""
     gpu_sm: int = 0
     vram_total_bytes: int = 0
     driver_version: str = ""
@@ -40,10 +45,6 @@ class HostFacts:
     accelerator PRESENT-BUT-UNQUALIFIED (#446): the torch-free worker can see that a
     device family exists, and only the executor's probe (#430) qualifies what it can DO —
     the worker never reports a capability it did not measure."""
-
-    @property
-    def gpu_count(self) -> int:
-        return 1 if self.gpu_name else 0
 
     def state(self, name: str) -> str:
         """`present` / `absent` / `unreadable` for one fact — the tri-state, spelled."""
@@ -59,6 +60,7 @@ def measure(expected_backend: str = "") -> HostFacts:
         raise ValueError(f"unsupported expected backend {expected_backend!r}")
     unreadable: list[str] = []
     gpu_name, gpu_sm, vram, driver, backend = "", 0, 0, "", ""
+    gpu_count = 0
     if expected_backend == "none":
         backend = "none"
     elif sys.platform == "darwin" and platform.machine() == "arm64":
@@ -68,8 +70,9 @@ def measure(expected_backend: str = "") -> HostFacts:
         backend = "mps"
     else:
         try:
-            out = (
-                subprocess.run(
+            rows = [
+                tuple(part.strip() for part in line.split(","))
+                for line in subprocess.run(
                     [
                         "nvidia-smi",
                         "--query-gpu=name,memory.total,driver_version,compute_cap",
@@ -81,11 +84,21 @@ def measure(expected_backend: str = "") -> HostFacts:
                     check=True,
                 )
                 .stdout.strip()
-                .splitlines()[0]
-            )
-            name, total, drv, cap = (part.strip() for part in out.split(","))
+                .splitlines()
+                if line.strip()
+            ]
+            if not rows:
+                raise IndexError("nvidia-smi named no device")
+            # ONE ROW PER CARD. The pair the protocol carries is (device_name,
+            # device_count), which describes a homogeneous host and nothing else, so a
+            # host whose cards disagree is UNREADABLE rather than reported by its first
+            # card — a width the renter is billed for must not be a guess.
+            if len({row[0] for row in rows}) != 1:
+                raise ValueError(f"mixed accelerators: {sorted({row[0] for row in rows})}")
+            name, total, drv, cap = rows[0]
             gpu_name, vram, driver = name, int(float(total)) * 1024 * 1024, drv
             gpu_sm = int(float(cap) * 10)
+            gpu_count = len(rows)
             backend = "cuda"
         except (OSError, subprocess.SubprocessError, ValueError, IndexError):
             unreadable += ["gpu_name", "gpu_sm", "vram_total_bytes", "driver_version"]
@@ -99,6 +112,7 @@ def measure(expected_backend: str = "") -> HostFacts:
         unreadable.append("backend_version")
     return HostFacts(
         gpu_name=gpu_name,
+        gpu_count=gpu_count,
         gpu_sm=gpu_sm,
         vram_total_bytes=vram,
         driver_version=driver,
