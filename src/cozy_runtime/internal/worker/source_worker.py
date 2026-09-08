@@ -44,7 +44,7 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
         selected = command["selection"]
         produced = store.materialize_source(
             command["native_owner"],
-            selected["members"],
+            [tuple(member) for member in selected["members"]],
             allowed_hosts=selected["allowed_hosts"],
             credential_hosts=selected["credential_hosts"],
             credential=command.get("credential", ""),
@@ -65,26 +65,40 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
         }
     if operation != "convert_cozytensors":
         raise ValueError("unknown fixed source operation")
-    checkpoints: list[tuple[str, str, int]] = []
     conversion_id = command["service_id"]
-    while True:
-        prepared = store.prepare_source_artifact(
-            command["source_owner"],
-            conversion_id,
-            [("model", args["profile"])],
-            checkpoints=checkpoints,
-        )
-        if prepared["complete"]:
-            break
-        checkpoints = [
-            (row["slot"], row["head"], row["head_length"]) for row in prepared["checkpoints"]
-        ]
-    converted = prepared["sources"][0]
     transaction = command["native_owner"]
     observed = store.derived_lookup(transaction)
     if observed.get("state") == "committed":
         receipt = observed["receipt"]
     else:
+        checkpoints: list[tuple[str, str, int]] = []
+        adopt = command.get("adopt_operation")
+        if adopt:
+            heads = store.source_checkpoints(adopt)
+            checkpoints = [(row["slot"], row["head"], row["head_length"]) for row in heads]
+            if not checkpoints:
+                adopt = None
+        registry = (
+            base64.b64decode(command["registry"], validate=True)
+            if command.get("registry")
+            else None
+        )
+        while True:
+            prepared = store.prepare_source_artifact(
+                command["source_owner"],
+                conversion_id,
+                [("model", args["profile"])],
+                checkpoints=checkpoints,
+                adopt_from_operation_id=adopt,
+                registry=registry,
+            )
+            adopt = None
+            if prepared["complete"]:
+                break
+            checkpoints = [
+                (row["slot"], row["head"], row["head_length"]) for row in prepared["checkpoints"]
+            ]
+        converted = prepared["sources"][0]
         if epoch := observed.get("writer_session_id"):
             store.derived_fence(transaction, epoch)
         header = fill.tensorfs_module().parse_header(
@@ -128,7 +142,6 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
     return {
         "result": result,
         "native_receipt": base64.b64encode(native_receipt).decode(),
-        "conversion_manifest": converted["manifest_digest"],
     }
 
 

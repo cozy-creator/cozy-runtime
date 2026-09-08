@@ -271,3 +271,77 @@ def record_complete(
             "WHERE owner=? AND service_id=?",
             (result, computation, native_receipt, owner, command.service_id),
         )
+
+
+def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -> bool:
+    """Independently acquire only a stopped predecessor with the exact native work key."""
+    with workspace.locked() as db:
+        current = db.execute(
+            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, service_id)
+        ).fetchone()
+        if current is None or current["operation"] == "convert_cozytensors":
+            return False
+        candidates = db.execute(
+            "SELECT n.native_owner FROM native_calls n JOIN attempts a "
+            "ON a.owner=n.owner AND a.request=n.parent_request AND a.ordinal=n.parent_ordinal "
+            "WHERE n.owner=? AND n.service_id<>? AND n.computation_digest=? AND n.operation=? "
+            "AND length(n.result)=0 AND (n.state IN ('failed','canceled') OR a.fenced=1 "
+            "OR a.state IN ('outcome','released')) ORDER BY n.service_id",
+            (owner, service_id, current["computation_digest"], current["operation"]),
+        ).fetchall()
+        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        for candidate in candidates:
+            try:
+                db.native(
+                    lambda candidate=candidate: store.adopt_source_progress(
+                        candidate["native_owner"], current["native_owner"]
+                    )
+                )
+            except Exception as exc:
+                if getattr(exc, "code", None) in {
+                    "STORE_BUSY",
+                    "ROOT_ABSENT",
+                    "TRANSACTION_CLOSED",
+                    "DURABILITY_UNPROVEN",
+                }:
+                    continue
+                raise
+            return True
+        return False
+
+
+def conversion_predecessor(workspace: Workspace, owner: str, service_id: str) -> str | None:
+    """Discover an exact stopped conversion; native readback/adoption proves the heads."""
+    with workspace.locked() as db:
+        current = db.execute(
+            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, service_id)
+        ).fetchone()
+        if current is None or current["operation"] != "convert_cozytensors":
+            return None
+        candidates = db.execute(
+            "SELECT n.service_id FROM native_calls n JOIN attempts a "
+            "ON a.owner=n.owner AND a.request=n.parent_request AND a.ordinal=n.parent_ordinal "
+            "WHERE n.owner=? AND n.service_id<>? AND n.computation_digest=? "
+            "AND n.operation='convert_cozytensors' AND length(n.result)=0 "
+            "AND (n.state IN ('failed','canceled') OR a.fenced=1 "
+            "OR a.state IN ('outcome','released')) "
+            "ORDER BY n.service_id",
+            (owner, service_id, current["computation_digest"]),
+        ).fetchall()
+        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        for candidate in candidates:
+            try:
+                heads = db.native(
+                    lambda candidate=candidate: store.source_checkpoints(candidate["service_id"])
+                )
+            except Exception as exc:
+                if getattr(exc, "code", None) in {
+                    "STORE_BUSY",
+                    "ROOT_ABSENT",
+                    "TRANSACTION_CLOSED",
+                }:
+                    continue
+                raise
+            if heads:
+                return str(candidate["service_id"])
+        return None

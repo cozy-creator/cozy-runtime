@@ -80,9 +80,11 @@ class SourceCalls:
         current: Callable[[pb.NativeSourceCommand], bool],
         *,
         endpoints: dict[str, str] | None = None,
+        native_registry: bytes | None = None,
     ):
         self.workspace, self.owner, self.send, self.current = workspace, owner, send, current
         self.endpoints = endpoints or {}
+        self.native_registry = native_registry
         self.lock = threading.Lock()
         self.processes: dict[str, subprocess.Popen[bytes] | None] = {}
         self.parents: dict[str, str] = {}
@@ -108,15 +110,6 @@ class SourceCalls:
             raise WorkspaceRefusal("unknown native source execution phase")
         if row["state"] == "canceled":
             self._status(command, pb.NATIVE_SOURCE_STATE_CANCELED)
-            return
-        if row["state"] == "complete":
-            self._status(
-                command,
-                pb.NATIVE_SOURCE_STATE_SUCCEEDED,
-                result=row["result"],
-                receipt=row["native_receipt"],
-                computation=row["computation_digest"],
-            )
             return
         if (
             command.phase == pb.NATIVE_SOURCE_PHASE_EXECUTE
@@ -181,6 +174,16 @@ class SourceCalls:
 
         released = False
         try:
+            if row["state"] == "complete":
+                workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
+                self._status(
+                    command,
+                    pb.NATIVE_SOURCE_STATE_SUCCEEDED,
+                    result=row["result"],
+                    receipt=row["native_receipt"],
+                    computation=row["computation_digest"],
+                )
+                return
             store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
             binding = source_interfaces.bindings()[
                 (source_interfaces.DIGEST, source_interfaces.MODULE, row["operation"])
@@ -225,6 +228,9 @@ class SourceCalls:
                             )
                     envelope["source_owner"] = access["retention_id"]
                     effective = {"source": artifact["manifest"], "profile": arguments["profile"]}
+                    if self.native_registry is not None:
+                        envelope["registry"] = base64.b64encode(self.native_registry).decode()
+                        effective["registry"] = hashlib.sha256(self.native_registry).hexdigest()
                 else:
                     envelope["selection"] = _native_selection(command.selection)
                     effective = {
@@ -256,6 +262,16 @@ class SourceCalls:
                         memo_hit=True,
                     )
                     return
+                if command.operation == pb.NATIVE_SOURCE_OPERATION_CONVERT:
+                    prior = workspace_sources.conversion_predecessor(
+                        self.workspace, owner, command.service_id
+                    )
+                    if prior is not None:
+                        envelope["adopt_operation"] = prior
+                else:
+                    workspace_sources.adopt_download_progress(
+                        self.workspace, owner, command.service_id
+                    )
                 envelope["computation_digest"] = documents.spell(computation)
                 envelope["writer_epoch"] = command.parent_call.parent_attempt_ordinal
             encoded = canonical_json.encode(envelope)
@@ -275,6 +291,12 @@ class SourceCalls:
             with self.lock:
                 canceled = command.service_id in self.canceled
             if canceled:
+                with self.workspace.locked() as db:
+                    db.execute(
+                        "UPDATE native_calls SET state='canceled' WHERE owner=? "
+                        "AND service_id=? AND state<>'complete'",
+                        (owner, command.service_id),
+                    )
                 self._status(command, pb.NATIVE_SOURCE_STATE_CANCELED)
                 return
             if process.returncode or len(output) > 2 << 20:
@@ -307,6 +329,12 @@ class SourceCalls:
             )
         except Exception:
             # No arbitrary native exception text or source/credential data crosses control.
+            with self.workspace.locked() as db:
+                db.execute(
+                    "UPDATE native_calls SET state='failed',native_error='native_source_failed' "
+                    "WHERE owner=? AND service_id=? AND state NOT IN ('complete','canceled')",
+                    (owner, command.service_id),
+                )
             self._status(command, pb.NATIVE_SOURCE_STATE_FAILED, code="native_source_failed")
         finally:
             if not released:
