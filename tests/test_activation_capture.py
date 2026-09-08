@@ -292,3 +292,21 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
     assert pending.observation.capture.tree is not None
     assert (pending.observation.capture.tree.path / "capture.json").is_file()
     broker.finish()
+
+
+def test_job_capture_refuses_before_any_executor_device_or_job_work(tmp_path: Path) -> None:
+    import socket
+
+    from cozy_runtime.internal.executor import Executor
+    from cozy_runtime.internal.seam import Channel
+
+    left, right = socket.socketpair()
+    try:
+        executor = Executor(Channel(left), tmp_path)
+        response = executor.run_job({"capture": {"components": ["denoiser"], "steps": [0]}})
+        assert response["code"] == "capture_mode" and response["terminal"] == "refused"
+        assert executor.torch is None and not executor.models
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        left.close()
+        right.close()
