@@ -26,5 +26,5 @@ The image-prepare stdin request no longer accepts `output_directory`; its `prepa
 names the one hash-addressed temporary derivative. Small images return the original path.
 Existing derivative bytes must match the hash before reuse; publication never replaces an
 existing inode. Attempt cleanup leaves temporary shared media in place for other readers.
-The host or user can reclaim those disposable files when idle. Runtime 0.8.3 is the client
+The host or user can reclaim those disposable files when idle. Runtime 0.9.0 is the client
 helper version boundary for this change.
