@@ -180,7 +180,7 @@ class Workspace:
                     + _MIGRATION_3
                     + "PRAGMA user_version=3; COMMIT;"
                 )
-            elif version not in (3, 4, 5):
+            elif version not in (3, 4, 5, 6):
                 raise WorkspaceRefusal("workspace journal schema is not supported")
             if version <= 3:
                 from .workspace_sources import SCHEMA4
@@ -190,6 +190,10 @@ class Workspace:
                 from .workspace_byte_outputs import SCHEMA5
 
                 db.executescript("BEGIN IMMEDIATE;" + SCHEMA5 + "PRAGMA user_version=5; COMMIT;")
+            if version <= 5:
+                from .workspace_byte_outputs import migrate6
+
+                migrate6(db)
             if (
                 not allow_frozen
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
@@ -480,8 +484,7 @@ class Workspace:
                 raise WorkspaceRefusal("outcome has no unchanged accepted execution")
             if row["state"] == "released":
                 return
-            from . import source_views
-            from .workspace_byte_outputs import reference
+            from .workspace_byte_outputs import recorded_native, reference
 
             output_rows = db.execute(
                 "SELECT * FROM byte_outputs WHERE owner=? AND request=? AND ordinal=?",
@@ -491,8 +494,8 @@ class Workspace:
             if body["status"] == pb.OUTCOME_STATUS_SUCCEEDED:
                 returned_rows = []
                 for output in output_rows:
-                    if output["slot"].startswith(source_views.PREFIX):
-                        if not source_views.recorded(db, output, complete=True):
+                    if output["native_service_id"]:
+                        if not recorded_native(db, output, complete=True):
                             raise WorkspaceRefusal(
                                 "terminal source view has no completed native call"
                             )
