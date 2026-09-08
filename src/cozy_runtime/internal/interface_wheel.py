@@ -63,7 +63,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         "from enum import Enum",
         "import msgspec",
         "from cozy_runtime.author import "
-        "AssetBound, ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
+        "AssetBound, Assets, ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
         "from cozy_runtime.author import ModelArtifact",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
         "",
@@ -198,6 +198,16 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         for name in metadata["parameters"]:
             path = "request/" + name
             annotation = expression(fields[name]["type"], path)
+            if entry.get("assets", {}).get("parameter") == name:
+                kinds = []
+                for row in entry["assets"]["kinds"]:
+                    cls = expression({"asset": row["kind"]}, path)
+                    bound = {key: value for key, value in row.items() if key != "kind"}
+                    bound["media_types"] = tuple(bound["media_types"])
+                    if any(bound.values()):
+                        cls = f"Annotated[{cls}, AssetBound(**{bound!r})]"
+                    kinds.append(cls)
+                annotation = "Assets[" + " | ".join(kinds) + "]"
             default = (
                 " = " + literal(fields[name]["type"], path, defaults[path])
                 if path in defaults

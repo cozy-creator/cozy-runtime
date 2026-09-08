@@ -1,8 +1,8 @@
 """Typed assets — the ONE asset type, both directions (§1.3/§3.4).
 
-Input assets are ordinary typed REQUEST FIELDS that arrive digest-verified; output assets
-are what `out.save_*` returns and what the result struct declares. There is no separate
-Inputs capability, no second asset type, and no author-managed fetch.
+Input assets are ordinary typed request fields or an explicit ordered Assets input.
+Their bytes arrive digest-verified; output assets are what `out.save_*` returns and
+what the result struct declares. Both use the same handles and granted reader.
 
 `Asset` is deliberately NOT a msgspec-native type. The only way one comes into existence
 from the wire is `asset_dec_hook`, which accepts a REF STRING and nothing else — so
@@ -13,9 +13,11 @@ paths cannot enter a schema, a digest, or serialized output.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Final, get_args
+from typing import Any, ClassVar, Final, Self, get_args, overload
 
 from cozy_runtime.author._errors import CapabilityError, PreflightViolation
 
@@ -28,8 +30,11 @@ class Asset:
     __slots__ = (
         "_attempt",
         "_input_id",
+        "_label",
         "_local",
         "_max_decoded_bytes",
+        "_position",
+        "_read_guard",
         "digest",
         "media_type",
         "ref",
@@ -55,6 +60,9 @@ class Asset:
         self._local = local
         self._attempt = attempt
         self._input_id = ""
+        self._label = ""
+        self._position = -1
+        self._read_guard: Callable[[], None] | None = None
         self._max_decoded_bytes = 0
 
     def __repr__(self) -> str:
@@ -65,6 +73,29 @@ class Asset:
 
     def __hash__(self) -> int:
         return hash((type(self).__name__, self.ref))
+
+    @property
+    def id(self) -> str:
+        """This input occurrence's request-local ID; empty before it is bound."""
+        return self._input_id
+
+    @property
+    def position(self) -> int:
+        """The input binding's order; -1 before an occurrence is assigned."""
+        return self._position
+
+    @property
+    def label(self) -> str:
+        """An optional caller-supplied name for this occurrence; empty when omitted."""
+        return self._label
+
+    def with_label(self, label: str) -> Self:
+        """Name a copy of this handle without changing its bytes or the original."""
+        if not isinstance(label, str):
+            raise TypeError("an asset label must be a string")
+        result = copy(self)
+        result._label = label
+        return result
 
     @property
     def hydrated(self) -> bool:
@@ -79,6 +110,8 @@ class Asset:
                 "kinds and typed metadata only — bytes exist after hydration (§1.3)",
                 code="asset_bytes_unavailable",
             )
+        if self._read_guard is not None:
+            self._read_guard()
         return self._local.read_bytes()
 
     def row(self) -> dict[str, Any]:
@@ -106,6 +139,83 @@ class VideoAsset(Asset):
 
 class FileAsset(Asset):
     kind: ClassVar[str] = "file"
+
+
+class Assets[T: Asset](Sequence[T]):
+    """An ordered input collection using the existing typed asset handles.
+
+    Construction gives each occurrence its own handle, ID and position. Reusing a
+    file preserves its content identity and granted access while keeping both list
+    positions. Nonempty labels must be unique and are preserved on copies. It performs
+    no I/O or decode, and does not mutate the source handles.
+    Runtime assigns the declared slot's IDs when binding a managed invocation.
+    """
+
+    __slots__ = ("_items",)
+
+    def __init__(self, values: Iterable[T] = ()) -> None:
+        items: list[T] = []
+        for position, value in enumerate(values):
+            if not isinstance(value, Asset):
+                raise TypeError("Assets accepts typed asset handles")
+            item = copy(value)
+            item._input_id = f"assets.{position}.asset"
+            item._position = position
+            items.append(item)
+        self._items = tuple(items)
+        self._check_labels()
+
+    @classmethod
+    def _from_bound(cls, values: Iterable[T]) -> Assets[T]:
+        """Retain the existing slot IDs/order after shared input binding."""
+        result = cls.__new__(cls)
+        items: list[T] = []
+        seen: set[str] = set()
+        for position, value in enumerate(values):
+            if not isinstance(value, Asset):
+                raise TypeError("Assets accepts typed asset handles")
+            if not value.id or value.id in seen or value.position != position:
+                raise ValueError("bound Assets requires distinct input IDs in binding order")
+            seen.add(value.id)
+            items.append(copy(value))
+        result._items = tuple(items)
+        result._check_labels()
+        return result
+
+    def _check_labels(self) -> None:
+        labels = [item.label for item in self._items if item.label]
+        if len(labels) != len(set(labels)):
+            raise ValueError("nonempty asset labels must be unique within the collection")
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self) -> Iterator[T]:
+        return iter(self._items)
+
+    @overload
+    def __getitem__(self, index: int) -> T: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[T, ...]: ...
+
+    def __getitem__(self, index: int | slice) -> T | tuple[T, ...]:
+        return self._items[index]
+
+    def by_id(self, input_id: str) -> T:
+        """Return an occurrence by its request-local ID, or raise KeyError."""
+        for item in self._items:
+            if item.id == input_id:
+                return item
+        raise KeyError(input_id)
+
+    def by_label(self, label: str) -> T:
+        """Look up an exact nonempty label, or raise KeyError."""
+        if label:
+            for item in self._items:
+                if item.label == label:
+                    return item
+        raise KeyError(label)
 
 
 def asset_kinds(annotation: object) -> frozenset[str]:
@@ -207,7 +317,18 @@ def digest_bytes(data: bytes) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class GrantedInput:
+class InputMetadata:
+    """Identity and declared metadata from one input binding, before byte hydration."""
+
+    input_id: str
+    media_type: str
+    digest: str
+    length: int
+    order: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GrantedInput(InputMetadata):
     """ONE input the worker already fetched, verified and spooled (cr-012).
 
     Everything on it was established BEFORE acceptance: the bytes were read under the
@@ -216,15 +337,7 @@ class GrantedInput:
     matches this against the FIELD it is about to fill, which is the half only it knows.
     """
 
-    input_id: str
-    """The payload field PATH, list index included — worker-protocol/01's stable identity.
-    Inputs are IDENTIFIED, ORDERED subjects, never a digest-sorted anonymous list."""
     local: Path
-    media_type: str
-    """What the BYTES are, from the sniff — not what the caller declared them to be."""
-    digest: str
-    length: int
-    order: int = 0
 
 
 def bind(
@@ -237,6 +350,8 @@ def bind(
     length: int,
     max_decoded_bytes: int = 0,
     input_id: str = "",
+    order: int = 0,
+    read_guard: Callable[[], None] | None = None,
 ) -> None:
     """Hydrate an asset in place. Runtime-only: author code has no path into this.
 
@@ -253,6 +368,8 @@ def bind(
     asset._local = local
     asset._attempt = attempt
     asset._input_id = input_id
+    asset._position = order
+    asset._read_guard = read_guard
     asset.media_type = media_type
     asset.size_bytes = length
     asset.digest = digest

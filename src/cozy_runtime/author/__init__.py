@@ -19,6 +19,7 @@ from cozy_runtime.author._app import App, Registration, RegistrationError
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._assets import (
     Asset,
+    Assets,
     AudioAsset,
     FileAsset,
     ImageAsset,
@@ -160,6 +161,7 @@ __all__ = [
     "Artifact",
     "Asset",
     "AssetBound",
+    "Assets",
     "AudioAsset",
     "AuthorError",
     "Backend",
