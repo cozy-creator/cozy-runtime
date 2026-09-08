@@ -276,7 +276,9 @@ sequence, and a CLOSED vocabulary — `msgspec.Struct` classes with their
 unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Assets[...]` with
 `AssetLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`/`fusion=`,
 `@sequence_parallel`, `@uses_components`), and `@app.entrypoint`/`@app.job` with literal
-keywords and `WeightsOutput(...)` tuples. A value the package owns as DATA rather than as
+keywords and `WeightsOutput(...)` tuples. Explicit function registrations and async
+`@invocable` exports use the same schema builders, with their declared capabilities and
+immutable defaults. A value the package owns as DATA rather than as
 code — MiniMax-H3's served denoise steps are its committed task plan's, and decision #705
 forbids a second copy in serving code — is spelled `data_values(__file__, "plan.json",
 "schedules", "transformer_evaluations")`: the reader and the imported app take it from the
@@ -287,8 +289,8 @@ declaration is rebuilt as a real type
 path uses, so the two readings cannot drift. Nothing of the package is imported, executed or
 evaluated — `checks/architecture.py`'s `static-describe-executes-nothing` fence holds the
 reader's import list to that — and anything outside the vocabulary (a call or comprehension in
-an interface position, a type from outside the tree, a star import, `@invocable`, registration
-by call, a function-local import of an interface name) is a typed refusal naming `file:line`
+an interface position, a type from outside the tree, a star import, computed registration,
+or a function-local import of an interface name) is a typed refusal naming `file:line`
 and the construct: `static_unresolvable`, `static_computed`, `static_unsupported`,
 `static_module`. Never a guess.
 
