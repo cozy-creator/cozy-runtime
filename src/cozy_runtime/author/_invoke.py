@@ -262,6 +262,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
         surface, result, attempt, grant_token=inv.calls.grant_token if inv.calls else None
     )
     attempt.closed = True
+    returned_handles: list[Asset | Tree] = [*assets_in(result), *trees_in(result)]
     return InvocationResult(
         result=result,
         outputs=tuple(
@@ -272,7 +273,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
         + tuple(tree.row() for tree in attempt.pending_trees.values())
         + tuple(
             asset.row()
-            for asset in [*assets_in(result), *trees_in(result)]
+            for asset in returned_handles
             if inv.calls is not None and asset._grant_token is inv.calls.grant_token
         ),
         adjustments=tuple(attempt.rows),
