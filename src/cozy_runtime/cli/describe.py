@@ -39,6 +39,10 @@ def run(function: str | None, opts: Options) -> Result:
                     code="package_interface_unreadable",
                 ) from exc
             body = package_interface.read_bytes(raw, str(interface))
+        elif opts.distribution:
+            body = static_interface.build_installed(
+                opts.distribution, environment_python=Path(opts.environment_python)
+            )
         else:
             body = static_interface.build(
                 project,

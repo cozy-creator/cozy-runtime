@@ -20,6 +20,7 @@ class Options:
     package_interface: str = ""
     conformance: bool = False
     environment_python: str = ""
+    distribution: str = ""
 
 
 @dataclass(frozen=True, slots=True)

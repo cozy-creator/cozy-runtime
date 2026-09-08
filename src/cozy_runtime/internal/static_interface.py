@@ -21,8 +21,12 @@ base, a star import — is a typed refusal naming file:line and the construct. N
 from __future__ import annotations
 
 import ast
+import configparser
+import csv
+import email.parser
 import enum
 import json
+import re
 import sysconfig
 import tomllib
 import types
@@ -1108,12 +1112,93 @@ def build(project: Path, *, environment_python: Path | None = None) -> dict[str,
     reader = Reader(
         project, dependency_roots=environment_roots(environment_python, project=project)
     )
+    return _build(reader, application, read_table(project / "package.toml"))
+
+
+def build_installed(distribution: str, *, environment_python: Path) -> dict[str, Json]:
+    """Describe one explicitly selected wheel using only its metadata and source bytes."""
+
+    def normalize(name: str) -> str:
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", distribution):
+        raise StaticRefusal("installed distribution name is invalid", code="static_distribution")
+    prefix = environment_python.absolute().parent.parent
+    roots = environment_roots(environment_python, project=prefix)
+    matches: list[Path] = []
+    for root in roots:
+        if not root.is_relative_to(prefix.resolve()):
+            continue
+        directories = list(root.glob("*.dist-info"))
+        if len(directories) > 512:
+            raise StaticRefusal(
+                "installed distribution count exceeds 512", code="static_distribution"
+            )
+        for directory in directories:
+            name, _, _version = directory.name.removesuffix(".dist-info").rpartition("-")
+            if normalize(name) == normalize(distribution):
+                matches.append(directory)
+    if len(matches) != 1:
+        raise StaticRefusal(
+            "the selected environment must contain exactly one matching distribution",
+            code="static_distribution",
+        )
+    metadata = matches[0]
+
+    def read(name: str) -> str:
+        path = metadata / name
+        if metadata.is_symlink() or path.is_symlink() or not path.is_file():
+            raise StaticRefusal(
+                "installed wheel metadata is absent or linked", code="static_distribution"
+            )
+        if path.stat().st_size > 8 << 20:
+            raise StaticRefusal(
+                "installed wheel metadata exceeds 8 MiB", code="static_distribution"
+            )
+        return path.read_text()
+
+    headers = email.parser.Parser().parsestr(read("METADATA"), headersonly=True)
+    if normalize(headers.get("Name", "")) != normalize(distribution):
+        raise StaticRefusal("installed wheel metadata identity differs", code="static_distribution")
+    entry_points = configparser.ConfigParser(interpolation=None)
+    try:
+        entry_points.read_string(read("entry_points.txt"))
+        entries = list(entry_points.items("cozy.application"))
+    except configparser.Error as exc:
+        raise StaticRefusal(
+            "installed application metadata is invalid", code="static_distribution"
+        ) from exc
+    if len(entries) != 1:
+        raise StaticRefusal("installed wheel must name exactly one App", code="static_distribution")
+    application = entries[0][1].strip()
+    if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*", application):
+        raise StaticRefusal("installed application export is invalid", code="static_distribution")
+    reader = Reader(metadata.parent, dependency_roots=roots)
+    entry = reader.application_module(application.partition(":")[0])
+    owned = {
+        metadata.parent.joinpath(row[0]).resolve()
+        for row in csv.reader(read("RECORD").splitlines())
+        if len(row) == 3 and row[0].endswith(".py")
+    }
+    if (
+        not entry.path.resolve().is_relative_to(metadata.parent.resolve())
+        or entry.path.resolve() not in owned
+    ):
+        raise StaticRefusal(
+            "installed App source is not owned by its wheel", code="static_distribution"
+        )
+    return _build(reader, application, {})
+
+
+def _build(
+    reader: Reader, application: str, bindings: Mapping[str, Mapping[str, object]]
+) -> dict[str, Json]:
     module_name, _, attribute = application.partition(":")
     entry = reader.application_module(module_name)
     app = reader.lookup(entry, attribute, entry.tree)
     if isinstance(app, Assigned) and _is_script_call(reader, app):
         return package_interface.assemble(
-            application, [("job", _script_doc(reader, app))], read_table(project / "package.toml")
+            application, [("job", _script_doc(reader, app))], bindings
         )
     if not (isinstance(app, Assigned) and _is_app_call(reader, app)):
         raise StaticRefusal(
@@ -1132,9 +1217,7 @@ def build(project: Path, *, environment_python: Path | None = None) -> dict[str,
                 "static_unsupported",
             )
         docs[registration.name] = registration.kind, _callable(reader, registration)
-    return package_interface.assemble(
-        application, list(docs.values()), read_table(project / "package.toml")
-    )
+    return package_interface.assemble(application, list(docs.values()), bindings)
 
 
 def _is_app_call(reader: Reader, app: Assigned) -> bool:
