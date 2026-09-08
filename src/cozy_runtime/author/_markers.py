@@ -151,6 +151,9 @@ class AssetLimits:
         }
 
 
+IMAGE_PREPARATION_PROFILE = "image-fit/1"
+
+
 @dataclass(frozen=True, slots=True)
 class ImagePreparation:
     """Opt-in useful image geometry for an Assets argument, preserving aspect ratio.
@@ -173,7 +176,7 @@ class ImagePreparation:
 
     def descriptor(self) -> dict[str, str | int]:
         return {
-            "profile": "image-fit/1",
+            "profile": IMAGE_PREPARATION_PROFILE,
             **{
                 key: value
                 for key, value in (("max_edge", self.max_edge), ("max_pixels", self.max_pixels))

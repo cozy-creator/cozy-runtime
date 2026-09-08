@@ -1133,7 +1133,6 @@ def require_decoder_dependency() -> None:
 # are source/working limits, separate from AssetBound and retained RGB budgets.
 IMAGE_SOURCE_MAX_BYTES = 256 << 20
 IMAGE_WORKING_MAX_BYTES = 2 << 30
-IMAGE_PREPARATION_PROFILE = "image-fit/1"
 
 
 def image_target_size(
@@ -1188,8 +1187,9 @@ def decode_image_path(
     It receives no grant authority. MediaDecoder still performs its attempt checks;
     the neutral CLI helper owns its separately authorized local input and limits.
     """
-    if preparation is not None:
-        image_source_geometry(path, limits, preparation)
+    source_geometry = (
+        image_source_geometry(path, limits, preparation) if preparation is not None else None
+    )
     with path.open("rb") as source:
         jpeg = source.read(2) == b"\xff\xd8"
         source.seek(0)
@@ -1207,8 +1207,19 @@ def decode_image_path(
         height = int(stream.codec_context.height or 0)
         if width > 0 and height > 0:
             _check_pixels(width, height, limits)
+            if source_geometry is not None and (width, height) != source_geometry:
+                raise MediaDecodeError(
+                    "image header and codec geometry disagree", code="media_geometry"
+                )
         decoded: DecodedImage | None = None
         for frame in container.decode(stream):
+            if (
+                source_geometry is not None
+                and (int(frame.width), int(frame.height)) != source_geometry
+            ):
+                raise MediaDecodeError(
+                    "image decoded geometry differs from its header", code="media_geometry"
+                )
             if decoded is not None:
                 raise MediaDecodeError(
                     "image asset contains more than one frame", code="animated_image"

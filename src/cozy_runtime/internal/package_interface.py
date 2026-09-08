@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from typing import NoReturn, cast
 
 from cozy_runtime.author import ConformanceError, ModelBinding, Surface
+from cozy_runtime.author._markers import IMAGE_PREPARATION_PROFILE
 from cozy_runtime.author._media import KIND_MEDIA
 from cozy_runtime.author._signature import AssetInputValue
 from cozy_runtime.internal import canonical, schema
@@ -519,7 +520,7 @@ def _assets_slot(value: Json, request: Json, source: str, path: str) -> None:
             preparation = _closed(
                 row["prepare"], {"profile"}, {"max_edge", "max_pixels"}, source, path + ".prepare"
             )
-            if preparation["profile"] != "image-fit/1" or not any(
+            if preparation["profile"] != IMAGE_PREPARATION_PROFILE or not any(
                 key in preparation for key in ("max_edge", "max_pixels")
             ):
                 _invalid(source, path, "unknown or empty image preparation")

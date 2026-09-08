@@ -5,9 +5,11 @@ import io
 import json
 import struct
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
 
+import av
 import msgspec
 import pytest
 from PIL import Image
@@ -28,6 +30,7 @@ from cozy_runtime.author._decode import (
     DecodedImage,
     MediaDecodeError,
     _Budget,
+    _decode_image_frame,
     _jpeg_rotation,
     decode_image_path,
     image_target_size,
@@ -132,6 +135,19 @@ def test_preparation_descriptor_is_argument_metadata(tmp_path: Path) -> None:
         "profile": "image-fit/1",
         "max_edge": 512,
     }
+    for policy in (
+        {"profile": "unknown", "max_edge": 512},
+        {"profile": "image-fit/1"},
+        {"profile": "image-fit/1", "max_edge": 0},
+        {"profile": "image-fit/1", "max_edge": True},
+        {"profile": "image-fit/1", "max_pixels": 1.5},
+        {"profile": "image-fit/1", "max_pixels": None},
+        {"profile": "image-fit/1", "max_edge": 512, "crop": True},
+    ):
+        invalid = json.loads(encoded)
+        invalid["entrypoints"][0]["assets"]["kinds"][0]["prepare"] = policy
+        with pytest.raises(ConformanceError):
+            package_interface.read_bytes(json.dumps(invalid).encode())
     for cap in (0, -1, True, 1.5):
         with pytest.raises(ConformanceError, match="positive"):
             ImagePreparation(max_edge=cap)  # type: ignore[arg-type]
@@ -141,3 +157,19 @@ def test_pixel_fit_preserves_hard_caps_for_thin_images() -> None:
     assert image_target_size(10001, 1, ImagePreparation(max_pixels=100)) == (100, 1)
     assert image_target_size(1, 10001, ImagePreparation(max_pixels=100)) == (1, 100)
     assert image_target_size(20, 30, ImagePreparation(max_edge=128)) == (20, 30)
+
+
+def test_source_pixels_do_not_hide_behind_small_prepared_output(tmp_path: Path) -> None:
+    limits = replace(DEFAULT_DECODE_LIMITS, max_pixels_per_frame=128 * 128)
+    prep = ImagePreparation(max_edge=64)
+    photo = tmp_path / "source.png"
+    Image.new("RGB", (512, 512)).save(photo)
+    with pytest.raises(MediaDecodeError, match="pixel"):
+        decode_image_path(photo, limits, _Budget(limits.max_decoded_bytes), prep)
+    # Real small native frame: the second check must hold even if a codec were
+    # to expose geometry different from its initial header.
+    frame = av.VideoFrame(512, 512, "rgb24")
+    with pytest.raises(MediaDecodeError, match="pixel"):
+        _decode_image_frame(
+            frame, limits, _Budget(limits.max_decoded_bytes), rotation=0, preparation=prep
+        )
