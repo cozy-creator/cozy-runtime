@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import sys
+import threading
 from typing import Any
 
 from cozy_runtime import canonical_json
@@ -73,11 +75,6 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
     else:
         checkpoints: list[tuple[str, str, int]] = []
         adopt = command.get("adopt_operation")
-        if adopt:
-            heads = store.source_checkpoints(adopt)
-            checkpoints = [(row["slot"], row["head"], row["head_length"]) for row in heads]
-            if not checkpoints:
-                adopt = None
         registry = (
             base64.b64decode(command["registry"], validate=True)
             if command.get("registry")
@@ -150,6 +147,17 @@ def main() -> None:
         command = canonical_json.decode(sys.stdin.buffer.read(MAX_COMMAND + 1))
         if not isinstance(command, dict):
             raise ValueError("source command must be an object")
+        parent = command.get("parent_pid")
+        if type(parent) is not int or parent <= 0:
+            raise ValueError("native source execution needs its process owner")
+
+        def parent_lifetime() -> None:
+            tick = threading.Event()
+            while os.getppid() == parent:
+                tick.wait(0.25)
+            os._exit(70)
+
+        threading.Thread(target=parent_lifetime, daemon=True, name="source-parent").start()
         result = {"ok": True, **execute(command)}
     except Exception as exc:
         # Exception text may include an input URL. Only the fixed native code leaves.

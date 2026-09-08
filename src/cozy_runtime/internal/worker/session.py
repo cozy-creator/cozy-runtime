@@ -2576,6 +2576,8 @@ class Worker:
                     "the next control stream could not be durably recorded",
                 )
             superseded = self.fence.control_stream_epoch
+            if self.source_calls is not None:
+                self.source_calls.fence_owner(claim.record_owner_id)
             self.fence.record_owner_epoch = claim.record_owner_epoch
             self.fence.record_owner_id = claim.record_owner_id
             self.fence.record_owner_recorded = True
@@ -2946,7 +2948,9 @@ class Worker:
             else:
                 self.send(pb.WorkerFrame(weights_finalize_result=result))
 
-    def on_outcome_ack(self, acked: pb.AttemptOutcomeAck) -> None:
+    def on_outcome_ack(
+        self, acked: pb.AttemptOutcomeAck, *, native_finalized: bool = False
+    ) -> None:
         """A closed outcome leaves the lane's RELEASED set — a SLOT COUNT change when the
         device was waiting on it (cr-079 D3), not a change in admission MEANING, so it does
         NOT bump `admission_epoch` (§6).
@@ -2960,6 +2964,19 @@ class Worker:
         `available_attempt_slots` is the field that carries this, and it is recomputed on
         every tick.
         """
+        if not native_finalized and self.source_calls is not None:
+
+            def finished() -> None:
+                with self.control_lock:
+                    if not self.fenced(acked):
+                        self.on_outcome_ack(acked, native_finalized=True)
+
+            try:
+                if self.source_calls.acknowledge(acked, finished):
+                    return
+            except ValueError:
+                self.note("source", "native source finalization was refused")
+                return
         if self.workspace is not None and self.workspace.contains(
             self.fence.record_owner_id, acked.request_id, acked.attempt_ordinal
         ):

@@ -297,9 +297,12 @@ def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(tmp_path:
         calls.handle(second)
         resolved = messages.get(timeout=30).native_source_status
         assert resolved.state == pb.NATIVE_SOURCE_STATE_RESOLVED
-        calls.cancel_parent("crashing-script")
+        with calls.lock:
+            process = calls.processes[first.service_id]
+            assert process is not None
+            process.kill()
         stopped = messages.get(timeout=30).native_source_status
-        assert stopped.state == pb.NATIVE_SOURCE_STATE_CANCELED
+        assert stopped.state == pb.NATIVE_SOURCE_STATE_FAILED
         release.set()
         before = len(ranges)
         second.phase = pb.NATIVE_SOURCE_PHASE_EXECUTE
@@ -311,9 +314,75 @@ def test_killed_source_process_adopts_durable_prefix_in_a_fresh_script(tmp_path:
         assert ranges[before:] == [block], "fresh script did not reuse the native durable prefix"
         store = tensorfs.Store.open(str(workspace.store_root))
         assert store.contains(digest)
-        assert store.verify(digest)["verdict"] in {"recorded", "valid", "rehashed"}
+        assert store.verify(digest)["verdict"] in {"recorded", "valid", "rehashed", "verified"}
     finally:
         release.set()
         origin.shutdown()
         origin.server_close()
         thread.join()
+
+
+def test_permanent_ack_releases_native_producer_and_access_but_keeps_cache(tmp_path: Path) -> None:
+    from cozy_runtime.internal.worker import workspace_sources
+    from cozy_runtime.protocol import documents
+    from test_workspace_native_memo import completed
+
+    workspace = Workspace(tmp_path / "store")
+    command = accepted(workspace, "completed-parent")
+    result, root = completed(workspace, command)
+    assert workspace_memo.record_native(workspace, "owner", command.service_id)
+    body, digest = documents.identity(
+        pb.AttemptOutcomeBody(
+            request_id=command.parent_call.parent_request_id,
+            attempt_ordinal=1,
+            invocation_spec_digest=documents.spell(
+                command.parent_call.parent_invocation_spec_digest
+            ),
+            status=pb.OUTCOME_STATUS_SUCCEEDED,
+            execution_started=True,
+            result=pb.ResultEnvelope(inline_result=b"{}"),
+        )
+    )
+    workspace.outcome(
+        "owner",
+        pb.AttemptOutcome(
+            request_id=command.parent_call.parent_request_id,
+            attempt_ordinal=1,
+            invocation_spec_digest=command.parent_call.parent_invocation_spec_digest,
+            outcome_id="source-parent-outcome",
+            outcome_digest=digest,
+            outcome_canonical_bytes=body,
+        ),
+    )
+    # A stop after the parent terminal is accepted against recorded call identity.
+    stopped = pb.NativeSourceCommand()
+    stopped.CopyFrom(command)
+    stopped.phase = pb.NATIVE_SOURCE_PHASE_CANCEL
+    messages: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    calls = SourceCalls(workspace, lambda: "owner", messages.put, lambda _: True)
+    calls.handle(stopped)
+    done = threading.Event()
+    ack = pb.AttemptOutcomeAck(
+        request_id=command.parent_call.parent_request_id,
+        attempt_ordinal=1,
+        invocation_spec_digest=command.parent_call.parent_invocation_spec_digest,
+        outcome_id="source-parent-outcome",
+        outcome_digest=digest,
+        retain_work=False,
+    )
+    assert calls.acknowledge(ack, done.set)
+    assert done.wait(30), "source finalizer did not complete"
+    store = tensorfs.Store.open(str(workspace.store_root))
+    assert store.tree_root(root["owner"])["released"]
+    with workspace.locked() as db:
+        row = db.execute(
+            "SELECT * FROM native_calls WHERE service_id=?", (command.service_id,)
+        ).fetchone()
+        assert row["state"] == "released"
+        assert row["result"] == result
+    tensorfs.gc(store.root)
+    consumer = accepted(workspace, "later-independent-parent")
+    hit = workspace_memo.lookup_native(workspace, "owner", consumer.service_id, b"k" * 32)
+    assert hit is not None and hit["result"] == result
+    workspace_memo.record_reuse(workspace, "owner", consumer.service_id)
+    assert not store.tree_root(workspace_sources.native_owner("owner", consumer.service_id))

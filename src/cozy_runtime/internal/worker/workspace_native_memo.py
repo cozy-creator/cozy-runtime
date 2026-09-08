@@ -19,11 +19,13 @@ def native_receipt_owned(
     owner: str,
     request: pb.DerivedRetentionRequest,
     kind: str,
+    *,
+    release: bool = False,
 ) -> bool | None:
     rows = db.execute(
         "SELECT operation,native_receipt FROM native_calls WHERE owner=? AND native_owner=? "
-        "AND state='complete'",
-        (owner, request.weights_transaction_id),
+        "AND (state='complete' OR (? AND state='releasing'))",
+        (owner, request.weights_transaction_id, release),
     ).fetchall()
     for row in rows:
         actual = "derived" if row["operation"] == "convert_cozytensors" else "tree"
@@ -108,9 +110,13 @@ def _row(db: Journal, owner: str, service: str) -> Any:
     return row
 
 
-def _payload(db: Journal, owner: str, service: str) -> dict[str, Any]:
+def _payload(db: Journal, owner: str, service: str, *, releasing: bool = False) -> dict[str, Any]:
     row = _row(db, owner, service)
-    if row["state"] != "complete" or not row["native_receipt"] or not row["result"]:
+    if (
+        (row["state"] != "complete" and not (releasing and row["state"] == "releasing"))
+        or not row["native_receipt"]
+        or not row["result"]
+    ):
         raise WorkspaceRefusal("native memo result has no successful retained terminal")
     value = canonical_json.decode(row["result"])
     receipt = canonical_json.decode(row["native_receipt"])
@@ -326,7 +332,7 @@ def record_reuse(workspace: Workspace, owner: str, service_id: str) -> bytes:
             (owner, row["parent_request"], row["parent_ordinal"]),
         ).fetchone()
         if (
-            row["state"] == "canceled"
+            row["state"] in ("stopped", "releasing", "released")
             or parent is None
             or parent["fenced"]
             or parent["spec"] != row["parent_spec"]
@@ -407,12 +413,13 @@ def release_native_result(workspace: Workspace, owner: str, service_id: str) -> 
         ).fetchall()
         if (
             not access
-            and row["state"] == "complete"
+            and row["state"] in ("complete", "releasing")
+            and row["native_receipt"]
             and row["native_owner"] == native_owner(owner, service_id)
         ):
             # A cancel may arrive before the first recipient is created. Fence its
             # deterministic identity even when no source_access row exists yet.
-            (hold,) = _payload(db, owner, service_id)["holds"]
+            (hold,) = _payload(db, owner, service_id, releasing=True)["holds"]
             hold["retention_id"] = workspace_memo._hold_id(
                 "native-result",
                 owner,

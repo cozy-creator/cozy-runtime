@@ -451,7 +451,10 @@ class Workspace:
             )
 
     def acknowledge(self, owner: str, ack: pb.AttemptOutcomeAck) -> None:
+        from . import workspace_sources
+
         self.owner(owner)
+        source_releases: list[str] = []
         with self.locked() as db:
             row = db.execute(
                 "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
@@ -459,6 +462,16 @@ class Workspace:
                 (owner, owner, ack.request_id, ack.attempt_ordinal),
             ).fetchone()
             if row is None and not ack.retain_work:
+                source_releases = [
+                    r[0]
+                    for r in db.execute(
+                        "SELECT service_id FROM native_calls WHERE owner=? AND parent_request=? "
+                        "AND release_ack=? AND state='releasing'",
+                        (owner, ack.request_id, workspace_sources.ack_identity(ack)),
+                    )
+                ]
+                for service in source_releases:
+                    db.native(partial(workspace_sources.release, self, owner, service))
                 return
             if (
                 row is None
@@ -480,6 +493,7 @@ class Workspace:
                 ),
             )
             if not ack.retain_work:
+                source_releases = workspace_sources.release_intent(db, owner, ack)
                 active = db.execute(
                     "SELECT 1 FROM weights WHERE owner=? AND request=? AND ordinal=? "
                     "AND state<>'released' LIMIT 1",
@@ -502,6 +516,9 @@ class Workspace:
                     "AND state='released'",
                     (row["owner"], ack.request_id, ack.attempt_ordinal),
                 )
+
+        for service in source_releases:
+            workspace_sources.release(self, owner, service)
 
     def begin_weights(self, owner: str, intent: pb.WeightsIntentFrame) -> dict[str, Any]:
         """Assign the epoch once, before native begin; the Host observes this decision."""
@@ -879,7 +896,7 @@ class Workspace:
             if original is None:
                 from .workspace_native_memo import native_receipt_owned
 
-                original = native_receipt_owned(db, owner, request, kind)
+                original = native_receipt_owned(db, owner, request, kind, release=release)
             pending_release = False
             if release and original is None and retained is None:
                 # Durable memo/lookup intent authorizes cancellation of a root

@@ -7,6 +7,7 @@ execution, exact pin and custody; they do not schedule jobs or define a retry qu
 from __future__ import annotations
 
 import hashlib
+from functools import partial
 from typing import Any
 
 from cozy_runtime import canonical_json
@@ -24,10 +25,10 @@ CREATE TABLE native_calls (
  accepted BLOB NOT NULL, pinned BLOB NOT NULL DEFAULT x'',
  computation_digest BLOB NOT NULL DEFAULT x'',
  state TEXT NOT NULL CHECK(state IN
- ('accepted','resolved','executing','complete','failed','canceled')),
+ ('accepted','resolved','executing','complete','failed','stopped','releasing','released')),
  result BLOB NOT NULL DEFAULT x'', native_receipt BLOB NOT NULL DEFAULT x'',
  native_owner TEXT NOT NULL,
- native_error TEXT NOT NULL DEFAULT '',
+ native_error TEXT NOT NULL DEFAULT '', release_ack BLOB NOT NULL DEFAULT x'',
  PRIMARY KEY(owner,parent_request,call_index), UNIQUE(owner,service_id)
 ) STRICT;
 CREATE TABLE source_access (
@@ -129,6 +130,17 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
         ):
             raise WorkspaceRefusal("parent call already names another native source intent")
         else:
+            if row["state"] in ("releasing", "released"):
+                raise WorkspaceRefusal("native source call was permanently released")
+            if (
+                row["state"] in ("stopped", "failed")
+                and call.parent_attempt_ordinal > row["parent_ordinal"]
+            ):
+                db.execute(
+                    "UPDATE native_calls SET state=?,native_error='' "
+                    "WHERE owner=? AND service_id=?",
+                    ("resolved" if row["pinned"] else "accepted", owner, command.service_id),
+                )
             db.execute(
                 "UPDATE native_calls SET parent_ordinal=?,parent_spec=? "
                 "WHERE owner=? AND service_id=?",
@@ -210,7 +222,7 @@ def record_complete(
         row = db.execute(
             "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, command.service_id)
         ).fetchone()
-        if row is None or row["state"] == "canceled":
+        if row is None or row["state"] in ("releasing", "released"):
             raise WorkspaceRefusal("source completion has no active accepted call")
         store = fill.tensorfs_module().Store.open(str(workspace.store_root))
         source = row["operation"] != "convert_cozytensors"
@@ -255,7 +267,7 @@ def record_complete(
         ).fetchone()
         if (
             row is None
-            or row["state"] == "canceled"
+            or row["state"] in ("releasing", "released")
             or row["intent_digest"] != command.parent_call.intent_digest
         ):
             raise WorkspaceRefusal("source call changed during native result validation")
@@ -285,7 +297,7 @@ def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -
             "SELECT n.native_owner FROM native_calls n JOIN attempts a "
             "ON a.owner=n.owner AND a.request=n.parent_request AND a.ordinal=n.parent_ordinal "
             "WHERE n.owner=? AND n.service_id<>? AND n.computation_digest=? AND n.operation=? "
-            "AND length(n.result)=0 AND (n.state IN ('failed','canceled') OR a.fenced=1 "
+            "AND length(n.result)=0 AND (n.state IN ('failed','stopped') OR a.fenced=1 "
             "OR a.state IN ('outcome','released')) ORDER BY n.service_id",
             (owner, service_id, current["computation_digest"], current["operation"]),
         ).fetchall()
@@ -293,8 +305,10 @@ def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -
         for candidate in candidates:
             try:
                 db.native(
-                    lambda candidate=candidate: store.adopt_source_progress(
-                        candidate["native_owner"], current["native_owner"]
+                    partial(
+                        store.adopt_source_progress,
+                        candidate["native_owner"],
+                        current["native_owner"],
                     )
                 )
             except Exception as exc:
@@ -323,25 +337,100 @@ def conversion_predecessor(workspace: Workspace, owner: str, service_id: str) ->
             "ON a.owner=n.owner AND a.request=n.parent_request AND a.ordinal=n.parent_ordinal "
             "WHERE n.owner=? AND n.service_id<>? AND n.computation_digest=? "
             "AND n.operation='convert_cozytensors' AND length(n.result)=0 "
-            "AND (n.state IN ('failed','canceled') OR a.fenced=1 "
+            "AND (n.state IN ('failed','stopped') OR a.fenced=1 "
             "OR a.state IN ('outcome','released')) "
             "ORDER BY n.service_id",
             (owner, service_id, current["computation_digest"]),
         ).fetchall()
         store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        retained = set(db.native(store.model_source_operations))
         for candidate in candidates:
-            try:
-                heads = db.native(
-                    lambda candidate=candidate: store.source_checkpoints(candidate["service_id"])
-                )
-            except Exception as exc:
-                if getattr(exc, "code", None) in {
-                    "STORE_BUSY",
-                    "ROOT_ABSENT",
-                    "TRANSACTION_CLOSED",
-                }:
-                    continue
-                raise
-            if heads:
+            if candidate["service_id"] in retained:
                 return str(candidate["service_id"])
         return None
+
+
+def stopped(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) -> None:
+    """Authenticate a stop against recorded call identity, including after parent exit."""
+    call = command.parent_call
+    with workspace.locked() as db:
+        row = db.execute(
+            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, command.service_id)
+        ).fetchone()
+        if (
+            row is None
+            or row["parent_request"] != call.parent_request_id
+            or row["call_index"] != call.call_index
+            or row["intent_digest"] != call.intent_digest
+            or row["parent_ordinal"] != call.parent_attempt_ordinal
+            or row["parent_spec"] != call.parent_invocation_spec_digest
+        ):
+            raise WorkspaceRefusal("source stop changed its recorded parent call")
+        db.execute(
+            "UPDATE native_calls SET state='stopped' WHERE owner=? AND service_id=? "
+            "AND state IN ('accepted','resolved','executing','failed')",
+            (owner, command.service_id),
+        )
+
+
+def ack_identity(ack: pb.AttemptOutcomeAck) -> bytes:
+    return canonical_json.encode(
+        {
+            "request": ack.request_id,
+            "ordinal": ack.attempt_ordinal,
+            "spec": documents.spell(ack.invocation_spec_digest),
+            "outcome_id": ack.outcome_id,
+            "outcome_digest": documents.spell(ack.outcome_digest),
+        }
+    )
+
+
+def release_intent(db: Journal, owner: str, ack: pb.AttemptOutcomeAck) -> list[str]:
+    """Called only after Workspace validates the exact terminal ACK with retain_work=false."""
+    rows = db.execute(
+        "SELECT service_id FROM native_calls WHERE owner=? AND parent_request=? "
+        "AND parent_ordinal<=? AND state<>'released'",
+        (owner, ack.request_id, ack.attempt_ordinal),
+    ).fetchall()
+    db.execute(
+        "UPDATE native_calls SET state='releasing',release_ack=? WHERE owner=? "
+        "AND parent_request=? AND parent_ordinal<=? AND state<>'released'",
+        (ack_identity(ack), owner, ack.request_id, ack.attempt_ordinal),
+    )
+    return [str(row["service_id"]) for row in rows]
+
+
+def release(workspace: Workspace, owner: str, service_id: str) -> None:
+    from . import workspace_memo
+
+    with workspace.locked() as db:
+        row = db.execute(
+            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, service_id)
+        ).fetchone()
+        if row is None or row["state"] == "released":
+            return
+        if row["state"] != "releasing":
+            raise WorkspaceRefusal("native cleanup has no permanent release intent")
+        row = dict(row)
+    workspace_memo.release_native_result(workspace, owner, service_id)
+    workspace_memo.release_native_lookup(workspace, owner, service_id)
+    store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+    if row["native_owner"] == native_owner(owner, service_id):
+        if row["operation"] == "convert_cozytensors":
+            state = store.derived_lookup(row["native_owner"])
+            if state.get("state") == "committed":
+                store.derived_dispose(row["native_owner"])
+            elif state.get("state") == "open":
+                epoch = state.get("writer_session_id")
+                if epoch:
+                    store.derived_fence(row["native_owner"], epoch)
+                store.derived_abandon(row["native_owner"])
+            store.release_model_source(service_id)
+        elif store.tree_root(row["native_owner"]) is not None:
+            store.release_tree_root(row["native_owner"])
+    with workspace.locked() as db:
+        db.execute(
+            "UPDATE native_calls SET state='released' WHERE owner=? AND service_id=? "
+            "AND state='releasing'",
+            (owner, service_id),
+        )
