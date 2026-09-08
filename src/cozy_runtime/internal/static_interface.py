@@ -34,6 +34,7 @@ import msgspec
 
 import cozy_runtime
 import cozy_runtime.internal.package_interface as package_interface
+import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._model import Model
@@ -404,6 +405,10 @@ class Reader:
         if not (base.startswith(_TRUSTED_ROOT) or self._tree_tops(base)):
             return External(f"{base}.{name}")
         source = self.module(base, where=(module, stmt))
+        if source.bindings.get(name) is stmt:
+            # `from . import operations` in the package __init__ binds the child
+            # module, not this same import statement recursively.
+            return ModuleRef(self.module(f"{base}.{name}", where=(module, stmt)))
         if name in source.bindings:
             return self.lookup(source, name, stmt, origin=module)
         return ModuleRef(self.module(f"{base}.{name}", where=(module, stmt)))
@@ -760,11 +765,22 @@ class Reader:
             if isinstance(callee, Vocab) and callee.key == "msgspec.field":
                 options = {k.arg: k.value for k in value.keywords if k.arg is not None}
                 wire = str(self.fold(module, options["name"])) if "name" in options else None
-                if "default" in options or "default_factory" in options:
+                if "default" in options:
+                    try:
+                        default = self.fold(module, options["default"])
+                    except StaticRefusal:
+                        return name, annotation, msgspec.field(default_factory=_unfolded, name=wire)
+                    return name, annotation, msgspec.field(default=default, name=wire)
+                if "default_factory" in options:
                     return name, annotation, msgspec.field(default_factory=_unfolded, name=wire)
                 return name, annotation, msgspec.field(name=wire)
-        # The default's VALUE is never interface content — only that one exists.
-        return name, annotation, msgspec.field(default_factory=_unfolded)
+        # Invocable metadata carries exact scalar defaults. Ordinary request
+        # schemas only need omission, and can retain an unevaluated default.
+        try:
+            default = self.fold(module, value)
+        except StaticRefusal:
+            return name, annotation, msgspec.field(default_factory=_unfolded)
+        return name, annotation, default
 
     def model(self, module: Module, node: ast.ClassDef) -> ModelSpec:
         key = (module.path, node.name)
@@ -813,6 +829,18 @@ class Reader:
         spec = ModelSpec(node.name, encoded_leaves, fusion, degrees, components)
         self.models[key] = spec
         return spec
+
+    def model_annotation(self, module: Module, node: ast.expr) -> ModelSpec | None:
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            return None
+        found = self.resolve(module, node)
+        if (
+            isinstance(found, Definition)
+            and isinstance(found.node, ast.ClassDef)
+            and self.class_kind(found.module, found.node) == "model"
+        ):
+            return self.model(found.module, found.node)
+        return None
 
     # ---------------------------------------------------------------- errors
 
@@ -937,6 +965,8 @@ class Registration:
     name: str
     publishes: bool
     weights: tuple[author.WeightsOutput, ...]
+    invocable: bool = False
+    memoize: bool = False
 
 
 def build(project: Path) -> dict[str, Json]:
@@ -980,28 +1010,53 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
     found: list[Registration] = []
     for module in modules:
         for stmt in _module_scope(module.tree.body):
-            if (
-                isinstance(stmt, ast.Expr)
-                and isinstance(stmt.value, ast.Call)
-                and _app_method(reader, module, stmt.value.func, app) is not None
-            ):
-                reader.refuse(
-                    module,
-                    stmt,
-                    "registration by call is not a declaration; use the decorator",
-                    "static_unsupported",
-                )
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                call = stmt.value
+                target = call.func
+                keywords = call.keywords
+                if isinstance(target, ast.Call):
+                    method = _app_method(reader, module, target.func, app)
+                    if method is not None:
+                        if target.args or call.keywords:
+                            reader.refuse(
+                                module,
+                                call,
+                                "computed App registration arguments",
+                                "static_unsupported",
+                            )
+                        keywords = target.keywords
+                else:
+                    method = _app_method(reader, module, target, app)
+                if method is not None:
+                    if len(call.args) != 1 or not isinstance(
+                        call.args[0], (ast.Name, ast.Attribute)
+                    ):
+                        reader.refuse(
+                            module,
+                            call,
+                            "App registration must name one function defined in the tree",
+                            "static_unsupported",
+                        )
+                    function = reader.resolve(module, call.args[0])
+                    if not (
+                        isinstance(function, Definition)
+                        and isinstance(function.node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    ):
+                        reader.refuse(
+                            module,
+                            call.args[0],
+                            "App registration target is not a function defined in the tree",
+                        )
+                    registration = _registration(
+                        reader, function.module, function.node, method, keywords, declaration=module
+                    )
+                    if registration is not None:
+                        found.append(registration)
+                continue
             if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for decorator in stmt.decorator_list:
                 target = decorator.func if isinstance(decorator, ast.Call) else decorator
-                if _is_invocable(reader, module, target):
-                    reader.refuse(
-                        module,
-                        decorator,
-                        "@invocable exports are described by the conformance oracle only",
-                        "static_unsupported",
-                    )
                 method = _app_method(reader, module, target, app)
                 if method is None:
                     continue
@@ -1010,7 +1065,9 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                     reader.refuse(
                         module, decorator, "positional decorator arguments", "static_unsupported"
                     )
-                registration = _registration(reader, module, stmt, method, keywords)
+                registration = _registration(
+                    reader, module, stmt, method, keywords, decorator=decorator
+                )
                 if registration is not None:
                     found.append(registration)
     return found
@@ -1044,7 +1101,50 @@ def _registration(
     fn: ast.FunctionDef | ast.AsyncFunctionDef,
     method: str,
     keywords: Sequence[ast.keyword],
+    *,
+    declaration: Module | None = None,
+    decorator: ast.expr | None = None,
 ) -> Registration | None:
+    function_module = module
+    invocable, memoize = False, False
+    for index, export in enumerate(fn.decorator_list):
+        target = export.func if isinstance(export, ast.Call) else export
+        if not _is_invocable(reader, function_module, target):
+            continue
+        if invocable or (decorator is not None and index < fn.decorator_list.index(decorator)):
+            reader.refuse(
+                function_module,
+                export,
+                "@invocable must occur once, inside the App decorator",
+                "static_unsupported",
+            )
+        invocable = True
+        if isinstance(export, ast.Call):
+            if export.args or any(keyword.arg != "memoize" for keyword in export.keywords):
+                reader.refuse(
+                    function_module,
+                    export,
+                    "@invocable accepts only memoize=",
+                    "static_unsupported",
+                )
+            for keyword in export.keywords:
+                value = reader.fold(function_module, keyword.value)
+                if type(value) is not bool:
+                    reader.refuse(
+                        function_module, keyword.value, "invocable memoize must be a boolean"
+                    )
+                memoize = value
+    if invocable:
+        for export in fn.decorator_list:
+            target = export.func if isinstance(export, ast.Call) else export
+            if export is not decorator and not _is_invocable(reader, function_module, target):
+                reader.refuse(
+                    function_module,
+                    export,
+                    "an invocable decorator outside the closed vocabulary",
+                    "static_unsupported",
+                )
+    module = declaration or module
     allowed = _ENTRYPOINT_KEYWORDS if method == "entrypoint" else _JOB_KEYWORDS
     name = fn.name
     publishes = False
@@ -1081,11 +1181,20 @@ def _registration(
             assert isinstance(value, tuple)
             weights = tuple(value)
     return Registration(
-        module, fn, typing.cast(package_interface.Kind, method), name, publishes, weights
+        function_module,
+        fn,
+        typing.cast(package_interface.Kind, method),
+        name,
+        publishes,
+        weights,
+        invocable,
+        memoize,
     )
 
 
 def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
+    if registration.invocable:
+        return static_invocable.build(reader, registration)
     module, fn = registration.module, registration.fn
     if fn.args.vararg or fn.args.kwarg:
         reader.refuse(module, fn, "*args/**kwargs on a handler", "static_unsupported")
