@@ -671,20 +671,36 @@ class PreparePrivatePlacementCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., private_placement_set: _Optional[_Union[DesiredPrivatePlacementSet, _Mapping]] = ...) -> None: ...
 
 class PrepareEvent(_message.Message):
-    __slots__ = ("stage", "total_bytes", "transferred_bytes", "placement_set", "safe_code", "safe_detail")
+    __slots__ = ("stage", "total_bytes", "transferred_bytes", "placement_set", "safe_code", "safe_detail", "model_progress")
     STAGE_FIELD_NUMBER: _ClassVar[int]
     TOTAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     TRANSFERRED_BYTES_FIELD_NUMBER: _ClassVar[int]
     PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
     SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
     SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    MODEL_PROGRESS_FIELD_NUMBER: _ClassVar[int]
     stage: PrepareStage
     total_bytes: int
     transferred_bytes: int
     placement_set: DesiredPlacementSet
     safe_code: str
     safe_detail: str
-    def __init__(self, stage: _Optional[_Union[PrepareStage, str]] = ..., total_bytes: _Optional[int] = ..., transferred_bytes: _Optional[int] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+    model_progress: _containers.RepeatedCompositeFieldContainer[PrepareModelProgress]
+    def __init__(self, stage: _Optional[_Union[PrepareStage, str]] = ..., total_bytes: _Optional[int] = ..., transferred_bytes: _Optional[int] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., model_progress: _Optional[_Iterable[_Union[PrepareModelProgress, _Mapping]]] = ...) -> None: ...
+
+class PrepareModelProgress(_message.Message):
+    __slots__ = ("model", "total_bytes", "transferred_bytes", "origin_bytes", "cached_bytes")
+    MODEL_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    TRANSFERRED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    ORIGIN_BYTES_FIELD_NUMBER: _ClassVar[int]
+    CACHED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    model: DownloadModelRef
+    total_bytes: int
+    transferred_bytes: int
+    origin_bytes: int
+    cached_bytes: int
+    def __init__(self, model: _Optional[_Union[DownloadModelRef, _Mapping]] = ..., total_bytes: _Optional[int] = ..., transferred_bytes: _Optional[int] = ..., origin_bytes: _Optional[int] = ..., cached_bytes: _Optional[int] = ...) -> None: ...
 
 class ModelSourceFileCall(_message.Message):
     __slots__ = ("claim", "request")
