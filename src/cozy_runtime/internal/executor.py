@@ -177,11 +177,12 @@ def _deadline(seconds: float | None) -> float:
 
 
 def _granted_inputs(command: Mapping[str, Any]) -> dict[str, GrantedInput]:
-    """Verified worker-spooled inputs, projected identically into either execution lane."""
+    """Verified input paths, projected identically into either execution lane."""
     return {
         input_id: GrantedInput(
             input_id=input_id,
             local=Path(row["local"]),
+            file_state=tuple(row["file_state"]) if row.get("file_state") else None,
             media_type=str(row["media_type"]),
             digest=str(row["digest"]),
             length=int(row["length"]),

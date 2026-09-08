@@ -699,6 +699,7 @@ def _hydrate(
         bind(
             item.asset,
             local=granted.local,
+            source_state=granted.file_state,
             attempt=inv.request_id,
             media_type=granted.media_type,
             digest=granted.digest,
