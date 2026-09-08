@@ -6,6 +6,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import grpc
 import pytest
@@ -95,11 +96,13 @@ def test_reserved_capture_grant_commits_native_tree_without_author_asset(tmp_pat
         _publication=lambda *args: SimpleNamespace(document=lambda: {}, digest=lambda: b"r" * 32),
         records=SimpleNamespace(append=lambda *args: None),
     )
-    result, error = AttemptEngine._tail(engine, attempt, {"outputs": [], "capture": capture})
+    result, error = AttemptEngine._tail(
+        cast(Any, engine), cast(Any, attempt), {"outputs": [], "capture": capture}
+    )
     assert error is None and result is not None
     assert [entry.output_id for entry in result.outputs] == ["runtime.capture"]
     assert result.outputs[0].native_tree.content_bytes == len(metadata) + len(sketches)
-    missing, error = AttemptEngine._tail(engine, attempt, {"outputs": []})
+    missing, error = AttemptEngine._tail(cast(Any, engine), cast(Any, attempt), {"outputs": []})
     assert missing is None and error is not None and error.startswith("capture_output_absent:")
 
 
