@@ -13,6 +13,8 @@ MAX_WEIGHTS_GRANT_URL_BYTES = 16 << 10
 # not content. It has no carve-out: the tensorhub fence in scripts/fence.py convicts any
 # content-bearing bound declared above it.
 MAX_INLINE_CONTROL_BYTES = 4 << 20
+MAX_CHILD_ARTIFACT_GRANTS = 32
+MAX_NATIVE_BYTE_READ_CHUNK_BYTES = 32 << 10
 MAX_MODEL_SOURCE_HEADER_BYTES = MAX_INLINE_CONTROL_BYTES
 MAX_CHECKPOINT_OBJECTS = 128
 MAX_MODEL_SOURCE_FILES = 4096
