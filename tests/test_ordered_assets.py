@@ -35,6 +35,7 @@ from cozy_runtime.author import (
 from cozy_runtime.author._assets import GrantedInput, InputMetadata
 from cozy_runtime.author._calls import _Broker, _CallType
 from cozy_runtime.author._invoke import run_prepared
+from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.internal import interface_wheel, package_interface
 from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.worker import grants
@@ -255,8 +256,6 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
         },
         no_exchange,
     )
-    from cozy_runtime.author.fakes import fake_context
-
     broker.bind(fake_context(request_id="parent"))
     photo = ImageAsset(
         rows["assets.0.asset"].digest,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from collections.abc import Awaitable, Callable, Generator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -137,8 +138,6 @@ class _Call[R](Awaitable[R]):
 
 def _input_ref(value: object, request_id: str) -> str:
     """Forward only a verified input of this attempt; Creator rechecks its custody."""
-    import re
-
     if (
         isinstance(value, Asset)
         and value.hydrated

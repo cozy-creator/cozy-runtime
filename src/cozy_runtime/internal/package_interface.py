@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from typing import NoReturn, cast
 
 from cozy_runtime.author import ConformanceError, ModelBinding, Surface
+from cozy_runtime.author._media import KIND_MEDIA
 from cozy_runtime.internal import canonical, schema
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.discovery import Discovered
@@ -81,8 +82,6 @@ def _callable(surface: Surface) -> dict[str, Json]:
     if models:
         doc["models"] = models
     if binding := surface.assets_binding:
-        from cozy_runtime.author._media import KIND_MEDIA
-
         kinds: list[Json] = []
         for cls, bound in binding.kinds:
             row: dict[str, Json] = {
