@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import egress, fill
+from cozy_runtime.internal.worker import workspace_byte_outputs
 from cozy_runtime.internal.worker.weights import _LeaseReader
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
@@ -117,22 +118,44 @@ class NativeArtifactTransfers:
     @staticmethod
     def _status(command: pb.NativeArtifactTransfer) -> pb.NativeArtifactTransferStatus:
         # Correlate even refusals raised before a native source can be opened.
-        return pb.NativeArtifactTransferStatus(
+        result = pb.NativeArtifactTransferStatus(
             effect_id=command.effect_id,
-            source=command.source,
             manifest=command.manifest,
             command_id=command.command_id,
             grant_revision=command.grant_revision,
             object_id=command.grant.object_id if command.HasField("grant") else "",
         )
+        if command.HasField("byte_source"):
+            result.byte_source.CopyFrom(command.byte_source)
+        elif command.HasField("source"):
+            result.source.CopyFrom(command.source)
+        return result
 
     def execute(self, command: pb.NativeArtifactTransfer) -> pb.NativeArtifactTransferStatus:
         result = self._status(command)
         lease = None
+        byte_context = None
         reader: Any = None
         try:
-            lease, manifest = self._hold(command)
-            store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+            if command.HasField("source") == command.HasField("byte_source"):
+                raise WorkspaceRefusal("native artifact transfer requires exactly one source")
+            if command.HasField("byte_source"):
+                if (
+                    not self.valid(command)
+                    or not command.effect_id
+                    or len(command.effect_id) > 128
+                    or not command.command_id
+                    or command.manifest != command.byte_source.source.manifest
+                ):
+                    raise WorkspaceRefusal("ordinary artifact transfer changed its exact subject")
+                byte_context = workspace_byte_outputs.leased(
+                    self.workspace, self.owner(), command.byte_source
+                )
+                store, lease, _ = byte_context.__enter__()
+                manifest = documents.spell(command.manifest.digest)
+            else:
+                lease, manifest = self._hold(command)
+                store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
             held = store.manifest(manifest)
             manifest_bytes = bytes(held["manifest"])
             if (
@@ -141,7 +164,11 @@ class NativeArtifactTransfers:
             ):
                 raise WorkspaceRefusal("native artifact manifest identity changed")
             objects = {manifest: command.manifest.length}
-            for row in store.walk_cozytensors(manifest):
+            for row in (
+                store.walk(manifest)
+                if byte_context is not None
+                else store.walk_cozytensors(manifest)
+            ):
                 object_id, length = str(row["id"]), int(row["length"])
                 if object_id in objects and objects[object_id] != length:
                     raise WorkspaceRefusal("native artifact closure changes an object length")
@@ -211,5 +238,7 @@ class NativeArtifactTransfers:
         finally:
             if reader is not None:
                 reader.close()
-            if lease is not None:
+            if byte_context is not None:
+                byte_context.__exit__(None, None, None)
+            elif lease is not None:
                 lease.release()

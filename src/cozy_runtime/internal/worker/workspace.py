@@ -180,12 +180,16 @@ class Workspace:
                     + _MIGRATION_3
                     + "PRAGMA user_version=3; COMMIT;"
                 )
-            elif version not in (3, 4):
+            elif version not in (3, 4, 5):
                 raise WorkspaceRefusal("workspace journal schema is not supported")
             if version <= 3:
                 from .workspace_sources import SCHEMA4
 
                 db.executescript("BEGIN IMMEDIATE;" + SCHEMA4 + "PRAGMA user_version=4; COMMIT;")
+            if version <= 4:
+                from .workspace_byte_outputs import SCHEMA5
+
+                db.executescript("BEGIN IMMEDIATE;" + SCHEMA5 + "PRAGMA user_version=5; COMMIT;")
             if (
                 not allow_frozen
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
@@ -437,6 +441,29 @@ class Workspace:
                 raise WorkspaceRefusal("outcome has no unchanged accepted execution")
             if row["state"] == "released":
                 return
+            from .workspace_byte_outputs import reference
+
+            output_rows = db.execute(
+                "SELECT * FROM byte_outputs WHERE owner=? AND request=? AND ordinal=?",
+                (row["owner"], outcome.request_id, outcome.attempt_ordinal),
+            ).fetchall()
+            body = documents.read(raw, pb.AttemptOutcomeBody)
+            if body["status"] == pb.OUTCOME_STATUS_SUCCEEDED:
+                native = {
+                    item["output_id"]: item["native_tree"]
+                    for item in body.get("output_manifest", {}).get("outputs", [])
+                    if "native_tree" in item
+                }
+                if set(native) != {output["slot"] for output in output_rows}:
+                    raise WorkspaceRefusal(
+                        "terminal native byte outputs do not match completed intents"
+                    )
+                for output in output_rows:
+                    expected = documents.body(reference(dict(output)))
+                    if output["state"] != "complete" or expected != native[output["slot"]]:
+                        raise WorkspaceRefusal(
+                            "terminal native byte output differs from its receipt"
+                        )
             db.execute(
                 "UPDATE attempts SET state='outcome',outcome_id=?,outcome_digest=?,outcome=? "
                 "WHERE owner=? AND request=? AND ordinal=?",
@@ -451,10 +478,11 @@ class Workspace:
             )
 
     def acknowledge(self, owner: str, ack: pb.AttemptOutcomeAck) -> None:
-        from . import workspace_sources
+        from . import workspace_byte_outputs, workspace_sources
 
         self.owner(owner)
         source_releases: list[str] = []
+        byte_releases: list[str] = []
         with self.locked() as db:
             row = db.execute(
                 "SELECT * FROM attempts WHERE (owner=? OR(owner='' AND transport_owner=?)) "
@@ -494,10 +522,24 @@ class Workspace:
             )
             if not ack.retain_work:
                 source_releases = workspace_sources.release_intent(db, owner, ack)
+                db.execute(
+                    "UPDATE byte_outputs SET state='releasing' WHERE owner=? AND request=? "
+                    "AND ordinal=? AND spec=? AND state<>'released'",
+                    (row["owner"], ack.request_id, ack.attempt_ordinal, ack.invocation_spec_digest),
+                )
+                byte_releases = [
+                    output[0]
+                    for output in db.execute(
+                        "SELECT id FROM byte_outputs WHERE owner=? AND request=? AND ordinal=? "
+                        "AND state='releasing'",
+                        (row["owner"], ack.request_id, ack.attempt_ordinal),
+                    )
+                ]
                 active = db.execute(
                     "SELECT 1 FROM weights WHERE owner=? AND request=? AND ordinal=? "
-                    "AND state<>'released' LIMIT 1",
-                    (row["owner"], ack.request_id, ack.attempt_ordinal),
+                    "AND state<>'released' UNION ALL SELECT 1 FROM byte_outputs WHERE "
+                    "owner=? AND request=? AND ordinal=? AND state<>'released' LIMIT 1",
+                    (row["owner"], ack.request_id, ack.attempt_ordinal) * 2,
                 ).fetchone()
                 if active is None:
                     db.execute(
@@ -519,6 +561,8 @@ class Workspace:
 
         for service in source_releases:
             workspace_sources.release(self, owner, service)
+        for root in byte_releases:
+            workspace_byte_outputs.release(self, owner, root)
 
     def begin_weights(self, owner: str, intent: pb.WeightsIntentFrame) -> dict[str, Any]:
         """Assign the epoch once, before native begin; the Host observes this decision."""
@@ -897,6 +941,12 @@ class Workspace:
                 from .workspace_native_memo import native_receipt_owned
 
                 original = native_receipt_owned(db, owner, request, kind, release=release)
+                if original is None and kind == "tree":
+                    original = db.execute(
+                        "SELECT 1 FROM byte_outputs WHERE owner=? AND id=? AND native_digest=? "
+                        "AND (state='complete' OR (? AND state IN ('releasing','released')))",
+                        (*subject, release),
+                    ).fetchone()
             pending_release = False
             if release and original is None and retained is None:
                 # Durable memo/lookup intent authorizes cancellation of a root

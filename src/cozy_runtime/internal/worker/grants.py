@@ -59,10 +59,13 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, cast
 from urllib.parse import ParseResult, urlparse
 
 from cozy_runtime.protocol import worker_pb2 as pb
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal.worker.workspace import Workspace
 
 
 class GrantRefusal(Exception):
@@ -238,6 +241,15 @@ class BoundInput:
     length: int
     kind_mime: str
     order: int
+    native_tree: pb.NativeByteRetentionRequest | None = None
+
+
+def _tree_input(entry: BoundInput) -> bool:
+    from cozy_runtime.internal.worker.workspace_byte_outputs import TREE_MIME
+
+    return entry.input_id.startswith(TREE_PREFIX) or (
+        entry.native_tree is not None and entry.kind_mime == TREE_MIME
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +316,9 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
         expires_at_unix=int(grant.expires_at_unix),
         credential_epoch=int(grant.credential.credential_epoch),
     )
+    native_inputs = {
+        row.input_id: row.native_tree for row in grant.inputs if row.HasField("native_tree")
+    }
     for input_id, row in spec_inputs.items():
         spelled = str(row.get("digest", ""))
         try:
@@ -313,7 +328,12 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             raise GrantRefusal(
                 "grant_input_identity", f"input {input_id!r} has malformed numeric facts"
             ) from exc
-        is_tree = input_id.startswith(TREE_PREFIX)
+        from cozy_runtime.internal.worker.workspace_byte_outputs import TREE_MIME
+
+        native = native_inputs.get(input_id)
+        is_tree = input_id.startswith(TREE_PREFIX) or (
+            native is not None and row.get("kind_mime") == TREE_MIME
+        )
         is_model = input_id.startswith(MODEL_PREFIX)
         if not is_tree and (
             not spelled.startswith("sha256:")
@@ -353,9 +373,37 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
                     "grant_model_identity",
                     f"input {input_id!r} is not one exact host-local Model Manifest capability",
                 )
+        if native is not None:
+            from cozy_runtime.internal.worker.byte_inputs import validate_source
+
+            try:
+                validate_source(native.source, native.retention_id)
+            except ValueError as exc:
+                raise GrantRefusal("grant_native_identity", str(exc)) from exc
+            if grant_inputs[input_id] or is_model or input_id == PAYLOAD_INPUT:
+                raise GrantRefusal(
+                    "grant_native_access", "native tree and URL access are mutually exclusive"
+                )
+            if is_tree and (
+                digest != native.source.manifest.digest
+                or carried_length != native.source.manifest.length
+                or (
+                    input_id.startswith(TREE_PREFIX)
+                    and input_id[len(TREE_PREFIX) :] != "sha256:" + digest.hex()
+                )
+            ):
+                raise GrantRefusal(
+                    "grant_native_identity", "native tree input differs from its manifest"
+                )
+            copied = pb.NativeByteRetentionRequest()
+            copied.CopyFrom(native)
+            native = copied
+        elif not grant_inputs[input_id]:
+            raise GrantRefusal("grant_input_access", "input has neither native tree nor URL access")
         bound.inputs[input_id] = BoundInput(
             input_id=input_id,
             url=grant_inputs[input_id],
+            native_tree=native,
             digest=digest,
             length=carried_length,
             kind_mime=str(row.get("kind_mime", "")),
@@ -631,6 +679,8 @@ def hydrate_inputs(
     spool: Path,
     max_bytes: int = 64 << 20,
     max_total_bytes: int = 256 << 20,
+    workspace: Workspace | None = None,
+    owner: str = "",
 ) -> dict[str, Any]:
     """Fetch, verify, sniff and spool EVERY input asset the grant carries (cr-012).
 
@@ -652,10 +702,14 @@ def hydrate_inputs(
         e
         for e in sorted(grant.inputs.values(), key=lambda e: (e.order, e.input_id))
         if e.input_id != PAYLOAD_INPUT
-        and not e.input_id.startswith(TREE_PREFIX)
+        and not _tree_input(e)
         and not e.input_id.startswith(MODEL_PREFIX)
     ]
-    declared_total = sum(int(e.length) for e in entries)
+    declared_total = sum(int(e.length) for e in entries) + sum(
+        e.native_tree.source.content_bytes
+        for e in grant.inputs.values()
+        if _tree_input(e) and e.native_tree is not None
+    )
     if declared_total > max_total_bytes:
         raise GrantRefusal(
             "inputs_over_total_cap",
@@ -685,14 +739,60 @@ def hydrate_inputs(
                     mode="w+b", dir=root, prefix=f".{position:03d}-", delete=False
                 ) as sink:
                     temporary = Path(sink.name)
-                    receipt = _transfer_granted(
-                        grant,
-                        entry,
-                        auth,
-                        sink,
-                        cap=max_bytes,
-                        prefix_bytes=SNIFF_BYTES,
-                    )
+                    if entry.native_tree is not None:
+                        if workspace is None:
+                            raise GrantRefusal(
+                                "grant_native_unavailable", "native input has no workspace"
+                            )
+                        from cozy_runtime.internal.worker import byte_inputs
+                        from cozy_runtime.internal.worker.workspace_byte_outputs import leased
+
+                        try:
+                            with leased(workspace, owner, entry.native_tree) as (
+                                _store,
+                                lease,
+                                members,
+                            ):
+                                blob = byte_inputs.file_member(entry.native_tree, members)
+                                if (blob["sha256"], blob["length"]) != (
+                                    entry.digest.hex(),
+                                    entry.length,
+                                ):
+                                    raise GrantRefusal(
+                                        "input_digest_mismatch",
+                                        "native input differs from its binding",
+                                    )
+                                from cozy_runtime.internal.egress import copy_bounded
+
+                                receipt = copy_bounded(
+                                    byte_inputs.chunks(
+                                        lease, "sha256:" + blob["sha256"], entry.length
+                                    ),
+                                    cast(BinaryIO, sink),
+                                    expected_length=entry.length,
+                                    cap=max_bytes,
+                                    prefix_bytes=SNIFF_BYTES,
+                                    what="native input",
+                                )
+                                if receipt.sha256 != entry.digest:
+                                    raise GrantRefusal(
+                                        "input_digest_mismatch", "native input bytes changed"
+                                    )
+                        except GrantRefusal:
+                            raise
+                        except Exception as exc:
+                            raise GrantRefusal(
+                                "grant_native_unavailable", "native input bytes are unavailable"
+                            ) from exc
+                    else:
+                        receipt = _transfer_granted(
+                            grant,
+                            entry,
+                            auth,
+                            sink,
+                            cap=max_bytes,
+                            prefix_bytes=SNIFF_BYTES,
+                        )
                 declared = normalize(entry.kind_mime)
                 actual = sniff(receipt.prefix)
                 if declared and actual and declared != actual:
@@ -721,7 +821,7 @@ def hydrate_inputs(
             out[entry.input_id] = GrantedInput(
                 input_id=entry.input_id,
                 local=local,
-                media_type=actual,
+                media_type=actual or declared,
                 digest="sha256:" + receipt.sha256.hex(),
                 length=receipt.length,
                 order=int(entry.order),
@@ -743,6 +843,9 @@ def release_inputs(spool: Path) -> int:
     input takes no lease, participates in no eviction ladder, and is not content-addressed
     storage — it is one attempt's spool and it ends with the attempt.
     """
+    from cozy_runtime.internal.worker.byte_inputs import remove_checkout
+
+    remove_checkout(spool / "native-input-trees")
     root = spool / "inputs"
     removed = 0
     for path in sorted(root.glob("*")) if root.is_dir() else ():
@@ -752,7 +855,15 @@ def release_inputs(spool: Path) -> int:
     return removed
 
 
-def read_trees(grant: BoundGrant, auth: Authorizer) -> dict[str, tuple[Path, str]]:
+def read_trees(
+    grant: BoundGrant,
+    auth: Authorizer,
+    *,
+    workspace: Workspace | None = None,
+    owner: str = "",
+    spool: Path | None = None,
+    max_bytes: int = 256 << 20,
+) -> dict[str, tuple[Path, str]]:
     """Every granted input tree, as `ref -> (root, declared digest)` (cr-009).
 
     The BYTES of a tree are not re-hashed here and that is a layering statement, not a gap:
@@ -765,10 +876,31 @@ def read_trees(grant: BoundGrant, auth: Authorizer) -> dict[str, tuple[Path, str
     if expired(grant):
         raise GrantRefusal("grant_expired", "the delivery grant expired before the tree read")
     out: dict[str, tuple[Path, str]] = {}
-    for entry in sorted(grant.inputs.values(), key=lambda e: e.input_id):
-        if not entry.input_id.startswith(TREE_PREFIX):
+    for position, entry in enumerate(sorted(grant.inputs.values(), key=lambda e: e.input_id)):
+        if not _tree_input(entry):
             continue
-        ref = entry.input_id[len(TREE_PREFIX) :]
+        ref = (
+            entry.input_id[len(TREE_PREFIX) :]
+            if entry.input_id.startswith(TREE_PREFIX)
+            else "sha256:" + entry.digest.hex()
+        )
+        if entry.native_tree is not None:
+            if workspace is None or spool is None:
+                raise GrantRefusal("grant_native_unavailable", "native tree input has no workspace")
+            from cozy_runtime.internal.worker import byte_inputs
+
+            root = spool / "native-input-trees" / str(position)
+            try:
+                byte_inputs.copy_retained(
+                    workspace, owner, entry.native_tree, root, max_bytes=max_bytes
+                )
+            except Exception as exc:
+                byte_inputs.remove_checkout(root)
+                raise GrantRefusal(
+                    "grant_native_unavailable", "native tree bytes are unavailable"
+                ) from exc
+            out[ref] = (root, "sha256:" + entry.digest.hex())
+            continue
         url = entry.url if "://" in entry.url else grant.file_base_url.rstrip("/") + "/" + entry.url
         auth.authorize("grant_tree_read", "GET", url, {"input_id": entry.input_id})
         root = _local(entry.url, grant.file_base_url)
@@ -1031,9 +1163,6 @@ def _output_media_type(output_id: str, bound: str, produced: str) -> str:
 def abort_outputs(spool: Path) -> int:
     """Abort an attempt's uncommitted outputs. Bytes written under the grant are the
     RecordOwner's problem only once a terminal claims them; the spool is ours."""
-    removed = 0
-    for path in sorted(spool.rglob("*")):
-        if path.is_file():
-            path.unlink()
-            removed += 1
-    return removed
+    from cozy_runtime.internal.worker.byte_inputs import remove_checkout
+
+    return remove_checkout(spool, keep_root=True)

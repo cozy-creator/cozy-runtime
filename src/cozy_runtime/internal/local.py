@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
+from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.internal import bindings as binding_table
 from cozy_runtime.internal import (
     canonical,
@@ -142,6 +143,7 @@ class LocalRequest:
     #: cr-016 derives these from the package interface; here the driver names them, and a
     #: set that does not match what the handler produced refuses the tail whole (#248).
     outputs: tuple[str, ...] = ("image",)
+    capture: ActivationCapture | None = None
     request_id: str = "run-1"
     attempt: int = 1
     timeout_ms: int = 0
@@ -804,6 +806,11 @@ class LocalRecordOwner:
             payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
             inputs=self._input_bindings(body),
             outputs=self._output_bindings(),
+            capture=pb.ActivationCapture(
+                components=self.request.capture.components, steps=self.request.capture.steps
+            )
+            if self.request.capture is not None
+            else None,
             # THE DEADLINE IS MINTED AT DISPATCH, from the caller's duration. It is what the
             # grant's own lifetime is derived from too, so the two cannot disagree.
             deadline_unix_ms=(
