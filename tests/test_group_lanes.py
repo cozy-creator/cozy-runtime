@@ -1158,15 +1158,15 @@ def test_the_offload_guard_refuses_a_wrapped_forward_and_admits_a_parked_encoder
     """
     import torch
 
-    class Block(torch.nn.Module):
+    class Block(torch.nn.Module):  # type: ignore[misc]  # optional real Torch
         def forward(self, x: Any) -> Any:  # pragma: no cover - identity only
             return x
 
-    class Sharded(torch.nn.Module):
+    class Sharded(torch.nn.Module):  # type: ignore[misc]  # optional real Torch
         def __init__(self) -> None:
             super().__init__()
             self.block = Block()
-            self._cp_plan = {"": {}}
+            self._cp_plan: dict[str, dict[str, Any]] = {"": {}}
 
         def enable_parallelism(self) -> None:  # pragma: no cover - marker only
             return None
@@ -1225,7 +1225,7 @@ def test_a_stripped_context_parallel_hook_refuses_instead_of_running_unsharded()
         def __init__(self) -> None:
             self.hooks = {"cp_input---": object()}
 
-    class Dit(torch.nn.Module):
+    class Dit(torch.nn.Module):  # type: ignore[misc]  # optional real Torch
         def __init__(self) -> None:
             super().__init__()
             self.weight = torch.nn.Parameter(torch.zeros(2, 2))
@@ -1236,7 +1236,7 @@ def test_a_stripped_context_parallel_hook_refuses_instead_of_running_unsharded()
     dit = Dit()
     dit._diffusers_hook = Registry()
     original = dit.forward
-    dit.forward = lambda *a, **k: original(*a, **k)  # what `register_hook` does
+    dit.forward = lambda *a, **k: original(*a, **k)  # type: ignore[method-assign]
     cp._record_cp_hooks(dit, "fl2va_dit")
     cp.refuse_if_cp_hooks_stripped(dit, "fl2va_dit")
 
@@ -1251,7 +1251,7 @@ def test_a_stripped_context_parallel_hook_refuses_instead_of_running_unsharded()
     # -- this is the composition h3a-019 needs to keep working.
     chained = dit.forward
     dit._diffusers_hook.hooks["group_offloading"] = object()
-    dit.forward = lambda *a, **k: chained(*a, **k)
+    dit.forward = lambda *a, **k: chained(*a, **k)  # type: ignore[method-assign]
     cp.refuse_if_cp_hooks_stripped(dit, "fl2va_dit")
     cp.refuse_if_cp_hooks_stripped(dit, "fl2va_dit")
 
@@ -1259,7 +1259,7 @@ def test_a_stripped_context_parallel_hook_refuses_instead_of_running_unsharded()
     # CALL is where #12533 lands -- the first is sharded and the next is not -- so the
     # check has to survive an unchanged first call and fire on the changed second one.
     dit._old_forward = original
-    dit.forward = dit._old_forward
+    dit.forward = dit._old_forward  # type: ignore[method-assign]
     with pytest.raises(cp.ContextParallelUnavailable) as stripped:
         cp.refuse_if_cp_hooks_stripped(dit, "fl2va_dit")
     assert "acquired '_old_forward'" in stripped.value.message and "12533" in (
@@ -1269,7 +1269,7 @@ def test_a_stripped_context_parallel_hook_refuses_instead_of_running_unsharded()
     # A CP hook removed from the registry outright is the other half of the same fault.
     removed = Dit()
     removed._diffusers_hook = Registry()
-    removed.forward = lambda *a, **k: None
+    removed.forward = lambda *a, **k: None  # type: ignore[method-assign]
     cp._record_cp_hooks(removed, "fl2va_dit")
     removed._diffusers_hook.hooks.clear()
     with pytest.raises(cp.ContextParallelUnavailable) as gone:
