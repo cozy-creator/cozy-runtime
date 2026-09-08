@@ -1780,8 +1780,15 @@ class Worker:
         slot while placements serve would replace a serving executor with the prepared
         package's environment."""
 
+        # Keep preparation's socket shorter than the boot-validated primary
+        # socket, independent of placement and operation identifiers. Its state
+        # stays in the original directory so orphan ownership still reconciles.
+        socket_path = self.root / "p.sock"
+        if refusal := socket_path_refusal(str(socket_path)):
+            raise ExecutorGone(refusal)
         supervision = ExecutorSupervision(
             root=self.root / "placements" / "prepare",
+            socket_path=socket_path,
             python=self.options.python or sys.executable,
             base_env=self.config.child_base_env,
             cozy_home=self.config.cozy_home,
