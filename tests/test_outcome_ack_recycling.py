@@ -22,7 +22,7 @@ def test_only_a_new_current_ordinary_terminal_ack_can_recycle(tmp_path: Path, mo
     tensorfs.Store.init(tmp_path / "store")
     worker = Worker(
         RuntimeConfig(cozy_home=tmp_path / "home", credentials=Credentials()),
-        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store", no_warm=True),
+        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
         InMemoryControlHost(),
     )
     try:

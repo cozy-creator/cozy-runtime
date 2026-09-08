@@ -96,8 +96,6 @@ _SERVE_FLAGS: dict[str, str] = {
     "--tls-key": "--tls-key",
 }
 
-#: Flags that carry no value.
-_SERVE_SWITCHES = ("--no-warm",)
 _DEVELOPMENT_FLAGS = (
     "--development-project",
     "--development-package",
@@ -121,21 +119,17 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
     from cozy_runtime.internal.worker.session import serve_worker
 
     values: dict[str, str] = {}
-    switches: list[str] = []
     rest = list(args)
     while rest:
         item = rest.pop(0)
         name, eq, inline = item.partition("=")
-        if name in _SERVE_SWITCHES:
-            switches.append(name)
-            continue
         if name not in ("--socket", "--out", *_DEVELOPMENT_FLAGS) and name not in _SERVE_FLAGS:
             raise CliError(
                 "usage",
                 f"unknown flag {item!r}",
                 "serve takes --socket <path> [--out <dir>] "
                 + " ".join(f"[{f} <value>]" for f in sorted(_SERVE_FLAGS))
-                + " [internal development flags] [--no-warm]; directives, grants and "
+                + " [internal development flags]; directives, grants and "
                 "config arrive over the protocol",
                 Exit.usage,
             )
@@ -252,7 +246,6 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             continue
         if flag in values:
             argv += [worker_flag, values[flag]]
-    argv += switches
     # THE CONFIG THIS VERB ALREADY READ. `session.main` reads it itself because it is a
     # process entrypoint too; calling that from here was a second read and refused.
     return serve_worker(config, argv)

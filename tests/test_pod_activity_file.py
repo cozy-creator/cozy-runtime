@@ -113,7 +113,7 @@ def test_the_published_document_is_the_shape_the_supervisor_parses() -> None:
     with _short_tmp() as root:
         worker = Worker(
             _config(root / "home"),
-            WorkerOptions(root=root / "worker", no_warm=True, activity_path=root / "activity"),
+            WorkerOptions(root=root / "worker", activity_path=root / "activity"),
             InMemoryControlHost(),
         )
         worker.publish_activity()
@@ -160,7 +160,7 @@ def test_an_unreadable_meter_is_absent_and_never_a_zero(monkeypatch: pytest.Monk
     with _short_tmp() as root:
         worker = Worker(
             _config(root / "home"),
-            WorkerOptions(root=root / "worker", no_warm=True),
+            WorkerOptions(root=root / "worker"),
             InMemoryControlHost(),
         )
         assert activity.meter(worker) is not None

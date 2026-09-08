@@ -305,13 +305,6 @@ class Ledger:
     paging: dict[str, dict[str, int]] = field(default_factory=dict)
     #: every re-baselining and its size, so a moved line is visible rather than assumed
     baseline_notes: list[str] = field(default_factory=list)
-    #: TRUE once the generation's first-call tax has been paid by something that is not a
-    #: paying request — the boot warm pass. It closes the one hole in `close_attempt`'s
-    #: first-attempt forgiveness: with a warm pass on, there IS no legitimate library-
-    #: workspace shift left for a paying attempt to hide a leak behind, so none is allowed.
-    #: Measured: a planted 64 MiB persistent allocation on the first paying attempt of a
-    #: warmed generation was absorbed as a `baseline_shift` and named nothing.
-    baseline_paid: bool = False
     reconciliations: list[dict[str, Any]] = field(default_factory=list)
     #: THE ATTEMPT'S DECLARED RESIDENCY TRANSITION, signed, in the same allocator bytes
     #: `device_allocated` is measured in. A staged rung moves gigabytes on purpose; that
@@ -386,7 +379,6 @@ class Ledger:
         self.declared_scopes.clear()
         self.paging.clear()
         self.baseline_notes.clear()
-        self.baseline_paid = False
         self.residency_delta = 0
         self.unreconciled = ""
         self.unsuitable_placements.clear()
@@ -746,26 +738,6 @@ class Ledger:
     def placement_refusal(self, placement: str) -> str:
         return self.unsuitable_placements.get(placement, "")
 
-    def rebaseline(self, why: str) -> int:
-        """Re-establish the resident baseline after real work that is NOT an attempt.
-
-        The boot warm pass is the case this exists for. It runs one real case per warmable
-        entrypoint through ordinary dispatch, so the library workspaces it causes to be
-        allocated belong to the executor GENERATION, not to the first paying request —
-        which is the whole point of paying the first-call tax on boot. Re-baselining here is
-        what makes "the first paying request reconciles to zero" a true statement instead of
-        an excused one. Returns the shift, which is recorded rather than swallowed.
-        """
-        if self.device_baseline < 0 or self.device_allocated < 0:
-            return 0
-        shift = self.device_allocated - self.device_baseline
-        self.device_baseline = self.device_allocated
-        self.closed_since_baseline = 0
-        self.baseline_paid = True
-        self.baseline_notes.append(f"{why}: {shift:+d} B")
-        del self.baseline_notes[:-8]
-        return shift
-
     def device_unreadable(self, why: str) -> None:
         """The executor is gone: its device classes are UNREADABLE, never zero."""
         self.device_allocated = -1
@@ -877,8 +849,8 @@ class Ledger:
         them for the life of the PROCESS, not the attempt. That is a baseline SHIFT, not a
         leak: the ledger records it with its size, re-baselines, and holds every later attempt
         to the new line — where a genuine per-attempt leak would keep growing and be caught on
-        attempt two. With the boot warm pass on, the shift lands on the warm case and the
-        first paying request already reconciles to zero.
+        attempt two. An author's `Model.warm` that launches kernels pays it inside the
+        prepare, before this baseline is read (cr-110).
 
         THE DECLARED RESIDENCY TRANSITION (cl-003's second-1024px defect). Under a staged
         rung the attempt evicts and stages components ON PURPOSE, so `device_allocated`
@@ -912,7 +884,7 @@ class Ledger:
                     row["declared_transition"] = declared
                     row["residual"] = residual
                     row["verdict"] = "residency_transition"
-                first = self.closed_since_baseline == 0 and not self.baseline_paid
+                first = self.closed_since_baseline == 0
                 if residual > 0 and name == "device_allocated" and first:
                     row["verdict"] = "baseline_shift"
                     shifts.append(

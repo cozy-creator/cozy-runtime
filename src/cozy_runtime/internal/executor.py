@@ -364,6 +364,7 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.fusion",
     "cozy_runtime.internal.fusion_install",
     "cozy_runtime.internal.planfacts",
+    "cozy_runtime.internal.warm",
     "cozy_runtime.internal.probe",
     "cozy_runtime.internal.residency",
     "cozy_runtime.internal.resolution",
@@ -892,6 +893,7 @@ class Executor:
             Variant,
             resolve,
         )
+        from cozy_runtime.internal.warm import WarmFailed, warm_generation
 
         stage("runtime_imports")
         refused = self._initialize_device(torch)
@@ -1454,6 +1456,37 @@ class Executor:
         refused = self._install_group(torch, model, binding["model_parameter_name"])
         if refused is not None:
             return refused
+        stage("install")
+        # THE AUTHOR'S ONE WARM MOMENT (cr-110, model-lifecycle.md): after the fill, its
+        # verification, the execution plan, the residency install and the group mirror;
+        # before this generation is Ready, so a placement is never DISPATCHABLE over a cold
+        # generation. Rank 0 only under a group — its component-use scopes are mirrored to
+        # the followers exactly as a handler's are, and the spool is what carries their
+        # arguments. Every other rung of the ladder (cr-109's attention contract, h3a-018's
+        # entrypoint reuse) hooks THIS call, never a second one.
+        warm_ms = 0.0
+        if self.rank == 0:
+            self._attempt_spool = self.root / "warm"
+            try:
+                warm_ms = warm_generation(
+                    model, device=self._device(), cancel=lambda: bool(self.poisoned)
+                )
+            except WarmFailed as exc:
+                # A CONSTRUCTION FAILURE, typed on the author's exception: the executor is
+                # poisoned and replaced like every other prepare refusal, and the binding
+                # faults instead of serving a generation whose warm did not complete.
+                backend.poison(())
+                self.poisoned = f"warm failed: {exc}"[:200]
+                return {
+                    "ok": False,
+                    "code": exc.code,
+                    "detail": str(exc)[:900],
+                    "state": backend.state,
+                    "envelope": envelope,
+                }
+            finally:
+                self._attempt_spool = None
+        stage("warm")
         group_facts = dict(self.facts)
         memory = accel.allocation(torch, self.device_kind)
         self.ready = True
@@ -1489,6 +1522,7 @@ class Executor:
             # wall was measured in that case, and zero is the exact value rather than an
             # absent-stat KeyError after a successful construction.
             "fill_ms": backend.stats.get("fill_ms", 0),
+            "warm_ms": round(warm_ms, 2),
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
             "device_free_bytes": memory["driver_free_bytes"],
@@ -1726,6 +1760,7 @@ class Executor:
                 for i in range(3)
             ],
             "fill_ms": sum(float(facts.get("fill_ms", 0)) for _, facts in facts_rows),
+            "warm_ms": sum(float(facts.get("warm_ms", 0)) for _, facts in facts_rows),
             "filled": sum(int(facts.get("filled", 0)) for _, facts in facts_rows),
             "filled_bytes": sum(int(facts.get("filled_bytes", 0)) for _, facts in facts_rows),
             "device_free_bytes": int(last.get("device_free_bytes", -1)),
@@ -1950,7 +1985,6 @@ class Executor:
                 request_id=command["request_id"],
                 spool=spool,
                 deadline=deadline,
-                boot_warmup=bool(command.get("boot_warmup")),
                 device=self._device(),
                 cancel=lambda: _cancelled(self.root, command["request_id"]),
                 models=self.models,
@@ -2558,85 +2592,6 @@ class Executor:
 
         return progress
 
-    # ------------------------------------------------------------------ warm
-
-    def warm(self, command: dict[str, Any]) -> dict[str, Any]:
-        """One attempted warm case for one entrypoint, through ORDINARY dispatch.
-
-        It runs HERE, in the disposable process, for one reason that is not convenience:
-        synthesizing a payload needs the entrypoint's schema, and reading that schema in the
-        worker would mean importing package code into the long-lived no-CUDA process.
-        A package whose module scope touches torch would then contaminate the worker
-        forever. The executor already imported it and is already disposable.
-        """
-        from cozy_runtime.internal import schema, warm
-
-        surface = self.surface_names.get(command["entrypoint"])
-        if surface is None:
-            return {
-                "ok": True,
-                "outcome": "skipped",
-                "reason": f"{command['entrypoint']!r} is not an entrypoint of this release",
-            }
-        spool = Path(command["spool"])
-        payload, reason = warm.synthesize(schema.render(surface.payload_type), spool)
-        if reason:
-            return {"ok": True, "outcome": "skipped", "reason": reason, "payload": {}}
-        # THROUGH ORDINARY DISPATCH means through both halves in order. The warm pass has no
-        # worker to prepare for it, so it prepares its own request and then invokes the
-        # record — the same two calls a served attempt makes across the seam.
-        ready = self.prepare_request({**command, "payload": payload})
-        if not ready.get("ok"):
-            return {
-                "ok": True,
-                "outcome": "failed",
-                "code": str(ready.get("code", "request_unresolvable")),
-                "payload": payload,
-                "reason": f"{ready.get('code')}: {str(ready.get('detail'))[:200]}",
-            }
-        reply = self.invoke({**command, "boot_warmup": True})
-        succeeded = reply.get("ok") and reply["outcome"]["terminal"] == "succeeded"
-        if succeeded:
-            return {
-                "ok": True,
-                "outcome": "warmed",
-                "code": "",
-                "reason": "",
-                "features": dict(ready.get("features") or {}),
-                "payload": payload,
-                "boot_warmup_observed": bool(_read_result(spool).get("warm")),
-                "execution_contract": reply.get("execution_contract"),
-                "handler_ms": reply.get("metrics", {}).get("handler_ms", 0),
-                "activation_peak_bytes": int(
-                    reply.get("metrics", {}).get("activation_peak_bytes", 0)
-                ),
-                "activation_peaks": dict(reply.get("metrics", {}).get("activation_peaks") or {}),
-                "resident_moved": bool(
-                    int(reply.get("residency", {}).get("attempt_stages", 0))
-                    or int(reply.get("residency", {}).get("attempt_evictions", 0))
-                ),
-            }
-        # Generic warm failures do not brick the worker. The worker separately consumes the
-        # typed capacity code below: an allocator OOM IS evidence against this placement rung
-        # and may only be followed by a proven fallback, never the same accepted envelope.
-        self.poisoned = ""
-        code = str(reply.get("code") or reply["outcome"]["code"])
-        return {
-            "ok": True,
-            "outcome": "failed",
-            "code": code,
-            "features": dict(ready.get("features") or {}),
-            "payload": payload,
-            "execution_contract": reply.get("execution_contract"),
-            "activation_peak_bytes": int(reply.get("metrics", {}).get("activation_peak_bytes", 0)),
-            "activation_peaks": dict(reply.get("metrics", {}).get("activation_peaks") or {}),
-            "resident_moved": bool(
-                int(reply.get("residency", {}).get("attempt_stages", 0))
-                or int(reply.get("residency", {}).get("attempt_evictions", 0))
-            ),
-            "reason": f"{code}: {(reply.get('detail') or reply['outcome']['message'])[:200]}",
-        }
-
     def _result_schema_digest(self, surface: Any) -> str:
         """The identity of the DECLARED annotated result surface — never of the value.
 
@@ -2869,15 +2824,6 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
     )
 
 
-def _read_result(spool: Path) -> dict[str, Any]:
-    """The document this process just spooled, read back in-process (the warm pass's half)."""
-    path = spool / RESULT_DOCUMENT
-    if not path.is_file():
-        return {}
-    value = canonical.parse(path.read_bytes())
-    return value if isinstance(value, dict) else {}
-
-
 def _serialize_result(
     envelope: Any, spool: Path
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int]:
@@ -3052,8 +2998,6 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.invoke(command)
             elif name == "run_job":
                 reply = executor.run_job(command)
-            elif name == "warm":
-                reply = executor.warm(command)
             elif name == "probe":
                 reply = executor.probe()
             elif name == "vacate":

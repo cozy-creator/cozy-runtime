@@ -88,7 +88,6 @@ class _Booted:
         options = WorkerOptions(
             root=root / "worker",
             devices=DEVICE,
-            no_warm=True,
             tensorfs_root=self.staged.tensorfs_root,
             artifact_cache=self.staged.artifact_cache,
             development_project=PACKAGE,

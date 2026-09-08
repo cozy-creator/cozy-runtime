@@ -88,7 +88,6 @@ class Invocation:
     request_id: str
     spool: Path
     deadline: float
-    boot_warmup: bool = False
     device: Device = field(default_factory=Device)
     cancel: Callable[[], bool] = field(default=lambda: False)
     models: Mapping[str, Model[Any]] = field(default_factory=dict)
@@ -229,9 +228,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
 
     attempt = record
     attempt.rows.extend(overlay.rows)
-    ctx = Context(
-        inv.request_id, inv.deadline, inv.boot_warmup, inv.device, inv.cancel, inv.adapters
-    )
+    ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)
 
     attempt.entered = True
@@ -282,7 +279,7 @@ def run_prepared(
 def attempt(
     registration: Registration, wire: Mapping[str, object], inv: Invocation
 ) -> tuple[InvocationResult | None, Outcome, Attempt]:
-    """PREPARE then RUN, for the doors that do both at once — a job, and the warm pass.
+    """PREPARE then RUN, for the door that does both at once — a job.
 
     A serving attempt prepares BEFORE the worker admits it, which is the whole point of
     the split; a job is accept-then-prepare by design (cr-009) and has nothing to price a

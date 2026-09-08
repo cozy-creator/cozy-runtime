@@ -1,4 +1,4 @@
-"""The attempt engine: offer -> prepare -> accept -> execute -> terminal, and the warm pass.
+"""The attempt engine: offer -> prepare -> accept -> execute -> terminal.
 
 Everything the worker may CLAIM about an attempt passes through here, in the one order
 worker-protocol/02 fixes:
@@ -507,9 +507,6 @@ class AttemptEngine:
         self.owner_scope = owner_scope
         self.tensorfs_root = tensorfs_root
         self.work_fingerprint = work_fingerprint
-        #: binding digests whose boot warm pass FAILED. Every attempt served under one
-        #: carries a per-request confession: the first-call tax was never paid for it.
-        self.degraded: dict[str, str] = {}
         #: the demand falsifier. It ships first, it counts, and it decides nothing — the
         #: `timing-decides-nothing` fence proves the module it lives in cannot reach the
         #: planner, the ledger or the fill plane.
@@ -1702,7 +1699,6 @@ class AttemptEngine:
             "request_id": key,
             "entrypoint": attempt.declared.entrypoint,
             "deadline_s": seconds,
-            "boot_warmup": False,
             "spool": str(spool),
             "placement": attempt.plan.placement,
             "headroom_bytes": attempt.plan.headroom_bytes,
@@ -2062,14 +2058,6 @@ class AttemptEngine:
                 "substituted" if str(row.get("reason", "")).startswith("adjusted") else "degraded",
                 f"{row.get('field')}: requested {row.get('requested')}, served "
                 f"{row.get('applied')} - {row.get('reason')}",
-            )
-        plan_id = attempt.declared.entrypoint_binding_digest if attempt.declared else ""
-        why = self.degraded.get(plan_id)
-        if why:
-            attempt.confess(
-                "degraded",
-                f"served by a binding whose boot warm pass FAILED ({why}): the first-call "
-                "tax was never paid on boot, so this request paid it",
             )
 
     def bank_demand(self, attempt: AttemptRecord, metrics: Mapping[str, Any], moved: bool) -> None:

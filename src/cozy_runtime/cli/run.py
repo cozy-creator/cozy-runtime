@@ -291,7 +291,6 @@ def run(
             options=WorkerOptions(
                 root=workspace / "worker",
                 release_id=package_code_digest,
-                no_warm=True,
             ),
         )
     return _render(outcome, out_dir, warnings, opts, verb=verb, stream="--stream" in flags)

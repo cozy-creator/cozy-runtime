@@ -10,14 +10,11 @@ Three entrypoints, each earning its place in the verification:
 
   denoise   the ordinary attempt — N real denoising steps through the guarded component
             root, a real PNG out of the final latent, cooperative cancellation between
-            steps, and `ctx.boot_warmup` reported in the result so the warm pass is
-            OBSERVABLE rather than asserted.
+            steps.
   stubborn  a handler that never asks whether it was cancelled. Real GPU work, no
             cancellation check: the cooperative signal cannot reach it, so the only honest
             way to stop it is to kill the executor. That is the cancellation red arm.
-  restyle   a required VIDEO input. The boot warm pass's payload synthesizer can make
-            strings, numbers and images at neutral defaults and cannot make a video, so
-            this entrypoint must land `skipped` with a typed reason — never `warmed`.
+  restyle   a required VIDEO input: the input-asset plane's video arm.
 """
 
 from __future__ import annotations
@@ -78,7 +75,6 @@ class DenoiseOutput(msgspec.Struct):
     mean: float
     std: float
     digest: str
-    warm: bool
 
 
 class StubbornInput(msgspec.Struct, forbid_unknown_fields=True):
@@ -186,9 +182,7 @@ def denoise(
     view = model.for_request(ctx, seed=payload.seed)
     device = torch.device("cuda", 0)
     latents, timestep, prompt, embeds, ids = _inputs(torch, device, payload.latent, view._seed)
-    # A warm case pays the first-call tax on the smallest legal shape it can: the body
-    # cheapens off `ctx.boot_warmup` rather than inventing an out-of-contract schedule.
-    steps = 1 if ctx.boot_warmup else payload.steps
+    steps = payload.steps
     tel.log("starting the denoise loop", latent=payload.latent, steps=steps, seed=view._seed)
     on_step = tel.step_callback(steps, stage="denoise")
     with tel.stage("denoise"):
@@ -210,7 +204,6 @@ def denoise(
         mean=round(float(stats.mean()), 6),
         std=round(float(stats.std()), 6),
         digest=hashlib.sha256(body).hexdigest(),
-        warm=ctx.boot_warmup,
     )
 
 
@@ -235,7 +228,6 @@ def stubborn(payload: StubbornInput, model: SdxlUnetModel, ctx: Context) -> Deno
         mean=round(float(stats.mean()), 6),
         std=round(float(stats.std()), 6),
         digest=hashlib.sha256(b"stubborn").hexdigest(),
-        warm=False,
     )
 
 

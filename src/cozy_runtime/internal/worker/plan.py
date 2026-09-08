@@ -632,8 +632,8 @@ class PlanChooser:
             # observation read out of its conditions, and it gets its own provenance. An
             # uncalibrated number may not refuse; it MAY deepen, because with no serve
             # behind it the deeper rung is the only conservative answer available, and
-            # cr-063 measured what happens without one (an all-resident warm pass that
-            # OOMs on an 8 GB card where the staged rung serves).
+            # cr-063 measured what happens without one (an all-resident first attempt
+            # that OOMs on an 8 GB card where the staged rung serves).
             terms.append(
                 Coefficient("activations", UNCALIBRATED_ACTIVATION_BYTES, "uncalibrated", "")
             )

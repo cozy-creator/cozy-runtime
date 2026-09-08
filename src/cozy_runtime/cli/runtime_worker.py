@@ -204,7 +204,6 @@ def _worker_options(
         artifact_cache=host_paths.PREPARE_CACHE,
         tensorfs_root=tensorfs_root,
         worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
-        no_warm=True,
         claim_ready=False,
         executor_uid=POD_EXECUTOR_UID,
         executor_gid=POD_EXECUTOR_GID,

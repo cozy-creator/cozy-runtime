@@ -149,7 +149,7 @@ def _slice(
             package_interface_document=body if kind == "entrypoint" else None,
             found=found,
             development_tensorfs_root=config.cozy_home / "tensorfs",
-            options=WorkerOptions(root=workspace / "worker", devices=devices, no_warm=True),
+            options=WorkerOptions(root=workspace / "worker", devices=devices),
             record_owner_hook=capture,
         )
     return outcome, seals
@@ -262,7 +262,7 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
     told to prepare for any other lane."""
     with _workspace() as root:
         config = _config(root / "home")
-        options = WorkerOptions(root=root / "worker", devices="0,1", no_warm=True)
+        options = WorkerOptions(root=root / "worker", devices="0,1")
         worker = Worker(config, options, InMemoryControlHost())
         assert [lane.devices for lane in worker.lanes.lanes] == ["0", "1"]
         assert worker.lanes.envelope.devices == "0,1"
@@ -441,7 +441,7 @@ def test_one_lane_worker_seats_and_a_two_lane_worker_sum() -> None:
         config = _config(root / "home")
         worker = Worker(
             config,
-            WorkerOptions(root=root / "worker", devices="0,1", no_warm=True),
+            WorkerOptions(root=root / "worker", devices="0,1"),
             InMemoryControlHost(),
         )
         try:
@@ -501,7 +501,7 @@ def test_the_ledger_row_survives_a_switch_to_another_placement() -> None:
         config = _config(root / "home")
         worker = Worker(
             config,
-            WorkerOptions(root=root / "worker", devices="0", no_warm=True),
+            WorkerOptions(root=root / "worker", devices="0"),
             InMemoryControlHost(),
         )
         try:

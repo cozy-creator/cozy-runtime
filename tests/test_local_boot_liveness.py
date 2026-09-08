@@ -121,7 +121,7 @@ def _run(root: Path, hook: Any) -> tuple[SliceOutcome, float]:
             package_interface_document=body,
             found=found,
             development_tensorfs_root=home / "tensorfs",
-            options=WorkerOptions(root=workspace / "worker", release_id=digest, no_warm=True),
+            options=WorkerOptions(root=workspace / "worker", release_id=digest),
             record_owner_hook=hook,
         )
     return outcome, time.monotonic() - started
