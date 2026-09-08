@@ -17,7 +17,7 @@ from packaging.version import Version
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical, invocable_interface, package_interface
 
-GENERATOR_ABI = "cozy.interface-generator/3"
+GENERATOR_ABI = "cozy.interface-generator/4"
 _DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -26,12 +26,13 @@ def generate(interface: bytes) -> dict[str, bytes]:
     document = package_interface.read_bytes(interface, source="interface generator")
     digest = "sha256:" + hashlib.sha256(interface).hexdigest()
     modules: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for entry in [*document["entrypoints"], *document["jobs"]]:
-        if "invocable" in entry:
-            metadata = invocable_interface.validate(
-                entry["invocable"], entry["request"], entry["result"]
-            )
-            modules[metadata["module"]].append(entry)
+    for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
+        for entry in document[collection]:
+            if "invocable" in entry:
+                metadata = invocable_interface.validate(
+                    entry["invocable"], entry["request"], entry["result"], kind=kind
+                )
+                modules[metadata["module"]].append({**entry, "_kind": kind})
     if not modules:
         raise ConformanceError(
             "package declares no invocable exports", code="interface_exports_absent"
@@ -59,7 +60,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
     imports = [
         "from __future__ import annotations",
         "from collections.abc import Awaitable",
-        "from typing import Annotated, Literal, cast",
+        "from typing import Annotated, Any, Literal, cast",
         "from enum import Enum",
         "import msgspec",
         "from cozy_runtime.author import "
@@ -69,12 +70,15 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
         "",
     ]
+    if any(entry["_kind"] == "entrypoint" for entry in entries):
+        imports.append("from cozy_runtime.author import ActivationCapture, PendingCall")
     declarations: dict[str, tuple[bytes, str]] = {}
     functions: list[str] = []
     bindings: list[str] = []
     exports: set[str] = set()
     for entry in sorted(entries, key=lambda item: item["invocable"]["export"]):
         metadata = entry["invocable"]
+        serving = entry["_kind"] == "entrypoint"
         defaults, names, enums = (
             metadata["defaults"],
             metadata["type_names"],
@@ -123,11 +127,14 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                         annotation = (
                             f"Annotated[{annotation}, AssetBound(**{field['asset_bound']!r})]"
                         )
-                    default = (
-                        " = " + literal(field["type"], field_path, defaults[field_path])
-                        if field_path in defaults
-                        else ""
-                    )
+                    default = ""
+                    if field_path in defaults:
+                        value = defaults[field_path]
+                        default = (
+                            f" = msgspec.field(default_factory=lambda: {value!r})"
+                            if isinstance(value, (list, dict))
+                            else " = " + literal(field["type"], field_path, value)
+                        )
                     fields.append(f"    {field['name']}: {annotation}{default}")
                 source = (
                     "class "
@@ -152,6 +159,19 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                 return "Literal[" + ", ".join(repr(value) for value in node["literal"]) + "]"
             if "list" in node:
                 return "list[" + expression(node["list"], path + "/[]") + "]"
+            if "map" in node:
+                key = expression(node["map"]["key"], path + "/map/key")
+                value = expression(node["map"]["value"], path + "/map/value")
+                return f"dict[{key}, {value}]"
+            if "tuple" in node:
+                return (
+                    "tuple["
+                    + ", ".join(
+                        expression(member, path + f"/tuple/{index}")
+                        for index, member in enumerate(node["tuple"])
+                    )
+                    + "]"
+                )
             if "union" in node:
                 return " | ".join(
                     expression(member, path + f"/union/{index}", node.get("tag_field"))
@@ -168,6 +188,8 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                 return "Tree"
             if node.get("input") == "model":
                 return "ModelArtifact"
+            if node.get("opaque") == "Any":
+                return "Any"
             raise ConformanceError(
                 "interface schema has no portable Python type", code="interface_type"
             )
@@ -193,7 +215,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
             )
         exports.add(export)
         parameters: list[str] = []
-        if metadata["parameters"]:
+        if metadata["parameters"] or serving:
             parameters.append("*")
         fields = {field["name"]: field for field in entry["request"]["fields"]}
         for name in metadata["parameters"]:
@@ -230,12 +252,58 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                 if path in defaults
                 else ""
             )
+            if isinstance(defaults.get(path), (list, dict)):
+                annotation += " | msgspec.UnsetType"
+                default = " = msgspec.UNSET"
             parameters.append(f"{name}: {annotation}{default}")
         arguments = "{" + ", ".join(f"{name!r}: {name}" for name in metadata["parameters"]) + "}"
+        if any(
+            isinstance(defaults.get("request/" + name), (list, dict))
+            for name in metadata["parameters"]
+        ):
+            arguments = (
+                "{key: value for key, value in "
+                + arguments
+                + ".items() if value is not msgspec.UNSET}"
+            )
+        options = ""
+        returned = f"Awaitable[{result_name}]"
+        if serving:
+            model_names = [slot["path"].rpartition(".")[2] for slot in entry.get("models", [])]
+            all_names = [*metadata["parameters"], *model_names, "capture"]
+            if len(set(all_names)) != len(all_names):
+                raise ConformanceError(
+                    "serving request fields collide with model slots or capture options",
+                    code="interface_name_conflict",
+                )
+            parameters += [f"{name}: ModelArtifact" for name in model_names]
+            parameters.append("capture: ActivationCapture | None = None")
+            models_name, call_name = f"__cozy_{export}Models", f"__cozy_{export}Call"
+            model_fields = [f"    {name}: ModelArtifact" for name in model_names]
+            _declare(
+                declarations,
+                models_name,
+                f"class {models_name}(msgspec.Struct, kw_only=True, frozen=True, "
+                "forbid_unknown_fields=True):\n"
+                + "\n".join(model_fields or ["    pass"])
+                + "\n",
+            )
+            _declare(
+                declarations,
+                call_name,
+                f"class {call_name}(msgspec.Struct, kw_only=True, frozen=True, "
+                "forbid_unknown_fields=True):\n"
+                f"    payload: {request_name}\n    models: {models_name}\n",
+            )
+            models = "{" + ", ".join(f"{name!r}: {name}" for name in model_names) + "}"
+            arguments = "{'payload': " + arguments + ", 'models': " + models + "}"
+            request_name = call_name
+            options = ", capture=capture"
+            returned = f"PendingCall[{result_name}]"
         functions.append(
-            f"def {export}({', '.join(parameters)}) -> Awaitable[{result_name}]:\n"
-            f"    return cast(Awaitable[{result_name}], "
-            f"_invoke_proxy({digest!r}, {module!r}, {export!r}, {arguments}))\n"
+            f"def {export}({', '.join(parameters)}) -> {returned}:\n"
+            f"    return cast({returned}, "
+            f"_invoke_proxy({digest!r}, {module!r}, {export!r}, {arguments}{options}))\n"
         )
         bindings.append(
             f"    {export!r}: _CallType({digest!r}, {module!r}, {export!r}, "
