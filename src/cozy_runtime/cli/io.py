@@ -18,6 +18,7 @@ class Options:
     fields: tuple[str, ...] = ()
     dir: str = "."
     package_interface: str = ""
+    conformance: bool = False
 
 
 @dataclass(frozen=True, slots=True)

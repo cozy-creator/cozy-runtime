@@ -588,6 +588,55 @@ def fence_torch_free_import() -> list[str]:
     return bad
 
 
+STATIC_READER = SRC / "internal" / "static_interface.py"
+#: Modules and builtins through which source becomes execution. The static reader may name none.
+EXECUTION_MODULES = frozenset({"importlib", "sys", "runpy", "subprocess", "builtins"})
+EXECUTION_CALLS = frozenset({"exec", "eval", "compile", "__import__"})
+#: The runtime modules the static reader may import: the author vocabulary, the shared
+#: document builders and the pure readers. `discovery` (the importer) is not among them.
+STATIC_READER_IMPORTS = frozenset(
+    {
+        "cozy_runtime",
+        "cozy_runtime.author",
+        "cozy_runtime.internal.package_interface",
+        "cozy_runtime.internal.bindings",
+        "cozy_runtime.internal.canonical",
+    }
+)
+
+
+def fence_static_describe_executes_nothing() -> list[str]:
+    """`internal/static_interface.py` reads package source and runs none of it (#713).
+
+    Package code is untrusted, and the static reader is what `describe` runs by default —
+    on a publisher's host, in packages CI, wherever a source tree is. A module that can
+    import, exec or compile is a module that can be made to run the tree it was handed, so
+    the reader's whole import list and call surface is held here: no execution module, no
+    execution builtin, no `sys.path`, and no runtime module that imports packages.
+    """
+    tree = ast.parse(STATIC_READER.read_text())
+    where = STATIC_READER.relative_to(ROOT)
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = (
+                [a.name for a in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+            )
+            for name in names:
+                if name.split(".")[0] in EXECUTION_MODULES:
+                    bad.append(f"{where}:{node.lineno} imports {name} — a door to execution")
+                elif name.split(".")[0] == "cozy_runtime" and not (
+                    name in STATIC_READER_IMPORTS or name.startswith("cozy_runtime.author.")
+                ):
+                    bad.append(f"{where}:{node.lineno} imports {name}, which is not a pure reader")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in EXECUTION_CALLS:
+                bad.append(f"{where}:{node.lineno} calls {node.func.id}()")
+    return bad
+
+
 KERNEL_CALLS = ("attempt", "prepare", "invoke", "run_prepared")
 KERNEL_CALLER = "internal/executor.py"
 ENGINE_CLASS = "AttemptEngine"
@@ -981,6 +1030,7 @@ FENCES = {
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
     "torch-free-import": fence_torch_free_import,
+    "static-describe-executes-nothing": fence_static_describe_executes_nothing,
     "package-imports": fence_package_imports,
     "author-import-boundary": fence_author_import_boundary,
     "env-authority": fence_env_authority,

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "rich-package"
+version = "0.1.0"
+description = "Every construct the static package-interface reader admits, in one weightless package"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "cozy-runtime>=0.1,<1",
+    "msgspec>=0.19",
+]
+
+[project.entry-points."cozy.application"]
+default = "rich_package:app"
+
+[tool.uv.build-backend]
+module-name = "rich_package"
+module-root = ""
