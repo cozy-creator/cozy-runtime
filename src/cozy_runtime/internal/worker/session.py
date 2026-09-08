@@ -303,6 +303,19 @@ class WorkerOptions:
     """Exact launch facts the development Placement must echo."""
     development_binding_overrides: Mapping[str, str] = field(default_factory=dict)
     """One-shot local resolver inputs; long-lived Creator launches use package.toml."""
+    attention_pin: str = ""
+    """THE EXECUTION-PATH OVERRIDE (cr-125): one attention kernel by name, or empty.
+
+    Empty is the whole product. A serving worker picks the fastest kernel this device and
+    image support by itself (cr-124) and has no knob at all — `_SERVE_FLAGS` is a closed
+    set and this is deliberately not in it, so the guard is the absence of a way to say it
+    rather than a condition somebody could get wrong. Only the ephemeral worker
+    `cozy-runtime run` builds in memory can carry one, which is exactly the dev mode the
+    A/B needs: two runs, two pins, one honest comparison.
+
+    It reaches `attention.select` at PREPARE, which is the only moment it can act — a pin
+    applied after `warm` compiled the module or after a group installed its collectives is
+    a field nobody reads. So this is a construction fact and never a per-request one."""
     worker_tls_certificate_digest: str = ""
     alloc_conf: str = "expandable_segments:True"
     threads: int = 4
@@ -770,10 +783,11 @@ def _placement_profile(entry: dict[str, Any]) -> None:
     model_ids: list[str] = []
     for index, value in enumerate(models):
         model = _closed_document(value, {"id", "repo", "version", "lane", "manifest"}, "Model")
-        _required(model, {"id", "repo", "version", "manifest"}, "Model")
+        _required(model, {"id", "repo", "manifest"}, "Model")
         model_ids.append(_identifier(model["id"], f"models[{index}].id"))
-        for name in ("repo", "version"):
-            _identifier(model[name], f"models[{index}].{name}")
+        _identifier(model["repo"], f"models[{index}].repo")
+        if "version" in model:
+            _identifier(model["version"], f"models[{index}].version")
         if "lane" in model:
             _identifier(model["lane"], f"models[{index}].lane")
         _exact_ref(model["manifest"], f"models[{index}].manifest")
@@ -901,6 +915,7 @@ def executor_prepare_command(
     authorized_device_limit_bytes: int = 0,
     sequence_parallel_degree: int = 1,
     parameter_names: Sequence[Sequence[str]] = (),
+    attention_pin: str = "",
 ) -> dict[str, Any]:
     """Translate one resolved callable binding into the executor's closed prepare shape.
 
@@ -912,7 +927,8 @@ def executor_prepare_command(
     a group lane's K, the ONE new fact its executor receives; a plain prepare is unchanged.
     `parameter_names[i]` is every parameter name the i-th model is bound under across the
     bindings that share this construction (h3a-018); absent, the model binds under this
-    binding's own name.
+    binding's own name. `attention_pin` rides the same way, and only when a dev-mode
+    override named a kernel (cr-125): a serving prepare carries no such key at all.
     """
 
     models = []
@@ -954,6 +970,8 @@ def executor_prepare_command(
     }
     if sequence_parallel_degree > 1:
         command["sequence_parallel_degree"] = int(sequence_parallel_degree)
+    if attention_pin:
+        command["attention_pin"] = attention_pin
     if not models:
         command.update(
             {
@@ -1485,6 +1503,7 @@ class Worker:
         wipes nothing (cr-066's red arm: it used to `begin_generation` the one ledger).
         """
         selected_job = None
+        bindings_digest = ""
         if attempt.spec.get("job") is not None or self.accepted.mode == "job":
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
             selected_job = next(
@@ -1510,6 +1529,8 @@ class Worker:
                 bindings = self.bindings
                 prepared = self.prepared_models
                 failed = self.failed_bindings
+                if self.placement is not None:
+                    bindings_digest = documents.spell(self.placement.bindings_digest)
             else:
                 lane = self._lane_of(attempt.placement_id)
                 supervision = hosted.supervision
@@ -1517,6 +1538,7 @@ class Worker:
                 bindings = hosted.bindings
                 prepared = hosted.prepared_models
                 failed = hosted.failed_bindings
+                bindings_digest = documents.spell(hosted.placement.bindings_digest)
         if attempt.lane_id and attempt.lane_id != lane.lane_id:
             raise AttemptRefusal(
                 "placement_lane_moved",
@@ -1548,6 +1570,7 @@ class Worker:
             if attempt.spec.get("job") is not None
             else 0,
             orchestration=lane is self.lanes.orchestration,
+            bindings_digest=bindings_digest,
         )
         attempt.slot = slot
         attempt.lane_id = lane.lane_id
@@ -1676,18 +1699,37 @@ class Worker:
             def mark_verified(digest: str, length: int, path: Path) -> None:
                 self.verified_artifacts.record(digest, length, path)
 
-            result = package_prepare.prepare_private_placement(
-                request,
-                prepared=prepared.document,
-                installed=prepared.installed,
-                artifact_cache=Path(self.options.artifact_cache or ""),
-                tensorfs_root=(
-                    Path(self.options.tensorfs_root)
-                    if self.options.tensorfs_root is not None
-                    else None
-                ),
-                verified=mark_verified,
-            )
+            with contextlib.ExitStack() as access:
+                if request.native_models:
+                    if self.workspace is None:
+                        raise package_prepare.PreparationRefusal(
+                            "private_workspace_absent",
+                            "native model preparation needs its retained workspace",
+                        )
+                    owner = self.authorize_workspace(request.claim)
+
+                    def guard() -> None:
+                        self.authorize_workspace(request.claim)
+
+                    access.enter_context(self.workspace.authorized(guard))
+                    for model in request.native_models:
+                        access.enter_context(
+                            self.workspace.held_model(owner, model.retention, model.manifest)
+                        )
+                result = package_prepare.prepare_private_placement(
+                    request,
+                    prepared=prepared.document,
+                    installed=prepared.installed,
+                    artifact_cache=Path(self.options.artifact_cache or ""),
+                    tensorfs_root=(
+                        Path(self.options.tensorfs_root)
+                        if self.options.tensorfs_root is not None
+                        else None
+                    ),
+                    verified=mark_verified,
+                )
+                if request.native_models:
+                    self.authorize_workspace(request.claim)
             joined = read_placement_set(result.placement_set)
             if (
                 len(joined) != 1
@@ -1738,8 +1780,15 @@ class Worker:
         slot while placements serve would replace a serving executor with the prepared
         package's environment."""
 
+        # Keep preparation's socket shorter than the boot-validated primary
+        # socket, independent of placement and operation identifiers. Its state
+        # stays in the original directory so orphan ownership still reconciles.
+        socket_path = self.root / "p.sock"
+        if refusal := socket_path_refusal(str(socket_path)):
+            raise ExecutorGone(refusal)
         supervision = ExecutorSupervision(
             root=self.root / "placements" / "prepare",
+            socket_path=socket_path,
             python=self.options.python or sys.executable,
             base_env=self.config.child_base_env,
             cozy_home=self.config.cozy_home,
@@ -1901,6 +1950,7 @@ class Worker:
             threads=self.options.threads,
             alloc_conf=self.options.alloc_conf,
             inherited=dict(self.config.child_base_env),
+            python=self.options.environment_python or Path(self.options.python or sys.executable),
         )
 
     def authorize_workspace(self, claim: pb.Claim) -> str:
@@ -3151,10 +3201,35 @@ class Worker:
         the previous set keeps serving.
         """
         mode = desired.WhichOneof("mode") or ""
+        retained_parent = None
+        if mode == "placement_set" and desired.placement_set.HasField("orchestration_parent"):
+            retained_parent = self.job_slots.get("orchestration")
+            supplied_parent = desired.placement_set.orchestration_parent
+            if (
+                retained_parent is None
+                or supplied_parent != retained_parent.directive
+                or not supplied_parent.orchestration
+                or supplied_parent.HasField("orchestration_parent")
+                or supplied_parent.device_count
+                or supplied_parent.resource_caps.device_required
+            ):
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FAULT_KIND_CONFIG_REFUSED,
+                        subject=f"revision {desired.revision}",
+                        reason="orchestration_parent_changed",
+                        detail="serving must retain the exact already-prepared CPU parent",
+                    )
+                )
+                return
         if (
             mode != "job"
             and self.job_slots
-            and any(self._job_lane_busy(slot.lane) for slot in self.job_slots.values())
+            and any(
+                self._job_lane_busy(slot.lane)
+                for slot in self.job_slots.values()
+                if slot is not retained_parent
+            )
         ):
             self.engine.fault(
                 pb.Fault(
@@ -3235,11 +3310,15 @@ class Worker:
         self.accepted.mode = "serving" if mode == "placement_set" else mode
         if mode != "job" and self.job_slots:
             cpu = self.job_slots.get("orchestration")
-            if cpu is not None:
+            if cpu is not None and cpu is not retained_parent:
                 cpu.supervision.close()
                 self.lanes.orchestration.forget("")
-            self.job_slots.clear()
-            self.jobs.clear()
+            self.job_slots = (
+                {"orchestration": retained_parent} if retained_parent is not None else {}
+            )
+            self.jobs = {
+                slot.binding.job_descriptor_id: slot.binding for slot in self.job_slots.values()
+            }
             self.engine.jobs = self.jobs
         self.latched = ""  # a NEW revision un-latches: the latch is per desired revision
         if mode == "job":
@@ -4681,6 +4760,7 @@ class Worker:
                     authorized_device_limit_bytes=authorized,
                     sequence_parallel_degree=lane.degree if lane.group else 1,
                     parameter_names=_parameter_names_by_model(group),
+                    attention_pin=self.options.attention_pin,
                 ),
                 timeout=None,
                 on_progress=lambda frame: self.monitor.advance(

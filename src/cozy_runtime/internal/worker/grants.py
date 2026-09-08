@@ -40,7 +40,7 @@ bounded reader `copy_bounded`, the ONE address predicate both downloaders call, 
 fetch boundary th-008's hub-minted input URLs and cr-012's author `Egress` capability will
 enter through. Whoever lands that row lands its allowlist writer with it.
 
-The executor is handed verified files in the attempt spool and never an address, and it
+The executor is handed verified files at their granted paths and never an address, and it
 installs `sandbox.refuse_network` so a dial of its own refuses (cr-042) — a Python-level
 bound on a buggy package, not a kernel bound on a hostile one.
 """
@@ -60,8 +60,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
-from urllib.parse import ParseResult, urlparse
+from urllib.parse import ParseResult, unquote, urlparse
 
+from cozy_runtime.author._assets import file_state
+from cozy_runtime.author._errors import RuntimeFailure
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
@@ -114,7 +116,7 @@ HUB_CALLS: tuple[HubCall, ...] = (
     HubCall(
         "grant_input_read",
         "GET",
-        r"^(?:file://(?P<path>/[\w./-]+)|data:application/json;base64,[A-Za-z0-9+/]*={0,2})$",
+        r"^(?:file://(?P<path>/(?:[\w./~-]|%[0-9A-Fa-f]{2})+)|data:application/json;base64,[A-Za-z0-9+/]*={0,2})$",
         ("input_id",),
         "read one granted input asset (the payload rides the grant as an input, inline or a file)",
     ),
@@ -491,7 +493,9 @@ def _local(url: str, base: str) -> Path:
             f"{parsed.scheme or 'relative'}:// is not a local grant URL; an https grant is "
             "fetched through the egress boundary (`internal/egress.py`), never opened here",
         )
-    return Path(parsed.path).resolve()
+    if parsed.netloc or parsed.query or parsed.fragment:
+        raise GrantRefusal("grant_transport", "local grants require an exact file path")
+    return Path(unquote(parsed.path)).resolve()
 
 
 def _select_root(path: Path, roots: tuple[str, ...]) -> tuple[Path, Path] | None:
@@ -566,7 +570,7 @@ def _transfer_granted(
     if entry.url.startswith("data:"):
         return _transfer_inline(entry, auth, sink, cap=cap, prefix_bytes=prefix_bytes)
     local_path = _local(entry.url, grant.file_base_url)
-    absolute = f"file://{local_path}"
+    absolute = local_path.as_uri()
     try:
         try:
             descriptor = _open_local_grant(local_path, auth, absolute, entry.input_id)
@@ -682,7 +686,7 @@ def hydrate_inputs(
     workspace: Workspace | None = None,
     owner: str = "",
 ) -> dict[str, Any]:
-    """Fetch, verify, sniff and spool EVERY input asset the grant carries (cr-012).
+    """Verify every local input in place; materialize only native retained bytes.
 
     THE LAUNCH CONTRACT IS EAGER (§1.3), and this is where the eagerness lives: the whole
     present asset set is materialized here, before acceptance and before any lease, so a
@@ -714,9 +718,7 @@ def hydrate_inputs(
         raise GrantRefusal(
             "inputs_over_total_cap",
             f"this attempt's {len(entries)} input asset(s) declare {declared_total} B and "
-            f"this deployment admits {max_total_bytes} B per attempt. Input retention is "
-            "its own bounded story: inputs are not weights, they take no CAS lease, and "
-            "they live exactly as long as the attempt spool",
+            f"this deployment admits {max_total_bytes} B per attempt",
         )
     out: dict[str, Any] = {}
     root = spool / "inputs"
@@ -731,15 +733,26 @@ def hydrate_inputs(
                     f"admits {max_bytes} B per input. The DECLARED length refuses before a "
                     "byte moves; the bytes are held to the same bound on the way in",
                 )
-            root.mkdir(parents=True, exist_ok=True)
-            local = root / f"{position:03d}-{_SAFE.sub('_', entry.input_id)[:96]}"
             temporary: Path | None = None
+            source_state = None
             try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w+b", dir=root, prefix=f".{position:03d}-", delete=False
-                ) as sink:
-                    temporary = Path(sink.name)
-                    if entry.native_tree is not None:
+                if entry.native_tree is None:
+                    local = _local(entry.url, grant.file_base_url)
+                    source_state = file_state(local)
+                    receipt = _transfer_granted(
+                        grant, entry, auth, None, cap=max_bytes, prefix_bytes=SNIFF_BYTES
+                    )
+                    if file_state(local) != source_state:
+                        raise GrantRefusal(
+                            "input_changed", "input file changed during verification"
+                        )
+                else:
+                    root.mkdir(parents=True, exist_ok=True)
+                    local = root / f"{position:03d}-{_SAFE.sub('_', entry.input_id)[:96]}"
+                    with tempfile.NamedTemporaryFile(
+                        mode="w+b", dir=root, prefix=f".{position:03d}-", delete=False
+                    ) as sink:
+                        temporary = Path(sink.name)
                         if workspace is None:
                             raise GrantRefusal(
                                 "grant_native_unavailable", "native input has no workspace"
@@ -784,15 +797,6 @@ def hydrate_inputs(
                             raise GrantRefusal(
                                 "grant_native_unavailable", "native input bytes are unavailable"
                             ) from exc
-                    else:
-                        receipt = _transfer_granted(
-                            grant,
-                            entry,
-                            auth,
-                            sink,
-                            cap=max_bytes,
-                            prefix_bytes=SNIFF_BYTES,
-                        )
                 declared = normalize(entry.kind_mime)
                 actual = sniff(receipt.prefix)
                 if declared and actual and declared != actual:
@@ -810,23 +814,27 @@ def hydrate_inputs(
                         "have no recognised media signature. A typed media declaration is "
                         "a claim, not a substitute for what the bytes are",
                     )
-                temporary.chmod(0o444)
-                os.link(temporary, local)
-                published.append(local)
-                temporary.unlink()
-                temporary = None
+                if temporary is not None:
+                    temporary.chmod(0o444)
+                    os.link(temporary, local)
+                    published.append(local)
+                    temporary.unlink()
+                    temporary = None
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
             out[entry.input_id] = GrantedInput(
                 input_id=entry.input_id,
                 local=local,
+                file_state=source_state,
                 media_type=actual or declared,
                 digest="sha256:" + receipt.sha256.hex(),
                 length=receipt.length,
                 order=int(entry.order),
             )
         complete = True
+    except RuntimeFailure as exc:
+        raise GrantRefusal(exc.code, exc.message) from exc
     except OSError as exc:
         raise GrantRefusal("input_spool_io", f"input spool publication failed: {exc}") from exc
     finally:
@@ -837,12 +845,7 @@ def hydrate_inputs(
 
 
 def release_inputs(spool: Path) -> int:
-    """Drop this attempt's hydrated inputs. Returns how many files went.
-
-    Input retention is its OWN bounded story, deliberately outside the weights CAS: an
-    input takes no lease, participates in no eviction ladder, and is not content-addressed
-    storage — it is one attempt's spool and it ends with the attempt.
-    """
+    """Remove only this attempt's native materializations, never borrowed media files."""
     from cozy_runtime.internal.worker.byte_inputs import remove_checkout
 
     remove_checkout(spool / "native-input-trees")

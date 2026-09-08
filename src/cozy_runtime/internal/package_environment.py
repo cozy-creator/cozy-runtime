@@ -22,6 +22,7 @@ import base64
 import csv
 import errno
 import hashlib
+import io
 import json
 import os
 import re
@@ -383,6 +384,7 @@ def materialize(
     python: Path = Path(sys.executable),
     base: base_observation.Observation | None = None,
     dependency_python: Path | None = None,
+    exact_dependencies: bool = False,
 ) -> InstalledEnvironment:
     """Verify exact wheels and atomically publish one ordinary uv virtual environment.
 
@@ -424,7 +426,7 @@ def materialize(
     final = contents / content_digest.removeprefix("sha256:")
     receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
     inspected = _verify_grants(source, wheels, observed)
-    boot_installs = _verify_python_requirements(inspected, observed, boot=True)
+    boot_installs = _verify_python_requirements(inspected, observed, boot=not exact_dependencies)
     if receipt_path.exists():
         installed = open_generation(
             root,
@@ -434,6 +436,9 @@ def materialize(
             python=python,
         )
         _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+        _verify_prefix_resources(installed.generation, inspected)
+        if exact_dependencies:
+            _verify_installed_requirements(installed.site_packages, inspected, observed)
         return installed
     reused = final.exists()
     _require_owned_root(root)
@@ -457,6 +462,9 @@ def materialize(
                 base=observed,
             )
             _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
+            _verify_prefix_resources(staging, inspected)
+            if exact_dependencies:
+                _verify_installed_requirements(staged.site_packages, inspected, observed)
             _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
             _make_read_only(staging)
             _fsync_dir(staging)
@@ -483,7 +491,54 @@ def materialize(
     )
     if reused:
         _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+        _verify_prefix_resources(installed.generation, inspected)
+    if exact_dependencies:
+        _verify_installed_requirements(installed.site_packages, inspected, observed)
     return installed
+
+
+def _verify_installed_requirements(
+    site_packages: Path,
+    inspected: Sequence[_Inspected],
+    base: base_observation.Observation,
+) -> None:
+    """Verify actual installed metadata against the captured wheel and requirement roster."""
+    installed: dict[str, str] = {}
+    for info in site_packages.glob("*.dist-info"):
+        path = info / "METADATA"
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_METADATA_BYTES:
+            raise EnvironmentRefusal("package_environment_installed_metadata_invalid", info.name)
+        metadata = BytesParser().parsebytes(path.read_bytes())
+        name, version = _name(str(metadata.get("Name", ""))), str(metadata.get("Version", ""))
+        if not name or not version or name in installed:
+            raise EnvironmentRefusal("package_environment_installed_metadata_invalid", info.name)
+        installed[name] = version
+    for item in inspected:
+        if installed.get(item.wheel.distribution) != item.wheel.version:
+            raise EnvironmentRefusal(
+                "package_environment_installed_dependency_changed",
+                f"distribution={item.wheel.distribution} expected={item.wheel.version} "
+                f"actual={installed.get(item.wheel.distribution)!r}",
+            )
+    joined = {**base.distribution_versions, **installed}
+    environment = _marker_environment(base)
+    for item in inspected:
+        for requirement in item.requirements:
+            if requirement.marker is not None and not requirement.marker.evaluate(environment):
+                continue
+            actual = joined.get(_name(requirement.name))
+            try:
+                accepted = actual is not None and requirement.specifier.contains(
+                    Version(actual), prereleases=True
+                )
+            except InvalidVersion:
+                accepted = False
+            if not accepted:
+                raise EnvironmentRefusal(
+                    "package_environment_installed_dependency_changed",
+                    f"distribution={item.wheel.distribution} "
+                    f"requires={requirement} actual={actual!r}",
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1279,7 +1334,21 @@ def _verify_grants(
             )
         )
     root_owners: dict[str, str] = {}
+    resource_files: set[PurePosixPath] = set()
+    resource_directories: set[PurePosixPath] = set()
     for item in inspected:
+        for member in item.members:
+            resource = _prefix_resource(member.filename)
+            if member.is_dir() or resource is None:
+                continue
+            if (
+                resource in resource_files
+                or resource in resource_directories
+                or any(parent in resource_files for parent in resource.parents)
+            ):
+                raise EnvironmentRefusal("package_environment_resource_collision", str(resource))
+            resource_files.add(resource)
+            resource_directories.update(resource.parents)
         for root in item.import_roots:
             prior = root_owners.get(root)
             if prior is not None:
@@ -1338,7 +1407,8 @@ def _inspect(
                     expanded > MAX_WHEEL_EXPANDED_BYTES
                     or (member.compress_size == 0 and member.file_size > 0)
                     or (
-                        member.compress_size > 0
+                        wheel.owner == "project"
+                        and member.compress_size > 0
                         and member.file_size > member.compress_size * MAX_WHEEL_EXPANSION
                     )
                 ):
@@ -1353,7 +1423,8 @@ def _inspect(
                 if member.is_dir():
                     continue
                 installed = _install_path(name)
-                if installed is None and ".data/" in name:
+                prefix_resource = wheel.owner == "custom" and _prefix_resource(name) is not None
+                if installed is None and ".data/" in name and not prefix_resource:
                     raise EnvironmentRefusal(
                         "package_environment_wheel_install_scheme_forbidden", name
                     )
@@ -1364,14 +1435,23 @@ def _inspect(
                     and len(posix.parts) == 1
                     and basename in {"pyproject.toml", "uv.lock"}
                 )
+                # Prebuilt dependency wheels may ship inert source/header resources
+                # (grpcio, SciPy, NumPy). Installation never runs a build. Authored
+                # project wheels still cannot carry native code or build inputs.
                 if (
-                    basename in _BUILD_INPUT_NAMES or suffix in _BUILD_SOURCE_SUFFIXES
-                ) and not project_metadata:
+                    wheel.owner == "project"
+                    and (basename in _BUILD_INPUT_NAMES or suffix in _BUILD_SOURCE_SUFFIXES)
+                    and not project_metadata
+                ):
                     raise EnvironmentRefusal(
                         "package_environment_native_build_input_forbidden", name
                     )
                 magic = archive.open(member).read(4)
                 native = suffix in _NATIVE_SUFFIXES or magic == b"\x7fELF"
+                if native and prefix_resource:
+                    raise EnvironmentRefusal(
+                        "package_environment_native_install_scheme_forbidden", name
+                    )
                 if wheel.owner == "project" and native:
                     raise EnvironmentRefusal("package_environment_project_wheel_native", name)
                 if native:
@@ -1393,11 +1473,12 @@ def _inspect(
                 raise EnvironmentRefusal(
                     "package_environment_wheel_metadata_missing", wheel.filename
                 )
+            for metadata_name in (dist_infos[0], wheel_infos[0]):
+                if archive.getinfo(metadata_name).file_size > MAX_METADATA_BYTES:
+                    raise EnvironmentRefusal(
+                        "package_environment_wheel_metadata_oversized", wheel.filename
+                    )
             metadata = archive.read(dist_infos[0])
-            if len(metadata) > MAX_METADATA_BYTES:
-                raise EnvironmentRefusal(
-                    "package_environment_wheel_metadata_oversized", wheel.filename
-                )
             parsed = BytesParser().parsebytes(metadata)
             parsed_wheel = BytesParser().parsebytes(archive.read(wheel_infos[0]))
             if (
@@ -1475,27 +1556,44 @@ def _inspect(
 
 
 def _verify_record(archive: zipfile.ZipFile, record_name: str, names: set[str]) -> None:
-    raw = archive.read(record_name)
+    recorded: set[str] = set()
     try:
-        rows = list(csv.reader(raw.decode("utf-8").splitlines()))
+        with (
+            archive.open(record_name) as source,
+            io.TextIOWrapper(source, encoding="utf-8", newline="") as text,
+        ):
+            for row in csv.reader(text):
+                if len(row) != 3 or not row[0] or row[0] in recorded or row[0] not in names:
+                    raise EnvironmentRefusal(
+                        "package_environment_wheel_record_invalid", record_name
+                    )
+                recorded.add(row[0])
+                if row[0] == record_name:
+                    if row[1] or row[2]:
+                        raise EnvironmentRefusal(
+                            "package_environment_wheel_record_invalid", record_name
+                        )
+                    continue
+                if not row[1] or not row[2].isdigit():
+                    raise EnvironmentRefusal("package_environment_wheel_record_unhashed", row[0])
+                algorithm, separator, encoded = row[1].partition("=")
+                expected = archive.getinfo(row[0]).file_size
+                if int(row[2]) != expected:
+                    raise EnvironmentRefusal("package_environment_wheel_record_mismatch", row[0])
+                digest, count = hashlib.sha256(), 0
+                with archive.open(row[0]) as payload:
+                    while chunk := payload.read(1 << 20):
+                        count += len(chunk)
+                        if count > expected:
+                            raise EnvironmentRefusal(
+                                "package_environment_wheel_record_mismatch", row[0]
+                            )
+                        digest.update(chunk)
+                got = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode()
+                if algorithm != "sha256" or not separator or encoded != got or count != expected:
+                    raise EnvironmentRefusal("package_environment_wheel_record_mismatch", row[0])
     except (UnicodeError, csv.Error) as exc:
         raise EnvironmentRefusal("package_environment_wheel_record_invalid", record_name) from exc
-    recorded: set[str] = set()
-    for row in rows:
-        if len(row) != 3 or not row[0] or row[0] in recorded or row[0] not in names:
-            raise EnvironmentRefusal("package_environment_wheel_record_invalid", record_name)
-        recorded.add(row[0])
-        if row[0] == record_name:
-            if row[1] or row[2]:
-                raise EnvironmentRefusal("package_environment_wheel_record_invalid", record_name)
-            continue
-        if not row[1] or not row[2].isdigit():
-            raise EnvironmentRefusal("package_environment_wheel_record_unhashed", row[0])
-        algorithm, separator, encoded = row[1].partition("=")
-        payload = archive.read(row[0])
-        got = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
-        if algorithm != "sha256" or not separator or encoded != got or int(row[2]) != len(payload):
-            raise EnvironmentRefusal("package_environment_wheel_record_mismatch", row[0])
     files = {name for name in names if not name.endswith("/")}
     if recorded != files:
         raise EnvironmentRefusal("package_environment_wheel_record_incomplete", record_name)
@@ -1726,6 +1824,46 @@ def _install_path(name: str) -> PurePosixPath | None:
             return None
         return PurePosixPath(*path.parts[2:])
     return path
+
+
+def _prefix_resource(name: str) -> PurePosixPath | None:
+    """Dependency documentation/data belongs to the venv share tree, outside imports."""
+    parts = PurePosixPath(name).parts
+    if len(parts) > 3 and parts[0].endswith(".data") and parts[1:3] == ("data", "share"):
+        return PurePosixPath(*parts[2:])
+    return None
+
+
+def _verify_prefix_resources(generation: Path, inspected: Sequence[_Inspected]) -> None:
+    for item in inspected:
+        resources = [
+            (member, resource)
+            for member in item.members
+            if not member.is_dir() and (resource := _prefix_resource(member.filename)) is not None
+        ]
+        if not resources:
+            continue
+        with zipfile.ZipFile(item.path) as archive:
+            for member, resource in resources:
+                target = generation / resource
+                try:
+                    info = target.lstat()
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or target.resolve() != target
+                        or info.st_size != member.file_size
+                    ):
+                        raise OSError("resource path or size changed")
+                    digest = hashlib.sha256()
+                    with archive.open(member) as source:
+                        while chunk := source.read(1 << 20):
+                            digest.update(chunk)
+                    if _hash_file(target) != "sha256:" + digest.hexdigest():
+                        raise OSError("resource bytes changed")
+                except OSError as exc:
+                    raise EnvironmentRefusal(
+                        "package_environment_installed_resource_changed", str(resource)
+                    ) from exc
 
 
 def _uv_binary() -> Path:

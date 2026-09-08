@@ -45,7 +45,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TENANT = ROOT / "corpus" / "tenant"
 
 PACKAGE = "cozytest/tenant"
-RELEASE = "1"
+RELEASE = "1.0.0"
 LANE = "bf16"
 ENTRYPOINT_SLOT = "touch.models.model"
 RETOUCH_SLOT = "retouch.models.model"
@@ -211,14 +211,21 @@ def test_a_job_shaped_selection_prepares(
     placement = json.loads(result.placement_set.placement_set_canonical_bytes)["placements"][0]
     assert placement["entrypoints"] == []
     assert [row["repo"] for row in placement["models"]] == [PACKAGE]
+    from cozy_runtime.internal.worker.session import read_placement_set
+
+    assert read_placement_set(result.placement_set)[0] == placement
     assert placement["models"][0].get("version", "") == ("" if checkpoint_only else RELEASE)
     assert placement["models"][0].get("lane", "") == ("" if checkpoint_only else LANE)
     # The job plan the JobDirective will resolve against exists.
     assert len(list((tmp_path / "job-plans").glob("*/*.json"))) == 1
 
 
+@pytest.mark.parametrize("checkpoint_only", [False, True])
 def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
-    interface: dict[str, Any], released: tuple[Path, str, int], tmp_path: Path
+    interface: dict[str, Any],
+    released: tuple[Path, str, int],
+    tmp_path: Path,
+    checkpoint_only: bool,
 ) -> None:
     """paul/anima's arm. The release declares two slots and the invocation binds ONE of
     them -- the entrypoint's. That is the case an equality between what the release
@@ -234,10 +241,14 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
         constructed.append(path)
         return ("text_encoder", "unet", "vae")
 
+    selection = _selection(ENTRYPOINT_SLOT, manifest)
+    if checkpoint_only:
+        selection.pop("release")
+        selection.pop("lane")
     models, entrypoints = _entrypoints(
         package_interface.read_bytes(raw),
         package_name=PACKAGE,
-        selections=[_selection(ENTRYPOINT_SLOT, manifest)],
+        selections=[selection],
         tensorfs_root=store_root,
         verified=lambda _digest, _length, _path: None,
         derive=derive,
@@ -246,6 +257,46 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
     assert [slot.slot for slot in entrypoints[0].slots] == ["model"]
     assert [row.repo for row in models] == [PACKAGE]
     assert constructed == [ENTRYPOINT_SLOT]
+
+    from cozy_runtime.internal import base_observation, canonical
+    from cozy_runtime.internal.worker.acquire import Acquirer
+    from cozy_runtime.internal.worker.session import Placement
+    from cozy_runtime.protocol import documents
+
+    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / digest[7:]).write_bytes(raw)
+    acquired = Acquirer(
+        cache_root=cache,
+        install_root=tmp_path / "environment",
+        selection_root=tmp_path / "selection",
+        tensorfs_root=store_root,
+        python=Path("/usr/bin/python3"),
+        base=base_observation.current(),
+    )
+    model_rows = tuple(documents.body(row) for row in models)
+    entry_rows = tuple(documents.body(row) for row in entrypoints)
+    placement = Placement(
+        placement_id="modeled",
+        placement_set_digest=b"a" * 32,
+        package={"package": PACKAGE, "release": RELEASE},
+        development={},
+        environment_digest=b"b" * 32,
+        package_interface=(digest, len(raw)),
+        bindings_digest=documents.digest_of(
+            canonical.write({"models": list(model_rows), "entrypoints": list(entry_rows)})
+        ),
+        models=model_rows,
+        entrypoints=entry_rows,
+        environment={},
+        document={},
+    )
+    bindings, _ = acquired._bindings(placement)
+    assert len(bindings) == 1
+    selected = next(iter(bindings.values())).models[0]
+    assert selected.reference_snapshot == manifest
+    assert selected.model == (PACKAGE if checkpoint_only else f"{PACKAGE}@{RELEASE}/{LANE}")
 
 
 def test_a_job_slot_is_never_constructed_at_preparation(

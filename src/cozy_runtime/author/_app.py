@@ -17,13 +17,14 @@ environment or config read, any device/allocator surface. Those are fenced (§7)
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ParamSpec, TypeVar, overload
 
 from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
+from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
 from cozy_runtime.author._signature import Kind, Surface, analyze
 from cozy_runtime.author._weights import WeightsOutput
 
@@ -63,6 +64,7 @@ class Registration:
     fn: Callable[..., object]
     invocable: bool = False
     memoize: bool = False
+    model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
     publishes: bool = False
     emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
@@ -98,6 +100,7 @@ class Registration:
                 hidden=self.hidden,
                 invocable=self.invocable,
                 memoize=self.memoize,
+                model_defaults=self.model_defaults,
             )
         return self._surface
 
@@ -110,7 +113,14 @@ class App:
     _frozen: bool = False
 
     @overload
-    def entrypoint(self, fn: Callable[P, R], /) -> Callable[P, R]: ...
+    def entrypoint(
+        self,
+        fn: Callable[P, R],
+        /,
+        *,
+        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+        memoize: bool = False,
+    ) -> Callable[P, R]: ...
 
     @overload
     def entrypoint(
@@ -121,7 +131,9 @@ class App:
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
         source_profiles: Mapping[str, str] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         hidden: bool = False,
+        memoize: bool = False,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def entrypoint(
@@ -133,17 +145,24 @@ class App:
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
         source_profiles: Mapping[str, str] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         hidden: bool = False,
+        memoize: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a request-serving callable. BARE is the common case (§1.2).
 
         `hidden=True` declares a surface that is real but NOT READY: it is omitted from the
         published interface and gets no binding staged and no traffic (§1.2, #572d).
 
+        `memoize=True` explicitly admits deterministic measurement results to the managed
+        operation cache. Ordinary generation remains nonmemoized by default.
+
         ``source_profiles`` is RETIRED (cr-077): capability is the slot's class annotation,
         and the publish-time slot facts are derived from the class itself. Passing it
         refuses with the typed code ``source_profiles_retired``."""
         _refuse_source_profiles(source_profiles)
+        if type(memoize) is not bool:
+            raise RegistrationError("entrypoint memoize must be a boolean")
         return self._register(
             "entrypoint",
             fn,
@@ -153,6 +172,8 @@ class App:
             preflight=preflight,
             demand=demand,
             hidden=hidden,
+            memoize=memoize,
+            defaults=defaults,
         )
 
     @overload
@@ -166,6 +187,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         demand: Bound | None = None,
     ) -> Callable[P, R]: ...
 
@@ -179,6 +201,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         demand: Bound | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
@@ -192,6 +215,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         demand: Bound | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a RUN-TO-COMPLETION callable (§2).
@@ -216,6 +240,7 @@ class App:
             weights_outputs=weights,
             preflight=None,
             demand=demand,
+            defaults=defaults,
         )
 
     def _register(
@@ -230,7 +255,11 @@ class App:
         demand: Bound | None,
         emits_media: bool = False,
         hidden: bool = False,
+        memoize: bool = False,
+        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
+        declared_defaults = model_defaults(defaults)
+
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             if self._frozen:
                 raise RegistrationError(
@@ -242,12 +271,18 @@ class App:
                 raise RegistrationError(
                     f"duplicate registration {registered!r}: names are unique per app"
                 )
+            export = _export(target)
+            if declared_defaults and export is not None and export.defaults:
+                raise ConformanceError(
+                    "declare defaults once, on invocable or App registration", code="model_defaults"
+                )
             self._registry[registered] = Registration(
                 name=registered,
                 kind=kind,
-                fn=export.implementation if (export := _export(target)) else target,
+                fn=export.implementation if export is not None else target,
                 invocable=export is not None,
-                memoize=export.memoize if export is not None else False,
+                memoize=export.memoize if export is not None else memoize,
+                model_defaults=declared_defaults or (export.defaults if export is not None else {}),
                 publishes=publishes,
                 emits_media=emits_media,
                 weights_outputs=weights_outputs,

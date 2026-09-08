@@ -177,11 +177,12 @@ def _deadline(seconds: float | None) -> float:
 
 
 def _granted_inputs(command: Mapping[str, Any]) -> dict[str, GrantedInput]:
-    """Verified worker-spooled inputs, projected identically into either execution lane."""
+    """Verified input paths, projected identically into either execution lane."""
     return {
         input_id: GrantedInput(
             input_id=input_id,
             local=Path(row["local"]),
+            file_state=tuple(row["file_state"]) if row.get("file_state") else None,
             media_type=str(row["media_type"]),
             digest=str(row["digest"]),
             length=int(row["length"]),
@@ -835,7 +836,20 @@ class Executor:
             _mark[0] = now
 
         self._stages = stages
+        pin = str(command.get("attention_pin", ""))
         if not binding.get("model_class"):
+            if pin:
+                # A PIN IS NEVER SILENTLY IGNORED (cr-125). A weightless binding constructs
+                # nothing and therefore holds no attention site, so there is nowhere to put
+                # the kernel that was named — and a run that reported success while serving
+                # no pin at all is the same lie as one that quietly served another kernel.
+                self.poisoned = "attention pin on a weightless binding"
+                return {
+                    "ok": False,
+                    "code": "attention_kernel_unsupported",
+                    "detail": f"{pin} was pinned on a binding that declares no model; a "
+                    "weightless package holds no attention site and a pin is never ignored",
+                }
             return self._prepare_weightless(binding, started)
         if "authorized_device_limit_bytes" not in command:
             # NO SELF-DERIVED CEILING (cr-025/cr-066): the worker assigns one before every
@@ -1272,7 +1286,14 @@ class Executor:
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
             # per attention SITE and before any warm step. No checkpoint is consulted:
             # attention is weightless, so the choice is (device, image) and nothing else.
-            applied = attention.select(device_facts, {**backend.components, **backend.parked})
+            # `pin` is the execution-path override (cr-125) and is empty on every serving
+            # worker; when it is set it names ONE kernel and refuses rather than falling
+            # back. HERE is the only place it can act: `warm` may compile the module in
+            # place and a group installs its collectives next, and cp.py's ordering is
+            # forced — set the backend, then parallelism, then compile. A pin applied after
+            # either is a field nobody reads, which is why this is a construction fact and
+            # not a per-attempt one.
+            applied = attention.select(device_facts, {**backend.components, **backend.parked}, pin)
             stage("attention_pin")
         except ModelFitRefused as exc:
             # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
@@ -1627,6 +1648,9 @@ class Executor:
                     **row,
                     "devices": command.get("devices", ""),
                     "authorized_device_limit_bytes": max(authorized - held, 0),
+                    # One construction, one execution path: every model of a set takes the
+                    # same pin (cr-125), exactly as they share one device authorization.
+                    "attention_pin": command.get("attention_pin", ""),
                 }
             )
             if reply.get("ok"):
@@ -1696,6 +1720,24 @@ class Executor:
             for component, layout in (facts.get("paging") or {}).items()
         }
         pinned_rows = [facts.get("pinned") or {} for _, facts in facts_rows]
+        # WHAT EACH MODEL PINNED, MERGED (cr-124). A group prepare has one boot note, so a
+        # per-model `attention` fact would simply be dropped and the placement would report
+        # no kernel at all — the one fact the boot line exists to carry. Components are
+        # namespaced by their model's parameter, exactly as `resident` and `parked` are.
+        attention_hosts: dict[str, dict[str, int]] = {}
+        attention_kernels: dict[str, int] = {}
+        attention_offered: list[str] = []
+        attention_locations: dict[str, str] = {}
+        for parameter, facts in facts_rows:
+            row = facts.get("attention") or {}
+            for component, chosen in (row.get("hosts") or {}).items():
+                attention_hosts[f"{parameter}/{component}"] = dict(chosen)
+            for name, sites in (row.get("kernels") or {}).items():
+                attention_kernels[name] = attention_kernels.get(name, 0) + int(sites)
+            attention_locations.update(row.get("locations") or {})
+            for name in row.get("offered") or ():
+                if name not in attention_offered:
+                    attention_offered.append(name)
         routes: dict[str, int] = {}
         kernels: dict[str, int] = {}
         for _, _, reply in children:
@@ -1757,6 +1799,16 @@ class Executor:
                 "registered_bytes": sum(int(row.get("registered_bytes", 0)) for row in pinned_rows),
                 "in_flight_bytes": sum(int(row.get("in_flight_bytes", 0)) for row in pinned_rows),
             },
+            "attention": {
+                "kernels": attention_kernels,
+                "hosts": attention_hosts,
+                "offered": attention_offered,
+                "locations": attention_locations,
+                "pin": "",
+                "line": attention.line(attention_kernels, attention_hosts, attention_offered, ""),
+            }
+            if attention_kernels
+            else None,
             "gpu_name": str(last.get("gpu_name", "")),
             "torch_version": str(last.get("torch_version", "")),
             "cuda_version": str(last.get("cuda_version", "")),
@@ -2598,6 +2650,12 @@ class Executor:
                         code="child_interface",
                     )
                 binding = candidate
+                # Source-preserving caller wheels retain ordinary @invocable job
+                # wrappers, whose lookup is by their exact module/export pair.
+                prior = bindings.get(("", module, export))
+                if prior is not None and prior != binding:
+                    raise CapabilityError("ambiguous managed export", code="child_interface")
+                bindings[("", module, export)] = binding
             bindings[(interface, module, export)] = binding
         return _Broker(str(command["request_id"]), bindings, self._durable)
 

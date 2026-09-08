@@ -35,14 +35,16 @@ from typing import Annotated, Literal
 import msgspec
 
 import cozy_runtime
+import cozy_runtime.internal.invocable_interface as invocable_interface
 import cozy_runtime.internal.package_interface as package_interface
 import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._model import Model
+from cozy_runtime.author._model_defaults import DefaultLadder, check_model_arguments, model_defaults
 from cozy_runtime.author._script_metadata import declarations, main_definition
 from cozy_runtime.author._services import SERVICES
-from cozy_runtime.author._signature import AssetsBinding, assets_binding, assets_payload
+from cozy_runtime.author._signature import AssetsBinding, _classify, assets_binding, assets_payload
 from cozy_runtime.author._walker import is_struct
 from cozy_runtime.internal.bindings import read_table
 from cozy_runtime.internal.canonical import Json
@@ -227,8 +229,8 @@ _SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
 #: A fold carries no local names unless a comprehension binds its own target.
 _NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
-_ENTRYPOINT_KEYWORDS = frozenset({"name", "preflight", "demand", "hidden"})
-_JOB_KEYWORDS = frozenset({"name", "publishes", "emits_media", "weights", "demand"})
+_ENTRYPOINT_KEYWORDS = frozenset({"name", "preflight", "demand", "hidden", "memoize", "defaults"})
+_JOB_KEYWORDS = frozenset({"name", "publishes", "emits_media", "weights", "demand", "defaults"})
 
 
 # -------------------------------------------------------------------------- the reader
@@ -516,6 +518,17 @@ class Reader:
         if isinstance(node, ast.Name) and node.id == "__file__":
             # The one dunder a data asset is addressed from: this module's own file.
             return str(module.path)
+        if isinstance(node, ast.Attribute):
+            base = self.resolve(module, node.value)
+            if (
+                isinstance(base, Definition)
+                and isinstance(base.node, ast.ClassDef)
+                and self.class_kind(base.module, base.node) == "enum"
+            ):
+                built = typing.cast(type[enum.Enum], self.class_type(base.module, base.node, node))
+                if node.attr in built.__members__:
+                    return built.__members__[node.attr]
+                self.refuse(module, node, "unknown enumeration member")
         if isinstance(node, (ast.Name, ast.Attribute)):
             found = self.resolve(module, node)
             if isinstance(found, Assigned):
@@ -827,6 +840,19 @@ class Reader:
                         return name, annotation, msgspec.field(default_factory=_unfolded, name=wire)
                     return name, annotation, msgspec.field(default=default, name=wire)
                 if "default_factory" in options:
+                    factory = self.resolve(module, options["default_factory"])
+                    if isinstance(factory, Vocab) and factory.key in (
+                        "builtins.list",
+                        "builtins.dict",
+                    ):
+                        return (
+                            name,
+                            annotation,
+                            msgspec.field(
+                                default_factory=list if factory.key == "builtins.list" else dict,
+                                name=wire,
+                            ),
+                        )
                     return name, annotation, msgspec.field(default_factory=_unfolded, name=wire)
                 return name, annotation, msgspec.field(name=wire)
         # Invocable metadata carries exact scalar defaults. Ordinary request
@@ -1072,6 +1098,7 @@ class Registration:
     weights: tuple[author.WeightsOutput, ...]
     invocable: bool = False
     memoize: bool = False
+    model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
 
 
 def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
@@ -1219,6 +1246,7 @@ def _registration(
 ) -> Registration | None:
     function_module = module
     invocable, memoize = False, False
+    default_models: dict[str, DefaultLadder] = {}
     for index, export in enumerate(fn.decorator_list):
         target = export.func if isinstance(export, ast.Call) else export
         if not _is_invocable(reader, function_module, target):
@@ -1232,15 +1260,20 @@ def _registration(
             )
         invocable = True
         if isinstance(export, ast.Call):
-            if export.args or any(keyword.arg != "memoize" for keyword in export.keywords):
+            if export.args or any(
+                keyword.arg not in {"memoize", "defaults"} for keyword in export.keywords
+            ):
                 reader.refuse(
                     function_module,
                     export,
-                    "@invocable accepts only memoize=",
+                    "@invocable accepts only memoize= and defaults=",
                     "static_unsupported",
                 )
             for keyword in export.keywords:
                 value = reader.fold(function_module, keyword.value)
+                if keyword.arg == "defaults":
+                    default_models = model_defaults(value)
+                    continue
                 if type(value) is not bool:
                     reader.refuse(
                         function_module, keyword.value, "invocable memoize must be a boolean"
@@ -1283,12 +1316,23 @@ def _registration(
             reader.fold(module, keyword.value)
             continue
         value = reader.fold(module, keyword.value)
-        if keyword.arg == "name":
+        if keyword.arg == "defaults":
+            declared_defaults = model_defaults(value)
+            if default_models and declared_defaults:
+                reader.refuse(
+                    module, keyword, "declare defaults once, on invocable or App registration"
+                )
+            default_models = declared_defaults or default_models
+        elif keyword.arg == "name":
             name = str(value)
         elif keyword.arg == "hidden" and value is True:
             return None
         elif keyword.arg == "publishes":
             publishes = bool(value)
+        elif keyword.arg == "memoize":
+            if type(value) is not bool:
+                reader.refuse(module, keyword.value, "entrypoint memoize must be a boolean")
+            memoize = value
         elif keyword.arg == "weights":
             assert isinstance(value, tuple)
             weights = tuple(value)
@@ -1301,6 +1345,7 @@ def _registration(
         weights,
         invocable,
         memoize,
+        default_models,
     )
 
 
@@ -1342,6 +1387,8 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         reader.refuse(module, fn, "*args/**kwargs on a handler", "static_unsupported")
     payloads: list[object] = []
     models: list[dict[str, Json]] = []
+    contexts: list[str] = []
+    capabilities: list[str] = []
     assets: AssetsBinding | None = None
     for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
         if arg.annotation is None:
@@ -1355,13 +1402,27 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
             ):
                 if isinstance(node, ast.Subscript):
                     reader.translate(annotation_module, node.slice)
+                parameter = _classify(
+                    arg.arg, reader.translate(module, arg.annotation), f"{module.name}:{fn.name}"
+                )
+                if parameter.role == "context":
+                    contexts.append(arg.arg)
+                if parameter.capability:
+                    capabilities.append(parameter.capability)
                 continue
             if vocab_name in {cls.__name__ for cls in SERVICES.values()}:
+                parameter = _classify(
+                    arg.arg, reader.translate(module, arg.annotation), f"{module.name}:{fn.name}"
+                )
+                if parameter.capability:
+                    capabilities.append(parameter.capability)
                 continue
             if vocab_name in ("Assets", "Annotated"):
                 if assets is not None:
                     reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
                 assets = assets_binding(arg.arg, reader.translate(module, arg.annotation))
+                if assets.decoded:
+                    capabilities.append("media_decode")
                 continue
 
         if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
@@ -1376,6 +1437,7 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                         spec.fusion,
                         spec.components,
                         spec.sequence_parallel,
+                        defaults=registration.model_defaults.get(arg.arg, ()),
                     )
                 )
                 continue
@@ -1383,6 +1445,10 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 payloads.append(reader.translate(module, arg.annotation))
                 continue
         reader.refuse(module, arg.annotation, f"parameter {arg.arg}: not an author surface type")
+    check_model_arguments(
+        registration.model_defaults,
+        [str(slot["path"]).rsplit(".", 1)[-1] for slot in models],
+    )
     if len(payloads) != 1:
         reader.refuse(
             module, fn, f"exactly one typed request struct is required, found {len(payloads)}"
@@ -1399,7 +1465,7 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         payload = assets_payload(
             typing.cast(type[msgspec.Struct], payload), assets, fn.name, module.name
         )
-    return package_interface.callable_doc(
+    doc = package_interface.callable_doc(
         name=registration.name,
         kind=registration.kind,
         payload_type=payload,
@@ -1409,6 +1475,17 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         publishes=registration.publishes,
         weights_outputs=registration.weights,
     )
+    if registration.kind == "entrypoint":
+        doc["invocable"] = invocable_interface.serving_metadata(
+            payload,
+            result,
+            module=module.name,
+            export=fn.name,
+            context=contexts[0] if contexts else "",
+            capabilities=sorted(capabilities),
+            memoize=registration.memoize,
+        )
+    return doc
 
 
 def environment_roots(python: Path | None, *, project: Path) -> tuple[Path, ...]:
