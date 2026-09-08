@@ -15,7 +15,6 @@ KINDS = (
     "outcome",
     "closed",
     "epoch",
-    "warm",
     "ledger",
     "triage",
     "job_checkpoint",

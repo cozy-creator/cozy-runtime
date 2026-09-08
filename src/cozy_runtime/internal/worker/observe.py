@@ -3,9 +3,10 @@
 Three things live here because they are one idea — what the worker knows about itself, kept
 bounded and kept honest.
 
-**Boot is attributed per step, and every step is typed.** `download | load | warm | derive`
-are the closed vocabulary; a step emits `started` at POSITION ZERO so a wedge before the
-first unit still renders, and it ends with an outcome. A compile/derive slice is named as
+**Boot is attributed per step, and every step is typed.** `download | load | derive` are
+the closed vocabulary (an author's `Model.warm` is a leg of `load`, cr-110); a step emits
+`started` at POSITION ZERO so a wedge before the first unit still renders, and it ends
+with an outcome. A compile/derive slice is named as
 its own step even though nothing measures it yet: leaving it unnamed is how the cache door's
 cost became invisible in v1.
 
@@ -30,7 +31,7 @@ from cozy_runtime.author._observations import EventRing, Observation, Scalar
 
 #: The CLOSED boot-step vocabulary (§3.3). `derive` is named even though no torchcg issue
 #: measures it — an unnamed step is a cost nobody can see.
-BOOT_STEPS = ("download", "load", "warm", "derive")
+BOOT_STEPS = ("download", "load", "derive")
 #: The two phases of one attempt (cr-079): the device phase, and the post phase that
 #: encodes and writes its outputs after device release.
 ATTEMPT_STEPS = ("invoke", "post")

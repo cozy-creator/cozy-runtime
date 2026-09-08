@@ -184,8 +184,6 @@ class _Broker:
         if self.closed or ctx is None or ctx.request_id != self.request_id:
             raise CapabilityError("package call escaped its attempt", code="escaped_handle")
         ctx.raise_if_cancelled()
-        if ctx.boot_warmup:
-            raise CapabilityError("warmup cannot reserve package calls", code="child_warmup")
         binding = self.bindings.get((interface_digest, module, export))
         if binding is None:
             raise CapabilityError(

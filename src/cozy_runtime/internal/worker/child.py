@@ -201,7 +201,7 @@ class Executor:
         """Bound a seam call by this process's OWN work, not by a clock.
 
         A cold `describe_installed` imports the package — torch included — and a `probe`
-        after a warm pass waits on a device sync backlog; neither has a length anyone can
+        after an attempt waits on a device sync backlog; neither has a length anyone can
         state in advance, and both used to be cut at a number of seconds a warm box happened
         to fit inside. Inside this context the call is made with no timeout, and this
         process is sampled on `liveness.SAMPLE_SECONDS`: it is killed — exact birth, through

@@ -27,7 +27,7 @@ boot='different-boot' if mode=='wrong-boot' else 'same-pod-boot'
 try:
     worker=Worker(RuntimeConfig(cozy_home=root/'home',credentials=Credentials(),
         record_owner_public_key=key.public_key().public_bytes(Encoding.Raw,PublicFormat.Raw)),
-        WorkerOptions(root=root/'worker',tensorfs_root=root/'store',no_warm=True,
+        WorkerOptions(root=root/'worker',tensorfs_root=root/'store',
             worker_id='fence-proof',worker_boot_id=boot,ownership_required=mode!='first',
             worker_tls_certificate_digest='sha256:'+'a'*64),InMemoryControlHost())
 except LaunchRefusal as exc:
