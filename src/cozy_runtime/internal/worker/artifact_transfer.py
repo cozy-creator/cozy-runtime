@@ -32,19 +32,39 @@ class NativeArtifactTransfers:
         self.allow_private_egress = allow_private_egress
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="native-artifact")
         self.lock = threading.Lock()
-        self.active: set[tuple[str, int]] = set()
+        self.active: dict[tuple[str, int, int, str, str, int], bytes] = {}
 
     def handle(self, command: pb.NativeArtifactTransfer) -> None:
         if not self.valid(command):
             raise WorkspaceRefusal("native artifact command has a stale claim")
         copied = pb.NativeArtifactTransfer.FromString(command.SerializeToString())
-        key = (command.effect_id, command.command_id)
+        key = (
+            self.owner(),
+            command.record_owner_epoch,
+            command.control_stream_epoch,
+            command.worker_boot_id,
+            command.effect_id,
+            command.command_id,
+        )
+        fingerprint = hashlib.sha256(copied.SerializeToString(deterministic=True)).digest()
+        refusal = ""
         with self.lock:
-            if key in self.active:
+            previous = self.active.get(key)
+            if previous == fingerprint:
                 return
-            if len(self.active) >= 32:
-                raise WorkspaceRefusal("native artifact transfer concurrency exceeds its bound")
-            self.active.add(key)
+            if previous is not None:
+                refusal = "native_artifact_refused"
+            elif len(self.active) >= 32:
+                refusal = "native_artifact_busy"
+            else:
+                self.active[key] = fingerprint
+        if refusal:
+            result = self._status(copied)
+            result.outcome = pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
+            result.safe_code = refusal
+            result.safe_detail = "native artifact command changed or has no available transfer slot"
+            self.send(pb.WorkerFrame(native_artifact_transfer_status=result))
+            return
 
         def run() -> None:
             try:
@@ -52,7 +72,7 @@ class NativeArtifactTransfers:
                 self.send(pb.WorkerFrame(native_artifact_transfer_status=result))
             finally:
                 with self.lock:
-                    self.active.discard(key)
+                    self.active.pop(key, None)
 
         self.pool.submit(run)
 
@@ -94,14 +114,20 @@ class NativeArtifactTransfers:
                 raise WorkspaceRefusal("native artifact hold was released during acquisition")
             return lease, manifest
 
-    def execute(self, command: pb.NativeArtifactTransfer) -> pb.NativeArtifactTransferStatus:
-        result = pb.NativeArtifactTransferStatus(
+    @staticmethod
+    def _status(command: pb.NativeArtifactTransfer) -> pb.NativeArtifactTransferStatus:
+        # Correlate even refusals raised before a native source can be opened.
+        return pb.NativeArtifactTransferStatus(
             effect_id=command.effect_id,
             source=command.source,
             manifest=command.manifest,
             command_id=command.command_id,
             grant_revision=command.grant_revision,
+            object_id=command.grant.object_id if command.HasField("grant") else "",
         )
+
+    def execute(self, command: pb.NativeArtifactTransfer) -> pb.NativeArtifactTransferStatus:
+        result = self._status(command)
         lease = None
         reader: Any = None
         try:

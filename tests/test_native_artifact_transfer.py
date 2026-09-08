@@ -126,3 +126,117 @@ def test_native_upload_lost_http_response_retries_same_bytes(tmp_path: Path) -> 
         server.server_close()
         thread.join()
         transfers.close()
+
+
+def test_upload_refusal_keeps_object_identity_before_hold_validation(tmp_path: Path) -> None:
+    _store, workspace, receipt = produced(tmp_path)
+    source = pb.DerivedRetentionRequest(
+        weights_transaction_id=receipt.weights_transaction_id,
+        tensorfs_receipt_digest=documents.raw(receipt.tensorfs_receipt_digest),
+        retention_id="sha256:" + "c" * 64,
+    )
+    held = workspace.retain("owner", source)
+    transfers = NativeArtifactTransfers(workspace, lambda: "owner", lambda _: None, lambda _: True)
+    try:
+        command = pb.NativeArtifactTransfer(
+            effect_id="refused-effect",
+            source=source,
+            manifest=held.manifest,
+            command_id=7,
+            grant_revision=1,
+            grant=pb.WeightsUploadGrant(object_id="sha256:" + "3" * 64, length=4),
+        )
+        workspace.retain("owner", source, release=True)
+        refused = transfers.execute(command)
+        assert refused.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_REFUSED
+        assert refused.object_id == command.grant.object_id
+        assert refused.source == command.source and refused.manifest == command.manifest
+        assert refused.command_id == command.command_id
+    finally:
+        transfers.close()
+
+
+def test_reclaimed_control_stream_does_not_drop_reused_command_number(tmp_path: Path) -> None:
+    import queue
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    _store, workspace, receipt = produced(tmp_path)
+    source = pb.DerivedRetentionRequest(
+        weights_transaction_id=receipt.weights_transaction_id,
+        tensorfs_receipt_digest=documents.raw(receipt.tensorfs_receipt_digest),
+        retention_id="sha256:" + "b" * 64,
+    )
+    held = workspace.retain("owner", source)
+    responses: queue.Queue[pb.WorkerFrame] = queue.Queue()
+    active_epoch = [1]
+    transfers = NativeArtifactTransfers(
+        workspace,
+        lambda: "owner",
+        responses.put,
+        lambda command: command.control_stream_epoch == active_epoch[0],
+        allow_private_egress=True,
+    )
+    received = threading.Event()
+    finish = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_PUT(self) -> None:
+            self.rfile.read(int(self.headers["Content-Length"]))
+            received.set()
+            finish.wait(10)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    serving_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    serving_thread.start()
+    try:
+        old = pb.NativeArtifactTransfer(
+            effect_id="reclaimed-effect",
+            source=source,
+            manifest=held.manifest,
+            record_owner_epoch=1,
+            control_stream_epoch=1,
+            worker_boot_id="boot",
+            command_id=1,
+            grant_revision=1,
+            server_time_unix=100,
+            grant=pb.WeightsUploadGrant(
+                object_id=documents.spell(held.manifest.digest),
+                length=held.manifest.length,
+                url=f"http://127.0.0.1:{server.server_port}/object",
+                expires_at_unix=200,
+            ),
+        )
+        transfers.handle(old)
+        assert received.wait(5)
+        active_epoch[0] = 2
+        new = pb.NativeArtifactTransfer(
+            effect_id=old.effect_id,
+            source=source,
+            manifest=held.manifest,
+            record_owner_epoch=1,
+            control_stream_epoch=2,
+            worker_boot_id="boot",
+            command_id=1,
+            limit=128,
+        )
+        transfers.handle(new)
+        try:
+            answer = responses.get(timeout=2).native_artifact_transfer_status
+        except queue.Empty:
+            raise AssertionError(
+                "new control command was hidden by the old active command"
+            ) from None
+        assert answer.command_id == 1 and answer.objects and not answer.safe_code
+    finally:
+        finish.set()
+        transfers.pool.shutdown(wait=True)
+        server.shutdown()
+        server.server_close()
+        serving_thread.join()
