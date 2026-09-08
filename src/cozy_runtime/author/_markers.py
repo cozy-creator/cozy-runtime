@@ -170,8 +170,8 @@ class AssetBound:
       and returned to the handler, not codec working memory or peak process RSS. Request data
       cannot set it.
 
-    Counts belong to the collection: Meta(max_length=...) or the AssetLimits decorator
-    declaration. Both compile centrally into the same request and kind constraints.
+    Counts belong to the collection: Meta(max_length=...) or the AssetLimits argument
+    annotation. Both compile centrally into the same request and kind constraints.
     """
 
     max_bytes: int | None = None
