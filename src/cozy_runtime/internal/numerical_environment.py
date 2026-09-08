@@ -107,7 +107,8 @@ def _record_digest(record: str) -> str:
             or (
                 len(path.parts) == 2
                 and path.parts[0].endswith(".dist-info")
-                and path.name in {"RECORD", "INSTALLER", "REQUESTED", "direct_url.json"}
+                and path.name
+                in {"RECORD", "INSTALLER", "REQUESTED", "direct_url.json", "uv_cache.json"}
             )
         ):
             continue
