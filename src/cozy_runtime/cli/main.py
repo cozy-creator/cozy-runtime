@@ -84,7 +84,7 @@ global flags:
   --package-interface <path>
                    exact PackageInterface input for describe/bindings (no package import)
   --environment-python <venv/bin/python>
-                   describe source roots of an explicit venv; never executes its Python
+                   describe/bindings source roots of an explicit venv; never executes it
   --conformance    describe only: also IMPORT the app in this interpreter — which must be
                    the package's own locked venv — and refuse unless it matches the source
   -h, --help       this text
@@ -172,10 +172,10 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
-    if opts.environment_python and verb != "describe":
+    if opts.environment_python and verb not in ("describe", "bindings"):
         raise CliError(
             "usage",
-            "--environment-python belongs only to describe",
+            "--environment-python belongs only to describe or bindings",
             "cozy-runtime describe --environment-python <venv/bin/python>",
             Exit.usage,
         )

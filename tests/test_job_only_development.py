@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -49,3 +54,49 @@ def test_empty_interface_still_refuses() -> None:
             release="0.0.0",
             source_digest="sha256:" + "a" * 64,
         )
+
+
+@pytest.mark.parametrize("kind", ["job", "entrypoint"])
+def test_metadata_placement_never_imports_weightless_or_job_source(
+    tmp_path: Path, kind: str
+) -> None:
+    module = f"never_import_placement_{kind}"
+    marker = tmp_path / "imported"
+    (tmp_path / "package.toml").write_text(f'[application]\nobject = "{module}:app"\n')
+    (tmp_path / f"{module}.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+        "import unavailable_package_dependency\n"
+        "import msgspec\nfrom cozy_runtime.author import App\napp = App()\n"
+        "class Request(msgspec.Struct):\n    value: int\n"
+        "class Result(msgspec.Struct):\n    value: int\n"
+        f"@app.{kind}\n"
+        "def run(payload: Request) -> Result:\n    return Result(payload.value)\n"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cozy_runtime.cli.main",
+            "--json",
+            "--dir",
+            str(tmp_path),
+            "development-placement",
+            "--package",
+            "local/no-import",
+            "--release",
+            "0.0.0",
+            "--source-digest",
+            "sha256:" + "a" * 64,
+            "--tensorfs-root",
+            str(tmp_path / "store"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "COZY_HOME": str(tmp_path / "home")},
+    )
+    assert result.returncode == 0, result.stderr
+    body = json.loads(result.stdout)
+    interface = json.loads(base64.b64decode(body["package_interface"]["canonical_bytes_base64"]))
+    assert [row["name"] for row in interface["jobs" if kind == "job" else "entrypoints"]] == ["run"]
+    assert not marker.exists()
