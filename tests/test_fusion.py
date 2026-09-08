@@ -23,7 +23,9 @@ exercised on the real `_scaled_mm` route.
 
 from __future__ import annotations
 
+import gc
 import json
+import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -101,6 +103,10 @@ def _no_grad(artifact: Path) -> Iterator[None]:
     _point_loader_at(artifact)
     with torch.no_grad():
         yield
+    # Each arm builds a real-width transformer; a development card is 8 GiB, so the
+    # previous arm's is collected before the next one allocates.
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def _assert_bf16_close(reference: Any, actual: Any, *, exact: bool = False) -> None:
@@ -306,7 +312,7 @@ def test_loader_never_compiles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
 
 
 @needs_card
-def test_artifact_absent_or_stale_refuses_typed(tmp_path: Path, artifact: Path) -> None:
+def test_artifact_absent_or_stale_is_typed_at_the_loader(tmp_path: Path, artifact: Path) -> None:
     device = torch.device("cuda")
     _point_loader_at(tmp_path)
     with pytest.raises(fusion.FusionUnavailable) as absent:
@@ -334,11 +340,53 @@ def test_artifact_absent_or_stale_refuses_typed(tmp_path: Path, artifact: Path) 
         fusion.load(device)
     assert stale_sources.value.code == "fusion_kernels_stale"
 
+    # A CONSENTING PACKAGE STILL SERVES on a stale artifact: recorded, not refused.
+    stale_record = fusion_install.apply_fusion_plan(
+        _Holder(_one_block_transformer(torch, device)), torch=torch, device=device
+    )
+    assert not stale_record.applied and stale_record.code == "fusion_kernels_stale"
     with pytest.raises(fusion_install.FusionRefusal) as through_plan:
         fusion_install.apply_fusion_plan(
-            _Holder(_one_block_transformer(torch, device)), torch=torch, device=device
+            _Holder(_one_block_transformer(torch, device)),
+            torch=torch,
+            device=device,
+            required=True,
         )
     assert through_plan.value.code == "fusion_kernels_stale"
+
+
+@needs_card
+def test_absent_artifact_serves_eager_and_records_the_fact(tmp_path: Path) -> None:
+    """`fusion="accept"` is CONSENT: an image with no artifact serves the eager forward.
+
+    The whole path the executor calls, on a real transformer: the plan does not install,
+    the record carries the typed code and both fixed paths the loader looked in, no
+    module's class changed, and the next forward is bit-for-bit the eager one. The
+    `fusion="require"` spelling is what turns the same condition into a refusal.
+    """
+    device = torch.device("cuda")
+    transformer = _one_block_transformer(torch, device)
+    inputs = _packed_inputs(torch, device, seq=1536)
+    video_eager, audio_eager = transformer(**inputs)
+    was = type(transformer.transformer_blocks[0])
+
+    nowhere = tmp_path / "an-image-baked-without-the-stage"
+    _point_loader_at(nowhere)
+    record = fusion_install.apply_fusion_plan(_Holder(transformer), torch=torch, device=device)
+
+    assert not record.applied and record.code == "fusion_kernels_absent"
+    assert str(nowhere) in record.reason and str(fusion.IMAGE_KERNELS_DIR) in record.reason
+    assert record.document()["code"] == "fusion_kernels_absent"
+    assert record.substitutions == () and record.fp8_sites == 0
+    assert type(transformer.transformer_blocks[0]) is was
+    video, audio = transformer(**inputs)
+    assert torch.equal(video, video_eager) and torch.equal(audio, audio_eager)
+
+    with pytest.raises(fusion_install.FusionRefusal) as required:
+        fusion_install.apply_fusion_plan(
+            _Holder(transformer), torch=torch, device=device, required=True
+        )
+    assert required.value.code == "fusion_kernels_absent"
 
 
 @needs_card
@@ -347,25 +395,89 @@ def test_build_is_deterministic() -> None:
 
 
 @needs_card
-def test_source_drift_refuses_before_any_substitution(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_built_artifact_carries_the_launcher_module(artifact: Path) -> None:
+    """The NON-`--check` build path, which CI never runs: `utils=True`.
+
+    `fusion_build.check` passes `utils=False` and so never calls `build_utils()` — which
+    has Triton link AND dlopen `cuda_utils`, whose own `libcuda.so.1` NEEDED entry has to
+    resolve. Every arm in this file loads through the fixture's `build(...)` (utils on),
+    so the module is built, carried and placed; this names the invariant.
+    """
+    manifest = json.loads((artifact / fusion.MANIFEST).read_text())
+    assert manifest["utils"] and manifest["utils"] == fusion.utils_key()
+    carried = sorted(path.name for path in (artifact / "utils" / manifest["utils"]).iterdir())
+    assert any(name.endswith(".so") for name in carried), carried
+
+
+@needs_card
+def test_corrupt_artifact_refuses_even_under_accept(tmp_path: Path, artifact: Path) -> None:
+    """An artifact keyed to THIS runtime that does not work is a BAD BAKE, not an absence.
+
+    `accept` serves eager past an image that was never given kernels; it must not serve
+    eager past one that was given broken ones, or nobody would ever find the bake bug.
+    """
+    device = torch.device("cuda")
+    manifest = json.loads((artifact / fusion.MANIFEST).read_text())
+
+    # (a) the launcher module the manifest names, not carried.
+    no_utils = tmp_path / "no-launcher-module"
+    shutil.copytree(artifact, no_utils)
+    shutil.rmtree(no_utils / "utils" / manifest["utils"])
+    _point_loader_at(no_utils)
+    with pytest.raises(fusion.FusionUnavailable) as broken:
+        fusion.load(device)
+    assert broken.value.code == "fusion_kernels_corrupt"
+    with pytest.raises(fusion_install.FusionRefusal) as refused:
+        fusion_install.apply_fusion_plan(
+            _Holder(_one_block_transformer(torch, device)), torch=torch, device=device
+        )
+    assert refused.value.code == "fusion_kernels_corrupt"
+
+    # (b) the cubin entries the manifest names, not carried.
+    gutted = tmp_path / "no-entry-files"
+    shutil.copytree(artifact, gutted)
+    for digest in manifest["targets"][f"sm{_arch()}"].values():
+        shutil.rmtree(gutted / f"sm{_arch()}" / digest)
+    _point_loader_at(gutted)
+    with pytest.raises(fusion.FusionUnavailable) as gone:
+        fusion.load(device)
+    assert gone.value.code == "fusion_kernels_corrupt"
+
+
+@needs_card
+def test_source_drift_serves_eager_before_any_substitution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     device = torch.device("cuda")
     transformer = _one_block_transformer(torch, device)
     was = type(transformer.transformer_blocks[0])
     monkeypatch.setitem(fusion_install._SOURCE_DIGESTS, "SwiGLU.forward", "0" * 64)
+    record = fusion_install.apply_fusion_plan(_Holder(transformer), torch=torch, device=device)
+    assert not record.applied and record.code == "fusion_source_mismatch"
+    assert type(transformer.transformer_blocks[0]) is was
     with pytest.raises(fusion_install.FusionRefusal) as refused:
-        fusion_install.apply_fusion_plan(_Holder(transformer), torch=torch, device=device)
+        fusion_install.apply_fusion_plan(
+            _Holder(transformer), torch=torch, device=device, required=True
+        )
     assert refused.value.code == "fusion_source_mismatch"
     assert type(transformer.transformer_blocks[0]) is was
 
 
 @needs_card
-def test_absent_triton_refuses_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_absent_triton_is_recorded_and_eager_serves(monkeypatch: pytest.MonkeyPatch) -> None:
     device = torch.device("cuda")
     monkeypatch.setattr(fusion.load, "_cached", {}, raising=False)
     monkeypatch.setattr(fusion, "TRITON_ABSENT", "triton does not import (planted)")
+    record = fusion_install.apply_fusion_plan(
+        _Holder(_one_block_transformer(torch, device)), torch=torch, device=device
+    )
+    assert not record.applied and record.code == "fusion_triton_absent"
     with pytest.raises(fusion_install.FusionRefusal) as refused:
         fusion_install.apply_fusion_plan(
-            _Holder(_one_block_transformer(torch, device)), torch=torch, device=device
+            _Holder(_one_block_transformer(torch, device)),
+            torch=torch,
+            device=device,
+            required=True,
         )
     assert refused.value.code == "fusion_triton_absent"
 
@@ -374,10 +486,14 @@ def test_fusion_is_a_closed_class_keyword() -> None:
     class Consenting(Model[object], encoded_leaves="accept", fusion="accept"):
         pass
 
+    class Requiring(Model[object], fusion="require"):
+        pass
+
     class Silent(Model[object]):
         pass
 
     assert Consenting.__fusion__ == "accept" and Consenting.__encoded_leaves__ == "accept"
+    assert Requiring.__fusion__ == "require"
     assert Silent.__fusion__ == "refuse"
     with pytest.raises(ConformanceError) as refused:
 
