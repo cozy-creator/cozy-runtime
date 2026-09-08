@@ -9,10 +9,12 @@ from typing import Any
 
 import msgspec
 
-from cozy_runtime.author._assets import Asset, FileAsset, Tree
+from cozy_runtime.author._assets import Asset, AudioAsset, FileAsset, ImageAsset, Tree, VideoAsset
 from cozy_runtime.author._capture import ExecutionObservation
+from cozy_runtime.author._media import admits, normalize
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_ASSETS = {kind.kind: kind for kind in (FileAsset, ImageAsset, AudioAsset, VideoAsset)}
 
 
 def result_at(value: Any, path: str) -> Any:
@@ -56,9 +58,9 @@ def decode(
                 raise ValueError("native result field is not an asset record")
             kind = node.get("kind")
             allowed = {"asset_ref", "kind", "digest", "size_bytes"}
-            if kind == "file":
+            if kind in _ASSETS:
                 allowed.add("media_type")
-            if set(node) != allowed or kind not in ("file", "tree"):
+            if set(node) != allowed or (kind not in _ASSETS and kind != "tree"):
                 raise ValueError("native result field has an invalid asset shape")
             digest, size = node["digest"], node["size_bytes"]
             media_type = node.get("media_type", "")
@@ -72,7 +74,12 @@ def decode(
             or type(size) is not int
             or size < 0
             or size != grant.get("content_bytes" if kind == "tree" else "length")
-            or (kind == "file" and media_type != grant.get("media_type"))
+            or (
+                kind in _ASSETS
+                and (
+                    media_type != grant.get("media_type") or not admits(kind, normalize(media_type))
+                )
+            )
             or not isinstance(grant.get("local"), str)
             or not Path(grant["local"]).is_absolute()
         ):
@@ -83,7 +90,7 @@ def decode(
             tree._read_guard = guard
             handle: Asset | Tree = tree
         else:
-            asset = FileAsset(
+            asset = _ASSETS[kind](
                 digest,
                 digest=digest,
                 media_type=media_type,

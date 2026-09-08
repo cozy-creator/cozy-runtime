@@ -12,7 +12,7 @@ import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author import FileAsset, Tree
+from cozy_runtime.author import FileAsset, ImageAsset, Tree
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal.worker import byte_inputs, child_byte_results, grants
@@ -355,3 +355,73 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
     worker.close("parent", 1)
     assert not Path(first["byte_grants"][0]["local"]).exists()
     assert not worker.pending
+
+
+class ImageResult(msgspec.Struct):
+    image: ImageAsset
+
+
+def png_result(tmp_path: Path) -> tuple[Workspace, pb.ChildCallResult, bytes]:
+    from PIL import Image
+
+    from cozy_runtime.internal.worker.byte_outputs import roster
+
+    workspace, spec, _, path = producing(tmp_path)
+    Image.new("RGB", (8, 8), (12, 34, 56)).save(path, format="PNG")
+    data = path.read_bytes()
+    manifest, files = roster(path, tree=False, max_bytes=1 << 20)
+    source = outputs.commit(
+        workspace, "owner", "producer", 1, spec, "image", manifest, files, 1 << 20
+    )
+    hold = pb.NativeByteRetentionRequest(source=source, retention_id="sha256:" + "13" * 32)
+    outputs.change_hold(workspace, "owner", hold, release=False)
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    reply = pb.ChildCallResult(
+        state=pb.CHILD_CALL_STATE_SUCCEEDED,
+        result_canonical_bytes=canonical_json.encode(
+            {
+                "image": {
+                    "asset_ref": digest,
+                    "kind": "image",
+                    "digest": digest,
+                    "size_bytes": len(data),
+                    "media_type": "image/png",
+                }
+            }
+        ),
+        byte_result_grants=[
+            pb.ChildByteResultGrant(
+                output_id="image", source=source, retention_id=hold.retention_id
+            )
+        ],
+    )
+    path.unlink()
+    return workspace, reply, data
+
+
+def test_encoded_png_result_hydrates_as_existing_image_asset(tmp_path: Path) -> None:
+    workspace, reply, data = png_result(tmp_path)
+    rows = child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
+    result, _ = decode(
+        canonical_json.decode(reply.result_canonical_bytes),
+        ImageResult,
+        rows,
+        request_id="parent",
+        guard=lambda: None,
+        observation=None,
+    )
+    assert isinstance(result.image, ImageAsset)
+    assert result.image.media_type == "image/png"
+    assert result.image.read_bytes() == data
+
+
+@pytest.mark.parametrize(
+    "kind,mime", [("audio", "audio/wav"), ("image", "image/jpeg"), ("video", "image/png")]
+)
+def test_encoded_png_refuses_a_wrong_kind_or_mime(tmp_path: Path, kind: str, mime: str) -> None:
+    workspace, reply, _ = png_result(tmp_path)
+    value = canonical_json.decode(reply.result_canonical_bytes)
+    value["image"].update(kind=kind, media_type=mime)
+    reply.result_canonical_bytes = canonical_json.encode(value)
+    with pytest.raises(WorkspaceRefusal, match="media type"):
+        child_byte_results.materialize(workspace, "owner", reply, tmp_path / "parent")
