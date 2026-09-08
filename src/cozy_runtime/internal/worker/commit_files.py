@@ -30,16 +30,13 @@ def prepare(
     with workspace.locked() as db:
         native = outputs.native_call(db, owner, command)
         args = canonical_json.decode(native["accepted"])
-        producer = db.execute(
-            "SELECT ordinal FROM byte_outputs WHERE owner=? AND native_service_id=?",
-            (owner, command.service_id),
-        ).fetchone()
-        ordinal = producer["ordinal"] if producer else call.parent_attempt_ordinal
-        prefix = f"attempt:{call.parent_request_id}#{ordinal}/file/"
-        tail = str(args["handle"]).removeprefix(prefix)
+        slot = args.get("slot")
+        tail = str(slot).removeprefix("file/")
         if (
             spool_root is None
-            or not str(args["handle"]).startswith(prefix)
+            or set(args) != {"slot", "digest", "size_bytes", "media_type"}
+            or not isinstance(slot, str)
+            or not slot.startswith("file/")
             or not re.fullmatch(r"[0-9]{4,16}", tail)
             or f"{int(tail):04d}" != tail
             or int(tail) == 0
@@ -52,7 +49,9 @@ def prepare(
         ):
             raise WorkspaceRefusal("file commit has no bounded own pending file")
         # The worker derives the directory and basename. Neither is author input.
-        spool = spool_root / opaque_key("attempt-input-spool", call.parent_request_id, ordinal)
+        spool = spool_root / opaque_key(
+            "attempt-input-spool", call.parent_request_id, call.parent_attempt_ordinal
+        )
         body = canonical_json.encode(
             {
                 "entries": [
