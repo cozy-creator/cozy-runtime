@@ -199,7 +199,7 @@ def _worker_options(
         owns_tensorfs_store=True,
         accelerator_backend=accelerator_backend,
         devices=",".join(str(row["device_index"]) for row in gpus),
-        grant_roots=(str(host_paths.MEDIA_ROOT),),
+        grant_roots=(str(host_paths.MEDIA_ROOT), str(host_paths.input_media_root())),
         install_root=host_paths.INSTALL_ROOT,
         artifact_cache=host_paths.PREPARE_CACHE,
         tensorfs_root=tensorfs_root,

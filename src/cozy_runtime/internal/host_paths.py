@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 from typing import Final
 
@@ -30,3 +31,8 @@ TLS_CERTIFICATE: Final = Path("/run/cozy/bootstrap/tls.crt")
 TLS_PRIVATE_KEY: Final = Path("/run/cozy/bootstrap/tls.key")
 WORKER_CONTROL_ADDRESS: Final = Path("/run/cozy/worker/control.addr")
 WORKER_STATE: Final = Path("/run/cozy/worker")
+
+
+def input_media_root() -> Path:
+    """Disposable downloaded media and prepared derivatives, shared with the granting host."""
+    return Path(tempfile.gettempdir()) / "cozy"
