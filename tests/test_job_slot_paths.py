@@ -45,7 +45,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TENANT = ROOT / "corpus" / "tenant"
 
 PACKAGE = "cozytest/tenant"
-RELEASE = "1"
+RELEASE = "1.0.0"
 LANE = "bf16"
 ENTRYPOINT_SLOT = "touch.models.model"
 RETOUCH_SLOT = "retouch.models.model"
