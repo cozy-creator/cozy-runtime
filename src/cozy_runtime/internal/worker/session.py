@@ -6494,6 +6494,10 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     )
     worker = Worker(config, options, host)
     if _loopback_preparation_listener(listen):
+        host.compatibility_checker = worker.check_package_set_compatibility
+        host.preparer = worker.prepare_package_set
+        host.local_package_preparer = worker.prepare_local_package
+        host.private_placement_preparer = worker.prepare_private_placement
         host.numerical_environment = worker.numerical_environment
         host.workspace_service = worker.workspace_service
 
