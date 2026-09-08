@@ -2371,7 +2371,14 @@ class Executor:
         bindings: dict[tuple[str, str, str], _CallType] = {}
         for row in rows:
             interface, module, export = row["interface_digest"], row["module"], row["export"]
-            if row.get("self"):
+            if row.get("native_source"):
+                from cozy_runtime.internal import source_interfaces
+
+                if interface != source_interfaces.DIGEST or module != source_interfaces.MODULE:
+                    raise CapabilityError("native source interface changed", code="child_interface")
+                binding = source_interfaces.bindings()[(interface, module, export)]
+                bindings[("", module, export)] = binding
+            elif row.get("self"):
                 assert self.discovered is not None
                 surface = next(
                     (
