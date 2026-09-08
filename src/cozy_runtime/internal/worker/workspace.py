@@ -83,6 +83,7 @@ CREATE TABLE attempts (
  worker_boot TEXT NOT NULL DEFAULT '', result_schema BLOB NOT NULL DEFAULT x'',
  process_owner BLOB NOT NULL DEFAULT x'',
  transport_owner TEXT NOT NULL DEFAULT '',
+ memoize INTEGER NOT NULL DEFAULT 0 CHECK(memoize IN (0,1)),
  PRIMARY KEY(owner,request,ordinal)
 ) STRICT;
 CREATE TABLE weights (
@@ -95,6 +96,8 @@ CREATE TABLE weights (
  receipt_digest BLOB NOT NULL DEFAULT x'', native_digest BLOB NOT NULL DEFAULT x'',
  manifest BLOB NOT NULL DEFAULT x'', manifest_length INTEGER NOT NULL DEFAULT 0,
  objects BLOB NOT NULL DEFAULT x'5b5d',
+ adoption_source TEXT NOT NULL DEFAULT '', adoption_epoch INTEGER NOT NULL DEFAULT 0,
+ adoption_checkpoint BLOB NOT NULL DEFAULT x'',
  UNIQUE(owner,request,spec,slot)
 ) STRICT;
 CREATE TABLE holds (
@@ -116,6 +119,13 @@ CREATE TABLE operation_lookups (
  ('retaining','ready','missing','miss','released','acknowledged')),
  PRIMARY KEY(owner,consumer)
 ) STRICT;
+"""
+
+_MIGRATION_3 = """
+ALTER TABLE attempts ADD COLUMN memoize INTEGER NOT NULL DEFAULT 0 CHECK(memoize IN (0,1));
+ALTER TABLE weights ADD COLUMN adoption_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE weights ADD COLUMN adoption_epoch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE weights ADD COLUMN adoption_checkpoint BLOB NOT NULL DEFAULT x'';
 """
 
 
@@ -157,13 +167,20 @@ class Workspace:
             db.execute("PRAGMA synchronous=FULL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
-                db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=2;COMMIT;")
-            elif version == 1:
-                db.executescript(
-                    "BEGIN IMMEDIATE; ALTER TABLE attempts ADD COLUMN "
-                    "process_owner BLOB NOT NULL DEFAULT x''; PRAGMA user_version=2; COMMIT;"
+                db.executescript("BEGIN IMMEDIATE;" + _SCHEMA + "PRAGMA user_version=3;COMMIT;")
+            elif version in (1, 2):
+                process_column = (
+                    "ALTER TABLE attempts ADD COLUMN process_owner BLOB NOT NULL DEFAULT x'';"
+                    if version == 1
+                    else ""
                 )
-            elif version != 2:
+                db.executescript(
+                    "BEGIN IMMEDIATE;"
+                    + process_column
+                    + _MIGRATION_3
+                    + "PRAGMA user_version=3; COMMIT;"
+                )
+            elif version != 3:
                 raise WorkspaceRefusal("workspace journal schema is not supported")
             if (
                 not allow_frozen
@@ -198,6 +215,7 @@ class Workspace:
         *,
         result_schema: bytes = b"",
         worker_boot: str = "",
+        memoize: bool = False,
     ) -> pb.AttemptOutcome | None:
         self.owner(owner)
         self.recover(owner)
@@ -229,7 +247,8 @@ class Workspace:
                 return None
             db.execute(
                 "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state,"
-                "worker_boot,result_schema,process_owner) VALUES(?,?,?,?,?,'accepted',?,?,?)",
+                "worker_boot,result_schema,process_owner,memoize) "
+                "VALUES(?,?,?,?,?,'accepted',?,?,?,?)",
                 (
                     owner,
                     offer.request_id,
@@ -239,6 +258,7 @@ class Workspace:
                     worker_boot,
                     result_schema,
                     process_owner,
+                    int(memoize),
                 ),
             )
 
@@ -554,10 +574,13 @@ class Workspace:
                         declaration,
                     ),
                 )
-            return dict(
-                db.execute(
-                    "SELECT * FROM weights WHERE id=?", (intent.weights_transaction_id,)
-                ).fetchone()
+            from .workspace_partial import adopt
+
+            return adopt(
+                self,
+                db,
+                owner,
+                intent.weights_transaction_id,
             )
 
     def record_receipt(self, owner: str, frame: pb.WeightsReceiptFrame) -> None:

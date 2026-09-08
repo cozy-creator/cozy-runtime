@@ -5408,17 +5408,20 @@ class Worker:
             and attempt.state not in ("outcome", "closed")
         ):
             result_schema = b""
+            memoize = False
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
             for slot in self.job_slots.values():
                 if slot.binding.job_descriptor_id == descriptor:
                     declaration = self.engine._job_declaration(slot.binding, descriptor)
                     result_schema = canonical.write(declaration["result"])
+                    memoize = declaration.get("invocable", {}).get("memoize", False) is True
                     break
             replay = self.workspace.accept(
                 self.fence.record_owner_id,
                 offered,
                 result_schema=result_schema,
                 worker_boot=self.fence.worker_boot_id,
+                memoize=memoize,
             )
             if replay is not None:
                 self.send(pb.WorkerFrame(attempt_outcome=replay))
