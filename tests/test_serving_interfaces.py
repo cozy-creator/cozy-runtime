@@ -227,6 +227,13 @@ def test_caller_overlay_preserves_helpers_assets_and_dependencies(tmp_path: Path
         assert b"Requires-Dist: numpy>=1.26\n" in metadata
         assert metadata.endswith(b"\n\nDescription.\n")
         assert archive.read("serving_fixture_data/defaults.json") == b'{"width":512}'
+    from cozy_runtime.internal.installed_interfaces import read
+    from cozy_runtime.internal.package_environment import InstalledEnvironment
+
+    installed = InstalledEnvironment(
+        tmp_path, tmp_path / "overlay", Path(sys.executable), b"", "", "sha256:" + "22" * 32, True
+    )
+    assert {row["export"] for row in read(installed)} == {"generate", "echo"}
     check = """import inspect, sys
 sys.path.insert(0, sys.argv[1])
 import serving_fixture as lib
@@ -243,3 +250,7 @@ assert "generate" in lib.__cozy_bindings__
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+    companion = next((tmp_path / "overlay").glob("_cozy_callers_*.py"))
+    companion.write_bytes(companion.read_bytes() + b"# changed\n")
+    with pytest.raises(ConformanceError, match="trusted generator"):
+        read(installed)

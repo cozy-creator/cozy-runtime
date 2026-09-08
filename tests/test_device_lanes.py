@@ -513,7 +513,7 @@ def test_the_ledger_row_survives_a_switch_to_another_placement() -> None:
                 development={},
                 environment_digest=b"",
                 package_interface=("", 0),
-                bindings_digest=b"",
+                bindings_digest=b"b" * 32,
                 models=(),
                 entrypoints=(),
                 environment={},
