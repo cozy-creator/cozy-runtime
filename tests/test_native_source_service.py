@@ -6,6 +6,7 @@ import hashlib
 import json
 import queue
 import threading
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -93,6 +94,7 @@ def test_native_source_resolve_execute_and_independent_parent_cache(tmp_path: Pa
             workspace_memo.release_native_result(workspace, "owner", command.service_id)
         tensorfs.gc(str(workspace.store_root))
         assert tensorfs.Store.open(str(workspace.store_root)).contains(sha256)
+        assert original is not None
         assert "http" not in original.decode()
         with workspace.locked() as db:
             for row in db.execute("SELECT accepted,pinned,result FROM native_calls"):
@@ -373,7 +375,8 @@ def test_permanent_ack_releases_native_producer_and_access_but_keeps_cache(tmp_p
     assert calls.acknowledge(ack, done.set)
     assert done.wait(30), "source finalizer did not complete"
     store = tensorfs.Store.open(str(workspace.store_root))
-    assert store.tree_root(root["owner"])["released"]
+    released_root = store.tree_root(root["owner"])
+    assert released_root is not None and released_root["released"]
     with workspace.locked() as db:
         row = db.execute(
             "SELECT * FROM native_calls WHERE service_id=?", (command.service_id,)
@@ -475,7 +478,8 @@ threading.Event().wait()
             threading.Event().wait(0.05)
         assert stopped, "source subprocess outlived its Runtime process"
         store.release_tree_root(native_owner)  # kernel writer fence has actually been released
-        assert store.tree_root(native_owner)["released"]
+        released_root = store.tree_root(native_owner)
+        assert released_root is not None and released_root["released"]
     finally:
         if parent is not None and parent.poll() is None:
             parent.kill()
@@ -516,11 +520,10 @@ def test_stale_parent_cancel_cannot_kill_a_new_source_attempt(tmp_path: Path) ->
 
 def test_current_source_validation_refusal_reaches_protocol_peer(tmp_path: Path) -> None:
     from concurrent.futures import ThreadPoolExecutor
-    from types import SimpleNamespace
 
     import grpc
 
-    from cozy_runtime.internal.worker.session import Worker
+    from cozy_runtime.internal.worker.session import OwnershipFence, Worker
     from cozy_runtime.protocol import worker_pb2_grpc as rpc
 
     workspace = Workspace(tmp_path / "store")
@@ -532,20 +535,35 @@ def test_current_source_validation_refusal_reaches_protocol_peer(tmp_path: Path)
     command.credential = "fake-source-refusal-secret-canary"
     command.parent_call.interface_digest = b"wrong-interface" * 2
     outgoing: queue.Queue[pb.WorkerFrame] = queue.Queue()
-    worker = object.__new__(Worker)
-    worker.fence = SimpleNamespace(
-        record_owner_epoch=1,
-        control_stream_epoch=1,
-        worker_boot_id="boot",
-        wire_minor=42,
-        dispatch_open=True,
-    )
-    worker.note = lambda *_: None
-    worker.send = outgoing.put
-    worker.source_calls = SourceCalls(workspace, lambda: "owner", outgoing.put, lambda _: True)
 
-    class Peer(rpc.WorkerControlServicer):
-        def Control(self, requests, context):
+    class DispatchWorker(Worker):
+        """Bind the real dispatcher to this test's existing control transport."""
+
+        def __init__(self) -> None:
+            self.fence = OwnershipFence(
+                record_owner_epoch=1,
+                control_stream_epoch=1,
+                worker_boot_id="boot",
+                wire_minor=42,
+                dispatch_open=True,
+            )
+            self.source_calls = SourceCalls(
+                workspace, lambda: "owner", outgoing.put, lambda _: True
+            )
+
+        def note(self, kind: str, step: str) -> None:
+            pass
+
+        def send(self, frame: pb.WorkerFrame) -> None:
+            outgoing.put(frame)
+
+    worker = DispatchWorker()
+
+    # The generated grpc base has no type declarations.
+    class Peer(rpc.WorkerControlServicer):  # type: ignore[misc]
+        def Control(
+            self, requests: Iterator[pb.RecordOwnerFrame], context: grpc.ServicerContext
+        ) -> Iterator[pb.WorkerFrame]:
             for frame in requests:
                 worker._dispatch_current_frame(frame)
                 while not outgoing.empty():
