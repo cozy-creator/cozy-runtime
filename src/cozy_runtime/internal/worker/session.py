@@ -5534,10 +5534,22 @@ class Worker:
             and attempt.state not in ("outcome", "closed")
         ):
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
-            assert attempt.job is not None
-            # The accepted attempt owns the selected binding on both local and
-            # placement-hosted paths. Local jobs need not populate job_slots.
-            declaration = self.engine._job_declaration(attempt.job, descriptor)
+            # Execution attaches attempt.job later. The prepared engine binding
+            # is available on both local and placement-hosted paths at offer time.
+            binding = self.engine.jobs.get(descriptor)
+            if binding is None:
+                self.refuse(
+                    offered,
+                    "job_binding_unavailable",
+                    "the selected job is not prepared",
+                    CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                )
+                return
+            try:
+                declaration = self.engine._job_declaration(binding, descriptor)
+            except AttemptRefusal as exc:
+                self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
+                return
             result_schema = canonical.write(declaration["result"])
             memoize = declaration.get("invocable", {}).get("memoize", False) is True
             replay = self.workspace.accept(
