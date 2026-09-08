@@ -121,6 +121,7 @@ def test_captured_model_source_and_pth_are_never_executed(tmp_path: Path) -> Non
     [
         "from cozy_runtime.author import Model\ndef main(*, model=Model): pass\n",
         "def main(*args): pass\n",
+        "# /// script\n# tool=1\n# ///\ndef main(): pass\n",
         "def main():\n    yield 1\n",
         "from cozy_runtime.author import Model\nclass Local(Model[object]): pass\n"
         "def main(*, model: Local): pass\n",
