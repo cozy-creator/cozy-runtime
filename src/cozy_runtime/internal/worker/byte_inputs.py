@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
@@ -75,11 +74,7 @@ def copy_retained(
             os.rename(temporary, destination)
             return members
     finally:
-        if temporary.exists():
-            for folder in [temporary, *temporary.rglob("*")]:
-                if folder.is_dir():
-                    folder.chmod(0o755)
-            shutil.rmtree(temporary)
+        remove_checkout(temporary)
 
 
 def file_member(
@@ -108,14 +103,35 @@ def validate_source(source: pb.NativeByteTreeRef, retention_id: str) -> None:
     documents.spell(source.manifest.digest)
 
 
-def remove_checkout(root: Path | None) -> None:
-    """Remove only a checkout owned by this attempt, including its readonly folders."""
-    if root is None or not root.exists():
-        return
-    for directory in [root, *root.rglob("*")]:
-        if directory.is_dir():
-            directory.chmod(0o755)
-    shutil.rmtree(root)
+def remove_checkout(root: Path | None, *, keep_root: bool = False) -> int:
+    """Reclaim only this owned projection; links never lead to their original storage."""
+    if root is None:
+        return 0
+    if root.is_symlink():
+        root.unlink()
+        return 1
+    if not root.exists():
+        return 0
+    if not root.is_dir():
+        root.unlink()
+        return 1
+    removed = 0
+    for directory, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        folder = Path(directory)
+        folder.chmod(0o700)
+        for name in files:
+            (folder / name).unlink()
+            removed += 1
+        for name in dirs:
+            child = folder / name
+            if child.is_symlink():
+                child.unlink()
+                removed += 1
+    for directory, _dirs, _files in os.walk(root, topdown=False, followlinks=False):
+        folder = Path(directory)
+        if folder != root or not keep_root:
+            folder.rmdir()
+    return removed
 
 
 def chunks(lease: Any, digest: str, length: int) -> Iterator[bytes]:
