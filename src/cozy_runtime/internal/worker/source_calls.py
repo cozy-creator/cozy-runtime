@@ -22,7 +22,7 @@ import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
-from cozy_runtime.internal import fill, source_interfaces
+from cozy_runtime.internal import fill, storage_admission, source_interfaces
 from cozy_runtime.internal.worker import source_views, workspace_sources
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
@@ -322,6 +322,30 @@ class SourceCalls:
             status.byte_output.CopyFrom(byte_output)
         self.send(pb.WorkerFrame(native_source_status=status))
 
+    def _write_bounds(self, command: dict[str, Any]) -> tuple[storage_admission.Write, ...]:
+        if command["phase"] == "resolve":
+            return (storage_admission.Write(self.workspace.store_root, 0, 0),)
+        operation, args = command["operation"], command["arguments"]
+        payload, objects = 0, 1
+        if operation in ("download_huggingface", "download_civitai"):
+            members = command["selection"]["members"]
+            payload, objects = sum(row[2] for row in members), len(members)
+        elif operation == "commit_file":
+            payload = args["size_bytes"]
+            return (
+                storage_admission.native_write(self.workspace.store_root, payload),
+                storage_admission.Write(Path(command["file_staging"]), payload, 3),
+            )
+        elif operation == "convert_cozytensors":
+            store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+            root = store.tree_root(command["source_owner"])
+            # Source conversion admits identity/permutation classes only. Their
+            # body bytes cannot exceed the verified carrier roster; no quantizer
+            # or value-expanding converter runs on this native source path.
+            members = store.walk(root["manifest_digest"])
+            payload, objects = sum(int(row["length"]) for row in members), len(members)
+        return (storage_admission.native_write(self.workspace.store_root, payload, objects),)
+
     def _run(
         self,
         owner: str,
@@ -495,17 +519,18 @@ class SourceCalls:
             encoded = canonical_json.encode(envelope)
             if len(encoded) > 2 << 20:
                 raise WorkspaceRefusal("source execution command exceeds bounded transfer")
-            process = subprocess.Popen(
-                [sys.executable, "-m", "cozy_runtime.internal.worker.source_worker"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            with self.lock:
-                self.processes[command.service_id] = process
-                if command.service_id in self.canceled:
-                    process.kill()
-            output, _ = process.communicate(encoded)
+            with storage_admission.admit(*self._write_bounds(envelope)):
+                process = subprocess.Popen(
+                    [sys.executable, "-m", "cozy_runtime.internal.worker.source_worker"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                with self.lock:
+                    self.processes[command.service_id] = process
+                    if command.service_id in self.canceled:
+                        process.kill()
+                output, _ = process.communicate(encoded)
             with self.lock:
                 canceled = command.service_id in self.canceled
             if canceled:

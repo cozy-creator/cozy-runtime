@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import fill
+from cozy_runtime.internal import fill, storage_admission
 from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -453,7 +453,10 @@ def commit(
             store = fill.tensorfs_module().Store.open(str(workspace.store_root))
             # Native holds its writer guard and records each member before import.
             # Separate put_file/create_tree_root calls leave a process-death/GC gap.
-            return dict(store.import_tree(root_id, manifest_body, [(p, str(f)) for p, f in files]))
+            with storage_admission.admit(
+                storage_admission.native_write(workspace.store_root, content_bytes, len(files))
+            ):
+                return dict(store.import_tree(root_id, manifest_body, [(p, str(f)) for p, f in files]))
 
         observed = db.native(produce)
         receipt = bytes(observed.get("receipt", b""))

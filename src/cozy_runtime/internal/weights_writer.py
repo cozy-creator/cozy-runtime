@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, cast
 
 from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.internal import storage_admission
 from cozy_runtime.author._weights import MAX_WEIGHTS_SOURCE_READ
 from cozy_runtime.protocol import weights_limits
 
@@ -207,9 +208,11 @@ class WriterBroker:
         self,
         store: Callable[[], Any],
         checkpoint: Callable[[Any, str, _Binding, dict[str, Any]], None] | None = None,
+        store_root: Path | None = None,
     ) -> None:
         self.store = store
         self.record_checkpoint = checkpoint
+        self.store_root = store_root
         self.bindings: dict[tuple[str, int, str], _Binding] = {}
         self.lock = threading.RLock()
         self.writers: dict[tuple[str, int, str], tuple[Any, dict[str, Any]]] = {}
@@ -332,13 +335,14 @@ class WriterBroker:
                     raise CapabilityError(
                         "writer declaration changed after intent", code="weights_writer_declaration"
                     )
-                writer = store.begin_derived(
-                    transaction,
-                    binding.epoch,
-                    *args,
-                    work_fingerprint=fingerprint,
-                    checkpoint=binding.checkpoint,
-                )
+                with storage_admission.admit(storage_admission.native_write(self.store_root)):
+                    writer = store.begin_derived(
+                        transaction,
+                        binding.epoch,
+                        *args,
+                        work_fingerprint=fingerprint,
+                        checkpoint=binding.checkpoint,
+                    )
                 self.writers[key] = writer, json.loads(declaration)
                 return {"ok": True}
             held = self.writers.get(key)
@@ -368,7 +372,10 @@ class WriterBroker:
                     raise CapabilityError(
                         "part length differs from declaration", code="weights_writer_length"
                     )
-                with _read(_path(spool, transaction, "input"), length, maximum) as source:
+                with (
+                    _read(_path(spool, transaction, "input"), length, maximum) as source,
+                    storage_admission.admit(storage_admission.native_write(self.store_root, length)),
+                ):
                     if operation == "part":
                         writer.add_part(
                             str(frame["component"]), str(frame["key"]), str(frame["role"]), source
@@ -376,7 +383,8 @@ class WriterBroker:
                     else:
                         writer.add_config(str(frame["name"]), source)
             elif operation in {"commit", "completed_parts", "completed_configs"}:
-                facts = getattr(writer, operation)()
+                with storage_admission.admit(storage_admission.native_write(self.store_root)):
+                    facts = getattr(writer, operation)()
                 if operation == "commit":
                     del self.writers[key]
                 raw = json.dumps(facts, separators=(",", ":"), sort_keys=True).encode()
@@ -397,11 +405,12 @@ class WriterBroker:
                         "checkpoint differs from writer scope", code="weights_writer_ungranted"
                     )
                 previous = frame.get("previous")
-                facts = writer.checkpoint(
-                    attempt.request_id,
-                    binding.slot,
-                    previous=tuple(previous) if previous is not None else None,
-                )
+                with storage_admission.admit(storage_admission.native_write(self.store_root)):
+                    facts = writer.checkpoint(
+                        attempt.request_id,
+                        binding.slot,
+                        previous=tuple(previous) if previous is not None else None,
+                    )
                 if facts.get("head") is not None and self.record_checkpoint is not None:
                     self.record_checkpoint(attempt, transaction, binding, facts)
                 return {"ok": True, "checkpoint": facts}

@@ -13,7 +13,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import host_paths, package_environment, proctree, readiness
+from cozy_runtime.internal import host_paths, package_environment, proctree, readiness, storage_admission
 from cozy_runtime.internal.config import (
     ConfigError,
     WorkerHostConfig,
@@ -47,6 +47,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchRefusal("worker_identity_invalid", "pod worker must start as UID/GID 0")
         config = read_worker_host_config()
         _arm_supervisor_lifetime()
+        storage_admission.inherit()
         return _run(config)
     except ConfigError as err:
         emit_error(CliError(err.name, err.message, err.remedy, err.code), opts)
