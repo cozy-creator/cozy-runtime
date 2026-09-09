@@ -57,7 +57,7 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "cozy_runtime"
 #: written for. Transcribed from the installed extension, not from the Rust source: the
 #: wheel is what a pod runs. A diff here is a seam change and wants a human, not a re-freeze.
 CALLED: dict[str, str] = {
-    "gc": "(root, dry_run=False)",
+    "gc": "(root, dry_run=False, *, evict_cached=False, keep_manifests=Ellipsis)",
     "fit": (
         "(requirements: 'Sequence[TensorRequirement]', header: 'bytes', *, custody: 'str', "
         "encoded_leaves: 'bool', device: 'str | None' = None, "
@@ -123,7 +123,8 @@ CALLED: dict[str, str] = {
     # The incremental roster/landed seam replaces the full-file barrier in xs-025.
     "Store.prepare_model_source": (
         "(self, /, operation_id, source_selection_digest, profiles, roster, landed, "
-        "*, checkpoints=Ellipsis, adopt_from_operation_id=None, registry=None)"
+        "*, checkpoints=Ellipsis, adopt_from_operation_id=None, registry=None, "
+        "write_budget_bytes=None)"
     ),
     "Store.release_model_source": "(self, /, operation_id)",
     "Store.checkpoint_page": (

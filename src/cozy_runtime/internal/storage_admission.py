@@ -14,7 +14,7 @@ import os
 import socket
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,7 +85,7 @@ def inherit(descriptor: int | None) -> None:
 class Lease:
     """One explicit operation hold; close may run in a different RPC thread."""
 
-    def __init__(self, context=None) -> None:
+    def __init__(self, context: AbstractContextManager[dict[str, object]] | None = None) -> None:
         self._context = context
         self._lock = threading.RLock()
         self._closed = False
