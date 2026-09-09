@@ -701,6 +701,14 @@ class ComponentResidency:
         """
         if self.placement == "all_resident":
             return
+        # A scope release records a CUDA event rather than synchronizing the stream.  That
+        # is the right fast path when the next operation uses the same components, but a
+        # component switch can otherwise observe every old component as temporarily held
+        # and report a false device shortfall.  Scopes are serial by contract, so waiting
+        # for the prior scope here is safe: no user operation can be running while this
+        # admission is deciding which bytes to evict.  Do it only when a pending fence is
+        # actually blocking eviction; ordinary same-component calls remain asynchronous.
+        self._wait_for_pending_victims(declared)
         for victim in self._victims(declared):
             self._evict(victim)
 
@@ -733,11 +741,33 @@ class ComponentResidency:
             # promise. If a component is not resident under it, admission checks the room
             # that is actually there and a shortage is a typed refusal with numbers.
             return
+        self._wait_for_pending_victims(declared)
         while not self._fits(need):
             victim = self._victim(declared)
             if victim is None:
                 return  # nothing left to give; the pre-mutation check refuses with numbers
             self._evict(victim)
+
+    def _wait_for_pending_victims(self, declared: tuple[str, ...]) -> None:
+        """Make a completed serial scope's components evictable before a lane switch.
+
+        ``release`` deliberately records a CUDA event instead of synchronizing.  That
+        keeps the common path cheap, but ``event.query()`` can be false for the few
+        microseconds between scopes.  Treating that transient state as a capacity fact
+        made H3's warm pass and the first BF16/FP8 swap refuse with the misleading
+        ``Every evictable component was already freed`` message.  Since ``admit`` is
+        entered only after the previous scope has released and scopes are serial, a
+        synchronization here cannot race user work.  It is performed only when a
+        non-declared resident component has a pending fence.
+        """
+        if not any(
+            name not in declared
+            and name in self.backend.components
+            and not self.fences.get(name, Fence()).passed()
+            for name in self.backend.components
+        ):
+            return
+        accel.synchronize(self.torch, self.kind)
 
     def _evict(self, victim: str) -> None:
         """One eviction, timed and MEASURED against the allocator on both sides."""
