@@ -113,6 +113,19 @@ def main(root: Path) -> None:
 
     models = {name: model() for name in ("a", "b")}
     original = {name: member.linear for name, member in models.items()}
+    hook_calls = {name: 0 for name in models}
+    handles = []
+    for name, linear in original.items():
+
+        def check_input(module: Any, args: Any, kwargs: Any, name: str = name) -> None:
+            assert isinstance(args[0], torch.Tensor)
+            hook_calls[name] += 1
+
+        def negate_output(module: Any, args: Any, kwargs: Any, output: Any) -> Any:
+            return -output
+
+        handles.append(linear.register_forward_pre_hook(check_input, with_kwargs=True))
+        handles.append(linear.register_forward_hook(negate_output, with_kwargs=True))
     holder = _Holder(models)
     walked = census(holder)
     backend.expect(
@@ -165,6 +178,12 @@ def main(root: Path) -> None:
         )
         torch.cuda.synchronize()
     assert records[0]["allocated"] == records[-1]["allocated"], records
+    assert all(count >= 3 for count in hook_calls.values()), hook_calls
+    # Handles registered on the original modules still control their replacements.
+    for handle in handles:
+        handle.remove()
+    assert expected is not None
+    expected = -expected
     # Read the peak immediately around the SAME backend.stage: admit resets CUDA's
     # peak at its end to start the forward-activation meter, so reading it afterwards
     # would misleadingly report zero staging overhead.

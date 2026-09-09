@@ -273,7 +273,12 @@ if not DIFFUSERS_ABSENT:
 
 
 def _rowwise_leaf(module: Any) -> bool:
-    return getattr(module, "provider", None) == ROWWISE_LEAF
+    # Semantic hooks must receive the original Tensor, not a quantized carrier.
+    return (
+        getattr(module, "provider", None) == ROWWISE_LEAF
+        and not module._forward_pre_hooks
+        and not module._forward_hooks
+    )
 
 
 def _tensor_census(module: Any) -> tuple[object, ...]:
