@@ -545,13 +545,17 @@ class Reader:
         if isinstance(node, ast.Call):
             callee = self.resolve(module, node.func)
             if isinstance(callee, Vocab) and callee.key in _SCALAR_REDUCTIONS:
+                if isinstance(node.func, ast.Name) and node.func.id in scope:
+                    self.refuse(module, node, "a reduction name shadowed by a comprehension")
                 if len(node.args) != 1 or node.keywords:
                     self.refuse(module, node, "a reduction needs one sequence and no keywords")
                 values = self.fold(module, node.args[0], scope)
                 if not isinstance(values, (tuple, list)) or not values:
                     self.refuse(module, node, "a reduction needs a nonempty tuple or list")
                 kind = type(values[0])
-                if kind not in (int, float, str) or any(type(value) is not kind for value in values):
+                if kind not in (int, float, str) or any(
+                    type(value) is not kind for value in values
+                ):
                     self.refuse(module, node, "a reduction needs scalars of one exact type")
                 if kind is float and any(not math.isfinite(value) for value in values):
                     self.refuse(module, node, "a reduction needs finite floats")

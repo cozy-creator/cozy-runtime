@@ -133,6 +133,57 @@ def test_invocable_defaults_are_part_of_the_static_interface_identity(tmp_path: 
 
 
 @pytest.mark.parametrize(
+    ("annotation", "expression", "expected"),
+    [
+        ("int", "min([50, 30, 40])", 30),
+        ("int", "max((30, 50, 40))", 50),
+        ("float", "min((0.5, -0.5, 0.0))", -0.5),
+        ("float", "max([0.5, -0.5, 0.0])", 0.5),
+        ("str", 'min(("zebra", "apple", "pear"))', "apple"),
+        ("str", 'max(["zebra", "apple", "pear"])', "zebra"),
+    ],
+)
+def test_static_invocable_scalar_reduction_default(
+    tmp_path: Path, annotation: str, expression: str, expected: object
+) -> None:
+    source = OPERATIONS.replace("timesteps: int = 50", f"timesteps: {annotation} = {expression}")
+    document = static_interface.build(project(tmp_path, source))
+    jobs = cast(list[dict[str, Any]], document["jobs"])
+    row = next(row for row in jobs if row["name"] == "precompute-adaln")
+    assert row["invocable"]["defaults"]["request/timesteps"] == expected
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "min([])",
+        "max(30, 40)",
+        "min([30], key=int)",
+        "max([], default=30)",
+        "min({30: 1, 40: 2})",
+        "max([True, False])",
+        "min([30, 40.0])",
+        "min([[30], [40]])",
+        "max([1e309, 30.0])",
+        "min([1e309 - 1e309, 30.0])",
+        "min(compute_default())",
+        "min([min([30, 40]) for min in [1]])",
+    ],
+)
+def test_static_invocable_refuses_unsupported_reductions(tmp_path: Path, expression: str) -> None:
+    source = OPERATIONS.replace("timesteps: int = 50", f"timesteps: int = {expression}")
+    with pytest.raises(ConformanceError):
+        static_interface.build(project(tmp_path, source))
+
+
+def test_static_invocable_does_not_call_shadowed_min(tmp_path: Path) -> None:
+    source = OPERATIONS.replace("timesteps: int = 50", "timesteps: int = min([30, 40])")
+    source += '\n\ndef min(values):\n    raise AssertionError("never call package code")\n'
+    with pytest.raises(ConformanceError, match="value exists only at run time"):
+        static_interface.build(project(tmp_path, source))
+
+
+@pytest.mark.parametrize(
     ("old", "new"),
     [
         ("@invocable(memoize=True)", "@invocable(memoize=compute_policy())"),

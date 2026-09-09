@@ -121,6 +121,36 @@ def _refusal(project: Path) -> StaticRefusal:
     return caught.value
 
 
+@pytest.mark.parametrize(("reduction", "expected"), [("min", 30), ("max", 50)])
+def test_data_derived_default_matches_imported_interface(
+    tmp_path: Path, reduction: str, expected: int
+) -> None:
+    project = _variant(
+        tmp_path,
+        {"schemas.py": ("denoise: Steps = 30", f"denoise: Steps = {reduction}(STEPS)")},
+    )
+    document = static_interface.build(project)
+    defaults = document["entrypoints"][0]["invocable"]["defaults"]
+    assert defaults["request/denoise"] == expected
+    # Variants share a module name, so use a fresh interpreter for the imported oracle.
+    oracle = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path\nimport sys\n"
+            "from cozy_runtime.internal import package_interface\n"
+            "from cozy_runtime.internal.discovery import discover\n"
+            "sys.stdout.buffer.write(package_interface.canonical_bytes("
+            "package_interface.build(discover(Path(sys.argv[1])))))\n",
+            str(project),
+        ],
+        capture_output=True,
+        check=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+    )
+    assert package_interface.canonical_bytes(document) == oracle.stdout
+
+
 def test_refuses_an_annotation_outside_the_vocabulary(tmp_path: Path) -> None:
     project = _variant(
         tmp_path,
