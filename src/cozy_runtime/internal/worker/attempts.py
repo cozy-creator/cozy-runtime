@@ -2059,14 +2059,20 @@ class AttemptEngine:
             if apply_ledger:
                 self.ledger_for(attempt).observe_residency(attempt.residency)
             if residency.get("attempt_stages"):
+                # ATTEMPT-SCOPED THROUGHOUT (cr-134). `staged_ms`/`evicted_ms` are the
+                # generation's whole history across every request it has served; only the
+                # `attempt_` counters were zeroed for this one. Reading a count from one
+                # scope beside a duration from the other reported 6 stages costing 31220.3
+                # ms on a run whose six stages cost 5542.85 ms, and that number became the
+                # case for changing residency policy.
                 attempt.confess(
                     "degraded",
                     f"served on the {residency.get('placement')} rung: "
                     f"{residency['attempt_stages']} component stage(s) costing "
-                    f"{residency.get('staged_ms', 0)} ms and "
+                    f"{residency.get('attempt_staged_ms', 0)} ms and "
                     f"{residency.get('attempt_evictions', 0)} eviction(s) costing "
-                    f"{residency.get('evicted_ms', 0)} ms - the weights did not all fit "
-                    "at once and the runtime moved them rather than refusing",
+                    f"{residency.get('attempt_evicted_ms', 0)} ms - the weights did not all "
+                    "fit at once and the runtime moved them rather than refusing",
                 )
         shortfall = reply.get("shortfall")
         if shortfall:

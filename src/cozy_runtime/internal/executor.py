@@ -332,6 +332,22 @@ class _CompositeResidency:
             "attempt_evictions": sum(
                 int(row.get("attempt_evictions", 0)) for row in documents.values()
             ),
+            # THE DURATIONS TRAVEL WITH THEIR COUNTS (cr-134). The fold carried the counts
+            # and dropped the milliseconds, so a multi-model placement's staged rung
+            # confessed "N stage(s) costing 0 ms". Attempt-scoped and cumulative both, so
+            # a reader can never take one for the other.
+            "attempt_staged_ms": round(
+                sum(float(row.get("attempt_staged_ms", 0.0)) for row in documents.values()), 2
+            ),
+            "attempt_evicted_ms": round(
+                sum(float(row.get("attempt_evicted_ms", 0.0)) for row in documents.values()), 2
+            ),
+            "staged_ms": round(
+                sum(float(row.get("staged_ms", 0.0)) for row in documents.values()), 2
+            ),
+            "evicted_ms": round(
+                sum(float(row.get("evicted_ms", 0.0)) for row in documents.values()), 2
+            ),
             "attempt_activation_peak_bytes": max(
                 (int(row.get("attempt_activation_peak_bytes", 0)) for row in documents.values()),
                 default=0,
