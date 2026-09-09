@@ -60,7 +60,8 @@ def project(module: Any, args: Any, kwargs: Any) -> Any:
 class BasePipe:
     def __init__(self, config: Config) -> None:
         mapping = cast(dict[str, Any], config.mapping())
-        dit: Any = MiniMaxH3Transformer3DModel(**mapping["dit"])  # type: ignore[no-untyped-call]
+        constructor: Any = MiniMaxH3Transformer3DModel
+        dit: Any = constructor(**mapping["dit"])
         dit = dit.eval()
         dit.set_attention_backend("native")
         dit.register_forward_pre_hook(project, with_kwargs=True)
