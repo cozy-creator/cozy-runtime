@@ -436,6 +436,9 @@ class Executor:
         #: What the runtime pinned on this generation's attention sites (cr-124). One BOOT
         #: line, not a per-attempt record: the choice is a function of device and image.
         self.attention: attention.Applied | None = None
+        #: The device the construction was pinned against, kept so a per-request pin (cr-125)
+        #: is checked against the SAME card rather than re-measuring one at attempt time.
+        self.device_facts: Any = None
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
@@ -1310,6 +1313,7 @@ class Executor:
             # either is a field nobody reads, which is why this is a construction fact and
             # not a per-attempt one.
             applied = attention.select(device_facts, {**backend.components, **backend.parked}, pin)
+            self.device_facts = device_facts
             stage("attention_pin")
         except ModelFitRefused as exc:
             # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
@@ -1918,6 +1922,24 @@ class Executor:
                 "code": "unknown_entrypoint",
                 "detail": f"{command['entrypoint']!r} is not an entrypoint of this release",
             }
+        pin = str(command.get("attention_kernel", ""))
+        if pin:
+            # PRE-ENTRY, so a mistyped kernel costs a millisecond and no device: the refusal
+            # arrives before the attempt is accepted, is a request fault rather than an
+            # executor fault, and never has to escape a held device lease (cr-122's incident).
+            # The check is the DEVICE-FREE half — this runs while the other arm of the A/B may
+            # still be generating, and a resolution probe fired here would land inside its step
+            # timings. Nothing is SET either: `invoke` plans and applies, because another
+            # request may be prepared while this construction is mid-attempt.
+            try:
+                self._attention_check(pin)
+            except attention.AttentionRefusal as exc:
+                return {
+                    "ok": False,
+                    "code": exc.code,
+                    "detail": str(exc)[:900],
+                    "origin": "request",
+                }
         registration = self.discovered.app.get(command["entrypoint"])
         try:
             self._capture_options(command, registration.surface)
@@ -1981,6 +2003,20 @@ class Executor:
                 "runs the record its plan was priced against, and this executor holds none "
                 "(a fresh epoch holds nothing at all)",
             }
+        pin = str(command.get("attention_kernel", ""))
+        if pin:
+            # THE SWAP, between attempts and before the device lease opens. It is checked
+            # again rather than carried from `prepare_request`: a pin applied there could
+            # move the kernel under an attempt already running on this construction.
+            try:
+                self._attention_plan(pin).apply()
+            except attention.AttentionRefusal as exc:
+                return {
+                    "ok": False,
+                    "code": exc.code,
+                    "detail": str(exc)[:900],
+                    "origin": "request",
+                }
         spool = Path(command["spool"])
         deadline = _deadline(command["deadline_s"])
         torch = self.torch
@@ -2151,6 +2187,58 @@ class Executor:
         options = msgspec.convert(raw, type=ActivationCapture, strict=True)
         validate_components(options, [binding.model_class for binding in surface.model_bindings])
         return options
+
+    # ------------------------------------------------------- the per-request pin (cr-125)
+
+    def _attention_roots(self) -> dict[str, Any]:
+        """Every constructed component a per-request pin acts on, labelled without collision.
+
+        A many-model prepare namespaces by its bound parameters exactly as `attention.merge`
+        does: two models holding a component of the same name must both be swapped, and a flat
+        map would silently drop one of them.
+        """
+        roots: dict[str, Any] = {}
+        executors = self.model_executors or [self]
+        for executor in executors:
+            if executor.backend is None:
+                continue
+            prefix = "+".join(sorted(executor.models)) + "/" if len(executors) > 1 else ""
+            for name, root in {**executor.backend.components, **executor.backend.parked}.items():
+                roots[prefix + name] = root
+        return roots
+
+    def _attention_device(self, pin: str) -> Any:
+        device = next(
+            (e.device_facts for e in (self.model_executors or [self]) if e.device_facts), None
+        )
+        if device is None:
+            raise attention.AttentionRefusal(
+                "attention_kernel_unsupported",
+                f"{pin} was pinned on a construction that reached no device; a weightless "
+                "package holds no attention site and a pin is never ignored",
+            )
+        return device
+
+    def _attention_frozen(self) -> str:
+        """Why a per-request swap would not take on this executor, or empty.
+
+        THE GROUP IS A REFUSAL, NOT A SILENT NO-OP (cr-125 amendment): `parallel/cp.py` orders
+        backend, then parallelism, then compile, so once collectives are installed a later
+        backend swap is a field nobody reads. `attention._baked_in` covers the compiled half.
+        """
+        return "a context-parallel group is installed" if self.group is not None else ""
+
+    def _attention_check(self, pin: str) -> None:
+        """Every refusal that is free to raise — no device is touched (cr-125)."""
+        attention.check(
+            self._attention_device(pin), self._attention_roots(), pin, self._attention_frozen()
+        )
+
+    def _attention_plan(self, pin: str) -> attention.Swap:
+        """The named kernel, proven admissible on every site of this construction."""
+        return attention.plan(
+            self._attention_device(pin), self._attention_roots(), pin, self._attention_frozen()
+        )
 
     def _capture_session(self, command: Mapping[str, Any], surface: Any) -> Any:
         from cozy_runtime.author._errors import InvalidRequest

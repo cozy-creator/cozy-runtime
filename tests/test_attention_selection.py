@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from cozy.worker.v1 import worker_pb2 as pb
 from cozy_runtime.author._observations import (
     NAME_CAP,
     TEXT_CAP,
@@ -39,9 +40,11 @@ from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.local import LocalRequest, development_source_digest, run_slice
+from cozy_runtime.internal.worker import attempts
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.plan import DeclaredBinding, ModelBinding
 from cozy_runtime.internal.worker.session import WorkerOptions, executor_prepare_command
+from cozy_runtime.protocol import documents
 from test_end_to_end import NO_EXECUTOR
 
 PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
@@ -774,3 +777,242 @@ def test_a_pin_that_cannot_be_honoured_refuses_through_the_whole_real_path() -> 
     assert "attention_kernel_unsupported" in reasons, outcome.faults
     assert outcome.result is None, outcome.result
     assert any("sageattention" in str(fault["detail"]) for fault in outcome.faults)
+
+
+# ---------------------------------------------------------- the served per-request pin (cr-125)
+
+
+class _Parameter:
+    def __init__(self, dtype: str) -> None:
+        self.dtype = f"torch.{dtype}"
+
+    def __str__(self) -> str:
+        return self.dtype
+
+
+class _Processor:
+    def __init__(self) -> None:
+        self._attention_backend: Any = "AUTO"
+
+
+class _Site:
+    """One attention module as `_sites` reads it: a processor, a dtype and a head dimension."""
+
+    def __init__(self, dtype: str = "bfloat16", head_dim: int = 128) -> None:
+        self.processor = _Processor()
+        self.head_dim = head_dim
+        self._dtype = dtype
+
+    def parameters(self) -> Any:
+        yield _Parameter(self._dtype)
+
+
+class _Tree:
+    """A torch module tree as `_trees` duck-types one: `modules()` and `parameters()`."""
+
+    def __init__(self, *modules: Any) -> None:
+        self._modules = modules
+
+    def modules(self) -> Any:
+        return [*self._modules, self]
+
+    def parameters(self) -> Any:
+        return iter(())
+
+
+class _Compiled(_Tree):
+    """`torch.compile(module)` — the wrapping spelling, which renames every state_dict key."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._orig_mod = _Tree()
+
+
+class _CompiledInPlace(_Tree):
+    """`nn.Module.compile()` — the in-place spelling, which leaves no wrapper to see."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._compiled_call_impl = lambda *a, **k: None
+
+
+@pytest.fixture
+def diffusers_attention_classes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_sites` looks up diffusers' attention classes by identity; CI installs no diffusers.
+
+    Only the CLASS LOOKUP is supplied. The walk, the dtype and head-dimension reads, the
+    admission rule and the swap itself are this module's own code, unpatched.
+    """
+    import types
+
+    processor_module = types.ModuleType("diffusers.models.attention_processor")
+    processor_module.Attention = _Site  # type: ignore[attr-defined]
+    processor_module.MochiAttention = _Site  # type: ignore[attr-defined]
+    attention_module = types.ModuleType("diffusers.models.attention")
+    attention_module.AttentionModuleMixin = _Site  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "diffusers", types.ModuleType("diffusers"))
+    monkeypatch.setitem(sys.modules, "diffusers.models", types.ModuleType("diffusers.models"))
+    monkeypatch.setitem(sys.modules, "diffusers.models.attention", attention_module)
+    monkeypatch.setitem(sys.modules, "diffusers.models.attention_processor", processor_module)
+
+
+def _ready(name: str) -> attention.Ready:
+    return attention.Ready(attention.BY_NAME[name], member=f"<{name}>")
+
+
+def test_a_per_request_swap_moves_every_site_and_records_the_kernel_it_moved_to() -> None:
+    """THE ARM THE AMENDMENT OWES: two attempts on ONE prepare, two kernels, two records.
+
+    The swap is mechanically a `setattr` across the processors because the fused forward reads
+    `_attention_backend` live on every call rather than capturing it at install
+    (`fusion_install.py:226`), so one prepared pod serves both arms of an A/B.
+    """
+    sites = [_Site(), _Site(), _Site()]
+    plan = tuple(("dit", site.processor) for site in sites)
+
+    first = attention.Swap(_ready("flash-attn3"), plan).apply()
+    assert [site.processor._attention_backend for site in sites] == ["<flash-attn3>"] * 3
+    assert first.totals() == {"flash-attn3": 3}
+    assert first.line() == "flash-attn3 x3 (PINNED flash-attn3) — dit: flash-attn3"
+
+    second = attention.Swap(_ready("cudnn"), plan).apply()
+    assert [site.processor._attention_backend for site in sites] == ["<cudnn>"] * 3
+    assert second.totals() == {"cudnn": 3}
+    assert second.line() == "cudnn x3 (PINNED cudnn) — dit: cudnn"
+    # Two attempts, two DIFFERENT records off one construction. A pin that rendered the same
+    # line twice would report an A/B that did not happen.
+    assert first.line() != second.line()
+
+
+@pytest.mark.parametrize(
+    ("root", "names"),
+    [
+        (_Compiled(), ("OptimizedModule",)),
+        (_CompiledInPlace(), ("compiled in place",)),
+    ],
+)
+def test_a_pin_on_a_compiled_module_refuses_instead_of_setting_a_field_nobody_reads(
+    root: Any, names: tuple[str, ...]
+) -> None:
+    """THE GUARD IS A REFUSAL, NOT AN ABSENCE (cr-125 amendment).
+
+    A compiled graph was traced with the kernel it had, so a later `setattr` moves nothing —
+    and an A/B whose pin did not take is WORSE than no A/B, because it reports a difference
+    that is not there. Both compile spellings are seen: the wrapper leaves `_orig_mod`, the
+    in-place form leaves only `_compiled_call_impl`.
+    """
+    with pytest.raises(attention.AttentionRefusal) as refused:
+        attention.plan(_device(90), {"dit": root}, "flash-attn3")
+    assert refused.value.code == "attention_kernel_frozen"
+    for name in names:
+        assert name in str(refused.value)
+    # And it names what would have to be true, plus where the pin DOES take.
+    assert "kernel.attention=flash-attn3" in str(refused.value)
+
+
+def test_an_installed_group_refuses_the_swap_before_the_kernel_is_even_looked_up() -> None:
+    """`parallel/cp.py` orders backend, then parallelism, then compile. Once collectives are
+    installed the ordering is spent, so the swap refuses rather than arriving too late."""
+    with pytest.raises(attention.AttentionRefusal) as refused:
+        attention.plan(_device(90), {"dit": _Tree()}, "sageattention", "a group is installed")
+    assert refused.value.code == "attention_kernel_frozen"
+    assert "a group is installed" in str(refused.value)
+
+
+def test_a_mistyped_kernel_refuses_per_request_exactly_as_it_does_per_prepare() -> None:
+    """The served path reuses `pinned`, so the override's vocabulary has ONE definition."""
+    with pytest.raises(attention.AttentionRefusal) as refused:
+        attention.plan(_device(90), {"dit": _Tree()}, "flash-attn3-fp9")
+    assert refused.value.code == "attention_kernel_unknown"
+    assert "flash-attn3-fp8" in str(refused.value)
+
+
+def test_a_site_the_kernel_cannot_serve_refuses_with_nothing_set(
+    diffusers_attention_classes: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A HALF-SWAPPED CONSTRUCTION WOULD SERVE TWO KERNELS AND RECORD ONE.
+
+    `plan` proves every site admits the kernel before `Swap.apply` sets any of them. Only the
+    baked-image resolution is substituted — this runner has no GPU and no diffusers — and the
+    walk, the admission rule and the ordering under test are real.
+    """
+    monkeypatch.setattr(attention, "pinned", lambda name, device: [_ready(name)])
+    good, bad = _Site(head_dim=128), _Site(head_dim=256)
+    with pytest.raises(attention.AttentionRefusal) as refused:
+        attention.plan(_device(90), {"dit": _Tree(good, bad)}, "sageattention")
+    assert refused.value.code == "attention_kernel_unsupported"
+    assert "head dimension 256" in str(refused.value)
+    assert good.processor._attention_backend == "AUTO"
+    assert bad.processor._attention_backend == "AUTO"
+
+    swapped = attention.plan(_device(90), {"dit": _Tree(good)}, "sageattention").apply()
+    assert good.processor._attention_backend == "<sageattention>"
+    assert swapped.pin == "sageattention"
+
+
+def test_a_construction_with_no_attention_site_refuses_the_pin_rather_than_ignoring_it(
+    diffusers_attention_classes: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(attention, "pinned", lambda name, device: [_ready(name)])
+    with pytest.raises(attention.AttentionRefusal) as refused:
+        attention.plan(_device(90), {"vae": _Tree()}, "cudnn")
+    assert refused.value.code == "attention_kernel_unsupported"
+    assert "never ignored" in str(refused.value)
+
+
+def test_an_unpinned_attempt_sends_no_kernel_key_to_the_executor_at_all() -> None:
+    """ABSENT BY DEFAULT, and absent means the key is not there — the executor branches on
+    presence, so a serving worker nobody pinned cannot reach the swap path."""
+    assert attempts._attention_pin({}) == {}
+    assert attempts._attention_pin({"attention_kernel": ""}) == {}
+    assert attempts._attention_pin({"attention_kernel": "cudnn"}) == {"attention_kernel": "cudnn"}
+
+
+def test_the_wire_carries_the_pin_inside_the_invocation_digest() -> None:
+    """Two attempts differing ONLY by their pin are two different documents. If the pin rode
+    beside the digest instead of inside it, one attempt could be replayed as the other."""
+    bare = pb.InvocationSpec(payload_digest="sha256:" + "aa" * 32)
+    pinned_spec = pb.InvocationSpec(payload_digest="sha256:" + "aa" * 32)
+    pinned_spec.attention_kernel = "flash-attn3-fp8"
+    assert documents.digest_of(documents.canonical_bytes(bare)) != documents.digest_of(
+        documents.canonical_bytes(pinned_spec)
+    )
+    assert (
+        documents.read(documents.canonical_bytes(pinned_spec), pb.InvocationSpec)[
+            "attention_kernel"
+        ]
+        == "flash-attn3-fp8"
+    )
+
+
+def test_the_pre_admission_half_of_a_pin_touches_no_device(
+    diffusers_attention_classes: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`prepare_request` runs while the OTHER arm of the A/B may still be generating, so its
+    check may not fire a resolution probe — `_computes` is a real kernel call, and one landing
+    there would sit inside somebody else's step timings. `check` therefore never resolves."""
+
+    def refuse(*_: Any, **__: Any) -> Any:
+        raise AssertionError("the pre-admission check resolved a kernel")
+
+    monkeypatch.setattr(attention, "_resolve", refuse)
+    monkeypatch.setattr(attention, "pinned", refuse)
+    assert attention.check(_device(90), {"dit": _Tree(_Site())}, "sdpa").name == "sdpa"
+    # And it still raises every refusal it can afford to: the vocabulary, the card, the sites.
+    for name, kernel, roots in (
+        ("attention_kernel_unknown", "nope", {"dit": _Tree(_Site())}),
+        ("attention_kernel_unsupported", "sageattention", {"dit": _Tree(_Site())}),
+        ("attention_kernel_frozen", "sdpa", {"dit": _Compiled()}),
+    ):
+        device = _device(80) if name == "attention_kernel_unsupported" else _device(90)
+        with pytest.raises(attention.AttentionRefusal) as refused:
+            attention.check(device, roots, kernel)
+        assert refused.value.code == name
+
+
+def test_a_typo_on_a_compiled_module_is_answered_as_a_typo() -> None:
+    """Order matters in a refusal ladder. Telling a developer their construction is compiled,
+    when what they did was misspell `sdpa`, sends them at the wrong thing entirely."""
+    with pytest.raises(attention.AttentionRefusal) as refused:
+        attention.check(_device(90), {"dit": _Compiled()}, "sdap")
+    assert refused.value.code == "attention_kernel_unknown"

@@ -796,21 +796,12 @@ def pinned(name: str, device: DeviceFacts) -> list[Ready]:
 # ------------------------------------------------------------------------------ the pin
 
 
-def _sites(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any]]:
-    """(component, attention module, its processor) for every diffusers attention site.
+def _trees(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any]]:
+    """(component, torch module tree) for every module the fill plane constructed.
 
     The walk follows public attributes and mapping values three levels deep and stops at torch
-    module trees, where `modules()` finds the attention classes diffusers' own
-    `set_attention_backend` looks for. A component's label is the name the fill plane gave it.
+    module trees. A component's label is the name the fill plane gave it.
     """
-    try:
-        from diffusers.models.attention import AttentionModuleMixin
-        from diffusers.models.attention_processor import Attention, MochiAttention
-    except ImportError:
-        # No diffusers, no diffusers attention site. Nothing to pin, and not a refusal.
-        return
-
-    classes = (Attention, MochiAttention, AttentionModuleMixin)
     seen: set[int] = set()
     queue: deque[tuple[str, Any, int]] = deque(
         (name, root, 0) for name, root in sorted(roots.items())
@@ -823,10 +814,7 @@ def _sites(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any]]:
         if callable(getattr(value, "modules", None)) and callable(
             getattr(value, "parameters", None)
         ):
-            for module in value.modules():
-                processor = getattr(module, "processor", None)
-                if isinstance(module, classes) and processor is not None:
-                    yield label, module, processor
+            yield label, value
             continue
         if depth >= 3:
             continue
@@ -837,6 +825,26 @@ def _sites(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any]]:
             for name, item in vars(value).items():
                 if not name.startswith("_"):
                     queue.append((name, item, depth + 1))
+
+
+def _sites(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any]]:
+    """(component, attention module, its processor) for every diffusers attention site.
+
+    `modules()` finds the attention classes diffusers' own `set_attention_backend` looks for.
+    """
+    try:
+        from diffusers.models.attention import AttentionModuleMixin
+        from diffusers.models.attention_processor import Attention, MochiAttention
+    except ImportError:
+        # No diffusers, no diffusers attention site. Nothing to pin, and not a refusal.
+        return
+
+    classes = (Attention, MochiAttention, AttentionModuleMixin)
+    for label, tree in _trees(roots):
+        for module in tree.modules():
+            processor = getattr(module, "processor", None)
+            if isinstance(module, classes) and processor is not None:
+                yield label, module, processor
 
 
 def _head_dim(module: Any) -> int:
@@ -988,14 +996,122 @@ def install(ready: list[Ready], roots: Mapping[str, Any], pin: str = "") -> Appl
                 locations[entry.name] = entry.location
             break
         else:
-            raise AttentionRefusal(
-                "attention_kernel_unsupported",
-                f"{ready[0].name if ready else 'no attention kernel'} does not serve "
-                f"{component}'s attention: "
-                f"{dtype or 'unknown'} activations at head dimension "
-                f"{head_dim or 'unknown'}. A pinned kernel is never quietly replaced",
+            raise _site_refusal(
+                ready[0].name if ready else "no attention kernel", component, dtype, head_dim
             )
     return Applied(hosts, locations, tuple(entry.name for entry in ready), pin)
+
+
+def _site_refusal(name: str, component: str, dtype: str, head_dim: int) -> AttentionRefusal:
+    return AttentionRefusal(
+        "attention_kernel_unsupported",
+        f"{name} does not serve {component}'s attention: {dtype or 'unknown'} activations "
+        f"at head dimension {head_dim or 'unknown'}. A pinned kernel is never quietly replaced",
+    )
+
+
+def _baked_in(roots: Mapping[str, Any]) -> str:
+    """Why a post-warm pin would NOT take on these components, or empty.
+
+    `torch.compile(module)` leaves an `OptimizedModule` wrapper carrying `_orig_mod`; the
+    in-place `nn.Module.compile()` leaves `_compiled_call_impl`. Either bakes the backend into
+    a graph that was traced with the kernel it had, so a later `setattr` moves nothing.
+    """
+    for label, tree in _trees(roots):
+        for module in tree.modules():
+            if hasattr(module, "_orig_mod"):
+                return f"{label} is an OptimizedModule wrapping {type(module._orig_mod).__name__}"
+            if getattr(module, "_compiled_call_impl", None) is not None:
+                return f"{label} holds {type(module).__name__} compiled in place"
+    return ""
+
+
+@dataclass(frozen=True, slots=True)
+class Swap:
+    """A per-request kernel change PROVEN admissible on every site, and not yet applied."""
+
+    entry: Ready
+    sites: tuple[tuple[str, Any], ...]
+
+    def apply(self) -> Applied:
+        hosts: dict[str, dict[str, int]] = {}
+        for component, processor in self.sites:
+            processor._attention_backend = self.entry.member
+            hosts.setdefault(component, {})
+            hosts[component][self.entry.name] = hosts[component].get(self.entry.name, 0) + 1
+        locations = {self.entry.name: self.entry.location} if self.entry.location else {}
+        return Applied(hosts, locations, (self.entry.name,), self.entry.name)
+
+
+def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Candidate:
+    """Every refusal a per-request pin can raise WITHOUT touching the device (cr-125).
+
+    Split from `plan` deliberately. Resolution ends in a real kernel call (`_computes`), and
+    this runs pre-admission — where the device may still be serving the OTHER arm of the very
+    A/B being measured, so a probe fired here would land inside somebody else's step timings.
+    The pre-entry half therefore asks only what is free to ask: the vocabulary, the card's
+    declared range, whether anything baked the backend, and whether every site's dtype and head
+    dimension admit the kernel. `attention_kernel_absent` is an image fact rather than a typo,
+    and it is the one refusal that waits for `plan`.
+    """
+    # THE VOCABULARY FIRST, so a typo is answered as a typo. Everything below it describes a
+    # kernel that exists; `nope` is not one, and telling a developer their construction is
+    # compiled when what they did was misspell `sdpa` sends them at the wrong thing.
+    candidate = BY_NAME.get(name)
+    if candidate is None:
+        raise AttentionRefusal(
+            "attention_kernel_unknown",
+            f"{name!r} is not an attention kernel this runtime knows; it knows {sorted(BY_NAME)}",
+        )
+    blocked = frozen or _baked_in(roots)
+    if blocked:
+        raise AttentionRefusal(
+            "attention_kernel_frozen",
+            f"{name} cannot be pinned per request: {blocked}. A per-request pin takes only "
+            "while the backend is read live on every call — an uncompiled module with no "
+            "collectives installed. Pin it at prepare instead (`cozy-runtime run "
+            f"kernel.attention={name}`), which is a construction fact",
+        )
+    unsupported = _device_admits(candidate, device)
+    if unsupported:
+        # `pinned` adds `image_kernels` here, which PROBES every candidate. That is device
+        # work and this half may not do it, so the refusal names the kernel's declared range
+        # and the card instead, and points at the record that does list the runnable set.
+        raise AttentionRefusal(
+            "attention_kernel_unsupported",
+            f"{unsupported}. This pod's boot line lists what it can actually run",
+        )
+    sites = 0
+    for component, module, _ in _sites(roots):
+        dtype, head_dim = _dtype(module), _head_dim(module)
+        if not _admits(candidate, dtype, head_dim):
+            raise _site_refusal(candidate.name, component, dtype, head_dim)
+        sites += 1
+    if not sites:
+        raise AttentionRefusal(
+            "attention_kernel_unsupported",
+            f"{name} was pinned on a construction that holds no diffusers attention site; a "
+            "pin is never ignored",
+        )
+    return candidate
+
+
+def plan(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Swap:
+    """The BETWEEN-ATTEMPTS pin (cr-125, amended 2026-09-09): one kernel, checked, not yet set.
+
+    Per-request is mechanically a `setattr` across the processors — the fused forward reads
+    `_attention_backend` live on every call rather than capturing it at install — but it is only
+    HONEST where nothing baked the backend first. Where a module is compiled or a group has
+    installed its collectives, the swap REFUSES typed instead of setting a field nobody reads:
+    an A/B whose pin did not take is worse than no A/B, because it reports a difference that is
+    not there.
+
+    Nothing is mutated until every site is known to admit the kernel. A half-swapped
+    construction would serve two kernels and record one, which is the same lie one step down.
+    """
+    check(device, roots, name, frozen)
+    entry = pinned(name, device)[0]
+    return Swap(entry, tuple((component, processor) for component, _, processor in _sites(roots)))
 
 
 def select(device: DeviceFacts, roots: Mapping[str, Any], pin: str = "") -> Applied:

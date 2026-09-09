@@ -82,6 +82,16 @@ def safe(text: str, cap: int = 1024) -> str:
     return ascii_only[:cap]
 
 
+def _attention_pin(spec: Mapping[str, Any]) -> dict[str, str]:
+    """The attempt's execution-path override, as the executor command spells it (cr-125).
+
+    Absent by default, and an ABSENT key rather than an empty one: the executor branches on
+    presence, so a serving worker that was never given a pin cannot take the swap path at all.
+    """
+    kernel = str(spec.get("attention_kernel") or "")
+    return {"attention_kernel": kernel} if kernel else {}
+
+
 def _coded(outcome: Mapping[str, Any]) -> str:
     """`<code>: <message>` — the AUTHOR's typed code in front of its own sentence.
 
@@ -758,6 +768,9 @@ class AttemptEngine:
                     "entrypoint": declared.entrypoint,
                     "payload": attempt.payload,
                     **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
+                    # THE EXECUTION-PATH OVERRIDE (cr-125), checked here so a mistyped kernel
+                    # refuses before the attempt is accepted and no device is ever touched.
+                    **_attention_pin(attempt.spec),
                     "input_metadata": {
                         name: {
                             "input_id": name,
@@ -1723,6 +1736,7 @@ class AttemptEngine:
         return {
             "cmd": "invoke",
             **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
+            **_attention_pin(attempt.spec),
             "request_id": key,
             "entrypoint": attempt.declared.entrypoint,
             "deadline_s": seconds,
