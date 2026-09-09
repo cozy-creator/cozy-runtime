@@ -4570,6 +4570,10 @@ class Worker:
             and executor.construction_key == construction_key
             and parameters <= executor.parameters
             and executor.prepared_model is not None
+            # Same seal rule as `_own_executor`: a process holding the right construction on
+            # the WRONG devices is not a reusable process. Cheap, and it keeps the two reuse
+            # paths from disagreeing about what makes an executor the right one.
+            and executor.sealed_devices == tenant.lane.devices
         ):
             executor.ready_bindings.clear()
             for binding in group:
@@ -4626,6 +4630,17 @@ class Worker:
                 and not executor.reserved_for_job
                 and not executor.ready_bindings
                 and executor.prepared_model is None
+                # THE SEAL IS SET ONCE, AT SPAWN, and a running process cannot be re-sealed.
+                # A tenant that moves between lanes of different WIDTH — the single-device
+                # lane a placement started on, then the K-device group lane it is assigned
+                # (cr-068) — would otherwise reuse a process sealed to `CUDA_VISIBLE_DEVICES`
+                # it no longer serves, and `executor.py` refuses the prepare `env_seal_broken`
+                # after the group has already been formed and the weights fetched. Retiring it
+                # here makes a seal change an ordinary replacement instead of a late refusal.
+                # A width change also changes whether the seal carries `NCCL_NVLS_ENABLE=0`
+                # (pgw#929), which only a group lane imposes, so this one comparison keeps a
+                # non-group process from forming a communicator without it.
+                and executor.sealed_devices == lane.devices
             ):
                 self.note(
                     "boot",
