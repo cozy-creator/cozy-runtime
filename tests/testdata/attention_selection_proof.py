@@ -167,6 +167,9 @@ def main() -> None:
     applied = attention.select(device, roots)
     out["auto"] = applied.document()
     out["auto_backends"] = _backends(roots)
+    # AUTO on a placement sharded at degree 4 (cr-137): a site admits only a kernel diffusers
+    # can shard, so the fp8 rank — which does not — is never pinned where `cp.py` would refuse.
+    out["auto_degree4"] = attention.select(device, roots, degree=4).document()
 
     # PER-SITE ADMISSION. cuDNN serves head dim 128 and not 256, so one site takes it and
     # the other keeps the floor — the same construction, two kernels, no per-call fallback.
@@ -245,6 +248,9 @@ def _fp8(device: DeviceFacts, dit: Attention) -> dict[str, Any]:
         "line": applied.line(),
         "forward": {"shape": list(result.shape), "dtype": str(result.dtype)},
         "bf16_slot_untouched": hub.kernel_fn is before,
+        "sharded_pin": _refusal(
+            lambda: attention.install(ready, {"dit": dit}, "flash-attn3-fp8", degree=4)
+        ),
     }
 
 

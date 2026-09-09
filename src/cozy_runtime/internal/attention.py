@@ -15,9 +15,10 @@ ran is a pure function of (device, image digest, checkpoint) — which is why on
 the whole record and no per-attempt attestation is kept.
 
 A NUMERICS-CHANGING KERNEL IS NOT AUTOMATICALLY FASTER, and speed is not the only thing a
-rank asserts. 8-bit attention has now been measured (h3a-013, H100 SXM, H3's own geometry):
-SageAttention2 sm90 is 1.12x rank 1, and flash-attn3's OWN fp8-e4m3 path — the same baked `.so`
-this image already ships — is 1.31x. Neither is ranked, and the reason is not the speed:
+rank asserts. 8-bit attention has been measured (h3a-013, H100 SXM, H3's own geometry):
+SageAttention2 sm90 is 1.12x flash-attn3, and flash-attn3's OWN fp8-e4m3 path — the same baked
+`.so` the bf16 entry loads — is 1.31x. That fp8 path is RANK 1 ON sm90 (cr-137, owner decision
+2026-09-08), and the rest of this section is the record of what the decision knowingly takes:
 
   An EXACT kernel needs no quality evidence to be promoted. flash-attn3 became rank 1 over
   cuDNN on a speed measurement alone because the two agree to max abs 1.2e-7, FOUR orders
@@ -26,29 +27,41 @@ this image already ships — is 1.31x. Neither is ranked, and the reason is not 
   30-step sampler amplifies any perturbation; that is a property of the sampler, not a defect
   of either kernel, and it is provable that the arithmetic did not change.
 
-  An INEXACT kernel cannot make that argument. Both 8-bit arms sit at 3.7-4.0e-2, ~16x the
-  bf16 floor. Nothing we own can currently separate "fp8 degrades quality" from "fp8 changes
-  the sample": h3a-001's gate is unbuilt, cozy-eval has no ratified conditions, and h3a-020 §5
+  An INEXACT kernel cannot make that argument. fp8 sits at 3.9e-2 rel L2 on Gaussian rows and
+  5.3e-2 on QK-normed ones — the model's own regime, and the worse figure — 16-23x the bf16
+  floor. Nothing we own can separate "fp8 degrades quality" from "fp8 changes the sample":
+  h3a-001's population gate is unbuilt, cozy-eval has no ratified conditions, and h3a-020 §5
   MEASURED that `cozy-eval compare` refuses the paired video form for an attention-backend
-  change and that paired audio distance cannot separate them either. A promotion would change
-  every customer's output on an image upgrade, silently, with no instrument that could tell us
-  whether it got worse. And it would not even reach the target: fp8 takes the 5 s cell to
-  2.68 c/s against a 2.5 target, still 7% short, and the 14 s cell to 4.75, 1.9x short. So it
-  buys an unverifiable quality risk for something that misses anyway.
+  change. h3a-013 parked it in `PINNABLE` on exactly that reasoning, with the pin as the
+  instrument that would produce the evidence. The owner then took the speed anyway, pre-launch,
+  with the gap stated rather than closed: 1.292x (5 s) / 1.317x (14 s) served through this
+  runtime with the per-call quantisation inside the timed call, composing on run 419's basis
+  to 3.06 -> 2.68 c/s at 5 s and 5.82 -> 4.70 at 14 s. It still misses the 2.5 target, and it
+  is at the kernel's physical ceiling — at head dimension 128 the softmax runs on the MUFU at
+  16 lanes/clk/SM and does not shrink with the GEMM (h3a-013 pass 3) — so no faster dense
+  8-bit arm is waiting to be ranked above it. WHAT IS OWED: h3a-001's population gate, and
+  before that a listening check — nobody has yet watched or listened to a single
+  fp8-attention clip, on a model whose joint audio is the differentiator and where the 4-bit
+  sweep measured audio degrading ~5x more than video under quantisation error (h3-4bit.md).
+  Both are recorded on cr-137. A kernel nobody has listened to is ranked here because the
+  owner said so, not because the question was settled.
 
-  fp8 therefore belongs in `PINNABLE` — available for measurement, chosen deliberately — and
-  the pin is the instrument that produces the evidence a promotion would need. It could not be
-  spelled here at first: diffusers 0.40.0's `_flash_3_hub` backend hard-codes
+  The promotion changes nothing about HOW a site is admitted. fp8 serves bf16/fp16 at head
+  dimension <= 128 — a strict subset of the bf16 entry's sites — so the only sites that move
+  are ones the bf16 entry already served, and every site that kept the floor keeps it (the two
+  H3 VAEs, x37, on dtype). And it does not serve context parallelism: its backend registers
+  `supports_context_parallel=False`, so a site in a SHARDED placement (degree > 1) admits only
+  a kernel diffusers can shard and falls through to the bf16 entry. That capability is read
+  from diffusers' registry at the pin rather than restated on the row, for the reason
+  `_admit_arch` reads a binary's archs from its artifact: a second copy drifts. At degree 4
+  fp8 was measured no faster than bf16 anyway (decision #714g), and `cp.py` refuses a sharded
+  site holding it rather than serving it unsharded.
+
+  It could not be spelled here at first: diffusers 0.40.0's `_flash_3_hub` backend hard-codes
   `q_descale=k_descale=v_descale=None` and constrains q/k/v to bf16/fp16, so FA3-fp8 is not an
-  `AttentionBackendName` diffusers knows. h3a-013 reached it by calling the baked kernel
-  directly. It IS spelled now (cr-136): `attention_fp8.py` registers that per-call quantising
-  dispatch path as a backend member of its own, over the same baked snapshot rank 1 loads, and
-  the `flash-attn3-fp8` row below names it — PINNABLE, held to its own numeric budget by the
-  same self-check as every other entry. It stays unranked for the reasons above, and for one
-  more that h3a-013's second pass settled with arithmetic: at head dimension 128 the fp8 kernel
-  is bound by the softmax, which runs on the MUFU at 16 lanes/clk/SM and does not shrink with
-  the GEMM, so ~1.3x is near this kernel's physical ceiling and no faster dense 8-bit arm
-  exists on sm90 to rank instead.
+  `AttentionBackendName` diffusers knows. `attention_fp8.py` (cr-136) registers that per-call
+  quantising dispatch path as a backend member of its own, over the same baked snapshot the
+  bf16 entry loads, held to its own numeric budget by the same self-check as every other entry.
 
 AN IMPORT IS NOT A PROOF THAT A KERNEL COMPUTES. h3a-013 measured the image's baked
 `sageattention` sm90 kernel returning UNINITIALIZED MEMORY on an H100 — no exception, the right
@@ -213,6 +226,45 @@ class Candidate:
 #: and with nothing else.
 CANDIDATES: tuple[Candidate, ...] = (
     Candidate(
+        name="flash-attn3-fp8",
+        backend=attention_fp8.BACKEND,
+        min_sm=90,
+        dtypes=frozenset({"bfloat16", "float16"}),
+        # 128 and not the bf16 entry's 256: the baked build instantiates e4m3 for hdim128 only
+        # (its `build.toml` lists `hdim128_e4m3_*_sm90` and no other e4m3 head dimension), so
+        # a 256-dim site handed to it would be refused by the kernel, not served. It is also
+        # where the measurement stops: the physics is per element — FA3 fp8 measured 701 / 946 /
+        # 1139 TF/s at head dim 64 / 128 / 256 (h3a-013 pass 3) — and the rank is asserted at
+        # 128 alone, H3's DiT being 56 x 128. A site outside it falls through to the next rank.
+        max_head_dim=128,
+        # The SAME snapshot as `flash-attn3`, so the same artifact metadata bounds it above.
+        baked="flash-attn3",
+        # A RANKED budget, tighter than the 1e-1 it carried as a pinnable. A pin's number is
+        # read by the developer who named it; a rank's by nobody, so this self-check is the
+        # only numeric witness on every pod that auto-selects it and has to refuse "a worse
+        # 8-bit kernel than the one measured", not only "not attention". MEASURED at `PROBE` on
+        # the H100 through this dispatch: 3.94e-2 (3.91e-2 at 4096 rows; per-tensor and
+        # per-head descales 3.84-3.96e-2; fused and eager quantisers 0 codes apart), and 5.3e-2
+        # on QK-normed rows, the model's own regime and the worst distribution measured. 6e-2
+        # admits all of that and refuses at ~1.5x the probe figure, under the smallest failure
+        # that has a name — a truncating cast, an e5m2 instantiation or a dropped descale each
+        # at least double it, and a kernel that returns V unchanged sits at 16. A refusal here
+        # costs 1.3x on one card and shows in the boot line; an admission that should not have
+        # happened shows nowhere.
+        rel_l2_max=6e-2,
+        why=(
+            "MEASURED on an H100 SXM through THIS runtime's dispatch (h3a-013 pass 3, "
+            "`results3/runtime_check.json`): 1.292x (5 s) / 1.317x (14 s) over flash-attn3 "
+            "with the per-call quantisation inside the timed call; kernel screen 946 vs 603 "
+            "TF/s at head dim 128; composed on run 419's basis 3.056 -> 2.676 c/s at 5 s and "
+            "5.817 -> 4.703 at 14 s. RANKED BY OWNER DECISION 2026-09-08 (cr-137), knowingly "
+            "INEXACT — rel L2 3.9e-2 Gaussian / 5.3e-2 QK-normed, 16-23x the bf16 floor — with "
+            "no population quality gate and no fp8 clip yet watched or listened to; still 7 % "
+            "short of the 5 s target and at the kernel's softmax-bound ceiling. Not "
+            "context-parallel: a sharded site falls through to the bf16 entry"
+        ),
+    ),
+    Candidate(
         name="flash-attn3",
         backend="_flash_3_hub",
         min_sm=90,
@@ -342,32 +394,6 @@ PINNABLE: tuple[Candidate, ...] = (
             "eb615cf6, whose `sm90_compile.py` bound a `register_fake` meta stub over the "
             "custom op, so every sm90 call returned its uninitialized output buffer at rel L2 "
             "311 with no error. The self-check below refuses exactly that, on any image"
-        ),
-    ),
-    Candidate(
-        name="flash-attn3-fp8",
-        backend=attention_fp8.BACKEND,
-        min_sm=90,
-        dtypes=frozenset({"bfloat16", "float16"}),
-        # 128 and not the bf16 entry's 256: the baked build instantiates e4m3 for hdim128 only
-        # (its `build.toml` lists `hdim128_e4m3_*_sm90` and no other e4m3 head dimension), so
-        # a 256-dim site handed to it would be refused by the kernel, not served.
-        max_head_dim=128,
-        # The SAME snapshot as `flash-attn3`, so the same artifact metadata bounds it above.
-        baked="flash-attn3",
-        # MEASURED at the probe shape and at H3's own: 3.9e-2 rel L2 against exact fp32
-        # (h3a-013), ~17x bf16's floor and ~2.5x under this budget. A kernel that returns V
-        # unchanged sits at 16; the budget separates quantisation from not-attention.
-        rel_l2_max=1e-1,
-        why=(
-            "The fastest 8-bit arm on sm90 (h3a-013, H100 SXM, H3's geometry): 1.31x "
-            "flash-attn3 kernel-only, 1.29x with the per-call quantisation charged, from the "
-            ".so this image already ships. NOT RANKED: it is INEXACT (3.9e-2 rel L2, ~17x the "
-            "bf16 floor) and no gate we own can tell 'fp8 degrades quality' from 'fp8 changes "
-            "the sample'; at 2.68 c/s it also misses the 5 s cell's 2.5 target. And it is near "
-            "its own physical ceiling — at head dim 128 the kernel is softmax-bound on the "
-            "MUFU (h3a-013 pass 3), so a faster dense 8-bit kernel is not waiting to be found. "
-            "Pin it to measure quality; promotion needs h3a-001's population gate"
         ),
     ),
 )
@@ -870,6 +896,15 @@ def _admits(candidate: Candidate, dtype: str, head_dim: int) -> bool:
     return not (candidate.max_head_dim and (head_dim == 0 or head_dim > candidate.max_head_dim))
 
 
+def _context_parallel(member: Any) -> bool:
+    """Does diffusers' registry mark this backend as one it can shard? Read at the pin and
+    never restated on a row: the backend's own registration is the authority, and a static
+    copy of it would be the drift `_admit_arch` exists to refuse."""
+    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+
+    return bool(_AttentionBackendRegistry._is_context_parallel_available(member))
+
+
 @dataclass(frozen=True, slots=True)
 class Applied:
     """What the runtime pinned, per component and per kernel. The BOOT record, and all of it."""
@@ -964,12 +999,20 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
     }
 
 
-def install(ready: list[Ready], roots: Mapping[str, Any], pin: str = "") -> Applied:
+def install(
+    ready: list[Ready], roots: Mapping[str, Any], pin: str = "", degree: int = 1
+) -> Applied:
     """Pin the fastest admitted kernel on every attention site of the constructed components.
 
     Per SITE, not per model: `set_attention_backend` would also move diffusers' PROCESS-GLOBAL
     active backend, which is what carried a DiT's kernel into an fp16 VAE decode once (cr-122).
     Setting `processor._attention_backend` is the same pin without the propagation.
+
+    A SHARDED site (`degree` > 1, sequence parallelism) admits only a kernel diffusers can
+    shard, and that is an admission rule like dtype and head dimension rather than a later
+    refusal: `cp.py` reads the backend off every site before arming and refuses the whole
+    placement on a CP-incapable one, so auto must fall through here, at the pin, to the next
+    rank — the fp8 entry is the one that does not shard (cr-137).
 
     With a PIN (cr-125) `ready` holds exactly one kernel, and a site it does not admit is a
     typed refusal rather than a quiet demotion.
@@ -980,6 +1023,8 @@ def install(ready: list[Ready], roots: Mapping[str, Any], pin: str = "") -> Appl
         dtype, head_dim = _dtype(module), _head_dim(module)
         for entry in ready:
             if not _admits(entry.candidate, dtype, head_dim):
+                continue
+            if degree > 1 and not _context_parallel(entry.member):
                 continue
             processor._attention_backend = entry.member
             hosts.setdefault(component, {})
@@ -993,14 +1038,24 @@ def install(ready: list[Ready], roots: Mapping[str, Any], pin: str = "") -> Appl
                 f"{ready[0].name if ready else 'no attention kernel'} does not serve "
                 f"{component}'s attention: "
                 f"{dtype or 'unknown'} activations at head dimension "
-                f"{head_dim or 'unknown'}. A pinned kernel is never quietly replaced",
+                f"{head_dim or 'unknown'}"
+                + (
+                    f", sharded at sequence-parallel degree {degree} (a kernel that does not "
+                    "serve context parallelism cannot take a sharded site)"
+                    if degree > 1
+                    else ""
+                )
+                + ". A pinned kernel is never quietly replaced",
             )
     return Applied(hosts, locations, tuple(entry.name for entry in ready), pin)
 
 
-def select(device: DeviceFacts, roots: Mapping[str, Any], pin: str = "") -> Applied:
-    """The whole decision, in one call: what this device and image offer, pinned on the sites."""
-    return install(pinned(pin, device) if pin else available(device), roots, pin)
+def select(
+    device: DeviceFacts, roots: Mapping[str, Any], pin: str = "", degree: int = 1
+) -> Applied:
+    """The whole decision, in one call: what this device and image offer, pinned on the sites
+    of a placement sharded at `degree` (1 = unsharded)."""
+    return install(pinned(pin, device) if pin else available(device), roots, pin, degree)
 
 
 def image_kernels(device: DeviceFacts) -> str:

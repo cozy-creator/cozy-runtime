@@ -1308,8 +1308,11 @@ class Executor:
             # place and a group installs its collectives next, and cp.py's ordering is
             # forced — set the backend, then parallelism, then compile. A pin applied after
             # either is a field nobody reads, which is why this is a construction fact and
-            # not a per-attempt one.
-            applied = attention.select(device_facts, {**backend.components, **backend.parked}, pin)
+            # not a per-attempt one. The degree rides in because a sharded site admits only
+            # a kernel `cp.py` can shard, and the fp8 rank is not one (cr-137).
+            applied = attention.select(
+                device_facts, {**backend.components, **backend.parked}, pin, degree=self.world
+            )
             stage("attention_pin")
         except ModelFitRefused as exc:
             # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
