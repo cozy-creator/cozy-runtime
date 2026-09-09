@@ -1,19 +1,9 @@
-"""Installing Ulysses sequence parallelism on a generation - the runtime's job, never the
-package's.
+"""Install Ulysses hooks and guard collectives on declared sharded components.
 
-Installing CP puts split/all-to-all/gather hooks ON THE MODULES, so from that moment EVERY
-forward through them issues collectives - and the model's component-use method is the only
-seam that supplies participants on the other ranks. A forward from anywhere else (a warm
-compile, a mint seed, a probe, a package calling a component by hand) runs on rank 0 alone
-and HANGS the whole group in NCCL. `gated_call` marks the dynamic extent in which
-collectives have participants; the guard installed on every sharded component refuses a
-forward outside it (`ungated_sharded_forward`) instead of hanging.
-
-The ordering is FORCED: set the attention backend, enable parallelism, then compile -
-compiling AFTER the hooks puts the split/all-to-all/gather inside the traced graph. Runtime
-staging preserves module forwards; pre-existing accelerate wrappers on the sharded
-component do not reliably preserve the CP hooks and are refused. Ring
-attention is not installed (it needs the attention kernel's LSE); this is Ulysses only.
+Runtime mirrors each component call before torch and diffusers hooks execute.
+Every rank enters the same call gate and owning component scope. Sampling, text
+encoding and VAE work remain on the leader. Select the attention backend before
+installing CP; existing accelerate wrappers on sharded components are refused.
 """
 
 from __future__ import annotations
@@ -172,10 +162,8 @@ def _install_gate_guard(component: Any, name: str) -> None:
         if in_gated_call():
             return
         raise UngatedShardedForward(
-            f"forward through the context-parallel component {name!r} outside the group's "
-            "call gate: this rank would issue collectives no other rank is in. Every forward "
-            "at degree>1 goes through a mirrored component-use method (compile warmups, mint "
-            "seeds, probes and direct component calls are refused under context parallelism)"
+            f"sharded component {name!r} needs the Runtime call gate inside an active "
+            "component scope, so every rank participates in its collectives"
         )
 
     handle = component.register_forward_pre_hook(guard, with_kwargs=True)

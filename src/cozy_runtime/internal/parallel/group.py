@@ -1,28 +1,9 @@
-"""RankGroup - the K-1 follower ranks that execute ONE generation beside rank 0.
+"""Manage follower executors inside the leader's process scope.
 
-Rank 0 is the executor the worker spawned and addresses. It spawns the followers itself:
-each is the same executor program (`internal/executor.py --rank r --world K`), a direct
-child inside rank 0's cgroup (inherited), armed with pdeathsig so it dies with rank 0,
-sealed to the same `CUDA_VISIBLE_DEVICES` and pinned to card `r` of it. The worker never
-sees a follower except as a process in the scope it already freezes, kills and proves
-absent.
-
-Two planes, deliberately distinct:
-
-* THE COMMAND PLANE is a `socketpair` per follower carrying the worker/executor seam's own
-  length-framed canonical-JSON frames (`internal/seam.py`): control, never pickle, never a
-  path on disk. Rank 0 broadcasts a command to every follower and collects one reply from
-  each; a follower parks on `recv`, so teardown cannot hang on a collective.
-* THE COLLECTIVE PLANE is torch.distributed over a loopback `TCPStore` on port 0 -
-  kernel-chosen, in-executor, never a constant and never on the wire - with NVLS
-  multicast off before the communicator forms (pgw#929: CUDA 401 on the first all-to-all
-  otherwise). Collectives happen only inside the gated call (`cp.py`).
-
-Nothing here waits on a clock. A follower that has not dialled back or replied is judged
-by `liveness.Pace` over its own progress meter: one that is still importing torch or
-filling is left alone, one that has stopped against its own evidence is `group_broken`.
-A follower's death is observed the moment its seam closes, and the group is then broken
-for good: rank 0 poisons itself and the worker rebuilds the whole cgroup.
+Each follower has a framed JSON command socket and joins the group's distributed
+collectives. A failed run or lost follower breaks the group and terminates its
+remaining followers, allowing blocked collectives to unwind. Import/fill progress
+is observed through the existing liveness meter.
 """
 
 from __future__ import annotations
