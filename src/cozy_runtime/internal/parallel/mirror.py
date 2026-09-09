@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +15,8 @@ from cozy_runtime.internal.parallel.plan import GroupRefusal
 def mirror_component(
     component: Any,
     *,
-    model: Any,
-    name: str,
+    name: tuple[str, str],
+    prepared: Mapping[tuple[str, str], tuple[Any, Any]],
     group: RankGroup,
     spool: Callable[[], Path | None],
 ) -> None:
@@ -38,31 +38,44 @@ def mirror_component(
 
         if cp.in_gated_call():
             return call(*args, **kwargs)
-        active = model._cozy_active
+        models = {key[0]: model for key, (model, _root) in prepared.items()}
+        active = {
+            key: model._cozy_active
+            for key, model in models.items()
+            if model._cozy_active is not None
+        }
         directory = spool()
-        if active is None or directory is None:
+        if name[0] not in active or directory is None:
             raise cp.UngatedShardedForward(
                 f"{name}: a sharded forward needs an active component scope and attempt spool"
             )
         group.check_alive()
-        payloads = wire.TensorSpool(directory / "ranks")
-        try:
-            command = {
-                **wire.run_command(args, kwargs, payloads),
-                "component": name,
-                "spool": str(directory),
-                "scope_method": active[0],
-                "scope_components": list(active[1]),
-                "grad_enabled": torch.is_grad_enabled(),
-                "inference_mode": torch.is_inference_mode_enabled(),
-            }
-            residency = model._cozy_residency
+        references = {
+            key: root
+            for key, (_model, root) in prepared.items()
+            if key[0] in active and key[1] in active[key[0]][1]
+        }
+        scopes = []
+        for key, (method, components) in active.items():
+            scope = {"model": key, "method": method, "components": list(components)}
+            residency = models[key]._cozy_residency
             if residency is not None:
-                command.update(
+                scope.update(
                     placement=residency.placement,
                     headroom_bytes=residency.headroom,
                     scope_headroom_bytes=residency.scope_headrooms,
                 )
+            scopes.append(scope)
+        payloads = wire.TensorSpool(directory / "ranks", references)
+        try:
+            command = {
+                **wire.run_command(args, kwargs, payloads),
+                "component": list(name),
+                "spool": str(directory),
+                "scopes": scopes,
+                "grad_enabled": torch.is_grad_enabled(),
+                "inference_mode": torch.is_inference_mode_enabled(),
+            }
             try:
                 group.broadcast(command)
                 with cp.gated_call():
