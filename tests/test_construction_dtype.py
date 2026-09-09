@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import msgspec
 import pytest
 import tensorfs
-import torch
 
 from cozy_runtime.author import (
     Artifact,
@@ -25,6 +24,8 @@ from cozy_runtime.internal import derive_child
 from cozy_runtime.internal.encoding import SPEC_PLAIN
 from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, tensor_schema_of
 from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+
+torch = pytest.importorskip("torch")
 
 
 @pytest.mark.parametrize("dtype,width", [("f32", 4), ("f16", 2)])
@@ -136,7 +137,7 @@ def test_native_checkpoint_fills_the_dtype_selected_constructor(
     )
 
     class Pipeline:
-        def __init__(self, config):
+        def __init__(self, config: Config) -> None:
             requested = {"f32": torch.float32, "f16": torch.float16}[
                 config.tensor_dtype("linear.weight", default="f32")
             ]
