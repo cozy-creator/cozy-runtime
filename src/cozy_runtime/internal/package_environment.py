@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
+from urllib.parse import unquote, urlsplit
 
 from packaging.markers import default_environment
 from packaging.requirements import InvalidRequirement, Requirement
@@ -45,7 +46,9 @@ from packaging.tags import Tag, parse_tag
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import base_observation, canonical
+from cozy_runtime.internal import base_observation, canonical, storage_admission
+from cozy_runtime.internal.config import inherited_environment
+from cozy_runtime.protocol import weights_limits
 
 RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
 LOCKED_RECEIPT_FORMAT = "cozy.runtime.LockedEnvironmentReceipt/1"
@@ -56,7 +59,7 @@ MAX_WHEEL_MEMBERS = 100_000
 MAX_WHEEL_EXPANDED_BYTES = 8 << 30
 MAX_WHEEL_EXPANSION = 64
 MAX_METADATA_BYTES = 4 << 20
-MAX_PACKAGE_WHEELS = 129
+MAX_PACKAGE_WHEELS = weights_limits.MAX_LOCAL_PACKAGE_FILES
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NORMALIZE = re.compile(r"[-_.]+")
@@ -242,12 +245,22 @@ def wheel_name_version(filename: str) -> tuple[str, str] | None:
 
 
 def measure_wheel(
+    path: Path, owner: str, base: base_observation.Observation, *, allow_base_owned: bool = False
+) -> tuple[Wheel, VerifiedFile]:
+    inspected, verified = _measure_inspected_wheel(
+        path, owner, base, allow_base_owned=allow_base_owned
+    )
+    return inspected.wheel, verified
+
+
+def _measure_inspected_wheel(
     path: Path,
     owner: str,
     base: base_observation.Observation,
     *,
     allow_base_owned: bool = False,
-) -> tuple[Wheel, VerifiedFile]:
+    verified: VerifiedFile | None = None,
+) -> tuple[_Inspected, VerifiedFile]:
     """Derive one local wheel fact, then run the ordinary full wheel inspection once."""
 
     if owner not in {"project", "custom"} or not path.is_absolute():
@@ -265,7 +278,14 @@ def measure_wheel(
         distribution=_name(str(distribution)),
         version=str(version),
         filename=path.name,
-        digest=_hash_file(path),
+        # The authenticated supervisor already checked the whole wheel digest.
+        # Reuse the existing same-boot immutable-file receipt exactly as the
+        # ordinary local wheel grant path does; full ZIP admission still runs.
+        digest=(
+            verified.digest
+            if verified is not None and verified.matches(path, verified.digest, info.st_size)
+            else _hash_file(path)
+        ),
         length=info.st_size,
         tags=tuple(sorted(str(tag) for tag in tags)),
         owner=owner,
@@ -277,7 +297,7 @@ def measure_wheel(
         base,
         allow_base_owned=allow_base_owned,
     )
-    return inspected.wheel, VerifiedFile.record(path, wheel.digest, wheel.length)
+    return inspected, VerifiedFile.record(path, wheel.digest, wheel.length)
 
 
 def preflight_environment(
@@ -405,6 +425,11 @@ def materialize(
     _require_digest(source.environment_digest, "environment_digest")
     _require_digest(source.project_wheel_digest, "project_wheel_digest")
     if dependency_python is not None:
+        if storage_admission.enabled():
+            raise EnvironmentRefusal(
+                "package_environment_dependency_snapshot_local_only",
+                "rented execution requires the declared exact dependency wheels",
+            )
         return _materialize_dependency_snapshot(source, root, python, dependency_python, base)
     observed = base or observe_base(python)
     wheels = _verify_inventory(source, observed, venv_precedence=True)
@@ -427,6 +452,11 @@ def materialize(
     receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
     inspected = _verify_grants(source, wheels, observed)
     boot_installs = _verify_python_requirements(inspected, observed, boot=not exact_dependencies)
+    if boot_installs and storage_admission.enabled():
+        raise EnvironmentRefusal(
+            "package_environment_dependency_wheels_required",
+            "rented execution requires bounded exact dependency wheels, not an online boot resolve",
+        )
     if receipt_path.exists():
         installed = open_generation(
             root,
@@ -441,60 +471,77 @@ def materialize(
             _verify_installed_requirements(installed.site_packages, inspected, observed)
         return installed
     reused = final.exists()
-    _require_owned_root(root)
-    _remove_dead_staging(root)
-    contents.mkdir(parents=True, exist_ok=True, mode=0o700)
-    receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # The executor receives only the venv interpreter. Search without directory listing is
-    # sufficient to reach it; write remains root-only and receipts remain fully private.
-    contents.chmod(0o711)
-    receipts.chmod(0o700)
-    if not reused:
-        staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
-        try:
-            _install_with_uv(uv, python, staging, inspected, boot_installs)
-            staged = _installed_at(
-                staging,
-                content_digest=content_digest,
-                receipt_bytes=receipt_bytes,
-                receipt_digest=receipt_digest,
-                reused=False,
-                base=observed,
-            )
-            _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
-            _verify_prefix_resources(staging, inspected)
-            if exact_dependencies:
-                _verify_installed_requirements(staged.site_packages, inspected, observed)
-            _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
-            _make_read_only(staging)
-            _fsync_dir(staging)
+    with storage_admission.admit(_wheel_write_bound(root, inspected, reused=reused)):
+        _require_owned_root(root)
+        _remove_dead_staging(root)
+        contents.mkdir(parents=True, exist_ok=True, mode=0o700)
+        receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # The executor receives only the venv interpreter. Search without directory listing is
+        # sufficient to reach it; write remains root-only and receipts remain fully private.
+        contents.chmod(0o711)
+        receipts.chmod(0o700)
+        if not reused:
+            staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
             try:
-                os.rename(staging, final)
-                final.chmod(0o555)
-            except OSError as exc:
-                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
-                    raise
-                _remove_tree(staging)
-                reused = True
-            _fsync_dir(contents)
-        except Exception:
-            if staging.exists():
-                _remove_tree(staging)
-            raise
-    _publish_receipt(receipt_path, receipt_bytes, receipts)
-    installed = open_generation(
+                _install_with_uv(uv, python, staging, inspected, boot_installs)
+                staged = _installed_at(
+                    staging,
+                    content_digest=content_digest,
+                    receipt_bytes=receipt_bytes,
+                    receipt_digest=receipt_digest,
+                    reused=False,
+                    base=observed,
+                )
+                _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
+                _verify_prefix_resources(staging, inspected)
+                if exact_dependencies:
+                    _verify_installed_requirements(staged.site_packages, inspected, observed)
+                _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
+                _make_read_only(staging)
+                _fsync_dir(staging)
+                try:
+                    os.rename(staging, final)
+                    final.chmod(0o555)
+                except OSError as exc:
+                    if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                        raise
+                    _remove_tree(staging)
+                    reused = True
+                _fsync_dir(contents)
+            except Exception:
+                if staging.exists():
+                    _remove_tree(staging)
+                raise
+        _publish_receipt(receipt_path, receipt_bytes, receipts)
+        installed = open_generation(
+            root,
+            receipt_digest=receipt_digest,
+            environment_digest=source.environment_digest,
+            reused=reused,
+            python=python,
+        )
+        if reused:
+            _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+            _verify_prefix_resources(installed.generation, inspected)
+        if exact_dependencies:
+            _verify_installed_requirements(installed.site_packages, inspected, observed)
+        return installed
+
+
+def _wheel_write_bound(
+    root: Path, inspected: Sequence[_Inspected], *, reused: bool = False
+) -> storage_admission.Write:
+    # Two expanded copies cover uv staging and the installed generation even
+    # when reflinks/hardlinks are unavailable. Reserve directory/record overhead
+    # too. Precompiled Python bytecode is omitted: import can compile in memory.
+    members = [member for wheel in inspected for member in wheel.members] if not reused else []
+    nodes = {str(parent) for member in members for parent in PurePosixPath(member.filename).parents}
+    count = len(members) + len(nodes)
+    return storage_admission.Write(
         root,
-        receipt_digest=receipt_digest,
-        environment_digest=source.environment_digest,
-        reused=reused,
-        python=python,
+        2 * sum(member.file_size for member in members) + (count * (128 << 10)) + (1 << 20),
+        2 * count + 128,
     )
-    if reused:
-        _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
-        _verify_prefix_resources(installed.generation, inspected)
-    if exact_dependencies:
-        _verify_installed_requirements(installed.site_packages, inspected, observed)
-    return installed
 
 
 def _verify_installed_requirements(
@@ -548,6 +595,8 @@ class LockedRow:
     text: str
     name: str
     version: str
+    url: str = ""
+    hashes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -626,18 +675,38 @@ def read_locked_requirements(raw: bytes) -> LockedRequirements:
         except InvalidRequirement as exc:
             raise refuse(str(exc)) from exc
         clauses = list(requirement.specifier)
-        if (
-            requirement.url is not None
-            or requirement.extras
-            or len(clauses) != 1
-            or clauses[0].operator != "=="
-        ):
-            raise refuse(f"{requirement_text.strip()!r} is not one exact == pin")
         name = _NORMALIZE.sub("-", requirement.name).lower()
+        if requirement.extras:
+            raise refuse("locked requirements cannot add unpinned extras")
+        if requirement.url:
+            parsed = urlsplit(requirement.url)
+            selected = wheel_name_version(unquote(Path(parsed.path).name))
+            if (
+                parsed.scheme not in {"https", "http"}
+                or (parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "::1"})
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.fragment
+                or selected is None
+                or selected[0] != name
+                or clauses
+            ):
+                raise refuse("direct requirement must name one exact public wheel")
+            version = selected[1]
+        elif len(clauses) == 1 and clauses[0].operator == "==":
+            version = clauses[0].version
+        else:
+            raise refuse("requirement is not one exact wheel or == pin")
         if name <= prior:
             raise refuse(f"{name!r} is out of order or repeats a name")
         prior = name
-        rows.append(LockedRow(text=row, name=name, version=clauses[0].version))
+        hashes = tuple(option.removeprefix("--hash=") for option in options)
+        rows.append(
+            LockedRow(
+                text=row, name=name, version=version, url=requirement.url or "", hashes=hashes
+            )
+        )
     if not rows:
         raise EnvironmentRefusal("package_environment_lock_invalid", "the export pins nothing")
     return LockedRequirements(
@@ -766,14 +835,16 @@ def materialize_locked(
             reused=True,
             python=python,
         )
+        _release_locked_wheels(install_rows)
         return installed
     reused = final.exists()
-    _require_owned_root(root)
-    _remove_dead_staging(root)
-    contents.mkdir(parents=True, exist_ok=True, mode=0o700)
-    receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
-    contents.chmod(0o711)
-    receipts.chmod(0o700)
+    with storage_admission.admit(storage_admission.Write(root, 1 << 20, 128)):
+        _require_owned_root(root)
+        _remove_dead_staging(root)
+        contents.mkdir(parents=True, exist_ok=True, mode=0o700)
+        receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
+        contents.chmod(0o711)
+        receipts.chmod(0o700)
     if not reused:
         staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
         cache = root / f".uv-cache-{os.getpid()}-{uuid.uuid4().hex}"
@@ -788,18 +859,19 @@ def materialize_locked(
                 reused=False,
                 base=observed,
             )
-            _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
-            _make_read_only(staging)
-            _fsync_dir(staging)
-            try:
-                os.rename(staging, final)
-                final.chmod(0o555)
-            except OSError as exc:
-                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
-                    raise
-                _remove_tree(staging)
-                reused = True
-            _fsync_dir(contents)
+            with storage_admission.admit(storage_admission.Write(root, 1 << 20, 128)):
+                _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
+                _make_read_only(staging)
+                _fsync_dir(staging)
+                try:
+                    os.rename(staging, final)
+                    final.chmod(0o555)
+                except OSError as exc:
+                    if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                        raise
+                    _remove_tree(staging)
+                    reused = True
+                _fsync_dir(contents)
         except Exception:
             if staging.exists():
                 _remove_tree(staging)
@@ -807,7 +879,8 @@ def materialize_locked(
         finally:
             if cache.exists():
                 _remove_tree(cache)
-    _publish_receipt(receipt_path, receipt_bytes, receipts)
+    with storage_admission.admit(storage_admission.Write(root, 1 << 20, 128)):
+        _publish_receipt(receipt_path, receipt_bytes, receipts)
     installed = open_generation(
         root,
         receipt_digest=receipt_digest,
@@ -815,6 +888,7 @@ def materialize_locked(
         reused=reused,
         python=python,
     )
+    _release_locked_wheels(install_rows)
     return installed
 
 
@@ -826,6 +900,9 @@ def _install_locked(
     indexes: Sequence[str],
     install_rows: Sequence[LockedRow],
 ) -> None:
+    if storage_admission.enabled():
+        _install_locked_bounded(uv, python, staging, install_rows)
+        return
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     requirements = cache / "locked-requirements.txt"
     requirements.write_text("".join(row.text + "\n" for row in install_rows))
@@ -881,6 +958,52 @@ def _install_locked(
                 "package_environment_uv_failed",
                 detail or f"uv exited {result.returncode}",
             )
+
+
+def _locked_operation(rows: Sequence[LockedRow]) -> str:
+    return "locked-" + hashlib.sha256("\n".join(row.text for row in rows).encode()).hexdigest()
+
+
+def _release_locked_wheels(rows: Sequence[LockedRow]) -> None:
+    if storage_admission.enabled():
+        storage_admission.release_wheels(_locked_operation(rows))
+
+
+def _install_locked_bounded(
+    uv: Path, python: Path, staging: Path, rows: Sequence[LockedRow]
+) -> None:
+    observed = observe_base(python)
+    inspected: list[_Inspected] = []
+    operation = _locked_operation(rows)
+    for row in rows:
+        if not row.url or len(row.hashes) != 1:
+            raise EnvironmentRefusal(
+                "package_environment_lock_wheels_required",
+                "refresh preparation facts from Tensorhub to obtain the exact selected wheels",
+            )
+        filename = unquote(Path(urlsplit(row.url).path).name)
+        path, length = storage_admission.fetch_wheel(operation, filename, row.hashes[0], row.url)
+        expected = staging.parent / ".stage" / operation / "wheels" / filename
+        if path != expected:
+            raise EnvironmentRefusal(
+                "package_environment_wheel_invalid", "wheel staging path changed"
+            )
+        verified = VerifiedFile.record(path, row.hashes[0], length)
+        item, verified = _measure_inspected_wheel(
+            path, "custom", observed, allow_base_owned=True, verified=verified
+        )
+        if (item.wheel.distribution, item.wheel.version, verified.digest, verified.length) != (
+            row.name,
+            row.version,
+            row.hashes[0],
+            length,
+        ):
+            raise EnvironmentRefusal(
+                "package_environment_wheel_invalid", "wheel differs from exact lock"
+            )
+        inspected.append(item)
+    with storage_admission.admit(_wheel_write_bound(staging.parent, inspected)):
+        _install_with_uv(uv, python, staging, inspected)
 
 
 def _locked_content_identity(
@@ -1907,6 +2030,7 @@ def _install_with_uv(
     *,
     dependencies: Callable[[Path], None] | None = None,
 ) -> None:
+    cache = staging.parent / (".uv-cache-" + staging.name)
     commands = [
         [
             str(uv),
@@ -1933,7 +2057,6 @@ def _install_with_uv(
             "--no-build",
             "--link-mode",
             "clone",
-            "--compile-bytecode",
             "--python",
             str(staging / "bin" / "python"),
             *(str(item.path) for item in sorted(inspected, key=lambda item: item.wheel.digest)),
@@ -1954,12 +2077,25 @@ def _install_with_uv(
                 "--no-build",
                 "--link-mode",
                 "clone",
-                "--compile-bytecode",
                 "--python",
                 str(staging / "bin" / "python"),
                 *(row.requirement for row in boot_installs),
             ]
         )
+    for command in commands:
+        command.extend(["--cache-dir", str(cache)])
+    try:
+        _run_install_commands(commands, staging, dependencies)
+    finally:
+        if cache.exists():
+            _remove_tree(cache)
+
+
+def _run_install_commands(
+    commands: Sequence[Sequence[str]],
+    staging: Path,
+    dependencies: Callable[[Path], None] | None,
+) -> None:
     for index, command in enumerate(commands):
         result = subprocess.run(
             command,
@@ -1967,6 +2103,11 @@ def _install_with_uv(
             capture_output=True,
             text=True,
             check=False,
+            env={
+                **inherited_environment(),
+                "TMPDIR": str(staging.parent),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
         )
         if result.returncode != 0:
             detail = result.stderr.strip()[-2000:] or result.stdout.strip()[-2000:]

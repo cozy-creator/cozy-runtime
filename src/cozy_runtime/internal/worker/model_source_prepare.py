@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import re
 import stat
+from functools import partial
 from pathlib import Path
 
-from cozy_runtime.internal import fill
+from cozy_runtime.internal import fill, storage_admission
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -46,7 +47,6 @@ def prepare_model_source(
             )
         profiles, roster, landed, checkpoints = _request(request)
         tensorfs = fill.tensorfs_module()
-        store = tensorfs.Store.ensure(str(tensorfs_root))
         adoption: dict[str, str] = {}
         if request.adopt_from_operation_id:
             if (
@@ -59,18 +59,51 @@ def prepare_model_source(
                     "adoption requires an old operation and no active source conversion",
                 )
             adoption["adopt_from_operation_id"] = request.adopt_from_operation_id
-        prepared = store.prepare_model_source(
-            request.operation_id,
-            documents.spell(bytes(request.source_selection_digest)),
-            profiles,
-            roster,
-            landed,
-            checkpoints=checkpoints,
-            **adoption,
-        )
+
+        def write_bound(payload: int = 0) -> storage_admission.Write:
+            bound = storage_admission.native_write(tensorfs_root, payload, len(roster))
+            metadata = storage_admission.native_write(tensorfs_root)
+            # Each profile can publish its own journal/header metadata. Sparse
+            # carrier staging writes only the supplied headers, never file length.
+            return storage_admission.Write(
+                tensorfs_root,
+                bound.bytes
+                + metadata.bytes * max(0, len(profiles) - 1)
+                + sum(len(row[4]) for row in roster),
+                bound.inodes + metadata.inodes * len(profiles),
+            )
+
+        bounded = storage_admission.enabled()
+        with storage_admission.admit(write_bound()):
+            store = tensorfs.Store.ensure(str(tensorfs_root))
+            advance = partial(
+                store.prepare_model_source,
+                request.operation_id,
+                documents.spell(bytes(request.source_selection_digest)),
+                profiles,
+                roster,
+                landed,
+                checkpoints=checkpoints,
+                **adoption,
+            )
+            prepared = advance(write_budget_bytes=0) if bounded else advance()
+        if bounded and (required := prepared["required_write_bytes"]) > 0:
+            preferred = max(required, prepared["write_interval_bytes"])
+            try:
+                with storage_admission.admit(write_bound(preferred)):
+                    prepared = advance(write_budget_bytes=preferred)
+            except storage_admission.StorageRefusal:
+                if preferred == required:
+                    raise
+                # Near capacity, one atomic op may still fit even when a full
+                # preferred pass does not. TensorFS owns both byte counts.
+                with storage_admission.admit(write_bound(required)):
+                    prepared = advance(write_budget_bytes=required)
         return _result(request, prepared)
     except ModelSourceRefusal as exc:
         return _refused(exc.code, exc.detail)
+    except storage_admission.StorageRefusal as exc:
+        return _refused("model_source_insufficient_storage", exc.detail)
     except LaunchRefusal as exc:
         return _refused("model_source_tensorfs_unavailable", exc.code)
     except Exception as exc:

@@ -73,6 +73,7 @@ from cozy_runtime.internal.worker import (
     model_source_prepare,
     observe,
     page_warm,
+    store_gc,
     triage,
     weights,
 )
@@ -2100,9 +2101,7 @@ class Worker:
         return result
 
     def collect_store_garbage(self) -> pb.CollectStoreGarbageResult:
-        from . import store_gc
-
-        return store_gc.collect(Path(self.options.tensorfs_root or ""))
+        return store_gc.collect_worker(self)
 
     def note(self, kind: str, step: str) -> None:
         """The NON-ATTEMPT activity lane: typed, sequence-bearing, on the DURABLE Report —
@@ -4570,6 +4569,10 @@ class Worker:
             and executor.construction_key == construction_key
             and parameters <= executor.parameters
             and executor.prepared_model is not None
+            # Same seal rule as `_own_executor`: a process holding the right construction on
+            # the WRONG devices is not a reusable process. Cheap, and it keeps the two reuse
+            # paths from disagreeing about what makes an executor the right one.
+            and executor.sealed_devices == tenant.lane.devices
         ):
             executor.ready_bindings.clear()
             for binding in group:
@@ -4608,6 +4611,8 @@ class Worker:
         overlaps a co-tenant (cr-104). A replacement kills a process holding device bytes,
         so this runs under the lane's lock like every other act that moves the card's
         occupancy; nothing here fills.
+        Package describe may have spawned an empty process before group selection;
+        reuse also requires that process's immutable device seal to match the lane.
         """
         lane = tenant.lane
         placement_id = tenant.placement.placement_id
@@ -4626,6 +4631,17 @@ class Worker:
                 and not executor.reserved_for_job
                 and not executor.ready_bindings
                 and executor.prepared_model is None
+                # THE SEAL IS SET ONCE, AT SPAWN, and a running process cannot be re-sealed.
+                # A tenant that moves between lanes of different WIDTH — the single-device
+                # lane a placement started on, then the K-device group lane it is assigned
+                # (cr-068) — would otherwise reuse a process sealed to `CUDA_VISIBLE_DEVICES`
+                # it no longer serves, and `executor.py` refuses the prepare `env_seal_broken`
+                # after the group has already been formed and the weights fetched. Retiring it
+                # here makes a seal change an ordinary replacement instead of a late refusal.
+                # A width change also changes whether the seal carries `NCCL_NVLS_ENABLE=0`
+                # (pgw#929), which only a group lane imposes, so this one comparison keeps a
+                # non-group process from forming a communicator without it.
+                and executor.sealed_devices == lane.devices
             ):
                 self.note(
                     "boot",
