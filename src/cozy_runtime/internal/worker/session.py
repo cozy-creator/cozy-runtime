@@ -2093,7 +2093,7 @@ class Worker:
     def collect_store_garbage(self) -> pb.CollectStoreGarbageResult:
         from . import store_gc
 
-        return store_gc.collect(Path(self.options.tensorfs_root or ""))
+        return store_gc.collect_worker(self)
 
     def note(self, kind: str, step: str) -> None:
         """The NON-ATTEMPT activity lane: typed, sequence-bearing, on the DURABLE Report —
