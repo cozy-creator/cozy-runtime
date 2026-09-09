@@ -1,0 +1,276 @@
+"""Small real models for rank-call integration; checkpoint preparation is a separate gate."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import struct
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from cozy_runtime.author import Model, uses_components
+from cozy_runtime.internal.executor import Executor, _capture_seal
+from cozy_runtime.internal.parallel.cp import in_gated_call
+from cozy_runtime.internal.seam import Channel
+
+
+class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in the base checking env
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.full((1,), 2.0))
+
+    def forward(
+        self, value: Any, *, check: bool = False, fail: bool = False, expected_stages: int = 0
+    ) -> Any:
+        assert in_gated_call()
+        assert not torch.is_grad_enabled()
+        if check:
+            torch.testing.assert_close(value.cpu(), torch.tensor([3.0, 5.0, 9.0]))
+            return value
+        if fail and torch.distributed.get_rank() > 0:
+            raise ValueError("follower failed before joining the collective")
+        result = value.detach().cpu().clone() + torch.distributed.get_rank()
+        torch.distributed.all_reduce(result)
+        return result
+
+
+class ModelCalls(Model[object]):
+    block: Any
+    overlay: Any
+    spare: Any
+
+    @uses_components("block", "overlay")
+    def sample(self, state: Any, *, on_step: Any, cancel: Any) -> Any:
+        # Rich mutable state and callbacks are deliberately not rank-wire values.
+        with torch.no_grad():
+            self.block(state.value, check=True, expected_stages=state.expected_stages)
+            for step in range(2):
+                assert not cancel()
+                result = self.block(state.value, expected_stages=state.expected_stages)
+                degree = torch.distributed.get_world_size()
+                torch.testing.assert_close(
+                    result, (state.value + 1) * degree + degree * (degree - 1) // 2
+                )
+                state.result = result
+                on_step(step)
+        return state.result
+
+    @uses_components("block", "overlay")
+    def fail_before_collective(self) -> None:
+        with torch.no_grad():
+            self.block(torch.ones(1), fail=True)
+
+
+def collective_model(root: Path | None = None) -> ModelCalls:
+    overlay, spare = torch.nn.Module(), torch.nn.Module()
+    overlay.weight = torch.nn.Parameter(torch.ones(1))
+    spare.weight = torch.nn.Parameter(torch.full((1,), 5.0))
+    model = ModelCalls.for_test(block=Collective(), overlay=overlay, spare=spare)
+    if root is not None:
+        fill_residency(root, model)
+
+    def check_scope(module: Any, args: Any, kwargs: Any) -> Any:
+        assert model._cozy_active is not None
+        assert model._cozy_active[1] == ("block", "overlay")
+        residency: Any = model._cozy_residency
+        if residency is not None:
+            assert residency.placement == "component_staged"
+            assert residency.headroom == 37
+            assert residency.scope_headrooms == {"sample": 11, "fail_before_collective": 13}
+            assert set(residency.backend.components) == {"block", "overlay"}
+            # Multiple DiT forwards retain their weights; a per-call open_attempt would
+            # erase the first call's two stages and this accumulated observation.
+            assert residency.attempt_stages == kwargs.get("expected_stages", 0)
+        return (args[0].to(model.overlay.weight.device) + model.overlay.weight, *args[1:]), kwargs
+
+    model.block.register_forward_pre_hook(check_scope, with_kwargs=True)
+    return model
+
+
+def fill_residency(root: Path, model: ModelCalls) -> None:
+    """Materialize three real native TensorFS components, then park the two used by DiT."""
+    import tensorfs
+
+    from cozy_runtime.author import WeightsConfig, WeightsPart, WeightsTarget, WeightsTensor
+    from cozy_runtime.author._loader import census
+    from cozy_runtime.author._weights import WeightsCommit
+    from cozy_runtime.internal.encoding import SPEC_PLAIN
+    from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, _Holder
+    from cozy_runtime.internal.residency import ComponentResidency
+    from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+
+    root.mkdir(parents=True, exist_ok=True)
+    store = tensorfs.Store.ensure(str(root / "store"))
+    values = {"block": 2.0, "overlay": 1.0, "spare": 5.0}
+    host = WeightsTransactionHost(
+        store=store,
+        owner_scope="parallel-test",
+        request_id="create",
+        invocation_spec_digest="sha256:" + "1" * 64,
+        work_fingerprint="sha256:" + "2" * 64,
+        writer_session_id=1,
+        allowed_sources={},
+        output_bounds={"model": 4096},
+    )
+    target = WeightsTensor("f32", (1,), SPEC_PLAIN, {"value": WeightsPart("f32", (1,))})
+    writer = host.open(
+        WeightsCommit(
+            output_slot="model",
+            sources={},
+            targets={name: WeightsTarget(add={"weight": target}) for name in values},
+            configs={"model": WeightsConfig(data=b"{}")},
+            order=tuple((name, "weight") for name in values),
+            max_new_bytes=4096,
+        )
+    )
+    for name, value in values.items():
+        writer.add_part(name, "weight", "value", struct.pack("<f", value))
+    writer.add_config("model", b"{}", 2)
+    receipt = json.loads(writer.commit().tensorfs_receipt)
+    manifest = "sha256:" + receipt["manifest"]["sha256"]
+    checkpoint = Checkpoint(root / "store", manifest)
+    backend = StreamingFillBackend.for_script(
+        checkpoint,
+        [row for name in values for row in checkpoint.rows(name)],
+        release="parallel-test/1",
+        store="fixture",
+        snapshot=manifest,
+        device="cuda",
+        encoded_leaves="refuse",
+        window_bytes=1 << 20,
+        slots=2,
+        readers=1,
+        inflight=1,
+    )
+    holder = _Holder({name: getattr(model, name) for name in values})
+    walked = census(holder)
+    backend.expect(
+        {name: [d.key for d in walked.destinations if d.component == name] for name in values}
+    )
+    backend.resident_budget = 12
+    backend.hold_lease = True
+    live = backend.materialize(holder, walked)
+    for destination in walked.destinations:
+        backend.fill(destination.key, destination.spec, live[destination.key])
+    backend.commit()
+    backend.evict("block")
+    backend.evict("overlay")
+    residency = ComponentResidency(backend, torch)
+    object.__setattr__(model, "_cozy_residency", residency)
+
+
+class H3Calls(Model[object]):
+    dit: Any
+    text_encoder: Any
+
+    def warm(self, ctx: Any) -> None:
+        ctx.raise_if_cancelled()
+        self.warm_dit()
+
+    @uses_components("dit")
+    def warm_dit(self) -> None:
+        with torch.no_grad():
+            self.dit(**h3_batch())
+
+    @uses_components("dit")
+    def compute(self, batch: dict[str, Any], expected: tuple[Any, Any]) -> Any:
+        with torch.no_grad():
+            result = self.dit(**batch)
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
+        return result
+
+
+def h3_model() -> H3Calls:
+    from diffusers import MiniMaxH3Transformer3DModel
+
+    torch.manual_seed(231)
+    dit = MiniMaxH3Transformer3DModel(
+        num_attention_heads=4,
+        attention_head_dim=16,
+        hidden_size=16,
+        num_layers=2,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=2,
+        audio_in_channels=2,
+        patch_size=(1, 1, 1),
+        text_dim=4,
+        freq_dim=8,
+        time_embed_hidden_dim=16,
+        time_embed_dim=8,
+        rope_freq_dim=2,
+    ).eval()
+    dit.set_attention_backend("native")
+
+    def no_grad(module: Any, args: Any) -> None:
+        assert not torch.is_grad_enabled()
+
+    dit.register_forward_pre_hook(no_grad)
+    return H3Calls.for_test(dit=dit, text_encoder=torch.nn.Linear(4, 4))
+
+
+def h3_batch() -> dict[str, Any]:
+    # Interleaved modalities exercise packed indices across each shard. Gloo cannot
+    # gather uneven tensor sizes; actual uneven H3 lengths require the NCCL CLI gate.
+    generator = torch.Generator().manual_seed(91)
+    return {
+        "hidden_states": torch.randn(1, 8, 2, generator=generator),
+        "audio_hidden_states": torch.randn(1, 8, 2, generator=generator),
+        "encoder_hidden_states": torch.randn(1, 8, 4, generator=generator),
+        "timestep": torch.tensor([0.0, 0.25, 0.75]),
+        "timestep_indices": torch.arange(24) % 3,
+        "token_tags": torch.arange(24) % 3,
+        "position_ids": torch.arange(72).reshape(24, 3) % 5,
+        "video_indices": torch.arange(0, 24, 3),
+        "text_indices": torch.arange(1, 24, 3),
+        "audio_indices": torch.arange(2, 24, 3),
+        "return_dict": False,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path)
+    parser.add_argument("--rank", type=int)
+    parser.add_argument("--world", type=int)
+    parser.add_argument("--rank-fd", type=int)
+    parser.add_argument("--leader")
+    parser.add_argument("--h3", action="store_true")
+    parser.add_argument("--staged", action="store_true")
+    args = parser.parse_args()
+    torch.set_num_threads(1)
+    _capture_seal()
+    channel = Channel(socket.socket(fileno=args.rank_fd))
+    executor: Any = Executor(channel, args.root, rank=args.rank, world=args.world)
+    executor.device_kind = "cpu"
+    model: Any = (
+        h3_model()
+        if args.h3
+        else collective_model(args.root / f"rank-{args.rank}" if args.staged else None)
+    )
+    executor.residency = model._cozy_residency
+    executor.torch = torch
+    executor.ready = True
+    if not args.h3:
+        executor.group_components["block"] = (model, model.block)
+    while (command := channel.recv()) is not None:
+        name = command["cmd"]
+        if name == "shutdown":
+            return
+        if name == "join":
+            reply = executor.join(command)
+            if args.h3 and reply.get("ok"):
+                refused = executor._install_group(torch, model)
+                assert refused is None, refused
+        elif name == "run":
+            reply = executor.run(command)
+        else:
+            raise AssertionError(name)
+        channel.send({**reply, "reply": name})
+
+
+if __name__ == "__main__":
+    main()

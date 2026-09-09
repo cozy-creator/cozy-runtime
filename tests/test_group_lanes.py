@@ -39,7 +39,6 @@ from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
-from cozy_runtime.internal.parallel.mirror import FollowerMirror
 from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDivergence
 from cozy_runtime.internal.worker import lane_wire, lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
@@ -82,21 +81,6 @@ def _torch_here() -> str:
 NO_TORCH = _torch_here()
 needs_torch = pytest.mark.skipif(bool(NO_TORCH), reason=NO_TORCH or "")
 
-
-def _second_card() -> str:
-    """Why the two-card arms cannot run here, or "" when they can."""
-    kind = accel.host_backend_family()
-    for entry in ("0", "1"):
-        if accel.device_memory(entry, kind).state != "measured":
-            return (
-                f"owed to a two-card box: the driver reports no device {entry!r} here "
-                f"(this host has {'one card' if entry == '1' else 'no readable card'})"
-            )
-    return ""
-
-
-NO_SECOND_CARD = _second_card()
-needs_two_cards = pytest.mark.skipif(bool(NO_SECOND_CARD), reason=NO_SECOND_CARD or "")
 
 MEASURED = {
     0: accel.DeviceMemory("measured", 6 * GiB, 8 * GiB),
@@ -1089,16 +1073,13 @@ def test_a_follower_that_never_dials_back_is_judged_by_its_own_meter(tmp_path: P
 @needs_torch
 def test_the_rank_wire_is_closed(tmp_path: Path) -> None:
     """Scalars, lists, tuples, str-keyed dicts, tensors (through the spool) and generators
-    (as seeds) cross; anything else refuses by name with the group still whole."""
+    cross; generators and callbacks stay on the leader."""
     import torch
 
     spool = wire.TensorSpool(tmp_path / "ranks")
     tensor = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
-    generator = torch.Generator().manual_seed(7)
-    command = wire.run_command(
-        "denoise", (tensor, 1.5, "x", None, (1, 2)), {"g": generator, "steps": [1, 2]}, spool
-    )
-    assert command["cmd"] == "run" and command["method"] == "denoise"
+    command = wire.run_command((tensor, 1.5, "x", None, (1, 2)), {"steps": [1, 2]}, spool)
+    assert command["cmd"] == "run"
     assert (tmp_path / "ranks" / "tensor-0.raw").stat().st_size == 12
     assert command["args"][0] == {
         "__sp__": "tensor",
@@ -1108,10 +1089,10 @@ def test_the_rank_wire_is_closed(tmp_path: Path) -> None:
     }
     args, kwargs = wire.run_call(command, spool, device=torch.device("cpu"))
     assert torch.equal(args[0], tensor) and args[1:] == (1.5, "x", None, (1, 2))
-    assert kwargs["g"].initial_seed() == 7 and kwargs["steps"] == [1, 2]
+    assert kwargs["steps"] == [1, 2]
     empty = wire.marshal(torch.empty(0, 3), spool)
     assert torch.equal(wire.unmarshal(empty, spool, device="cpu"), torch.empty(0, 3))
-    for bad in (lambda: None, {1: 2}, {"__sp__": 1}, object()):
+    for bad in (lambda: None, {1: 2}, {"__sp__": 1}, object(), torch.Generator()):
         with pytest.raises(wire.UncrossableArgument) as refused:
             wire.marshal(bad, spool)
         assert refused.value.code == "uncrossable_argument"
@@ -1125,21 +1106,16 @@ def test_the_rank_wire_is_closed(tmp_path: Path) -> None:
     assert not any((tmp_path / "ranks").iterdir())
 
 
+@needs_torch
 def test_a_sharded_forward_outside_the_gate_refuses() -> None:
-    """Collectives have participants only inside the gated call; a follower entered
-    outside it refuses `ungated_sharded_forward`; the divisibility and shard-invariance
-    rules refuse typed before any device is committed."""
-    assert not cp.in_gated_call()
-    mirror = FollowerMirror()
-    with pytest.raises(cp.UngatedShardedForward) as refused:
-        mirror.enter("denoise", (), {})
-    assert refused.value.code == "ungated_sharded_forward"
+    import torch
+
+    component = torch.nn.Identity()
+    cp._install_gate_guard(component, "dit")
+    with pytest.raises(cp.UngatedShardedForward):
+        component(torch.ones(1))
     with cp.gated_call():
-        assert cp.in_gated_call()
-        mirror.enter("denoise", (), {})
-        with cp.gated_call():
-            assert cp.in_gated_call()
-        assert cp.in_gated_call()
+        torch.testing.assert_close(component(torch.ones(1)), torch.ones(1))
     assert not cp.in_gated_call()
     cp.refuse_unless_heads_divisible(heads=16, degree=4)
     cp.refuse_unless_heads_divisible(heads=0, degree=1)
@@ -1158,19 +1134,6 @@ def test_a_sharded_forward_outside_the_gate_refuses() -> None:
         cp.install_context_parallel(object(), degree=2, comms=None)
     assert "no declared component carries a `_cp_plan`" in unsharded.value.message
     assert cp.install_context_parallel(object(), degree=1, comms=None) == ()
-
-
-# ------------------------------------------------------------------- owed: two cards
-
-
-@needs_two_cards
-def test_two_real_cards_form_an_nccl_group_under_one_executor() -> None:
-    """OWED (cr-068's live item). On two driver-readable cards: a placement pinned to
-    (0, 1) on a package declaring degree 2 fuses the lanes, the worker spawns ONE executor
-    sealed to both, rank 0 spawns rank 1, the NCCL group forms before the fill, both ranks
-    fill the same plan, and the reclaim proves both devices ABSENT with one epoch bump.
-    This body is the arm; it needs a second card to run and says so when it cannot."""
-    raise AssertionError("two driver-readable cards found: write the live H3 arm here")
 
 
 @needs_executor

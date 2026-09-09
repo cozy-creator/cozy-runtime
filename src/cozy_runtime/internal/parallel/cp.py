@@ -10,8 +10,9 @@ collectives have participants; the guard installed on every sharded component re
 forward outside it (`ungated_sharded_forward`) instead of hanging.
 
 The ordering is FORCED: set the attention backend, enable parallelism, then compile -
-compiling AFTER the hooks puts the split/all-to-all/gather inside the traced graph. CP and
-CPU offload do not compose (diffusers #12533), so an offloaded pipeline refuses. Ring
+compiling AFTER the hooks puts the split/all-to-all/gather inside the traced graph. Runtime
+staging preserves module forwards; pre-existing accelerate wrappers on the sharded
+component do not reliably preserve the CP hooks and are refused. Ring
 attention is not installed (it needs the attention kernel's LSE); this is Ulysses only.
 """
 
@@ -147,14 +148,13 @@ def install_context_parallel(model: Any, *, degree: int, comms: CpComms | None) 
             "no declared component carries a `_cp_plan`; this model has not been adapted "
             "for context parallelism and sharding it would produce silently wrong output"
         )
-    _refuse_if_offloaded(model)
+    _refuse_if_forward_wrapped(components)
     if comms is None:
         raise ContextParallelUnavailable(
             "context parallelism at degree>1 requires the group's explicit process group "
             "(CpComms); installing against the default process group is exactly the "
             "pgw#773 cross-group corruption"
         )
-    refuse_unless_shard_invariant_quant(model, degree=int(degree))
     installed: list[str] = []
     for name, component in components:
         refuse_unless_heads_divisible(heads=_declared_heads(component), degree=int(degree))
@@ -228,7 +228,6 @@ def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> Non
                 f"attention backend {backend.value!r} does not support context parallelism; "
                 f"set one of {supported} before arming"
             )
-        break
 
     device = (
         comms.device if isinstance(comms.device, torch.device) else torch.device(str(comms.device))
@@ -242,23 +241,21 @@ def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> Non
         processor = getattr(module, "processor", None)
         if processor is not None and hasattr(processor, "_parallel_config"):
             processor._parallel_config = config
-    plan = getattr(component, _CP_PLAN_ATTR, None)
-    if not plan:
-        raise ContextParallelUnavailable(
-            f"{type(component).__name__} lost its `_cp_plan` between candidate discovery "
-            "and install"
-        )
-    apply_context_parallel(component, cp_config, plan)
+    apply_context_parallel(component, cp_config, getattr(component, _CP_PLAN_ATTR))
 
 
-def _refuse_if_offloaded(model: Any) -> None:
-    for name, module in _modules_of(model):
-        for marker in ("_all_hooks", "_offload_gpu_id", "hf_device_map"):
-            if getattr(module, marker, None):
+def _refuse_if_forward_wrapped(components: list[tuple[str, Any]]) -> None:
+    """Accelerate can restore a saved forward and remove CP's subsequently installed hooks.
+
+    Only the sharded components matter. Runtime staging and paging keep their forwards;
+    an offloaded text encoder or VAE does not participate in the collective.
+    """
+    for name, component in components:
+        for inner_name, module in component.named_modules():
+            if hasattr(module, "_hf_hook") or hasattr(module, "_old_forward"):
                 raise ContextParallelUnavailable(
-                    f"{name} carries {marker!r}: CPU offload and context parallelism do not "
-                    "compose (diffusers #12533); a generation that needs offload serves at "
-                    "degree 1"
+                    f"{name}.{inner_name}: an accelerate forward wrapper precedes context "
+                    "parallelism and may remove its hooks when restored"
                 )
 
 
@@ -278,7 +275,7 @@ def _declared_heads(component: Any) -> int:
 
 
 def refuse_unless_heads_divisible(*, heads: int, degree: int) -> None:
-    """Checked BEFORE a device is committed. Sequence length is NOT checked: under
+    """Checked at component installation. Sequence length is NOT checked: under
     `ulysses_anything` the packed sequence is split by `tensor_split`, so any length shards
     (H3 packs 37,763 / 73,439 / 106,932 / 109,308 rows and none of them divide). The head
     count is the constraint that remains a CAPABILITY statement rather than a mechanical
@@ -290,30 +287,4 @@ def refuse_unless_heads_divisible(*, heads: int, degree: int) -> None:
     if int(heads) % d:
         raise ContextParallelUnavailable(
             f"attention head count {heads} is not divisible by ulysses_degree {d}"
-        )
-
-
-def refuse_unless_shard_invariant_quant(model: Any, *, degree: int) -> None:
-    """W8A8 composes with CP with one typed exception: `rowwise` derives a scale per TOKEN,
-    a function of that token alone and identical whichever rank holds it; `pertensor`
-    derives one scalar from the LOCAL shard, so two ranks quantize the same logical tensor
-    differently and the group produces silently wrong output. That is the quiet failure
-    mode, which is why this refuses rather than warns."""
-    if int(degree) <= 1:
-        return
-    bad: list[str] = []
-    for name, module in _modules_of(model):
-        for inner_name, inner in module.named_modules():
-            mode = getattr(inner, "gemm_mode", "")
-            if mode and mode != "rowwise":
-                bad.append(f"{name}.{inner_name}={mode}")
-                if len(bad) >= 4:
-                    break
-        if len(bad) >= 4:
-            break
-    if bad:
-        raise ContextParallelUnavailable(
-            "w8a8 gemm_mode must be `rowwise` under context parallelism: a per-tensor "
-            "activation scale is derived from the local sequence shard, so each rank "
-            f"quantizes differently and the output is silently wrong. Found {', '.join(bad)}"
         )

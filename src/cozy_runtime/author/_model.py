@@ -163,28 +163,9 @@ class ModelTestHarness:
             raise AssertionError(f"component scopes were {got}, expected {expected}")
 
 
-class GroupMirror(Protocol):
-    """The runtime's sequence-parallel seam, installed beside the residency plane.
-
-    Under a group lane (cr-068) the runtime holds K replicas of one model in K processes;
-    the handler runs on rank 0 alone and every OUTERMOST component-use method it enters is
-    mirrored to the others with the same arguments, so the ranks' collectives pair up.
-    Absent everywhere but under a group: a single-device generation carries `None` and
-    the wrapper below calls nothing.
-    """
-
-    def enter(
-        self, method: str, args: tuple[object, ...], kwargs: Mapping[str, object]
-    ) -> None: ...
-
-    def leave(self, method: str, failed: bool) -> None: ...
-
-
 class _ScopedModel(Protocol):
     """What `@uses_components` needs from the instance it wraps — so the decorator is
     ParamSpec-preserving and fully typed without an `Any` seam (§1.7)."""
-
-    _cozy_group: GroupMirror | None
 
     def _cozy_scope(self, method: str, components: tuple[str, ...]) -> _Scope: ...
 
@@ -326,16 +307,7 @@ def _sync_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> R:
         with self._cozy_scope(fn.__name__, components):
-            mirror = self._cozy_group
-            if mirror is not None:
-                mirror.enter(fn.__name__, args, kwargs)
-            failed = True
-            try:
-                result = fn(self, *args, **kwargs)
-                failed = False
-            finally:
-                if mirror is not None:
-                    mirror.leave(fn.__name__, failed)
+            result = fn(self, *args, **kwargs)
             _refuse_lazy(fn.__name__, result)
             return result
 
@@ -350,16 +322,7 @@ def _async_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     async def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> object:
         with self._cozy_scope(fn.__name__, components):
-            mirror = self._cozy_group
-            if mirror is not None:
-                mirror.enter(fn.__name__, args, kwargs)
-            failed = True
-            try:
-                result = await fn(self, *args, **kwargs)  # type: ignore[misc]
-                failed = False
-            finally:
-                if mirror is not None:
-                    mirror.leave(fn.__name__, failed)
+            result = await fn(self, *args, **kwargs)  # type: ignore[misc]
             _refuse_lazy(fn.__name__, result)
             return result
 
@@ -432,8 +395,6 @@ class Model[PipelineT]:
     _cozy_residency: Residency | None = None
     """Runtime-installed. Absent under `for_test` and in derive mode, which is the whole
     reason a scope works without one: a test double has no bytes to stage."""
-    _cozy_group: GroupMirror | None = None
-    """Runtime-installed under a group lane only (cr-068): the sequence-parallel mirror."""
 
     def __init_subclass__(cls, /, **keywords: str) -> None:
         """The class-keyword plane is exactly `encoded_leaves` and `fusion` (model-code-fit
