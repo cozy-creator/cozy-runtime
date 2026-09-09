@@ -4567,6 +4567,7 @@ class Worker:
             executor is not None
             and executor.alive()
             and not executor.poisoned
+            and tenant.supervision.devices == tenant.lane.entries
             and executor.construction_key == construction_key
             and parameters <= executor.parameters
             and executor.prepared_model is not None
@@ -4608,6 +4609,8 @@ class Worker:
         overlaps a co-tenant (cr-104). A replacement kills a process holding device bytes,
         so this runs under the lane's lock like every other act that moves the card's
         occupancy; nothing here fills.
+        Package describe may have spawned an empty process before group selection;
+        reuse also requires that process's immutable device seal to match the lane.
         """
         lane = tenant.lane
         placement_id = tenant.placement.placement_id
@@ -4623,6 +4626,7 @@ class Worker:
             elif (
                 executor.alive()
                 and not executor.poisoned
+                and tenant.supervision.devices == lane.entries
                 and not executor.reserved_for_job
                 and not executor.ready_bindings
                 and executor.prepared_model is None
