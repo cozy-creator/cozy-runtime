@@ -21,6 +21,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
+import tensorfs
+
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._errors import CapabilityError
@@ -226,8 +228,6 @@ def source_structure(header: Mapping[str, Any]) -> WeightsSource:
 def source_config(store: Any, manifest: str, length: int, name: str) -> bytes:
     """Read one config through native retained-source validation under the Store owner."""
     try:
-        import tensorfs
-
         held = store.manifest(manifest)
         structure = source_structure(tensorfs.parse_header(bytes(held["header"])))
         if name not in structure.configs:
