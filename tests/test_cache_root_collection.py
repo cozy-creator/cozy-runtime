@@ -8,6 +8,7 @@ from threading import Event, Lock, RLock
 from types import SimpleNamespace
 
 import pytest
+import tensorfs
 
 from cozy_runtime.internal.worker import store_gc
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -124,3 +125,15 @@ def test_shared_store_never_authorizes_cache_root_eviction(
     monkeypatch.setattr(store_gc, "collect", collect)
     store_gc.collect_worker(w)
     assert calls == [{}]
+
+
+def test_managed_worker_uses_native_cached_collection_and_refreshes_residency(
+    tmp_path: Path,
+) -> None:
+    native = tensorfs.Store.init(tmp_path / "store")
+    w = worker(Path(native.root))
+    observed = []
+    w.held_manifests = SimpleNamespace(rebuild=lambda store: observed.append(store.root))
+    result = store_gc.collect_worker(w)
+    assert not result.store_busy and result.reclaimed_bytes == 0
+    assert observed == [native.root]
