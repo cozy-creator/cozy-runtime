@@ -182,6 +182,7 @@ def main(root: Path) -> None:
     # Handles registered on the original modules still control their replacements.
     for handle in handles:
         handle.remove()
+    assert expected is not None
     expected = -expected
     # Read the peak immediately around the SAME backend.stage: admit resets CUDA's
     # peak at its end to start the forward-activation meter, so reading it afterwards
