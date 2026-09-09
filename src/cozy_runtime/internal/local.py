@@ -147,6 +147,8 @@ class LocalRequest:
     #: set that does not match what the handler produced refuses the tail whole (#248).
     outputs: tuple[str, ...] = ("image",)
     capture: ActivationCapture | None = None
+    #: Optional developer execution-path override; empty leaves runtime auto-selection.
+    attention_kernel: str = ""
     request_id: str = "run-1"
     attempt: int = 1
     timeout_ms: int = 0
@@ -881,6 +883,7 @@ class LocalRecordOwner:
             payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
             inputs=self._input_bindings(body),
             outputs=self._output_bindings(),
+            attention_kernel=self.request.attention_kernel,
             capture=pb.ActivationCapture(
                 components=self.request.capture.components, steps=self.request.capture.steps
             )

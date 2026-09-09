@@ -437,6 +437,8 @@ class Executor:
         #: What the runtime pinned on this generation's attention sites (cr-124). One BOOT
         #: line, not a per-attempt record: the choice is a function of device and image.
         self.attention: attention.Applied | None = None
+        #: Device facts for this prepared generation, reused for per-request pin checks.
+        self.device_facts: Any = None
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
@@ -1346,6 +1348,7 @@ class Executor:
             applied = attention.select(
                 device_facts, {**backend.components, **backend.parked}, pin, degree=self.world
             )
+            self.device_facts = device_facts
             stage("attention_pin")
         except ModelFitRefused as exc:
             # THE FIT VERDICT (model-code-fit §3), verbatim. Nothing was reserved: the
@@ -1948,6 +1951,17 @@ class Executor:
                 "detail": f"{command['entrypoint']!r} is not an entrypoint of this release",
             }
         registration = self.discovered.app.get(command["entrypoint"])
+        pin = str(command.get("attention_kernel", ""))
+        if pin:
+            try:
+                self._attention_check(pin)
+            except attention.AttentionRefusal as exc:
+                return {
+                    "ok": False,
+                    "code": exc.code,
+                    "detail": str(exc)[:900],
+                    "origin": "request",
+                }
         try:
             self._capture_options(command, registration.surface)
             prepared = prepare(
@@ -2010,6 +2024,22 @@ class Executor:
                 "runs the record its plan was priced against, and this executor holds none "
                 "(a fresh epoch holds nothing at all)",
             }
+        pin = str(command.get("attention_kernel", ""))
+        try:
+            if pin:
+                self._attention_plan(pin).apply()
+            elif self.device_facts is not None and self.backend is not None:
+                # A previous pinned request must never affect the next ordinary request.
+                # Re-run the automatic selection at the attempt boundary so the mutable
+                # processor field is restored before author code enters.
+                attention.select(
+                    self.device_facts,
+                    {**self.backend.components, **self.backend.parked},
+                    "",
+                    degree=self.world,
+                )
+        except attention.AttentionRefusal as exc:
+            return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "origin": "request"}
         spool = Path(command["spool"])
         deadline = _deadline(command["deadline_s"])
         torch = self.torch
@@ -2167,6 +2197,43 @@ class Executor:
                 "gpu_count": self.world if torch is not None else 0,
             },
         }
+
+    # ------------------------------------------------------- the per-request attention pin
+
+    def _attention_roots(self) -> dict[str, Any]:
+        roots: dict[str, Any] = {}
+        executors = self.model_executors or [self]
+        for executor in executors:
+            if executor.backend is None:
+                continue
+            prefix = "+".join(sorted(executor.models)) + "/" if len(executors) > 1 else ""
+            for name, root in {**executor.backend.components, **executor.backend.parked}.items():
+                roots[prefix + name] = root
+        return roots
+
+    def _attention_device(self, pin: str) -> Any:
+        device = next(
+            (e.device_facts for e in (self.model_executors or [self]) if e.device_facts), None
+        )
+        if device is None:
+            raise attention.AttentionRefusal(
+                "attention_kernel_unsupported",
+                f"{pin} was pinned on a construction that reached no device",
+            )
+        return device
+
+    def _attention_frozen(self) -> str:
+        return "a context-parallel group is installed" if self.group is not None else ""
+
+    def _attention_check(self, pin: str) -> None:
+        attention.check(
+            self._attention_device(pin), self._attention_roots(), pin, self._attention_frozen()
+        )
+
+    def _attention_plan(self, pin: str) -> attention.Swap:
+        return attention.plan(
+            self._attention_device(pin), self._attention_roots(), pin, self._attention_frozen()
+        )
 
     @staticmethod
     def _capture_options(command: Mapping[str, Any], surface: Any) -> ActivationCapture | None:

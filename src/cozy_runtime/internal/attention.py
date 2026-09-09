@@ -509,6 +509,33 @@ def pinned(name: str, device: DeviceFacts) -> list[Ready]:
 # ------------------------------------------------------------------------------ the pin
 
 
+def _trees(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any]]:
+    """Yield each constructed module tree, preserving component labels."""
+    seen: set[int] = set()
+    queue: deque[tuple[str, Any, int]] = deque(
+        (name, root, 0) for name, root in sorted(roots.items())
+    )
+    while queue:
+        label, value, depth = queue.popleft()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if callable(getattr(value, "modules", None)) and callable(
+            getattr(value, "parameters", None)
+        ):
+            yield label, value
+            continue
+        if depth >= 3:
+            continue
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                queue.append((str(key), item, depth + 1))
+        elif hasattr(value, "__dict__"):
+            for name, item in vars(value).items():
+                if not name.startswith("_"):
+                    queue.append((name, item, depth + 1))
+
+
 def _sites(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any]]:
     """(component, attention module, its processor) for every diffusers attention site.
 
@@ -713,6 +740,77 @@ def install(
                 + ". A pinned kernel is never quietly replaced",
             )
     return Applied(hosts, locations, tuple(entry.name for entry in ready), pin)
+
+
+def _site_refusal(name: str, component: str, dtype: str, head_dim: int) -> AttentionRefusal:
+    return AttentionRefusal(
+        "attention_kernel_unsupported",
+        f"{name} does not serve {component}'s attention: {dtype or 'unknown'} activations "
+        f"at head dimension {head_dim or 'unknown'}. A pinned kernel is never quietly replaced",
+    )
+
+
+def _baked_in(roots: Mapping[str, Any]) -> str:
+    for label, tree in _trees(roots):
+        for module in tree.modules():
+            if hasattr(module, "_orig_mod"):
+                return f"{label} is an OptimizedModule wrapping {type(module._orig_mod).__name__}"
+            if getattr(module, "_compiled_call_impl", None) is not None:
+                return f"{label} holds {type(module).__name__} compiled in place"
+    return ""
+
+
+@dataclass(frozen=True, slots=True)
+class Swap:
+    """A validated per-request attention backend change, applied atomically."""
+
+    entry: Ready
+    sites: tuple[tuple[str, Any], ...]
+
+    def apply(self) -> Applied:
+        hosts: dict[str, dict[str, int]] = {}
+        for component, processor in self.sites:
+            processor._attention_backend = self.entry.member
+            hosts.setdefault(component, {})
+            hosts[component][self.entry.name] = hosts[component].get(self.entry.name, 0) + 1
+        locations = {self.entry.name: self.entry.location} if self.entry.location else {}
+        return Applied(hosts, locations, (self.entry.name,), self.entry.name)
+
+
+def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Candidate:
+    candidate = BY_NAME.get(name)
+    if candidate is None:
+        raise AttentionRefusal(
+            "attention_kernel_unknown",
+            f"{name!r} is not an attention kernel this runtime knows; it knows {sorted(BY_NAME)}",
+        )
+    blocked = frozen or _baked_in(roots)
+    if blocked:
+        raise AttentionRefusal(
+            "attention_kernel_frozen",
+            f"{name} cannot be pinned per request: {blocked}",
+        )
+    unsupported = _device_admits(candidate, device)
+    if unsupported:
+        raise AttentionRefusal("attention_kernel_unsupported", unsupported)
+    sites = 0
+    for component, module, _ in _sites(roots):
+        dtype, head_dim = _dtype(module), _head_dim(module)
+        if not _admits(candidate, dtype, head_dim):
+            raise _site_refusal(candidate.name, component, dtype, head_dim)
+        sites += 1
+    if not sites:
+        raise AttentionRefusal(
+            "attention_kernel_unsupported",
+            f"{name} was pinned on a construction that holds no diffusers attention site",
+        )
+    return candidate
+
+
+def plan(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Swap:
+    check(device, roots, name, frozen)
+    entry = pinned(name, device)[0]
+    return Swap(entry, tuple((component, processor) for component, _, processor in _sites(roots)))
 
 
 def select(
