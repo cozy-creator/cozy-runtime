@@ -29,6 +29,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
 
 import msgspec
@@ -175,15 +176,18 @@ class Config:
     a dynamic `__getattr__` would be exactly the declared `Any` seam §1.7 deletes.
     """
 
-    __slots__ = ("_data", "_where")
+    __slots__ = ("_data", "_tensor_dtypes", "_where")
 
     _data: Mapping[str, object]
     _where: str
+    _tensor_dtypes: Mapping[str, str] | None
 
     def __init__(
         self,
         data: Mapping[str, object],
         where: str = "config",
+        *,
+        tensor_dtypes: Mapping[str, str] | None = None,
     ) -> None:
         """Freeze one in-memory construction config."""
         for key, value in data.items():
@@ -201,6 +205,11 @@ class Config:
         frozen = dict(data)
         object.__setattr__(self, "_data", frozen)
         object.__setattr__(self, "_where", where)
+        object.__setattr__(
+            self,
+            "_tensor_dtypes",
+            None if tensor_dtypes is None else MappingProxyType(dict(tensor_dtypes)),
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
         raise CapabilityError(
@@ -222,7 +231,23 @@ class Config:
                 f"{self._where}.{name} is {type(value).__name__}, not a config section",
                 code="config_kind",
             )
-        return Config(value, f"{self._where}.{name}")
+        return Config(value, f"{self._where}.{name}", tensor_dtypes=self._tensor_dtypes)
+
+    def tensor_dtype(self, key: str, *, default: str) -> str:
+        """Logical dtype of a component-qualified checkpoint tensor, before construction.
+
+        This is native header metadata, separate from ``mapping()`` and not a compute
+        dtype override. ``default`` applies only to config-only construction; once a
+        checkpoint is supplied, a missing key refuses rather than hiding a typo.
+        """
+        if self._tensor_dtypes is None:
+            return default
+        try:
+            return canonical_dtype(self._tensor_dtypes[key])
+        except KeyError:
+            raise ConformanceError(
+                f"checkpoint has no tensor {key!r}", code="config_tensor_missing", fields=[key]
+            ) from None
 
     def as_int(self, name: str, default: int | None = None) -> int:
         return self._scalar(name, int, default)
@@ -707,7 +732,16 @@ class Loader:
         identity = factory_identity(factory)
         _legs: list[tuple[str, float]] = []
         _t0 = time.perf_counter()
-        obj = factory(self._artifact.config)
+        config = self._artifact.config
+        if self._artifact.tensor_schema:
+            config = Config(
+                config.mapping(),
+                config._where,
+                tensor_dtypes={
+                    key: spec.dtype for key, spec in self._artifact.tensor_schema.items()
+                },
+            )
+        obj = factory(config)
         _legs.append(("factory", round((time.perf_counter() - _t0) * 1000, 1)))
         _weightless = _weightless_census(obj)
         _t0 = time.perf_counter()

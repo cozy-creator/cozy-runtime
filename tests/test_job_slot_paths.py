@@ -235,7 +235,7 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
     raw = package_interface.canonical_bytes(interface)
     constructed: list[str] = []
 
-    def derive(path: str, _config: bytes, _assets: Any) -> tuple[str, ...]:
+    def derive(path: str, _config: bytes, _assets: Any, _dtypes: Any) -> tuple[str, ...]:
         # The one process seam: a real derive runs inside the installed venv's own
         # interpreter. Everything the guards read is real.
         constructed.append(path)
@@ -306,7 +306,7 @@ def test_a_job_slot_is_never_constructed_at_preparation(
 
     store_root, manifest, _length = released
 
-    def derive(path: str, _config: bytes, _assets: Any) -> tuple[str, ...]:
+    def derive(path: str, _config: bytes, _assets: Any, _dtypes: Any) -> tuple[str, ...]:
         raise AssertionError(f"a job slot was constructed at preparation: {path}")
 
     models, entrypoints = _entrypoints(
@@ -336,7 +336,7 @@ def test_a_selection_no_callable_declares_still_refuses(
             selections=[_selection("no_such.models.source", manifest)],
             tensorfs_root=store_root,
             verified=lambda _digest, _length, _path: None,
-            derive=lambda _path, _config, _assets: (),
+            derive=lambda _path, _config, _assets, _dtypes: (),
         )
     assert refusal.value.code == "package_prepare_model_selection_mismatch"
     assert "no_such.models.source" in refusal.value.detail
