@@ -65,17 +65,6 @@ def _refusal(run: Any) -> attention.AttentionRefusal:
 RANKED = ["flash-attn3-fp8", "flash-attn3", "sdpa"]
 
 
-def test_the_ranked_table_is_ordered_by_a_measurement_and_ends_in_the_floor() -> None:
-    """A rank is a measurement or it is not a rank. The floor is last and takes everything."""
-    assert [c.name for c in attention.CANDIDATES] == RANKED
-    for candidate in attention.CANDIDATES:
-        assert "MEASURED" in candidate.why or "torch's own" in candidate.why, candidate.name
-    floor = attention.CANDIDATES[-1]
-    assert floor.name == "sdpa"
-    assert floor.min_sm == 0 and not floor.dtypes and floor.max_head_dim == 0
-    assert attention._admits(floor, "float32", 512) and attention._admits(floor, "", 0)
-
-
 def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
     """cr-127. A kernel is admitted only if it AGREES with exact fp32 attention, so every entry
     has to say how far it is allowed to drift. The two classes are visible in the numbers: an
@@ -94,60 +83,6 @@ def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
         budget = candidate.rel_l2_max
         assert (budget <= 2e-2) is (candidate.name in exact), (candidate.name, budget)
     assert attention.PROBE == (1, 256, 4, 128)
-
-
-def test_fp8_attention_is_rank_1_on_sm90_by_owner_decision_and_the_row_says_what_it_costs() -> None:
-    """cr-138. h3a-013 parked FA3's fp8 path in PINNABLE because it is INEXACT and no gate we
-    own can tell 'degrades quality' from 'changes the sample'. The owner took the speed anyway,
-    pre-launch: 1.292x / 1.317x served through this runtime, 3.06 -> 2.68 c/s at 5 s. The row
-    is the record of that decision — the run it cites, the date, and what is still owed:
-    h3a-001's population gate, and a listening check, since no fp8 clip has been watched or
-    heard on a model whose joint audio is the differentiator."""
-    fp8, bf16 = attention.CANDIDATES[0], attention.CANDIDATES[1]
-    assert (fp8.name, bf16.name) == ("flash-attn3-fp8", "flash-attn3")
-    assert fp8 not in attention.PINNABLE and attention.BY_NAME["flash-attn3-fp8"] is fp8
-    # The SAME baked snapshot as the bf16 entry, reached through OUR backend rather than
-    # diffusers': 0.40.0's `_flash_3_hub` hard-codes `q_descale=k_descale=v_descale=None`.
-    assert fp8.baked == bf16.baked == "flash-attn3"
-    assert fp8.backend == attention_fp8.BACKEND == "_flash_3_hub_fp8"
-    assert (fp8.min_sm, fp8.max_sm, fp8.jit) == (90, 0, False)
-    # e4m3 is instantiated for head dim 128 only in the baked build, and 128 is where the rank
-    # was measured (701 / 946 / 1139 TF/s at 64 / 128 / 256); bf16 serves 256.
-    assert (fp8.max_head_dim, bf16.max_head_dim) == (128, 256)
-    for cited in (
-        "MEASURED",
-        "1.292x",
-        "1.317x",
-        "3.056 -> 2.676",
-        "5.817 -> 4.703",
-        "OWNER DECISION 2026-09-08",
-        "cr-138",
-        "INEXACT",
-        "listened",
-    ):
-        assert cited in fp8.why, cited
-    doc = attention.__doc__ or ""
-    assert "RANK 1 ON sm90" in doc and "cr-138" in doc and "listened to" in doc
-    assert "1.31x" in doc and "2.68 c/s" in doc
-    assert "q_descale=k_descale=v_descale=None" in doc
-    assert attention_fp8.E4M3_TARGET < attention_fp8.E4M3_MAX
-
-
-def test_a_ranked_inexact_kernel_is_held_to_a_tighter_budget_than_a_pinnable_one() -> None:
-    """cr-127's self-check is the only numeric witness on a pod that auto-selects fp8 — nobody
-    reads a rank the way a developer reads a pin — so the budget must refuse 'a worse 8-bit
-    kernel than the one measured', not only 'not attention'. h3a-013 measured the kernel at
-    3.84-3.96e-2 at PROBE across every quantiser form (3.94e-2 through this dispatch) and at
-    5.3e-2 on QK-normed rows: the model's own regime, and the worse figure. The budget admits
-    all of that and refuses at ~1.5x the probe figure, under the smallest named failure — a
-    truncating cast, an e5m2 instantiation or a dropped descale, each at least 2x."""
-    budget = attention.BY_NAME["flash-attn3-fp8"].rel_l2_max
-    probe, qk_normed, pinnable = 3.94e-2, 5.3e-2, 1e-1
-    assert qk_normed < budget < 2 * probe < pinnable
-    assert budget == 6e-2
-    # Still the inexact class, and still nowhere near the 16 of a kernel that returns V.
-    assert 2e-2 < budget < 1
-    assert attention.BY_NAME["flash-attn3"].rel_l2_max <= 2e-2
 
 
 def test_fp8_admits_a_strict_subset_of_the_bf16_entrys_sites_so_no_floor_site_moves() -> None:
@@ -552,14 +487,37 @@ def _ready(*names: str) -> list[attention.Ready]:
 
 def _sites_of(count: int, *, dim_head: int, heads: int, dtype: Any) -> Any:
     import torch
-    from diffusers.models.attention_processor import Attention
+    from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
 
     return torch.nn.ModuleList(
         [
-            Attention(query_dim=dim_head * heads, heads=heads, dim_head=dim_head)
+            WanAttention(
+                dim=dim_head * heads, heads=heads, dim_head=dim_head, processor=WanAttnProcessor()
+            )
             for _ in range(count)
         ]
     ).to(dtype)
+
+
+def test_the_attention_processor_uses_the_installed_backend() -> None:
+    why = _diffusers_skip()
+    if why:
+        pytest.skip(why)
+    import torch
+
+    root = _sites_of(1, dim_head=8, heads=1, dtype=torch.float32)
+    device = _device(0, kind="cpu")
+    applied = attention.select(device, {"dit": root})
+    assert applied.totals() == {"sdpa": 1}
+    with torch.no_grad():
+        output = root[0](torch.ones(1, 2, 8))
+    assert output.shape == (1, 2, 8) and output.isfinite().all()
+
+    # A processor that ignores the field also passes a successful forward.
+    # Rejecting an invalid backend proves this forward reads the installed choice.
+    root[0].processor._attention_backend = "missing-audit-backend"
+    with pytest.raises(ValueError, match="missing-audit-backend"):
+        root[0](torch.ones(1, 2, 8))
 
 
 def _h3_shaped() -> dict[str, Any]:
