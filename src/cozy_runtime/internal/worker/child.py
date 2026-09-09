@@ -37,7 +37,10 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import accel, jit_cache, liveness, proctree, spawn
-from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
+from cozy_runtime.internal.child_env import (
+    EXECUTOR_SCOPE_ENV,
+    FLASH_ATTENTION_CACHE_ENABLED_ENV,
+)
 from cozy_runtime.internal.seam import Channel, SeamError, listener
 from cozy_runtime.internal.worker.plan import PreparedModel
 
@@ -764,6 +767,13 @@ class ExecutorSupervision:
                 **accel.child_env_law(accel.host_backend_family()),
                 "COZY_EXECUTOR_SOCKET": self.socket_path,
                 "COZY_HOME": str(self.cozy_home),
+                # Beside the JIT scope, never inside it: that scope is DIRECTORIES, and
+                # every value in it is an absolute path. FlashAttention-4 compiles on the pod
+                # (h3a-024) and upstream gates its persistent cache on a switch read at
+                # import, separate from the directory the scope already imposes. Imposed
+                # unconditionally because it is meaningless without that directory and the
+                # directory is always imposed.
+                FLASH_ATTENTION_CACHE_ENABLED_ENV: "1",
             }
             try:
                 owner = OwnerRecord(
