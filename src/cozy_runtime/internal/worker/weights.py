@@ -143,7 +143,9 @@ class WeightsExchange:
         self._bindings: dict[str, tuple[int, bytes]] = {}
         self._held: dict[str, _Held] = {}
         self._abandoned: set[str] = set()
-        self.writer_broker = WriterBroker(self._store, checkpoint=self.record_checkpoint)
+        self.writer_broker = WriterBroker(
+            self._store, checkpoint=self.record_checkpoint, store_root=store_root
+        )
 
     def record_checkpoint(
         self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]

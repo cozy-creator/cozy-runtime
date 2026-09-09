@@ -73,6 +73,7 @@ from cozy_runtime.internal.worker import (
     model_source_prepare,
     observe,
     page_warm,
+    store_gc,
     triage,
     weights,
 )
@@ -2100,9 +2101,7 @@ class Worker:
         return result
 
     def collect_store_garbage(self) -> pb.CollectStoreGarbageResult:
-        from . import store_gc
-
-        return store_gc.collect(Path(self.options.tensorfs_root or ""))
+        return store_gc.collect_worker(self)
 
     def note(self, kind: str, step: str) -> None:
         """The NON-ATTEMPT activity lane: typed, sequence-bearing, on the DURABLE Report —
@@ -4612,6 +4611,8 @@ class Worker:
         overlaps a co-tenant (cr-104). A replacement kills a process holding device bytes,
         so this runs under the lane's lock like every other act that moves the card's
         occupancy; nothing here fills.
+        Package describe may have spawned an empty process before group selection;
+        reuse also requires that process's immutable device seal to match the lane.
         """
         lane = tenant.lane
         placement_id = tenant.placement.placement_id

@@ -116,6 +116,7 @@ class WorkerHostConfig:
     control_public_key_ed25519_b64url: str
     media_token_sha256: tuple[str, ...]
     child_base_env: tuple[tuple[str, str], ...]
+    storage_admission_fd: int | None = None
     lease_expiry_unix: int = 0
     """What the supervisor SAID the lease expires at, or 0 for no lease. Carried, never
     decided on (xs-007 row 18): tensorhub deleted the rental cap, the supervisor still
@@ -140,6 +141,7 @@ WORKER_HOST_ENV = {
     "COZY_WORKER_LEASE_EXPIRY_UNIX",
     "COZY_RECORD_OWNER_AUTH_JSON",
     "COZY_WORKER_INTERNAL_PORT",
+    "COZY_STORAGE_ADMISSION_FD",
 }
 
 # The host starts one current control worker. Provider/image inheritance is not a config
@@ -409,7 +411,13 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         raise ConfigError(
             "worker_host_config", "worker and media ports are equal", "fix host launch"
         )
+    storage_fd = env.get("COZY_STORAGE_ADMISSION_FD")
+    if storage_fd not in (None, "4"):
+        raise ConfigError(
+            "worker_host_config", "storage admission must use inherited fd 4", "fix host launch"
+        )
     parsed = WorkerHostConfig(
+        storage_admission_fd=4 if storage_fd == "4" else None,
         worker_id=bounded("COZY_WORKER_ID"),
         worker_internal_port=worker_port,
         media_internal_port=media_port,
@@ -423,6 +431,8 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
             )
         ),
     )
+    if environ is None:
+        os.environ.pop("COZY_STORAGE_ADMISSION_FD", None)
     _worker_host_read = True
     return parsed
 
