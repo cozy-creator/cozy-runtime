@@ -173,7 +173,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.15.0"
+version = "0.15.1"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -1024,6 +1024,7 @@ wheels = [
 name = "tensorfs"
 version = "0.3.34"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/59/37/3ea2ffe4e925562ce16e4d527c015d6b32c23ba5e1319ab2923b72899710/tensorfs-0.3.34.tar.gz", hash = "sha256:beb3ee10e2bb38f463c6ee5b1009fe98ef963084f124205b7f7bd3abf7ebb4da", size = 732752, upload-time = "2026-09-09T03:45:06.769Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/25/81/1862d72290b631a206e319a7d8da5e01efd587c924a008322c808c74461c/tensorfs-0.3.34-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d80d77266cbec711455869ca1c5fed4b545bc777f1d7dd40266bcb587e161618", size = 7639937, upload-time = "2026-09-09T03:45:04.429Z" },
 ]
