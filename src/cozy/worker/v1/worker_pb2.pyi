@@ -1761,7 +1761,7 @@ class SnapshotAck(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_digest: _Optional[bytes] = ..., host_snapshot_digest: _Optional[bytes] = ...) -> None: ...
 
 class DesiredWorkerState(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "revision", "posture", "wire_minor", "drain_grace_ms", "job", "placement_set", "package_set", "local_package_set", "private_placement_set")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "revision", "posture", "wire_minor", "drain_grace_ms", "job", "placement_set", "package_set", "local_package_set", "private_placement_set", "runtime_revision")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1774,6 +1774,7 @@ class DesiredWorkerState(_message.Message):
     PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
     LOCAL_PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
     PRIVATE_PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
+    RUNTIME_REVISION_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
@@ -1786,7 +1787,8 @@ class DesiredWorkerState(_message.Message):
     package_set: DesiredPackageSet
     local_package_set: DesiredLocalPackageSet
     private_placement_set: DesiredPrivatePlacementSet
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., revision: _Optional[int] = ..., posture: _Optional[_Union[Posture, str]] = ..., wire_minor: _Optional[int] = ..., drain_grace_ms: _Optional[int] = ..., job: _Optional[_Union[JobDirective, _Mapping]] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., local_package_set: _Optional[_Union[DesiredLocalPackageSet, _Mapping]] = ..., private_placement_set: _Optional[_Union[DesiredPrivatePlacementSet, _Mapping]] = ...) -> None: ...
+    runtime_revision: RuntimeRevision
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., revision: _Optional[int] = ..., posture: _Optional[_Union[Posture, str]] = ..., wire_minor: _Optional[int] = ..., drain_grace_ms: _Optional[int] = ..., job: _Optional[_Union[JobDirective, _Mapping]] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., local_package_set: _Optional[_Union[DesiredLocalPackageSet, _Mapping]] = ..., private_placement_set: _Optional[_Union[DesiredPrivatePlacementSet, _Mapping]] = ..., runtime_revision: _Optional[_Union[RuntimeRevision, _Mapping]] = ...) -> None: ...
 
 class DesiredPackageSet(_message.Message):
     __slots__ = ("download_delegation", "download_delegation_signature")
@@ -3725,3 +3727,19 @@ class ExecutionObservation(_message.Message):
     environment: ExecutionEnvironment
     capture: ActivationCaptureResult
     def __init__(self, environment: _Optional[_Union[ExecutionEnvironment, _Mapping]] = ..., capture: _Optional[_Union[ActivationCaptureResult, _Mapping]] = ...) -> None: ...
+
+class RuntimeRevision(_message.Message):
+    __slots__ = ("wheel_digest", "wheel_length", "runtime_version", "python_abi", "provenance_digest", "channel")
+    WHEEL_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    WHEEL_LENGTH_FIELD_NUMBER: _ClassVar[int]
+    RUNTIME_VERSION_FIELD_NUMBER: _ClassVar[int]
+    PYTHON_ABI_FIELD_NUMBER: _ClassVar[int]
+    PROVENANCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CHANNEL_FIELD_NUMBER: _ClassVar[int]
+    wheel_digest: bytes
+    wheel_length: int
+    runtime_version: str
+    python_abi: str
+    provenance_digest: bytes
+    channel: str
+    def __init__(self, wheel_digest: _Optional[bytes] = ..., wheel_length: _Optional[int] = ..., runtime_version: _Optional[str] = ..., python_abi: _Optional[str] = ..., provenance_digest: _Optional[bytes] = ..., channel: _Optional[str] = ...) -> None: ...
