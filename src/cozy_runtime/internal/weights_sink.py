@@ -462,8 +462,6 @@ class WeightsTransactionHost:
                 code="weights_source_ungranted",
             )
         try:
-            import tensorfs
-
             held = self.store.manifest(manifest)
             header = tensorfs.parse_header(bytes(held["header"]))
             return source_structure(header)
