@@ -11,13 +11,13 @@ import argparse
 import contextlib
 import json
 import os
+import resource
 import socket
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
-import psutil
 import tensorfs
 import torch
 
@@ -36,7 +36,12 @@ from cozy_runtime.internal.worker.session import executor_prepare_command
 
 PACKAGE = Path(__file__).parent / "dual_model_package"
 sys.path.insert(0, str(PACKAGE))
-from dual_model_package import CONFIG, BasePipe, OverlayPipe, batch  # noqa: E402
+from dual_model_package import (  # type: ignore[import-not-found]  # noqa: E402
+    CONFIG,
+    BasePipe,
+    OverlayPipe,
+    batch,
+)
 
 from cozy_runtime.author import Config  # noqa: E402
 
@@ -77,7 +82,8 @@ class _CpuRing:
             for _ in range(slots)
         ]
         self.views = [memoryview(buffer.numpy()) for buffer in self.buffers]
-        self.inflight, self.stream = [], object()
+        self.inflight: list[tuple[_CpuEvent, Any]] = []
+        self.stream = object()
 
     def track(self, _tensor: Any) -> None:
         return None
@@ -102,9 +108,9 @@ class _CpuRing:
 def install_cpu_transport() -> None:
     import cozy_runtime.internal.fill as fill_module
 
-    fill_module.StagingRing = _CpuRing  # type: ignore[assignment]
-    torch.cuda.stream = lambda _stream: contextlib.nullcontext()  # type: ignore[method-assign]
-    torch.cuda.Event = lambda *args, **kwargs: _CpuEvent()  # type: ignore[method-assign]
+    setattr(fill_module, "StagingRing", _CpuRing)  # noqa: B010
+    setattr(torch.cuda, "stream", lambda _stream: contextlib.nullcontext())  # noqa: B010
+    setattr(torch.cuda, "Event", lambda *args, **kwargs: _CpuEvent())  # noqa: B010
 
 
 def cpu_accounting() -> None:
@@ -113,23 +119,24 @@ def cpu_accounting() -> None:
     def allocation(torch_module: Any, kind: str, device: Any = None) -> dict[str, int]:
         if kind != "cpu":
             return original_allocation(torch_module, kind, device)
-        memory = psutil.virtual_memory()
-        rss = psutil.Process().memory_info().rss
+        page_size = int(os.sysconf("SC_PAGESIZE"))
+        total = int(os.sysconf("SC_PHYS_PAGES")) * page_size
+        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
         return {
             "allocated_bytes": rss,
             "reserved_bytes": rss,
-            "driver_free_bytes": memory.available,
-            "driver_total_bytes": memory.total,
+            "driver_free_bytes": max(total - rss, 0),
+            "driver_total_bytes": total,
         }
 
     def allocated(torch_module: Any, kind: str, device: Any = None) -> int:
         return (
-            psutil.Process().memory_info().rss
+            int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
             if kind == "cpu"
             else original_allocated(torch_module, kind, device)
         )
 
-    accel.allocation, accel.allocated = allocation, allocated
+    accel.allocation, accel.allocated = cast(Any, allocation), cast(Any, allocated)
 
 
 def native_model(root: Path, name: str, components: dict[str, Any], config: dict[str, Any]) -> None:
@@ -254,7 +261,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
     executor = Executor(Channel(ours), root / "executor", world=degree)
     if backend == "cpu":
         install_cpu_transport()
-    executor.device_kind = backend
+    executor.device_kind = cast(Any, backend)
     _capture_seal()
 
     def launch(module_argv: list[str], fd: int) -> spawn.Child:

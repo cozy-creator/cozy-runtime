@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import msgspec
 import torch
@@ -59,7 +59,9 @@ def project(module: Any, args: Any, kwargs: Any) -> Any:
 
 class BasePipe:
     def __init__(self, config: Config) -> None:
-        dit = MiniMaxH3Transformer3DModel(**config.mapping()["dit"]).eval()
+        mapping = cast(dict[str, Any], config.mapping())
+        dit: Any = MiniMaxH3Transformer3DModel(**mapping["dit"])  # type: ignore[no-untyped-call]
+        dit = dit.eval()
         dit.set_attention_backend("native")
         dit.register_forward_pre_hook(project, with_kwargs=True)
         self.components = {"dit": dit}
