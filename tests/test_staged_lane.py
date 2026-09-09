@@ -144,3 +144,91 @@ def test_complete_model_larger_than_vram_reaches_bounded_prepare_and_stages() ->
             ),
             flush=True,
         )
+
+
+@needs_tenant
+def test_staged_rung_confesses_this_attempt_not_the_generations_history() -> None:
+    """The staged-rung confession's counts and its milliseconds are the SAME scope (cr-134).
+
+    `Residency` keeps two ledgers: `stages`/`evictions`/`staged_ms`/`evicted_ms` accumulate
+    for the life of the executor generation, and the `attempt_` counters are zeroed at every
+    attempt. The confession read `attempt_stages` beside `staged_ms` — one count from each —
+    and reported a production H3 request as "6 component stage(s) costing 31220.3 ms" when
+    its six stages cost 5542.85 ms. The 31.2 s was the pod's whole history and became the
+    case for changing residency policy.
+
+    Two turns on one placement is the smallest arm that separates the ledgers: the second
+    attempt's `attempt_staged_ms` is strictly below the generation's `staged_ms`, because
+    the first attempt's staging is in one and not the other.
+    """
+    memory = accel.device_memory("0", accel.host_backend_family())
+    assert memory.state == "measured"
+    part = 64 << 20
+    component_bytes = (memory.total_bytes // 4 // part + 1) * part
+    with _workspace() as root:
+        store = write_staged(root, component_bytes)
+        assert store.weight_bytes > memory.total_bytes
+        package = root / "package"
+        shutil.copytree(PACKAGE, package)
+        owner, worker, notes = _drive(
+            store,
+            [_turn("plc-staged", "staged-first", 0), _turn("plc-staged", "staged-second", 1)],
+            root,
+            package,
+        )
+        assert owner.ended == "terminal", (owner.ended, owner.error, notes)
+        assert [turn.outcome["status"] for turn in owner.turns] == [1, 1], [
+            turn.outcome for turn in owner.turns
+        ]
+        bundles = sorted(Path(worker.bundles.root).glob("*.json"))
+        assert len(bundles) == 2, bundles
+        seen = []
+        for path in bundles:
+            bundle = json.loads(path.read_text())
+            residency = bundle["measurements"]["residency"]
+            confessions = [
+                row["value"]
+                for row in bundle["confessions"]
+                if "component stage(s)" in row["value"]
+            ]
+            assert len(confessions) == 1, bundle["confessions"]
+            seen.append((residency, confessions[0]))
+            # THE CONFESSION QUOTES THE ATTEMPT'S OWN NUMBERS, both halves.
+            assert (
+                f"{residency['attempt_stages']} component stage(s) costing "
+                f"{residency['attempt_staged_ms']} ms" in confessions[0]
+            ), confessions[0]
+            assert (
+                f"{residency['attempt_evictions']} eviction(s) costing "
+                f"{residency['attempt_evicted_ms']} ms" in confessions[0]
+            ), confessions[0]
+            assert residency["attempt_stages"] > 0, residency
+            assert residency["attempt_staged_ms"] > 0, residency
+            # ... and never the generation's, which is a superset of them.
+            assert residency["attempt_stages"] <= residency["stages"], residency
+            assert residency["attempt_staged_ms"] <= residency["staged_ms"], residency
+        # THE RED ARM: the second attempt inherits the first's history, so the two ledgers
+        # have measurably different values. Without that, quoting either would pass.
+        later = seen[-1][0] if seen[-1][0]["stages"] > seen[0][0]["stages"] else seen[0][0]
+        assert later["attempt_stages"] < later["stages"], later
+        assert later["attempt_staged_ms"] < later["staged_ms"], later
+        assert str(later["staged_ms"]) not in seen[-1][1] + seen[0][1], (later, seen)
+        print(
+            json.dumps(
+                {
+                    "component": component_bytes,
+                    "device_total": memory.total_bytes,
+                    "attempts": [
+                        {
+                            "attempt_stages": row["attempt_stages"],
+                            "attempt_staged_ms": row["attempt_staged_ms"],
+                            "stages": row["stages"],
+                            "staged_ms": row["staged_ms"],
+                            "confession": line,
+                        }
+                        for row, line in seen
+                    ],
+                }
+            ),
+            flush=True,
+        )
