@@ -67,6 +67,8 @@ CALLED: dict[str, str] = {
     "parse_header": "(data: 'bytes', closure: 'Closure | None' = None) -> 'Header'",
     "parse_manifest": "(data)",
     "seed_digests": "()",
+    "object_id": "(data)",
+    "dtypes": "()",
     "TensorRequirement": (
         "(component: 'str', key: 'str', shape: 'Sequence[int]', "
         "logical_dtype: 'str | None' = None) -> None"
@@ -139,6 +141,7 @@ CALLED: dict[str, str] = {
     "ReadLease.stream": "(self, /, plan, slots, on_batch, readers=4)",
     "ReadLease.read_into": "(self, /, object, object_length, off, length, into)",
     "ReadLease.read_asset": "(self, /, header, name, max_bytes=67108864)",
+    "ReadLease.read_part_into": "(self, /, header, component, key, role, off, into)",
     "ReadLease.release": "(self, /)",
     "DerivedWriter.add_part": "(self, /, component, key, role, reader)",
     "DerivedWriter.add_config": "(self, /, name, reader)",

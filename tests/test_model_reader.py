@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import io
 import json
 from pathlib import Path
@@ -175,12 +176,20 @@ def test_inherited_identity_and_changed_scale_use_native_read_custody(
         assert ref.identity("model", "inherited") == cand.identity("model", "inherited")
         assert not any(frame["operation"] == "read" for _, frame in frames)
         assert ref.identity("model", "changed") != cand.identity("model", "changed")
-        left = np.empty(expected.shape, dtype=np.float32)
-        right = np.empty_like(left)
-        ref.read_values_into("model", "changed", 0, left)
-        cand.read_values_into("model", "changed", 0, right)
-        np.testing.assert_array_equal(left.view(np.uint32), expected.view(np.uint32))
-        np.testing.assert_array_equal(right, changed_expected)
+        for role, facts in encoded["roles"].items():
+            original_part = bytearray(len(facts["bytes"]))
+            changed_part = bytearray(len(changed["roles"][role]["bytes"]))
+            ref.read_part_into("model", "changed", role, 0, original_part)
+            cand.read_part_into("model", "changed", role, 0, changed_part)
+            assert original_part == facts["bytes"]
+            assert changed_part == changed["roles"][role]["bytes"]
+        if importlib.util.find_spec("torch") is not None:
+            left = np.empty(expected.shape, dtype=np.float32)
+            right = np.empty_like(left)
+            ref.read_values_into("model", "changed", 0, left)
+            cand.read_values_into("model", "changed", 0, right)
+            np.testing.assert_array_equal(left.view(np.uint32), expected.view(np.uint32))
+            np.testing.assert_array_equal(right, changed_expected)
     assert not broker.views
     with pytest.raises(CapabilityError):
         ref.identity("model", "inherited")
@@ -202,6 +211,7 @@ def test_inherited_identity_and_changed_scale_use_native_read_custody(
 def test_logical_ranges_match_banked_format_vectors(
     tmp_path: Path, filename: str, encoding: str
 ) -> None:
+    pytest.importorskip("torch", reason="encoded reconstruction uses the optional Torch decoder")
     store = tensorfs.Store.init(tmp_path / "store")
     row, expected = vector(filename, encoding)
     reference = model(store, filename, {"weight": row})
@@ -273,6 +283,7 @@ def test_foreign_stale_canceled_and_released_views_refuse(tmp_path: Path) -> Non
 
 
 def test_ragged_mxfp8_and_partial_final_block(tmp_path: Path) -> None:
+    pytest.importorskip("torch", reason="encoded reconstruction uses the optional Torch decoder")
     store = tensorfs.Store.init(tmp_path / "store")
     row = {
         "logical": {"dtype": "f32", "shape": [2, 35]},
