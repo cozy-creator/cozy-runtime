@@ -1,15 +1,21 @@
+from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from cozy_runtime.internal import fill
 from cozy_runtime.internal import storage_admission as storage
 from cozy_runtime.internal.worker import model_source_prepare
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
 @pytest.mark.parametrize("mode", ["preferred", "minimum", "pending", "replay", "full"])
-def test_source_pass_uses_native_bounds_instead_of_whole_carriers(tmp_path, monkeypatch, mode):
+def test_source_pass_uses_native_bounds_instead_of_whole_carriers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
     profiles = [("left", "fixture/left"), ("right", "fixture/right")]
     request = pb.PrepareModelSourceRequest(
         operation_id="source-pass", source_selection_digest=b"a" * 32
@@ -23,7 +29,7 @@ def test_source_pass_uses_native_bounds_instead_of_whole_carriers(tmp_path, monk
     minimum, preferred = 128 << 10, 64 << 20
 
     @contextmanager
-    def admit(*writes):
+    def admit(*writes: storage.Write) -> Iterator[None]:
         reservation = sum(row.bytes for row in writes)
         reservations.append(reservation)
         if mode == "full" or (mode == "minimum" and reservation > 1 << 20):
@@ -34,7 +40,7 @@ def test_source_pass_uses_native_bounds_instead_of_whole_carriers(tmp_path, monk
         finally:
             admitted.pop()
 
-    def advance(*args, **kwargs):
+    def advance(*args: Any, **kwargs: Any) -> dict[str, Any]:
         assert admitted, "native preparation started without admission"
         calls.append(kwargs["write_budget_bytes"])
         replay = mode == "replay"
@@ -60,12 +66,12 @@ def test_source_pass_uses_native_bounds_instead_of_whole_carriers(tmp_path, monk
             "write_interval_bytes": preferred,
         }
 
-    def ensure(_):
+    def ensure(_: str) -> SimpleNamespace:
         assert admitted, "Store creation started before metadata admission"
         return SimpleNamespace(prepare_model_source=advance)
 
     facade = SimpleNamespace(Store=SimpleNamespace(ensure=ensure), manifest_max_bytes=lambda: 128)
-    monkeypatch.setattr(model_source_prepare.fill, "tensorfs_module", lambda: facade)
+    monkeypatch.setattr(fill, "tensorfs_module", lambda: facade)
     monkeypatch.setattr(storage, "admit", admit)
     result = model_source_prepare.prepare_model_source(request, tensorfs_root=tmp_path / "store")
     assert not admitted

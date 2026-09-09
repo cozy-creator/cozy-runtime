@@ -4,8 +4,10 @@ import hashlib
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -14,7 +16,7 @@ from cozy_runtime.internal import storage_admission as storage
 from test_private_exact_dependencies import _wheel
 
 
-def test_standard_direct_requirements_preserve_exact_wheel_and_legacy_pins():
+def test_standard_direct_requirements_preserve_exact_wheel_and_legacy_pins() -> None:
     direct = b"proof @ https://files.example/proof-1.0-py3-none-any.whl --hash=sha256:" + b"a" * 64
     selected = environment.read_locked_requirements(direct).rows[0]
     assert (selected.name, selected.version, selected.hashes) == (
@@ -36,12 +38,14 @@ def test_standard_direct_requirements_preserve_exact_wheel_and_legacy_pins():
         "https://example/source.tar.gz",
     ],
 )
-def test_direct_lock_rejects_credentials_other_artifacts_and_wrong_distribution(target):
+def test_direct_lock_rejects_credentials_other_artifacts_and_wrong_distribution(
+    target: str,
+) -> None:
     with pytest.raises(environment.EnvironmentRefusal):
         environment.read_locked_requirements(f"proof @ {target} --hash=sha256:{'a' * 64}".encode())
 
 
-def wheel_fixture(tmp_path: Path):
+def wheel_fixture(tmp_path: Path) -> tuple[Path, Path, environment.LockedRow]:
     candidate = _wheel(tmp_path, "bounded_proof", (), b"VALUE = 73\n")
     digest = "sha256:" + hashlib.sha256(candidate.read_bytes()).hexdigest()
     raw = f"bounded-proof @ https://files.example/{candidate.name} --hash={digest}".encode()
@@ -55,17 +59,17 @@ def wheel_fixture(tmp_path: Path):
     return root, target, row
 
 
-def test_refused_expansion_does_not_start_uv_or_create_environment(tmp_path, monkeypatch):
+def test_refused_expansion_does_not_start_uv_or_create_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root, wheel, row = wheel_fixture(tmp_path)
     staging = root / "generation"
     monkeypatch.setattr(storage, "fetch_wheel", lambda *args: (wheel, wheel.stat().st_size))
 
-    @contextmanager
-    def refuse(*bounds):
+    def refuse(*bounds: storage.Write) -> NoReturn:
         assert bounds[0].bytes > wheel.stat().st_size
         assert bounds[0].inodes > 4
         raise storage.StorageRefusal("disk full before expansion")
-        yield
 
     monkeypatch.setattr(storage, "admit", refuse)
     before = set(root.rglob("*"))
@@ -77,19 +81,21 @@ def test_refused_expansion_does_not_start_uv_or_create_environment(tmp_path, mon
     assert not staging.exists()
 
 
-def test_exact_downloaded_wheel_installs_with_uv_offline(tmp_path, monkeypatch):
+def test_exact_downloaded_wheel_installs_with_uv_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root, wheel, row = wheel_fixture(tmp_path)
     staging = root / "generation"
     monkeypatch.setattr(storage, "fetch_wheel", lambda *args: (wheel, wheel.stat().st_size))
 
-    def unexpected_rehash(_path):
+    def unexpected_rehash(_path: Path) -> NoReturn:
         pytest.fail("Runtime rehashed a supervisor-verified wheel")
 
     monkeypatch.setattr(environment, "_hash_file", unexpected_rehash)
-    admitted = []
+    admitted: list[storage.Write] = []
 
     @contextmanager
-    def allow(*bounds):
+    def allow(*bounds: storage.Write) -> Iterator[None]:
         admitted.extend(bounds)
         yield
 
@@ -113,21 +119,25 @@ def test_exact_downloaded_wheel_installs_with_uv_offline(tmp_path, monkeypatch):
     assert not list(root.glob(".uv-cache-*"))
 
 
-def test_complete_locked_install_admits_metadata_and_releases_wheel_stage(tmp_path, monkeypatch):
+def test_complete_locked_install_admits_metadata_and_releases_wheel_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root, wheel, row = wheel_fixture(tmp_path)
     locked = environment.read_locked_requirements(
         ("--index-url https://pypi.org/simple\n" + row.text + "\n").encode()
     )
     monkeypatch.setattr(storage, "enabled", lambda: True)
-    fetched, released, held = [], [], []
+    fetched: list[tuple[str, ...]] = []
+    released: list[str] = []
+    held: list[storage.Write] = []
 
-    def fetch(*args):
+    def fetch(*args: str) -> tuple[Path, int]:
         assert not held
         fetched.append(args)
         return wheel, wheel.stat().st_size
 
     @contextmanager
-    def admit(*bounds):
+    def admit(*bounds: storage.Write) -> Iterator[None]:
         assert not held, "metadata/installer acquired nested host exclusion"
         held.extend(bounds)
         try:
@@ -135,7 +145,7 @@ def test_complete_locked_install_admits_metadata_and_releases_wheel_stage(tmp_pa
         finally:
             held.clear()
 
-    def release(operation):
+    def release(operation: str) -> None:
         assert not held
         assert list((root / "receipts").glob("*.json")), (
             "released before immutable install completed"
