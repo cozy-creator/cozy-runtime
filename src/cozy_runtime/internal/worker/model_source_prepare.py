@@ -16,7 +16,7 @@ import re
 import stat
 from pathlib import Path
 
-from cozy_runtime.internal import fill
+from cozy_runtime.internal import fill, storage_admission
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -59,15 +59,20 @@ def prepare_model_source(
                     "adoption requires an old operation and no active source conversion",
                 )
             adoption["adopt_from_operation_id"] = request.adopt_from_operation_id
-        prepared = store.prepare_model_source(
-            request.operation_id,
-            documents.spell(bytes(request.source_selection_digest)),
-            profiles,
-            roster,
-            landed,
-            checkpoints=checkpoints,
-            **adoption,
-        )
+        with storage_admission.admit(
+            storage_admission.native_write(
+                tensorfs_root, sum(row[2] for row in roster) * len(profiles), len(roster)
+            )
+        ):
+            prepared = store.prepare_model_source(
+                request.operation_id,
+                documents.spell(bytes(request.source_selection_digest)),
+                profiles,
+                roster,
+                landed,
+                checkpoints=checkpoints,
+                **adoption,
+            )
         return _result(request, prepared)
     except ModelSourceRefusal as exc:
         return _refused(exc.code, exc.detail)

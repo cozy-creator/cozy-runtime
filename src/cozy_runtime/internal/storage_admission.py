@@ -14,6 +14,7 @@ import os
 import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,11 @@ class Write:
 
 
 _channel: socket.socket | None = None
+_held: ContextVar[bool] = ContextVar("storage_admission_held", default=False)
+
+
+def enabled() -> bool:
+    return _channel is not None
 
 
 def native_write(path: Path | None, payload: int = 0, objects: int = 1) -> Write:
@@ -77,6 +83,8 @@ def admit(*writes: Write) -> Iterator[None]:
     if _channel is None:
         yield
         return
+    if _held.get():
+        raise StorageRefusal("nested storage admission would deadlock; combine write destinations")
     if not 1 <= len(writes) <= 8 or any(
         not row.path.is_absolute()
         or type(row.bytes) is not int
@@ -90,15 +98,49 @@ def admit(*writes: Write) -> Iterator[None]:
         [{"path": str(row.path), "bytes": row.bytes, "inodes": row.inodes} for row in writes],
         separators=(",", ":"),
     ).encode()
+    with _exchange(body, tuple(row.path for row in writes)):
+        token = _held.set(True)
+        try:
+            yield
+        finally:
+            _held.reset(token)
+
+
+@contextmanager
+def _exchange(body: bytes, directories: tuple[Path, ...] = ()) -> Iterator[dict[str, object]]:
+    if _channel is None or _held.get():
+        raise StorageRefusal("supervisor storage channel is unavailable or already held")
     if len(body) > 4096:
         raise StorageRefusal("Runtime write admission exceeds its control bound")
     client, host = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     with client, host:
         try:
-            sent = _channel.sendmsg(
-                [body],
-                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [host.fileno()]))],
-            )
+            descriptors: list[int] = []
+            try:
+                for directory in directories:
+                    while True:
+                        try:
+                            descriptors.append(
+                                os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                            )
+                            break
+                        except FileNotFoundError:
+                            if directory.parent == directory:
+                                raise
+                            directory = directory.parent
+                sent = _channel.sendmsg(
+                    [body],
+                    [
+                        (
+                            socket.SOL_SOCKET,
+                            socket.SCM_RIGHTS,
+                            array.array("i", [host.fileno(), *descriptors]),
+                        )
+                    ],
+                )
+            finally:
+                for descriptor in descriptors:
+                    os.close(descriptor)
             if sent != len(body):
                 raise OSError("short admission command")
             host.close()
@@ -112,4 +154,23 @@ def admit(*writes: Write) -> Iterator[None]:
                 raise StorageRefusal("supervisor refused Runtime disk write", facts)
         except (OSError, ValueError) as exc:
             raise StorageRefusal("supervisor storage admission is unavailable") from exc
-        yield
+        yield answer
+
+
+def fetch_wheel(operation: str, filename: str, digest: str, url: str) -> tuple[Path, int]:
+    """The existing supervisor downloader owns redirects, admission and hashing."""
+    body = json.dumps(
+        {"operation": operation, "filename": filename, "digest": digest, "url": url},
+        separators=(",", ":"),
+    ).encode()
+    with _exchange(body) as answer:
+        path, length = answer.get("path"), answer.get("length")
+        if not isinstance(path, str) or type(length) is not int or not 0 < length <= 2 << 30:
+            raise StorageRefusal("supervisor returned an invalid wheel file")
+        return Path(path), length
+
+
+def release_wheels(operation: str) -> None:
+    """A completed immutable install releases its existing wheel staging operation."""
+    with _exchange(json.dumps({"operation": operation, "release": True}).encode()):
+        pass

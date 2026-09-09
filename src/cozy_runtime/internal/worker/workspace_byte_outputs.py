@@ -443,20 +443,25 @@ def commit(
                         or files
                     ):
                         raise WorkspaceRefusal("re-export changed its retained input manifest")
-                    return dict(
-                        store.create_tree_root(
-                            root_id,
-                            documents.spell(retained.source.manifest.digest),
-                            retained.source.manifest.length,
+                    with storage_admission.admit(
+                        storage_admission.native_write(workspace.store_root)
+                    ):
+                        return dict(
+                            store.create_tree_root(
+                                root_id,
+                                documents.spell(retained.source.manifest.digest),
+                                retained.source.manifest.length,
+                            )
                         )
-                    )
             store = fill.tensorfs_module().Store.open(str(workspace.store_root))
             # Native holds its writer guard and records each member before import.
             # Separate put_file/create_tree_root calls leave a process-death/GC gap.
             with storage_admission.admit(
                 storage_admission.native_write(workspace.store_root, content_bytes, len(files))
             ):
-                return dict(store.import_tree(root_id, manifest_body, [(p, str(f)) for p, f in files]))
+                return dict(
+                    store.import_tree(root_id, manifest_body, [(p, str(f)) for p, f in files])
+                )
 
         observed = db.native(produce)
         receipt = bytes(observed.get("receipt", b""))

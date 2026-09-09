@@ -22,7 +22,7 @@ import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
-from cozy_runtime.internal import fill, storage_admission, source_interfaces
+from cozy_runtime.internal import fill, source_interfaces, storage_admission
 from cozy_runtime.internal.worker import source_views, workspace_sources
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
@@ -323,6 +323,8 @@ class SourceCalls:
         self.send(pb.WorkerFrame(native_source_status=status))
 
     def _write_bounds(self, command: dict[str, Any]) -> tuple[storage_admission.Write, ...]:
+        if not storage_admission.enabled():
+            return ()
         if command["phase"] == "resolve":
             return (storage_admission.Write(self.workspace.store_root, 0, 0),)
         operation, args = command["operation"], command["arguments"]
@@ -530,7 +532,14 @@ class SourceCalls:
                     self.processes[command.service_id] = process
                     if command.service_id in self.canceled:
                         process.kill()
-                output, _ = process.communicate(encoded)
+                try:
+                    output, _ = process.communicate(encoded)
+                finally:
+                    # Do not free admission while an exceptional IPC exit leaves
+                    # the privileged native child writing in the background.
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
             with self.lock:
                 canceled = command.service_id in self.canceled
             if canceled:
@@ -601,7 +610,11 @@ class SourceCalls:
             )
         except Exception as exc:
             # Only a known native refusal code crosses; arbitrary exception text stays private.
-            code = exc.code if isinstance(exc, NativeSourceFailure) else "native_source_failed"
+            code = (
+                exc.code
+                if isinstance(exc, (NativeSourceFailure, storage_admission.StorageRefusal))
+                else "native_source_failed"
+            )
             with self.workspace.locked() as db:
                 db.execute(
                     "UPDATE native_calls SET state='failed',native_error=? "

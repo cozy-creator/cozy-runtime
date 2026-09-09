@@ -13,7 +13,13 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
-from cozy_runtime.internal import host_paths, package_environment, proctree, readiness, storage_admission
+from cozy_runtime.internal import (
+    host_paths,
+    package_environment,
+    proctree,
+    readiness,
+    storage_admission,
+)
 from cozy_runtime.internal.config import (
     ConfigError,
     WorkerHostConfig,

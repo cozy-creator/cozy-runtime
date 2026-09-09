@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, BinaryIO, cast
 
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.internal import storage_admission
 from cozy_runtime.author._weights import MAX_WEIGHTS_SOURCE_READ
+from cozy_runtime.internal import storage_admission
 from cozy_runtime.protocol import weights_limits
 
 _TRANSACTION = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -374,7 +374,9 @@ class WriterBroker:
                     )
                 with (
                     _read(_path(spool, transaction, "input"), length, maximum) as source,
-                    storage_admission.admit(storage_admission.native_write(self.store_root, length)),
+                    storage_admission.admit(
+                        storage_admission.native_write(self.store_root, length)
+                    ),
                 ):
                     if operation == "part":
                         writer.add_part(
