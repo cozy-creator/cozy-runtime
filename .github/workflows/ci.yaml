@@ -51,6 +51,24 @@ jobs:
       - run: uv sync
       - run: uv run pytest
 
+  # Real CPU rank execution, separate from the torch-free base checks. The native
+  # staging case names its CUDA requirement and skips on this runner.
+  context-parallel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.12
+      - run: uv sync --locked
+      - run: uv pip install --python .venv/bin/python --index https://download.pytorch.org/whl/cpu "torch==2.13.0"
+      - run: uv pip install --python .venv/bin/python "diffusers==0.40.0" "accelerate==1.14.0"
+      - run: .venv/bin/python -c "import torch; assert torch.version.cuda is None"
+      - run: .venv/bin/python -m pytest tests/test_parallel_calls.py -q -rs
+
   # THE VENDORED-DRIFT GATE (#536d). `src/cozy/worker/v1/` is a COPY of another repo's
   # generated output, and a copy is only a copy while somebody compares the bytes.
   #

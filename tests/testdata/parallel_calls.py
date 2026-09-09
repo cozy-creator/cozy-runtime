@@ -17,7 +17,7 @@ from cozy_runtime.internal.parallel.cp import in_gated_call
 from cozy_runtime.internal.seam import Channel
 
 
-class Collective(torch.nn.Module):
+class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in the base checking env
     def __init__(self) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.full((1,), 2.0))
