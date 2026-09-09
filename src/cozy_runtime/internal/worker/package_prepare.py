@@ -27,10 +27,9 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import acquire
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
-MAX_FILES = 4096
 MAX_FILE_BYTES = 8 << 30
 _DISTRIBUTION = re.compile(r"[-_.]+")
 _OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
@@ -903,14 +902,14 @@ def prepare_package(
 
     if development is None:
         raise PreparationRefusal("package_prepare_development_absent", package_name)
+    rows = list(wheels)
+    if not 1 <= len(rows) <= weights_limits.MAX_LOCAL_PACKAGE_FILES:
+        raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
     expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     try:
         observed_base = base or package_environment.observe_base(python)
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
-    rows = list(wheels)
-    if not 1 <= len(rows) <= MAX_FILES:
-        raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
     if not wheel_root.is_absolute():
         raise PreparationRefusal("package_prepare_file_path_invalid", str(wheel_root))
     facts: list[tuple[package_environment.Wheel, Path, package_environment.VerifiedFile]] = []

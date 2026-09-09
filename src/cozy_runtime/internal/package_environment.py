@@ -48,6 +48,7 @@ from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import base_observation, canonical, storage_admission
 from cozy_runtime.internal.config import inherited_environment
+from cozy_runtime.protocol import weights_limits
 
 RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
 LOCKED_RECEIPT_FORMAT = "cozy.runtime.LockedEnvironmentReceipt/1"
@@ -58,7 +59,7 @@ MAX_WHEEL_MEMBERS = 100_000
 MAX_WHEEL_EXPANDED_BYTES = 8 << 30
 MAX_WHEEL_EXPANSION = 64
 MAX_METADATA_BYTES = 4 << 20
-MAX_PACKAGE_WHEELS = 129
+MAX_PACKAGE_WHEELS = weights_limits.MAX_LOCAL_PACKAGE_FILES
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NORMALIZE = re.compile(r"[-_.]+")
