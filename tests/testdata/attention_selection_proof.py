@@ -184,6 +184,23 @@ def main() -> None:
     out["pin_served"] = attention.install(ready[:1], {"dit": dit}, "cudnn").document()
     out["pin_backends"] = _backends({"dit": dit})
 
+    # A GROUP PREPARE has one record, merged from its models' own (cr-135): two real
+    # constructions pinned to one kernel, each read back off its own processors, and the
+    # merge `_prepare_many` runs — which used to drop the pin — renders PINNED.
+    second = _site(1024, 8, torch.bfloat16)
+    out["group_pinned"] = attention.merge(
+        {
+            "fl2va": attention.install(ready[:1], {"dit": dit}, "cudnn").document(),
+            "ref2va": attention.install(ready[:1], {"dit": second}, "cudnn").document(),
+        }
+    )
+    out["group_auto"] = attention.merge(
+        {
+            "fl2va": attention.select(device, {"dit": dit}).document(),
+            "ref2va": attention.select(device, {"dit": second}).document(),
+        }
+    )
+
     out["unknown"] = _refusal(lambda: attention.pinned("no-such-kernel", device))
     out["too_old"] = _refusal(lambda: attention.pinned("flash-attn3", _device_at(80)))
     out["absent"] = _refusal(lambda: attention.pinned("sageattention", _device_at(90)))

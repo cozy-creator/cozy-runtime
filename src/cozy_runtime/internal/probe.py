@@ -1030,6 +1030,7 @@ def _table(result: Mapping[str, Any]) -> Capabilities:
                 # reason: a zero would win every comparison it was never entitled to enter.
                 resident_bits_per_element=float(axes.get("resident_bits_per_element", -1.0)),
                 kernel_numeric_error=float(axes.get("deviation_rel", -1.0)),
+                leaf_speedup_x=_leaf_speedup(observation),
                 # #549.9's identity, carried onto every record it minted. A record read back
                 # from a probe file written before these existed carries empty strings, which
                 # is honest — the file genuinely did not record what it ran on.
@@ -1044,6 +1045,32 @@ def _table(result: Mapping[str, Any]) -> Capabilities:
             )
         )
     return caps
+
+
+def _leaf_speedup(observation: Mapping[str, Any]) -> float:
+    """`speedup_x` off a passed encoded-GEMM observation's leaf bench; -1.0 for everything
+    else, including a document written before the bench existed."""
+    if observation.get("delivery_route") != "encoded_gemm":
+        return -1.0
+    bench = observation["evidence"].get("micro_bench") or {}
+    return float(bench.get("speedup_x", -1.0))
+
+
+def leaf_speedups(result: Mapping[str, Any]) -> dict[str, float]:
+    """`<implementation>@<output dtype>` -> the WORST `speedup_x` a passed leaf observation
+    banked for it, across every spec digest it was measured under. What the boot record
+    prints, so a leaf this card measured losing to its float GEMM is read where the route
+    census is read."""
+    worst: dict[str, float] = {}
+    for observation in result.get("observations", ()):
+        if not observation["evidence"]["passed"]:
+            continue
+        speedup = _leaf_speedup(observation)
+        if speedup < 0.0:
+            continue
+        name = f"{observation['implementation']}@{observation['output_dtype']}"
+        worst[name] = min(worst.get(name, speedup), speedup)
+    return dict(sorted(worst.items()))
 
 
 #: Bumped when a stored document's MEANING changes in a way no other term of the key
@@ -1079,6 +1106,7 @@ class Qualification:
             "source": "measured" if self.measured else "reused",
             "suite_ms": int(self.result.get("suite_ms", 0)),
             "observations": len(self.result.get("observations", ())),
+            "leaf_speedup_x": leaf_speedups(self.result),
             "note": self.note,
         }
 

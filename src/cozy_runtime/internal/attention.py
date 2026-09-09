@@ -884,6 +884,45 @@ def line(
     return f"{chosen} ({how}) — {where}"
 
 
+def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
+    """A GROUP prepare's one attention fact, from its models' own `Applied.document()`s.
+
+    `documents` is model parameter -> that model's fact. Components are namespaced by the
+    parameter exactly as `resident` and `parked` are, sites are summed per kernel, the
+    offered set is unioned in rank order, and the PIN is the one every model of the set took
+    (cr-125): a group is one construction on one execution path, and a merged record that
+    dropped it rendered a pinned prepare as `auto over [...]`. None when no model holds a
+    site.
+    """
+    hosts: dict[str, dict[str, int]] = {}
+    kernels: dict[str, int] = {}
+    offered: list[str] = []
+    locations: dict[str, str] = {}
+    pins: set[str] = set()
+    for parameter, row in documents.items():
+        for component, chosen in (row.get("hosts") or {}).items():
+            hosts[f"{parameter}/{component}"] = dict(chosen)
+        for name, sites in (row.get("kernels") or {}).items():
+            kernels[name] = kernels.get(name, 0) + int(sites)
+        locations.update(row.get("locations") or {})
+        for name in row.get("offered") or ():
+            if name not in offered:
+                offered.append(name)
+        if row.get("pin"):
+            pins.add(str(row["pin"]))
+    if not kernels:
+        return None
+    pin = "+".join(sorted(pins))
+    return {
+        "kernels": kernels,
+        "hosts": hosts,
+        "offered": offered,
+        "locations": locations,
+        "pin": pin,
+        "line": line(kernels, hosts, offered, pin),
+    }
+
+
 def install(ready: list[Ready], roots: Mapping[str, Any], pin: str = "") -> Applied:
     """Pin the fastest admitted kernel on every attention site of the constructed components.
 

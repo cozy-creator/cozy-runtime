@@ -218,6 +218,8 @@ class TensorResolution:
     reason: str
     """One sentence. #549.5's ragged-K case reads: the leaf refused this shape, here is the
     rule, and the decode floor serves it — IN the plan, not in a log nobody keeps."""
+    leaf_speedup_x: float = -1.0
+    """`CapabilityRecord.leaf_speedup_x` of the implementation this row resolved to."""
 
     def identity(self) -> dict[str, Any]:
         """What the plan DIGEST takes from this row. Measurements are excluded on purpose:
@@ -244,6 +246,7 @@ class TensorResolution:
             "stored_bytes": self.stored_bytes,
             "resident_bits_per_element": self.resident_bits_per_element,
             "kernel_numeric_error": self.kernel_numeric_error,
+            "leaf_speedup_x": self.leaf_speedup_x,
             "reason": self.reason,
         }
 
@@ -360,6 +363,7 @@ class ResolvedModelPlan:
             "plan_digest": self.digest(),
             "routes": self.route_census(),
             "kernels": self.kernels(),
+            "leaf_speedup_x": self.derived_leaf_speedup_x(),
             "objective": self.objective,
             "calibrated": self.measurements is not None,
             "confession": self.confession,
@@ -391,6 +395,14 @@ class ResolvedModelPlan:
             bits = row.resident_bits_per_element
             total += (bits if bits >= 0.0 else 0.0) * row.numel
         return int(total / 8.0)
+
+    def derived_leaf_speedup_x(self) -> float:
+        """The WORST leaf speedup among this plan's encoded-GEMM tensors, against the float
+        GEMM each replaces at the probe shape. -1.0 when the plan replaces no leaf or nothing
+        measured them. Below 1.0 the plan's leaves LOSE to decoding, and every record that
+        serves the plan says so — the number is evidence, not a rank (`score`)."""
+        seen = [row.leaf_speedup_x for row in self.tensors if row.leaf_speedup_x >= 0.0]
+        return min(seen) if seen else -1.0
 
     def derived_kernel_numeric_error(self) -> float:
         """The WORST per-tensor route deviation. -1.0 when nothing measured any of them.
@@ -491,6 +503,7 @@ class ResolvedModelPlan:
             "stored_bytes": self.stored_bytes(),
             "derived_resident_bytes": self.derived_resident_bytes(),
             "derived_kernel_numeric_error": self.derived_kernel_numeric_error(),
+            "derived_leaf_speedup_x": self.derived_leaf_speedup_x(),
             "calibrated": self.measurements is not None and self.measurements.samples > 0,
             "measured": self.measurements.document() if self.measurements else None,
             "confession": self.confession,
@@ -717,6 +730,8 @@ def resolve(
                 "routes": plan.route_census(),
                 "samples": plan.measurements.samples if plan.measurements else 0,
             }
+            if plan.replaces_leaves():
+                row["leaf_speedup_x"] = plan.derived_leaf_speedup_x()
             if value < 0.0:
                 row["verdict"] = "unscored"
                 row["why"] = provenance
@@ -775,6 +790,7 @@ def resolve(
                     f"through its ENCODED-GEMM plan ({preferred.label()}) rather than "
                     "decoding it back to the float it was derived from. This prepare banks "
                     "the facts a later resolution can rank"
+                    + _leaf_speed_confession(preferred.derived_leaf_speedup_x())
                 ),
                 walk=tuple(walk),
             )
@@ -906,6 +922,7 @@ def _build(
                 resident_bits_per_element=selection.record.resident_bits_per_element,
                 kernel_numeric_error=selection.record.kernel_numeric_error,
                 reason=_reason(selection, found, policy),
+                leaf_speedup_x=selection.record.leaf_speedup_x,
             )
         )
     return ResolvedModelPlan(
@@ -957,6 +974,27 @@ def _reason(selection: Selection, found: Any, policy: str) -> str:
             "policy did not take it"
         )
     return "; ".join(p for p in parts if p)
+
+
+def _leaf_speed_confession(speedup: float) -> str:
+    """The leaf-speed evidence, spelled into the uncalibrated confession.
+
+    NOT a rank and NOT a demotion, on purpose. The number is one GEMM shape with the
+    activation quantizer inside it (#515f: shape-dependent), the alternative decodes the
+    weights to float and doubles their residency on a card resolution cannot see the budget
+    of (`ModelFitRefused` has no fallback plan), and the package's consent names the encoded
+    lane as the reference's own bytes (cr-086). What the number IS for is being read: a leaf
+    this card measured losing to its float GEMM says so on the line that reports the route.
+    """
+    if speedup < 0.0:
+        return ""
+    verdict = (
+        " — SLOWER than decoding at the probe shape: this plan is served for the bytes it "
+        "keeps resident, not for speed"
+        if speedup < 1.0
+        else ""
+    )
+    return f". The qualification measured these leaves at {speedup:.2f}x their float GEMM" + verdict
 
 
 def _with_facts(plan: ResolvedModelPlan, facts: PlanFacts) -> ResolvedModelPlan:
