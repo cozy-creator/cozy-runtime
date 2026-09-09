@@ -88,11 +88,11 @@ def _host(
     )
 
 
-def _source(store: tensorfs.Store, component: str) -> ModelArtifact:
+def _source(store: tensorfs.Store, component: str, dtype: str = "bf16") -> ModelArtifact:
     plain = dict(tensorfs.seed_digests())["plain/1"]
     keys = ("z.weight", "a.weight", "bias")
     tensors = {
-        key: WeightsTensor("bf16", (8, 64), plain, {"value": WeightsPart("bf16", (8, 64))})
+        key: WeightsTensor(dtype, (8, 64), plain, {"value": WeightsPart(dtype, (8, 64))})
         for key in keys
     }
     host = _host(store, "source")
@@ -108,7 +108,7 @@ def _source(store: tensorfs.Store, component: str) -> ModelArtifact:
     )
     values = np.random.default_rng(22).normal(0, 0.05, (8, 64)).astype(np.float32)
     for index, key in enumerate(keys):
-        writer.add_part(component, key, "value", st.from_f32(values + index, "BF16"))
+        writer.add_part(component, key, "value", st.from_f32(values + index, dtype.upper()))
     return writer.commit().artifact
 
 
@@ -286,3 +286,86 @@ def test_half_written_group_recomputes_and_inherits_unchanged_parts(
     original = tensorfs.parse_header(original_bytes)
     result = tensorfs.parse_header(result_bytes)
     assert result["components"]["unet"]["bias"] == original["components"]["unet"]["bias"]
+
+
+@pytest.mark.parametrize("source_dtype", ["f16", "bf16", "f32"])
+@pytest.mark.parametrize("encoding", ["fp8-rowwise/1", "mxfp8/1"])
+def test_quantized_encoding_keeps_the_source_precision_contract(
+    tmp_path: Path, source_dtype: str, encoding: str
+) -> None:
+    store = tensorfs.Store.init(tmp_path / "store")
+    source = _source(store, "unet", source_dtype)
+    result, outcome, _ = _run(
+        tmp_path / "quantize", _host(store, "quantize", source), source, "unet", encoding
+    )
+    assert outcome.terminal == "succeeded", outcome
+    assert result is not None
+    raw_header = store.manifest(result.manifest.digest)["header"]
+    assert raw_header is not None
+    header = tensorfs.parse_header(raw_header)
+    expected = "bf16" if source_dtype == "f32" else source_dtype
+    assert {row["logical"]["logical_dtype"] for row in header["components"]["unet"].values()} == {
+        expected
+    }
+
+
+def test_fp16_quantized_native_header_enters_fp16_fill(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    from cozy_runtime.author._loader import TensorSpec
+    from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend
+
+    store = tensorfs.Store.init(tmp_path / "store")
+    source = _source(store, "unet", "f16")
+    result, outcome, _ = _run(
+        tmp_path / "quantize", _host(store, "quantize", source), source, "unet", "fp8-rowwise/1"
+    )
+    assert outcome.terminal == "succeeded" and result is not None
+    checkpoint = Checkpoint(tmp_path / "store", result.manifest.digest)
+    rows = checkpoint.rows("unet")
+    backend = StreamingFillBackend.for_script(
+        checkpoint,
+        rows,
+        release="fp16-contract-proof",
+        store="fixture",
+        snapshot=result.manifest.digest,
+        device="cpu",
+        encoded_leaves="refuse",
+        window_bytes=1 << 20,
+        slots=2,
+        readers=1,
+        inflight=1,
+    )
+    try:
+        backend.expect({"unet": [row.key for row in rows]})
+        destinations = {row.key: torch.empty(row.shape, dtype=torch.float16) for row in rows}
+        for row in rows:
+            backend.fill(
+                row.key, TensorSpec(row.shape, "float16", nbytes=row.nbytes), destinations[row.key]
+            )
+        assert set(backend.enqueued) == set(destinations)
+        # The CUDA staging ring is not part of this CPU preflight. Read through a
+        # real native lease and run the selected decoder into those exact admitted
+        # FP16 buffers; no fabricated header, provider or destination stands in.
+        from cozy_runtime.internal.encoding import TORCH_DTYPES
+
+        with store.acquire_cozytensors(result.manifest.digest) as lease:
+            header = checkpoint.header_bytes
+            for row in rows:
+                parts = {}
+                for part in row.encoded.parts:
+                    raw = bytearray(part.nbytes)
+                    lease.read_part_into(header, row.component, row.name, part.role, 0, raw)
+                    parts[part.role] = torch.frombuffer(
+                        raw, dtype=getattr(torch, TORCH_DTYPES[part.dtype])
+                    ).reshape(part.shape)
+                provider = backend.selected[row.key].provider
+                if provider.route == "verbatim":
+                    destinations[row.key].copy_(parts["value"])
+                else:
+                    provider.decode(torch, parts, destinations[row.key])
+        assert all(
+            value.dtype == torch.float16 and bool(torch.isfinite(value).all())
+            for value in destinations.values()
+        )
+    finally:
+        backend.close()

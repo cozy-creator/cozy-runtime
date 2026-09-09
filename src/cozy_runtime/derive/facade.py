@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import msgspec
@@ -208,11 +209,17 @@ def _quantize(
         selected = {(tensor.component, tensor.key) for tensor in artifact.tensors}
         targets = bf16_targets(bf16, source="source", excluded=selected)
         for component in artifact.components:
+            # Encoded F16/BF16 tensors keep their loader contract. Only F32 is
+            # normalized to BF16, just like the unselected tensors below.
+            additions = quantization_additions(plan.encoding, artifact, component)
             combined = {
                 **targets[component].add,
-                **quantization_additions(
-                    plan.encoding, artifact, component, target_logical_dtype="bf16"
-                ),
+                **{
+                    key: replace(tensor, logical_dtype="bf16")
+                    if tensor.logical_dtype == "f32"
+                    else tensor
+                    for key, tensor in additions.items()
+                },
             }
             targets[component] = WeightsTarget(
                 source="source",
