@@ -332,6 +332,22 @@ class _CompositeResidency:
             "attempt_evictions": sum(
                 int(row.get("attempt_evictions", 0)) for row in documents.values()
             ),
+            # THE DURATIONS TRAVEL WITH THEIR COUNTS (cr-134). The fold carried the counts
+            # and dropped the milliseconds, so a multi-model placement's staged rung
+            # confessed "N stage(s) costing 0 ms". Attempt-scoped and cumulative both, so
+            # a reader can never take one for the other.
+            "attempt_staged_ms": round(
+                sum(float(row.get("attempt_staged_ms", 0.0)) for row in documents.values()), 2
+            ),
+            "attempt_evicted_ms": round(
+                sum(float(row.get("attempt_evicted_ms", 0.0)) for row in documents.values()), 2
+            ),
+            "staged_ms": round(
+                sum(float(row.get("staged_ms", 0.0)) for row in documents.values()), 2
+            ),
+            "evicted_ms": round(
+                sum(float(row.get("evicted_ms", 0.0)) for row in documents.values()), 2
+            ),
             "attempt_activation_peak_bytes": max(
                 (int(row.get("attempt_activation_peak_bytes", 0)) for row in documents.values()),
                 default=0,
@@ -1722,22 +1738,10 @@ class Executor:
         pinned_rows = [facts.get("pinned") or {} for _, facts in facts_rows]
         # WHAT EACH MODEL PINNED, MERGED (cr-124). A group prepare has one boot note, so a
         # per-model `attention` fact would simply be dropped and the placement would report
-        # no kernel at all — the one fact the boot line exists to carry. Components are
-        # namespaced by their model's parameter, exactly as `resident` and `parked` are.
-        attention_hosts: dict[str, dict[str, int]] = {}
-        attention_kernels: dict[str, int] = {}
-        attention_offered: list[str] = []
-        attention_locations: dict[str, str] = {}
-        for parameter, facts in facts_rows:
-            row = facts.get("attention") or {}
-            for component, chosen in (row.get("hosts") or {}).items():
-                attention_hosts[f"{parameter}/{component}"] = dict(chosen)
-            for name, sites in (row.get("kernels") or {}).items():
-                attention_kernels[name] = attention_kernels.get(name, 0) + int(sites)
-            attention_locations.update(row.get("locations") or {})
-            for name in row.get("offered") or ():
-                if name not in attention_offered:
-                    attention_offered.append(name)
+        # no kernel at all — the one fact the boot line exists to carry.
+        attention_fact = attention.merge(
+            {parameter: facts.get("attention") or {} for parameter, facts in facts_rows}
+        )
         routes: dict[str, int] = {}
         kernels: dict[str, int] = {}
         for _, _, reply in children:
@@ -1799,16 +1803,7 @@ class Executor:
                 "registered_bytes": sum(int(row.get("registered_bytes", 0)) for row in pinned_rows),
                 "in_flight_bytes": sum(int(row.get("in_flight_bytes", 0)) for row in pinned_rows),
             },
-            "attention": {
-                "kernels": attention_kernels,
-                "hosts": attention_hosts,
-                "offered": attention_offered,
-                "locations": attention_locations,
-                "pin": "",
-                "line": attention.line(attention_kernels, attention_hosts, attention_offered, ""),
-            }
-            if attention_kernels
-            else None,
+            "attention": attention_fact,
             "gpu_name": str(last.get("gpu_name", "")),
             "torch_version": str(last.get("torch_version", "")),
             "cuda_version": str(last.get("cuda_version", "")),

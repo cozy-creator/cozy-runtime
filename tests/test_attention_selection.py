@@ -34,7 +34,7 @@ from cozy_runtime.author._observations import (
 from cozy_runtime.cli import host
 from cozy_runtime.cli import run as cli_run
 from cozy_runtime.cli.io import CliError
-from cozy_runtime.internal import attention, child_env, package_interface
+from cozy_runtime.internal import attention, attention_fp8, child_env, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.encoding import DeviceFacts
@@ -92,19 +92,60 @@ def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
     assert attention.PROBE == (1, 256, 4, 128)
 
 
-def test_fp8_attention_is_measured_and_deliberately_not_ranked() -> None:
+def test_fp8_attention_is_measured_pinnable_and_deliberately_not_ranked() -> None:
     """h3a-013 timed both 8-bit arms on an H100 and NEITHER is ranked. The reason is recorded
     in the module, because a table that only records speed would have promoted them: flash-attn3
     fp8 is 1.31x rank 1 from the .so we already ship. It is not ranked because it is INEXACT
     (~16x bf16's floor) and no gate we own can separate 'degrades quality' from 'changes the
-    sample' — and because at 2.68 c/s it misses the 2.5 target anyway."""
-    assert "flash-attn3-fp8" not in attention.BY_NAME
+    sample' — and because at 2.68 c/s it misses the 2.5 target anyway. cr-136 makes it
+    NAMEABLE: a pin is the instrument that produces the quality evidence a promotion needs."""
     assert [c.name for c in attention.CANDIDATES] == ["flash-attn3", "sdpa"]
+    fp8 = attention.BY_NAME["flash-attn3-fp8"]
+    assert fp8 in attention.PINNABLE and fp8 not in attention.CANDIDATES
+    # The SAME baked snapshot as rank 1, reached through OUR backend rather than diffusers':
+    # 0.40.0's `_flash_3_hub` hard-codes `q_descale=k_descale=v_descale=None`, so the fp8 path
+    # is not an `AttentionBackendName` diffusers ships and the row names the one we register.
+    assert fp8.baked == attention.BY_NAME["flash-attn3"].baked == "flash-attn3"
+    assert fp8.backend == attention_fp8.BACKEND == "_flash_3_hub_fp8"
+    assert fp8.backend not in {c.backend for c in attention.PINNABLE if c is not fp8}
+    # e4m3 is instantiated for head dim 128 only in the baked build; bf16 serves 256.
+    assert (fp8.max_head_dim, attention.BY_NAME["flash-attn3"].max_head_dim) == (128, 256)
+    # Inexact, and the budget says by how much: h3a-013 measured 3.9e-2, the budget is 1e-1,
+    # and a kernel that returns V unchanged measures 16 — the budget is between them.
+    assert 2e-2 < fp8.rel_l2_max < 1
     doc = attention.__doc__ or ""
     assert "1.31x" in doc and "2.68 c/s" in doc and "PINNABLE" in doc
-    # And the reason it is not merely deferred: diffusers 0.40.0 has no fp8 FA3 backend, so it
-    # is not an `AttentionBackendName` this table could name at all.
     assert "q_descale=k_descale=v_descale=None" in doc
+    assert attention_fp8.E4M3_TARGET < attention_fp8.E4M3_MAX
+
+
+def test_the_fp8_quantiser_maps_each_head_onto_e4m3_and_hands_back_its_descale() -> None:
+    """cr-136. The eager path is the executable floor of the fused one and what a CPU probe
+    runs: per-(batch, head) descales in FA3's shape, every code finite, the largest magnitude
+    of every head landing on 440 (not 448, which a rounded product could overshoot into NaN),
+    and a dequantised tensor within e4m3's own precision of the input. An all-zero head is
+    zeros, not a division by zero."""
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("torch is not installed")
+    import torch
+
+    x = torch.randn(2, 96, 3, 32, generator=torch.Generator().manual_seed(1)) * 0.6
+    x[1, :, 2] = 0.0
+    codes, descale = attention_fp8.quantise_eager(x.to(torch.bfloat16))
+    assert codes.dtype == torch.float8_e4m3fn and codes.shape == x.shape
+    assert descale.shape == (2, 3) and descale.dtype == torch.float32
+    assert torch.isfinite(codes.float()).all()
+    top = codes.float().abs().amax(dim=(1, 3))
+    assert torch.allclose(
+        top[:, :2], torch.full_like(top[:, :2], attention_fp8.E4M3_TARGET), rtol=0.02
+    )
+    assert float(top[1, 2]) == 0.0
+    assert float(descale[1, 2]) == pytest.approx(attention_fp8.SCALE_FLOOR)
+    back = codes.float() * descale[:, None, :, None]
+    error = float((back - x.to(torch.bfloat16).float()).norm() / x.norm())
+    assert 1e-2 < error < 6e-2, error
+    # A CUDA-less box has no fused path, and asks for it exactly once.
+    assert attention_fp8.quantise(x.to(torch.bfloat16))[1].shape == (2, 3)
 
 
 def test_every_nameable_kernel_has_one_name_and_one_backend() -> None:
@@ -390,6 +431,45 @@ def test_the_group_boot_line_renders_from_merged_facts_alone() -> None:
     assert attention.line({}, {}, [], "").startswith("NONE")
 
 
+def test_a_pinned_group_prepare_renders_pinned_from_its_models_own_facts() -> None:
+    """THE RED ARM (cr-135). `_prepare_many` merges its models' `attention` facts into the
+    one boot record through `attention.merge`; the merge it replaced hardcoded an empty pin,
+    so a PINNED two-model prepare printed `auto over [...]` — indistinguishable in the record
+    from an unpinned one, which is exactly the A/B h3a-013 cannot afford."""
+    pinned = {
+        parameter: attention.Applied(
+            hosts={"dit": {"cudnn": 52}}, locations={}, offered=("cudnn",), pin="cudnn"
+        ).document()
+        for parameter in ("fl2va", "ref2va")
+    }
+    merged = attention.merge(pinned)
+    assert merged is not None
+    assert merged["pin"] == "cudnn"
+    assert merged["line"] == "cudnn x104 (PINNED cudnn) — fl2va/dit: cudnn; ref2va/dit: cudnn"
+    assert merged["hosts"] == {"fl2va/dit": {"cudnn": 52}, "ref2va/dit": {"cudnn": 52}}
+    assert merged["kernels"] == {"cudnn": 104} and merged["offered"] == ["cudnn"]
+
+    # Unpinned models merge to `auto`, the offered set unioned in rank order.
+    auto = attention.merge(
+        {
+            "fl2va": attention.Applied(
+                hosts={"dit": {"flash-attn3": 52}}, locations={}, offered=("flash-attn3", "sdpa")
+            ).document(),
+            "ref2va": attention.Applied(
+                hosts={"vae": {"sdpa": 36}}, locations={}, offered=("sdpa",)
+            ).document(),
+        }
+    )
+    assert auto is not None and auto["pin"] == ""
+    assert auto["line"].startswith("flash-attn3 x52, sdpa x36 (auto over ['flash-attn3', 'sdpa'])")
+
+    # A model with no site contributes nothing; a set with no site at all is no fact.
+    partial = attention.merge({"fl2va": pinned["fl2va"], "vae": {}})
+    assert partial is not None
+    assert partial["line"] == "cudnn x52 (PINNED cudnn) — fl2va/dit: cudnn"
+    assert attention.merge({"a": {}, "b": {}}) is None
+
+
 # ------------------------------------------------------------------------------ the CUDA arm
 
 
@@ -445,6 +525,18 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     assert out["pin_served"]["line"] == "cudnn x1 (PINNED cudnn) — dit: cudnn"
     assert out["pin_backends"] == {"dit": ["_native_cudnn"]}
 
+    # cr-135: the pin SURVIVES THE GROUP MERGE. Two real constructions pinned to cuDNN, read
+    # back off their own processors, render PINNED from the one merged record; unpinned they
+    # render auto over what this card offers.
+    assert out["group_pinned"]["pin"] == "cudnn"
+    assert out["group_pinned"]["line"] == (
+        "cudnn x2 (PINNED cudnn) — fl2va/dit: cudnn; ref2va/dit: cudnn"
+    )
+    assert out["group_auto"]["pin"] == ""
+    assert out["group_auto"]["offered"] == out["offered"]
+    assert sum(out["group_auto"]["kernels"].values()) == 2
+    assert "(auto over " in out["group_auto"]["line"]
+
     # The refusals double as discoverability: each names what would have to be true.
     assert out["unknown"]["code"] == "attention_kernel_unknown"
     assert out["too_old"]["code"] == "attention_kernel_unsupported"
@@ -489,6 +581,21 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     # And the green arm holds again once the plants are removed: a passing red arm is not a
     # registry left broken.
     assert out["selfcheck_restored"] == out["offered"]
+
+    # cr-136. The fp8 path is NAMEABLE on any box, and what it does depends on what the box
+    # ships: without the baked snapshot the pin refuses `absent` by name; with it, the pin
+    # resolves through OUR registered backend, measures inside its budget (quantisation, not
+    # the 16 of a kernel that returns V), lands on a real 128-dim site and computes, and
+    # leaves the bf16 entry's Hub slot untouched.
+    fp8 = out["fp8"]
+    if fp8["code"]:
+        assert fp8["code"] == "attention_kernel_absent" and "flash-attn3-fp8" in fp8["detail"]
+    else:
+        assert 1e-2 < fp8["rel_l2"] < out["selfcheck_budgets"]["flash-attn3-fp8"]
+        assert fp8["backend"] == "_flash_3_hub_fp8"
+        assert fp8["line"] == "flash-attn3-fp8 x1 (PINNED flash-attn3-fp8) — dit: flash-attn3-fp8"
+        assert fp8["forward"] == {"shape": [1, 64, 1024], "dtype": "torch.bfloat16"}
+        assert fp8["bf16_slot_untouched"] is True
 
 
 # ------------------------------------------------- the durable record is BOUNDED (cr-122)

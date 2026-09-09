@@ -184,6 +184,23 @@ def main() -> None:
     out["pin_served"] = attention.install(ready[:1], {"dit": dit}, "cudnn").document()
     out["pin_backends"] = _backends({"dit": dit})
 
+    # A GROUP PREPARE has one record, merged from its models' own (cr-135): two real
+    # constructions pinned to one kernel, each read back off its own processors, and the
+    # merge `_prepare_many` runs — which used to drop the pin — renders PINNED.
+    second = _site(1024, 8, torch.bfloat16)
+    out["group_pinned"] = attention.merge(
+        {
+            "fl2va": attention.install(ready[:1], {"dit": dit}, "cudnn").document(),
+            "ref2va": attention.install(ready[:1], {"dit": second}, "cudnn").document(),
+        }
+    )
+    out["group_auto"] = attention.merge(
+        {
+            "fl2va": attention.select(device, {"dit": dit}).document(),
+            "ref2va": attention.select(device, {"dit": second}).document(),
+        }
+    )
+
     out["unknown"] = _refusal(lambda: attention.pinned("no-such-kernel", device))
     out["too_old"] = _refusal(lambda: attention.pinned("flash-attn3", _device_at(80)))
     out["absent"] = _refusal(lambda: attention.pinned("sageattention", _device_at(90)))
@@ -201,8 +218,34 @@ def main() -> None:
     out["forward"] = {"shape": list(result.shape), "dtype": str(result.dtype)}
 
     _selfcheck(out, device)
+    out["fp8"] = _fp8(device, dit)
 
     print(json.dumps(out))
+
+
+def _fp8(device: DeviceFacts, dit: Attention) -> dict[str, Any]:
+    """cr-136: the fp8 path through the real registry — refused by name where the snapshot is
+    absent, otherwise resolved, self-checked, pinned on a real site and run."""
+    from diffusers.models.attention_dispatch import _HUB_KERNELS_REGISTRY, AttentionBackendName
+
+    hub = _HUB_KERNELS_REGISTRY[AttentionBackendName._FLASH_3_HUB]
+    before = hub.kernel_fn
+    try:
+        ready = attention.pinned("flash-attn3-fp8", device)
+    except attention.AttentionRefusal as exc:
+        return {"code": exc.code, "detail": str(exc)[:300]}
+    applied = attention.install(ready, {"dit": dit}, "flash-attn3-fp8")
+    hidden = torch.randn(1, 64, 1024, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        result = dit(hidden)
+    return {
+        "code": "",
+        "rel_l2": _rel_l2(ready[0], device),
+        "backend": _backends({"dit": dit})["dit"][0],
+        "line": applied.line(),
+        "forward": {"shape": list(result.shape), "dtype": str(result.dtype)},
+        "bf16_slot_untouched": hub.kernel_fn is before,
+    }
 
 
 def _device_at(sm: int) -> DeviceFacts:
