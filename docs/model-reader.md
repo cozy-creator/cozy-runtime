@@ -15,7 +15,7 @@ with reader.open(reference) as original, reader.open(candidate) as changed:
             values = np.empty(shape, dtype=np.float32)
             flat = values.reshape(-1)
             for offset in range(0, flat.size, 1 << 22):
-                original.read_values_into(component, key, offset, flat[offset:offset + (1 << 22)])
+                original.read_values_into(component, key, offset, flat[offset : offset + (1 << 22)])
 ```
 
 `tensor()` exposes logical dtype/shape, the exact encoding digest, and stored-role
