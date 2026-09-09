@@ -1163,6 +1163,9 @@ class Worker:
         #: the ones that tick on a clock (`pollers`). Not the device lanes: those are
         #: `self.lanes`, the resource the threads serve.
         self.lane_threads: dict[str, int] = {}
+        self._device_consumers: dict[DeviceLane, tuple[threading.Thread, ...]] = {}
+        self._retired_consumers: list[threading.Thread] = []
+        self._consumers_started = False
         self.bundles = triage.BundleStore(
             options.triage_root or self.root / "triage",
             self.records,
@@ -1485,6 +1488,7 @@ class Worker:
             + ")",
         )
         if self.lanes.revision != revision:
+            self._sync_lane_consumers()
             self.bump_admission(
                 f"{lane.lane_id} fused from {list(lane.ordinals)} for {placement.placement_id!r}"
             )
@@ -1497,6 +1501,7 @@ class Worker:
         revision = self.lanes.revision
         self.lanes.release(placement_id)
         if self.lanes.revision != revision:
+            self._sync_lane_consumers()
             self.bump_admission(f"a group lane split when {placement_id!r} left it")
 
     def lane_documents(self) -> list[dict[str, Any]]:
@@ -2369,7 +2374,8 @@ class Worker:
         """
 
         def guarded() -> None:
-            self.lane_threads[name] = threading.get_native_id()
+            native_id = threading.get_native_id()
+            self.lane_threads[name] = native_id
             try:
                 body(*args)
             except BaseException as exc:
@@ -2383,6 +2389,9 @@ class Worker:
                 if not self.host.persistent:
                     with contextlib.suppress(Exception):
                         self.host.stop()
+            finally:
+                if self.lane_threads.get(name) == native_id:
+                    self.lane_threads.pop(name, None)
 
         return guarded
 
@@ -3553,9 +3562,17 @@ class Worker:
         `MATERIALIZATION_STATE_STAGED` asserts that the exact package environment installed
         and imported; it is unspeakable otherwise (§8).
         """
+        if revision != self.accepted.accepted_desired_state_revision:
+            return
         if self.pending is None and self.placement is not None:
             self._reconcile_hosted(revision)
             return
+        desired_hosted = {
+            str(entry.get("placement_id", "")): self._placement_from_entry(
+                entry, self.accepted.accepted_placement_set_digest
+            )
+            for entry in self.pending_hosted
+        }
         candidate = self.pending or self.placement
         assert candidate is not None
         outgoing = self.placement if self.pending is not None else None
@@ -3600,15 +3617,26 @@ class Worker:
             self.await_drained(revision)
             if revision != self.accepted.accepted_desired_state_revision:
                 return
-            if outgoing.device_pin != candidate.device_pin:
-                current = self.supervision.current
-                if current is not None:
-                    try:
-                        self.supervision.retire_current(current, "placement device pin changed")
-                    except ExecutorGone as exc:
-                        self.latched = f"executor_reclaim_failed: {exc}"[:200]
-                        self._settle()
-                        return
+        # Obsolete hosted owners must release their devices before the primary
+        # can fuse them. Keep unchanged tenants on disjoint devices running.
+        keep = {
+            identity
+            for identity, placement in desired_hosted.items()
+            if identity in self.hosted
+            and self.hosted[identity].placement.document == placement.document
+            and self.hosted[identity].placement.device_pin == placement.device_pin
+        }
+        if not self._retire_hosted(keep, revision):
+            return
+        if outgoing is not None and outgoing.device_pin != candidate.device_pin:
+            current = self.supervision.current
+            if current is not None:
+                try:
+                    self.supervision.retire_current(current, "placement device pin changed")
+                except ExecutorGone as exc:
+                    self.latched = f"executor_reclaim_failed: {exc}"[:200]
+                    self._settle()
+                    return
         with self.control_lock:
             if revision != self.accepted.accepted_desired_state_revision:
                 return
@@ -3648,10 +3676,12 @@ class Worker:
         if self._placement_dispatchable(candidate.placement_id):
             self._reconcile_hosted(revision)
 
-    def _retire_hosted(self, keep: set[str]) -> None:
+    def _retire_hosted(self, keep: set[str], revision: int | None = None) -> bool:
         """Remove only placements absent from the complete desired set."""
 
         for placement_id in sorted(set(self.hosted) - keep):
+            if revision is not None and revision != self.accepted.accepted_desired_state_revision:
+                return False
             hosted = self.hosted[placement_id]
             self._hosted_set_serving(
                 placement_id,
@@ -3660,7 +3690,13 @@ class Worker:
             )
             for attempt in list(self.engine.history.values()):
                 while attempt.placement_id == placement_id and attempt.state in self.engine.HELD:
-                    time.sleep(0.02)
+                    if (
+                        revision is not None
+                        and revision != self.accepted.accepted_desired_state_revision
+                    ) or self.stop.wait(0.02):
+                        return False
+            if revision is not None and revision != self.accepted.accepted_desired_state_revision:
+                return False
             current = hosted.supervision.current
             if current is not None:
                 try:
@@ -3675,11 +3711,18 @@ class Worker:
                             detail=safe(str(exc)),
                         )
                     )
-                    continue
-            hosted.supervision.close()
-            del self.hosted[placement_id]
-            self._release_lane(placement_id)
-            self.bump_admission(f"placement {placement_id!r} removed")
+                    return False
+            with self.control_lock:
+                if (
+                    revision is not None
+                    and revision != self.accepted.accepted_desired_state_revision
+                ):
+                    return False
+                hosted.supervision.close()
+                del self.hosted[placement_id]
+                self._release_lane(placement_id)
+                self.bump_admission(f"placement {placement_id!r} removed")
+        return True
 
     def _reconcile_hosted(self, revision: int) -> None:
         """Converge the additional placements without disturbing the primary one."""
@@ -3701,13 +3744,16 @@ class Worker:
                 or self.hosted[placement_id].placement.device_pin != placement.device_pin
             )
         }
-        self._retire_hosted(set(desired) - changed)
+        if not self._retire_hosted(set(desired) - changed, revision):
+            return
         for placement_id, placement in desired.items():
             if revision != self.accepted.accepted_desired_state_revision:
                 return
             hosted = self.hosted.get(placement_id)
             if hosted is not None:
                 hosted.placement.placement_set_digest = self.accepted.accepted_placement_set_digest
+                if hosted.placement.serving == pb.ServingState.SERVING_STATE_DRAINING:
+                    self._prepare_hosted_executor(hosted)
                 continue
             hosted = HostedPlacement(
                 placement=placement,
@@ -3715,17 +3761,20 @@ class Worker:
             )
             self.hosted[placement_id] = hosted
             self._activate_hosted(hosted, revision)
-        self.pending_hosted = []
-        if (
-            self.placement is not None
-            and self._placement_dispatchable(self.placement.placement_id)
-            and all(
-                hosted.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
-                for hosted in self.hosted.values()
-            )
-        ):
-            self.accepted.converged_revision = revision
-        self._settle()
+        with self.control_lock:
+            if revision != self.accepted.accepted_desired_state_revision:
+                return
+            self.pending_hosted = []
+            if (
+                self.placement is not None
+                and self._placement_dispatchable(self.placement.placement_id)
+                and all(
+                    hosted.placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
+                    for hosted in self.hosted.values()
+                )
+            ):
+                self.accepted.converged_revision = revision
+            self._settle()
 
     def _activate_hosted(self, hosted: HostedPlacement, revision: int) -> None:
         """Acquire, place and activate one hosted placement in its own uv environment."""
@@ -5738,6 +5787,37 @@ class Worker:
 
     # ------------------------------------------------------------------ the device lane
 
+    def _sync_lane_consumers(self) -> None:
+        """Each current queue has exactly one consumer; replaced empty lanes stop."""
+        with self.control_lock:
+            if not self._consumers_started or self.stop.is_set():
+                return
+            current = set(self.lanes)
+            for lane in self._device_consumers.keys() - current:
+                lane.work.put(None)
+                lane.post.put(None)
+                self._retired_consumers.extend(self._device_consumers.pop(lane))
+            for lane in current - self._device_consumers.keys():
+                consumers = tuple(
+                    threading.Thread(
+                        target=self._lane(name.removeprefix("device-"), target, lane),
+                        daemon=True,
+                        name=name,
+                    )
+                    for name, target in (
+                        (f"device-{lane.lane_id}", self.device_lane),
+                        (f"post-{lane.lane_id}", self.post_lane),
+                    )
+                )
+                self._device_consumers[lane] = consumers
+                for consumer in consumers:
+                    consumer.start()
+            # Called under the control lock during assignment. Never wait here for a
+            # retiring consumer that may itself need that lock to finish its last event.
+            for consumer in self._retired_consumers:
+                consumer.join(timeout=0)
+            self._retired_consumers = [t for t in self._retired_consumers if t.is_alive()]
+
     def device_lane(self, lane: DeviceLane) -> None:
         """ONE SERIALIZED PER-DEVICE STATE MACHINE: admit, execute, reconcile, rebuild.
 
@@ -6392,17 +6472,8 @@ class Worker:
             # RecordOwner has dialled it — and admission is CLOSED until the barrier anyway.
             self._rebuild_held_manifests()
             self.set_phase(pb.WorkerPhase.WORKER_PHASE_ONLINE, "boot completed")
-            for lane in self.lanes:
-                threading.Thread(
-                    target=self._lane(lane.lane_id, self.device_lane, lane),
-                    daemon=True,
-                    name=f"device-{lane.lane_id}",
-                ).start()
-                threading.Thread(
-                    target=self._lane(f"post-{lane.lane_id}", self.post_lane, lane),
-                    daemon=True,
-                    name=f"post-{lane.lane_id}",
-                ).start()
+            self._consumers_started = True
+            self._sync_lane_consumers()
             threading.Thread(
                 target=self._lane("convergence", self.convergence_lane),
                 daemon=True,
@@ -6453,6 +6524,13 @@ class Worker:
             except ExecutorGone as exc:
                 self.exit_code = int(Exit.internal)
                 self.note("shutdown", f"executor reclaim failed: {exc}")
+        for consumer in [
+            *self._retired_consumers,
+            *(thread for pair in self._device_consumers.values() for thread in pair),
+        ]:
+            consumer.join()
+        self._retired_consumers.clear()
+        self._device_consumers.clear()
         print(
             "[worker] summary "
             + json.dumps(
