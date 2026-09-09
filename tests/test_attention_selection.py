@@ -592,6 +592,23 @@ def test_auto_preserves_h3_attention_precision_and_explicit_fp8_remains_availabl
     assert not any("_flash_3_hub_fp8" in values for values in _backends(roots).values())
 
 
+def test_per_request_swap_can_be_followed_by_auto_without_pin_leak() -> None:
+    """A pinned attempt changes live processors only for that attempt's boundary."""
+    why = _diffusers_skip()
+    if why:
+        pytest.skip(why)
+    import torch
+
+    roots = {"dit": _sites_of(1, dim_head=64, heads=1, dtype=torch.float32)}
+    device = _device(0, kind="cpu")
+    attention.install(_ready("sdpa"), roots)
+    attention.plan(device, roots, "sdpa").apply()
+    assert _backends(roots) == {"dit": ["native"]}
+    # This is the exact reset Executor.invoke performs before an unpinned request.
+    attention.select(device, roots, "")
+    assert _backends(roots) == {"dit": ["native"]}
+
+
 def test_explicit_fp8_refuses_unsupported_sites_while_auto_preserves_dtype() -> None:
     """Both eligible floating sites keep FA3; FP32 uses SDPA. An explicit
     FP8 selection still refuses a head dimension it cannot execute."""

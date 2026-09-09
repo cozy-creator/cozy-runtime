@@ -3249,7 +3249,7 @@ class AttemptProgress(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., seq: _Optional[int] = ..., content_type: _Optional[str] = ..., data: _Optional[bytes] = ..., placement_id: _Optional[str] = ...) -> None: ...
 
 class InvocationSpec(_message.Message):
-    __slots__ = ("environment_digest", "payload_digest", "inputs", "outputs", "deadline_unix_ms", "serving", "job", "capture")
+    __slots__ = ("environment_digest", "payload_digest", "inputs", "outputs", "deadline_unix_ms", "serving", "job", "capture", "attention_kernel")
     ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PAYLOAD_DIGEST_FIELD_NUMBER: _ClassVar[int]
     INPUTS_FIELD_NUMBER: _ClassVar[int]
@@ -3258,6 +3258,7 @@ class InvocationSpec(_message.Message):
     SERVING_FIELD_NUMBER: _ClassVar[int]
     JOB_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_FIELD_NUMBER: _ClassVar[int]
+    ATTENTION_KERNEL_FIELD_NUMBER: _ClassVar[int]
     environment_digest: str
     payload_digest: str
     inputs: _containers.RepeatedCompositeFieldContainer[InputBinding]
@@ -3266,7 +3267,8 @@ class InvocationSpec(_message.Message):
     serving: ServingInvocationSpec
     job: JobInvocationSpec
     capture: ActivationCapture
-    def __init__(self, environment_digest: _Optional[str] = ..., payload_digest: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[OutputBinding, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., serving: _Optional[_Union[ServingInvocationSpec, _Mapping]] = ..., job: _Optional[_Union[JobInvocationSpec, _Mapping]] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ...) -> None: ...
+    attention_kernel: str
+    def __init__(self, environment_digest: _Optional[str] = ..., payload_digest: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[OutputBinding, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., serving: _Optional[_Union[ServingInvocationSpec, _Mapping]] = ..., job: _Optional[_Union[JobInvocationSpec, _Mapping]] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., attention_kernel: _Optional[str] = ...) -> None: ...
 
 class InputBinding(_message.Message):
     __slots__ = ("input_id", "digest", "length", "kind_mime", "order")
