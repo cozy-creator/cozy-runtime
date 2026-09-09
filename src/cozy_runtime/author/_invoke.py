@@ -61,6 +61,7 @@ from cozy_runtime.author._errors import (
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
+from cozy_runtime.author._model_reader import ModelViewHost, WeightsReader
 from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
@@ -133,6 +134,7 @@ class Invocation:
     """Cost-governor facts from the typed config channel. Never read from environment."""
     weights: Callable[[WeightsCommit], WeightsHostTransaction] | None = None
     """The Runtime/host weights transaction. Author code receives only WeightsSink."""
+    weights_reader: Callable[[str], ModelViewHost] | None = None
     weights_source_config: Callable[[str, str], bytes] | None = None
     weights_source_structure: Callable[[str], WeightsSource] | None = None
     """Bounded structure reader for exact Manifest inputs already granted to this attempt."""
@@ -821,6 +823,8 @@ def _service(
             return Checkpoints(attempt, inv.checkpoints)
         case "budget":
             return Budget(attempt, inv.budget)
+        case "weights_read":
+            return WeightsReader(attempt, inv.models, inv.weights_reader, inv.cancel)
         case "weights":
             return WeightsSink(
                 attempt=attempt,

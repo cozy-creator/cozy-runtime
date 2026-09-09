@@ -45,6 +45,7 @@ from cozy_runtime.author._decode import (
     MediaDecoder,
 )
 from cozy_runtime.author._errors import AuthorError, CapabilityError, OutputError
+from cozy_runtime.author._model_reader import WeightsReader
 from cozy_runtime.author._observations import Attribution, EventRing, Observation, Scalar
 from cozy_runtime.author._weights import WeightsSink
 
@@ -1406,11 +1407,14 @@ SERVICES: Mapping[str, type] = {
     "budget": Budget,
     "media_decode": MediaDecoder,
     "weights": WeightsSink,
+    "weights_read": WeightsReader,
 }
 
 #: The one service set a JOB may request and a serving entrypoint may not (§2). A job runs
 #: to completion and owns durable working state; a request handler owns neither.
-JOB_ONLY: frozenset[str] = frozenset({"scratch", "checkpoints", "budget", "weights"})
+JOB_ONLY: frozenset[str] = frozenset(
+    {"scratch", "checkpoints", "budget", "weights", "weights_read"}
+)
 
 #: The mirror: SERVING-ONLY surface. `adjust` writes the caller-visible adjustments envelope,
 #: which is a fact about serving one request; a run-to-completion job has no caller to

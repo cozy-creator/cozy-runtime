@@ -1492,6 +1492,12 @@ class AttemptEngine:
                 "detail": "this worker has no WeightsSink host",
             }
         try:
+            if kind == "model_reader":
+                if attempt.job is None:
+                    raise ValueError("a model read requires the current job")
+                # Exact Model inputs already grant read access. The broker verifies
+                # those immutable input refs; it grants no output or write authority.
+                return self.weights.reader_broker.handle(attempt, frame)
             if kind == "weights_writer":
                 return self.weights.writer_broker.handle(attempt, frame)
             output_slot = str(frame.get("output_slot", ""))
@@ -1660,6 +1666,7 @@ class AttemptEngine:
         finally:
             if self.weights is not None:
                 self.weights.writer_broker.close_attempt(attempt)
+                self.weights.reader_broker.close_attempt(attempt)
         return self.release(attempt, reply, spool, key)
 
     @staticmethod

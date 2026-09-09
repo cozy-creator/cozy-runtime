@@ -2361,6 +2361,13 @@ class Executor:
         except CapabilityError as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:1024]}
 
+        weights_reader = None
+        if "weights_read" in surface.capabilities:
+            from cozy_runtime.internal.model_reader import ModelReaderProxy
+
+            def weights_reader(manifest: str) -> ModelReaderProxy:
+                return ModelReaderProxy.open(spool, self._durable, manifest)
+
         weights_open = None
         weights_source_structure = None
         weights_source_config = None
@@ -2521,6 +2528,7 @@ class Executor:
                 scratch=scratch,
                 checkpoints=durable_checkpoint,
                 weights=weights_open,
+                weights_reader=weights_reader,
                 weights_source_structure=weights_source_structure,
                 weights_source_config=weights_source_config,
                 budget=BudgetFacts(

@@ -122,6 +122,11 @@ def _separation(surface: Surface) -> None:
             "act on would grant a destination nothing can write (§2)",
             code="publication_declaration",
         )
+    if "weights_read" in surface.capabilities and not surface.model_bindings:
+        raise ConformanceError(
+            f"{surface.name}: WeightsReader requires exact typed model inputs",
+            code="weights_source_absent",
+        )
     weights_names = [output.name for output in surface.weights_outputs]
     if len(weights_names) > MAX_WEIGHTS_OUTPUTS:
         raise ConformanceError(

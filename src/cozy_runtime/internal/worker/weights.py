@@ -23,6 +23,7 @@ from typing import Any, BinaryIO, cast
 from urllib.parse import urlparse
 
 from cozy_runtime.internal import egress, fill
+from cozy_runtime.internal.model_reader import ModelReaderBroker
 from cozy_runtime.internal.weights_writer import WriterBroker
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents, weights_limits
@@ -144,6 +145,7 @@ class WeightsExchange:
         self._held: dict[str, _Held] = {}
         self._abandoned: set[str] = set()
         self.writer_broker = WriterBroker(self._store, checkpoint=self.record_checkpoint)
+        self.reader_broker = ModelReaderBroker(self._store)
 
     def record_checkpoint(
         self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]
