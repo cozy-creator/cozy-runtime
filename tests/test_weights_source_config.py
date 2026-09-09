@@ -144,7 +144,9 @@ def test_parent_config_read_preserves_repository_permissions(tmp_path: Path) -> 
             def exchange(kind: str, frame: dict[str, object]) -> dict[str, object]:
                 assert kind == "weights_writer"
                 channel.write(json.dumps(frame).encode() + b"\n")
-                return json.loads(channel.readline())
+                reply = json.loads(channel.readline())
+                assert isinstance(reply, dict)
+                return {str(key): value for key, value in reply.items()}
 
             proxy = StoreProxy(None, spool, exchange)
             assert proxy.config(manifest, "unet") == _CONFIG
