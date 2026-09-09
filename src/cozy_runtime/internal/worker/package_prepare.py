@@ -466,7 +466,7 @@ def check_package_set_compatibility(
             f"declared={sorted(slot_paths)}",
         )
     requests = tuple(
-        derive_child.SlotRequest(path, row["config"], row["assets"])
+        derive_child.SlotRequest(path, row["config"], row["assets"], row["tensor_dtypes"])
         for path, row in sorted(candidates.items())
     )
     if not requests:
@@ -665,7 +665,12 @@ def _compatibility_models(
                     "package_prepare_model_asset_unavailable",
                     f"{digest}: {type(exc).__name__}: {exc}",
                 ) from exc
-        by_manifest[digest] = {"header": header_raw, "config": config, "assets": assets}
+        by_manifest[digest] = {
+            "header": header_raw,
+            "config": config,
+            "assets": assets,
+            "tensor_dtypes": model_config.tensor_dtypes(header),
+        }
     for selected in selections.values():
         selected.update(by_manifest[selected["manifest"]])
     return selections
@@ -1107,7 +1112,7 @@ def _verify_local_revision(
 
 
 #: `(slot path, config bytes, verified model assets) -> constructed components`.
-Deriver = Callable[[str, bytes, Mapping[str, bytes]], tuple[str, ...]]
+Deriver = Callable[[str, bytes, Mapping[str, bytes], Mapping[str, str]], tuple[str, ...]]
 
 
 def _deriver(installed: package_environment.InstalledEnvironment, application: str) -> Deriver:
@@ -1116,12 +1121,14 @@ def _deriver(installed: package_environment.InstalledEnvironment, application: s
     this plane never reads it off the header. The child imports the derive machinery; this
     plane imports only the request/response seam (cr-067's guard, kept by construction)."""
 
-    def derive(slot: str, config_bytes: bytes, assets: Mapping[str, bytes]) -> tuple[str, ...]:
+    def derive(
+        slot: str, config_bytes: bytes, assets: Mapping[str, bytes], dtypes: Mapping[str, str]
+    ) -> tuple[str, ...]:
         if not application:
             raise PreparationRefusal("package_prepare_interface_invalid", "application")
         try:
             request = derive_child.DeriveRequest(
-                (derive_child.SlotRequest(slot, config_bytes, assets),),
+                (derive_child.SlotRequest(slot, config_bytes, assets, dtypes),),
                 application=application,
             )
             (held,) = derive_child.derive_in(installed.python, request)
@@ -1224,7 +1231,9 @@ def _entrypoints(
             model = selected[path]
             model_id = model_ids[path]
             assert derive is not None
-            constructed = derive(path, model["config_bytes"], model["assets"])
+            constructed = derive(
+                path, model["config_bytes"], model["assets"], model["tensor_dtypes"]
+            )
             slots.append(
                 pb.Slot(
                     slot=path.removeprefix(prefix),
@@ -1441,6 +1450,7 @@ def _selected_models(
                         manifest_length=length,
                         config_bytes=config_bytes,
                         assets=assets,
+                        tensor_dtypes=model_config.tensor_dtypes(header),
                     )
     except PreparationRefusal:
         raise

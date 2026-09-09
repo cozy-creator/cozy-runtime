@@ -192,6 +192,7 @@ def test_cold_fit_reads_manifest_header_and_model_assets_from_the_store(tmp_path
     candidate = _compatibility_models(selected, tensorfs_root=store_root)["generate.models.model"]
     assert candidate["config"] == _CONFIG
     assert candidate["assets"] == {"tokenizer/vocab.txt": _ASSET}
+    assert candidate["tensor_dtypes"] == {"unet.weight": "f32"}
 
     mismatch = tensorfs.fit(
         [tensorfs.TensorRequirement("unet", "weight", [2], "f32")],
@@ -301,6 +302,7 @@ def test_exact_checkpoint_prepares_and_streams_without_any_release(
         assert prepared[selection["slot"]]["manifest_length"] == length
         assert prepared[selection["slot"]]["config_bytes"] == _CONFIG
         assert prepared[selection["slot"]]["assets"] == {"tokenizer/vocab.txt": _ASSET}
+        assert prepared[selection["slot"]]["tensor_dtypes"] == {"unet.weight": "f32"}
         checkpoint = fill.Checkpoint(root, manifest)
         plan = checkpoint.read_plan([("unet", "weight")], 64, ["unet"])
         slot = bytearray(b"\xa5" * 64)

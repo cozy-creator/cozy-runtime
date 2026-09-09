@@ -24,12 +24,15 @@ class EmptyServing(Model[object]):
     def load(self, loader):
         pass
 class LinearPipeline:
-    def __init__(self):
+    def __init__(self, config):
         import torch
-        self.components = {"linear": torch.nn.Linear(2, 3)}
+        dtype = {"f32": torch.float32, "f16": torch.float16}[
+            config.tensor_dtype("linear.weight", default="f32")
+        ]
+        self.components = {"linear": torch.nn.Linear(2, 3, dtype=dtype)}
 class Serving(Model[LinearPipeline]):
     def load(self, loader):
-        self.pipe = loader.construct(LinearPipeline, factory=lambda config: LinearPipeline())
+        self.pipe = loader.construct(LinearPipeline, factory=LinearPipeline)
     @uses_components("linear")
     def sample(self) -> int:
         return 3
@@ -82,6 +85,21 @@ def test_ordinary_torch_model_derives_and_empty_serving_refuses(source_project: 
     )
     with pytest.raises(derive_child.DeriveRefusal, match="requirements shape"):
         derive_child.derive_in(Path(sys.executable), empty)
+
+
+@pytest.mark.parametrize("dtype", ["f32", "f16"])
+def test_native_dtype_reaches_real_derivation_child(source_project: Path, dtype: str) -> None:
+    request = derive_child.DeriveRequest(
+        (
+            derive_child.SlotRequest(
+                "linear.models.model", b"{}", tensor_dtypes={"linear.weight": dtype}
+            ),
+        ),
+        project=source_project,
+    )
+    (result,) = derive_child.derive_in(Path(sys.executable), request)
+    assert isinstance(result, derive_child.TensorRequirements)
+    assert {row[2] for row in result.rows} == {dtype}
 
 
 @pytest.mark.parametrize("error", ["RuntimeError", "ModuleNotFoundError"])

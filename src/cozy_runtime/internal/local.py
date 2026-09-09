@@ -1396,7 +1396,9 @@ def _resolve_development_models(
         if not header.get("components"):
             raise RuntimeError(f"development_model_components_absent: {binding.ref}")
         assets = fill.Checkpoint(store_root, manifest_digest).model_assets()
-        components = _derive_components(project, slot.path, config_bytes, assets)
+        components = _derive_components(
+            project, slot.path, config_bytes, assets, model_config.tensor_dtypes(header)
+        )
         try:
             model_weight_bytes = sum(
                 int(row["length"]) for row in store.walk_cozytensors(manifest_digest)
@@ -1426,14 +1428,18 @@ def _resolve_development_models(
 
 
 def _derive_components(
-    project: Path, slot: str, config_bytes: bytes, assets: Mapping[str, bytes]
+    project: Path,
+    slot: str,
+    config_bytes: bytes,
+    assets: Mapping[str, bytes],
+    dtypes: Mapping[str, str],
 ) -> tuple[str, ...]:
     """What the private bounded child constructs for this config in this package venv."""
     import sys
 
     try:
         request = derive_child.DeriveRequest(
-            (derive_child.SlotRequest(slot, config_bytes, assets),),
+            (derive_child.SlotRequest(slot, config_bytes, assets, dtypes),),
             project=Path(project).resolve(),
         )
         (held,) = derive_child.derive_in(Path(sys.executable), request)

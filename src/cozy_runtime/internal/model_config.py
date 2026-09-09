@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from typing import Any
 
 from cozy_runtime.internal import canonical
 
@@ -19,6 +20,19 @@ class ModelConfigRefusal(Exception):
 #: source carrier and the §1.1 ban refuses the whole lane, which is exactly the 42-second
 #: prepare death cr-121 was opened for. Inert, not fatal.
 RESERVED = frozenset({"execution"})
+
+
+def tensor_dtypes(header: Mapping[str, Any]) -> dict[str, str]:
+    """Project the already validated native header for weightless construction.
+
+    Ephemeral constructor input only: no duplicated config field, geometry calculation,
+    schema document, or dtype policy. TensorFS remains the metadata authority.
+    """
+    return {
+        f"{component}.{key}": row["logical"]["logical_dtype"]
+        for component, tensors in header["components"].items()
+        for key, row in tensors.items()
+    }
 
 
 def construction_config(configs: object) -> bytes:
