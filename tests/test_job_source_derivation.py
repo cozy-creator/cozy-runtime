@@ -89,6 +89,7 @@ def test_ordinary_torch_model_derives_and_empty_serving_refuses(source_project: 
 
 @pytest.mark.parametrize("dtype", ["f32", "f16"])
 def test_native_dtype_reaches_real_derivation_child(source_project: Path, dtype: str) -> None:
+    pytest.importorskip("torch")
     request = derive_child.DeriveRequest(
         (
             derive_child.SlotRequest(
