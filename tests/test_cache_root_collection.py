@@ -25,7 +25,7 @@ def worker(tmp_path: Path, *, owns: bool = True) -> SimpleNamespace:
         pending_hosted=[],
         local_revisions={},
         local_operations={},
-        accepted=SimpleNamespace(desired_state_body=b""),
+        accepted=SimpleNamespace(desired_state_body=b"", accepted_desired_state_revision=1),
         held_manifests=SimpleNamespace(rebuild=lambda _: None),
     )
 
@@ -137,3 +137,19 @@ def test_managed_worker_uses_native_cached_collection_and_refreshes_residency(
     result = store_gc.collect_worker(w)
     assert not result.store_busy and result.reclaimed_bytes == 0
     assert observed == [native.root]
+
+
+def test_fresh_runtime_preserves_cache_roots_before_owner_replays_desired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = worker(tmp_path)
+    w.accepted.accepted_desired_state_revision = 0
+    calls = []
+
+    def collect(root: Path, **kwargs: object) -> pb.CollectStoreGarbageResult:
+        calls.append(kwargs)
+        return pb.CollectStoreGarbageResult()
+
+    monkeypatch.setattr(store_gc, "collect", collect)
+    store_gc.collect_worker(w)
+    assert calls == [{}]

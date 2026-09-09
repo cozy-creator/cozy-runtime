@@ -51,6 +51,11 @@ def collect_worker(worker: Worker) -> pb.CollectStoreGarbageResult:
         if not worker.control_lock.acquire(blocking=False):
             return pb.CollectStoreGarbageResult(store_busy=True)
         try:
+            if worker.accepted.accepted_desired_state_revision == 0:
+                # Host preparation/activation facts outlive this Runtime incarnation.
+                # Until the owner replays desired state, those selected models are unknown
+                # here and may not be made disposable from an empty in-memory census.
+                return collect(root)
             keep: set[str] = set()
             placements = [worker.placement, worker.pending]
             placements.extend(hosted.placement for hosted in worker.hosted.values())
