@@ -88,9 +88,13 @@ def _host(
     )
 
 
-def _source(store: tensorfs.Store, component: str) -> ModelArtifact:
+def _source(
+    store: tensorfs.Store,
+    component: str,
+    *,
+    keys: tuple[str, ...] = ("z.weight", "a.weight", "bias"),
+) -> ModelArtifact:
     plain = dict(tensorfs.seed_digests())["plain/1"]
-    keys = ("z.weight", "a.weight", "bias")
     tensors = {
         key: WeightsTensor("bf16", (8, 64), plain, {"value": WeightsPart("bf16", (8, 64))})
         for key in keys
@@ -110,6 +114,54 @@ def _source(store: tensorfs.Store, component: str) -> ModelArtifact:
     for index, key in enumerate(keys):
         writer.add_part(component, key, "value", st.from_f32(values + index, "BF16"))
     return writer.commit().artifact
+
+
+@pytest.mark.parametrize("encoding,payload_bytes", [("fp8-rowwise/1", 544), ("mxfp8/1", 528)])
+def test_two_durable_quantization_groups_skip_source_reads_and_payload_writes(
+    tmp_path: Path, encoding: str, payload_bytes: int
+) -> None:
+    store = tensorfs.Store.init(tmp_path / "store")
+    source = _source(store, "unet", keys=("z.weight", "a.weight", "b.weight", "bias"))
+    cancelled = [False]
+    checkpoints: list[WeightsCheckpoint] = []
+
+    def stop_after_two(value: WeightsCheckpoint) -> None:
+        checkpoints.append(value)
+        cancelled[0] = len(checkpoints) == 2
+
+    partial, outcome, _ = _run(
+        tmp_path / "partial",
+        _host(store, "two-groups", source, checkpoint=stop_after_two),
+        source,
+        "unet",
+        encoding,
+        cancelled=cancelled,
+    )
+    assert partial is None and outcome.terminal == "canceled" and len(checkpoints) == 2
+    resumed, outcome, record = _run(
+        tmp_path / "resumed",
+        _host(store, "two-groups", source, epoch=2),
+        source,
+        "unet",
+        encoding,
+    )
+    assert outcome.terminal == "succeeded" and resumed is not None
+    measured = next(
+        row["fields"] for row in record.ring.rows() if row.get("name") == "quantization measurement"
+    )
+    assert isinstance(measured, dict)
+    assert measured["reused_keys"] == 2
+    assert measured["source_bytes_read_this_run"] == 1024
+    assert measured["new_bytes_written_this_run"] == payload_bytes
+    clean, outcome, _ = _run(
+        tmp_path / "clean",
+        _host(store, "clean-three-groups", source),
+        source,
+        "unet",
+        encoding,
+    )
+    assert outcome.terminal == "succeeded" and clean is not None
+    assert clean.manifest == resumed.manifest
 
 
 def _run(
