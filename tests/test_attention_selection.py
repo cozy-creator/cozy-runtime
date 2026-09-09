@@ -81,7 +81,11 @@ def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
     for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
         assert candidate.rel_l2_max > 0, candidate.name
         assert candidate.rel_l2_max < 1, candidate.name
-    exact = {"flash-attn3", "sdpa", "cudnn"}
+    # flash-attn4 is EXACT: bf16/fp16 in, no quantisation anywhere in it. Its
+    # `torch2cute_dtype_map` is float16/bfloat16/float32 and its interface has no fp8 or fp4
+    # path at all (h3a-024), so it is held to the same floor as flash-attn3 and is not the
+    # 4-bit story h3a-022's Blackwell case rests on.
+    exact = {"flash-attn3", "flash-attn4", "sdpa", "cudnn"}
     for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
         budget = candidate.rel_l2_max
         assert (budget <= 2e-2) is (candidate.name in exact), (candidate.name, budget)
@@ -166,12 +170,22 @@ def test_every_candidate_states_the_architectures_it_serves_and_where_that_came_
     a binary's arch list is the thing that drifted. Everything else declares one, and a 0 is a
     CLAIM about a dispatcher that owns its own fallback, not a field nobody filled in."""
     for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
-        assert not (candidate.baked and candidate.max_sm), candidate.name
+        # A COMPILED artifact is bounded by its own metadata and may not restate it. A `jit`
+        # snapshot is source and has no metadata to be bounded by, so it MUST declare the
+        # ceiling instead — the one case where `baked` and `max_sm` belong together.
+        assert candidate.jit or not (candidate.baked and candidate.max_sm), candidate.name
+        assert not candidate.jit or candidate.max_sm, candidate.name
         assert not candidate.max_sm or candidate.max_sm >= candidate.min_sm, candidate.name
     # The two shapes, named. `flash-attn3` is the artifact-bounded one; `sageattention` is
     # bounded here because its architecture is IN ITS BACKEND NAME and so cannot drift; the
     # two torch backends are unbounded because torch, not this image, builds them.
     assert attention.BY_NAME["flash-attn3"].baked and not attention.BY_NAME["flash-attn3"].max_sm
+    # h3a-024. The third shape: a snapshot that is SOURCE. It declares a ceiling where
+    # `flash-attn3` may not, because there is no arch list to drift from — FA4 ships device
+    # code for no card and compiles for the one it finds.
+    fa4 = attention.BY_NAME["flash-attn4"]
+    assert fa4.jit and fa4.baked and (fa4.min_sm, fa4.max_sm) == (90, 110)
+    assert not attention.BY_NAME["flash-attn3"].jit
     assert attention.BY_NAME["sageattention"].max_sm == 90
     assert attention.BY_NAME["sageattention"].backend.endswith("sm90")
     assert attention.BY_NAME["cudnn"].max_sm == 0 and attention.BY_NAME["sdpa"].max_sm == 0
