@@ -5,7 +5,9 @@ import json
 import os
 import socket
 import threading
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,14 +15,14 @@ from cozy_runtime.internal import storage_admission as storage
 
 
 @pytest.fixture
-def channel(monkeypatch):
+def channel(monkeypatch: pytest.MonkeyPatch) -> Iterator[socket.socket]:
     host, worker = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     monkeypatch.setattr(storage, "_channel", worker)
     with host, worker:
         yield host
 
 
-def operation(channel):
+def operation(channel: socket.socket) -> tuple[list[dict[str, Any]], socket.socket]:
     body, ancillary, flags, _ = channel.recvmsg(4096, socket.CMSG_SPACE(9 * 4))
     assert flags == 0
     descriptors = array.array("i")
@@ -30,10 +32,10 @@ def operation(channel):
     return json.loads(body), socket.socket(fileno=descriptors[0])
 
 
-def test_refusal_happens_before_any_file_write(channel, tmp_path):
+def test_refusal_happens_before_any_file_write(channel: socket.socket, tmp_path: Path) -> None:
     target = tmp_path / "not-created"
 
-    def host():
+    def host() -> None:
         rows, conn = operation(channel)
         assert rows == [{"path": str(tmp_path), "bytes": 100, "inodes": 1}]
         with conn:
@@ -52,10 +54,12 @@ def test_refusal_happens_before_any_file_write(channel, tmp_path):
     assert not target.exists()
 
 
-def test_exception_releases_only_after_work_finishes(channel, tmp_path):
+def test_exception_releases_only_after_work_finishes(
+    channel: socket.socket, tmp_path: Path
+) -> None:
     acquired, released = threading.Event(), threading.Event()
 
-    def host():
+    def host() -> None:
         _, conn = operation(channel)
         with conn:
             conn.sendall(b'{"ok":true}\n')
@@ -76,8 +80,10 @@ def test_exception_releases_only_after_work_finishes(channel, tmp_path):
     thread.join(2)
 
 
-def test_nested_admission_refuses_without_waiting_on_its_own_host_lock(channel, tmp_path):
-    def host():
+def test_nested_admission_refuses_without_waiting_on_its_own_host_lock(
+    channel: socket.socket, tmp_path: Path
+) -> None:
+    def host() -> None:
         _, conn = operation(channel)
         with conn:
             conn.sendall(b'{"ok":true}\n')
@@ -103,7 +109,7 @@ def test_nested_admission_refuses_without_waiting_on_its_own_host_lock(channel, 
         storage.Write(Path("/tmp"), 1, -1),
     ],
 )
-def test_invalid_bounds_do_not_send_a_request(channel, write):
+def test_invalid_bounds_do_not_send_a_request(channel: socket.socket, write: storage.Write) -> None:
     with pytest.raises(storage.StorageRefusal), storage.admit(write):
         pytest.fail("invalid write ran")
     channel.settimeout(0.01)
@@ -111,7 +117,9 @@ def test_invalid_bounds_do_not_send_a_request(channel, write):
         channel.recv(1)
 
 
-def test_missing_controller_is_not_a_local_storage_policy(monkeypatch, tmp_path):
+def test_missing_controller_is_not_a_local_storage_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr(storage, "_channel", None)
     with storage.admit(storage.Write(tmp_path, 1, 1)):
         (tmp_path / "local").write_bytes(b"x")

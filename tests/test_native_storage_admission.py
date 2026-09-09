@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import io
-from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 
 import pytest
 import tensorfs
@@ -15,14 +16,14 @@ from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from test_workspace_byte_outputs import producing
 
 
-def test_native_import_refusal_preserves_input_and_can_resume(tmp_path, monkeypatch):
+def test_native_import_refusal_preserves_input_and_can_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     workspace, spec, manifest, path = producing(tmp_path)
     original = path.read_bytes()
 
-    @contextmanager
-    def refuse(*writes):
+    def refuse(*writes: storage.Write) -> NoReturn:
         raise storage.StorageRefusal("no native import capacity")
-        yield
 
     with monkeypatch.context() as scoped:
         scoped.setattr(storage, "admit", refuse)
@@ -52,7 +53,9 @@ def test_native_import_refusal_preserves_input_and_can_resume(tmp_path, monkeypa
     )
 
 
-def test_parent_writer_checks_admission_before_creating_native_writer(tmp_path, monkeypatch):
+def test_parent_writer_checks_admission_before_creating_native_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     spool = tmp_path / "spool"
     spool.mkdir()
@@ -88,7 +91,7 @@ def test_parent_writer_checks_admission_before_creating_native_writer(tmp_path, 
     broker.authorize(attempt, transaction, 1, hashlib.sha256(declaration).digest(), "model")
     proxy = StoreProxy(store, spool, lambda _kind, frame: broker.handle(attempt, frame))
 
-    def refuse(*writes):
+    def refuse(*writes: storage.Write) -> NoReturn:
         raise storage.StorageRefusal("native capacity exhausted")
 
     with monkeypatch.context() as scoped:

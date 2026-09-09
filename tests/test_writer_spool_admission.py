@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import socket
 import threading
+from collections.abc import Callable, Mapping
+from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 
 import pytest
 import tensorfs
@@ -15,8 +18,8 @@ from test_storage_admission import operation
 
 @pytest.mark.parametrize("finish", ["part", "cancel", "spool_error"])
 def test_spool_admission_survives_rpc_thread_changes_and_releases_on_finish(
-    tmp_path, monkeypatch, finish
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, finish: str
+) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     spool = tmp_path / "spool"
     spool.mkdir()
@@ -55,7 +58,7 @@ def test_spool_admission_survives_rpc_thread_changes_and_releases_on_finish(
     released = threading.Event()
     seen, failures = [], []
 
-    def controller():
+    def controller() -> None:
         try:
             rows, conn = operation(host)
             seen.extend(rows)
@@ -66,8 +69,8 @@ def test_spool_admission_survives_rpc_thread_changes_and_releases_on_finish(
         except BaseException as exc:
             failures.append(exc)
 
-    def on_thread(call):
-        def execute():
+    def on_thread(call: Callable[[], None]) -> None:
+        def execute() -> None:
             try:
                 call()
             except BaseException as exc:
@@ -95,14 +98,14 @@ def test_spool_admission_survives_rpc_thread_changes_and_releases_on_finish(
         if finish == "spool_error":
 
             class BrokenSource:
-                def read(self, _size):
+                def read(self, _size: int) -> NoReturn:
                     raise RuntimeError("input source stopped")
 
             with pytest.raises(RuntimeError, match="input source stopped"):
                 writer.add_part("model", "w", "value", BrokenSource())
         else:
 
-            def bound():
+            def bound() -> None:
                 assert broker.handle(
                     attempt, {**fields, "operation": "bound", "target_operation": "part"}
                 ) == {"ok": True, "length": 4}
@@ -136,5 +139,5 @@ def test_spool_admission_survives_rpc_thread_changes_and_releases_on_finish(
         broker.close_attempt(attempt)
 
 
-def assert_part(result):
+def assert_part(result: Mapping[str, object]) -> None:
     assert result == {"ok": True}

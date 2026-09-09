@@ -334,7 +334,7 @@ class WriterBroker:
             pending = self.pending.get(key)
             borrowed = pending[1] if pending is not None else None
             if operation in {"part", "config"} and (
-                borrowed is None or pending[0] != self._payload(frame)
+                pending is None or borrowed is None or pending[0] != self._payload(frame)
             ):
                 return self._refused(
                     CapabilityError(

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Lock, RLock
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import tensorfs
@@ -14,7 +15,7 @@ from cozy_runtime.internal.worker import store_gc
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
-def worker(tmp_path: Path, *, owns: bool = True) -> SimpleNamespace:
+def worker(tmp_path: Path, *, owns: bool = True) -> Any:
     return SimpleNamespace(
         options=SimpleNamespace(tensorfs_root=tmp_path, owns_tensorfs_store=owns),
         control_lock=RLock(),
