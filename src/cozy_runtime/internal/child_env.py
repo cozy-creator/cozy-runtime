@@ -58,6 +58,10 @@ ERASED_PREFIXES: tuple[str, ...] = (
     "COMFY_",
     "OMP_",
     "MKL_",
+    # h3a-024: FlashAttention-4 compiles on the pod, and both halves of where it keeps the
+    # objects are erased then imposed, so no image or operator export can redirect a
+    # compiler cache out of the worker-boot scope that owns and deletes it.
+    "FLASH_ATTENTION_",
 )
 
 #: The fill plane's capture directory, named here because the allowlist row and the config
@@ -70,7 +74,20 @@ JIT_CACHE_ENV: tuple[tuple[str, str], ...] = (
     ("TORCH_EXTENSIONS_DIR", "extensions"),
     ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
     ("TRITON_CACHE_DIR", "triton"),
+    # FlashAttention-4 is CuTe-DSL source and compiles for the card it finds (h3a-024). Its
+    # OWN cache, deliberately, and not CUTLASS's `CUTE_DSL_CACHE_DIR`: FA4 keys on
+    # `sha256(pickle(compile_key))` under a fingerprint of its own sources and carries no
+    # absolute path, while the CuTe-DSL file cache hashes every `envar` attribute including
+    # `Path.cwd()` and the cache directory itself — so two processes that merely started in
+    # different directories cannot share its entries.
+    ("FLASH_ATTENTION_CUTE_DSL_CACHE_DIR", "flash-attn4"),
 )
+
+#: The other half of the row above. Upstream gates the persistent cache on a second variable
+#: read at import, so the pair is ONE fact — where FA4 keeps compiled objects — in upstream's
+#: spelling, not a behaviour flag of ours: nothing in this runtime reads it, and with it unset
+#: the only difference is that a re-prepared model compiles again.
+FLASH_ATTENTION_CACHE_ENABLED_ENV = "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"
 
 # IMPOSE pass: the complete reviewed allowlist. Adding a row is a reviewed change; the
 # runtime refuses to project anything not listed here. Class-B impose vocabulary
@@ -120,6 +137,13 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
             "warm-cache ownership inside the pod's admitted trust domain, not same-UID isolation",
         )
         for name, _directory in JIT_CACHE_ENV
+    ),
+    ProjectedVar(
+        FLASH_ATTENTION_CACHE_ENABLED_ENV,
+        "worker.pod_jit_cache_scope",
+        "turns on the persistent half of FlashAttention-4's compile cache, which upstream "
+        "reads at import and gates on a variable separate from the directory. Imposed with "
+        "the directory or not at all: alone it would name a cache with nowhere to live",
     ),
     ProjectedVar(
         "COZY_HOME",

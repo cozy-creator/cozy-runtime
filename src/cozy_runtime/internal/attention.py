@@ -80,6 +80,28 @@ was actually loaded; a candidate with no such artifact — torch's own backends,
 distribution whose diffusers backend names its architecture in its own name — carries a static
 `max_sm` with the reason it is not a guess. A baked artifact that declares no archs is a
 REFUSAL, not a pass: a check that reads nothing must not look like a check that read.
+
+AND A SNAPSHOT IS NOT ALWAYS A BINARY (h3a-024). FlashAttention-4 arrives through the same
+`kernels` Hub mechanism as flash-attn3 and is not the same kind of thing: it is 46 Python
+files of CuTe-DSL, ships device code for no card at all, and compiles for the one it finds at
+first use. So its `metadata.json` declares no `backend.archs` because it HAS none, and the
+refusal in the paragraph above would be reading silence as a claim in the one case where the
+silence is honest. Such an entry is marked `jit`, the arch check is not applied to it — there
+is no binary to bound — and its ceiling is the static `max_sm` claim, which it is admissible
+for the same reason torch's own backends' is: outside sm90-sm110 FA4 raises an ordinary
+Python `ValueError` that auto-selection's `except` already handles, rather than exiting from
+C++.
+
+NOTHING COMPILES ON THE REQUEST PATH, and that is a property of WHEN a kernel first runs, not
+of an artifact. The author's `warm` (cr-110) runs a dry forward after the fill and before the
+generation is Ready, so a `jit` kernel pays its compile there — measured at 2.5-5.9 s per key
+(h3a-024, sm_90a and sm_100a), against staging at 5.5-17 s and a weight pull in minutes.
+There is no image bake, no manifest and no cache-invalidation surface, because a bake would
+buy back ~20 s once per pod. WHAT THE WARM FORWARD ACTUALLY COVERS IS THE THING TO CHECK: the
+compile key is (dtype, head dims, GQA ratio, causal, mask/score-mod hash, arch, block sizes),
+sequence length is NOT in it, and h3a-024 measured the key identical from S=256 to S=109,000
+— but on sm_100 `q_stage` flips at S>128, so a warm forward SHORTER than that compiles a
+different key than the request it was meant to pay for.
 """
 
 from __future__ import annotations
@@ -106,6 +128,12 @@ else:
 #: `<distribution>/build/<variant>/` holds one built variant and its metadata. Nothing here is
 #: fetched — a pod's executor has no network for it.
 IMAGE_KERNELS_DIR = Path("/opt/cozy/kernels")
+
+#: A `jit` kernel's compiled objects are NOT this module's to place. They go where every
+#: other upstream compiler cache goes — the worker-boot JIT scope (`internal/jit_cache.py`,
+#: named in `child_env.JIT_CACHE_ENV`), which is content-keyed, imposed on the executor at
+#: spawn and deleted when the worker shuts down. So a model re-prepared after eviction loads
+#: instead of recompiling, and nothing here reads an environment variable to arrange it.
 
 
 class AttentionRefusal(RuntimeError):
@@ -149,6 +177,19 @@ class Candidate:
     baked: str = ""
     #: An installed distribution this kernel needs, by project name; empty when torch's own.
     distribution: str = ""
+    #: The snapshot carries SOURCE, not device code: it compiles for the card it finds, at
+    #: first use. `_admit_arch` is not applied to such an entry — not because the check is
+    #: inconvenient but because THERE IS NO BINARY TO BOUND, and a check with nothing to read
+    #: must not run at all rather than read nothing and pass. The ceiling is the static
+    #: `max_sm` claim instead, which a `jit` entry must therefore declare.
+    #:
+    #: This is the narrow difference between the two kernels that both arrive as `kernels`
+    #: Hub snapshots. flash-attn3's snapshot is compiled `.so`s whose `metadata.json` states
+    #: the architectures they carry, and calling one on a card outside that list kills the
+    #: process from C++. FA4's snapshot is 46 Python files, states no architectures because it
+    #: has none to state, and refuses a card it cannot serve with an ordinary Python
+    #: `ValueError` that auto-selection's own `except` already handles.
+    jit: bool = False
     #: The relative-L2 disagreement with exact fp32 attention this kernel is ALLOWED at
     #: `PROBE`, at which point it stops being attention. Every entry declares one, because the
     #: budget is the statement of what the kernel is: an exact kernel may not drift past bf16's
@@ -213,6 +254,38 @@ CANDIDATES: tuple[Candidate, ...] = (
 #: a measurement. Name one with the execution-path override (cr-125) to measure it; a
 #: measurement that beats the table promotes it into `CANDIDATES` in a runtime release.
 PINNABLE: tuple[Candidate, ...] = (
+    Candidate(
+        name="flash-attn4",
+        backend="flash_4_hub",
+        min_sm=90,
+        dtypes=frozenset({"bfloat16", "float16"}),
+        max_head_dim=256,
+        # sm90 THROUGH sm110, and BOTH ends are the kernel's own statement rather than a
+        # second copy of a binary's arch list — the drift `flash-attn3` may not risk. FA4
+        # ships no device code for any card, so there is no list to copy: `interface.py`
+        # reads `torch.cuda.get_device_capability()` and raises `Unsupported compute
+        # capability: {arch}. Supported: 9.x, 10.x, 11.x` outside that range. A recoverable
+        # Python exception, which is why this row carries a static ceiling and why `jit`
+        # turns `_admit_arch` off rather than leaving it to read an empty arch list.
+        max_sm=110,
+        baked="flash-attn4",
+        jit=True,
+        rel_l2_max=2e-2,
+        why=(
+            "NOT RANKED BECAUSE IT IS NOT YET MEASURED, and on this table that is the whole "
+            "reason. v1's B200 screen (h3a-022) is the only run that has touched it: on "
+            "sm_100 torch `native` and `_native_cudnn` both FAIL (`cuDNN Frontend error: No "
+            "valid execution plans built`), flash-attn3 ABORTS as the sm_90a build it is, "
+            "and FA4 was the only arm that ran at all — 1161.8 TF/s. So this entry exists to "
+            "make the 4xH100-vs-4xB200 comparison POSSIBLE, not to assert it: pin it, "
+            "measure it, and a measurement that beats the table promotes it in a runtime "
+            "release. On sm_120 the question is only 'is it faster', because torch's own "
+            "dispatch already serves there at 365 TF/s. IT IS NOT THE fp4 STORY: FA4's "
+            "`torch2cute_dtype_map` is float16/bfloat16/float32 and its interface has no fp8 "
+            "or fp4 path at all, so it unblocks Blackwell from 'nothing runs' and says "
+            "nothing about the 40-56% h3a-022 rests on SageAttention3's fp4 for"
+        ),
+    ),
     Candidate(
         name="cudnn",
         backend="_native_cudnn",
@@ -379,6 +452,13 @@ def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: Devic
     check that passed. The one quiet case is no baked snapshot at all, which is `_load_baked`'s
     `attention_kernel_absent` to report and not this function's business.
     """
+    if candidate.jit:
+        # NOTHING TO READ, so nothing is checked here and the static `max_sm` on the row is
+        # the whole ceiling. A source snapshot declares no architectures because it carries
+        # no device code, and treating that silence as the same refusal an empty
+        # `metadata.json` earns from a COMPILED variant would refuse the kernel on every
+        # card it serves.
+        return
     if device.kind != "cuda" or not archs:
         return
     if any(_covers(arch, device.sm) for declared in archs.values() for arch in declared):
