@@ -4566,7 +4566,6 @@ class Worker:
             executor is not None
             and executor.alive()
             and not executor.poisoned
-            and tenant.supervision.devices == tenant.lane.entries
             and executor.construction_key == construction_key
             and parameters <= executor.parameters
             and executor.prepared_model is not None
@@ -4629,7 +4628,6 @@ class Worker:
             elif (
                 executor.alive()
                 and not executor.poisoned
-                and tenant.supervision.devices == lane.entries
                 and not executor.reserved_for_job
                 and not executor.ready_bindings
                 and executor.prepared_model is None
