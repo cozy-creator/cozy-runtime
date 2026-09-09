@@ -2215,6 +2215,13 @@ class AttemptEngine:
                 )
             for output_id in sorted(produced):
                 row = produced[output_id]
+                received = (
+                    self.calls.received_output(attempt, row)
+                    if native
+                    and self.calls is not None
+                    and str(row["asset_ref"]).startswith("sha256:")
+                    else None
+                )
                 if row.get("kind") == "tree":
                     if not native:
                         raise grants.GrantRefusal(
@@ -2224,7 +2231,9 @@ class AttemptEngine:
                     from .workspace import Workspace
                     from .workspace_byte_outputs import TREE_MIME
 
-                    root = self._blob_path(spool, str(row["asset_ref"]))
+                    root = (
+                        received[0] if received else self._blob_path(spool, str(row["asset_ref"]))
+                    )
                     if root is None or self.tensorfs_root is None:
                         raise grants.GrantRefusal(
                             "output_spool_io", "tree output has no owned spool"
@@ -2233,8 +2242,21 @@ class AttemptEngine:
                     media_type = grants._output_media_type(
                         output_id, destination.mime_type, TREE_MIME
                     )
-                    entries.append(
-                        byte_outputs.commit(
+                    if received:
+                        entry = byte_outputs.reexport(
+                            Workspace(self.tensorfs_root),
+                            self.owner_scope(),
+                            attempt.request_id,
+                            attempt.attempt,
+                            attempt.digest,
+                            output_id,
+                            received[1],
+                            tree=True,
+                            max_bytes=destination.max_bytes or (256 << 20),
+                            media_type=media_type,
+                        )
+                    else:
+                        entry = byte_outputs.commit(
                             Workspace(self.tensorfs_root),
                             self.owner_scope(),
                             attempt.request_id,
@@ -2246,9 +2268,9 @@ class AttemptEngine:
                             max_bytes=destination.max_bytes or (256 << 20),
                             media_type=media_type,
                         )
-                    )
+                    entries.append(entry)
                     continue
-                blob = self._blob(spool, str(row["asset_ref"]))
+                blob = received[0] if received else self._blob(spool, str(row["asset_ref"]))
                 if blob is None:
                     return None, (f"output {output_id} has no bytes in the attempt spool")
                 entries.append(
@@ -2268,18 +2290,32 @@ class AttemptEngine:
                     from .workspace import Workspace
 
                     assert self.tensorfs_root is not None
-                    committed = byte_outputs.commit(
-                        Workspace(self.tensorfs_root),
-                        self.owner_scope(),
-                        attempt.request_id,
-                        attempt.attempt,
-                        attempt.digest,
-                        output_id,
-                        blob,
-                        tree=False,
-                        max_bytes=attempt.grant.outputs[output_id].max_bytes or (256 << 20),
-                        media_type=entries[-1].mime_type,
-                    )
+                    if received:
+                        committed = byte_outputs.reexport(
+                            Workspace(self.tensorfs_root),
+                            self.owner_scope(),
+                            attempt.request_id,
+                            attempt.attempt,
+                            attempt.digest,
+                            output_id,
+                            received[1],
+                            tree=False,
+                            max_bytes=attempt.grant.outputs[output_id].max_bytes or (256 << 20),
+                            media_type=entries[-1].mime_type,
+                        )
+                    else:
+                        committed = byte_outputs.commit(
+                            Workspace(self.tensorfs_root),
+                            self.owner_scope(),
+                            attempt.request_id,
+                            attempt.attempt,
+                            attempt.digest,
+                            output_id,
+                            blob,
+                            tree=False,
+                            max_bytes=attempt.grant.outputs[output_id].max_bytes or (256 << 20),
+                            media_type=entries[-1].mime_type,
+                        )
                     if (
                         committed.digest != entries[-1].digest
                         or committed.length != entries[-1].length
@@ -2333,6 +2369,13 @@ class AttemptEngine:
                         "capture_output", "capture semantic digest differs from retained bytes"
                     )
                 entries.append(entry)
+            if sum(
+                entry.native_tree.content_bytes if entry.HasField("native_tree") else entry.length
+                for entry in entries
+            ) > min(int(reply.get("max_output_bytes") or MAX_OUTPUT_BYTES), MAX_OUTPUT_BYTES):
+                raise grants.GrantRefusal(
+                    "output_too_large", "returned bytes exceed the output budget"
+                )
         except grants.GrantRefusal as exc:
             grants.abort_outputs(spool)
             return None, f"{exc.code}: {exc.detail}"

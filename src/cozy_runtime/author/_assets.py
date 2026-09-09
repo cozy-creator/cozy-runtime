@@ -53,6 +53,7 @@ class Asset:
         "_attempt",
         "_fidelity",
         "_file_state",
+        "_grant_token",
         "_image_preparation",
         "_input_id",
         "_label",
@@ -92,6 +93,7 @@ class Asset:
         self._read_guard: Callable[[], None] | None = None
         self._max_decoded_bytes = 0
         self._file_state: FileState | None = None
+        self._grant_token: object | None = None
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.ref!r}, media_type={self.media_type!r})"
@@ -389,7 +391,7 @@ class Tree:
     it was not granted — the capability is the grant, and there is no ambient store handle.
     """
 
-    __slots__ = ("_attempt", "_read_guard", "_root", "digest", "ref", "size_bytes")
+    __slots__ = ("_attempt", "_grant_token", "_read_guard", "_root", "digest", "ref", "size_bytes")
 
     kind: ClassVar[str] = "tree"
 
@@ -402,6 +404,7 @@ class Tree:
         self._attempt = attempt
         self.size_bytes = 0
         self._read_guard: Callable[[], None] | None = None
+        self._grant_token: object | None = None
 
     def __repr__(self) -> str:
         return f"Tree({self.ref!r}, hydrated={self.hydrated})"

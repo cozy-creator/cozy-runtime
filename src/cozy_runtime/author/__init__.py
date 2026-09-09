@@ -161,8 +161,10 @@ from cozy_runtime.author._weights import (
     WeightsTransaction,
 )
 from cozy_runtime.author.publication import (
+    AssessmentRef,
     CheckpointRef,
     ReleaseReceipt,
+    attach_assessment,
     publish_release,
     upload_checkpoint,
 )
@@ -179,6 +181,7 @@ __all__ = [
     "Adjustments",
     "App",
     "Artifact",
+    "AssessmentRef",
     "Asset",
     "AssetBound",
     "AssetInfo",
@@ -292,6 +295,7 @@ __all__ = [
     "WeightsTensor",
     "WeightsTransaction",
     "assert_declaration_shape",
+    "attach_assessment",
     "attempt",
     "canonical_json",
     "classify",

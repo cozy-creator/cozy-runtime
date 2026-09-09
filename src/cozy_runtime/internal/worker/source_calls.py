@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib
+import logging
 import os
 import subprocess
 import sys
@@ -20,11 +21,14 @@ from typing import Any
 import msgspec
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
 from cozy_runtime.internal import fill, source_interfaces
-from cozy_runtime.internal.worker import workspace_sources
+from cozy_runtime.internal.worker import source_views, workspace_sources
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+
+_LOG = logging.getLogger(__name__)
 
 
 def _selection(value: dict[str, Any]) -> pb.NativeSourceSelection:
@@ -113,10 +117,12 @@ class SourceCalls:
         *,
         endpoints: dict[str, str] | None = None,
         native_registry: bytes | None = None,
+        spool_root: Path | None = None,
     ):
         self.workspace, self.owner, self.send, self.current = workspace, owner, send, current
         self.endpoints = endpoints or {}
         self.native_registry = native_registry
+        self.spool_root = spool_root
         self.lock = threading.Lock()
         self.processes: dict[str, subprocess.Popen[bytes] | None] = {}
         self.tasks: dict[str, threading.Event] = {}
@@ -136,6 +142,12 @@ class SourceCalls:
                 if process is not None:
                     process.kill()
             return
+        if (
+            command.operation
+            in (pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES, pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE)
+            and command.phase != pb.NATIVE_SOURCE_PHASE_EXECUTE
+        ):
+            raise WorkspaceRefusal("source view has no foreign resolution phase")
         row = workspace_sources.accepted(self.workspace, owner, command)
         if row["state"] not in ("stopped", "failed", "releasing", "released"):
             with self.lock:
@@ -145,9 +157,9 @@ class SourceCalls:
         if row["state"] == "stopped":
             self._status(command, pb.NATIVE_SOURCE_STATE_CANCELED)
             return
-        if (
-            command.phase == pb.NATIVE_SOURCE_PHASE_EXECUTE
-            and command.operation != pb.NATIVE_SOURCE_OPERATION_CONVERT
+        if command.phase == pb.NATIVE_SOURCE_PHASE_EXECUTE and command.operation in (
+            pb.NATIVE_SOURCE_OPERATION_HUGGINGFACE,
+            pb.NATIVE_SOURCE_OPERATION_CIVITAI,
         ):
             workspace_sources.record_pin(self.workspace, owner, command, command.selection)
         copied = pb.NativeSourceCommand()
@@ -280,6 +292,9 @@ class SourceCalls:
         selection: pb.NativeSourceSelection | None = None,
         code: str = "",
         memo_hit: bool = False,
+        byte_output: pb.NativeByteTreeRef | None = None,
+        byte_output_attempt: int = 0,
+        byte_output_spec: bytes = b"",
     ) -> None:
         command = self._latest(command)
         if not self.current(command):
@@ -298,9 +313,13 @@ class SourceCalls:
             computation_digest=computation,
             safe_code=code,
             memo_hit=memo_hit,
+            byte_output_attempt_ordinal=byte_output_attempt,
+            byte_output_invocation_spec_digest=byte_output_spec,
         )
         if selection is not None:
             status.selection.CopyFrom(selection)
+        if byte_output is not None:
+            status.byte_output.CopyFrom(byte_output)
         self.send(pb.WorkerFrame(native_source_status=status))
 
     def _run(
@@ -310,18 +329,53 @@ class SourceCalls:
         row: dict[str, Any],
         done: threading.Event,
     ) -> None:
-        from cozy_runtime.internal.worker import workspace_memo
+        from cozy_runtime.internal.worker import (
+            commit_files,
+            workspace_byte_outputs,
+            workspace_memo,
+        )
 
-        released = False
+        def finish() -> None:
+            # A retry can arrive immediately after the terminal frame. Detach this
+            # exact completed task first, and never erase a new task's registration.
+            with self.lock:
+                if self.tasks.get(command.service_id) is done:
+                    self.processes.pop(command.service_id, None)
+                    self.parents.pop(command.service_id, None)
+                    self.commands.pop(command.service_id, None)
+                    self.process_owners.pop(command.service_id, None)
+                    self.tasks.pop(command.service_id, None)
+            done.set()
+
+        def terminal(
+            current: pb.NativeSourceCommand, state: pb.NativeSourceState, **fields: Any
+        ) -> None:
+            finish()
+            self._status(current, state, **fields)
+
+        view = command.operation == pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES
+        file = command.operation == pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE
+        native_bytes = view or file
         try:
             if row["state"] == "complete":
-                workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
-                self._status(
+                view_fact = (
+                    workspace_byte_outputs.replay_native(self.workspace, owner, command)
+                    if file
+                    else source_views.replay(self.workspace, owner, command)
+                    if view
+                    else None
+                )
+                if not native_bytes:
+                    workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
+                terminal(
                     command,
                     pb.NATIVE_SOURCE_STATE_SUCCEEDED,
                     result=row["result"],
                     receipt=row["native_receipt"],
                     computation=row["computation_digest"],
+                    byte_output=view_fact[0] if view_fact else None,
+                    byte_output_attempt=view_fact[1] if view_fact else 0,
+                    byte_output_spec=view_fact[2] if view_fact else b"",
                 )
                 return
             store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
@@ -348,7 +402,16 @@ class SourceCalls:
             }
             computation = b""
             if phase == "execute":
-                if command.operation == pb.NATIVE_SOURCE_OPERATION_CONVERT:
+                if file:
+                    effective = {
+                        key: arguments[key] for key in ("digest", "size_bytes", "media_type")
+                    }
+                elif view:
+                    effective = {
+                        "source": arguments["source"]["manifest"],
+                        "max_bytes": SOURCE_FILES_MAX_BYTES,
+                    }
+                elif command.operation == pb.NATIVE_SOURCE_OPERATION_CONVERT:
                     artifact = arguments["source"]
                     with self.workspace.locked() as db:
                         access = db.execute(
@@ -389,12 +452,16 @@ class SourceCalls:
                         }
                     )
                 ).digest()
-                hit = workspace_memo.lookup_native(
-                    self.workspace, owner, command.service_id, computation
+                hit = (
+                    None
+                    if native_bytes
+                    else workspace_memo.lookup_native(
+                        self.workspace, owner, command.service_id, computation
+                    )
                 )
                 if hit is not None:
                     workspace_memo.record_reuse(self.workspace, owner, command.service_id)
-                    self._status(
+                    terminal(
                         command,
                         pb.NATIVE_SOURCE_STATE_SUCCEEDED,
                         result=hit["result"],
@@ -403,7 +470,17 @@ class SourceCalls:
                         memo_hit=True,
                     )
                     return
-                if command.operation == pb.NATIVE_SOURCE_OPERATION_CONVERT:
+                if file:
+                    envelope.update(
+                        commit_files.prepare(
+                            self.workspace, owner, command, computation, self.spool_root
+                        )
+                    )
+                elif view:
+                    envelope.update(
+                        source_views.prepare(self.workspace, owner, command, computation)
+                    )
+                elif command.operation == pb.NATIVE_SOURCE_OPERATION_CONVERT:
                     prior = workspace_sources.conversion_predecessor(
                         self.workspace, owner, command.service_id
                     )
@@ -433,12 +510,14 @@ class SourceCalls:
                 canceled = command.service_id in self.canceled
             if canceled:
                 with self.workspace.locked() as db:
+                    # A parent interruption is retryable. Explicit logical source
+                    # cancellation already wrote stopped and must remain permanent.
                     db.execute(
-                        "UPDATE native_calls SET state='stopped' WHERE owner=? "
+                        "UPDATE native_calls SET state='failed' WHERE owner=? "
                         "AND service_id=? AND state IN ('accepted','resolved','executing')",
                         (owner, command.service_id),
                     )
-                self._status(command, pb.NATIVE_SOURCE_STATE_CANCELED)
+                terminal(command, pb.NATIVE_SOURCE_STATE_CANCELED)
                 return
             if process.returncode or len(output) > 2 << 20:
                 raise WorkspaceRefusal("native source execution ended without bounded result")
@@ -454,29 +533,46 @@ class SourceCalls:
             if phase == "resolve":
                 resolved = _selection(answer["selection"])
                 workspace_sources.record_pin(self.workspace, owner, command, resolved)
-                with self.lock:
-                    self.processes.pop(command.service_id, None)
-                    self.parents.pop(command.service_id, None)
-                    self.commands.pop(command.service_id, None)
-                    self.process_owners.pop(command.service_id, None)
-                    self.tasks.pop(command.service_id, None)
-                done.set()
-                released = True
-                self._status(command, pb.NATIVE_SOURCE_STATE_RESOLVED, selection=resolved)
+                terminal(command, pb.NATIVE_SOURCE_STATE_RESOLVED, selection=resolved)
                 return
             result = canonical_json.encode(answer["result"])
             receipt = base64.b64decode(answer["native_receipt"], validate=True)
-            workspace_sources.record_complete(
-                self.workspace, owner, command, result, computation, receipt
-            )
-            workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
-            workspace_memo.record_native(self.workspace, owner, command.service_id)
-            self._status(
+            view_fact = None
+            if file:
+                view_fact = workspace_byte_outputs.complete_native(
+                    self.workspace,
+                    owner,
+                    command,
+                    result,
+                    computation,
+                    receipt,
+                    str(envelope["view_owner"]),
+                )
+            elif view:
+                view_fact = source_views.complete(
+                    self.workspace,
+                    owner,
+                    command,
+                    result,
+                    computation,
+                    receipt,
+                    str(envelope["view_owner"]),
+                )
+            else:
+                workspace_sources.record_complete(
+                    self.workspace, owner, command, result, computation, receipt
+                )
+                workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
+                workspace_memo.record_native(self.workspace, owner, command.service_id)
+            terminal(
                 command,
                 pb.NATIVE_SOURCE_STATE_SUCCEEDED,
                 result=result,
                 receipt=receipt,
                 computation=computation,
+                byte_output=view_fact[0] if view_fact else None,
+                byte_output_attempt=view_fact[1] if view_fact else 0,
+                byte_output_spec=view_fact[2] if view_fact else b"",
             )
         except Exception as exc:
             # Only a known native refusal code crosses; arbitrary exception text stays private.
@@ -488,13 +584,12 @@ class SourceCalls:
                     "AND state IN ('accepted','resolved','executing')",
                     (code, owner, command.service_id),
                 )
-            self._status(command, pb.NATIVE_SOURCE_STATE_FAILED, code=code)
+            terminal(command, pb.NATIVE_SOURCE_STATE_FAILED, code=code)
         finally:
-            if not released:
-                with self.lock:
-                    self.processes.pop(command.service_id, None)
-                    self.parents.pop(command.service_id, None)
-                    self.commands.pop(command.service_id, None)
-                    self.process_owners.pop(command.service_id, None)
-                    self.tasks.pop(command.service_id, None)
-            done.set()
+            if view:
+                try:
+                    source_views.abort_unfinished(self.workspace, owner, command)
+                except Exception:
+                    # Durable release intent is retried by the ordinary parent ACK path.
+                    _LOG.warning("Native source view cleanup deferred to parent release")
+            finish()

@@ -258,12 +258,24 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
             inv.calls.closed = True
         _current.reset(token)
 
-    _validate_result(surface, result, attempt)
+    _validate_result(
+        surface, result, attempt, grant_token=inv.calls.grant_token if inv.calls else None
+    )
     attempt.closed = True
+    returned_handles: list[Asset | Tree] = [*assets_in(result), *trees_in(result)]
     return InvocationResult(
         result=result,
-        outputs=tuple(a.row() for a in attempt.pending.values())
-        + tuple(tree.row() for tree in attempt.pending_trees.values()),
+        outputs=tuple(
+            asset.row()
+            for ref, asset in attempt.pending.items()
+            if ref not in attempt.committed_files
+        )
+        + tuple(tree.row() for tree in attempt.pending_trees.values())
+        + tuple(
+            asset.row()
+            for asset in returned_handles
+            if inv.calls is not None and asset._grant_token is inv.calls.grant_token
+        ),
         adjustments=tuple(attempt.rows),
         features=prepared.features,
         overlay_digest=overlay.digest,
@@ -889,7 +901,9 @@ def assets_in(value: object, _seen: set[int] | None = None) -> list[Asset]:
     return found
 
 
-def _validate_result(surface: Surface, result: object, attempt: Attempt) -> None:
+def _validate_result(
+    surface: Surface, result: object, attempt: Attempt, *, grant_token: object | None = None
+) -> None:
     """§3.4 step 1: the actual return value validates against the EXACT annotated result
     schema, and every pending handle reachable from it belongs to THIS attempt."""
     if type(result) is not surface.result_type:
@@ -917,9 +931,16 @@ def _validate_result(surface: Surface, result: object, attempt: Attempt) -> None
 
     returned: list[str] = []
     output_handles: list[Asset | Tree] = [*assets_in(result), *trees_in(result)]
-    pending_handles = set(attempt.pending) | set(attempt.pending_trees)
+    pending_handles = (set(attempt.pending) - set(attempt.committed_files)) | set(
+        attempt.pending_trees
+    )
+    if sum(asset.size_bytes for asset in output_handles) > attempt.max_output_bytes:
+        raise OutputError("returned assets exceed the output byte budget", code="output_too_large")
     for asset in output_handles:
-        if asset._attempt != attempt.request_id or asset.ref not in pending_handles:
+        received = grant_token is not None and asset._grant_token is grant_token and asset.hydrated
+        if asset._attempt != attempt.request_id or (
+            asset.ref not in pending_handles and not received
+        ):
             raise OutputError(
                 f"output handle {asset.ref!r} does not belong to attempt "
                 f"{attempt.request_id!r}: a foreign or escaped handle is a typed failure, "

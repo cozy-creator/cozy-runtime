@@ -73,8 +73,7 @@ def _parent(db: Journal, owner: str, call: pb.ChildCallRequest) -> None:
 def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) -> dict[str, Any]:
     call = command.parent_call
     if (
-        call.call_index >= 32
-        or call.interface_digest != documents.raw(source_interfaces.DIGEST)
+        call.interface_digest != documents.raw(source_interfaces.DIGEST)
         or call.module != source_interfaces.MODULE
         or len(call.request_canonical_bytes) > 48 << 10
     ):
@@ -83,6 +82,8 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
         "download_huggingface": pb.NATIVE_SOURCE_OPERATION_HUGGINGFACE,
         "download_civitai": pb.NATIVE_SOURCE_OPERATION_CIVITAI,
         "convert_cozytensors": pb.NATIVE_SOURCE_OPERATION_CONVERT,
+        "source_files": pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES,
+        "commit_file": pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE,
     }.get(call.export)
     if expected_operation is None or command.operation != expected_operation:
         raise WorkspaceRefusal("native source operation differs from its fixed interface")
@@ -132,10 +133,7 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
         else:
             if row["state"] in ("releasing", "released"):
                 raise WorkspaceRefusal("native source call was permanently released")
-            if (
-                row["state"] in ("stopped", "failed")
-                and call.parent_attempt_ordinal > row["parent_ordinal"]
-            ):
+            if row["state"] == "failed" and call.parent_attempt_ordinal > row["parent_ordinal"]:
                 db.execute(
                     "UPDATE native_calls SET state=?,native_error='' "
                     "WHERE owner=? AND service_id=?",
@@ -412,10 +410,19 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
         if row["state"] != "releasing":
             raise WorkspaceRefusal("native cleanup has no permanent release intent")
         row = dict(row)
-    workspace_memo.release_native_result(workspace, owner, service_id)
-    workspace_memo.release_native_lookup(workspace, owner, service_id)
+    if row["operation"] not in ("source_files", "commit_file"):
+        workspace_memo.release_native_result(workspace, owner, service_id)
+        workspace_memo.release_native_lookup(workspace, owner, service_id)
     store = fill.tensorfs_module().Store.open(str(workspace.store_root))
-    if row["native_owner"] == native_owner(owner, service_id):
+    if row["operation"] == "commit_file":
+        from . import workspace_byte_outputs
+
+        workspace_byte_outputs.release_native(workspace, owner, service_id)
+    elif row["operation"] == "source_files":
+        from . import source_views
+
+        source_views.release_service(workspace, owner, row)
+    elif row["native_owner"] == native_owner(owner, service_id):
         if row["operation"] == "convert_cozytensors":
             state = store.derived_lookup(row["native_owner"])
             if state.get("state") == "committed":

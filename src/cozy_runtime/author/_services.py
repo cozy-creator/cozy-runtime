@@ -137,6 +137,7 @@ class Attempt:
     """Whether the package handler itself was entered. Pre-entry refusals never poison a
     healthy executor; one structural bit is safer than duplicating refusal-code lists."""
     pending: dict[str, Asset] = field(default_factory=dict)
+    committed_files: dict[str, FileAsset] = field(default_factory=dict)
     pending_trees: dict[str, Tree] = field(default_factory=dict)
     rows: list[AdjustmentRow] = field(default_factory=list)
     ring: EventRing = field(default_factory=EventRing)
@@ -318,8 +319,11 @@ def settle_frame(attempt: Attempt, handle: str) -> Asset:
 
 
 class Outputs(_Bound):
-    """Transactional outputs (`out`). Every save REGISTERS a pending handle and validates
-    its declared bounds; nothing is durable until the handler returns it (§3.4 step 1)."""
+    """Transactional outputs (``out``). Save registers a bounded pending handle.
+
+    Returning a saved value completes it with the invocation. ``await commit(file)``
+    completes an owned file earlier so the running caller can forward it.
+    """
 
     __slots__ = ()
 
@@ -636,6 +640,12 @@ class Outputs(_Bound):
 
     def save_bytes(self, data: bytes, *, media_type: str) -> FileAsset:
         return self._register(data, FileAsset, media_type)
+
+    async def commit(self, pending: FileAsset) -> FileAsset:
+        """Complete an owned pending file now, for reading or forwarding to another call."""
+        from cozy_runtime.author._output_commit import commit
+
+        return await commit(self._attempt, pending)
 
     def save_tree(self, path: Path | str) -> Tree:
         """Snapshot regular files now; native retention commits after the handler returns."""

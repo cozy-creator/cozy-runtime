@@ -391,10 +391,18 @@ def test_worker_poll_verifies_caches_and_releases_its_owned_checkout(tmp_path: P
     assert worker.materialized[("parent", 1)][1] > 0
     assert Path(first["byte_grants"][0]["local"]).read_bytes() == data
     assert not sent
+    returned = canonical_json.decode(reply.result_canonical_bytes)["report"]
+    forwarded = worker.received_output(parent, returned)
+    assert forwarded is not None and forwarded[0].read_bytes() == data
+    changed = dict(returned, size_bytes=len(data) + 1)
+    with pytest.raises(ValueError, match="exact received"):
+        worker.received_output(parent, changed)
     worker.close("parent", 1)
     assert not Path(first["byte_grants"][0]["local"]).exists()
     assert not worker.pending
     assert not worker.materialized
+    with pytest.raises(ValueError, match="exact received"):
+        worker.received_output(parent, returned)
 
 
 class ImageResult(msgspec.Struct):

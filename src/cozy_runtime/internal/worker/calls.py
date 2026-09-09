@@ -37,6 +37,12 @@ class _Pending:
     forgotten: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _Received:
+    metadata: dict[str, Any]
+    source: pb.NativeByteRetentionRequest
+
+
 class Calls:
     def __init__(
         self,
@@ -51,6 +57,7 @@ class Calls:
         self.workspace, self.owner = workspace, owner
         self.pending: dict[tuple[str, int, int], _Pending] = {}
         self.materialized: dict[tuple[str, int], tuple[Path, int]] = {}
+        self.received: dict[tuple[str, int], dict[str, _Received]] = {}
         self.lock = threading.RLock()
 
     @staticmethod
@@ -316,6 +323,31 @@ class Calls:
                 attempt.spool,
                 max_bytes=byte_inputs.MAX_BYTES - held_bytes,
             )
+            received = dict(self.received.get(parent, {}))
+            for metadata, grant in zip(granted, result.byte_result_grants, strict=True):
+                identity = canonical.write(
+                    [metadata["kind"], metadata["digest"], metadata["media_type"]]
+                ).decode()
+                received.setdefault(
+                    identity,
+                    _Received(
+                        dict(metadata),
+                        pb.NativeByteRetentionRequest(
+                            source=grant.source, retention_id=grant.retention_id
+                        ),
+                    ),
+                )
+            # Re-export retains metadata after call-forget, under the existing
+            # bounded call inventory's aggregate control-byte allowance.
+            if (
+                sum(
+                    len(canonical.write(value.metadata)) + value.source.ByteSize()
+                    for value in received.values()
+                )
+                > MAX_ACTIVE_CALLS * MAX_CALL_BYTES
+            ):
+                raise ValueError("received native output metadata exceeds its bound")
+            self.received[parent] = received
             self.materialized[parent] = (
                 spool,
                 held_bytes + sum(int(row["content_bytes"]) for row in granted),
@@ -327,8 +359,29 @@ class Calls:
                 raise
             raise ValueError("native child artifact bytes are unavailable") from exc
 
+    def received_output(
+        self, attempt: AttemptRecord, row: Mapping[str, Any]
+    ) -> tuple[Path, pb.NativeByteRetentionRequest] | None:
+        """Resolve an explicit returned handle only against this parent's actual grants."""
+        ref = str(row.get("asset_ref", ""))
+        if not ref.startswith("sha256:"):
+            return None
+        kind = row.get("kind")
+        media = byte_inputs.TREE_MIME if kind == "tree" else row.get("media_type")
+        identity = canonical.write([kind, ref, media]).decode()
+        with self.lock:
+            grant = self.received.get((attempt.request_id, attempt.attempt), {}).get(identity)
+            if (
+                grant is None
+                or row.get("digest") != ref
+                or row.get("size_bytes") != grant.metadata["content_bytes"]
+            ):
+                raise ValueError("returned native handle has no exact received grant")
+            return Path(grant.metadata["local"]), grant.source
+
     def close(self, request_id: str, attempt: int) -> None:
         with self.lock:
+            self.received.pop((request_id, attempt), None)
             if held := self.materialized.pop((request_id, attempt), None):
                 byte_inputs.remove_checkout(held[0] / "child-results")
             for key in list(self.pending):

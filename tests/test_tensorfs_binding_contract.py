@@ -73,6 +73,25 @@ CALLED: dict[str, str] = {
     ),
     "Store.open": "(root=None)",
     "Store.ensure": "(root=None)",
+    "Store.resolve_source": (
+        "(self, /, source_uri, carriers=Ellipsis, *, profiles=Ellipsis, files=Ellipsis, "
+        "credential=Ellipsis, huggingface=None, civitai=None, allow_local=False)"
+    ),
+    "Store.materialize_source": (
+        "(self, /, owner, members, *, allowed_hosts, credential_hosts=Ellipsis, "
+        "credential=Ellipsis, allow_local=False)"
+    ),
+    "Store.prepare_source_artifact": (
+        "(self, /, source_owner, operation_id, profiles, *, checkpoints=Ellipsis, "
+        "adopt_from_operation_id=None, registry=None)"
+    ),
+    "Store.create_tree_root": "(self, /, owner, manifest_id, manifest_length)",
+    "Store.import_tree": "(self, /, owner, manifest_bytes, files)",
+    "Store.retain_tree_root": "(self, /, source_owner, owner)",
+    "Store.tree_root": "(self, /, owner)",
+    "Store.release_tree_root": "(self, /, owner)",
+    "Store.release_tree_retention": "(self, /, source_owner, receipt_digest, owner)",
+    "Store.adopt_source_progress": "(self, /, source_owner, owner)",
     "Store.prepare_readers": "(self, /)",
     "Store.manifest": "(self, /, hex)",
     "Store.put_file": "(self, /, path, expect=None, expect_length=None)",

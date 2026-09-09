@@ -311,7 +311,9 @@ class WriterBroker:
                     if str(row.get("input_id", "")).startswith(MODEL_PREFIX)
                 }
                 outputs = {
-                    row["output_id"]: row["max_bytes"] for row in attempt.spec.get("outputs", [])
+                    # Canonical protobuf documents omit the zero scalar default.
+                    row["output_id"]: row.get("max_bytes", 0)
+                    for row in attempt.spec.get("outputs", [])
                 }
                 if type(args[4]) is not int or args[4] < 0 or args[4] != outputs.get(binding.slot):
                     raise CapabilityError(

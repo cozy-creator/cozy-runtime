@@ -36,6 +36,7 @@ def decode(
     request_id: str,
     guard: Callable[[], None],
     observation: ExecutionObservation | None,
+    grant_token: object | None = None,
 ) -> tuple[Any, ExecutionObservation | None]:
     """Every native result leaf is replaced from the separately verified host grant."""
     if len(grants) > 32:
@@ -100,6 +101,7 @@ def decode(
             )
             asset._read_guard = guard
             handle = asset
+        handle._grant_token = grant_token
         handles[output_id] = handle
         if capture:
             assert observation is not None and observation.capture is not None
