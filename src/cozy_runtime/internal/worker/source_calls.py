@@ -326,7 +326,8 @@ class SourceCalls:
         if not storage_admission.enabled():
             return ()
         if command["phase"] == "resolve":
-            return (storage_admission.Write(self.workspace.store_root, 0, 0),)
+            # Profile selection stages sparse header carriers and Store metadata.
+            return (storage_admission.native_write(self.workspace.store_root),)
         operation, args = command["operation"], command["arguments"]
         payload, objects = 0, 1
         if operation in ("download_huggingface", "download_civitai"):
@@ -340,10 +341,14 @@ class SourceCalls:
             )
         elif operation == "convert_cozytensors":
             store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+            if store.derived_lookup(command["native_owner"]).get("state") == "committed":
+                return (storage_admission.native_write(self.workspace.store_root),)
             root = store.tree_root(command["source_owner"])
             # Source conversion admits identity/permutation classes only. Their
             # body bytes cannot exceed the verified carrier roster; no quantizer
             # or value-expanding converter runs on this native source path.
+            # This child runs all native passes before returning, unlike the
+            # incremental PrepareModelSource RPC, so its hold covers the whole body.
             members = store.walk(root["manifest_digest"])
             payload, objects = sum(int(row["length"]) for row in members), len(members)
         return (storage_admission.native_write(self.workspace.store_root, payload, objects),)
