@@ -99,7 +99,9 @@ def test_native_dtype_reaches_real_derivation_child(source_project: Path, dtype:
     )
     (result,) = derive_child.derive_in(Path(sys.executable), request)
     assert isinstance(result, derive_child.TensorRequirements)
-    assert {row[2] for row in result.rows} == {dtype}
+    # Float16 is the ordinary convertible 16-bit fit contract; float32 is a hard
+    # precision island. The constructor census above separately measures exact bytes.
+    assert {row[2] for row in result.rows} == ({None} if dtype == "f16" else {"f32"})
 
 
 @pytest.mark.parametrize("error", ["RuntimeError", "ModuleNotFoundError"])

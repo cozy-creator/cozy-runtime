@@ -1,13 +1,30 @@
 """Checkpoint dtype is immutable constructor input, before census and allocation."""
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import msgspec
 import pytest
+import tensorfs
 import torch
 
-from cozy_runtime.author import Artifact, Config, ConformanceError, Loader
+from cozy_runtime.author import (
+    Artifact,
+    Config,
+    ConformanceError,
+    Loader,
+    WeightsConfig,
+    WeightsPart,
+    WeightsTarget,
+    WeightsTensor,
+)
 from cozy_runtime.author._loader import TensorSpec
+from cozy_runtime.author._weights import WeightsCommit
 from cozy_runtime.internal import derive_child
+from cozy_runtime.internal.encoding import SPEC_PLAIN
+from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, tensor_schema_of
+from cozy_runtime.internal.weights_sink import WeightsTransactionHost
 
 
 @pytest.mark.parametrize("dtype,width", [("f32", 4), ("f16", 2)])
@@ -51,8 +68,6 @@ def test_dtype_view_is_read_only_and_missing_supplied_key_refuses() -> None:
 
 
 def test_private_derive_request_carries_dtype_metadata() -> None:
-    import msgspec
-
     request = derive_child.DeriveRequest(
         (
             derive_child.SlotRequest(
@@ -62,3 +77,88 @@ def test_private_derive_request_carries_dtype_metadata() -> None:
         application="fixture:app",
     )
     assert derive_child.read_request(msgspec.msgpack.encode(request.render())) == request
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="actual native streaming fill uses CUDA")
+@pytest.mark.parametrize("dtype,width", [("f32", 4), ("f16", 2)])
+def test_native_checkpoint_fills_the_dtype_selected_constructor(
+    tmp_path: Path,
+    dtype: str,
+    width: int,
+) -> None:
+    selected_dtype = {"f32": torch.float32, "f16": torch.float16}[dtype]
+    source = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=selected_dtype)
+    store = tensorfs.Store.ensure(str(tmp_path / "store"))
+    host = WeightsTransactionHost(
+        store=store,
+        owner_scope="dtype-proof",
+        request_id="proof",
+        invocation_spec_digest="sha256:" + "1" * 64,
+        work_fingerprint="sha256:" + "2" * 64,
+        writer_session_id=1,
+        allowed_sources={},
+        output_bounds={"model": 8192},
+    )
+    transaction = host.open(
+        WeightsCommit(
+            output_slot="model",
+            sources={},
+            targets={
+                "linear": WeightsTarget(
+                    add={
+                        "weight": WeightsTensor(
+                            dtype, (3, 2), SPEC_PLAIN, {"value": WeightsPart(dtype, (3, 2))}
+                        )
+                    }
+                )
+            },
+            configs={"model": WeightsConfig(data=b"{}")},
+            order=(("linear", "weight"),),
+            max_new_bytes=8192,
+        )
+    )
+    transaction.add_part("linear", "weight", "value", source.numpy().tobytes())
+    transaction.add_config("model", b"{}", 2)
+    receipt = json.loads(transaction.commit().tensorfs_receipt)
+    manifest = "sha256:" + receipt["manifest"]["sha256"]
+    checkpoint = Checkpoint(tmp_path / "store", manifest)
+    rows = checkpoint.rows("linear")
+    backend = StreamingFillBackend.for_script(
+        checkpoint,
+        rows,
+        release="dtype-proof/1",
+        store="fixture",
+        snapshot=manifest,
+        window_bytes=4096,
+        slots=3,
+        readers=1,
+        inflight=1,
+    )
+
+    class Pipeline:
+        def __init__(self, config):
+            requested = {"f32": torch.float32, "f16": torch.float16}[
+                config.tensor_dtype("linear.weight", default="f32")
+            ]
+            with torch.device("meta"):
+                self.components = {"linear": torch.nn.Linear(2, 3, bias=False, dtype=requested)}
+
+    try:
+        backend.expect({"linear": ("linear.weight",)})
+        loader = Loader(
+            Artifact(manifest, tensor_schema_of(rows), Config({})),
+            owner=SimpleNamespace(),
+            backend=backend,
+        )
+        model = loader.construct(Pipeline, factory=Pipeline)
+        layer = model.components["linear"]
+        assert torch.equal(layer.weight.cpu(), source)
+        assert layer.weight.numel() * layer.weight.element_size() == width * 6
+        assert loader.records()[0].filled_bytes == width * 6
+        assert backend.device_envelope()["destination_bytes"] == width * 6
+        assert torch.equal(
+            layer(torch.ones(2, device="cuda", dtype=selected_dtype)).cpu(),
+            torch.tensor([3, 7, 11], dtype=selected_dtype),
+        )
+    finally:
+        backend.close()
