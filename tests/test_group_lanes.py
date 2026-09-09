@@ -56,6 +56,7 @@ from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
 from cozy_runtime.internal.worker.session import (
     HostedPlacement,
     Placement,
+    Tenant,
     Worker,
     WorkerOptions,
     executor_prepare_command,
@@ -751,6 +752,38 @@ def _weightless_prepare(body: dict[str, Any], interface: Path, **extra: Any) -> 
         "authorized_device_limit_bytes": 0,
         **extra,
     }
+
+
+@needs_executor
+def test_package_describe_executor_is_replaced_when_its_placement_takes_a_group() -> None:
+    with _workspace() as root:
+        worker = Worker(
+            _config(root / "home"),
+            WorkerOptions(root=root / "worker", devices="0,1"),
+            InMemoryControlHost(),
+        )
+        try:
+            single = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
+            described = worker.supervision.spawn(imposed=worker.imposed(single))
+            assert not described.ready_bindings and described.prepared_model is None
+            assert described.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0"
+            group = worker.lanes.fuse((0, 1))
+            tenant = Tenant(
+                _placement("candidate"), worker.supervision, {}, {}, {}, group, "candidate"
+            )
+            prepared = worker._own_executor(tenant, [])
+            assert not isinstance(prepared, str), prepared
+            assert prepared is not described, (
+                "the package-describe process retained its single-GPU seal"
+            )
+            assert not described.alive()
+            assert prepared.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1"
+            assert worker.supervision.devices == group.entries
+            assert worker._own_executor(tenant, []) is prepared, (
+                "unchanged seals should still reuse"
+            )
+        finally:
+            worker.supervision.close()
 
 
 @needs_executor
