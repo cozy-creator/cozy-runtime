@@ -390,6 +390,45 @@ def test_the_group_boot_line_renders_from_merged_facts_alone() -> None:
     assert attention.line({}, {}, [], "").startswith("NONE")
 
 
+def test_a_pinned_group_prepare_renders_pinned_from_its_models_own_facts() -> None:
+    """THE RED ARM (cr-135). `_prepare_many` merges its models' `attention` facts into the
+    one boot record through `attention.merge`; the merge it replaced hardcoded an empty pin,
+    so a PINNED two-model prepare printed `auto over [...]` — indistinguishable in the record
+    from an unpinned one, which is exactly the A/B h3a-013 cannot afford."""
+    pinned = {
+        parameter: attention.Applied(
+            hosts={"dit": {"cudnn": 52}}, locations={}, offered=("cudnn",), pin="cudnn"
+        ).document()
+        for parameter in ("fl2va", "ref2va")
+    }
+    merged = attention.merge(pinned)
+    assert merged is not None
+    assert merged["pin"] == "cudnn"
+    assert merged["line"] == "cudnn x104 (PINNED cudnn) — fl2va/dit: cudnn; ref2va/dit: cudnn"
+    assert merged["hosts"] == {"fl2va/dit": {"cudnn": 52}, "ref2va/dit": {"cudnn": 52}}
+    assert merged["kernels"] == {"cudnn": 104} and merged["offered"] == ["cudnn"]
+
+    # Unpinned models merge to `auto`, the offered set unioned in rank order.
+    auto = attention.merge(
+        {
+            "fl2va": attention.Applied(
+                hosts={"dit": {"flash-attn3": 52}}, locations={}, offered=("flash-attn3", "sdpa")
+            ).document(),
+            "ref2va": attention.Applied(
+                hosts={"vae": {"sdpa": 36}}, locations={}, offered=("sdpa",)
+            ).document(),
+        }
+    )
+    assert auto is not None and auto["pin"] == ""
+    assert auto["line"].startswith("flash-attn3 x52, sdpa x36 (auto over ['flash-attn3', 'sdpa'])")
+
+    # A model with no site contributes nothing; a set with no site at all is no fact.
+    partial = attention.merge({"fl2va": pinned["fl2va"], "vae": {}})
+    assert partial is not None
+    assert partial["line"] == "cudnn x52 (PINNED cudnn) — fl2va/dit: cudnn"
+    assert attention.merge({"a": {}, "b": {}}) is None
+
+
 # ------------------------------------------------------------------------------ the CUDA arm
 
 
@@ -444,6 +483,18 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     assert out["pin_served"]["pin"] == "cudnn"
     assert out["pin_served"]["line"] == "cudnn x1 (PINNED cudnn) — dit: cudnn"
     assert out["pin_backends"] == {"dit": ["_native_cudnn"]}
+
+    # cr-135: the pin SURVIVES THE GROUP MERGE. Two real constructions pinned to cuDNN, read
+    # back off their own processors, render PINNED from the one merged record; unpinned they
+    # render auto over what this card offers.
+    assert out["group_pinned"]["pin"] == "cudnn"
+    assert out["group_pinned"]["line"] == (
+        "cudnn x2 (PINNED cudnn) — fl2va/dit: cudnn; ref2va/dit: cudnn"
+    )
+    assert out["group_auto"]["pin"] == ""
+    assert out["group_auto"]["offered"] == out["offered"]
+    assert sum(out["group_auto"]["kernels"].values()) == 2
+    assert "(auto over " in out["group_auto"]["line"]
 
     # The refusals double as discoverability: each names what would have to be true.
     assert out["unknown"]["code"] == "attention_kernel_unknown"

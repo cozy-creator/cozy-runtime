@@ -322,6 +322,15 @@ class CapabilityRecord:
 
     It is NOT model quality and may never be reported as such: quality is a paired
     video+audio eval on real outputs and belongs to the eval plane (#549.6)."""
+    leaf_speedup_x: float = -1.0
+    """The LEAF SPEED evidence, encoded-GEMM routes only: the float GEMM's wall over the
+    leaf's forward at the probe shape, activation quantization inside the timed region
+    (`probe._leaf_bench`). Above 1.0 the leaf wins; below it the leaf LOSES to decoding and
+    the route is a memory play. -1.0 means NOT MEASURED, which every decode route is.
+
+    It is evidence at ONE shape, not a whole-plan wall, so nothing ranks on it (see
+    `resolution.score`); it exists so that a leaf that measured slower is READABLE on every
+    record, plan and boot line that serves it, rather than banked and never read."""
     runtime_source_digest: str = ""
     torch_build: str = ""
     os_arch: str = ""
@@ -358,6 +367,7 @@ class CapabilityRecord:
             "evidence_digest": self.evidence_digest,
             "resident_bits_per_element": self.resident_bits_per_element,
             "kernel_numeric_error": self.kernel_numeric_error,
+            "leaf_speedup_x": self.leaf_speedup_x,
         }
 
 

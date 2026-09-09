@@ -197,12 +197,21 @@ def _delivery_observation(delivery: Mapping[str, Any]) -> str:
     materialization = str(delivery.get("materialization") or "verbatim")
     calibrated = "calibrated" if delivery.get("calibrated") else "uncalibrated"
     confession = str(delivery.get("confession") or "")
+    # The leaf-speed evidence rides BESIDE the route census it qualifies: a plan that routes
+    # `encoded_gemm x453` on a card whose probe measured the leaf at 0.61x its float GEMM
+    # says so on the same line, rather than banking the number where nothing reads it.
+    speedup = delivery.get("leaf_speedup_x")
+    leaf = (
+        f"; leaf {speedup:.2f}x its float GEMM"
+        if isinstance(speedup, int | float) and speedup >= 0.0
+        else ""
+    )
     return (
         f"{delivery.get('variant', '')!r} / {delivery.get('label', 'unlabelled')} on rung "
         f"{delivery.get('rung', 'unreported')} "
         f"({delivery.get('delivery', 'unreported')}/{materialization}; "
-        f"routes {census('routes')}; kernels {census('kernels')}; {calibrated}) chosen on "
-        f"the {delivery.get('objective', 'unreported')} axis"
+        f"routes {census('routes')}; kernels {census('kernels')}{leaf}; {calibrated}) chosen "
+        f"on the {delivery.get('objective', 'unreported')} axis"
         + (f" - {confession}" if confession else "")
     )
 
@@ -4897,7 +4906,16 @@ class Worker:
             # one, and it is worthless if the cap eats it instead of a 78 ms leg.
             _q = reply["facts"].get("qualification") or {}
             _l = reply["facts"].get("leases") or {}
-            tail = (f" [qualification {_q['source']} {_q['key'][:12]}]" if _q else "") + (
+            # The worst leaf speedup the qualification banked rides the tail too: it is the
+            # one number on this record that moves when the fp8 GEMM path silently degrades.
+            _leaf = min((_q.get("leaf_speedup_x") or {}).values(), default=-1.0)
+            tail = (
+                f" [qualification {_q['source']} {_q['key'][:12]}"
+                + (f" leaf {_leaf:.2f}x" if _leaf >= 0.0 else "")
+                + "]"
+                if _q
+                else ""
+            ) + (
                 f" [{_l['leases']} lease(s) over {_l['objects']} object(s) in "
                 f"{_l['acquisitions']} acquisition(s)]"
                 if _l
