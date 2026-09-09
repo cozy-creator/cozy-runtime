@@ -157,6 +157,11 @@ class WriterProxy:
         try:
             length = _write(path, source, maximum)
             self.call(operation, length=length, **fields)
+        except BaseException:
+            # A failed local spool copy must also relinquish its parent hold.
+            with contextlib.suppress(Exception):
+                self.fence()
+            raise
         finally:
             path.unlink(missing_ok=True)
 
@@ -216,6 +221,9 @@ class WriterBroker:
         self.bindings: dict[tuple[str, int, str], _Binding] = {}
         self.lock = threading.RLock()
         self.writers: dict[tuple[str, int, str], tuple[Any, dict[str, Any]]] = {}
+        self.pending: dict[
+            tuple[str, int, str], tuple[tuple[Any, ...], storage_admission.Lease | None]
+        ] = {}
 
     @staticmethod
     def key(attempt: Any, transaction: str) -> tuple[str, int, str]:
@@ -256,9 +264,122 @@ class WriterBroker:
 
         return int(math.prod(part["shape"])) * int(fill.tensorfs_module().dtypes()[part["dtype"]])
 
-    def handle(self, attempt: Any, frame: Mapping[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _payload(frame: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            frame.get("target_operation", frame.get("operation")),
+            *(frame.get(name) for name in ("component", "key", "role", "name")),
+        )
+
+    @staticmethod
+    def _refused(exc: Exception) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "code": str(getattr(exc, "code", "weights_writer_refused")),
+            "detail": str(exc)[:1024],
+        }
+
+    def _bound(self, attempt: Any, frame: Mapping[str, Any]) -> dict[str, Any]:
+        key = self.key(attempt, str(frame.get("weights_transaction_id", "")))
         with self.lock:
-            return self._handle(attempt, frame)
+            if key in self.pending:
+                return self._refused(
+                    CapabilityError(
+                        "writer payload is already pending", code="weights_writer_payload_pending"
+                    )
+                )
+            result = self._handle(attempt, frame)
+            if not result.get("ok"):
+                return result
+            current = self.writers[key]
+            pending = (self._payload(frame), None)
+            self.pending[key] = pending
+        # Never wait for the global disk lock while holding the broker lock: a
+        # different writer may need that lock to finish its already-held part.
+        lease = None
+        try:
+            maximum = int(result["length"])
+            lease = storage_admission.acquire(
+                storage_admission.native_write(self.store_root, maximum),
+                storage_admission.Write(attempt.spool, maximum + MAX_WEIGHTS_SOURCE_READ, 3),
+            )
+            with self.lock:
+                if (
+                    self.pending.get(key) is not pending
+                    or self.writers.get(key) is not current
+                    or attempt.canceling
+                    or attempt.state != "running"
+                ):
+                    raise CapabilityError(
+                        "writer closed during admission", code="weights_writer_closed"
+                    )
+                self.pending[key] = pending[0], lease
+                lease = None  # The existing writer lifecycle now owns this hold.
+            return result
+        except Exception as exc:
+            with self.lock:
+                if self.pending.get(key) is pending:
+                    self.pending.pop(key)
+            return self._refused(exc)
+        finally:
+            if lease is not None:
+                lease.close()
+
+    def handle(self, attempt: Any, frame: Mapping[str, Any]) -> dict[str, Any]:
+        operation = frame.get("operation")
+        if operation == "bound":
+            return self._bound(attempt, frame)
+        key = self.key(attempt, str(frame.get("weights_transaction_id", "")))
+        with self.lock:
+            pending = self.pending.get(key)
+            borrowed = pending[1] if pending is not None else None
+            if operation in {"part", "config"} and (
+                borrowed is None or pending[0] != self._payload(frame)
+            ):
+                return self._refused(
+                    CapabilityError(
+                        "writer payload has no matching admission", code="weights_writer_ungranted"
+                    )
+                )
+            if pending is not None and operation not in {"part", "config", "read", "fence"}:
+                return self._refused(
+                    CapabilityError(
+                        "writer payload is pending", code="weights_writer_payload_pending"
+                    )
+                )
+        lease = borrowed
+        try:
+            if lease is None:
+                if operation == "fence":
+                    lease = storage_admission.Lease()  # Releasing work needs no fresh capacity.
+                elif operation == "read":
+                    length = int(frame.get("length", 0))
+                    if not 0 < length <= MAX_WEIGHTS_SOURCE_READ:
+                        raise CapabilityError(
+                            "source read exceeds bound", code="weights_writer_length"
+                        )
+                    lease = storage_admission.acquire(
+                        storage_admission.Write(attempt.spool, length, 1)
+                    )
+                else:
+                    lease = storage_admission.acquire(
+                        storage_admission.native_write(self.store_root),
+                        storage_admission.Write(
+                            attempt.spool, weights_limits.MAX_WEIGHTS_RECEIPT_BYTES, 2
+                        ),
+                    )
+            with self.lock, lease.scope():
+                result = self._handle(attempt, frame)
+                if operation in {"part", "config", "fence"} or not result.get("ok"):
+                    self.pending.pop(key, None)
+                    if borrowed is not None:
+                        borrowed.close()
+                return result
+        except Exception as exc:
+            return self._refused(exc)
+        finally:
+            if lease is not None and lease is not borrowed:
+                lease.close()
 
     def _handle(self, attempt: Any, frame: Mapping[str, Any]) -> dict[str, Any]:
         import io
@@ -335,14 +456,13 @@ class WriterBroker:
                     raise CapabilityError(
                         "writer declaration changed after intent", code="weights_writer_declaration"
                     )
-                with storage_admission.admit(storage_admission.native_write(self.store_root)):
-                    writer = store.begin_derived(
-                        transaction,
-                        binding.epoch,
-                        *args,
-                        work_fingerprint=fingerprint,
-                        checkpoint=binding.checkpoint,
-                    )
+                writer = store.begin_derived(
+                    transaction,
+                    binding.epoch,
+                    *args,
+                    work_fingerprint=fingerprint,
+                    checkpoint=binding.checkpoint,
+                )
                 self.writers[key] = writer, json.loads(declaration)
                 return {"ok": True}
             held = self.writers.get(key)
@@ -372,12 +492,7 @@ class WriterBroker:
                     raise CapabilityError(
                         "part length differs from declaration", code="weights_writer_length"
                     )
-                with (
-                    _read(_path(spool, transaction, "input"), length, maximum) as source,
-                    storage_admission.admit(
-                        storage_admission.native_write(self.store_root, length)
-                    ),
-                ):
+                with _read(_path(spool, transaction, "input"), length, maximum) as source:
                     if operation == "part":
                         writer.add_part(
                             str(frame["component"]), str(frame["key"]), str(frame["role"]), source
@@ -385,8 +500,7 @@ class WriterBroker:
                     else:
                         writer.add_config(str(frame["name"]), source)
             elif operation in {"commit", "completed_parts", "completed_configs"}:
-                with storage_admission.admit(storage_admission.native_write(self.store_root)):
-                    facts = getattr(writer, operation)()
+                facts = getattr(writer, operation)()
                 if operation == "commit":
                     del self.writers[key]
                 raw = json.dumps(facts, separators=(",", ":"), sort_keys=True).encode()
@@ -407,12 +521,11 @@ class WriterBroker:
                         "checkpoint differs from writer scope", code="weights_writer_ungranted"
                     )
                 previous = frame.get("previous")
-                with storage_admission.admit(storage_admission.native_write(self.store_root)):
-                    facts = writer.checkpoint(
-                        attempt.request_id,
-                        binding.slot,
-                        previous=tuple(previous) if previous is not None else None,
-                    )
+                facts = writer.checkpoint(
+                    attempt.request_id,
+                    binding.slot,
+                    previous=tuple(previous) if previous is not None else None,
+                )
                 if facts.get("head") is not None and self.record_checkpoint is not None:
                     self.record_checkpoint(attempt, transaction, binding, facts)
                 return {"ok": True, "checkpoint": facts}
@@ -448,5 +561,10 @@ class WriterBroker:
     def _close(self, key: tuple[str, int, str]) -> None:
         held = self.writers.pop(key, None)
         self.bindings.pop(key, None)
-        if held is not None:
-            held[0].fence()
+        pending = self.pending.pop(key, None)
+        try:
+            if held is not None:
+                held[0].fence()
+        finally:
+            if pending is not None and pending[1] is not None:
+                pending[1].close()

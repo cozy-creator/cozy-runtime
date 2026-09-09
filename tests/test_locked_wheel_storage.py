@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -80,6 +81,11 @@ def test_exact_downloaded_wheel_installs_with_uv_offline(tmp_path, monkeypatch):
     root, wheel, row = wheel_fixture(tmp_path)
     staging = root / "generation"
     monkeypatch.setattr(storage, "fetch_wheel", lambda *args: (wheel, wheel.stat().st_size))
+
+    def unexpected_rehash(_path):
+        pytest.fail("Runtime rehashed a supervisor-verified wheel")
+
+    monkeypatch.setattr(environment, "_hash_file", unexpected_rehash)
     admitted = []
 
     @contextmanager
@@ -105,3 +111,56 @@ def test_exact_downloaded_wheel_installs_with_uv_offline(tmp_path, monkeypatch):
     )
     assert result.stdout.strip() == "73"
     assert not list(root.glob(".uv-cache-*"))
+
+
+def test_complete_locked_install_admits_metadata_and_releases_wheel_stage(tmp_path, monkeypatch):
+    root, wheel, row = wheel_fixture(tmp_path)
+    locked = environment.read_locked_requirements(
+        ("--index-url https://pypi.org/simple\n" + row.text + "\n").encode()
+    )
+    monkeypatch.setattr(storage, "enabled", lambda: True)
+    fetched, released, held = [], [], []
+
+    def fetch(*args):
+        assert not held
+        fetched.append(args)
+        return wheel, wheel.stat().st_size
+
+    @contextmanager
+    def admit(*bounds):
+        assert not held, "metadata/installer acquired nested host exclusion"
+        held.extend(bounds)
+        try:
+            yield
+        finally:
+            held.clear()
+
+    def release(operation):
+        assert not held
+        assert list((root / "receipts").glob("*.json")), (
+            "released before immutable install completed"
+        )
+        released.append(operation)
+        shutil.rmtree(root / ".stage" / operation, ignore_errors=True)
+
+    monkeypatch.setattr(storage, "admit", admit)
+    monkeypatch.setattr(storage, "fetch_wheel", fetch)
+    monkeypatch.setattr(storage, "release_wheels", release)
+    installed = environment.materialize_locked(
+        locked,
+        locked.rows,
+        root,
+        environment_digest="sha256:" + "73" * 32,
+        python=Path(sys.executable),
+    )
+    assert len(fetched) == 1 and len(released) == 1
+    assert not wheel.exists()
+    replayed = environment.materialize_locked(
+        locked,
+        locked.rows,
+        root,
+        environment_digest="sha256:" + "73" * 32,
+        python=Path(sys.executable),
+    )
+    assert replayed.generation == installed.generation and replayed.reused
+    assert len(fetched) == 1

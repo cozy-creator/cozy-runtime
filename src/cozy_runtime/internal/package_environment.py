@@ -47,6 +47,7 @@ from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import base_observation, canonical, storage_admission
+from cozy_runtime.internal.config import inherited_environment
 
 RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
 LOCKED_RECEIPT_FORMAT = "cozy.runtime.LockedEnvironmentReceipt/1"
@@ -257,6 +258,7 @@ def _measure_inspected_wheel(
     base: base_observation.Observation,
     *,
     allow_base_owned: bool = False,
+    verified: VerifiedFile | None = None,
 ) -> tuple[_Inspected, VerifiedFile]:
     """Derive one local wheel fact, then run the ordinary full wheel inspection once."""
 
@@ -275,7 +277,14 @@ def _measure_inspected_wheel(
         distribution=_name(str(distribution)),
         version=str(version),
         filename=path.name,
-        digest=_hash_file(path),
+        # The authenticated supervisor already checked the whole wheel digest.
+        # Reuse the existing same-boot immutable-file receipt exactly as the
+        # ordinary local wheel grant path does; full ZIP admission still runs.
+        digest=(
+            verified.digest
+            if verified is not None and verified.matches(path, verified.digest, info.st_size)
+            else _hash_file(path)
+        ),
         length=info.st_size,
         tags=tuple(sorted(str(tag) for tag in tags)),
         owner=owner,
@@ -978,7 +987,10 @@ def _install_locked_bounded(
             raise EnvironmentRefusal(
                 "package_environment_wheel_invalid", "wheel staging path changed"
             )
-        item, verified = _measure_inspected_wheel(path, "custom", observed, allow_base_owned=True)
+        verified = VerifiedFile.record(path, row.hashes[0], length)
+        item, verified = _measure_inspected_wheel(
+            path, "custom", observed, allow_base_owned=True, verified=verified
+        )
         if (item.wheel.distribution, item.wheel.version, verified.digest, verified.length) != (
             row.name,
             row.version,
@@ -2090,7 +2102,11 @@ def _run_install_commands(
             capture_output=True,
             text=True,
             check=False,
-            env={**os.environ, "TMPDIR": str(staging.parent), "PYTHONDONTWRITEBYTECODE": "1"},
+            env={
+                **inherited_environment(),
+                "TMPDIR": str(staging.parent),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
         )
         if result.returncode != 0:
             detail = result.stderr.strip()[-2000:] or result.stdout.strip()[-2000:]

@@ -12,6 +12,7 @@ import array
 import json
 import os
 import socket
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -26,7 +27,12 @@ class StorageRefusal(Exception):
 
     def __init__(self, detail: str, facts: dict[str, int] | None = None) -> None:
         super().__init__(detail)
-        self.detail, self.facts = detail, facts or {}
+        self.facts = facts or {}
+        counts = ", ".join(
+            f"{key}={value}" for key, value in sorted(self.facts.items()) if type(value) is int
+        )
+        self.detail = detail + (": " + counts if counts else "")
+        self.args = (self.detail,)
 
 
 @dataclass(frozen=True)
@@ -60,13 +66,12 @@ def native_write(path: Path | None, payload: int = 0, objects: int = 1) -> Write
     return Write(path, payload + 4 * metadata, 3 * (objects + blocks) + 16)
 
 
-def inherit() -> None:
+def inherit(descriptor: int | None) -> None:
     """Consume the pod's fixed descriptor before any executor is launched."""
     global _channel
-    value = os.environ.pop("COZY_STORAGE_ADMISSION_FD", None)
-    if value is None:
+    if descriptor is None:
         return
-    if value != "4" or _channel is not None:
+    if type(descriptor) is not int or descriptor != 4 or _channel is not None:
         raise StorageRefusal("invalid supervisor storage channel")
     try:
         _channel = socket.socket(fileno=4)
@@ -77,12 +82,38 @@ def inherit() -> None:
         raise StorageRefusal("supervisor storage channel is unavailable") from exc
 
 
-@contextmanager
-def admit(*writes: Write) -> Iterator[None]:
-    """Hold admission through the actual write/child exit, never just its launch."""
+class Lease:
+    """One explicit operation hold; close may run in a different RPC thread."""
+
+    def __init__(self, context=None) -> None:
+        self._context = context
+        self._lock = threading.RLock()
+        self._closed = False
+
+    @contextmanager
+    def scope(self) -> Iterator[None]:
+        with self._lock:
+            if self._closed:
+                raise StorageRefusal("storage admission was already released")
+            token = _held.set(True)
+            try:
+                yield
+            finally:
+                _held.reset(token)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._context is not None:
+                self._context.__exit__(None, None, None)
+                self._context = None
+
+
+def acquire(*writes: Write) -> Lease:
     if _channel is None:
-        yield
-        return
+        return Lease()
     if _held.get():
         raise StorageRefusal("nested storage admission would deadlock; combine write destinations")
     if not 1 <= len(writes) <= 8 or any(
@@ -98,12 +129,23 @@ def admit(*writes: Write) -> Iterator[None]:
         [{"path": str(row.path), "bytes": row.bytes, "inodes": row.inodes} for row in writes],
         separators=(",", ":"),
     ).encode()
-    with _exchange(body, tuple(row.path for row in writes)):
-        token = _held.set(True)
-        try:
+    context = _exchange(body, tuple(row.path for row in writes))
+    context.__enter__()
+    return Lease(context)
+
+
+@contextmanager
+def admit(*writes: Write) -> Iterator[None]:
+    """Hold admission through the actual write/child exit, never just its launch."""
+    if _channel is None:
+        yield
+        return
+    lease = acquire(*writes)
+    try:
+        with lease.scope():
             yield
-        finally:
-            _held.reset(token)
+    finally:
+        lease.close()
 
 
 @contextmanager

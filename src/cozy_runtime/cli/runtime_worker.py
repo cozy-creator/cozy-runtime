@@ -53,7 +53,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchRefusal("worker_identity_invalid", "pod worker must start as UID/GID 0")
         config = read_worker_host_config()
         _arm_supervisor_lifetime()
-        storage_admission.inherit()
+        storage_admission.inherit(config.storage_admission_fd)
         return _run(config)
     except ConfigError as err:
         emit_error(CliError(err.name, err.message, err.remedy, err.code), opts)
