@@ -218,8 +218,34 @@ def main() -> None:
     out["forward"] = {"shape": list(result.shape), "dtype": str(result.dtype)}
 
     _selfcheck(out, device)
+    out["fp8"] = _fp8(device, dit)
 
     print(json.dumps(out))
+
+
+def _fp8(device: DeviceFacts, dit: Attention) -> dict[str, Any]:
+    """cr-136: the fp8 path through the real registry — refused by name where the snapshot is
+    absent, otherwise resolved, self-checked, pinned on a real site and run."""
+    from diffusers.models.attention_dispatch import _HUB_KERNELS_REGISTRY, AttentionBackendName
+
+    hub = _HUB_KERNELS_REGISTRY[AttentionBackendName._FLASH_3_HUB]
+    before = hub.kernel_fn
+    try:
+        ready = attention.pinned("flash-attn3-fp8", device)
+    except attention.AttentionRefusal as exc:
+        return {"code": exc.code, "detail": str(exc)[:300]}
+    applied = attention.install(ready, {"dit": dit}, "flash-attn3-fp8")
+    hidden = torch.randn(1, 64, 1024, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        result = dit(hidden)
+    return {
+        "code": "",
+        "rel_l2": _rel_l2(ready[0], device),
+        "backend": _backends({"dit": dit})["dit"][0],
+        "line": applied.line(),
+        "forward": {"shape": list(result.shape), "dtype": str(result.dtype)},
+        "bf16_slot_untouched": hub.kernel_fn is before,
+    }
 
 
 def _device_at(sm: int) -> DeviceFacts:
