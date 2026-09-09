@@ -1,16 +1,8 @@
-"""The rank command wire: what a mirrored model call may carry across the rank seam.
+"""Transport sharded component arguments as JSON control and tensor snapshots.
 
-The writer is rank 0, the process that runs TENANT handler code and marshals whatever the
-handler passed to a component-use method. The seam between ranks is the same length-framed
-canonical-JSON control seam the worker drives an executor with (`internal/seam.py`), so the
-frame is control and never pickle: a follower that unpickled would be a deserialization
-gadget on tenant-reachable input. The value vocabulary is CLOSED - JSON scalars, list,
-tuple, str-keyed dict, and tensor values - and anything else
-is a typed refusal raised on rank 0 at send time, with the group still coherent.
-
-Bytes never ride the frame. A tensor's payload lands in the attempt SPOOL, the one road
-data takes in this runtime, as raw little-endian storage under a name rank 0 minted; the
-frame carries the name, dtype and shape, and a follower reads the file into ITS device.
+Tensor bytes live in the call's shared spool. Followers read the exact dtype and
+shape onto their own device. Values are snapshots; aliases, generators, callbacks
+and other Python state are not transported.
 """
 
 from __future__ import annotations

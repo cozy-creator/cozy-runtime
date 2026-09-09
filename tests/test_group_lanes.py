@@ -1,24 +1,7 @@
-"""Group lanes (cr-068): one executor sealed to K devices, K ranks under one cgroup.
+"""Group placement bookkeeping and sealed executor lifecycle regressions.
 
-Every arm below drives the REAL code path — the real `LaneSet`, the real worker, a real
-executor process sealed by the real trampoline, real follower executor processes spawned by
-rank 0 over a real `socketpair` seam and a real torch.distributed rendezvous. Nothing is
-patched.
-
-WHAT IS REAL AND WHAT IS OWED. This box has ONE card. Proven here on the RTX 4070: the
-fuse/split bookkeeping and every typed pin refusal; the per-device ledger rows and the MIN
-ceiling; the chooser refusing the ladder under a group; a group is ONE seat and the wire
-(`lanes[]`, `device_lane_id`, `device_pins`; proto-024) says so; the author's opt-in
-reaching the PackageInterface and its fixed-point scan; an executor sealed to `0,1` reading both
-entries and NVLS-off from its own `/proc`
-environment; the seal, degree and construction refusals of a group prepare; the reclaim
-proof iterating K devices; a degree-1 prepare byte-identical to a plain one. Proven on GLOO
-(torch in this interpreter, CPU process group, real follower executor processes): the
-rendezvous on a kernel-chosen port, the barrier, the broadcast plan's divergence refusal, a
-follower's death observed through its seam, a follower that never dials back judged by its
-own meter. OWED to a two-card box, skipping with the reason: the NCCL group over two real
-devices, the mirrored Ulysses attempt, follower-death poisoning mid-attempt, and the
-per-device absence proof over two driver-readable cards.
+Actual sharded component forwards and native residency are exercised separately
+in test_parallel_calls.py. These tests do not establish multi-GPU H3 performance.
 """
 
 from __future__ import annotations
