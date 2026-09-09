@@ -388,6 +388,8 @@ class Placement:
     #: measured fit (or the RecordOwner's pin) before activation, empty while unassigned;
     #: on the wire as `PlacementStatus.device_lane_id` (proto-024).
     lane_id: str = ""
+    #: The operational pin this placement was converged under, including a failed assignment.
+    device_pin: tuple[int, ...] | None = None
     #: The environment THIS boot materialized when it prepared a local revision. The
     #: wheels were the pod host's carriers and are gone once the PlacementSet is journaled,
     #: so the placement over that revision serves from this environment instead of
@@ -3175,8 +3177,9 @@ class Worker:
 
     # ------------------------------------------------------------- the desired state
 
-    @staticmethod
-    def _placement_from_entry(entry: Mapping[str, Any], placement_set_digest: bytes) -> Placement:
+    def _placement_from_entry(
+        self, entry: Mapping[str, Any], placement_set_digest: bytes
+    ) -> Placement:
         package_interface = dict(entry.get("package_interface", {}))
         return Placement(
             placement_id=str(entry.get("placement_id", "")),
@@ -3193,6 +3196,7 @@ class Worker:
             entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
             environment=dict(entry.get("environment", {})),
             document=dict(entry),
+            device_pin=self.accepted.device_pins.get(str(entry.get("placement_id", ""))),
         )
 
     def _apply_desired_state(self, desired: pb.DesiredWorkerState) -> None:
@@ -3460,6 +3464,7 @@ class Worker:
             previous is not None
             and previous.placement_id == placement_id
             and previous.document == candidate.document
+            and previous.device_pin == candidate.device_pin
         ):
             previous.placement_set_digest = desired_set.placement_set_digest
             self.pending = None
@@ -3592,7 +3597,19 @@ class Worker:
                 f"draining {outgoing.placement_id or '(unnamed)'} and handing off the device",
             )
             self.await_drained()
-            if outgoing.placement_id != candidate.placement_id:
+            if outgoing.device_pin != candidate.device_pin:
+                current = self.supervision.current
+                if current is not None:
+                    try:
+                        self.supervision.retire_current(current, "placement device pin changed")
+                    except ExecutorGone as exc:
+                        self.latched = f"executor_reclaim_failed: {exc}"[:200]
+                        self._settle()
+                        return
+            if (
+                outgoing.placement_id != candidate.placement_id
+                or outgoing.device_pin != candidate.device_pin
+            ):
                 self._release_lane(outgoing.placement_id)
         # THE LANE, before the executor exists to be sealed to it (cr-066): the same
         # placement id keeps its lane across a replacement; a new one is placed by fit.
@@ -3672,7 +3689,10 @@ class Worker:
             placement_id
             for placement_id, placement in desired.items()
             if placement_id in self.hosted
-            and self.hosted[placement_id].placement.document != placement.document
+            and (
+                self.hosted[placement_id].placement.document != placement.document
+                or self.hosted[placement_id].placement.device_pin != placement.device_pin
+            )
         }
         self._retire_hosted(set(desired) - changed)
         for placement_id, placement in desired.items():
