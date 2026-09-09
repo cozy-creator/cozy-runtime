@@ -1495,6 +1495,15 @@ class AttemptEngine:
             if kind == "model_reader":
                 if attempt.job is None:
                     raise ValueError("a model read requires the current job")
+                if frame.get("operation") in {
+                    "open",
+                    "read",
+                } and self.weights.writer_broker.payload_pending(attempt):
+                    return {
+                        "ok": False,
+                        "code": "weights_reader_writer_pending",
+                        "detail": "read before reserving a payload, or use writer source_read_into",
+                    }
                 # Exact Model inputs already grant read access. The broker verifies
                 # those immutable input refs; it grants no output or write authority.
                 return self.weights.reader_broker.handle(attempt, frame)

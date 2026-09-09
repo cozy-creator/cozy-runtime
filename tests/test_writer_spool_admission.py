@@ -112,6 +112,7 @@ def test_spool_admission_survives_rpc_thread_changes_and_releases_on_finish(
 
             on_thread(bound)
             assert not released.is_set()
+            assert broker.payload_pending(attempt)
             assert (
                 broker.handle(
                     attempt, {**fields, "operation": "bound", "target_operation": "part"}
@@ -131,6 +132,7 @@ def test_spool_admission_survives_rpc_thread_changes_and_releases_on_finish(
         assert released.wait(3), "writer completion/cancel left disk admission held"
         server.join(3)
         assert not failures and not broker.pending
+        assert not broker.payload_pending(attempt)
         assert len(seen) == 2  # Native body plus actual spool/scratch copy.
         assert seen[1]["bytes"] >= 4
         monkeypatch.setattr(storage, "_channel", None)
