@@ -2,7 +2,7 @@
 
 Run as a child process by `tests/test_attention_selection.py`, which skips it where torch,
 diffusers 0.40.0 or a CUDA device is missing. Nothing here is faked: the modules are
-diffusers' own `Attention` at real head dimensions and dtypes, the pin is read back off the
+diffusers' own `WanAttention` at real head dimensions and dtypes, the pin is read back off the
 processors diffusers itself would dispatch through, and one pinned site runs one real forward.
 
 The cr-127 self-check arms plant the h3a-013 defect the only faithful way: by replacing what
@@ -19,7 +19,7 @@ import json
 from typing import Any
 
 import torch
-from diffusers.models.attention_processor import Attention
+from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
 
 from cozy_runtime.internal import attention
 from cozy_runtime.internal.encoding import DeviceFacts
@@ -37,8 +37,10 @@ def _device() -> DeviceFacts:
     )
 
 
-def _site(dim: int, heads: int, dtype: torch.dtype) -> Attention:
-    return Attention(query_dim=dim, heads=heads, dim_head=dim // heads).to("cuda", dtype)
+def _site(dim: int, heads: int, dtype: torch.dtype) -> WanAttention:
+    return WanAttention(
+        dim=dim, heads=heads, dim_head=dim // heads, processor=WanAttnProcessor()
+    ).to("cuda", dtype)
 
 
 def _backends(roots: dict[str, Any]) -> dict[str, list[str]]:
@@ -226,7 +228,7 @@ def main() -> None:
     print(json.dumps(out))
 
 
-def _fp8(device: DeviceFacts, dit: Attention) -> dict[str, Any]:
+def _fp8(device: DeviceFacts, dit: WanAttention) -> dict[str, Any]:
     """cr-136: the fp8 path through the real registry — refused by name where the snapshot is
     absent, otherwise resolved, self-checked, pinned on a real site and run."""
     from diffusers.models.attention_dispatch import _HUB_KERNELS_REGISTRY, AttentionBackendName

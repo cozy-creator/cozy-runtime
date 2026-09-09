@@ -1,127 +1,11 @@
-"""The runtime picks the fastest attention kernel this device and this image support (cr-124).
+"""Select and install attention backends for constructed diffusers modules.
 
-ATTENTION IS WEIGHTLESS. No checkpoint stores an attention kernel, so no checkpoint can name
-one, and binding a kernel to a lane pointer was a category error (decision #707 as amended
-2026-09-08). The only genuine weight-to-kernel coupling is in the GEMMs — fp8-rowwise weights need a
-rowwise-fp8 GEMM, mxfp8 needs block scales — and that coupling is already expressed by the
-checkpoint's own weight encoding plus `resolution.py`'s encoded-leaf routing. It needs no
-contract, and neither does this.
+Selection checks device architecture, installed artifacts, a numerical smoke test,
+site dtype/head dimension, and context-parallel support. Explicit pins refuse
+unsupported sites. Automatic selection tries candidates in order.
 
-THE RULE IS STATIC AND VERSIONED. `CANDIDATES` is an ordered table whose order is MEASURED on
-the device it claims, never asserted from a vendor's benchmark. Selection walks it and takes
-the first entry this device admits, this image ships, and the attention site's own dtype and
-head dimension fit. Nothing is measured at run time and nothing falls back per call, so what
-ran is a pure function of (device, image digest, checkpoint) — which is why one BOOT line is
-the whole record and no per-attempt attestation is kept.
-
-A NUMERICS-CHANGING KERNEL IS NOT AUTOMATICALLY FASTER, and speed is not the only thing a
-rank asserts. 8-bit attention has been measured (h3a-013, H100 SXM, H3's own geometry):
-SageAttention2 sm90 is 1.12x flash-attn3, and flash-attn3's OWN fp8-e4m3 path — the same baked
-`.so` the bf16 entry loads — is 1.31x. That fp8 path is RANK 1 ON sm90 (cr-138, owner decision
-2026-09-08), and the rest of this section is the record of what the decision knowingly takes:
-
-  An EXACT kernel needs no quality evidence to be promoted. flash-attn3 became rank 1 over
-  cuDNN on a speed measurement alone because the two agree to max abs 1.2e-7, FOUR orders
-  BELOW bf16's own 2.3e-3 representation floor — the same computation, reordered. The
-  generated video still moved (26.5 dB PSNR, 0.873 SSIM against the paired control), because a
-  30-step sampler amplifies any perturbation; that is a property of the sampler, not a defect
-  of either kernel, and it is provable that the arithmetic did not change.
-
-  An INEXACT kernel cannot make that argument. fp8 sits at 3.9e-2 rel L2 on Gaussian rows and
-  5.3e-2 on QK-normed ones — the model's own regime, and the worse figure — 16-23x the bf16
-  floor. Nothing we own can separate "fp8 degrades quality" from "fp8 changes the sample":
-  h3a-001's population gate is unbuilt, cozy-eval has no ratified conditions, and h3a-020 §5
-  MEASURED that `cozy-eval compare` refuses the paired video form for an attention-backend
-  change. h3a-013 parked it in `PINNABLE` on exactly that reasoning, with the pin as the
-  instrument that would produce the evidence. The owner then took the speed anyway, pre-launch,
-  with the gap stated rather than closed: 1.292x (5 s) / 1.317x (14 s) served through this
-  runtime with the per-call quantisation inside the timed call, composing on run 419's basis
-  to 3.06 -> 2.68 c/s at 5 s and 5.82 -> 4.70 at 14 s. It still misses the 2.5 target, and it
-  is at the kernel's physical ceiling — at head dimension 128 the softmax runs on the MUFU at
-  16 lanes/clk/SM and does not shrink with the GEMM (h3a-013 pass 3) — so no faster dense
-  8-bit arm is waiting to be ranked above it. WHAT IS OWED: h3a-001's population gate, and
-  before that a listening check — nobody has yet watched or listened to a single
-  fp8-attention clip, on a model whose joint audio is the differentiator and where the 4-bit
-  sweep measured audio degrading ~5x more than video under quantisation error (h3-4bit.md).
-  Both are recorded on cr-138. A kernel nobody has listened to is ranked here because the
-  owner said so, not because the question was settled.
-
-  The promotion changes nothing about HOW a site is admitted. fp8 serves bf16/fp16 at head
-  dimension <= 128 — a strict subset of the bf16 entry's sites — so the only sites that move
-  are ones the bf16 entry already served, and every site that kept the floor keeps it (the two
-  H3 VAEs, x37, on dtype). And it does not serve context parallelism: its backend registers
-  `supports_context_parallel=False`, so a site in a SHARDED placement (degree > 1) admits only
-  a kernel diffusers can shard and falls through to the bf16 entry. That capability is read
-  from diffusers' registry at the pin rather than restated on the row, for the reason
-  `_admit_arch` reads a binary's archs from its artifact: a second copy drifts. At degree 4
-  fp8 was measured no faster than bf16 anyway (decision #714g), and `cp.py` refuses a sharded
-  site holding it rather than serving it unsharded.
-
-  It could not be spelled here at first: diffusers 0.40.0's `_flash_3_hub` backend hard-codes
-  `q_descale=k_descale=v_descale=None` and constrains q/k/v to bf16/fp16, so FA3-fp8 is not an
-  `AttentionBackendName` diffusers knows. `attention_fp8.py` (cr-136) registers that per-call
-  quantising dispatch path as a backend member of its own, over the same baked snapshot the
-  bf16 entry loads, held to its own numeric budget by the same self-check as every other entry.
-
-AN IMPORT IS NOT A PROOF THAT A KERNEL COMPUTES. h3a-013 measured the image's baked
-`sageattention` sm90 kernel returning UNINITIALIZED MEMORY on an H100 — no exception, the right
-shape and dtype, rel L2 311, at 14.5x the card's fp8 peak because no kernel launched at all
-(upstream `sm90_compile.py` bound a `register_fake` meta stub over the `custom_op` of the same
-name). The image gate proved only that it imported and that its extension file existed; both
-were true. So a kernel is now PROVEN, once, at prepare, against exact fp32 attention on the
-device it will actually run on, and one that disagrees beyond its DECLARED budget is dropped
-from auto-selection and refused to a pin. This does not weaken the purity claim above: the
-verdict is a deterministic function of (device, image), computed once, never per call.
-
-The implausible RATE — 14.5x a card's theoretical peak — is the symptom that made the defect
-visible, and it is deliberately NOT the check. It would need a per-device peak table we do not
-maintain and would say nothing about a kernel that is merely wrong at a plausible speed. The
-numeric check catches the same failure with three orders of magnitude of margin (rel L2 311
-against a 0.2 budget) and no device-specific constant.
-
-AND THE CHECK ABOVE CANNOT RUN IF THE PROCESS IS ALREADY DEAD. A kernel with no device image
-for the card does not raise: FlashAttention-3's `flash_fwd_launch_template.h` prints
-`no kernel image is available for execution on the device` and calls `exit(1)`. h3a-022 measured
-exactly that on an sm_120 RTX PRO 6000 with the snapshot THIS image bakes, and there is no
-Python exception at any point — `_computes` never gets to run, `available`'s broad `except`
-never sees anything, and the pod dies at prepare with no typed refusal. A C++ abort is not
-recoverable, so it has to be UNREACHABLE. Admission is therefore bounded ABOVE as well as
-below, and a device outside a kernel's range is refused by name before the kernel is ever
-called.
-
-THE UPPER BOUND IS READ FROM THE BINARY, NOT DECLARED BESIDE IT. `kernels` writes a
-`metadata.json` next to every built variant whose `backend.archs` is the artifact's own
-statement of what it carries — the baked flash-attn3 snapshot says `["8.0", "9.0a"]`, and
-`9.0a` is architecture-CONDITIONAL, so it has an image for sm_90 and for nothing else. A static
-`max_sm` beside it would be a second copy of that list, and a second copy drifts: this table
-already said "sm90 and up" while the binary carried sm_90a, which is the whole defect. So a
-BAKED candidate declares no ceiling at all and is bounded by the metadata of the variant that
-was actually loaded; a candidate with no such artifact — torch's own backends, and a
-distribution whose diffusers backend names its architecture in its own name — carries a static
-`max_sm` with the reason it is not a guess. A baked artifact that declares no archs is a
-REFUSAL, not a pass: a check that reads nothing must not look like a check that read.
-
-AND A SNAPSHOT IS NOT ALWAYS A BINARY (h3a-024). FlashAttention-4 arrives through the same
-`kernels` Hub mechanism as flash-attn3 and is not the same kind of thing: it is 46 Python
-files of CuTe-DSL, ships device code for no card at all, and compiles for the one it finds at
-first use. So its `metadata.json` declares no `backend.archs` because it HAS none, and the
-refusal in the paragraph above would be reading silence as a claim in the one case where the
-silence is honest. Such an entry is marked `jit`, the arch check is not applied to it — there
-is no binary to bound — and its ceiling is the static `max_sm` claim, which it is admissible
-for the same reason torch's own backends' is: outside sm90-sm110 FA4 raises an ordinary
-Python `ValueError` that auto-selection's `except` already handles, rather than exiting from
-C++.
-
-NOTHING COMPILES ON THE REQUEST PATH, and that is a property of WHEN a kernel first runs, not
-of an artifact. The author's `warm` (cr-110) runs a dry forward after the fill and before the
-generation is Ready, so a `jit` kernel pays its compile there — measured at 2.5-5.9 s per key
-(h3a-024, sm_90a and sm_100a), against staging at 5.5-17 s and a weight pull in minutes.
-There is no image bake, no manifest and no cache-invalidation surface, because a bake would
-buy back ~20 s once per pod. WHAT THE WARM FORWARD ACTUALLY COVERS IS THE THING TO CHECK: the
-compile key is (dtype, head dims, GQA ratio, causal, mask/score-mod hash, arch, block sizes),
-sequence length is NOT in it, and h3a-024 measured the key identical from S=256 to S=109,000
-— but on sm_100 `q_stage` flips at S>128, so a warm forward SHORTER than that compiles a
-different key than the request it was meant to pay for.
+The FP8 rank is based on an H100 kernel benchmark, including quantization. It is
+inexact; that benchmark does not establish full-video speed or output quality.
 """
 
 from __future__ import annotations
@@ -150,12 +34,6 @@ else:
 #: fetched — a pod's executor has no network for it.
 IMAGE_KERNELS_DIR = Path("/opt/cozy/kernels")
 
-#: A `jit` kernel's compiled objects are NOT this module's to place. They go where every
-#: other upstream compiler cache goes — the worker-boot JIT scope (`internal/jit_cache.py`,
-#: named in `child_env.JIT_CACHE_ENV`), which is content-keyed, imposed on the executor at
-#: spawn and deleted when the worker shuts down. So a model re-prepared after eviction loads
-#: instead of recompiling, and nothing here reads an environment variable to arrange it.
-
 
 class AttentionRefusal(RuntimeError):
     """A typed refusal on the attention axis. Only a PIN can raise one; auto never does."""
@@ -169,99 +47,32 @@ class AttentionRefusal(RuntimeError):
 class Candidate:
     """One attention kernel the runtime knows how to reach, and what it needs to run."""
 
-    #: The stable public name. This is the execution-path override's vocabulary (cr-125) and
-    #: the word the boot line prints; it is NOT diffusers' backend spelling, which is an
-    #: implementation detail of the version we pin.
     name: str
-    #: diffusers' backend member value at `DIFFUSERS_VERSION`.
     backend: str
-    #: The lowest CUDA compute capability, as `DeviceFacts.sm` spells it (90 = sm90). This is a
-    #: FUNCTIONAL floor and it is allowed to be stricter than the binary: the baked flash-attn3
-    #: snapshot carries an sm_80 cubin, but FlashAttention-3's kernels are Hopper's and h3a-012
-    #: measured it on sm90, so sm90 is where the entry starts.
-    min_sm: int
-    #: Activation dtypes the kernel takes. Empty = any (torch's own dispatch).
-    dtypes: frozenset[str]
-    #: The largest per-head dimension the kernel serves. 0 = unbounded.
-    max_head_dim: int
-    #: The highest CUDA compute capability this candidate's binary has an image for; 0 = not
-    #: bounded here. A BAKED candidate MUST leave this 0 — its ceiling is read from the
-    #: artifact's own `metadata.json` (`_baked_archs`), because a static copy of a binary's
-    #: arch list is the drift that killed a Blackwell pod. 0 on a NON-baked candidate is a
-    #: CLAIM, not an omission: torch's in-tree backends are bounded by torch, they raise a
-    #: Python exception when they have no plan for a card (h3a-022 measured cuDNN doing exactly
-    #: that on sm_100 and computing fine on sm_120), and the floor may never be bounded at all
-    #: because a device it refused would hold no attention kernel whatsoever.
-    max_sm: int = 0
-    #: A `kernels` Hub snapshot the image BAKES, by distribution directory name; empty for a
-    #: kernel that is installed as an ordinary distribution or is torch's own.
+    min_sm: int  # CUDA capability, e.g. 90 for sm90; zero also admits CPU.
+    dtypes: frozenset[str]  # Empty admits all dtypes.
+    max_head_dim: int  # Zero is unbounded.
+    max_sm: int = 0  # Baked binaries use their artifact's architecture metadata instead.
     baked: str = ""
-    #: An installed distribution this kernel needs, by project name; empty when torch's own.
     distribution: str = ""
-    #: The snapshot carries SOURCE, not device code: it compiles for the card it finds, at
-    #: first use. `_admit_arch` is not applied to such an entry — not because the check is
-    #: inconvenient but because THERE IS NO BINARY TO BOUND, and a check with nothing to read
-    #: must not run at all rather than read nothing and pass. The ceiling is the static
-    #: `max_sm` claim instead, which a `jit` entry must therefore declare.
-    #:
-    #: This is the narrow difference between the two kernels that both arrive as `kernels`
-    #: Hub snapshots. flash-attn3's snapshot is compiled `.so`s whose `metadata.json` states
-    #: the architectures they carry, and calling one on a card outside that list kills the
-    #: process from C++. FA4's snapshot is 46 Python files, states no architectures because it
-    #: has none to state, and refuses a card it cannot serve with an ordinary Python
-    #: `ValueError` that auto-selection's own `except` already handles.
-    jit: bool = False
-    #: The relative-L2 disagreement with exact fp32 attention this kernel is ALLOWED at
-    #: `PROBE`, at which point it stops being attention. Every entry declares one, because the
-    #: budget is the statement of what the kernel is: an exact kernel may not drift past bf16's
-    #: own floor, and an 8-bit one is permitted its quantisation and nothing more.
-    rel_l2_max: float = 0.0
-    #: Why this entry sits where it sits. A rank is a MEASUREMENT or it is not a rank.
+    jit: bool = False  # Source kernels use the declared device range, not binary metadata.
+    rel_l2_max: float = 0.0  # Numerical smoke-test threshold, not an output-quality guarantee.
     why: str = ""
 
 
-#: RANKED, FASTEST FIRST — and every rank cites the run that put it there. A kernel with no
-#: measurement ON THIS DEVICE is not ranked, because a rank we cannot cite is a guess.
-#: Reordering this table changes what a pod computes, so it moves with the runtime version
-#: and with nothing else.
 CANDIDATES: tuple[Candidate, ...] = (
     Candidate(
         name="flash-attn3-fp8",
         backend=attention_fp8.BACKEND,
         min_sm=90,
         dtypes=frozenset({"bfloat16", "float16"}),
-        # 128 and not the bf16 entry's 256: the baked build instantiates e4m3 for hdim128 only
-        # (its `build.toml` lists `hdim128_e4m3_*_sm90` and no other e4m3 head dimension), so
-        # a 256-dim site handed to it would be refused by the kernel, not served. It is also
-        # where the measurement stops: the physics is per element — FA3 fp8 measured 701 / 946 /
-        # 1139 TF/s at head dim 64 / 128 / 256 (h3a-013 pass 3) — and the rank is asserted at
-        # 128 alone, H3's DiT being 56 x 128. A site outside it falls through to the next rank.
         max_head_dim=128,
-        # The SAME snapshot as `flash-attn3`, so the same artifact metadata bounds it above.
         baked="flash-attn3",
-        # A RANKED budget, tighter than the 1e-1 it carried as a pinnable. A pin's number is
-        # read by the developer who named it; a rank's by nobody, so this self-check is the
-        # only numeric witness on every pod that auto-selects it and has to refuse "a worse
-        # 8-bit kernel than the one measured", not only "not attention". MEASURED at `PROBE` on
-        # the H100 through this dispatch: 3.94e-2 (3.91e-2 at 4096 rows; per-tensor and
-        # per-head descales 3.84-3.96e-2; fused and eager quantisers 0 codes apart), and 5.3e-2
-        # on QK-normed rows, the model's own regime and the worst distribution measured. 6e-2
-        # admits all of that and refuses at ~1.5x the probe figure, under the smallest failure
-        # that has a name — a truncating cast, an e5m2 instantiation or a dropped descale each
-        # at least double it, and a kernel that returns V unchanged sits at 16. A refusal here
-        # costs 1.3x on one card and shows in the boot line; an admission that should not have
-        # happened shows nowhere.
         rel_l2_max=6e-2,
         why=(
-            "MEASURED on an H100 SXM through THIS runtime's dispatch (h3a-013 pass 3, "
-            "`results3/runtime_check.json`): 1.292x (5 s) / 1.317x (14 s) over flash-attn3 "
-            "with the per-call quantisation inside the timed call; kernel screen 946 vs 603 "
-            "TF/s at head dim 128; composed on run 419's basis 3.056 -> 2.676 c/s at 5 s and "
-            "5.817 -> 4.703 at 14 s. RANKED BY OWNER DECISION 2026-09-08 (cr-138), knowingly "
-            "INEXACT — rel L2 3.9e-2 Gaussian / 5.3e-2 QK-normed, 16-23x the bf16 floor — with "
-            "no population quality gate and no fp8 clip yet watched or listened to; still 7 % "
-            "short of the 5 s target and at the kernel's softmax-bound ceiling. Not "
-            "context-parallel: a sharded site falls through to the bf16 entry"
+            "H100 SXM kernel benchmark: 1.292x/1.317x versus BF16 FA3 at sequences "
+            "37,710/103,966, including quantization; h3a-013 results3/runtime_check.json. "
+            "Inexact; no clip qualification."
         ),
     ),
     Candidate(
@@ -270,21 +81,9 @@ CANDIDATES: tuple[Candidate, ...] = (
         min_sm=90,
         dtypes=frozenset({"bfloat16", "float16"}),
         max_head_dim=256,
-        # NO `max_sm`. This is the one entry whose ceiling is a BINARY's, and the binary says
-        # it: the baked snapshot's `metadata.json` declares `["8.0", "9.0a"]`, so the ceiling
-        # is sm_90 and it is read at resolution rather than restated here. Restating it is
-        # what broke: this row said sm90-and-up while the `.so` carried `sm_90a`, and h3a-022
-        # measured the consequence — `exit(1)` from C++ on an sm_120 card, before any check
-        # this module owns could run.
         baked="flash-attn3",
         rel_l2_max=2e-2,
-        why=(
-            "MEASURED on an H100 SXM (h3a-012, one DiT forward at S=106,932): 22.84 s of "
-            "attention against cuDNN's 28.45 s — 718 vs 576 TF/s, 29.02 vs 34.70 s per "
-            "forward. On the SERVED path (th-186 run 410, FL2VA 5 s / 30 steps) 159.6 s "
-            "execution against a paired 181.2 s control: -14.3 % s/step. Same math to "
-            "kernel-precision noise: max abs 1.2e-7, rel L2 2.8e-10, audio bit-identical"
-        ),
+        why="H100 SXM attention: 22.84 s versus cuDNN 28.45 s per DiT forward; h3a-012.",
     ),
     Candidate(
         name="sdpa",
@@ -292,27 +91,12 @@ CANDIDATES: tuple[Candidate, ...] = (
         min_sm=0,
         dtypes=frozenset(),
         max_head_dim=0,
-        # UNBOUNDED IN BOTH DIRECTIONS, and that is the one bound this module may not add. A
-        # ceiling here would leave a card with no attention kernel at all, and there is
-        # nothing to protect it from: torch's chooser owns its own fallback down to the math
-        # backend, and its failures are Python exceptions the numeric self-check already
-        # catches (h3a-022 measured torch's own dispatch computing correctly on sm_120 at
-        # 365.0 TF/s).
         max_sm=0,
         rel_l2_max=2e-2,
-        why=(
-            "torch's own `scaled_dot_product_attention` dispatch, and the FLOOR: it takes "
-            "every dtype, head dimension and mask, so a site no ranked kernel admits still "
-            "runs. It is not a fallback nobody measured — on sm90 torch's C++ chooser already "
-            "selects cuDNN (h3a-012: 34.70 s/forward, the arm every H3 number is quoted "
-            "against), which is why pinning cuDNN explicitly buys nothing"
-        ),
+        why="PyTorch scaled_dot_product_attention; supports all site dtypes and head dimensions.",
     ),
 )
 
-#: ADMITTED AND NAMEABLE, BUT NOT RANKED. Two different reasons, both the same rule: a rank is
-#: a measurement. Name one with the execution-path override (cr-125) to measure it; a
-#: measurement that beats the table promotes it into `CANDIDATES` in a runtime release.
 PINNABLE: tuple[Candidate, ...] = (
     Candidate(
         name="flash-attn4",
@@ -320,31 +104,11 @@ PINNABLE: tuple[Candidate, ...] = (
         min_sm=90,
         dtypes=frozenset({"bfloat16", "float16"}),
         max_head_dim=256,
-        # sm90 THROUGH sm110, and BOTH ends are the kernel's own statement rather than a
-        # second copy of a binary's arch list — the drift `flash-attn3` may not risk. FA4
-        # ships no device code for any card, so there is no list to copy: `interface.py`
-        # reads `torch.cuda.get_device_capability()` and raises `Unsupported compute
-        # capability: {arch}. Supported: 9.x, 10.x, 11.x` outside that range. A recoverable
-        # Python exception, which is why this row carries a static ceiling and why `jit`
-        # turns `_admit_arch` off rather than leaving it to read an empty arch list.
         max_sm=110,
         baked="flash-attn4",
         jit=True,
         rel_l2_max=2e-2,
-        why=(
-            "NOT RANKED BECAUSE IT IS NOT YET MEASURED, and on this table that is the whole "
-            "reason. v1's B200 screen (h3a-022) is the only run that has touched it: on "
-            "sm_100 torch `native` and `_native_cudnn` both FAIL (`cuDNN Frontend error: No "
-            "valid execution plans built`), flash-attn3 ABORTS as the sm_90a build it is, "
-            "and FA4 was the only arm that ran at all — 1161.8 TF/s. So this entry exists to "
-            "make the 4xH100-vs-4xB200 comparison POSSIBLE, not to assert it: pin it, "
-            "measure it, and a measurement that beats the table promotes it in a runtime "
-            "release. On sm_120 the question is only 'is it faster', because torch's own "
-            "dispatch already serves there at 365 TF/s. IT IS NOT THE fp4 STORY: FA4's "
-            "`torch2cute_dtype_map` is float16/bfloat16/float32 and its interface has no fp8 "
-            "or fp4 path at all, so it unblocks Blackwell from 'nothing runs' and says "
-            "nothing about the 40-56% h3a-022 rests on SageAttention3's fp4 for"
-        ),
+        why="Unranked: limited B200 kernel screen in h3a-022, no controlled serving comparison.",
     ),
     Candidate(
         name="cudnn",
@@ -352,21 +116,9 @@ PINNABLE: tuple[Candidate, ...] = (
         min_sm=80,
         dtypes=frozenset({"bfloat16", "float16"}),
         max_head_dim=128,
-        # NO CEILING, and it is a claim rather than an oversight. This is torch's in-tree
-        # cuDNN frontend, not a binary of ours: it is built for whatever the image's cuDNN
-        # supports, and when it has no plan for a card it RAISES — v1's B200 screen got
-        # `cuDNN Frontend error: No valid execution plans built` on sm_100, which auto drops
-        # and a pin surfaces typed. h3a-022 then measured cuDNN 9.20 serving sm_120 at
-        # 373.6 TF/s, the fastest exact arm on that card, so a ceiling would be wrong as well
-        # as unnecessary.
         max_sm=0,
         rel_l2_max=2e-2,
-        why=(
-            "MEASURED SLOWER than the floor it duplicates (h3a-012): 34.99 s against 34.70 s, "
-            "because diffusers' wrapper adds three `.contiguous()` around the same cuDNN "
-            "kernel torch already picks. Nameable so the reference arm can be pinned "
-            "explicitly, never chosen"
-        ),
+        why="H100 SXM reference: 34.99 s per DiT forward versus native dispatch 34.70 s; h3a-012.",
     ),
     Candidate(
         name="sageattention",
@@ -374,31 +126,16 @@ PINNABLE: tuple[Candidate, ...] = (
         min_sm=90,
         dtypes=frozenset({"bfloat16", "float16"}),
         max_head_dim=128,
-        # sm90 AND ONLY sm90, and this ceiling cannot drift because the architecture is IN THE
-        # BACKEND NAME: `_sage_qk_int8_pv_fp8_cuda_sm90` reaches
-        # `sageattention._qattn_sm90`, which the image builds as
-        # `arch=compute_90a,code=sm_90a` — architecture-conditional, so it has an image for
-        # sm_90 and for nothing above or below it. h3a-022 measured
-        # `cudaErrorNoKernelImageForDevice` from this extension on sm_120. A future image that
-        # bakes an sm_120 SageAttention adds a NEW row for its own sm_120 entry point; it does
-        # not widen this one.
         max_sm=90,
         distribution="sageattention",
         rel_l2_max=2e-1,
         why=(
-            "8-bit attention: Q/K int8 per-thread, V fp8-e4m3 per-channel, fp32+fp32 PV. It "
-            "CHANGES THE NUMBERS, which the owner admits (2026-09-08). NOW TIMED (h3a-013, "
-            "H100 SXM at H3's geometry): 1.12x flash-attn3, against flash-attn3's own fp8 "
-            "path at 1.31x — so it is not even the best 8-bit arm, and 1.12x does not justify "
-            "a dependency. It also SHIPPED DEAD: worker images before th-192 baked upstream "
-            "eb615cf6, whose `sm90_compile.py` bound a `register_fake` meta stub over the "
-            "custom op, so every sm90 call returned its uninitialized output buffer at rel L2 "
-            "311 with no error. The self-check below refuses exactly that, on any image"
+            "H100 SXM kernel benchmark: 1.12x versus BF16 FA3; h3a-013. "
+            "Inexact and slower than the FP8 FA3 benchmark."
         ),
     ),
 )
 
-#: Every kernel the override may name, by public name.
 BY_NAME: dict[str, Candidate] = {c.name: c for c in (*CANDIDATES, *PINNABLE)}
 
 
@@ -462,15 +199,7 @@ def _capability(declared: str) -> tuple[int, int, str] | None:
 
 
 def _covers(declared: str, sm: int) -> bool:
-    """Does device code built for `declared` have an image for a device of capability `sm`?
-
-    NVIDIA's binary-compatibility rule and nothing more: a cubin built for X.y runs on X.z
-    where z >= y, and NEVER across a major generation — so sm_90a code has no image on sm_100
-    or sm_120 however close the numbers look. An ACCELERATED target (the `a` suffix) is
-    architecture-CONDITIONAL — Hopper's `wgmma` and Blackwell's `tcgen05` are only reachable
-    through it — and runs on exactly the architecture it was built for, so it does not even
-    carry forward to a higher minor. A FAMILY target (`f`, CUDA 13) does.
-    """
+    """Does device code built for `declared` have an image for a device of capability `sm`?"""
     parsed = _capability(declared)
     if parsed is None:
         return False
@@ -508,13 +237,7 @@ def _baked_archs(candidate: Candidate) -> dict[str, list[str]]:
 
 
 def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: DeviceFacts) -> None:
-    """Refuse a card that none of these baked variants has device code for.
-
-    Silence is NOT admission: a variant present but declaring no architecture is refused, the
-    same as one declaring the wrong ones — a check that read nothing must not look like a
-    check that passed. The one quiet case is no baked snapshot at all, which is `_load_baked`'s
-    `attention_kernel_absent` to report and not this function's business.
-    """
+    """Refuse a card that none of these baked variants has device code for."""
     if candidate.jit:
         # NOTHING TO READ, so nothing is checked here and the static `max_sm` on the row is
         # the whole ceiling. A source snapshot declares no architectures because it carries
@@ -539,20 +262,7 @@ def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: Devic
 
 
 def _load_baked(candidate: Candidate, device: DeviceFacts) -> tuple[Any, str]:
-    """Load the image's baked snapshot into diffusers' Hub slot so nothing is fetched.
-
-    diffusers resolves a Hub kernel over the network on first use; filling `kernel_fn` and the
-    wrapped forward/backward slots makes `_maybe_download_kernel_for_backend` a no-op, which
-    is the only reason a pod without egress can run FlashAttention-3 at all.
-
-    `_resolve` has already refused a card no baked variant claims. This repeats the check
-    against the variant `kernels` ACTUALLY resolved, which is the authoritative one — the
-    resolution is by torch ABI and CUDA version, not by architecture, so an image baking two
-    variants could pass the first check on one of them and load the other. Loading is safe on
-    any card (a `.so` full of Hopper cubins still dlopens on Blackwell); CALLING it is not, so
-    the check sits after the load and before diffusers' registry is touched, and a refused
-    kernel leaves no half-filled slot behind.
-    """
+    """Load the image's baked snapshot into diffusers' Hub slot so nothing is fetched."""
     if KERNELS_ABSENT:
         raise AttentionRefusal(
             "attention_kernel_absent",
@@ -624,17 +334,7 @@ PROBE: tuple[int, int, int, int] = (1, 256, 4, 128)
 
 
 def _computes(entry: Ready, device: DeviceFacts) -> None:
-    """PROVE the kernel computes attention on THIS device, or refuse it by name.
-
-    Runs one forward through the same `dispatch_attention_fn` a pinned processor dispatches
-    through — not a hand-rolled call to the kernel — and compares it against exact fp32
-    attention over the kernel's own inputs, so bf16's input rounding is not charged to it.
-
-    Non-finite output fails BEFORE the ratio, because a NaN comparison is False and would
-    otherwise report a pass. That is the whole reason this is written as a guard rather than a
-    one-line assert: the h3a-023 hazard note records live NaN reports for this kernel family on
-    Hopper, and the check that misses NaN is worse than no check.
-    """
+    """PROVE the kernel computes attention on THIS device, or refuse it by name."""
     if device.kind != "cuda":
         # There is no device to prove anything on, and the only entry a CPU executor admits is
         # torch's own eager dispatch. Silence here is the honest answer, not a skipped gate.
@@ -688,16 +388,7 @@ def _computes(entry: Ready, device: DeviceFacts) -> None:
 
 
 def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
-    """One candidate, proven present here AND proven to compute, or a typed refusal.
-
-    Present is not enough: an import and an extension file were both true of a kernel that
-    returned uninitialized memory (h3a-013), so resolution ends with `_computes`.
-
-    IT BEGINS WITH THE ARCHITECTURE, before diffusers or the loader is asked anything. The
-    artifact's own `metadata.json` needs neither, and a card it has no image for must be
-    refused wherever this runs — a dev box, a CI runner, a pod — not only where the rest of
-    the stack happens to be installed.
-    """
+    """One candidate, proven present here AND proven to compute, or a typed refusal."""
     _admit_arch(candidate, _baked_archs(candidate), device)
     registry = _registry()
     member = _member(candidate.backend)
@@ -734,13 +425,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
 
 
 def _device_admits(candidate: Candidate, device: DeviceFacts) -> str:
-    """Empty when this DEVICE is inside the candidate's DECLARED range, else why it is not.
-
-    Both ends, and the ceiling is the one this module was missing: an open-ended range is a
-    claim that the kernel serves every architecture ever built, which is false of every entry
-    that is a compiled binary rather than a dispatcher. A candidate whose ceiling belongs to a
-    baked artifact declares none here and is bounded by `_admit_arch` at resolution instead.
-    """
+    """Empty when this DEVICE is inside the candidate's DECLARED range, else why it is not."""
     if candidate.min_sm and (device.kind != "cuda" or device.sm < candidate.min_sm):
         return (
             f"{candidate.name} needs sm{candidate.min_sm} or better; this executor holds "
@@ -961,15 +646,7 @@ def line(
 
 
 def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
-    """A GROUP prepare's one attention fact, from its models' own `Applied.document()`s.
-
-    `documents` is model parameter -> that model's fact. Components are namespaced by the
-    parameter exactly as `resident` and `parked` are, sites are summed per kernel, the
-    offered set is unioned in rank order, and the PIN is the one every model of the set took
-    (cr-125): a group is one construction on one execution path, and a merged record that
-    dropped it rendered a pinned prepare as `auto over [...]`. None when no model holds a
-    site.
-    """
+    """A GROUP prepare's one attention fact, from its models' own `Applied.document()`s."""
     hosts: dict[str, dict[str, int]] = {}
     kernels: dict[str, int] = {}
     offered: list[str] = []
@@ -1002,21 +679,7 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
 def install(
     ready: list[Ready], roots: Mapping[str, Any], pin: str = "", degree: int = 1
 ) -> Applied:
-    """Pin the fastest admitted kernel on every attention site of the constructed components.
-
-    Per SITE, not per model: `set_attention_backend` would also move diffusers' PROCESS-GLOBAL
-    active backend, which is what carried a DiT's kernel into an fp16 VAE decode once (cr-122).
-    Setting `processor._attention_backend` is the same pin without the propagation.
-
-    A SHARDED site (`degree` > 1, sequence parallelism) admits only a kernel diffusers can
-    shard, and that is an admission rule like dtype and head dimension rather than a later
-    refusal: `cp.py` reads the backend off every site before arming and refuses the whole
-    placement on a CP-incapable one, so auto must fall through here, at the pin, to the next
-    rank — the fp8 entry is the one that does not shard (cr-138).
-
-    With a PIN (cr-125) `ready` holds exactly one kernel, and a site it does not admit is a
-    typed refusal rather than a quiet demotion.
-    """
+    """Pin the fastest admitted kernel on every attention site of the constructed components."""
     hosts: dict[str, dict[str, int]] = {}
     locations: dict[str, str] = {}
     for component, module, processor in _sites(roots):
@@ -1059,16 +722,7 @@ def select(
 
 
 def image_kernels(device: DeviceFacts) -> str:
-    """What this image and device can actually RUN, for a refusal message (cr-125).
-
-    Device-filtered first, so a card the entry does not claim is never probed; and it lists
-    what computes, not what imports — naming a kernel here that returns garbage would send a
-    developer straight at the trap the refusal was meant to steer them away from.
-
-    The filter is the FULL declared range, not just the floor. On a card above a kernel's
-    ceiling that is the difference between an answer and a dead process: probing means calling,
-    and calling a kernel with no image for the device exits from C++ (h3a-022).
-    """
+    """What this image and device can actually RUN, for a refusal message (cr-125)."""
     shipped: list[str] = []
     for candidate in (*CANDIDATES, *PINNABLE):
         if _device_admits(candidate, device):
