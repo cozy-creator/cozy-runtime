@@ -26,6 +26,7 @@ import csv
 import email.parser
 import enum
 import json
+import math
 import re
 import sysconfig
 import tomllib
@@ -225,11 +226,12 @@ _STRUCT_KEYWORDS = frozenset(
         "repr_omit_defaults",
     }
 )
-#: `tuple(...)`/`list(...)` over a folded sequence: the only builtins a constant may call.
+#: Closed builtins over already-folded sequences; no callbacks or arbitrary iterators.
 _SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
     "builtins.tuple": tuple,
     "builtins.list": list,
 }
+_SCALAR_REDUCTIONS = {"builtins.min": min, "builtins.max": max}
 #: A fold carries no local names unless a comprehension binds its own target.
 _NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
@@ -405,7 +407,7 @@ class Reader:
     ) -> Resolved:
         stmt = module.bindings.get(name)
         if stmt is None:
-            if name in _BUILTIN_TYPES:
+            if name in _BUILTIN_TYPES or f"builtins.{name}" in _SCALAR_REDUCTIONS:
                 return Vocab(f"builtins.{name}")
             if module.is_package:
                 try:
@@ -542,6 +544,18 @@ class Reader:
             self.refuse(module, node, "not a module-level constant")
         if isinstance(node, ast.Call):
             callee = self.resolve(module, node.func)
+            if isinstance(callee, Vocab) and callee.key in _SCALAR_REDUCTIONS:
+                if len(node.args) != 1 or node.keywords:
+                    self.refuse(module, node, "a reduction needs one sequence and no keywords")
+                values = self.fold(module, node.args[0], scope)
+                if not isinstance(values, (tuple, list)) or not values:
+                    self.refuse(module, node, "a reduction needs a nonempty tuple or list")
+                kind = type(values[0])
+                if kind not in (int, float, str) or any(type(value) is not kind for value in values):
+                    self.refuse(module, node, "a reduction needs scalars of one exact type")
+                if kind is float and any(not math.isfinite(value) for value in values):
+                    self.refuse(module, node, "a reduction needs finite floats")
+                return _SCALAR_REDUCTIONS[callee.key](values)
             if isinstance(callee, Vocab) and callee.key in _SEQUENCE_BUILTINS:
                 if len(node.args) != 1 or node.keywords:
                     self.refuse(module, node, "a sequence built from several arguments")
