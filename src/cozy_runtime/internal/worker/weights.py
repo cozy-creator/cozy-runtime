@@ -23,6 +23,7 @@ from typing import Any, BinaryIO, cast
 from urllib.parse import urlparse
 
 from cozy_runtime.internal import egress, fill
+from cozy_runtime.internal.model_reader import ModelReaderBroker
 from cozy_runtime.internal.weights_writer import WriterBroker
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents, weights_limits
@@ -146,6 +147,7 @@ class WeightsExchange:
         self.writer_broker = WriterBroker(
             self._store, checkpoint=self.record_checkpoint, store_root=store_root
         )
+        self.reader_broker = ModelReaderBroker(self._store, store_root=store_root)
 
     def record_checkpoint(
         self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]
@@ -447,6 +449,7 @@ class WeightsExchange:
     def close(self) -> None:
         """Forget receipt metadata; active transports release their own read leases."""
         self.writer_broker.close()
+        self.reader_broker.close()
         with self._lock:
             self._held = {}
 

@@ -229,6 +229,11 @@ class WriterBroker:
     def key(attempt: Any, transaction: str) -> tuple[str, int, str]:
         return attempt.request_id, attempt.attempt, transaction
 
+    def payload_pending(self, attempt: Any) -> bool:
+        """A source callback must not recursively acquire its writer's disk exclusion."""
+        with self.lock:
+            return any(key[:2] == (attempt.request_id, attempt.attempt) for key in self.pending)
+
     def authorize(
         self,
         attempt: Any,

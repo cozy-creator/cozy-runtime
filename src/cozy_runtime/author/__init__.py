@@ -120,6 +120,7 @@ from cozy_runtime.author._model import (
     sequence_parallel,
     uses_components,
 )
+from cozy_runtime.author._model_reader import WeightsReader, WeightsView
 from cozy_runtime.author._script import ScriptContext, script_app
 from cozy_runtime.author._services import (
     JOB_ONLY,
@@ -286,6 +287,7 @@ __all__ = [
     "WeightsOutput",
     "WeightsPart",
     "WeightsPartSource",
+    "WeightsReader",
     "WeightsReceipt",
     "WeightsSink",
     "WeightsSource",
@@ -294,6 +296,7 @@ __all__ = [
     "WeightsTarget",
     "WeightsTensor",
     "WeightsTransaction",
+    "WeightsView",
     "assert_declaration_shape",
     "attach_assessment",
     "attempt",

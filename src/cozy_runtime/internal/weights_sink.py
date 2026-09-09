@@ -183,6 +183,46 @@ def write_exchange_file(spool: Path, output_slot: str, kind: str, data: bytes) -
     return target
 
 
+def source_structure(header: Mapping[str, Any]) -> WeightsSource:
+    """Author-safe geometry from one native-validated header, shared by readers/writers."""
+    configs = header.get("configs") or {}
+    components = header.get("components")
+    if not isinstance(configs, Mapping) or not isinstance(components, Mapping):
+        raise ValueError("header configs/components are not mappings")
+    tensors: list[WeightsSourceTensor] = []
+    for component, table in components.items():
+        if not isinstance(table, Mapping):
+            raise ValueError(f"component {component!r} is not a tensor mapping")
+        for key, entry in table.items():
+            if not isinstance(entry, Mapping):
+                raise ValueError(f"tensor {component}/{key} is not a mapping")
+            logical = entry.get("logical")
+            parts = entry.get("parts")
+            if not isinstance(logical, Mapping) or not isinstance(parts, Mapping):
+                raise ValueError(f"tensor {component}/{key} has no logical/parts maps")
+            tensors.append(
+                WeightsSourceTensor(
+                    component=str(component),
+                    key=str(key),
+                    logical_dtype=str(logical["logical_dtype"]),
+                    encoding=str(entry["encoding"]),
+                    shape=tuple(int(value) for value in logical["shape"]),
+                    parts=tuple(
+                        WeightsSourcePart(
+                            name=str(role),
+                            dtype=str(part["dtype"]),
+                            shape=tuple(int(value) for value in part["shape"]),
+                        )
+                        for role, part in parts.items()
+                    ),
+                )
+            )
+    return WeightsSource(
+        configs=tuple(str(name) for name in configs),
+        tensors=tuple(tensors),
+    )
+
+
 class WeightsTransactionHost:
     """One immutable invocation's real TensorFS weights authority."""
 
@@ -418,42 +458,7 @@ class WeightsTransactionHost:
 
             held = self.store.manifest(manifest)
             header = tensorfs.parse_header(bytes(held["header"]))
-            configs = header.get("configs") or {}
-            components = header.get("components")
-            if not isinstance(configs, Mapping) or not isinstance(components, Mapping):
-                raise ValueError("header configs/components are not mappings")
-            tensors: list[WeightsSourceTensor] = []
-            for component, table in components.items():
-                if not isinstance(table, Mapping):
-                    raise ValueError(f"component {component!r} is not a tensor mapping")
-                for key, entry in table.items():
-                    if not isinstance(entry, Mapping):
-                        raise ValueError(f"tensor {component}/{key} is not a mapping")
-                    logical = entry.get("logical")
-                    parts = entry.get("parts")
-                    if not isinstance(logical, Mapping) or not isinstance(parts, Mapping):
-                        raise ValueError(f"tensor {component}/{key} has no logical/parts maps")
-                    tensors.append(
-                        WeightsSourceTensor(
-                            component=str(component),
-                            key=str(key),
-                            logical_dtype=str(logical["logical_dtype"]),
-                            encoding=str(entry["encoding"]),
-                            shape=tuple(int(value) for value in logical["shape"]),
-                            parts=tuple(
-                                WeightsSourcePart(
-                                    name=str(role),
-                                    dtype=str(part["dtype"]),
-                                    shape=tuple(int(value) for value in part["shape"]),
-                                )
-                                for role, part in parts.items()
-                            ),
-                        )
-                    )
-            return WeightsSource(
-                configs=tuple(str(name) for name in configs),
-                tensors=tuple(tensors),
-            )
+            return source_structure(header)
         except CapabilityError:
             raise
         except Exception as exc:
