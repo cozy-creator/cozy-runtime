@@ -37,11 +37,18 @@ this image already ships — is 1.31x. Neither is ranked, and the reason is not 
   buys an unverifiable quality risk for something that misses anyway.
 
   fp8 therefore belongs in `PINNABLE` — available for measurement, chosen deliberately — and
-  the pin is the instrument that produces the evidence a promotion would need. Note also that
-  it cannot be spelled here yet: diffusers 0.40.0's `_flash_3_hub` backend hard-codes
+  the pin is the instrument that produces the evidence a promotion would need. It could not be
+  spelled here at first: diffusers 0.40.0's `_flash_3_hub` backend hard-codes
   `q_descale=k_descale=v_descale=None` and constrains q/k/v to bf16/fp16, so FA3-fp8 is not an
-  `AttentionBackendName` at all. h3a-013 reached it by calling the baked kernel directly.
-  Adding it is a new dispatch path that quantises per call, not a row in this table.
+  `AttentionBackendName` diffusers knows. h3a-013 reached it by calling the baked kernel
+  directly. It IS spelled now (cr-136): `attention_fp8.py` registers that per-call quantising
+  dispatch path as a backend member of its own, over the same baked snapshot rank 1 loads, and
+  the `flash-attn3-fp8` row below names it — PINNABLE, held to its own numeric budget by the
+  same self-check as every other entry. It stays unranked for the reasons above, and for one
+  more that h3a-013's second pass settled with arithmetic: at head dimension 128 the fp8 kernel
+  is bound by the softmax, which runs on the MUFU at 16 lanes/clk/SM and does not shrink with
+  the GEMM, so ~1.3x is near this kernel's physical ceiling and no faster dense 8-bit arm
+  exists on sm90 to rank instead.
 
 AN IMPORT IS NOT A PROOF THAT A KERNEL COMPUTES. h3a-013 measured the image's baked
 `sageattention` sm90 kernel returning UNINITIALIZED MEMORY on an H100 — no exception, the right
@@ -114,6 +121,7 @@ from importlib import import_module, metadata
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.internal import attention_fp8
 from cozy_runtime.internal.anima_optimization import DIFFUSERS_VERSION
 from cozy_runtime.internal.encoding import DeviceFacts
 
@@ -336,6 +344,32 @@ PINNABLE: tuple[Candidate, ...] = (
             "311 with no error. The self-check below refuses exactly that, on any image"
         ),
     ),
+    Candidate(
+        name="flash-attn3-fp8",
+        backend=attention_fp8.BACKEND,
+        min_sm=90,
+        dtypes=frozenset({"bfloat16", "float16"}),
+        # 128 and not the bf16 entry's 256: the baked build instantiates e4m3 for hdim128 only
+        # (its `build.toml` lists `hdim128_e4m3_*_sm90` and no other e4m3 head dimension), so
+        # a 256-dim site handed to it would be refused by the kernel, not served.
+        max_head_dim=128,
+        # The SAME snapshot as `flash-attn3`, so the same artifact metadata bounds it above.
+        baked="flash-attn3",
+        # MEASURED at the probe shape and at H3's own: 3.9e-2 rel L2 against exact fp32
+        # (h3a-013), ~17x bf16's floor and ~2.5x under this budget. A kernel that returns V
+        # unchanged sits at 16; the budget separates quantisation from not-attention.
+        rel_l2_max=1e-1,
+        why=(
+            "The fastest 8-bit arm on sm90 (h3a-013, H100 SXM, H3's geometry): 1.31x "
+            "flash-attn3 kernel-only, 1.29x with the per-call quantisation charged, from the "
+            ".so this image already ships. NOT RANKED: it is INEXACT (3.9e-2 rel L2, ~17x the "
+            "bf16 floor) and no gate we own can tell 'fp8 degrades quality' from 'fp8 changes "
+            "the sample'; at 2.68 c/s it also misses the 5 s cell's 2.5 target. And it is near "
+            "its own physical ceiling — at head dim 128 the kernel is softmax-bound on the "
+            "MUFU (h3a-013 pass 3), so a faster dense 8-bit kernel is not waiting to be found. "
+            "Pin it to measure quality; promotion needs h3a-001's population gate"
+        ),
+    ),
 )
 
 #: Every kernel the override may name, by public name.
@@ -376,6 +410,9 @@ def _registry() -> Any:
 
 
 def _member(backend: str) -> Any:
+    if backend == attention_fp8.BACKEND:
+        # OURS, not diffusers': registered into its registry on first use (cr-136).
+        return attention_fp8.member()
     from diffusers.models.attention_dispatch import AttentionBackendName
 
     return AttentionBackendName(backend)
@@ -519,6 +556,10 @@ def _load_baked(candidate: Candidate, device: DeviceFacts) -> tuple[Any, str]:
         ) from exc
     loaded = Path(str(getattr(module, "__file__", ""))).resolve().parent
     _admit_arch(candidate, {loaded.name: _declared_archs(loaded)}, device)
+    if candidate.backend == attention_fp8.BACKEND:
+        # The fp8 path binds the snapshot's forward to ITS OWN backend and leaves the bf16
+        # entry's Hub slot alone, so pinning one never rewires the other (cr-136).
+        return attention_fp8.bind(_lookup(module, "flash_attn_func", candidate.name)), str(loaded)
     from diffusers.models.attention_dispatch import _HUB_KERNELS_REGISTRY
 
     member = _member(candidate.backend)
