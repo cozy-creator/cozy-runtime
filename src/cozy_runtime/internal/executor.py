@@ -1143,7 +1143,9 @@ class Executor:
             if self.rank == 0:
                 assert self.group is not None
                 try:
-                    self.group.broadcast({**command, "group": {"plan": mine.document()}})
+                    self.group.broadcast(
+                        {"cmd": "prepare", **command, "group": {"plan": mine.document()}}
+                    )
                 except GroupRefusal as exc:
                     return self._group_refusal(exc)
             else:
