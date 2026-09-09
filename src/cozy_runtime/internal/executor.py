@@ -72,7 +72,7 @@ from cozy_runtime.internal.discovery import discover, discover_distribution, dis
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup, RankSpec, join_rank
-from cozy_runtime.internal.parallel.mirror import FollowerMirror, LeaderMirror
+from cozy_runtime.internal.parallel.mirror import mirror_component
 from cozy_runtime.internal.parallel.plan import (
     GroupPlan,
     GroupRefusal,
@@ -427,6 +427,7 @@ class Executor:
         self.residency: Any = None
         self.model_executors: list[Executor] = []
         self.models: dict[str, Any] = {}
+        self.group_components: dict[str, tuple[Any, Any]] = {}
         self.surface_names: dict[str, Any] = {}
         self.discovered: Any = None
         self.ready = False
@@ -539,7 +540,7 @@ class Executor:
         return {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
 
     def run(self, command: dict[str, Any]) -> dict[str, Any]:
-        """A FOLLOWER's half of one mirrored component-use call (cr-068)."""
+        """Run a prepared sharded component under its leader's scope and execution modes."""
         if self.rank == 0:
             return {
                 "ok": False,
@@ -550,32 +551,50 @@ class Executor:
             return {"ok": False, "code": "executor_not_ready", "detail": "no generation is Ready"}
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        model = self.models.get(str(command.get("model", "")))
-        method = str(command.get("method", ""))
-        if model is None or not method or method.startswith("_"):
-            self.poisoned = "mirrored call names no model method"
+        name = str(command.get("component", ""))
+        target = self.group_components.get(name)
+        if target is None:
+            self.poisoned = "mirrored call names no prepared sharded component"
             return {
                 "ok": False,
                 "code": "rank_divergence",
-                "detail": f"rank {self.rank} holds no {command.get('model')!r}.{method}",
+                "detail": f"rank {self.rank} holds no sharded component {name!r}",
                 "rank": self.rank,
             }
-        payloads = wire.TensorSpool(Path(str(command.get("spool", self.root))) / "ranks")
+        model, component = target
         try:
-            args, kwargs = wire.run_call(command, payloads, device=self._rank_device(self.torch))
-            with cp.gated_call():
-                getattr(model, method)(*args, **kwargs)
-            accel.synchronize(self.torch, self.device_kind)
+            spool = Path(command["spool"])
+            if self._attempt_spool != spool:
+                if self.residency is not None:
+                    self.residency.open_attempt(
+                        command["placement"],
+                        command["headroom_bytes"],
+                        command["scope_headroom_bytes"],
+                    )
+                self._attempt_spool = spool
+            # Admission precedes device input allocation, just as it did on the leader.
+            # Release drops the active hold; cached weights stay for the next DiT step.
+            with (
+                model._cozy_scope(command["scope_method"], tuple(command["scope_components"])),
+                self.torch.inference_mode(command["inference_mode"]),
+                self.torch.set_grad_enabled(command["grad_enabled"]),
+                cp.gated_call(),
+            ):
+                args, kwargs = wire.run_call(
+                    command, wire.TensorSpool(spool / "ranks"), device=self._rank_device(self.torch)
+                )
+                component(*args, **kwargs)
+                accel.synchronize(self.torch, self.device_kind)
         except Exception as exc:
             outcome = classify(exc)
-            self.poisoned = f"mirrored {method} failed: {outcome.code}"
+            self.poisoned = f"mirrored {name} failed: {outcome.code}"
             return {
                 "ok": False,
                 "code": outcome.code,
                 "detail": f"{type(exc).__name__}: {exc}"[:900],
                 "rank": self.rank,
             }
-        return {"ok": True, "rank": self.rank, "method": method}
+        return {"ok": True, "rank": self.rank, "component": name}
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
         """A group that could not form or hold is THIS process's poison: the worker
@@ -585,7 +604,7 @@ class Executor:
             self.group.close()
         return {"ok": False, "code": exc.code, "detail": exc.message[:900]}
 
-    def _install_group(self, torch: Any, model: Any, parameter: str) -> dict[str, Any] | None:
+    def _install_group(self, torch: Any, model: Any) -> dict[str, Any] | None:
         """Every rank shards its replica and takes its side of the mirror."""
         if self.world <= 1:
             return None
@@ -594,13 +613,17 @@ class Executor:
             installed = cp.install_context_parallel(model, degree=self.world, comms=comms)
         except GroupRefusal as exc:
             return self._group_refusal(exc)
-        mirror: LeaderMirror | FollowerMirror
-        if self.rank == 0:
-            assert self.group is not None
-            mirror = LeaderMirror(self.group, parameter, lambda: self._attempt_spool)
-        else:
-            mirror = FollowerMirror()
-        object.__setattr__(model, "_cozy_group", mirror)
+        for name, component in cp.sharding_candidates(model):
+            self.group_components[name] = (model, component)
+            if self.rank == 0:
+                assert self.group is not None
+                mirror_component(
+                    component,
+                    model=model,
+                    name=name,
+                    group=self.group,
+                    spool=lambda: self._attempt_spool,
+                )
         self.facts["sequence_parallel"] = {
             "degree": self.world,
             "rank": self.rank,
@@ -608,6 +631,16 @@ class Executor:
             "followers": list(self.group.pids()) if self.group is not None else [],
         }
         return None
+
+    def _warm_model(self, model: Any) -> float:
+        """Preparation has its own spool; component calls need no request to warm."""
+        from cozy_runtime.internal.warm import warm_generation
+
+        self._attempt_spool = self.root / "warm"
+        try:
+            return warm_generation(model, device=self._device(), cancel=lambda: bool(self.poisoned))
+        finally:
+            self._attempt_spool = None
 
     def preconstruct(self, command: dict[str, Any]) -> dict[str, Any]:
         """THE DEVICE-FREE HALF OF A CONSTRUCTION, run OFF the lane's device lock (cr-104).
@@ -925,7 +958,7 @@ class Executor:
             Variant,
             resolve,
         )
-        from cozy_runtime.internal.warm import WarmFailed, warm_generation
+        from cozy_runtime.internal.warm import WarmFailed
 
         stage("runtime_imports")
         refused = self._initialize_device(torch)
@@ -1480,24 +1513,19 @@ class Executor:
                             )
                         )
         self.facts = {}
-        refused = self._install_group(torch, model, binding["model_parameter_name"])
+        refused = self._install_group(torch, model)
         if refused is not None:
             return refused
         stage("install")
         # THE AUTHOR'S ONE WARM MOMENT (cr-110, model-lifecycle.md): after the fill, its
         # verification, the execution plan, the residency install and the group mirror;
         # before this generation is Ready, so a placement is never DISPATCHABLE over a cold
-        # generation. Rank 0 only under a group — its component-use scopes are mirrored to
-        # the followers exactly as a handler's are, and the spool is what carries their
-        # arguments. Every other rung of the ladder (cr-109's attention contract, h3a-018's
-        # entrypoint reuse) hooks THIS call, never a second one.
+        # generation. Rank 0 runs the warm method; its sharded component forwards reach
+        # the followers through the same mirror as ordinary inference.
         warm_ms = 0.0
         if self.rank == 0:
-            self._attempt_spool = self.root / "warm"
             try:
-                warm_ms = warm_generation(
-                    model, device=self._device(), cancel=lambda: bool(self.poisoned)
-                )
+                warm_ms = self._warm_model(model)
             except WarmFailed as exc:
                 # A CONSTRUCTION FAILURE, typed on the author's exception: the executor is
                 # poisoned and replaced like every other prepare refusal, and the binding
@@ -1511,8 +1539,6 @@ class Executor:
                     "state": backend.state,
                     "envelope": envelope,
                 }
-            finally:
-                self._attempt_spool = None
         stage("warm")
         group_facts = dict(self.facts)
         memory = accel.allocation(torch, self.device_kind)

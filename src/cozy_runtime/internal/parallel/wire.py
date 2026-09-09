@@ -5,7 +5,7 @@ handler passed to a component-use method. The seam between ranks is the same len
 canonical-JSON control seam the worker drives an executor with (`internal/seam.py`), so the
 frame is control and never pickle: a follower that unpickled would be a deserialization
 gadget on tenant-reachable input. The value vocabulary is CLOSED - JSON scalars, list,
-tuple, str-keyed dict, `torch.Tensor` and `torch.Generator` as its seed - and anything else
+tuple, str-keyed dict, and tensor values - and anything else
 is a typed refusal raised on rank 0 at send time, with the group still coherent.
 
 Bytes never ride the frame. A tensor's payload lands in the attempt SPOOL, the one road
@@ -15,6 +15,8 @@ frame carries the name, dtype and shape, and a follower reads the file into ITS 
 
 from __future__ import annotations
 
+import ctypes
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -40,13 +42,13 @@ class TensorSpool:
         self.written = 0
 
     def write(self, tensor: Any) -> str:
-        import torch
-
         self.directory.mkdir(parents=True, exist_ok=True)
         name = f"tensor-{self.written}.raw"
         self.written += 1
-        flat = tensor.detach().to("cpu").contiguous()
-        payload = bytes(flat.view(torch.uint8).untyped_storage()) if flat.numel() else b""
+        # data_ptr includes a slice's offset; storage bytes do not. Keep the tensor alive
+        # while copying exactly its logical bytes, including scalars and empty tensors.
+        flat = tensor.detach().to("cpu").resolve_conj().resolve_neg().contiguous()
+        payload = ctypes.string_at(flat.data_ptr(), flat.numel() * flat.element_size())
         (self.directory / name).write_bytes(payload)
         return name
 
@@ -59,6 +61,11 @@ class TensorSpool:
         kind = getattr(torch, dtype, None)
         if not isinstance(kind, torch.dtype):
             raise UncrossableArgument(f"unknown tensor dtype {dtype!r} on the wire")
+        expected = math.prod(shape) * torch.empty((), dtype=kind).element_size()
+        if len(raw) != expected:
+            raise UncrossableArgument(
+                f"tensor payload {name!r} has {len(raw)} bytes, expected {expected}"
+            )
         if not raw:
             return torch.empty(shape, dtype=kind, device=device)
         return torch.frombuffer(raw, dtype=kind).reshape(shape).to(device)
@@ -84,8 +91,6 @@ def marshal(value: Any, spool: TensorSpool, *, path: str = "") -> Any:
             "dtype": str(value.dtype).removeprefix("torch."),
             "shape": list(value.shape),
         }
-    if isinstance(value, torch.Generator):
-        return {_TAG: "generator", _VAL: int(value.initial_seed())}
     if isinstance(value, tuple):
         return {
             _TAG: "tuple",
@@ -111,14 +116,13 @@ def marshal(value: Any, spool: TensorSpool, *, path: str = "") -> Any:
     raise UncrossableArgument(
         f"{path or 'argument'} is a {type(value).__name__}, which cannot cross the rank seam. "
         "A mirrored model call carries JSON scalars, lists, tuples, str-keyed dicts, torch "
-        "tensors (through the attempt spool) and torch.Generator (as its seed); a closure, a "
+        "tensors (through the attempt spool); a generator, closure, "
         "callback, a request view or a live handle cannot be broadcast to follower ranks"
     )
 
 
 def unmarshal(value: Any, spool: TensorSpool, *, device: Any) -> Any:
     """Wire data -> the argument, on THIS rank's device."""
-    import torch
 
     if isinstance(value, dict):
         tag = value.get(_TAG)
@@ -129,8 +133,6 @@ def unmarshal(value: Any, spool: TensorSpool, *, device: Any) -> Any:
             return spool.read(
                 payload, str(value.get("dtype")), [int(n) for n in value.get("shape") or []], device
             )
-        if tag == "generator" and isinstance(payload, int):
-            return torch.Generator(device=device).manual_seed(payload)
         if tag == "tuple" and isinstance(payload, list):
             return tuple(unmarshal(v, spool, device=device) for v in payload)
         raise UncrossableArgument(
@@ -142,12 +144,11 @@ def unmarshal(value: Any, spool: TensorSpool, *, device: Any) -> Any:
 
 
 def run_command(
-    method: str, args: tuple[Any, ...], kwargs: Mapping[str, Any], spool: TensorSpool
+    args: tuple[Any, ...], kwargs: Mapping[str, Any], spool: TensorSpool
 ) -> dict[str, Any]:
-    """Marshal one model-method call as the `run` command every follower receives."""
+    """Marshal one component call as the `run` command every follower receives."""
     return {
         "cmd": "run",
-        "method": method,
         "args": [marshal(a, spool, path=f"args[{i}]") for i, a in enumerate(args)],
         "kwargs": {k: marshal(v, spool, path=k) for k, v in kwargs.items()},
     }

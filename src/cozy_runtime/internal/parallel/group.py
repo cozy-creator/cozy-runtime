@@ -224,13 +224,26 @@ class RankGroup:
                         self.forward(frame)
                 continue
             follower.replies.put(frame)
+            if frame.get("reply") == "run" and not frame.get("ok"):
+                self._break(
+                    f"rank {follower.rank} failed its mirrored call: "
+                    f"{frame.get('code')}: {frame.get('detail', '')}"[:600]
+                )
         follower.replies.put(None)
         self._break(follower.gone)
 
     def _break(self, why: str) -> None:
-        if not self.broken:
-            self.broken = why
+        if self.broken:
+            return
+        self.broken = why
         self._abort_collectives()
+        # A live follower can fail before entering a collective its peers have entered.
+        # Closing those processes releases the peer connections too, including on gloo
+        # where the experimental NCCL abort API cannot unblock the leader.
+        for follower in self.followers:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                if follower.exit_status() is None:
+                    follower.process.send_signal(signal.SIGKILL)
 
     def _abort_collectives(self) -> None:
         """A dead follower must not park rank 0 on a collective that cannot complete:
@@ -356,6 +369,7 @@ class RankGroup:
     def close(self) -> None:
         """Teardown of THIS group only, idempotent. The cgroup is the authority: followers
         are told to leave, then killed; the worker proves their absence."""
+        pg, self.pg = self.pg, None
         for follower in self.followers:
             with contextlib.suppress(SeamError, OSError):
                 follower.channel.send({"cmd": "shutdown"})
@@ -366,7 +380,6 @@ class RankGroup:
             with contextlib.suppress(OSError):
                 follower.process.wait()
             follower.channel.close()
-        pg, self.pg = self.pg, None
         if pg is not None:
             with contextlib.suppress(Exception):
                 importlib.import_module("torch.distributed").destroy_process_group()
