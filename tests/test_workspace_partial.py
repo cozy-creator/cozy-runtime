@@ -20,10 +20,17 @@ from cozy_runtime.protocol import worker_pb2 as pb
 def accepted(workspace: Workspace, request: str, *, memoize: bool = True) -> tuple[bytes, str]:
     raw = documents.canonical_bytes(
         pb.InvocationSpec(
+            outputs=[
+                pb.OutputBinding(
+                    output_id="model",
+                    mime_type="application/vnd.cozy.model-manifest",
+                    max_bytes=4096,
+                )
+            ],
             job=pb.JobInvocationSpec(
                 build_id="sha256:" + "22" * 32,
                 job_descriptor_id="sha256:" + "33" * 32,
-            )
+            ),
         )
     )
     spec = hashlib.sha256(raw).digest()
@@ -76,7 +83,9 @@ def failed(workspace: Workspace, request: str, spec: bytes) -> None:
     )
 
 
-def fixture(tmp_path: Path, *, memoize: bool = True) -> tuple[Any, ...]:
+def fixture(
+    tmp_path: Path, *, memoize: bool = True, fingerprint: str = "sha256:" + "45" * 32
+) -> tuple[Any, ...]:
     store = tensorfs.Store.init(tmp_path / "store")
     workspace = Workspace(Path(store.root))
     spec, transaction = accepted(workspace, "first", memoize=memoize)
@@ -89,7 +98,6 @@ def fixture(tmp_path: Path, *, memoize: bool = True) -> tuple[Any, ...]:
     }
     targets = {"model": {"add": {"a": tensor, "b": tensor}, "drop": []}}
     order = [("model", "a"), ("model", "b")]
-    fingerprint = "sha256:" + "45" * 32
     declaration = store.derived_declaration(
         {}, targets, {}, order, 4096, work_fingerprint=fingerprint
     )
