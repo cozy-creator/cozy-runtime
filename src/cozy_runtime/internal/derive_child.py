@@ -47,6 +47,7 @@ class SlotRequest:
     slot: str
     config: bytes
     assets: Mapping[str, bytes] = field(default_factory=dict)
+    tensor_dtypes: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +71,7 @@ class DeriveRequest:
                     "slot": row.slot,
                     "config": row.config,
                     "assets": dict(sorted(row.assets.items())),
+                    "tensor_dtypes": None if row.tensor_dtypes is None else dict(row.tensor_dtypes),
                 }
                 for row in self.slots
             ],
@@ -120,7 +122,7 @@ def read_request(raw: bytes) -> DeriveRequest:
         raise DeriveRefusal("derive_request_invalid", "slots is a non-empty array")
     slots: list[SlotRequest] = []
     for row in encoded_rows:
-        if not isinstance(row, dict) or set(row) != {"slot", "config", "assets"}:
+        if not isinstance(row, dict) or set(row) != {"slot", "config", "assets", "tensor_dtypes"}:
             raise DeriveRefusal("derive_request_invalid", "slot row field set")
         slot = row["slot"]
         config = row["config"]
@@ -143,7 +145,16 @@ def read_request(raw: bytes) -> DeriveRequest:
             if not isinstance(name, str) or not name or not isinstance(value, bytes):
                 raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} asset")
             assets[name] = value
-        slots.append(SlotRequest(slot, config, assets))
+        dtypes = row["tensor_dtypes"]
+        if dtypes is not None and (
+            not isinstance(dtypes, dict)
+            or any(
+                not isinstance(k, str) or not k or not isinstance(v, str) or not v
+                for k, v in dtypes.items()
+            )
+        ):
+            raise DeriveRefusal("derive_request_invalid", f"slot {slot!r} tensor dtypes")
+        slots.append(SlotRequest(slot, config, assets, dtypes))
     names = [row.slot for row in slots]
     if names != sorted(set(names)):
         raise DeriveRefusal("derive_request_invalid", "slots are sorted unique by path")
@@ -376,7 +387,13 @@ def main() -> int:
             if row.slot in sources:
                 requirements.append(SourceSlot(row.slot))
             else:
-                requirements.append(_derive_twice(binding, Config(document, "config"), row.assets))
+                requirements.append(
+                    _derive_twice(
+                        binding,
+                        Config(document, "config", tensor_dtypes=row.tensor_dtypes),
+                        row.assets,
+                    )
+                )
     except DeriveRefusal as err:
         _emit({"error": err.code, "detail": err.detail})
         return int(Exit.structural)
