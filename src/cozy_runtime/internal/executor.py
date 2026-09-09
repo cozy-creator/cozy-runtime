@@ -239,8 +239,14 @@ class _CompositeResidency:
         headroom_bytes: int,
         scope_headroom_bytes: dict[str, int] | None = None,
     ) -> None:
-        for row in self.rows.values():
-            row.open_attempt(placement, headroom_bytes, scope_headroom_bytes)
+        for name, row in self.rows.items():
+            prefix = name + "."
+            scoped = {
+                key.removeprefix(prefix): value
+                for key, value in (scope_headroom_bytes or {}).items()
+                if key.startswith(prefix)
+            }
+            row.open_attempt(placement, headroom_bytes, scoped)
 
     def vacate(self) -> dict[str, Any]:
         """Every slot frees its own components; the reports merge under the slot prefix."""
@@ -427,7 +433,12 @@ class Executor:
         self.residency: Any = None
         self.model_executors: list[Executor] = []
         self.models: dict[str, Any] = {}
-        self.group_components: dict[str, tuple[Any, Any]] = {}
+        self.group_components: dict[tuple[str, str], tuple[Any, Any]] = {}
+        self.group_sharded: set[tuple[str, str]] = set()
+        self._group_parent: Executor | None = None
+        self._group_model_key = ""
+        self._group_model_keys: tuple[str, ...] = ()
+        self._group_attempts: dict[str, Path] = {}
         self.surface_names: dict[str, Any] = {}
         self.discovered: Any = None
         self.ready = False
@@ -553,9 +564,20 @@ class Executor:
             return {"ok": False, "code": "executor_not_ready", "detail": "no generation is Ready"}
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        name = str(command.get("component", ""))
+        named = command.get("component")
+        if (
+            not isinstance(named, list)
+            or len(named) != 2
+            or not all(isinstance(part, str) for part in named)
+        ):
+            return {
+                "ok": False,
+                "code": "rank_divergence",
+                "detail": "component identity is not a model/root pair",
+            }
+        name = (named[0], named[1])
         target = self.group_components.get(name)
-        if target is None:
+        if target is None or name not in self.group_sharded:
             self.poisoned = "mirrored call names no prepared sharded component"
             return {
                 "ok": False,
@@ -563,30 +585,55 @@ class Executor:
                 "detail": f"rank {self.rank} holds no sharded component {name!r}",
                 "rank": self.rank,
             }
-        model, component = target
+        _model, component = target
+        models = {key[0]: model for key, (model, _root) in self.group_components.items()}
         try:
             spool = Path(command["spool"])
-            if self._attempt_spool != spool:
-                if self.residency is not None:
-                    self.residency.open_attempt(
-                        command["placement"],
-                        command["headroom_bytes"],
-                        command["scope_headroom_bytes"],
-                    )
-                self._attempt_spool = spool
-            # Admission precedes device input allocation, just as it did on the leader.
-            # Release drops the active hold; cached weights stay for the next DiT step.
-            with (
-                model._cozy_scope(command["scope_method"], tuple(command["scope_components"])),
-                self.torch.inference_mode(command["inference_mode"]),
-                self.torch.set_grad_enabled(command["grad_enabled"]),
-                cp.gated_call(),
-            ):
+            scopes = command["scopes"]
+            if not isinstance(scopes, list) or not 1 <= len(scopes) <= len(models):
+                raise GroupRefusal("mirrored scope set is not a bounded prepared model set")
+            seen: set[str] = set()
+            active: dict[str, tuple[str, ...]] = {}
+            with contextlib.ExitStack() as stack:
+                for scope in scopes:
+                    key = scope["model"]
+                    if key not in models or key in seen:
+                        raise GroupRefusal("mirrored scope names an unknown or duplicate model")
+                    seen.add(key)
+                    components = tuple(scope["components"])
+                    if not components or any(
+                        (key, root) not in self.group_components for root in components
+                    ):
+                        raise GroupRefusal("mirrored scope names no prepared component")
+                    residency = models[key]._cozy_residency
+                    if residency is not None and self._group_attempts.get(key) != spool:
+                        residency.open_attempt(
+                            scope["placement"],
+                            scope["headroom_bytes"],
+                            scope["scope_headroom_bytes"],
+                        )
+                        self._group_attempts[key] = spool
+                    stack.enter_context(models[key]._cozy_scope(scope["method"], components))
+                    active[key] = components
+                if name[0] not in active or name[1] not in active[name[0]]:
+                    raise GroupRefusal("sharded component has no active owning scope")
+                references = {
+                    key: root
+                    for key, (_owner, root) in self.group_components.items()
+                    if key[0] in active and key[1] in active[key[0]]
+                }
+                # Stage the same scopes before allocating the incoming activations.
+                stack.enter_context(self.torch.inference_mode(command["inference_mode"]))
+                stack.enter_context(self.torch.set_grad_enabled(command["grad_enabled"]))
+                stack.enter_context(cp.gated_call())
                 args, kwargs = wire.run_call(
-                    command, wire.TensorSpool(spool / "ranks"), device=self._rank_device(self.torch)
+                    command,
+                    wire.TensorSpool(spool / "ranks", references),
+                    device=self._rank_device(self.torch),
                 )
                 component(*args, **kwargs)
                 accel.synchronize(self.torch, self.device_kind)
+            self._attempt_spool = spool
         except Exception as exc:
             outcome = classify(exc)
             self.poisoned = f"mirrored {name} failed: {outcome.code}"
@@ -596,7 +643,7 @@ class Executor:
                 "detail": f"{type(exc).__name__}: {exc}"[:900],
                 "rank": self.rank,
             }
-        return {"ok": True, "rank": self.rank, "component": name}
+        return {"ok": True, "rank": self.rank, "component": list(name)}
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
         """A group that could not form or hold is THIS process's poison: the worker
@@ -610,21 +657,36 @@ class Executor:
         """Every rank shards its replica and takes its side of the mirror."""
         if self.world <= 1:
             return None
-        comms = cp.CpComms(self.pg, self.rank, self._rank_device(torch))
-        try:
-            installed = cp.install_context_parallel(model, degree=self.world, comms=comms)
-        except GroupRefusal as exc:
-            return self._group_refusal(exc)
-        for name, component in cp.sharding_candidates(model):
-            self.group_components[name] = (model, component)
+        owner = self._group_parent or self
+        roots = {**self.backend.components, **self.backend.parked}
+        for component, root in roots.items():
+            owner.group_components[(self._group_model_key, component)] = (model, root)
+        candidates = cp.sharding_candidates(model)
+        # An explicitly group-compatible auxiliary model can be replicated beside a
+        # sharded model. The complete multi-model prepare still requires a sharded root.
+        installed: tuple[str, ...] = ()
+        if candidates or self._group_parent is None:
+            comms = cp.CpComms(self.pg, self.rank, self._rank_device(torch))
+            try:
+                installed = cp.install_context_parallel(model, degree=self.world, comms=comms)
+            except GroupRefusal as exc:
+                return self._group_refusal(exc)
+        for _label, component in candidates:
+            component_name = next((name for name, root in roots.items() if root is component), None)
+            if component_name is None:
+                return self._group_refusal(
+                    GroupRefusal("a sharded component is not a prepared root")
+                )
+            name = (self._group_model_key, component_name)
+            owner.group_sharded.add(name)
             if self.rank == 0:
                 assert self.group is not None
                 mirror_component(
                     component,
-                    model=model,
                     name=name,
+                    prepared=owner.group_components,
                     group=self.group,
-                    spool=lambda: self._attempt_spool,
+                    spool=lambda: owner._attempt_spool,
                 )
         self.facts["sequence_parallel"] = {
             "degree": self.world,
@@ -638,11 +700,14 @@ class Executor:
         """Preparation has its own spool; component calls need no request to warm."""
         from cozy_runtime.internal.warm import warm_generation
 
-        self._attempt_spool = self.root / "warm"
+        owner = self._group_parent or self
+        owner._attempt_spool = (
+            self.root / "warm" / hashlib.sha256(self._group_model_key.encode()).hexdigest()
+        )
         try:
             return warm_generation(model, device=self._device(), cancel=lambda: bool(self.poisoned))
         finally:
-            self._attempt_spool = None
+            owner._attempt_spool = None
 
     def preconstruct(self, command: dict[str, Any]) -> dict[str, Any]:
         """THE DEVICE-FREE HALF OF A CONSTRUCTION, run OFF the lane's device lock (cr-104).
@@ -764,6 +829,8 @@ class Executor:
         successful fill: no later command may enter the construction body and stack another
         generation on whatever the failed attempt retained.
         """
+        if self.rank > 0 and self._group_parent is None and "model_key" in command:
+            return self._prepare_group_model(command)
         if self._prepare_consumed:
             return {
                 "ok": False,
@@ -780,6 +847,50 @@ class Executor:
             raise
         if not reply.get("ok"):
             self.poisoned = self.poisoned or f"prepare refused: {reply.get('code', 'unknown')}"
+        return reply
+
+    def _prepare_group_model(self, command: dict[str, Any]) -> dict[str, Any]:
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        keys, key = command.get("group_model_keys"), command.get("model_key")
+        if (
+            not isinstance(keys, list)
+            or not 2 <= len(keys) <= 16
+            or not all(isinstance(item, str) and item for item in keys)
+            or keys != sorted(set(keys))
+            or key not in keys
+            or key != command.get("binding", {}).get("model_binding_path")
+            or (self._group_model_keys and tuple(keys) != self._group_model_keys)
+            or any(child._group_model_key == key for child in self.model_executors)
+        ):
+            self.poisoned = "group model identity changed or was prepared twice"
+            return {"ok": False, "code": "rank_divergence", "detail": self.poisoned}
+        self._group_model_keys = tuple(keys)
+        child = Executor(
+            self.channel, self.root, self.fill_forensics_dir, rank=self.rank, world=self.world
+        )
+        child._group_parent, child.pg = self, self.pg
+        child.device_kind = self.device_kind
+        child._device_ready = self._device_ready
+        child.discovered = self.discovered
+        child.surface_names = dict(self.surface_names)
+        self.model_executors.append(child)
+        reply = child.prepare(command)
+        if not reply.get("ok"):
+            self.poisoned = child.poisoned
+            return reply
+        self.discovered, self.surface_names = child.discovered, dict(child.surface_names)
+        self.models.update(child.models)
+        self.torch = child.torch
+        self._device_ready = child._device_ready
+        self.residency = _CompositeResidency(
+            {
+                next(iter(item.models)): item.residency
+                for item in self.model_executors
+                if item.residency is not None
+            }
+        )
+        self.ready = True  # prepared roots can receive their leader's warm calls
         return reply
 
     def _prepare_first(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -843,15 +954,16 @@ class Executor:
                     f"{list(broadcast.devices)}",
                     "rank": self.rank,
                 }
-        if degree > 1 and (
-            "models" in command or not command.get("binding", {}).get("model_class")
+        if (
+            degree > 1
+            and "models" not in command
+            and not command.get("binding", {}).get("model_class")
         ):
             self.poisoned = "sequence-parallel construction unsupported"
             return {
                 "ok": False,
                 "code": "sequence_parallel_unsupported",
-                "detail": "a group shards ONE model-bearing construction; a weightless or "
-                "multi-model placement serves at degree 1",
+                "detail": "a group requires a model-bearing construction",
             }
         if degree > 1 and self.rank == 0 and self.group is None:
             # RANKS 1..K-1 EXIST FROM HERE, before torch is imported: they dial back over
@@ -873,6 +985,7 @@ class Executor:
         if "models" in command:
             return self._prepare_many(command)
         binding = command["binding"]
+        self._group_model_key = str(binding.get("model_binding_path", ""))
         budgets = command["budgets"]
         started = time.perf_counter()
         # THE SEGMENT LEDGER (cr-102). A `prepare` that reports one total and one fill leg
@@ -1145,7 +1258,9 @@ class Executor:
             if self.rank == 0:
                 assert self.group is not None
                 try:
-                    self.group.broadcast({**command, "group": {"plan": mine.document()}})
+                    self.group.broadcast(
+                        {"cmd": "prepare", **command, "group": {"plan": mine.document()}}
+                    )
                 except GroupRefusal as exc:
                     return self._group_refusal(exc)
             else:
@@ -1185,6 +1300,7 @@ class Executor:
             checkpoints,
             rows,
             plan=plan,
+            device=str(self._rank_device(torch)),
             on_position=position,
             window_bytes=binding.get("window_bytes", WINDOW_BYTES),
             slots=binding.get("slots", RING_SLOTS),
@@ -1688,12 +1804,27 @@ class Executor:
         for row in rows:
             binding = row["binding"]
             parameter = str(binding["model_parameter_name"])
-            child = Executor(self.channel, self.root, self.fill_forensics_dir)
+            child = Executor(
+                self.channel, self.root, self.fill_forensics_dir, rank=self.rank, world=self.world
+            )
+            if self.world > 1:
+                child._group_parent, child.group, child.pg = self, self.group, self.pg
+            child.device_kind = self.device_kind
+            child._device_ready = self._device_ready
             child.discovered = self.discovered
             child.surface_names = dict(self.surface_names)
-            reply = child._prepare_first(
+            reply = child.prepare(
                 {
                     **row,
+                    **(
+                        {
+                            "model_key": binding["model_binding_path"],
+                            "group_model_keys": paths,
+                            "sequence_parallel_degree": self.world,
+                        }
+                        if self.world > 1
+                        else {}
+                    ),
                     "devices": command.get("devices", ""),
                     "authorized_device_limit_bytes": max(authorized - held, 0),
                     # One construction, one execution path: every model of a set takes the
@@ -1702,14 +1833,19 @@ class Executor:
                 }
             )
             if reply.get("ok"):
+                self._device_ready = child._device_ready
                 held = int(reply["facts"].get("allocator_bytes", held))
             if not reply.get("ok"):
                 self.poisoned = f"model {parameter} refused: {reply.get('code', 'unknown')}"
                 return {**reply, "model_parameter": parameter}
             self.discovered = child.discovered
             self.surface_names = dict(child.surface_names)
+            if self.world > 1:
+                self.pg = child.pg
             children.append((parameter, child, reply))
 
+        if self.world > 1 and not self.group_sharded:
+            return self._group_refusal(GroupRefusal("the model set contains no sharded component"))
         self.model_executors = [child for _, child, _ in children]
         self.torch = children[-1][1].torch
         self.models = {}

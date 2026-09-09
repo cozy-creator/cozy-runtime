@@ -7,6 +7,7 @@ import json
 import socket
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -252,10 +253,18 @@ def main() -> None:
         else collective_model(args.root / f"rank-{args.rank}" if args.staged else None)
     )
     executor.residency = model._cozy_residency
+    executor._group_model_key = "fixture"
+    roots = (
+        {"dit": model.dit, "text_encoder": model.text_encoder}
+        if args.h3
+        else {"block": model.block, "overlay": model.overlay, "spare": model.spare}
+    )
+    executor.backend = SimpleNamespace(components=roots, parked={})
     executor.torch = torch
     executor.ready = True
     if not args.h3:
-        executor.group_components["block"] = (model, model.block)
+        executor.group_components = {("fixture", key): (model, root) for key, root in roots.items()}
+        executor.group_sharded.add(("fixture", "block"))
     while (command := channel.recv()) is not None:
         name = command["cmd"]
         if name == "shutdown":

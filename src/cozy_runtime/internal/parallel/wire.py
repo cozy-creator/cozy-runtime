@@ -2,7 +2,8 @@
 
 Tensor bytes live in the call's shared spool. Followers read the exact dtype and
 shape onto their own device. Values are snapshots; aliases, generators, callbacks
-and other Python state are not transported.
+and other Python state are not transported. A module can cross only as the identity
+of a prepared component root whose owning scope is active on every rank.
 """
 
 from __future__ import annotations
@@ -29,9 +30,14 @@ class TensorSpool:
     """Where one mirrored call's tensor payloads live: a directory rank 0 writes and every
     follower reads. Files are numbered per call and removed by the caller with the call."""
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(
+        self, directory: Path, components: Mapping[tuple[str, str], Any] | None = None
+    ) -> None:
         self.directory = directory
         self.written = 0
+        # References identify already prepared local roots, never a serialized module graph.
+        self.components = dict(components or {})
+        self.component_names = {id(root): key for key, root in self.components.items()}
 
     def write(self, tensor: Any) -> str:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -83,6 +89,13 @@ def marshal(value: Any, spool: TensorSpool, *, path: str = "") -> Any:
             "dtype": str(value.dtype).removeprefix("torch."),
             "shape": list(value.shape),
         }
+    if isinstance(value, torch.nn.Module):
+        key = spool.component_names.get(id(value))
+        if key is None:
+            raise UncrossableArgument(
+                f"{path or 'argument'} is not a prepared component in an active model scope"
+            )
+        return {_TAG: "component", _VAL: list(key)}
     if isinstance(value, tuple):
         return {
             _TAG: "tuple",
@@ -125,6 +138,16 @@ def unmarshal(value: Any, spool: TensorSpool, *, device: Any) -> Any:
             return spool.read(
                 payload, str(value.get("dtype")), [int(n) for n in value.get("shape") or []], device
             )
+        if tag == "component":
+            if (
+                set(value) != {_TAG, _VAL}
+                or not isinstance(payload, list)
+                or len(payload) != 2
+                or not all(isinstance(part, str) for part in payload)
+                or (payload[0], payload[1]) not in spool.components
+            ):
+                raise UncrossableArgument("component reference has no prepared active owner")
+            return spool.components[(payload[0], payload[1])]
         if tag == "tuple" and isinstance(payload, list):
             return tuple(unmarshal(v, spool, device=device) for v in payload)
         raise UncrossableArgument(

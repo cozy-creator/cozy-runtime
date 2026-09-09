@@ -93,6 +93,13 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
     leader: Any = Executor(Channel(ours), tmp_path, world=degree)
     leader.device_kind = "cpu"
     leader.group = group
+    leader._group_model_key = "fixture"
+    roots = (
+        {"dit": model.dit, "text_encoder": model.text_encoder}
+        if kind == "h3"
+        else {"block": model.block, "overlay": model.overlay, "spare": model.spare}
+    )
+    leader.backend = SimpleNamespace(components=roots, parked={})
     try:
         group.spawn()
         group.form(torch, {})
@@ -112,10 +119,14 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
             assert leader._attempt_spool is None
             assert leader._warm_model(model) >= 0
             assert leader._attempt_spool is None
-            assert not list((tmp_path / "warm" / "ranks").iterdir())
+            assert not list((tmp_path / "warm").rglob("tensor-*.raw"))
         else:
             mirror_component(
-                model.block, model=model, name="block", group=group, spool=lambda: spool
+                model.block,
+                name=("fixture", "block"),
+                prepared={("fixture", key): (model, root) for key, root in roots.items()},
+                group=group,
+                spool=lambda: spool,
             )
         for attempt in ("attempt-a", "attempt-b"):
             spool = tmp_path / attempt

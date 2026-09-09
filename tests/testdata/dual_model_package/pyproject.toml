@@ -1,0 +1,5 @@
+[project]
+name = "dual-model-package"
+version = "0.0.1"
+requires-python = ">=3.12"
+dependencies = ["cozy-runtime>=0.16.3,<1", "torch>=2.13", "diffusers==0.40.0"]
