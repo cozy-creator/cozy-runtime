@@ -2476,8 +2476,9 @@ class Executor:
 
             from cozy_runtime.internal.weights_writer import StoreProxy
 
+            weights_store = StoreProxy(store, spool, self._durable)
             weights_host = weights_sink.WeightsTransactionHost(
-                store=StoreProxy(store, spool, self._durable),
+                store=weights_store,
                 owner_scope=owner_scope,
                 request_id=weights_request_id,
                 invocation_spec_digest=invocation_spec_digest,
@@ -2492,7 +2493,7 @@ class Executor:
             )
             weights_open = weights_host.open
             weights_source_structure = weights_host.structure
-            weights_source_config = weights_host.config
+            weights_source_config = weights_store.config
 
         from cozy_runtime.author._services import (
             BudgetFacts,
