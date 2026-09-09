@@ -62,7 +62,7 @@ def _refusal(run: Any) -> attention.AttentionRefusal:
 # ------------------------------------------------------------------------- the static rule
 
 
-RANKED = ["flash-attn3-fp8", "flash-attn3", "sdpa"]
+RANKED = ["flash-attn3", "sdpa"]
 
 
 def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
@@ -138,10 +138,11 @@ def test_every_nameable_kernel_has_one_name_and_one_backend() -> None:
     backends = [c.backend for c in (*attention.CANDIDATES, *attention.PINNABLE)]
     assert len(names) == len(set(names)) == len(set(backends))
     assert set(attention.BY_NAME) == set(names)
-    # A numerics-changing kernel is admitted and NAMEABLE, and it is not ranked, because
-    # nothing has timed it here. That is the whole reason `PINNABLE` exists.
-    assert "sageattention" in {c.name for c in attention.PINNABLE}
-    assert "sageattention" not in {c.name for c in attention.CANDIDATES}
+    # Both quantized-activation kernels remain explicit choices. A speed result
+    # alone does not make their numerical change an automatic model default.
+    for name in ("flash-attn3-fp8", "sageattention"):
+        assert name in {c.name for c in attention.PINNABLE}
+        assert name not in {c.name for c in attention.CANDIDATES}
 
 
 @pytest.mark.parametrize(
@@ -521,17 +522,26 @@ def test_the_attention_processor_uses_the_installed_backend() -> None:
 
 
 def _h3_shaped() -> dict[str, Any]:
-    """H3's construction as its served boot line records it (h3a-012): two DiTs of 52 bf16
-    sites at head dim 128 (56 x 128 in the model; two heads here), two VAEs whose 37 sites
-    hold fp32 and keep the floor on dtype."""
-    import torch
+    """Real H3 attention classes at reduced width, on meta; VAE dtype-only stand-ins.
 
-    return {
-        "fl2va_dit": _sites_of(52, dim_head=128, heads=2, dtype=torch.bfloat16),
-        "ref2va_dit": _sites_of(52, dim_head=128, heads=2, dtype=torch.bfloat16),
-        "audio_vae": _sites_of(16, dim_head=64, heads=1, dtype=torch.float32),
-        "video_vae": _sites_of(21, dim_head=64, heads=1, dtype=torch.float32),
-    }
+    The previous helper used WanAttention for every site, which never exercised
+    H3's processor despite the test name. No model weights or GPU are allocated.
+    """
+    import torch
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Attention
+
+    with torch.device("meta"):
+        dits = {
+            name: torch.nn.ModuleList(
+                [MiniMaxH3Attention(hidden_size=256, heads=2, dim_head=128) for _ in range(52)]
+            ).to(torch.bfloat16)
+            for name in ("fl2va_dit", "ref2va_dit")
+        }
+        return {
+            **dits,
+            "audio_vae": _sites_of(16, dim_head=64, heads=1, dtype=torch.float32),
+            "video_vae": _sites_of(21, dim_head=64, heads=1, dtype=torch.float32),
+        }
 
 
 def _backends(roots: Mapping[str, Any]) -> dict[str, list[str]]:
@@ -543,54 +553,48 @@ def _backends(roots: Mapping[str, Any]) -> dict[str, list[str]]:
     return {component: sorted(values) for component, values in out.items()}
 
 
-def test_auto_lands_fp8_on_h3s_dit_sites_and_on_nothing_else_over_real_modules() -> None:
-    """THE PROMOTION, on the construction H3 actually serves: every DiT site (x104, bf16 at
-    head dim 128) takes fp8, every VAE site (x37, fp32) keeps the floor, the boot line says so
-    in cr-124's format, and the pin is per SITE — diffusers' process-global active backend is
-    untouched (cr-122). Then THE RED ARM: the ordering before cr-138, on the same modules,
-    renders the old served record and holds no fp8 anywhere."""
+def test_auto_preserves_h3_attention_precision_and_explicit_fp8_remains_available() -> None:
     why = _diffusers_skip()
     if why:
         pytest.skip(why)
     from diffusers.models.attention_dispatch import _AttentionBackendRegistry
 
     roots = _h3_shaped()
+    weights = {name: [(id(p), p.dtype) for p in root.parameters()] for name, root in roots.items()}
     active = _AttentionBackendRegistry.get_active_backend()
     applied = attention.install(_ready(*RANKED), roots)
-    assert applied.totals() == {"flash-attn3-fp8": 104, "sdpa": 37}
+    assert applied.totals() == {"flash-attn3": 104, "sdpa": 37}
     assert applied.hosts == {
         "audio_vae": {"sdpa": 16},
-        "fl2va_dit": {"flash-attn3-fp8": 52},
-        "ref2va_dit": {"flash-attn3-fp8": 52},
+        "fl2va_dit": {"flash-attn3": 52},
+        "ref2va_dit": {"flash-attn3": 52},
         "video_vae": {"sdpa": 21},
     }
-    assert applied.line() == (
-        "flash-attn3-fp8 x104, sdpa x37 (auto over ['flash-attn3-fp8', 'flash-attn3', 'sdpa']) "
-        "— audio_vae: sdpa; fl2va_dit: flash-attn3-fp8; ref2va_dit: flash-attn3-fp8; "
-        "video_vae: sdpa"
-    )
     assert _backends(roots) == {
         "audio_vae": ["native"],
-        "fl2va_dit": ["_flash_3_hub_fp8"],
-        "ref2va_dit": ["_flash_3_hub_fp8"],
+        "fl2va_dit": ["_flash_3_hub"],
+        "ref2va_dit": ["_flash_3_hub"],
         "video_vae": ["native"],
     }
     assert _AttentionBackendRegistry.get_active_backend() == active
+    assert {
+        name: [(id(p), p.dtype) for p in root.parameters()] for name, root in roots.items()
+    } == weights
 
-    # RED ARM: the pre-cr-138 ordering on the same construction is the old served record.
-    before = attention.install(_ready("flash-attn3", "sdpa"), roots)
-    assert before.totals() == {"flash-attn3": 104, "sdpa": 37}
-    assert before.line().startswith(
-        "flash-attn3 x104, sdpa x37 (auto over ['flash-attn3', 'sdpa'])"
-    )
+    # Explicit comparisons keep the FP8 implementation. Automatic preparation
+    # after the pin restores BF16 on the same real H3 processor instances.
+    dits = {name: roots[name] for name in ("fl2va_dit", "ref2va_dit")}
+    pinned = attention.install(_ready("flash-attn3-fp8"), dits, "flash-attn3-fp8")
+    assert pinned.totals() == {"flash-attn3-fp8": 104}
+    assert all(values == ["_flash_3_hub_fp8"] for values in _backends(dits).values())
+    restored = attention.install(_ready(*RANKED), roots)
+    assert restored.totals() == {"flash-attn3": 104, "sdpa": 37}
     assert not any("_flash_3_hub_fp8" in values for values in _backends(roots).values())
 
 
-def test_a_site_outside_fp8s_range_falls_through_to_the_next_rank_and_is_never_forced() -> None:
-    """One construction, three sites, three kernels: a 128-dim bf16 site takes fp8, a 256-dim
-    fp16 site is outside fp8's admitted range and takes the bf16 entry (the kernel is
-    instantiated for e4m3 at 128 only, and the rank is measured there), an fp32 site keeps
-    the floor. Nothing is forced and nothing falls back per call."""
+def test_explicit_fp8_refuses_unsupported_sites_while_auto_preserves_dtype() -> None:
+    """Both eligible floating sites keep FA3; FP32 uses SDPA. An explicit
+    FP8 selection still refuses a head dimension it cannot execute."""
     why = _diffusers_skip()
     if why:
         pytest.skip(why)
@@ -603,17 +607,17 @@ def test_a_site_outside_fp8s_range_falls_through_to_the_next_rank_and_is_never_f
     }
     applied = attention.install(_ready(*RANKED), roots)
     assert applied.hosts == {
-        "dit": {"flash-attn3-fp8": 1},
+        "dit": {"flash-attn3": 1},
         "wide": {"flash-attn3": 1},
         "vae": {"sdpa": 1},
     }
     assert applied.line() == (
-        "flash-attn3 x1, flash-attn3-fp8 x1, sdpa x1 "
-        "(auto over ['flash-attn3-fp8', 'flash-attn3', 'sdpa']) "
-        "— dit: flash-attn3-fp8; vae: sdpa; wide: flash-attn3"
+        "flash-attn3 x2, sdpa x1 "
+        "(auto over ['flash-attn3', 'sdpa']) "
+        "— dit: flash-attn3; vae: sdpa; wide: flash-attn3"
     )
     assert _backends(roots) == {
-        "dit": ["_flash_3_hub_fp8"],
+        "dit": ["_flash_3_hub"],
         "wide": ["_flash_3_hub"],
         "vae": ["native"],
     }
@@ -624,10 +628,8 @@ def test_a_site_outside_fp8s_range_falls_through_to_the_next_rank_and_is_never_f
     assert "wide's attention: float16 activations at head dimension 256" in str(refused)
 
 
-def test_the_group_merge_renders_the_fp8_rank_from_its_models_own_facts() -> None:
-    """cr-135's merge path, with the new rank: two real DiT constructions and a VAE, merged
-    the way `_prepare_many` merges them, render one line naming x104 on fp8 — and PINNED
-    fp8 survives the merge as it must."""
+def test_group_merge_preserves_automatic_precision_and_explicit_fp8() -> None:
+    """A group reports the precision actually selected and retains explicit pins."""
     why = _diffusers_skip()
     if why:
         pytest.skip(why)
@@ -641,10 +643,10 @@ def test_the_group_merge_renders_the_fp8_rank_from_its_models_own_facts() -> Non
         }
     )
     assert auto is not None and auto["pin"] == ""
-    assert auto["kernels"] == {"flash-attn3-fp8": 104, "sdpa": 21}
+    assert auto["kernels"] == {"flash-attn3": 104, "sdpa": 21}
     assert auto["line"] == (
-        "flash-attn3-fp8 x104, sdpa x21 (auto over ['flash-attn3-fp8', 'flash-attn3', 'sdpa']) "
-        "— fl2va/dit: flash-attn3-fp8; ref2va/dit: flash-attn3-fp8; ref2va/vae: sdpa"
+        "flash-attn3 x104, sdpa x21 (auto over ['flash-attn3', 'sdpa']) "
+        "— fl2va/dit: flash-attn3; ref2va/dit: flash-attn3; ref2va/vae: sdpa"
     )
     pinned = attention.merge(
         {
@@ -673,7 +675,7 @@ def test_a_sharded_site_admits_only_a_kernel_diffusers_can_shard() -> None:
     import torch
 
     roots = {"dit": _sites_of(2, dim_head=128, heads=2, dtype=torch.bfloat16)}
-    assert attention.install(_ready(*RANKED), roots, degree=1).totals() == {"flash-attn3-fp8": 2}
+    assert attention.install(_ready(*RANKED), roots, degree=1).totals() == {"flash-attn3": 2}
     sharded = attention.install(_ready(*RANKED), roots, degree=4)
     assert sharded.totals() == {"flash-attn3": 2}
     assert sharded.offered == tuple(RANKED)
@@ -728,10 +730,7 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     chosen = ", ".join(f"{n} x{c}" for n, c in sorted(out["auto"]["kernels"].items()))
     assert out["auto"]["line"].startswith(chosen)
 
-    # cr-138: on EVERY card, each site takes the first offered kernel that admits it; where
-    # this card offers the fp8 rank (sm90 with the baked snapshot) that is fp8 on the 128-dim
-    # bf16 site and the bf16 entry on the 256-dim one — never forced — and a placement
-    # sharded at degree 4 holds no fp8 at all.
+    # Every site takes the first supported precision-preserving kernel.
     expected: dict[str, dict[str, int]] = {}
     for site in ("dit", "vae"):
         for name in out["offered"]:
@@ -741,17 +740,10 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
                 expected[site] = {name: 1}
                 break
     assert out["auto"]["hosts"] == expected
-    if "flash-attn3-fp8" in out["offered"]:
+    assert "flash-attn3-fp8" not in out["offered"]
+    if "flash-attn3" in out["offered"]:
         assert out["offered"] == RANKED
-        assert out["auto"]["hosts"] == {"dit": {"flash-attn3-fp8": 1}, "vae": {"flash-attn3": 1}}
-        assert out["auto"]["line"].startswith(
-            "flash-attn3 x1, flash-attn3-fp8 x1 "
-            "(auto over ['flash-attn3-fp8', 'flash-attn3', 'sdpa'])"
-        )
-        assert out["auto_degree4"]["hosts"] == {
-            "dit": {"flash-attn3": 1},
-            "vae": {"flash-attn3": 1},
-        }
+        assert out["auto"]["hosts"] == {"dit": {"flash-attn3": 1}, "vae": {"flash-attn3": 1}}
     assert "flash-attn3-fp8" not in out["auto_degree4"]["kernels"]
     assert out["auto_degree4"]["offered"] == out["offered"]
 

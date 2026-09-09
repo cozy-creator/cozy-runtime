@@ -2,10 +2,12 @@
 
 Selection checks device architecture, installed artifacts, a numerical smoke test,
 site dtype/head dimension, and context-parallel support. Explicit pins refuse
-unsupported sites. Automatic selection tries candidates in order.
+unsupported sites. Automatic selection preserves attention activation precision;
+quantizing those activations requires an explicit backend choice.
 
-The FP8 rank is based on an H100 kernel benchmark, including quantization. It is
-inexact; that benchmark does not establish full-video speed or output quality.
+The optional FP8 backend has an H100 kernel benchmark, including quantization.
+That result does not establish full-video speed or output quality; matched H3
+outputs exposed detail loss despite passing its numerical smoke test.
 """
 
 from __future__ import annotations
@@ -62,20 +64,6 @@ class Candidate:
 
 CANDIDATES: tuple[Candidate, ...] = (
     Candidate(
-        name="flash-attn3-fp8",
-        backend=attention_fp8.BACKEND,
-        min_sm=90,
-        dtypes=frozenset({"bfloat16", "float16"}),
-        max_head_dim=128,
-        baked="flash-attn3",
-        rel_l2_max=6e-2,
-        why=(
-            "H100 SXM kernel benchmark: 1.292x/1.317x versus BF16 FA3 at sequences "
-            "37,710/103,966, including quantization; h3a-013 results3/runtime_check.json. "
-            "Inexact; no clip qualification."
-        ),
-    ),
-    Candidate(
         name="flash-attn3",
         backend="_flash_3_hub",
         min_sm=90,
@@ -98,6 +86,20 @@ CANDIDATES: tuple[Candidate, ...] = (
 )
 
 PINNABLE: tuple[Candidate, ...] = (
+    Candidate(
+        name="flash-attn3-fp8",
+        backend=attention_fp8.BACKEND,
+        min_sm=90,
+        dtypes=frozenset({"bfloat16", "float16"}),
+        max_head_dim=128,
+        baked="flash-attn3",
+        rel_l2_max=6e-2,
+        why=(
+            "H100 SXM kernel benchmark: 1.292x/1.317x versus BF16 FA3 at sequences "
+            "37,710/103,966, including quantization; h3a-013 results3/runtime_check.json. "
+            "Inexact; no clip qualification."
+        ),
+    ),
     Candidate(
         name="flash-attn4",
         backend="flash_4_hub",
