@@ -2351,6 +2351,16 @@ class StreamingFillBackend:
         destination = self.enqueued[row.key]
         owner, replaced, attribute = self._leaf_site(row.key, row, destination)
         leaf = selection.provider.leaf(self.torch, parts, replaced, destination.dtype)
+        # Hooks are authored computation. Share their registries so existing handles
+        # still remove them after replacement and after a component is staged again.
+        for name in (
+            "_forward_pre_hooks",
+            "_forward_pre_hooks_with_kwargs",
+            "_forward_hooks",
+            "_forward_hooks_with_kwargs",
+            "_forward_hooks_always_called",
+        ):
+            setattr(leaf, name, getattr(replaced, name))
         # `nn.Module.__setattr__` is the whole reason this is machinery: it accepts the leaf
         # here precisely because the leaf is a Module, and would have refused the payload.
         setattr(owner, attribute, leaf)

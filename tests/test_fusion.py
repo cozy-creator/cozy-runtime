@@ -257,12 +257,28 @@ def _encode_leaves(torch: Any, transformer: Any) -> int:
 
 
 @needs_card
-@pytest.mark.parametrize("encoded", [False, True])
-def test_installed_block_matches_eager_transformer(encoded: bool) -> None:
+@pytest.mark.parametrize("encoded,hooked", [(False, False), (True, False), (True, True)])
+def test_installed_block_matches_eager_transformer(encoded: bool, hooked: bool) -> None:
     device = torch.device("cuda")
     transformer = _one_block_transformer(torch, device)
     if encoded:
         assert _encode_leaves(torch, transformer) == 5
+    hook_inputs = []
+    if hooked:
+
+        def observe_input(module: Any, args: tuple[Any, ...]) -> None:
+            assert isinstance(args[0], torch.Tensor)
+            hook_inputs.append(tuple(args[0].shape))
+
+        block = transformer.transformer_blocks[0]
+        for leaf in (
+            block.attn.to_q,
+            block.attn.to_k,
+            block.attn.to_v,
+            block.ff.net[0].proj,
+            block.ff.net[2],
+        ):
+            leaf.register_forward_pre_hook(observe_input)
     inputs = _packed_inputs(torch, device, seq=1536)
     video_eager, audio_eager = transformer(**inputs)
     holder = _Holder(transformer)
@@ -275,14 +291,17 @@ def test_installed_block_matches_eager_transformer(encoded: bool) -> None:
         "fl2va_dit.transformer_blocks.0.ff.net.0",
         "fl2va_dit.transformer_blocks.0",
     ]
-    assert applied.fp8_sites == (3 if encoded else 0)
+    assert applied.fp8_sites == (3 if encoded and not hooked else 0)
     assert applied.document()["substitutions"] == {
         "MiniMaxH3AttnProcessor->FusedMiniMaxH3AttnProcessor": 1,
         "SwiGLU->FusedSwiGLU": 1,
         "MiniMaxH3TransformerBlock->FusedMiniMaxH3TransformerBlock": 1,
     }
     block = transformer.transformer_blocks[0]
-    assert block._fusion_attn_fp8 is encoded and block.ff.net[0]._fusion_fp8 is encoded
+    assert block._fusion_attn_fp8 is (encoded and not hooked)
+    assert block.ff.net[0]._fusion_fp8 is (encoded and not hooked)
+    if hooked:
+        assert len(hook_inputs) == 10
     # The heads are float32; one block of one-ulp bf16 noise stays well inside 1e-2 there.
     for eager, fused in ((video_eager, video_fused), (audio_eager, audio_fused)):
         assert fused.dtype is torch.float32 and fused.shape == eager.shape
