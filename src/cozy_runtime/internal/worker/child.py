@@ -112,6 +112,11 @@ class Executor:
     scope: proctree.ExecutorScope
     channel: Channel
     seal_digest: str
+    #: `CUDA_VISIBLE_DEVICES` as this process was SEALED with it, verbatim (cr-066). The
+    #: seal is imposed once, at spawn, and a running process can never be re-sealed — so
+    #: this is what the executor actually serves, and reusing it for a lane whose
+    #: `devices` differ is what `executor.py` refuses as `env_seal_broken`.
+    sealed_devices: str = ""
     hello: dict[str, Any] = field(default_factory=dict)
     ready_bindings: set[str] = field(default_factory=set)
     construction_key: str = ""
@@ -824,6 +829,7 @@ class ExecutorSupervision:
                 scope=owner.scope,
                 channel=Channel(conn),
                 seal_digest=spawned.seal_digest,
+                sealed_devices=spawned.env.get("CUDA_VISIBLE_DEVICES", ""),
                 spawned_at=started,
             )
             # Identity is checked before `current` can point at it: a stale connector is not

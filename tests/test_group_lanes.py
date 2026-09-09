@@ -1171,3 +1171,70 @@ def test_two_real_cards_form_an_nccl_group_under_one_executor() -> None:
     fill the same plan, and the reclaim proves both devices ABSENT with one epoch bump.
     This body is the arm; it needs a second card to run and says so when it cannot."""
     raise AssertionError("two driver-readable cards found: write the live H3 arm here")
+
+
+@needs_executor
+def test_a_seal_width_change_is_a_replacement_not_a_reuse() -> None:
+    """THE DEFECT: a live executor is sealed ONCE, at spawn, and cannot be re-sealed.
+
+    A placement that starts on a one-device lane and is then assigned the K-device group
+    lane (cr-068) used to REUSE the running process: `_own_executor` asked whether it was
+    alive, unpoisoned, unreserved, unbound and model-free, and never whether it was sealed
+    to the devices it was about to serve. The prepare then reached `executor.py` and was
+    refused `env_seal_broken` -- correctly, since an executor serves exactly its lane's
+    devices -- but only AFTER the group had formed and 97.5 GiB of weights had been
+    fetched. Measured on a 2xH200 rental, 2026-09-08: `this executor is sealed to
+    CUDA_VISIBLE_DEVICES='0' and the prepare names '0,1'`.
+
+    `Executor.sealed_devices` records what the process was actually sealed with, so both
+    reuse paths can ask the question cr-066 answers: does this process serve THIS lane?
+    """
+    with _workspace() as root:
+        config = _config(root / "home")
+        worker = Worker(
+            config,
+            WorkerOptions(root=root / "worker", devices="0,1"),
+            InMemoryControlHost(),
+        )
+        group = worker.lanes.fuse((0, 1))
+        single = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
+        executor = worker.supervision.spawn(imposed=worker.imposed(single))
+        try:
+            # what the child really got, and what we recorded, are the same string
+            assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0"
+            assert executor.sealed_devices == "0"
+            # it MATCHES the lane it was spawned for, so an ordinary reuse still reuses
+            assert executor.sealed_devices == single.devices
+            # and it does NOT match the group lane, which is the whole fix: the reuse
+            # branch in `_own_executor` now falls through to `replace` instead of handing
+            # a one-card process to a two-card prepare
+            assert executor.sealed_devices != group.devices
+            assert group.devices == "0,1"
+            # the width change also adds the NVLS row a group communicator needs
+            # (pgw#929), which a reused one-device process would never have carried
+            assert "NCCL_NVLS_ENABLE" not in worker.imposed(single)
+            assert worker.imposed(group)["NCCL_NVLS_ENABLE"] == "0"
+        finally:
+            worker.supervision.close()
+
+
+@needs_executor
+def test_a_group_sealed_executor_records_both_ordinals() -> None:
+    """The same record, taken from the other side: spawned FOR the group, it says so."""
+    with _workspace() as root:
+        config = _config(root / "home")
+        worker = Worker(
+            config,
+            WorkerOptions(root=root / "worker", devices="0,1"),
+            InMemoryControlHost(),
+        )
+        group = worker.lanes.fuse((0, 1))
+        executor = worker.supervision.spawn(imposed=worker.imposed(group))
+        try:
+            assert executor.sealed_devices == "0,1" == group.devices
+            assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1"
+            # and it is not reusable for a one-card lane either -- the rule is symmetric
+            single = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
+            assert executor.sealed_devices != single.devices
+        finally:
+            worker.supervision.close()
