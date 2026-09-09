@@ -21,6 +21,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
+import tensorfs
+
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._errors import CapabilityError
@@ -223,6 +225,37 @@ def source_structure(header: Mapping[str, Any]) -> WeightsSource:
     )
 
 
+def source_config(store: Any, manifest: str, length: int, name: str) -> bytes:
+    """Read one config through native retained-source validation under the Store owner."""
+    try:
+        held = store.manifest(manifest)
+        structure = source_structure(tensorfs.parse_header(bytes(held["header"])))
+        if name not in structure.configs:
+            raise CapabilityError(
+                "weights source has no declared config with this name",
+                code="weights_config_ungranted",
+            )
+        inspected = store.inspect_derived_source(
+            manifest,
+            length,
+            list(dict.fromkeys(tensor.component for tensor in structure.tensors)),
+            [name],
+        )
+        configs = inspected["configs"]
+        if len(configs) != 1 or configs[0]["name"] != name:
+            raise ValueError("native config selection changed")
+        data = configs[0]["data"]
+        if not isinstance(data, bytes) or not 0 < len(data) <= MAX_WEIGHTS_SOURCE_READ:
+            raise ValueError("native config exceeds the source read bound")
+        return data
+    except CapabilityError:
+        raise
+    except Exception as exc:
+        raise CapabilityError(
+            f"TensorFS source config refused: {exc}", code="weights_source_refused"
+        ) from exc
+
+
 class WeightsTransactionHost:
     """One immutable invocation's real TensorFS weights authority."""
 
@@ -419,32 +452,7 @@ class WeightsTransactionHost:
                 "weights config source is outside the immutable grant",
                 code="weights_source_ungranted",
             )
-        try:
-            structure = self.structure(manifest)
-            if name not in structure.configs:
-                raise CapabilityError(
-                    "weights source has no declared config with this name",
-                    code="weights_config_ungranted",
-                )
-            inspected = self.store.inspect_derived_source(
-                manifest,
-                length,
-                list(dict.fromkeys(tensor.component for tensor in structure.tensors)),
-                [name],
-            )
-            configs = inspected["configs"]
-            if len(configs) != 1 or configs[0]["name"] != name:
-                raise ValueError("native config selection changed")
-            data = configs[0]["data"]
-            if not isinstance(data, bytes) or not 0 < len(data) <= MAX_WEIGHTS_SOURCE_READ:
-                raise ValueError("native config exceeds the source read bound")
-            return data
-        except CapabilityError:
-            raise
-        except Exception as exc:
-            raise CapabilityError(
-                f"TensorFS source config refused: {exc}", code="weights_source_refused"
-            ) from exc
+        return source_config(self.store, manifest, length, name)
 
     def structure(self, manifest: str) -> WeightsSource:
         """Project one granted Manifest to author-safe structural facts only."""
@@ -454,8 +462,6 @@ class WeightsTransactionHost:
                 code="weights_source_ungranted",
             )
         try:
-            import tensorfs
-
             held = self.store.manifest(manifest)
             header = tensorfs.parse_header(bytes(held["header"]))
             return source_structure(header)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import math
 import os
@@ -22,6 +23,7 @@ from typing import Any, BinaryIO, cast
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._weights import MAX_WEIGHTS_SOURCE_READ
 from cozy_runtime.internal import storage_admission
+from cozy_runtime.internal.weights_sink import source_config
 from cozy_runtime.protocol import weights_limits
 
 _TRANSACTION = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -29,7 +31,12 @@ _CHUNK = 1 << 20
 
 
 def _path(spool: Path, transaction: str, kind: str) -> Path:
-    if _TRANSACTION.fullmatch(transaction) is None or kind not in {"request", "input", "output"}:
+    if _TRANSACTION.fullmatch(transaction) is None or kind not in {
+        "request",
+        "input",
+        "output",
+        "source-config",
+    }:
         raise CapabilityError("invalid writer exchange identity", code="weights_writer_identity")
     return spool / f"weights-writer-{transaction[7:]}-{kind}"
 
@@ -82,6 +89,22 @@ class StoreProxy:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.store, name)
+
+    def config(self, manifest: str, name: str) -> bytes:
+        path = _path(self.spool, manifest, "source-config")
+        result = self.exchange(
+            "weights_writer", {"operation": "source_config", "manifest": manifest, "name": name}
+        )
+        if not result.get("ok"):
+            raise CapabilityError(
+                str(result.get("detail", "parent config read refused")),
+                code=str(result.get("code", "weights_source_refused")),
+            )
+        try:
+            with _read(path, int(result["length"]), MAX_WEIGHTS_SOURCE_READ) as stream:
+                return stream.read()
+        finally:
+            path.unlink(missing_ok=True)
 
     def begin_derived(
         self,
@@ -330,8 +353,49 @@ class WriterBroker:
             if lease is not None:
                 lease.close()
 
+    def _source_config(self, attempt: Any, frame: Mapping[str, Any]) -> dict[str, Any]:
+        from cozy_runtime.internal.worker.grants import MODEL_PREFIX
+
+        manifest, name = str(frame.get("manifest", "")), str(frame.get("name", ""))
+        try:
+            path = _path(attempt.spool, manifest, "source-config")
+            allowed = {
+                row["digest"]: row["length"]
+                for row in attempt.spec.get("inputs", [])
+                if str(row.get("input_id", "")).startswith(MODEL_PREFIX)
+            }
+            length = allowed.get(manifest)
+            if type(length) is not int or length <= 0:
+                raise CapabilityError(
+                    "weights config source is outside the immutable grant",
+                    code="weights_source_ungranted",
+                )
+            with self.lock:
+                if self.payload_pending(attempt):
+                    raise CapabilityError(
+                        "writer payload is pending", code="weights_writer_payload_pending"
+                    )
+            with (
+                storage_admission.admit(
+                    storage_admission.native_write(self.store_root),
+                    storage_admission.Write(attempt.spool, MAX_WEIGHTS_SOURCE_READ, 1),
+                ),
+                self.lock,
+            ):
+                if attempt.canceling or attempt.state != "running":
+                    raise CapabilityError(
+                        "config read attempt is not running", code="weights_writer_closed"
+                    )
+                data = source_config(self.store(), manifest, length, name)
+                written = _write(path, io.BytesIO(data), MAX_WEIGHTS_SOURCE_READ)
+                return {"ok": True, "length": written}
+        except Exception as exc:
+            return self._refused(exc)
+
     def handle(self, attempt: Any, frame: Mapping[str, Any]) -> dict[str, Any]:
         operation = frame.get("operation")
+        if operation == "source_config":
+            return self._source_config(attempt, frame)
         if operation == "bound":
             return self._bound(attempt, frame)
         key = self.key(attempt, str(frame.get("weights_transaction_id", "")))
