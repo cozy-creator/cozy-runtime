@@ -817,6 +817,7 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
             # a WIDE envelope: the RecordOwner pins (cr-068); the worker validates the pin
             # against the driver's reading of that card and never picks one itself
             worker.accepted.device_pins = {"plc-p": (0,)}
+            primary.device_pin = (0,)
             assert worker._assign_lane(primary, worker.bindings, worker.supervision)
             assert primary.lane_id == "lane-0"
             with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):

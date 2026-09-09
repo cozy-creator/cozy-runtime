@@ -190,3 +190,88 @@ def test_changed_pin_reassigns_live_or_failed_hosted_placement(hosted: bool) -> 
     else:
         assert seals == ["0", "1"]
         assert worker.supervision.spawns == 2
+
+
+@needs_executor
+def test_newer_pins_during_real_attempt_drain_keep_the_newest_assignment() -> None:
+    workers: list[Worker] = []
+    transitions: list[int] = []
+
+    def owner_hook(owner: LocalRecordOwner) -> None:
+        desired = owner._desired_state
+        observe = owner._on_observed_state
+        initial: pb.DesiredWorkerState | None = None
+
+        def first() -> pb.DesiredWorkerState:
+            nonlocal initial
+            initial = desired()
+            assert owner.placement is not None
+            initial.placement_set.device_pins.append(
+                pb.PlacementDevicePin(
+                    placement_id=owner.placement.placement_id,
+                    device_ordinals=[0],
+                )
+            )
+            return initial
+
+        def revise(revision: int, pin: int) -> None:
+            assert initial is not None
+            state = pb.DesiredWorkerState()
+            state.CopyFrom(initial)
+            state.revision = revision
+            state.placement_set.device_pins[0].device_ordinals[:] = [pin]
+            transitions.append(revision)
+            owner._send(pb.RecordOwnerFrame(desired_state=state))
+
+        def terminal(outcome: pb.AttemptOutcome) -> None:
+            # The real completed attempt still holds its settlement until the owner ACKs.
+            owner.terminal = outcome
+            revise(2, 1)
+
+        def report(report: pb.ObservedWorkerState) -> None:
+            worker = workers[0]
+            if owner.terminal is None:
+                observe(report)
+                return
+            if (
+                transitions == [2]
+                and worker.placement is not None
+                and worker.placement.serving == pb.SERVING_STATE_DRAINING
+            ):
+                assert report.accepted_desired_state_revision == 2
+                assert any(a.state in worker.engine.HELD for a in worker.engine.history.values())
+                revise(3, 0)
+                outcome = owner.terminal
+                owner._send(
+                    pb.RecordOwnerFrame(
+                        outcome_ack=owner._env(
+                            pb.AttemptOutcomeAck(
+                                request_id=outcome.request_id,
+                                attempt_ordinal=outcome.attempt_ordinal,
+                                invocation_spec_digest=outcome.invocation_spec_digest,
+                                outcome_id=outcome.outcome_id,
+                                outcome_digest=outcome.outcome_digest,
+                            )
+                        )
+                    )
+                )
+            if transitions == [2, 3] and worker.accepted.converged_revision == 3:
+                assert worker.placement is not None
+                assert worker.placement.lane_id == "lane-0"
+                assert worker.placement.device_pin == (0,)
+                owner.ended = "terminal"
+                owner.done.set()
+                owner.host.close()
+
+        owner._desired_state = first  # type: ignore[method-assign]
+        owner._on_observed_state = report  # type: ignore[method-assign]
+        owner._on_outcome = terminal  # type: ignore[method-assign]
+
+    with _workspace() as root:
+        outcome, seals = _slice(
+            root, devices="0,1", kind="entrypoint", hook=workers.append, owner_hook=owner_hook
+        )
+    assert outcome.status == "OUTCOME_STATUS_SUCCEEDED", outcome.error
+    assert transitions == [2, 3]
+    assert seals == ["0"], "superseded pin retired an executor that the newest pin still uses"
+    assert workers[0].accepted.device_pins == {workers[0].placement.placement_id: (0,)}  # type: ignore[union-attr]

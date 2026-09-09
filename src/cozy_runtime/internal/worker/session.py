@@ -1440,7 +1440,7 @@ class Worker:
                 measured[ordinal] = accel.device_memory(entry, kind)
         # THE PIN (cr-068): the RecordOwner's placement of this placement on THIS worker,
         # validated here and never chosen here. The declared degrees are the package's.
-        pin = self.accepted.device_pins.get(placement.placement_id)
+        pin = placement.device_pin
         degrees: set[int] | None = None
         for binding in bindings.values():
             if binding.weightless:
@@ -3465,6 +3465,7 @@ class Worker:
             and previous.placement_id == placement_id
             and previous.document == candidate.document
             and previous.device_pin == candidate.device_pin
+            and previous.serving != pb.ServingState.SERVING_STATE_DRAINING
         ):
             previous.placement_set_digest = desired_set.placement_set_digest
             self.pending = None
@@ -3596,7 +3597,9 @@ class Worker:
                 f"incoming set {documents.spell(candidate.placement_set_digest)[:23]}… is STAGED; "
                 f"draining {outgoing.placement_id or '(unnamed)'} and handing off the device",
             )
-            self.await_drained()
+            self.await_drained(revision)
+            if revision != self.accepted.accepted_desired_state_revision:
+                return
             if outgoing.device_pin != candidate.device_pin:
                 current = self.supervision.current
                 if current is not None:
@@ -3606,37 +3609,41 @@ class Worker:
                         self.latched = f"executor_reclaim_failed: {exc}"[:200]
                         self._settle()
                         return
-            if (
+        with self.control_lock:
+            if revision != self.accepted.accepted_desired_state_revision:
+                return
+            if outgoing is not None and (
                 outgoing.placement_id != candidate.placement_id
                 or outgoing.device_pin != candidate.device_pin
             ):
                 self._release_lane(outgoing.placement_id)
-        # THE LANE, before the executor exists to be sealed to it (cr-066): the same
-        # placement id keeps its lane across a replacement; a new one is placed by fit.
-        if not self._assign_lane(candidate, bindings, self.supervision):
-            candidate.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+            # THE LANE, before the executor exists to be sealed to it (cr-066): the same
+            # placement id keeps its lane across a replacement; a new one is placed by fit.
+            if not self._assign_lane(candidate, bindings, self.supervision):
+                candidate.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
+                self.placement = candidate
+                self.pending = None
+                self.latched = "device_lane_infeasible"
+                self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
+                self._settle()
+                return
             self.placement = candidate
             self.pending = None
-            self.latched = "device_lane_infeasible"
-            self.set_serving(pb.ServingState.SERVING_STATE_OFFLINE, self.latched)
-            self._settle()
-            return
-        self.placement = candidate
-        self.pending = None
-        self.bindings = bindings
-        self.prepared_models = {}
-        self.bump_admission(
-            f"placement {candidate.placement_id or '(unnamed)'} moved to set "
-            f"{documents.spell(candidate.placement_set_digest)[:23]}…"
-        )
-        self.note(
-            "desired_state",
-            f"revision {revision} STAGED: placement "
-            f"{candidate.placement_id or '(unnamed)'} in set "
-            f"{documents.spell(candidate.placement_set_digest)[:23]}… with {len(self.bindings)} of "
-            f"{len(candidate.entrypoints)} binding(s) resolved, "
-            f"posture={pb.Posture.Name(self.accepted.posture)}",
-        )
+            self.bindings = bindings
+            self.prepared_models = {}
+            self.bump_admission(
+                f"placement {candidate.placement_id or '(unnamed)'} moved to set "
+                f"{documents.spell(candidate.placement_set_digest)[:23]}…"
+            )
+            self.note(
+                "desired_state",
+                f"revision {revision} STAGED: placement "
+                f"{candidate.placement_id or '(unnamed)'} in set "
+                f"{documents.spell(candidate.placement_set_digest)[:23]}… "
+                f"with {len(self.bindings)} of "
+                f"{len(candidate.entrypoints)} binding(s) resolved, "
+                f"posture={pb.Posture.Name(self.accepted.posture)}",
+            )
         self.activate_executor()
         if self._placement_dispatchable(candidate.placement_id):
             self._reconcile_hosted(revision)
@@ -3801,7 +3808,7 @@ class Worker:
             f"placement {placement.placement_id!r} dispatchable",
         )
 
-    def await_drained(self) -> None:
+    def await_drained(self, revision: int) -> None:
         """Step 2 of the hand-off: admission stops, ALREADY-ACCEPTED attempts settle.
 
         NO DRAIN CONSTANT EXISTS (#434/#479). This waits on the attempts the RecordOwner
@@ -3811,8 +3818,15 @@ class Worker:
         """
         self.set_serving(pb.ServingState.SERVING_STATE_DRAINING, "handing off the device")
         for attempt in list(self.engine.history.values()):
-            if attempt.state in self.engine.HELD:
-                self.await_settled(attempt)
+            while (
+                self.placement is not None
+                and attempt.placement_id == self.placement.placement_id
+                and attempt.state in self.engine.HELD
+            ):
+                if revision != self.accepted.accepted_desired_state_revision or self.stop.wait(
+                    0.02
+                ):
+                    return
 
     def _acquire(self, placement: Placement, revision: int) -> acquire.AcquiredPlacement | None:
         """Fetch what the spec reaches and join its receipt to content-keyed installed bytes.

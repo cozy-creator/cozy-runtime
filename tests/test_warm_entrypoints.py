@@ -114,6 +114,7 @@ class _Booted:
         )
         self.worker.placement = self.placement
         self.worker.accepted.device_pins = {"plc-p": (0,)}
+        self.placement.device_pin = (0,)
 
     def binding(self, entrypoint: str) -> Any:
         return next(b for b in self.staged.declared_bindings.values() if b.entrypoint == entrypoint)

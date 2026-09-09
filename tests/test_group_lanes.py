@@ -417,6 +417,7 @@ def test_a_pin_through_the_worker_fuses_and_bumps_the_admission_epoch() -> None:
             assert binding.sequence_parallel_degrees() == (2,)
             bindings = {binding.entrypoint_binding_digest: binding}
             worker.accepted.device_pins = {"g": (0, 1)}
+            placement.device_pin = (0, 1)
             epoch = worker.admission_epoch
             # the second card does not exist here: the driver's honest UNREADABLE refuses
             # the group before anything fuses (never authorized zero)
@@ -430,6 +431,7 @@ def test_a_pin_through_the_worker_fuses_and_bumps_the_admission_epoch() -> None:
             # a weightless placement pinned to one device lands on it, no fuse, no bump
             weightless = _placement("w")
             worker.accepted.device_pins = {"w": (1,)}
+            weightless.device_pin = (1,)
             light = DeclaredBinding(
                 entrypoint_binding_digest="sha256:" + "1" * 64,
                 entrypoint="ping",
