@@ -28,13 +28,8 @@ def run(args: list[str], _opts: Options) -> Result:
         distribution = importlib.metadata.distribution("cozy-runtime")
         version = distribution.version
         builtin_operations.validate_carrier(wheel_path, version)
-        record = distribution.read_text("RECORD")
-        if not record:
-            raise ConformanceError(
-                "Runtime builtin preparation needs an installed wheel",
-                code="builtin_runtime_identity",
-            )
-        implementation = "sha256:" + numerical_environment._record_digest(record)
+        records = numerical_environment._installed_records({"cozy-runtime": version})
+        implementation = "sha256:" + records["cozy-runtime"]["record_digest"]
         base = package_environment.observe_base(Path(sys.executable))
         wheel, verified = package_environment.measure_wheel(wheel_path, "project", base)
         identity = canonical_json.digest(
@@ -62,8 +57,8 @@ def run(args: list[str], _opts: Options) -> Result:
         body = {
             "environment_python": str(installed.python),
             "environment_digest": identity,
-            "environment_content_digest": installed.content_digest,
-            "environment_receipt_digest": installed.receipt_digest,
+            "content_digest": installed.content_digest,
+            "receipt_digest": installed.receipt_digest,
             "closure": "\n".join(name + "==" + selected for name, selected in actual.distributions),
             "runtime_version": version,
             "implementation_digest": implementation,
