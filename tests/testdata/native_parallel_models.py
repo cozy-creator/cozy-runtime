@@ -11,7 +11,6 @@ import argparse
 import contextlib
 import json
 import os
-import resource
 import socket
 import sys
 from pathlib import Path
@@ -74,7 +73,7 @@ class _CpuRing:
             raise ValueError("CPU ring requires slots > inflight")
         self.torch, self.device = torch_module, torch_module.device("cpu")
         self.window_bytes, self.keep = int(window_bytes), int(inflight)
-        self.registered_bytes = self.window_bytes * slots
+        self.registered_bytes = 0  # CPU slots are ordinary host memory, not pinned CUDA memory.
         self.in_flight_peak = 0
         self.waits = 0
         self.buffers = [
@@ -111,32 +110,39 @@ def install_cpu_transport() -> None:
     setattr(fill_module, "StagingRing", _CpuRing)  # noqa: B010
     setattr(torch.cuda, "stream", lambda _stream: contextlib.nullcontext())  # noqa: B010
     setattr(torch.cuda, "Event", lambda *args, **kwargs: _CpuEvent())  # noqa: B010
+    setattr(torch.cuda, "current_stream", lambda *args, **kwargs: _CpuEvent())  # noqa: B010
 
 
 def cpu_accounting() -> None:
     original_allocation, original_allocated = accel.allocation, accel.allocated
+    original_identity = accel.device_identity
+
+    def rss_bytes() -> int:
+        return int(Path("/proc/self/statm").read_text().split()[1]) * int(os.sysconf("SC_PAGESIZE"))
 
     def allocation(torch_module: Any, kind: str, device: Any = None) -> dict[str, int]:
         if kind != "cpu":
             return original_allocation(torch_module, kind, device)
         page_size = int(os.sysconf("SC_PAGESIZE"))
         total = int(os.sysconf("SC_PHYS_PAGES")) * page_size
-        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+        rss = rss_bytes()
         return {
             "allocated_bytes": rss,
             "reserved_bytes": rss,
-            "driver_free_bytes": max(total - rss, 0),
+            "driver_free_bytes": int(os.sysconf("SC_AVPHYS_PAGES")) * page_size,
             "driver_total_bytes": total,
         }
 
     def allocated(torch_module: Any, kind: str, device: Any = None) -> int:
-        return (
-            int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
-            if kind == "cpu"
-            else original_allocated(torch_module, kind, device)
-        )
+        return rss_bytes() if kind == "cpu" else original_allocated(torch_module, kind, device)
+
+    def identity(torch_module: Any, kind: str, index: int = 0) -> dict[str, Any]:
+        if kind != "cpu":
+            return original_identity(torch_module, kind, index)
+        return {"name": "CPU fixture", "sm": 0, "driver_api": 0, "cuda_runtime": ""}
 
     accel.allocation, accel.allocated = cast(Any, allocation), cast(Any, allocated)
+    accel.device_identity = cast(Any, identity)
 
 
 def native_model(root: Path, name: str, components: dict[str, Any], config: dict[str, Any]) -> None:
@@ -251,6 +257,9 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         sequence_parallel_degree=degree,
         authorized_device_limit_bytes=2 << 30,
     )
+    # Tiny weights do not need the production 256 MiB staging ring on every rank.
+    for row in command["models"]:
+        row["binding"].update(window_bytes=1 << 20, slots=2, readers=1, inflight=1)
     # The test's explicit CPU variant is qualified on CPU; no CUDA claim is substituted.
     if backend == "cpu":
         for row in command["models"]:
@@ -273,7 +282,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         )
 
     group = (
-        RankGroup(degree=degree, backend="gloo", root=str(root / "group"), launch=launch)
+        RankGroup(degree=degree, backend="cpu:gloo", root=str(root / "group"), launch=launch)
         if degree > 1
         else None
     )
@@ -290,7 +299,8 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         assert set(executor.models) == {"base", "overlay"}
         assert all(child.facts["filled_bytes"] > 0 for child in executor.model_executors)
         executor._attempt_spool = root / "attempt"
-        executor.residency.open_attempt("all_resident", 0, {"base.sample": 0, "overlay.sample": 0})
+        scope_headrooms = {"base.sample": 11, "overlay.sample": 17}
+        executor.residency.open_attempt("all_resident", 0, scope_headrooms)
         device = next(executor.models["base"].pipe.components["dit"].parameters()).device
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch().items()}
         values = SimpleNamespace(values=inputs, opaque=lambda: None)
@@ -309,6 +319,39 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
             assert remote["ok"] and len(remote["models"]) == 2, remote
             assert not any(remote["active"].values()), remote
             assert all(value > 0 for value in remote["filled"]), remote
+        report = executor.residency.document()
+        assert report["scope_headroom_bytes"] == scope_headrooms, report
+        assert set(report["attempt_activation_peaks"]) == {
+            "base.sample",
+            "base.plain",
+            "overlay.sample",
+        }, report
+        for child in executor.model_executors:
+            for captured in child.backend.derived.values():
+                for (module, name), retained in captured.items():
+                    current = module._buffers[name]
+                    if current.device == retained.device and current.numel():
+                        assert (
+                            current.untyped_storage().data_ptr()
+                            != retained.untyped_storage().data_ptr()
+                        )
+        if backend == "cuda":
+            torch.cuda.synchronize()
+        vacated = executor.vacate()
+        assert vacated["ok"], vacated
+        assert set(vacated["vacated"]["freed"]) == {"base/dit", "overlay/projection"}, vacated
+        restored = executor.restore(names=("overlay/projection",))
+        assert restored["ok"], restored
+        assert restored["restored"]["restored"] == {"overlay/projection": 16}, restored
+        assert restored["restored"]["held"] == {}, restored
+        assert set(executor.residency.document()["resident"]) == {"overlay/projection"}
+        restored = executor.restore(names=("base/dit",))
+        assert restored["ok"] and set(restored["restored"]["restored"]) == {"base/dit"}, restored
+        got = executor.models["base"].sample(
+            executor.models["overlay"], values, lambda: callbacks.append(2)
+        )
+        torch.testing.assert_close(tuple(t.cpu() for t in got), expected, rtol=2e-5, atol=2e-6)
+        assert callbacks == [0, 1, 2]
         print(
             json.dumps(
                 {
@@ -344,6 +387,8 @@ def main() -> None:
     parser.add_argument("--rank-fd", type=int)
     parser.add_argument("--leader")
     args = parser.parse_args()
+    if args.backend == "cuda" and args.degree > 1:
+        parser.error("this fixture uses one CUDA GPU; multi-GPU qualification uses Creator")
     torch.set_num_threads(1)
     if args.backend == "cpu":
         cpu_accounting()

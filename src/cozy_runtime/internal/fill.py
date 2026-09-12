@@ -2752,6 +2752,8 @@ def _restore_derived(root: Any, held: Mapping[tuple[Any, str], Any]) -> int:
         destination = sub._buffers.get(local)
         if destination is None:
             continue
-        sub._buffers[local] = value.to(destination.device, non_blocking=False)
+        # Eviction frees the module's storage in place. Never alias the retained
+        # reconstruction copy, even when it already lives on the target device.
+        sub._buffers[local] = value.to(destination.device, non_blocking=False, copy=True)
         landed += 1
     return landed
