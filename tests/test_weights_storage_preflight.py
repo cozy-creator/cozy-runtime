@@ -19,6 +19,7 @@ from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._weights import MAX_WEIGHTS_SOURCE_READ
 from cozy_runtime.internal import storage_admission as storage
 from cozy_runtime.internal.weights_writer import StoreProxy, WriterBroker
+from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from test_storage_admission import operation
 
 
@@ -82,6 +83,11 @@ def _host(channel: socket.socket, accept: bool, rows: list[list[dict[str, Any]]]
     # The first hold admits only opening metadata. The second is the whole pending
     # writer preflight, whose release is essential before later per-part writes.
     for index in range(2):
+        try:
+            if not channel.recv(1, socket.MSG_PEEK):
+                return
+        except OSError:
+            return
         writes, connection = operation(channel)
         rows.append(writes)
         with connection:
@@ -139,6 +145,52 @@ def test_preflight_uses_geometry_instead_of_the_loose_output_ceiling(
         assert not thread.is_alive()
     assert rows[1][0]["bytes"] == 4096 + 4 * tensorfs.manifest_max_bytes()
     assert rows[1][1]["bytes"] == 4096 + MAX_WEIGHTS_SOURCE_READ
+
+
+def test_inherited_checkpoint_needs_no_new_payload_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, broker, attempt, opened = _rig(tmp_path, {"weight": 4096}, 4096)
+    writer = opened()
+    writer.add_part("model", "weight", "value", io.BytesIO(bytes(4096)))
+    manifest = writer.commit()["manifest"]
+    source = "sha256:" + manifest["sha256"]
+    sources = {"source": (source, manifest["length"])}
+    targets = {"model": {"source": "source", "source_component": "model", "drop": [], "add": {}}}
+    order = [("model", "weight")]
+    declaration = store.derived_declaration(
+        sources, targets, {}, order, 0, work_fingerprint=attempt.weights_work_fingerprint
+    )
+    transaction = "sha256:" + "74" * 32
+    broker.authorize(attempt, transaction, 1, hashlib.sha256(declaration).digest(), "inherited")
+    attempt.spec["inputs"] = [
+        {"input_id": MODEL_PREFIX + "source", "digest": source, "length": manifest["length"]}
+    ]
+    attempt.spec["outputs"].append({"output_id": "inherited", "max_bytes": 0})
+    proxy = StoreProxy(store, attempt.spool, lambda _kind, frame: broker.handle(attempt, frame))
+    host, worker = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    rows: list[list[dict[str, Any]]] = []
+    with host, worker:
+        monkeypatch.setattr(storage, "_channel", worker)
+        thread = threading.Thread(target=_host, args=(host, True, rows), daemon=True)
+        thread.start()
+        try:
+            proxy.begin_derived(
+                transaction,
+                1,
+                sources,
+                targets,
+                {},
+                order,
+                0,
+                work_fingerprint=attempt.weights_work_fingerprint,
+            )
+        finally:
+            broker.close_attempt(attempt)
+        thread.join(3)
+        assert not thread.is_alive()
+    assert rows[1][0]["bytes"] == 4 * tensorfs.manifest_max_bytes()
+    assert rows[1][1]["bytes"] == MAX_WEIGHTS_SOURCE_READ
 
 
 def test_resume_excludes_native_completed_roles(
