@@ -1,4 +1,4 @@
-"""Private wheel revisions cannot borrow a different numerical base or omit a dependency."""
+"""Captured wheel revisions cannot borrow a different numerical base or omit a dependency."""
 
 from __future__ import annotations
 
@@ -116,7 +116,9 @@ def test_actual_patch_requires_python_and_inactive_marker_install(tmp_path: Path
 
 
 @pytest.mark.parametrize("distribution", ["numpy", "setuptools"])
-def test_private_refuses_divergent_base_before_install(tmp_path: Path, distribution: str) -> None:
+def test_unpublished_refuses_divergent_base_before_install(
+    tmp_path: Path, distribution: str
+) -> None:
     base = environment.observe_base(Path(sys.executable))
     base = dataclasses.replace(
         base,
@@ -231,7 +233,9 @@ def test_dependency_share_resource_collisions_refuse_before_install(
     assert not (tmp_path / "refused").exists()
 
 
-def test_private_missing_wheel_refuses_then_real_install_and_reopen_verify(tmp_path: Path) -> None:
+def test_unpublished_missing_wheel_refuses_then_real_install_and_reopen_verify(
+    tmp_path: Path,
+) -> None:
     base = environment.observe_base(Path(sys.executable))
     helper = _wheel(tmp_path, "closure_helper", (), b"VALUE=641\n")
     project = _wheel(

@@ -126,7 +126,7 @@ def _run(config: WorkerHostConfig) -> int:
     host.checkpoint_transfer = worker.checkpoint_transfer
     host.weights_checkpoint_validator = worker.weights.validate_checkpoint
     host.local_package_preparer = worker.prepare_local_package
-    host.private_placement_preparer = worker.prepare_private_placement
+    host.unpublished_placement_preparer = worker.prepare_unpublished_placement
     # The loopback weights seam (proto-025). The supervisor opens Exchange per control
     # session and calls Upload; both are the worker's own WeightsExchange.
     host.weights = worker.weights

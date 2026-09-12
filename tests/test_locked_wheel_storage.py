@@ -13,7 +13,7 @@ import pytest
 
 from cozy_runtime.internal import package_environment as environment
 from cozy_runtime.internal import storage_admission as storage
-from test_private_exact_dependencies import _wheel
+from test_unpublished_exact_dependencies import _wheel
 
 
 def test_standard_direct_requirements_preserve_exact_wheel_and_legacy_pins() -> None:

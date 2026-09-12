@@ -1,4 +1,4 @@
-"""Old terminal cleanup cannot recycle a replacement private job."""
+"""Old terminal cleanup cannot recycle a replacement unpublished package job."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def test_only_a_new_current_ordinary_terminal_ack_can_recycle(tmp_path: Path, mo
         job = JobBinding(
             "sha256:" + "11" * 32,
             "sha256:" + "12" * 32,
-            "private_job:app",
+            "unpublished_job:app",
             str(tmp_path / "interface.json"),
             sys.executable,
             "sha256:" + "13" * 32,

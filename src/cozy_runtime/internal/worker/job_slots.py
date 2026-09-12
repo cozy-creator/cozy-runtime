@@ -1,4 +1,4 @@
-"""The two explicitly admitted private job roles; no independent scheduler."""
+"""The two explicitly admitted unpublished package job roles; no independent scheduler."""
 
 from __future__ import annotations
 
