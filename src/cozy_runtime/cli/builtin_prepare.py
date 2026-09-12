@@ -14,7 +14,7 @@ from cozy_runtime.internal import builtin_operations, numerical_environment, pac
 from cozy_runtime.internal.exits import Exit
 
 
-def run(args: list[str], _opts: Options) -> Result:
+def run(args: list[str], _opts: Options, *, capture: bool = False) -> Result:
     if not args or args[0] != "operations":
         raise CliError(
             "usage",
@@ -46,12 +46,13 @@ def run(args: list[str], _opts: Options) -> Result:
             (wheel,),
             (package_environment.BlobGrant(wheel.digest, wheel.length, wheel_path, verified),),
         )
-        installed = package_environment.materialize(
+        installed = package_environment._materialize_dependency_snapshot(
             source,
             root,
-            python=Path(sys.executable),
-            base=base,
-            dependency_python=Path(sys.executable),
+            Path(sys.executable),
+            Path(sys.executable),
+            base,
+            builtin_capture=capture,
         )
         builtin_operations.validate_installed(
             installed.site_packages / f"cozy_runtime_operations-{version}.dist-info"
