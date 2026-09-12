@@ -71,6 +71,7 @@ class Observation:
     uv_version: str
     distributions: tuple[tuple[str, str], ...]
     import_roots: tuple[tuple[str, tuple[str, ...]], ...]
+    python_full_version: str
 
     @property
     def distribution_versions(self) -> dict[str, str]:
@@ -120,6 +121,7 @@ def current() -> Observation:
 
     return Observation(
         python_abi="cp" + match.group(1),
+        python_full_version=platform.python_version(),
         os_arch="linux/amd64",
         libc="glibc" + libc_version,
         accelerator_backend=backend,
@@ -186,7 +188,11 @@ def from_python(python: Path) -> Observation:
             str(python),
             "-I",
             "-c",
-            "from cozy_runtime.internal.base_observation import print_current; print_current()",
+            # Measure the target patch even when its installed Runtime predates this field.
+            "import json, platform; "
+            "from cozy_runtime.internal.base_observation import current, _body; "
+            "print(json.dumps({**_body(current()), "
+            "'python_full_version': platform.python_version()}))",
         ],
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -320,6 +326,7 @@ def _body(observation: Observation) -> dict[str, Any]:
         "libc": observation.libc,
         "os_arch": observation.os_arch,
         "python_abi": observation.python_abi,
+        "python_full_version": observation.python_full_version,
         "torch_release": observation.torch_release,
         "uv_version": observation.uv_version,
     }
@@ -335,6 +342,7 @@ def _parse(value: object) -> Observation:
         "libc",
         "os_arch",
         "python_abi",
+        "python_full_version",
         "torch_release",
         "uv_version",
     }
@@ -343,6 +351,7 @@ def _parse(value: object) -> Observation:
     try:
         observation = Observation(
             python_abi=str(value["python_abi"]),
+            python_full_version=str(value["python_full_version"]),
             os_arch=str(value["os_arch"]),
             libc=str(value["libc"]),
             accelerator_backend=str(value["accelerator_backend"]),

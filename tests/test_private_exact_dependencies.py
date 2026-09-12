@@ -7,6 +7,7 @@ import csv
 import dataclasses
 import hashlib
 import io
+import platform
 import struct
 import subprocess
 import sys
@@ -26,9 +27,12 @@ def _wheel(
     code: bytes,
     *,
     resources: dict[str, bytes] | None = None,
+    requires_python: str = "",
 ) -> Path:
     info = f"{name}-1.0.dist-info"
     metadata = f"Metadata-Version: 2.3\nName: {name}\nVersion: 1.0\n"
+    if requires_python:
+        metadata += f"Requires-Python: {requires_python}\n"
     metadata += "".join(f"Requires-Dist: {value}\n" for value in requirements)
     members = {
         f"{name}.py": code,
@@ -71,6 +75,44 @@ def _material(
             for row, verified, path in rows
         ),
     )
+
+
+@pytest.mark.parametrize("marker", ["python_full_version", "implementation_version"])
+def test_patch_markers_require_the_dependency_on_the_actual_interpreter(
+    tmp_path: Path, marker: str
+) -> None:
+    base = environment.observe_base(Path(sys.executable))
+    version = platform.python_version()
+    project = _wheel(
+        tmp_path, "patch_client", (f"patch_helper==1.0; {marker} >= '{version}'",), b"VALUE=42\n"
+    )
+    with pytest.raises(environment.EnvironmentRefusal, match="dependency_missing"):
+        environment.materialize(
+            _material(project, (), base), tmp_path / "missing", base=base, exact_dependencies=True
+        )
+    assert not (tmp_path / "missing").exists()
+
+
+def test_actual_patch_requires_python_and_inactive_marker_install(tmp_path: Path) -> None:
+    base = environment.observe_base(Path(sys.executable))
+    version = platform.python_version()
+    project = _wheel(
+        tmp_path,
+        "patch_client",
+        (f"patch_helper==1.0; python_full_version < '{version}'",),
+        b"VALUE=42\n",
+        requires_python=f">={version}",
+    )
+    installed = environment.materialize(
+        _material(project, (), base), tmp_path / "installed", base=base, exact_dependencies=True
+    )
+    result = subprocess.run(
+        [str(installed.python), "-I", "-c", "import patch_client; print(patch_client.VALUE)"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "42"
 
 
 @pytest.mark.parametrize("distribution", ["numpy", "setuptools"])
