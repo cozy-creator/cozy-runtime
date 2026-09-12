@@ -1,4 +1,4 @@
-"""Private wheel capacity is checked before base probing or carrier reads."""
+"""Captured wheel capacity is checked before base probing or carrier reads."""
 
 from pathlib import Path
 
@@ -9,7 +9,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 
 @pytest.mark.parametrize("count", [0, 130])
-def test_private_revision_count_refused_before_io(count: int, tmp_path: Path) -> None:
+def test_unpublished_revision_count_refused_before_io(count: int, tmp_path: Path) -> None:
     with pytest.raises(PreparationRefusal) as fault:
         prepare_package(
             package_name="local/capacity",

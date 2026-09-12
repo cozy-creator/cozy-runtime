@@ -197,7 +197,7 @@ class GrpcControlHost:
         local_package_preparer: (
             Callable[[pb.PrepareLocalPackageRequest], pb.PreparePackageSetResult] | None
         ) = None,
-        private_placement_preparer: (
+        unpublished_placement_preparer: (
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
         ) = None,
         numerical_environment: Callable[[], bytes] | None = None,
@@ -223,7 +223,7 @@ class GrpcControlHost:
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
         self.local_package_preparer = local_package_preparer
-        self.private_placement_preparer = private_placement_preparer
+        self.unpublished_placement_preparer = unpublished_placement_preparer
         #: The loopback weights seam (proto-025), served only when a pod supervisor is the
         #: peer. Absent on a local run, where there is no supervisor to open `Exchange`.
         self.weights = weights
@@ -251,7 +251,7 @@ class GrpcControlHost:
             or self.checkpoint_pager is not None
             or self.checkpoint_transfer is not None
             or self.local_package_preparer is not None
-            or self.private_placement_preparer is not None
+            or self.unpublished_placement_preparer is not None
             or self.weights is not None
             or self.weights_checkpoint_validator is not None
         )
@@ -265,7 +265,7 @@ class GrpcControlHost:
                 self.preparer,
                 self.model_source_preparer,
                 self.local_package_preparer,
-                self.private_placement_preparer,
+                self.unpublished_placement_preparer,
                 self.checkpoint_pager,
                 self.checkpoint_transfer,
                 self.weights_checkpoint_validator,
@@ -376,7 +376,7 @@ class _PreparationServicer(WorkspaceRPC):
         local_package_handler: (
             Callable[[pb.PrepareLocalPackageRequest], pb.PreparePackageSetResult] | None
         ),
-        private_placement_handler: (
+        unpublished_placement_handler: (
             Callable[[pb.PreparePrivatePlacementRequest], pb.PreparePackageSetResult] | None
         ),
         checkpoint_pager: (
@@ -404,7 +404,7 @@ class _PreparationServicer(WorkspaceRPC):
         self.package_handler = package_handler
         self.model_source_handler = model_source_handler
         self.local_package_handler = local_package_handler
-        self.private_placement_handler = private_placement_handler
+        self.unpublished_placement_handler = unpublished_placement_handler
         self.checkpoint_pager = checkpoint_pager
         self.checkpoint_transfer = checkpoint_transfer
         self.weights_checkpoint_validator = weights_checkpoint_validator
@@ -564,10 +564,11 @@ class _PreparationServicer(WorkspaceRPC):
     def PreparePrivatePlacement(
         self, request: pb.PreparePrivatePlacementRequest, context: Any
     ) -> Any:
-        handler = self.private_placement_handler
+        handler = self.unpublished_placement_handler
         if handler is None:
             return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "private placement preparation is unavailable"
+                grpc.StatusCode.UNIMPLEMENTED,
+                "unpublished package placement preparation is unavailable",
             )
         try:
             return handler(request)

@@ -1,4 +1,4 @@
-"""Explicit publication effects delegated to the admitted private script owner."""
+"""Explicit publication effects delegated to the admitted unpublished package owner."""
 
 from __future__ import annotations
 

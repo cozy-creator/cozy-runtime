@@ -1,4 +1,4 @@
-# Sources in private client scripts
+# Sources in local scripts
 
 Ordinary `async def main(ctx)` scripts can await three fixed native operations:
 
@@ -47,7 +47,7 @@ before their source access and producer roots are released. A memo entry has its
 so cleanup of one script cannot remove another recipient's work. Process death also stops
 the native subprocess; its durable native checkpoints remain resumable.
 
-These source builtins are available to private client jobs on local or rented machines
+These source builtins are available to unpublished package jobs on local or rented machines
 through the same Runtime/TensorFS code. They do not publish workflows or private memo rows
 to Tensorhub. Dynamic provider resolution is refused inside a memoized package parent,
 since otherwise the parent could skip resolution; conversion of an explicit SourceArtifact
