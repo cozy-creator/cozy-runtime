@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import msgspec
 
@@ -12,6 +12,8 @@ from cozy_runtime.author import (
     MAX_WEIGHTS_NEW_BYTES,
     App,
     Context,
+    Loader,
+    Model,
     ModelArtifact,
     Telemetry,
     UnsupportedInput,
@@ -22,13 +24,16 @@ from cozy_runtime.author import (
 )
 
 from . import facade
-from .quantization import (
-    PLAIN_SPEC,
-    ArtifactQuantizationPlan,
-    QuantizationSource,
-    QuantizationTensor,
-    prepare_source_quantization,
-)
+
+if TYPE_CHECKING:
+    from .quantization import ArtifactQuantizationPlan
+
+
+class QuantizationSource(Model[object]):
+    """Manifest-only builtin input; numerical libraries are unnecessary to bind it."""
+
+    def load(self, loader: Loader) -> None:
+        del loader
 
 
 class QuantizationPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -48,6 +53,13 @@ app = App()
 
 
 def _selection(structure: WeightsSource, plan: QuantizationPlan) -> ArtifactQuantizationPlan:
+    from .quantization import (
+        PLAIN_SPEC,
+        ArtifactQuantizationPlan,
+        QuantizationTensor,
+        prepare_source_quantization,
+    )
+
     if (
         not 1 <= len(plan.components) <= 64
         or len(set(plan.components)) != len(plan.components)
