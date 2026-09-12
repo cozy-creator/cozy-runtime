@@ -1,0 +1,104 @@
+"""Core-only SDK capture resolves numerical dependencies only on the owned call path."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from test_builtin_operation_carrier import carrier
+
+
+def test_core_sdk_capture_is_offline_and_later_preparation_uses_captured_code(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    wheels = tmp_path / "wheels"
+    subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(wheels)],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    wheel = next(wheels.glob("*.whl"))
+    core = tmp_path / "core"
+    subprocess.run(
+        ["uv", "venv", str(core), "--python", sys.executable], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["uv", "pip", "install", "--python", str(core / "bin/python"), str(wheel), "uv==0.12.11"],
+        check=True,
+        capture_output=True,
+    )
+    env = dict(os.environ)
+    env["PATH"] = str(core / "bin") + os.pathsep + env.get("PATH", "")
+    env.pop("UV_OFFLINE", None)
+
+    def python(executable: str, source: str) -> str:
+        return subprocess.check_output([executable, "-I", "-c", source], text=True, env=env).strip()
+
+    probe = """
+import importlib.util
+assert importlib.util.find_spec('numpy') is None
+from cozy_runtime.derive.operations import app
+from cozy_runtime.internal import builtin_operations
+from cozy_runtime.internal.executor import Executor
+broker = Executor._call_broker(object.__new__(Executor), {
+    'request_id': 'core-only-proof', 'call_interfaces': builtin_operations.rows()})
+import sys
+assert broker is not None and 'numpy' not in sys.modules
+"""
+    python(str(core / "bin/python"), probe)
+    version = python(
+        str(core / "bin/python"), "import importlib.metadata as m; print(m.version('cozy-runtime'))"
+    )
+    capsule = carrier(tmp_path / "carrier", version=version)
+
+    def operation(
+        executable: str, verb: str, target: Path, *, offline: bool = False
+    ) -> dict[str, Any]:
+        result = subprocess.run(
+            [
+                str(Path(executable).with_name("cozy-runtime")),
+                "--json",
+                verb,
+                "operations",
+                "--wheel",
+                str(capsule),
+                "--out",
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            env={**env, **({"UV_OFFLINE": "1"} if offline else {})},
+        )
+        assert result.returncode == 0, result.stderr + result.stdout
+        value = json.loads(result.stdout)
+        assert isinstance(value, dict)
+        return value
+
+    captured = operation(
+        str(core / "bin/python"), "builtin-capture", tmp_path / "captured", offline=True
+    )
+    python(captured["environment_python"], probe)
+    # Replace code in the original SDK after capture. The later operation must use
+    # the retained snapshot; source freezing is byte custody, not a version check.
+    original = next(core.glob("lib/python*/site-packages/cozy_runtime/derive/operations.py"))
+    original.write_text("raise AssertionError('mutable original SDK was used')\n")
+    prepared = operation(captured["environment_python"], "builtin-prepare", tmp_path / "prepared")
+    assert prepared["implementation_digest"] == captured["implementation_digest"]
+    assert prepared["content_digest"] != captured["content_digest"]
+    python(captured["environment_python"], probe)
+    python(
+        prepared["environment_python"],
+        "import numpy; from cozy_runtime.derive.operations import app; "
+        "from cozy_runtime.author import describe; assert describe(app)",
+    )
+    assert "numpy==" in prepared["closure"] and "numpy==" not in captured["closure"]
+    manifest = next((tmp_path / "prepared/contents").glob("*/installed-dependencies.json"))
+    snapshot = json.loads(manifest.read_bytes())
+    assert any(row["distribution"] == "numpy" for row in snapshot["distributions"])
+    assert any("/numpy/" in row["path"] for row in snapshot["files"])

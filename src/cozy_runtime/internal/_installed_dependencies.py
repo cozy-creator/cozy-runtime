@@ -131,22 +131,37 @@ def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) 
             after.st_mode,
         ):
             raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
+    _verify_dependency_hash(target, expected)
+    target.chmod(0o755 if info.st_mode & 0o111 else 0o644)
+
+
+def _verify_dependency_hash(target: Path, expected: str) -> None:
     if expected:
         algorithm, separator, encoded = expected.partition("=")
         if not separator or algorithm not in {"sha256", "sha384", "sha512"}:
-            raise EnvironmentRefusal("package_environment_dependency_hash_unsupported", str(source))
+            raise EnvironmentRefusal("package_environment_dependency_hash_unsupported", str(target))
         digest = hashlib.new(algorithm)
         with target.open("rb") as copied:
             while chunk := copied.read(1 << 20):
                 digest.update(chunk)
         if base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode() != encoded:
-            raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
-    target.chmod(0o755 if info.st_mode & 0o111 else 0o644)
+            raise EnvironmentRefusal("package_environment_dependency_member_changed", str(target))
 
 
-def snapshot(source_python: Path, staging: Path, excluded: set[str]) -> bytes:
+def snapshot(
+    source_python: Path,
+    staging: Path,
+    excluded: set[str],
+    *,
+    included: set[str] | None = None,
+    inventory_only: bool = False,
+) -> bytes:
     # Metadata discovery must never start this interpreter: its editable hooks are mutable.
     prefix = source_python.parent.parent
+    if inventory_only and prefix != staging:
+        raise EnvironmentRefusal(
+            "package_environment_dependency_source_invalid", str(source_python)
+        )
     sites = list(prefix.glob("lib/python*/site-packages"))
     if (
         not source_python.is_absolute()
@@ -168,6 +183,7 @@ def snapshot(source_python: Path, staging: Path, excluded: set[str]) -> bytes:
     distributions: list[dict[str, Any]] = []
     copied: set[Path] = set()
     names: set[str] = set()
+    selected_infos: list[Path] = []
     for info in sorted(source_site.glob("*.dist-info")):
         if info.is_symlink() or not info.is_dir():
             raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(info))
@@ -182,11 +198,12 @@ def snapshot(source_python: Path, staging: Path, excluded: set[str]) -> bytes:
         name, version = _name(str(headers.get("Name", ""))), str(headers.get("Version", ""))
         if not normalized_distribution(name) or not valid_wheel_version(version):
             raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(info))
-        if name in excluded:
+        if name in excluded or (included is not None and name not in included):
             continue
         if name in names:
             raise EnvironmentRefusal("package_environment_dependency_distribution_collision", name)
         names.add(name)
+        selected_infos.append(target_site / info.name)
         direct = info / "direct_url.json"
         if direct.is_file():
             if direct.is_symlink() or direct.stat().st_size > MAX_METADATA_BYTES:
@@ -234,7 +251,14 @@ def snapshot(source_python: Path, staging: Path, excluded: set[str]) -> bytes:
                         raise EnvironmentRefusal(
                             "package_environment_dependency_launcher_unsupported", relative
                         )
-            _copy_dependency_file(member, destination, digest, length)
+            if inventory_only:
+                if length and (not length.isdecimal() or int(length) != member.stat().st_size):
+                    raise EnvironmentRefusal(
+                        "package_environment_dependency_member_changed", str(member)
+                    )
+                _verify_dependency_hash(member, digest)
+            else:
+                _copy_dependency_file(member, destination, digest, length)
             copied.add(destination)
         if metadata not in {source_site / relative for relative, _, _ in rows}:
             raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(metadata))
@@ -245,7 +269,7 @@ def snapshot(source_python: Path, staging: Path, excluded: set[str]) -> bytes:
             raise EnvironmentRefusal(
                 "package_environment_dependency_snapshot_oversized", str(source_site)
             )
-    rewrite_launchers(staging, target_site, sorted(target_site.glob("*.dist-info")), copied)
+    rewrite_launchers(staging, target_site, selected_infos, copied, replace=inventory_only)
     manifest = canonical.write(
         {
             "format": "cozy.runtime.InstalledDependencySnapshot/1",

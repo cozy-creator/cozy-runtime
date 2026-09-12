@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 
@@ -33,18 +33,8 @@ from cozy_runtime.author import (
     WeightsTarget,
 )
 
-from .quantization import (
-    _ENCODINGS,
-    ArtifactQuantizationPlan,
-    ArtifactQuantizationRequest,
-    bf16_targets,
-    inherited_configs,
-    prepare_bf16,
-    prepare_source_quantization,
-    quantization_additions,
-    quantize_component_into,
-    write_bf16,
-)
+if TYPE_CHECKING:
+    from .quantization import ArtifactQuantizationPlan
 
 
 class QuantizePlan(msgspec.Struct, frozen=True):
@@ -98,6 +88,8 @@ def plan(
     ``keep`` is the ingest config's per-component keep list (#695): a named component's
     f32 tensors inherit at source precision instead of normalizing to bf16.
     """
+    from .quantization import _ENCODINGS
+
     selected = tuple(components)
     kept = tuple(keep)
     if len(set(kept)) != len(kept) or any(not name for name in kept):
@@ -206,6 +198,17 @@ def _quantize(
     selection: ArtifactQuantizationPlan | None = None,
     preserve_precision: bool = False,
 ) -> tuple[QuantizeResult, WeightsReceipt]:
+    from .quantization import (
+        ArtifactQuantizationRequest,
+        bf16_targets,
+        inherited_configs,
+        prepare_bf16,
+        prepare_source_quantization,
+        quantization_additions,
+        quantize_component_into,
+        write_bf16,
+    )
+
     model, structure = _resolve(source, sink)
     keep = (
         tuple(dict.fromkeys(tensor.component for tensor in structure.tensors))

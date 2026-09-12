@@ -2385,12 +2385,25 @@ def _materialize_dependency_snapshot(
     python: Path,
     dependency_python: Path,
     base: base_observation.Observation | None,
+    *,
+    builtin_capture: bool | None = None,
 ) -> InstalledEnvironment:
     from cozy_runtime.internal import _installed_dependencies
 
     observed = base or observe_base(python)
     wheels = _verify_inventory(source, observed, venv_precedence=True)
     inspected = _verify_grants(source, wheels, observed)
+    supplements: tuple[BootInstall, ...] = ()
+    if builtin_capture is not None:
+        from cozy_runtime.internal import builtin_operations
+
+        if len(inspected) != 1 or inspected[0].wheel.distribution != builtin_operations.NAME:
+            raise EnvironmentRefusal(
+                "builtin_carrier", "only the fixed Runtime carrier may capture an SDK"
+            )
+        builtin_operations.validate_carrier(inspected[0].path, inspected[0].wheel.version)
+        if not builtin_capture and "numpy" not in observed.distribution_versions:
+            supplements = (BootInstall("numpy", ">=1.26", (), "absent"),)
     uv = _uv_binary()
     if _observed_uv_version(uv) != observed.uv_version:
         raise EnvironmentRefusal("package_environment_uv_changed", observed.uv_version)
@@ -2411,8 +2424,24 @@ def _materialize_dependency_snapshot(
         )
 
     try:
-        _install_with_uv(uv, python, staging, inspected, dependencies=copy_dependencies)
+        _install_with_uv(
+            uv, python, staging, inspected, supplements, dependencies=copy_dependencies
+        )
         _installed_dependencies.verify_files(staging, manifest)
+        if supplements:
+            # Only newly resolved optional numerical files join the existing immutable
+            # snapshot. Verify original SDK bytes first; the resolver cannot replace them.
+            additional = _installed_dependencies.snapshot(
+                staging / "bin/python", staging, set(), included={"numpy"}, inventory_only=True
+            )
+            original_body = canonical.parse_canonical(manifest)
+            extra_body = canonical.parse_canonical(additional)
+            original_body["distributions"] += extra_body["distributions"]
+            original_body["files"] += extra_body["files"]
+            original_body["distributions"].sort(key=lambda row: row["distribution"])
+            original_body["files"].sort(key=lambda row: row["path"])
+            manifest = canonical.write(original_body)
+            _installed_dependencies.verify_files(staging, manifest)
         target_site = next(staging.glob("lib/python*/site-packages"))
         captured = [
             info
@@ -2436,7 +2465,8 @@ def _materialize_dependency_snapshot(
                 "package_environment_dependency_snapshot_mismatch", "interpreter"
             )
         _verify_inventory(source, actual, venv_precedence=True)
-        _verify_python_requirements(inspected, actual)
+        if not builtin_capture:
+            _verify_python_requirements(inspected, actual)
         snapshot = canonical.parse_canonical(manifest)
         assert isinstance(snapshot, dict)
         for row in snapshot["distributions"]:
