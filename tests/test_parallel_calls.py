@@ -111,7 +111,7 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
             env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
         )
 
-    group = RankGroup(degree=degree, backend="gloo", root=str(tmp_path), launch=launch)
+    group = RankGroup(degree=degree, backend="cpu:gloo", root=str(tmp_path), launch=launch)
     model: Any = (
         h3_model()
         if kind == "h3"
