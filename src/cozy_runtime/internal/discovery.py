@@ -113,12 +113,23 @@ def discover_distribution(distribution: str, *, seconds: float = IMPORT_SECONDS)
     """Discover one installed wheel through its single standard ``cozy.application`` entry."""
 
     try:
-        entries = tuple(importlib.metadata.distribution(distribution).entry_points)
+        installed = importlib.metadata.distribution(distribution)
+        entries = tuple(installed.entry_points)
     except importlib.metadata.PackageNotFoundError as exc:
         raise DiscoveryError(
             f"installed distribution {distribution!r} is absent", code="missing_distribution"
         ) from exc
     applications = [entry.value for entry in entries if entry.group == "cozy.application"]
+    if distribution == "cozy-runtime-operations":
+        from cozy_runtime.internal import builtin_operations
+
+        metadata = next(
+            (file for file in installed.files or () if str(file).endswith(".dist-info/METADATA")),
+            None,
+        )
+        if metadata is None:
+            raise DiscoveryError("Runtime carrier metadata absent", code="builtin_carrier")
+        builtin_operations.validate_installed(Path(str(installed.locate_file(metadata))).parent)
     if len(applications) != 1:
         raise DiscoveryError(
             f"{distribution!r} exposes {len(applications)} cozy.application entries; exactly one "

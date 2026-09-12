@@ -21,6 +21,7 @@ class Options:
     conformance: bool = False
     environment_python: str = ""
     distribution: str = ""
+    builtin: str = ""
 
 
 @dataclass(frozen=True, slots=True)

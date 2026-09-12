@@ -35,6 +35,7 @@ from cozy_runtime.author import (
 
 from .quantization import (
     _ENCODINGS,
+    ArtifactQuantizationPlan,
     ArtifactQuantizationRequest,
     bf16_targets,
     inherited_configs,
@@ -173,6 +174,12 @@ def quantize_artifact(
     contains no per-attempt counters, so memoized operations can retain it unchanged.
     """
     result, receipt = _quantize(source, plan, sink=sink, ctx=ctx, tel=tel, output=output)
+    return _artifact_result(result, receipt, tel, output)
+
+
+def _artifact_result(
+    result: QuantizeResult, receipt: WeightsReceipt, tel: Telemetry, output: str
+) -> ModelArtifact:
     tel.log(
         "quantization measurement",
         output=output,
@@ -196,16 +203,23 @@ def _quantize(
     ctx: Context,
     tel: Telemetry,
     output: str,
+    selection: ArtifactQuantizationPlan | None = None,
+    preserve_precision: bool = False,
 ) -> tuple[QuantizeResult, WeightsReceipt]:
     model, structure = _resolve(source, sink)
-    bf16 = prepare_bf16(structure, keep=plan.keep)
+    keep = (
+        tuple(dict.fromkeys(tensor.component for tensor in structure.tensors))
+        if preserve_precision
+        else plan.keep
+    )
+    bf16 = prepare_bf16(structure, keep=keep)
     canonical = plan.encoding is None
     if plan.encoding is None:
         artifact = None
         selected: set[tuple[str, str]] = set()
         targets = bf16_targets(bf16, source="source")
     else:
-        artifact = prepare_source_quantization(structure, components=plan.components)
+        artifact = selection or prepare_source_quantization(structure, components=plan.components)
         selected = {(tensor.component, tensor.key) for tensor in artifact.tensors}
         targets = bf16_targets(bf16, source="source", excluded=selected)
         for component in artifact.components:
@@ -216,7 +230,7 @@ def _quantize(
                 **targets[component].add,
                 **{
                     key: replace(tensor, logical_dtype="bf16")
-                    if tensor.logical_dtype == "f32"
+                    if tensor.logical_dtype == "f32" and not preserve_precision
                     else tensor
                     for key, tensor in additions.items()
                 },

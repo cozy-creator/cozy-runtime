@@ -29,7 +29,9 @@ def run(function: str | None, opts: Options) -> Result:
     project = Path(opts.dir).expanduser()
     rows: tuple[tuple[str, str], ...] = ()
     try:
-        if opts.package_interface:
+        if opts.builtin:
+            body = static_interface.build_builtin(opts.builtin)
+        elif opts.package_interface:
             interface = Path(opts.package_interface).expanduser()
             try:
                 raw = interface.read_bytes()

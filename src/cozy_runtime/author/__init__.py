@@ -148,6 +148,7 @@ from cozy_runtime.author._services import (
 )
 from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._weights import (
+    MAX_WEIGHTS_NEW_BYTES,
     WeightsConfig,
     WeightsOutput,
     WeightsPart,
@@ -173,6 +174,7 @@ from cozy_runtime.author.publication import (
 __all__ = [
     "DEFAULT_DECODE_LIMITS",
     "JOB_ONLY",
+    "MAX_WEIGHTS_NEW_BYTES",
     "NEUTRAL_ERROR_SET",
     "SERVING_ONLY",
     "ActivationCapture",
