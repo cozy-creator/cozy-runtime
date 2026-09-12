@@ -50,6 +50,37 @@ def test_plain_main_executes_only_inside_attempt(
     assert ran.read_text() == "completed"
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("parameter", ["ctx: Context", "*, ctx: 'ExecutionContext'"])
+def test_plain_main_receives_declared_execution_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, asynchronous: bool, parameter: str
+) -> None:
+    module = f"typed_context_script_{int(asynchronous)}_{int(parameter.startswith('*'))}"
+    imported = tmp_path / "imported"
+    deadline = time.monotonic() + 5
+    (tmp_path / (module + ".py")).write_text(
+        "from pathlib import Path\n"
+        "from cozy_runtime.author import Context, Context as ExecutionContext\n"
+        f"Path({str(imported)!r}).touch()\n"
+        f"{'async ' if asynchronous else ''}def main({parameter}) -> str:\n"
+        "    assert isinstance(ctx, Context)\n"
+        "    assert ctx.request_id == 'typed-script'\n"
+        f"    assert ctx.deadline == {deadline!r}\n"
+        "    ctx.raise_if_cancelled()\n"
+        "    return str(ctx.device)\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    app = script_app(module)
+    describe(app)
+    assert not imported.exists()
+    result, outcome, _ = attempt(
+        app.get("main"), {}, Invocation("typed-script", tmp_path / "out", deadline)
+    )
+    assert outcome.terminal == "succeeded" and result is not None, outcome
+    assert imported.exists()
+    assert result.result.value == "cpu"
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -223,6 +254,8 @@ def test_plain_main_saves_and_returns_real_media(
         "def main(*, source: unknown()): pass",
         "def main(*, source: Model = None): pass",
         "def main(*, source: int): pass",
+        "def main(ctx: int): pass",
+        "def main(ctx: unknown()): pass",
         "# /// script\n# [tool.cozy.weights]\n# result = -1\n# ///\ndef main(): pass",
         '# /// script\n# [tool.cozy.models]\n# missing = "a/b"\n# ///\ndef main(): pass',
     ],

@@ -34,6 +34,7 @@ BUILT = (
     "version",
 )
 PRIVATE = (
+    "builtin-capture",
     "builtin-prepare",
     "development-placement",
     "prepare-package",
@@ -106,6 +107,7 @@ _VALUE_FLAGS = (
 #: Verbs that own their own flag parsing: everything after the verb belongs to them, so a
 #: payload term like `--in` is not eaten by the global pass.
 _OWNS_ARGS = (
+    "builtin-capture",
     "builtin-prepare",
     "run",
     "job",
@@ -198,10 +200,10 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
-    if verb == "builtin-prepare":
+    if verb in ("builtin-prepare", "builtin-capture"):
         from cozy_runtime.cli import builtin_prepare
 
-        return builtin_prepare.run(args, opts)
+        return builtin_prepare.run(args, opts, capture=verb == "builtin-capture")
     if opts.builtin and (
         verb != "describe"
         or opts.distribution
