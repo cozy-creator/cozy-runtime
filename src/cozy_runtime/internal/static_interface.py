@@ -32,7 +32,7 @@ import tomllib
 import types
 import typing
 from collections.abc import Callable, Mapping, Sequence, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -539,6 +539,8 @@ class Reader:
                 return self.fold(found.module, found.value)
             if isinstance(found, Vocab) and found.key == "author.DEFAULT_DECODE_LIMITS":
                 return author.DEFAULT_DECODE_LIMITS
+            if isinstance(found, Vocab) and found.key == "author.MAX_WEIGHTS_NEW_BYTES":
+                return author.MAX_WEIGHTS_NEW_BYTES
             self.refuse(module, node, "not a module-level constant")
         if isinstance(node, ast.Call):
             callee = self.resolve(module, node.func)
@@ -1115,6 +1117,19 @@ def build(project: Path, *, environment_python: Path | None = None) -> dict[str,
     return _build(reader, application, read_table(project / "package.toml"))
 
 
+def build_builtin(name: str) -> dict[str, Json]:
+    """Read only the explicitly selected Runtime-owned App, never caller source."""
+    if name != "operations":
+        raise StaticRefusal("unknown Runtime builtin surface", code="static_builtin")
+    reader = Reader(Path(cozy_runtime.__file__).resolve().parent.parent)
+    application = "cozy_runtime.derive.operations:app"
+    # Ordinary caller discovery must keep skipping Runtime registrations. Only
+    # this reader instance's selected built-in module becomes an App root.
+    selected = reader.module("cozy_runtime.derive.operations")
+    reader.modules[selected.name] = replace(selected, trusted=False)
+    return _build(reader, application, {})
+
+
 def build_installed(distribution: str, *, environment_python: Path) -> dict[str, Json]:
     """Describe one explicitly selected wheel using only its metadata and source bytes."""
 
@@ -1144,6 +1159,11 @@ def build_installed(distribution: str, *, environment_python: Path) -> dict[str,
             code="static_distribution",
         )
     metadata = matches[0]
+    if normalize(distribution) == "cozy-runtime-operations":
+        from cozy_runtime.internal.builtin_operations import validate_installed
+
+        validate_installed(metadata)
+        return build_builtin("operations")
 
     def read(name: str) -> str:
         path = metadata / name

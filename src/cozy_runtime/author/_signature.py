@@ -586,6 +586,11 @@ def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
         for value in get_args(base):
             _wire_default(value)
         return
+    if origin is tuple:
+        args = get_args(base)
+        if len(args) == 2 and args[1] is Ellipsis:
+            _wire_type(args[0], seen)
+            return
     if origin in (typing.Union, types.UnionType, list):
         args = get_args(base)
         if not args:

@@ -34,6 +34,7 @@ BUILT = (
     "version",
 )
 PRIVATE = (
+    "builtin-prepare",
     "development-placement",
     "prepare-package",
     "interface-wheel",
@@ -87,6 +88,8 @@ global flags:
                    describe/bindings source roots of an explicit venv; never executes it
   --distribution <name>
                    describe one installed wheel in --environment-python, without imports
+  --builtin operations
+                   describe Runtime's fixed managed operation surface, without imports
   --conformance    describe only: also IMPORT the app in this interpreter — which must be
                    the package's own locked venv — and refuse unless it matches the source
   -h, --help       this text
@@ -98,10 +101,12 @@ _VALUE_FLAGS = (
     "--package-interface",
     "--environment-python",
     "--distribution",
+    "--builtin",
 )
 #: Verbs that own their own flag parsing: everything after the verb belongs to them, so a
 #: payload term like `--in` is not eaten by the global pass.
 _OWNS_ARGS = (
+    "builtin-prepare",
     "run",
     "job",
     "hostfacts",
@@ -120,6 +125,7 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
     package_interface = ""
     environment_python = ""
     distribution = ""
+    builtin = ""
     verb: str | None = None
     args: list[str] = []
     unknown: list[str] = []
@@ -155,6 +161,8 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
                 environment_python = inline
             elif flag == "--distribution":
                 distribution = inline
+            elif flag == "--builtin":
+                builtin = inline
             else:
                 package_interface = inline
         elif item.startswith("-") and item != "-":
@@ -183,12 +191,30 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
             conformance,
             environment_python,
             distribution,
+            builtin,
         ),
         want_help,
     )
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
+    if verb == "builtin-prepare":
+        from cozy_runtime.cli import builtin_prepare
+
+        return builtin_prepare.run(args, opts)
+    if opts.builtin and (
+        verb != "describe"
+        or opts.distribution
+        or opts.environment_python
+        or opts.package_interface
+        or opts.conformance
+    ):
+        raise CliError(
+            "usage",
+            "--builtin belongs only to static describe",
+            "cozy-runtime describe --builtin operations",
+            Exit.usage,
+        )
     if opts.distribution and (
         verb != "describe"
         or not opts.environment_python

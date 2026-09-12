@@ -945,10 +945,14 @@ def prepare_package(
         if wheel.digest != digest or wheel.length != row.length:
             raise PreparationRefusal("package_prepare_file_identity_mismatch", row.filename)
         if owner == "project" and not wheel.import_roots:
-            raise PreparationRefusal(
-                "package_prepare_project_wheel_no_import_roots",
-                f"{row.filename} installs no importable module",
-            )
+            from cozy_runtime.internal import builtin_operations
+
+            if wheel.distribution != builtin_operations.NAME:
+                raise PreparationRefusal(
+                    "package_prepare_project_wheel_no_import_roots",
+                    f"{row.filename} installs no importable module",
+                )
+            builtin_operations.validate_carrier(path, wheel.version)
         try:
             base_owned = owner == "custom" and package_environment.base_owned_wheel(
                 wheel, observed_base

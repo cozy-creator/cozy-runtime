@@ -2876,6 +2876,32 @@ class Executor:
                         code="child_interface",
                     )
                 bindings[("", module, export)] = effect_binding
+            elif row.get("builtin"):
+                import msgspec
+
+                from cozy_runtime.internal import builtin_operations
+
+                if row["builtin"] != "operations":
+                    raise CapabilityError("unknown Runtime builtin", code="child_interface")
+                builtin_operations.validate_binding(interface, module, export)
+                from cozy_runtime.author import describe
+                from cozy_runtime.derive.operations import app
+
+                describe(app)
+                builtin_surface = app.get("quantize").surface
+                request_type, result_type = (
+                    builtin_surface.payload_type,
+                    builtin_surface.result_type,
+                )
+                if not (
+                    isinstance(request_type, type)
+                    and issubclass(request_type, msgspec.Struct)
+                    and isinstance(result_type, type)
+                    and issubclass(result_type, msgspec.Struct)
+                ):
+                    raise CapabilityError("Runtime builtin types changed", code="child_interface")
+                binding = _CallType(interface, module, export, request_type, result_type)
+                bindings[("", module, export)] = binding
             elif row.get("self"):
                 assert self.discovered is not None
                 surface = next(

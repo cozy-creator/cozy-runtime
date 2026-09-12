@@ -125,7 +125,9 @@ def from_types(
             names[path] = base.__name__
             members = sorted(base, key=lambda member: canonical.write(member.value))
             enums[path] = [member.name for member in members]
-        elif origin is list:
+        elif origin is list or (
+            origin is tuple and len(get_args(base)) == 2 and get_args(base)[1] is Ellipsis
+        ):
             walk(get_args(base)[0], path + "/[]")
         elif serving and origin is dict:
             walk(get_args(base)[0], path + "/map/key")
@@ -295,7 +297,10 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
         allowed = (
             (str, int, float, bool, list, dict) if kind == "entrypoint" else (str, int, float, bool)
         )
-        if path not in nodes or not (default is None or type(default) in allowed):
+        empty_sequence = (
+            default in ([], ()) and isinstance(nodes.get(path), dict) and "list" in nodes[path]
+        )
+        if path not in nodes or not (default is None or type(default) in allowed or empty_sequence):
             raise ConformanceError(
                 "invocable default is not a canonical immutable field value",
                 code="invocable_interface",
