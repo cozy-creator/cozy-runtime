@@ -30,6 +30,10 @@ _TRANSACTION = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CHUNK = 1 << 20
 
 
+def _part_bytes(part: Mapping[str, Any], dtypes: Mapping[str, int]) -> int:
+    return int(math.prod(part["shape"])) * int(dtypes[part["dtype"]])
+
+
 def _path(spool: Path, transaction: str, kind: str) -> Path:
     if _TRANSACTION.fullmatch(transaction) is None or kind not in {
         "request",
@@ -290,7 +294,7 @@ class WriterBroker:
         ][str(frame["role"])]
         from cozy_runtime.internal import fill
 
-        return int(math.prod(part["shape"])) * int(fill.tensorfs_module().dtypes()[part["dtype"]])
+        return _part_bytes(part, fill.tensorfs_module().dtypes())
 
     @staticmethod
     def _payload(frame: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -443,12 +447,58 @@ class WriterBroker:
                     self.pending.pop(key, None)
                     if borrowed is not None:
                         borrowed.close()
-                return result
         except Exception as exc:
             return self._refused(exc)
         finally:
             if lease is not None and lease is not borrowed:
                 lease.close()
+        if operation == "open" and result.get("ok"):
+            try:
+                self._preflight_writers(attempt)
+            except Exception as exc:
+                # The native writer retains completed parts, but no package may
+                # start expensive work with an already-insufficient disk budget.
+                with self.lock:
+                    held = self.writers.pop(key, None)
+                    if held is not None:
+                        held[0].fence()
+                return self._refused(exc)
+        return result
+
+    def _preflight_writers(self, attempt: Any) -> None:
+        """Check remaining declared additions before handing writers to the package.
+
+        This is a preflight, not a long-held reservation: the per-part write/read
+        leases still arbitrate concurrent I/O. Native completion owns resume state;
+        inherited roles and completed roles consume no new-payload budget here.
+        """
+        if not storage_admission.enabled():
+            return
+        from cozy_runtime.internal import fill
+
+        dtypes = fill.tensorfs_module().dtypes()
+        payload = largest = parts = 0
+        with self.lock:
+            for key, (writer, declaration) in self.writers.items():
+                if key[:2] != (attempt.request_id, attempt.attempt):
+                    continue
+                completed = {tuple(row) for row in writer.completed_parts()}
+                for component, target in declaration["components"].items():
+                    for name, tensor in target["add"].items():
+                        for role, part in tensor["parts"].items():
+                            if "source" in part or (component, name, role) in completed:
+                                continue
+                            length = _part_bytes(part, dtypes)
+                            payload += length
+                            largest = max(largest, length)
+                            parts += 1
+        # Configs and commit metadata use the existing native document allowance.
+        # One added role and its source-read window can coexist in the spool.
+        with storage_admission.admit(
+            storage_admission.native_write(self.store_root, payload, parts),
+            storage_admission.Write(attempt.spool, largest + MAX_WEIGHTS_SOURCE_READ, 3),
+        ):
+            pass
 
     def _handle(self, attempt: Any, frame: Mapping[str, Any]) -> dict[str, Any]:
         import io
