@@ -1767,30 +1767,20 @@ class Worker:
         """Derive one local PlacementSet while package imports stay in the isolated executor."""
 
         with self.preparation_lock:
-            # A worker already serving placements prepares BESIDE them: the describe
-            # executor runs in a preparation-scoped slot, so the serving placements'
-            # executors are never replaced by a preparation. One preparation at a time
-            # (this lock); the slot is retired when the preparation returns. An idle
-            # worker keeps using the primary slot so the desired state that follows
-            # reuses the already-spawned executor and its environment.
-            busy = (
-                self.placement is not None
-                or self.pending is not None
-                or bool(self.bindings)
-                or bool(self.hosted)
-            )
-            supervision = self._new_preparation_supervision() if busy else self.supervision
+            # Preparation never borrows execution authority. Even an apparently
+            # idle primary slot can be admitted by a concurrent desired-state
+            # transition while describe is importing the new package.
+            supervision = self._new_preparation_supervision()
             try:
                 return self._prepare_package_in(request, supervision, local=local)
             finally:
-                if busy:
-                    executor = supervision.current
-                    if executor is not None:
-                        try:
-                            supervision.retire_current(executor, "package preparation finished")
-                        except ExecutorGone as exc:
-                            self.note("recovery", f"preparation executor reclaim failed: {exc}")
-                    supervision.close()
+                executor = supervision.current
+                if executor is not None:
+                    try:
+                        supervision.retire_current(executor, "package preparation finished")
+                    except ExecutorGone as exc:
+                        self.note("recovery", f"preparation executor reclaim failed: {exc}")
+                supervision.close()
 
     def _new_preparation_supervision(self) -> ExecutorSupervision:
         """The preparation-scoped executor slot. Package describe needs an isolated
