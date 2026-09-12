@@ -282,12 +282,12 @@ def _receipt(transaction: WeightsTransaction) -> WeightsReceipt:
 def _sdxl_targets(
     bf16: Bf16Plan, *, encoding: str | None, quantization: ArtifactQuantizationPlan
 ) -> dict[str, WeightsTarget]:
-    """Verbatim helper composition from the packages-repo `sdxl_three_lane` consumer."""
+    """Low-level composition preserving the source FP16/BF16 contracts."""
     if encoding is None:
         return bf16_targets(bf16, source="source")
     selected = {(tensor.component, tensor.key) for tensor in quantization.tensors}
     targets = bf16_targets(bf16, source="source", excluded=selected)
-    additions = quantization_additions(encoding, quantization, "unet", target_logical_dtype="bf16")
+    additions = quantization_additions(encoding, quantization, "unet")
     current = targets["unet"]
     combined = {**current.add, **additions}
     targets["unet"] = WeightsTarget(
