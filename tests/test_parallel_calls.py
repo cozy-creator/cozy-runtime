@@ -186,8 +186,13 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         if kind in ("collective", "staged"):
             # The follower returns a failure while rank 0 is already in all_reduce.
             # Reading the failure only AFTER rank 0's body returns would wait forever.
-            with pytest.raises(RuntimeError):
+            with pytest.raises((RuntimeError, ValueError)) as failed:
                 model.fail_before_collective()
+            if isinstance(failed.value, ValueError):
+                # A follower can fail before rank 0 enters all_reduce. The error
+                # monitor then destroys the group first, so Torch refuses entry
+                # rather than interrupting a collective already in progress.
+                assert "Default process group has not been initialized" in str(failed.value)
             assert group.broken
             assert not cp.in_gated_call()
     finally:
