@@ -1178,6 +1178,16 @@ class Worker:
         self.workspace = (
             Workspace(options.tensorfs_root) if options.tensorfs_root is not None else None
         )
+        if self.workspace is not None:
+            from cozy_runtime.internal import storage_admission
+
+            from . import workspace_memo
+
+            workspace = self.workspace
+            storage_admission.register_workspace(
+                workspace.store_root,
+                lambda target: workspace_memo.reclaim_unused(workspace, target_bytes=target),
+            )
         self.workspace_service = (
             WorkspaceService(self.workspace, self.authorize_workspace, self.workspace_weights_ready)
             if self.workspace is not None

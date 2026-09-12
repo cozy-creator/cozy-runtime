@@ -1,0 +1,1 @@
+{"format":"cozy.storage-pressure-policy/1","minimum_free_bytes":1073741824,"minimum_free_inodes":32,"reserve_capacity_divisor":50,"enter_free_capacity_divisor":10,"leave_free_capacity_divisor":5,"max_memo_victims":8}

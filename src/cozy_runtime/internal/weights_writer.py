@@ -468,7 +468,7 @@ class WriterBroker:
         leases still arbitrate concurrent I/O. Native completion owns resume state;
         inherited roles and completed roles consume no new-payload budget here.
         """
-        if not storage_admission.enabled():
+        if not storage_admission.pressure_enabled():
             return
         dtypes = fill.tensorfs_module().dtypes()
         payload = largest = parts = 0

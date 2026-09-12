@@ -323,7 +323,7 @@ class SourceCalls:
         self.send(pb.WorkerFrame(native_source_status=status))
 
     def _write_bounds(self, command: dict[str, Any]) -> tuple[storage_admission.Write, ...]:
-        if not storage_admission.enabled():
+        if not storage_admission.pressure_enabled():
             return ()
         if command["phase"] == "resolve":
             # Profile selection stages sparse header carriers and Store metadata.
@@ -332,6 +332,10 @@ class SourceCalls:
         payload, objects = 0, 1
         if operation in ("download_huggingface", "download_civitai"):
             members = command["selection"]["members"]
+            store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+            # Native presence excludes complete members. Partial prefixes remain
+            # conservatively charged until native exposes verified remaining bytes.
+            members = [row for row in members if not store.contains(row[1].removeprefix("sha256:"))]
             payload, objects = sum(row[2] for row in members), len(members)
         elif operation == "commit_file":
             payload = args["size_bytes"]
