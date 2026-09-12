@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
+from cozy_runtime.internal.local_storage_admission import POLICY
 from cozy_runtime.internal.worker import store_gc
 from cozy_runtime.internal.worker.workspace import _ID, Journal, WorkspaceBusy, WorkspaceRefusal
 from cozy_runtime.protocol import documents
@@ -874,7 +875,7 @@ def prune(workspace: Workspace, owner: str) -> pb.PruneOperationCacheResult:
 
 
 def reclaim_unused(
-    workspace: Workspace, *, target_bytes: int, max_entries: int = 8
+    workspace: Workspace, *, target_bytes: int, max_entries: int = int(POLICY["max_memo_victims"])
 ) -> pb.PruneOperationCacheResult:
     try:
         return _reclaim_unused(workspace, target_bytes=target_bytes, max_entries=max_entries)
