@@ -1703,7 +1703,7 @@ class Worker:
     ) -> pb.PreparePackageSetResult:
         return self._prepare_package(request, local=True)
 
-    def prepare_private_placement(
+    def prepare_unpublished_placement(
         self, request: pb.PreparePrivatePlacementRequest
     ) -> pb.PreparePackageSetResult:
         from cozy_runtime.internal.worker import package_prepare
@@ -1734,7 +1734,7 @@ class Worker:
                         access.enter_context(
                             self.workspace.held_model(owner, model.retention, model.manifest)
                         )
-                result = package_prepare.prepare_private_placement(
+                result = package_prepare.prepare_unpublished_placement(
                     request,
                     prepared=prepared.document,
                     installed=prepared.installed,
@@ -3258,7 +3258,7 @@ class Worker:
                     kind=pb.FAULT_KIND_CONFIG_REFUSED,
                     subject=f"revision {desired.revision}",
                     reason="job_set_busy",
-                    detail="stop private attempts before replacing their job set",
+                    detail="stop unpublished package attempts before replacing their job set",
                 )
             )
             return
@@ -4281,7 +4281,9 @@ class Worker:
                 attempt.kind != "job" and attempt.state in self.engine.ON_DEVICE
                 for attempt in self.engine.history.values()
             ):
-                raise ValueError("stop active serving attempts before entering the private job set")
+                raise ValueError(
+                    "stop active serving attempts before entering the unpublished package job set"
+                )
 
             if not cpu_same and old_cpu is not None:
                 old_cpu.supervision.close()
@@ -6726,7 +6728,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         host.compatibility_checker = worker.check_package_set_compatibility
         host.preparer = worker.prepare_package_set
         host.local_package_preparer = worker.prepare_local_package
-        host.private_placement_preparer = worker.prepare_private_placement
+        host.unpublished_placement_preparer = worker.prepare_unpublished_placement
         host.numerical_environment = worker.numerical_environment
         host.workspace_service = worker.workspace_service
 

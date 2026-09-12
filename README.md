@@ -603,7 +603,9 @@ Model-bound `cozy-runtime run` uses the same explicit source-checkout lane: pack
 and the normal worker/attempt kernel applies the host's real GPU checks. It never authors a
 flat binding record or pretends the local selection carries Tensorhub's hardware evidence.
 
-On a private rental, an editable checkout is not mounted or watched. Creator builds one exact
+An unpublished package runs from captured source without a Tensorhub package release.
+A local script is the single-file form; editable describes an installation mode.
+On a rental, an editable checkout is not mounted or watched. Creator builds one exact
 ephemeral project wheel and closed dependency-wheel set, and pod-supervisor verifies their bounded
 WorkerControl chunks into local files. The loopback-only
 `RuntimePreparation.PrepareLocalPackage` method then calls the same wheel/base/venv/interface/

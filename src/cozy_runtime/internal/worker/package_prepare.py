@@ -760,7 +760,7 @@ def prepare_local_package(
     )
 
 
-def prepare_private_placement(
+def prepare_unpublished_placement(
     request: pb.PreparePrivatePlacementRequest,
     *,
     prepared: Mapping[str, Any],
