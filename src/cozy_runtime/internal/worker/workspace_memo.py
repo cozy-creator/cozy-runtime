@@ -894,6 +894,14 @@ def _reclaim_unused(
         raise ValueError("cache reclamation requires a positive target and bounded batch")
     result = pb.PruneOperationCacheResult()
     with workspace.locked(blocking=False) as db:
+        # A previous busy pass may already have dropped its cache mapping. Sweep
+        # now-unreferenced bytes before choosing another victim, including when
+        # no optional memo roots remain. Live native readers/writers win first.
+        collected = db.native(lambda: store_gc.collect(workspace.store_root))
+        result.reclaimed_bytes = collected.reclaimed_bytes
+        result.store_busy = collected.store_busy
+        if result.store_busy or result.reclaimed_bytes >= target_bytes:
+            return result
         candidates = db.execute(
             "SELECT owner,id FROM operation_cache WHERE state<>'disabled' "
             "ORDER BY sequence,id LIMIT ?",

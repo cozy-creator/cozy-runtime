@@ -18,6 +18,7 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from cozy_runtime.internal import fill
 
@@ -44,7 +45,7 @@ class Write:
 
 _channel: socket.socket | None = None
 _held: ContextVar[bool] = ContextVar("storage_admission_held", default=False)
-_reclaimers: dict[Path, Callable[[int], object]] = {}
+_reclaimers: WeakValueDictionary[int, Registration] = WeakValueDictionary()
 _reclaiming: ContextVar[bool] = ContextVar("storage_reclaiming", default=False)
 
 
@@ -56,11 +57,24 @@ def pressure_enabled() -> bool:
     return enabled() or bool(_reclaimers)
 
 
-def register_workspace(root: Path, reclaim: Callable[[int], object]) -> None:
+@dataclass(eq=False)
+class Registration:
+    """A worker lifetime reference, not another durable storage owner."""
+
+    root: Path
+    reclaim: Callable[[int], object]
+
+    def close(self) -> None:
+        _reclaimers.pop(id(self), None)
+
+
+def register_workspace(root: Path, reclaim: Callable[[int], object]) -> Registration:
     """Only a worker's already-open native workspace supplies deletion authority."""
     if not root.is_absolute() or not (root / ".cozy-workspace").is_dir():
         raise StorageRefusal("pressure recovery requires an existing Runtime workspace")
-    _reclaimers[root] = reclaim
+    registration = Registration(root, reclaim)
+    _reclaimers[id(registration)] = registration
+    return registration
 
 
 def native_write(path: Path | None, payload: int = 0, objects: int = 1) -> Write:
@@ -148,7 +162,10 @@ def acquire(*writes: Write) -> Lease:
             return _exchange(body, tuple(row.path for row in writes))
         from . import local_storage_admission
 
-        return local_storage_admission.acquire(next(iter(_reclaimers)), writes)
+        registrations = tuple(_reclaimers.values())
+        if not registrations:
+            raise StorageRefusal("local write has no live workspace admission owner")
+        return local_storage_admission.acquire(registrations[0].root, writes)
 
     context = admission()
     try:
@@ -182,9 +199,12 @@ def _recover(writes: tuple[Write, ...], facts: dict[str, int]) -> bool:
     try:
         devices = {local_storage_admission.device(row.path) for row in writes}
         matched = False
-        for root, reclaim in tuple(_reclaimers.items()):
-            if local_storage_admission.device(root) in devices:
-                reclaim(target)
+        seen: set[Path] = set()
+        for registration in tuple(_reclaimers.values()):
+            root = registration.root
+            if root not in seen and local_storage_admission.device(root) in devices:
+                registration.reclaim(target)
+                seen.add(root)
                 matched = True
         return matched
     except OSError as exc:
