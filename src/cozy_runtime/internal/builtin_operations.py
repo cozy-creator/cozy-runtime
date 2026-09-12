@@ -139,6 +139,38 @@ def rows() -> list[dict[str, Any]]:
     ]
 
 
+def supports_environment(python: str) -> bool:
+    """Do not send a new broker row to an older captured Runtime interpreter."""
+    executable = Path(python)
+    prefix = executable.parent.parent
+    config = prefix / "pyvenv.cfg"
+    if not executable.is_absolute() or not config.is_file() or config.stat().st_size > 8192:
+        return False
+    roots = list((prefix / "lib").glob("python*/site-packages"))
+    metadata = [path for root in roots for path in root.glob("cozy_runtime-*.dist-info/METADATA")]
+    if not metadata:
+        # The normal remote generation inherits the current worker image's base.
+        # Local SDK snapshots instead carry their own Runtime metadata above.
+        settings = dict(
+            line.split("=", 1) for line in config.read_text().splitlines() if "=" in line
+        )
+        if not any(
+            key.strip() == "include-system-site-packages" and value.strip() == "true"
+            for key, value in settings.items()
+        ):
+            return False
+        metadata = list(Path(__file__).parents[2].glob("cozy_runtime-*.dist-info/METADATA"))
+    if len(metadata) != 1 or metadata[0].stat().st_size > 8192:
+        return False
+    headers = BytesParser().parsebytes(metadata[0].read_bytes(), headersonly=True)
+    try:
+        return headers.get("Name") == "cozy-runtime" and Version(
+            headers.get("Version", "")
+        ) >= Version(FLOOR)
+    except InvalidVersion:
+        return False
+
+
 def validate_binding(interface: str, module: str, export: str) -> None:
     if (interface, module, export) != (digest(), MODULE, "quantize"):
         raise _refuse()

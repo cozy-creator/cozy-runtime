@@ -69,7 +69,8 @@ class Calls:
         result = [dict(row) for row in attempt.job.call_interfaces]
         result.extend(source_interfaces.rows())
         result.extend(effect_interfaces.rows())
-        result.extend(builtin_operations.rows())
+        if builtin_operations.supports_environment(attempt.job.python):
+            result.extend(builtin_operations.rows())
         raw = Path(attempt.job.package_interface).read_bytes()
         interface = package_interface.read_bytes(raw)
         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
