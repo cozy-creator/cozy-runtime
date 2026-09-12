@@ -62,6 +62,8 @@ def script_app(module: str) -> App:
 
     The script and imports are executed only inside the admitted remote/local
     attempt. Authors provide main() or main(ctx), synchronous or asynchronous.
+    An explicit Context annotation receives the execution context; untyped ctx
+    and ScriptContext annotations receive the cancellation/reporting convenience.
     """
     if not module.isidentifier():
         raise ConformanceError("script adapter requires one module", code="script_main_missing")
@@ -81,10 +83,16 @@ def script_app(module: str) -> App:
     positional = [*args.posonlyargs, *args.args]
     parameters = [*positional, *args.kwonlyargs]
     types: dict[str, Any] = {}
+    execution_context = False
     try:
         models, weights = declarations(raw)
         for parameter in parameters:
             if parameter.arg == "ctx":
+                if parameter.annotation is not None:
+                    value = annotation(parameter.annotation, tree)
+                    if value not in (Context, ScriptContext):
+                        raise ValueError("ctx must declare Context or ScriptContext")
+                    execution_context = value is Context
                 continue
             if parameter.annotation is None:
                 raise ValueError("injected parameters need a type")
@@ -128,7 +136,7 @@ def script_app(module: str) -> App:
             function = getattr(importlib.import_module(module), "main", None)
             if not callable(function):
                 raise ConformanceError("script main is not callable", code="script_main_signature")
-            context = ScriptContext(ctx, telemetry)
+            context = ctx if execution_context else ScriptContext(ctx, telemetry)
             if positional:
                 result = function(context, **injected)
             else:
