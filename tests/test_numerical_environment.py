@@ -101,6 +101,7 @@ def test_installed_code_changes_reuse_identity_without_version_or_machine_change
         "0.10.0",
         (("cozy-runtime", "0.9.0"),),
         (),
+        "3.12.12",
     )
     device = HostFacts(backend="cuda", gpu_sm=89, driver_version="580.1")
 

@@ -1832,11 +1832,11 @@ def _marker_environment(base: base_observation.Observation) -> dict[str, str]:
     environment.update(
         {
             "implementation_name": "cpython",
-            "implementation_version": f"{major}.{minor}.0",
+            "implementation_version": base.python_full_version,
             "os_name": "posix",
             "platform_machine": "x86_64",
             "platform_python_implementation": "CPython",
-            "python_full_version": f"{major}.{minor}.0",
+            "python_full_version": base.python_full_version,
             "python_version": f"{major}.{minor}",
             "sys_platform": "linux",
         }

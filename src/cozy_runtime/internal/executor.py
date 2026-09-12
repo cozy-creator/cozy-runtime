@@ -276,8 +276,23 @@ class _CompositeResidency:
 
     def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]:
         """Every slot re-fills what it can without evicting; the reports merge as above."""
-        reports = {name: row.restore(names=names) for name, row in sorted(self.rows.items())}
-        prefix = len(reports) > 1
+        prefix = len(self.rows) > 1
+        reports = {}
+        for name, row in sorted(self.rows.items()):
+            local = (
+                tuple(
+                    value.removeprefix(name + "/")
+                    for value in names
+                    if value.startswith(name + "/")
+                )
+                if prefix
+                else names
+            )
+            # An empty selection means "restore everything" to a child, so do not call
+            # unselected models when the worker named specific global components.
+            if names and not local:
+                continue
+            reports[name] = row.restore(names=local)
 
         def keyed(name: str, component: str) -> str:
             return f"{name}/{component}" if prefix else str(component)
@@ -289,9 +304,16 @@ class _CompositeResidency:
                 for component, size in report["restored"].items()
             },
             "held": {
-                keyed(name, component): str(why)
-                for name, report in reports.items()
-                for component, why in report["held"].items()
+                **{
+                    value: "this generation has no checkpoint for it"
+                    for value in names
+                    if prefix and ("/" not in value or value.partition("/")[0] not in self.rows)
+                },
+                **{
+                    keyed(name, component): str(why)
+                    for name, report in reports.items()
+                    for component, why in report["held"].items()
+                },
             },
             "restored_bytes": sum(int(report["restored_bytes"]) for report in reports.values()),
             "allocator_delta_bytes": sum(
@@ -313,15 +335,16 @@ class _CompositeResidency:
             for name, document in documents.items()
             for component, size in document.get("evicted", {}).items()
         }
-        activation_peaks: dict[str, int] = {}
-        scope_headrooms: dict[str, int] = {}
-        for document in documents.values():
-            for method, value in (document.get("attempt_activation_peaks") or {}).items():
-                activation_peaks[str(method)] = max(
-                    activation_peaks.get(str(method), 0), int(value)
-                )
-            for method, value in (document.get("scope_headroom_bytes") or {}).items():
-                scope_headrooms[str(method)] = max(scope_headrooms.get(str(method), 0), int(value))
+        activation_peaks = {
+            f"{name}.{method}" if prefix else str(method): int(value)
+            for name, document in documents.items()
+            for method, value in (document.get("attempt_activation_peaks") or {}).items()
+        }
+        scope_headrooms = {
+            f"{name}.{method}" if prefix else str(method): int(value)
+            for name, document in documents.items()
+            for method, value in (document.get("scope_headroom_bytes") or {}).items()
+        }
         return {
             "placement": next(
                 (document.get("placement", "") for document in documents.values()), ""

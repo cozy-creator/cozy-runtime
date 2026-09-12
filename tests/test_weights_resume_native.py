@@ -113,6 +113,7 @@ def test_work_identity_ignores_attempt_authority_but_binds_numerical_inputs() ->
     ]
     base = Observation(
         python_abi="cp312",
+        python_full_version="3.12.12",
         os_arch="linux/amd64",
         libc="glibc2.28",
         accelerator_backend="cuda",
