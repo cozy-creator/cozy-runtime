@@ -22,7 +22,7 @@ from typing import Any, BinaryIO, cast
 
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._weights import MAX_WEIGHTS_SOURCE_READ
-from cozy_runtime.internal import storage_admission
+from cozy_runtime.internal import fill, storage_admission
 from cozy_runtime.internal.weights_sink import source_config
 from cozy_runtime.protocol import weights_limits
 
@@ -280,8 +280,6 @@ class WriterBroker:
         if operation == "config":
             if str(frame.get("name", "")) not in declaration["configs"]:
                 raise CapabilityError("undeclared config", code="weights_writer_ungranted")
-            from cozy_runtime.internal import fill
-
             # Native Manifest and config admission share DOC_MAX_BYTES; use its
             # published bound rather than narrowing configs to the intent-frame cap.
             return min(
@@ -292,8 +290,6 @@ class WriterBroker:
         part = declaration["components"][str(frame["component"])]["add"][str(frame["key"])][
             "parts"
         ][str(frame["role"])]
-        from cozy_runtime.internal import fill
-
         return _part_bytes(part, fill.tensorfs_module().dtypes())
 
     @staticmethod
@@ -474,8 +470,6 @@ class WriterBroker:
         """
         if not storage_admission.enabled():
             return
-        from cozy_runtime.internal import fill
-
         dtypes = fill.tensorfs_module().dtypes()
         payload = largest = parts = 0
         with self.lock:
