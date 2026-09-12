@@ -104,7 +104,9 @@ def test_serving_defaults_from_committed_choices_match_imported_interface(tmp_pa
     (root / "steps.json").write_text('{"plans":[{"steps":30},{"steps":40},{"steps":50}]}')
     captured = static_interface.build(root)
     imported = package_interface.build(discover(root))
-    assert package_interface.canonical_bytes(captured) == package_interface.canonical_bytes(imported)
+    assert package_interface.canonical_bytes(captured) == package_interface.canonical_bytes(
+        imported
+    )
     for entrypoint in captured["entrypoints"]:
         defaults = entrypoint["invocable"]["defaults"]
         assert defaults["request/steps"] == 30
@@ -123,9 +125,7 @@ def test_serving_defaults_from_committed_choices_match_imported_interface(tmp_pa
         'min((30, "forty"))',
     ],
 )
-def test_unresolved_scalar_default_refuses_before_capture(
-    tmp_path: Path, expression: str
-) -> None:
+def test_unresolved_scalar_default_refuses_before_capture(tmp_path: Path, expression: str) -> None:
     root = project(tmp_path)
     source = SOURCE.replace(
         "class Request(msgspec.Struct, kw_only=True):",
@@ -152,6 +152,13 @@ def test_shadowed_min_is_not_executed_or_treated_as_a_builtin(tmp_path: Path) ->
     with pytest.raises(static_interface.StaticRefusal) as caught:
         static_interface.build(root)
     assert caught.value.code == "static_computed"
+
+
+def test_foldable_reducer_is_not_an_interface_type(tmp_path: Path) -> None:
+    root = project(tmp_path)
+    (root / "serving_fixture.py").write_text(SOURCE.replace("prompt: str", "prompt: min"))
+    with pytest.raises(static_interface.StaticRefusal, match="not an interface type"):
+        static_interface.build(root)
 
 
 def test_deterministic_serving_measurement_explicitly_opts_into_memoization(tmp_path: Path) -> None:

@@ -225,7 +225,7 @@ _STRUCT_KEYWORDS = frozenset(
         "repr_omit_defaults",
     }
 )
-#: `tuple(...)`/`list(...)` over a folded sequence: the only builtins a constant may call.
+#: Constructors over a folded sequence; scalar min/max reduction is handled separately.
 _SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
     "builtins.tuple": tuple,
     "builtins.list": list,
@@ -405,7 +405,7 @@ class Reader:
     ) -> Resolved:
         stmt = module.bindings.get(name)
         if stmt is None:
-            if name in _BUILTIN_TYPES:
+            if name in _BUILTIN_TYPES or name in ("min", "max"):
                 return Vocab(f"builtins.{name}")
             if module.is_package:
                 try:
@@ -544,6 +544,27 @@ class Reader:
             self.refuse(module, node, "not a module-level constant")
         if isinstance(node, ast.Call):
             callee = self.resolve(module, node.func)
+            if isinstance(callee, Vocab) and callee.key in ("builtins.min", "builtins.max"):
+                if len(node.args) != 1 or node.keywords:
+                    self.refuse(
+                        module, node, "min/max needs one literal sequence", "static_computed"
+                    )
+                values = self.fold(module, node.args[0], scope)
+                if (
+                    not isinstance(values, (tuple, list))
+                    or not values
+                    or any(type(value) not in (int, float, bool, str) for value in values)
+                ):
+                    self.refuse(
+                        module, node, "min/max needs a nonempty literal sequence", "static_computed"
+                    )
+                try:
+                    literals = typing.cast(Sequence[typing.Any], values)
+                    return min(literals) if callee.key == "builtins.min" else max(literals)
+                except TypeError:
+                    self.refuse(
+                        module, node, "min/max literal values are not comparable", "static_computed"
+                    )
             if isinstance(callee, Vocab) and callee.key in _SEQUENCE_BUILTINS:
                 if len(node.args) != 1 or node.keywords:
                     self.refuse(module, node, "a sequence built from several arguments")
@@ -680,7 +701,7 @@ class Reader:
 
     def _vocab_type(self, module: Module, node: ast.expr, found: Vocab) -> object:
         prefix, _, name = found.key.partition(".")
-        if prefix == "builtins":
+        if prefix == "builtins" and name in _BUILTIN_TYPES:
             return _BUILTIN_TYPES[name]
         if prefix == "abc" and name in _ABC_TYPES:
             return _ABC_TYPES[name]
@@ -840,10 +861,7 @@ class Reader:
                 options = {k.arg: k.value for k in value.keywords if k.arg is not None}
                 wire = str(self.fold(module, options["name"])) if "name" in options else None
                 if "default" in options:
-                    try:
-                        default = self.fold(module, options["default"])
-                    except StaticRefusal:
-                        return name, annotation, msgspec.field(default_factory=_unfolded, name=wire)
+                    default = self.fold(module, options["default"])
                     return name, annotation, msgspec.field(default=default, name=wire)
                 if "default_factory" in options:
                     factory = self.resolve(module, options["default_factory"])
@@ -861,12 +879,9 @@ class Reader:
                         )
                     return name, annotation, msgspec.field(default_factory=_unfolded, name=wire)
                 return name, annotation, msgspec.field(name=wire)
-        # Invocable metadata carries exact scalar defaults. Ordinary request
-        # schemas only need omission, and can retain an unevaluated default.
-        try:
-            default = self.fold(module, value)
-        except StaticRefusal:
-            return name, annotation, msgspec.field(default_factory=_unfolded)
+        # Portable callable metadata includes scalar defaults. An unresolved value
+        # must refuse here, rather than change identity after worker-side import.
+        default = self.fold(module, value)
         return name, annotation, default
 
     def model(self, module: Module, node: ast.ClassDef) -> ModelSpec:
@@ -957,7 +972,7 @@ class Reader:
 
 
 def _unfolded() -> None:
-    """A default the reader did not evaluate: a default's VALUE is not interface content."""
+    """An unevaluated custom factory; its per-call value is not interface content."""
     return None
 
 
