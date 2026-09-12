@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from cozy_runtime.derive.operations import MAX_QUANTIZED_BYTES, QuantizationPlan
 from cozy_runtime.derive.quantization import QuantizationSource
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import Discovered
-from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+from cozy_runtime.internal.weights_sink import WeightsCheckpoint, WeightsTransactionHost
 from test_quantize_artifact_native import _host, _run, _source
 
 
@@ -31,16 +32,22 @@ def _shared(
     source: ModelArtifact,
     plan: QuantizationPlan,
     encoding: str = "fp8-rowwise/1",
+    *,
+    request: str | None = None,
+    epoch: int = 1,
+    canceled: list[bool] | None = None,
+    checkpoint: Callable[[WeightsCheckpoint], None] | None = None,
 ) -> tuple[InvocationResult | None, Outcome, Attempt]:
     host = WeightsTransactionHost(
         store=store,
         owner_scope="shared-quantize",
-        request_id=root.name,
+        request_id=request or root.name,
         invocation_spec_digest="sha256:" + "42" * 32,
         work_fingerprint="sha256:" + "43" * 32,
-        writer_session_id=1,
+        writer_session_id=epoch,
         allowed_sources={source.manifest.digest: source.manifest.length},
         output_bounds={"model": MAX_QUANTIZED_BYTES},
+        record_checkpoint=checkpoint,
     )
     describe(app)
     return attempt(
@@ -51,14 +58,52 @@ def _shared(
             "encoding": encoding,
         },
         Invocation(
-            root.name,
+            host.request_id,
             root,
             time.monotonic() + 30,
             models={"source": _derive_model(QuantizationSource, source.manifest.digest)},
             weights=host.open,
             weights_source_structure=host.structure,
+            cancel=lambda: bool(canceled and canceled[0]),
         ),
     )
+
+
+@pytest.mark.parametrize("encoding", ["fp8-rowwise/1", "mxfp8/1"])
+def test_shared_operation_resumes_complete_native_groups(tmp_path: Path, encoding: str) -> None:
+    store = tensorfs.Store.init(tmp_path / "store")
+    source = _source(store, "control")
+    plan = QuantizationPlan(("control",))
+    canceled = [False]
+    checkpoints = []
+
+    def stop(value: WeightsCheckpoint) -> None:
+        checkpoints.append(value)
+        canceled[0] = True
+
+    result, outcome, _ = _shared(
+        tmp_path / "first",
+        store,
+        source,
+        plan,
+        encoding,
+        request="resume",
+        canceled=canceled,
+        checkpoint=stop,
+    )
+    assert result is None and outcome.terminal == "canceled" and len(checkpoints) == 1
+    result, outcome, record = _shared(
+        tmp_path / "resumed", store, source, plan, encoding, request="resume", epoch=2
+    )
+    assert outcome.terminal == "succeeded" and result is not None
+    facts = next(
+        row["fields"] for row in record.ring.rows() if row.get("name") == "quantization measurement"
+    )
+    assert isinstance(facts, dict) and facts["reused_keys"] == 1
+    assert facts["source_bytes_read_this_run"] == 1024
+    clean, outcome, _ = _shared(tmp_path / "clean", store, source, plan, encoding)
+    assert outcome.terminal == "succeeded" and clean is not None
+    assert clean.result.manifest == result.result.manifest
 
 
 def test_builtin_interface_is_static_and_matches_its_actual_app() -> None:
