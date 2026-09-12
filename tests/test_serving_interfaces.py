@@ -84,6 +84,76 @@ def test_serving_metadata_keeps_original_handler_and_cli_schema(tmp_path: Path) 
         package_interface.read_bytes(package_interface.canonical_bytes(source))
 
 
+def test_serving_defaults_from_committed_choices_match_imported_interface(tmp_path: Path) -> None:
+    root = project(tmp_path)
+    source = SOURCE.replace("from typing import Any", "from typing import Any, Literal")
+    source = source.replace(
+        "from cozy_runtime.author import App, Context, Model",
+        "from cozy_runtime.author import App, Context, Model, data_values\n"
+        'STEPS = data_values(__file__, "steps.json", "plans", "steps")\n'
+        "DEFAULT_STEPS = min(STEPS)",
+    )
+    source = source.replace(
+        "    prompt: str",
+        "    prompt: str\n"
+        "    steps: Literal[STEPS] = DEFAULT_STEPS\n"
+        "    highest: Literal[STEPS] = msgspec.field(default=max(STEPS))\n"
+        "    values: list[int] = msgspec.field(default_factory=list)",
+    )
+    (root / "serving_fixture.py").write_text(source)
+    (root / "steps.json").write_text('{"plans":[{"steps":30},{"steps":40},{"steps":50}]}')
+    captured = static_interface.build(root)
+    imported = package_interface.build(discover(root))
+    assert package_interface.canonical_bytes(captured) == package_interface.canonical_bytes(imported)
+    for entrypoint in captured["entrypoints"]:
+        defaults = entrypoint["invocable"]["defaults"]
+        assert defaults["request/steps"] == 30
+        assert defaults["request/highest"] == 50
+        assert defaults["request/values"] == []
+        assert defaults["request/tags"] == {}
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "custom_default()",
+        "msgspec.field(default=custom_default())",
+        "min((30, 40), key=custom_default)",
+        "min(())",
+        'min((30, "forty"))',
+    ],
+)
+def test_unresolved_scalar_default_refuses_before_capture(
+    tmp_path: Path, expression: str
+) -> None:
+    root = project(tmp_path)
+    source = SOURCE.replace(
+        "class Request(msgspec.Struct, kw_only=True):",
+        'raise AssertionError("static capture must not import this module")\n\n'
+        "def custom_default():\n"
+        '    raise AssertionError("static capture must not call user code")\n\n'
+        "class Request(msgspec.Struct, kw_only=True):",
+    ).replace('msgspec.field(name="wire_count", default=3)', expression)
+    (root / "serving_fixture.py").write_text(source)
+    with pytest.raises(static_interface.StaticRefusal) as caught:
+        static_interface.build(root)
+    assert caught.value.code == "static_computed"
+
+
+def test_shadowed_min_is_not_executed_or_treated_as_a_builtin(tmp_path: Path) -> None:
+    root = project(tmp_path)
+    source = SOURCE.replace(
+        "class Request(msgspec.Struct, kw_only=True):",
+        "def min(values):\n"
+        '    raise AssertionError("user function must never execute during capture")\n\n'
+        "class Request(msgspec.Struct, kw_only=True):",
+    ).replace('msgspec.field(name="wire_count", default=3)', "min((30, 40))")
+    (root / "serving_fixture.py").write_text(source)
+    with pytest.raises(static_interface.StaticRefusal) as caught:
+        static_interface.build(root)
+    assert caught.value.code == "static_computed"
+
+
 def test_deterministic_serving_measurement_explicitly_opts_into_memoization(tmp_path: Path) -> None:
     root = project(tmp_path)
     (root / "serving_fixture.py").write_text(
