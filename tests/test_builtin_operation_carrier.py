@@ -6,6 +6,8 @@ import base64
 import csv
 import hashlib
 import io
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -73,6 +75,31 @@ def test_metadata_only_carrier_passes_ordinary_wheel_admission(tmp_path: Path) -
     with zipfile.ZipFile(path) as archive:
         archive.extractall(root)
     builtin_operations.validate_installed(root / "cozy_runtime_operations-0.16.8.dist-info")
+
+
+def test_installed_carrier_accepts_only_standard_installer_metadata(tmp_path: Path) -> None:
+    path = carrier(tmp_path / "wheel")
+    environment = tmp_path / "environment"
+    for args in (
+        ["uv", "venv", str(environment), "--python", sys.executable],
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(environment / "bin/python"),
+            "--no-deps",
+            str(path),
+        ],
+    ):
+        subprocess.run(args, check=True, capture_output=True)
+    directory = next(
+        environment.glob("lib/python*/site-packages/cozy_runtime_operations-*.dist-info")
+    )
+    builtin_operations.validate_installed(directory)
+    (directory / "untrusted.py").write_text("raise AssertionError('not metadata')\n")
+    with pytest.raises(ConformanceError, match="builtin_carrier"):
+        builtin_operations.validate_installed(directory)
 
 
 @pytest.mark.parametrize(

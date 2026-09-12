@@ -53,6 +53,9 @@ def run(args: list[str], _opts: Options) -> Result:
             base=base,
             dependency_python=Path(sys.executable),
         )
+        builtin_operations.validate_installed(
+            installed.site_packages / f"cozy_runtime_operations-{version}.dist-info"
+        )
         actual = package_environment.observe_base(installed.python)
         body = {
             "environment_python": str(installed.python),

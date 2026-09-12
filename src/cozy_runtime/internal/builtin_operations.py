@@ -104,7 +104,7 @@ def validate_installed(directory: Path) -> None:
     suffix = directory.name.removeprefix("cozy_runtime_operations-").removesuffix(".dist-info")
     if directory.name != "cozy_runtime_operations-" + suffix + ".dist-info":
         raise _refuse()
-    allowed = MEMBERS | {"INSTALLER", "REQUESTED", "direct_url.json"}
+    allowed = MEMBERS | {"INSTALLER", "REQUESTED", "direct_url.json", "uv_cache.json"}
     if directory.is_symlink() or any(
         row.is_symlink() or not row.is_file() or row.name not in allowed
         for row in directory.iterdir()
