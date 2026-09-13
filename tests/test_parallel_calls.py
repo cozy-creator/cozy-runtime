@@ -117,10 +117,10 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         if kind == "h3"
         else collective_model(tmp_path / "rank-0" if kind == "staged" else None)
     )
-    batch = h3_batch() if kind == "h3" else {}
     if kind == "h3":
         with torch.no_grad():
-            expected = model.dit(**batch)
+            batches = [h3_batch(), h3_batch(mixed_lengths=True)]
+            expected = [(batch, model.dit(**batch)) for batch in batches]
     spool = tmp_path / "attempt-a"
     ours, theirs = socket.socketpair()
     leader: Any = Executor(Channel(ours), tmp_path, world=degree)
@@ -169,7 +169,8 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                     "component_staged", 37, {"sample": 11, "fail_before_collective": 13}
                 )
             if kind == "h3":
-                model.compute(batch, expected)
+                for batch, full_output in expected:
+                    model.compute(batch, full_output)
             else:
                 state = SimpleNamespace(
                     value=torch.tensor([2.0, 4.0, 8.0]),
