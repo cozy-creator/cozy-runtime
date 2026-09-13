@@ -34,8 +34,8 @@ def verify_claim_proof(
     worker_id: str,
     worker_boot_id: str,
     worker_tls_certificate_digest: str,
-) -> None:
-    """Verify the canonical private-rental Claim transcript."""
+) -> bytes:
+    """Verify the rental or delegated pod claim; return its execution grant digest."""
 
     if claim.worker_id != worker_id or claim.worker_boot_id != worker_boot_id:
         raise DownloadRefusal(
@@ -51,6 +51,54 @@ def verify_claim_proof(
             "claim_proof_tls_digest_invalid",
             exc.detail,
         ) from exc
+    if claim.HasField("execution_owner"):
+        authorization = claim.execution_owner
+        grant = authorization.grant
+        known = pb.SignedExecutionOwnerGrant()
+        known.CopyFrom(authorization)
+        known.DiscardUnknownFields()
+        if (
+            known.SerializeToString(deterministic=True)
+            != authorization.SerializeToString(deterministic=True)
+            or claim.wire_minor < 50
+            or claim.record_owner_epoch == 0
+            or not claim.record_owner_id
+            or len(claim.record_owner_id) > 256
+            or grant.record_owner_epoch != claim.record_owner_epoch
+            or grant.record_owner_id != claim.record_owner_id
+            or grant.worker_id != worker_id
+            or grant.worker_boot_id != worker_boot_id
+            or grant.worker_tls_certificate_digest != tls_digest
+            or len(grant.execution_public_key) != 32
+            or len(grant.initial_capsule_digest) != 32
+        ):
+            raise DownloadRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                "execution_grant_binding_mismatch",
+                "execution grant does not bind this complete claimant and worker lifetime",
+            )
+        try:
+            grant_bytes = documents.canonical_bytes(grant)
+            grant_digest = hashlib.sha256(grant_bytes).digest()
+            transcript = documents.canonical_bytes(
+                pb.ExecutionClaimProof(
+                    execution_grant_digest=grant_digest,
+                    record_owner_epoch=claim.record_owner_epoch,
+                    record_owner_id=claim.record_owner_id,
+                    worker_id=worker_id,
+                    worker_boot_id=worker_boot_id,
+                    worker_tls_certificate_digest=tls_digest,
+                )
+            )
+        except documents.DocumentError as exc:
+            raise DownloadRefusal(
+                pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                "execution_grant_invalid",
+                "execution grant has no canonical encoding",
+            ) from exc
+        _verify_signature(public_key, authorization.signature, grant_bytes, "execution_grant")
+        _verify_signature(grant.execution_public_key, claim.proof, transcript, "execution_claim")
+        return grant_digest
     transcript = documents.canonical_bytes(
         pb.ClaimProof(
             record_owner_epoch=claim.record_owner_epoch,
@@ -60,6 +108,7 @@ def verify_claim_proof(
         )
     )
     _verify_signature(public_key, claim.proof, transcript, "claim_proof")
+    return b""
 
 
 def _verify_signature(public_key: bytes, signature: bytes, payload: bytes, subject: str) -> None:

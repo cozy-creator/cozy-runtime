@@ -1543,6 +1543,16 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
                 _registered_method=True)
+        self.PrepareExecutionOwner = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/PrepareExecutionOwner',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareExecutionOwnerCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparedExecutionOwner.FromString,
+                _registered_method=True)
+        self.AcceptExecutionOwner = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/AcceptExecutionOwner',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.AcceptExecutionOwnerCall.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ExecutionOwnerAcceptance.FromString,
+                _registered_method=True)
         self.PreparePackageSet = channel.unary_stream(
                 '/cozy.worker.v1.PodHost/PreparePackageSet',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetCall.SerializeToString,
@@ -1707,6 +1717,18 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PrepareExecutionOwner(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AcceptExecutionOwner(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def PreparePackageSet(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -1863,6 +1885,16 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.NumericalEnvironment,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.SerializeToString,
+            ),
+            'PrepareExecutionOwner': grpc.unary_unary_rpc_method_handler(
+                    servicer.PrepareExecutionOwner,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareExecutionOwnerCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparedExecutionOwner.SerializeToString,
+            ),
+            'AcceptExecutionOwner': grpc.unary_unary_rpc_method_handler(
+                    servicer.AcceptExecutionOwner,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.AcceptExecutionOwnerCall.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.ExecutionOwnerAcceptance.SerializeToString,
             ),
             'PreparePackageSet': grpc.unary_stream_rpc_method_handler(
                     servicer.PreparePackageSet,
@@ -2064,6 +2096,60 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/NumericalEnvironment',
             cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.NumericalEnvironmentResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PrepareExecutionOwner(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/PrepareExecutionOwner',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PrepareExecutionOwnerCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparedExecutionOwner.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AcceptExecutionOwner(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/AcceptExecutionOwner',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.AcceptExecutionOwnerCall.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.ExecutionOwnerAcceptance.FromString,
             options,
             channel_credentials,
             insecure,

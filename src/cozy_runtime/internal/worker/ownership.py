@@ -14,7 +14,7 @@ _MAX_BYTES = 4096
 _MAX_COUNTER = (1 << 64) - 1
 
 
-def read(path: Path, boot_id: str, *, required: bool) -> tuple[int, str, int]:
+def read(path: Path, boot_id: str, *, required: bool) -> tuple[int, str, int, bytes]:
     """Load the existing counters after ExecutorSupervision owns the worker root."""
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -24,7 +24,7 @@ def read(path: Path, boot_id: str, *, required: bool) -> tuple[int, str, int]:
                 "worker_ownership_absent", "a resumed pod has no accepted control history"
             ) from exc
         write(path, boot_id, 0, "", 0)
-        return 0, "", 0
+        return 0, "", 0, b""
     except OSError as exc:
         raise LaunchRefusal("worker_ownership_unreadable", "cannot open control history") from exc
     try:
@@ -42,7 +42,16 @@ def read(path: Path, boot_id: str, *, required: bool) -> tuple[int, str, int]:
             len(raw) > _MAX_BYTES
             or not isinstance(value, dict)
             or set(value)
-            != {"worker_boot_id", "record_owner_epoch", "record_owner_id", "control_stream_epoch"}
+            not in (
+                {"worker_boot_id", "record_owner_epoch", "record_owner_id", "control_stream_epoch"},
+                {
+                    "worker_boot_id",
+                    "record_owner_epoch",
+                    "record_owner_id",
+                    "control_stream_epoch",
+                    "execution_grant_digest",
+                },
+            )
         ):
             raise ValueError("control history fields or size are invalid")
         if _encode(value) != raw:
@@ -55,22 +64,40 @@ def read(path: Path, boot_id: str, *, required: bool) -> tuple[int, str, int]:
             value["control_stream_epoch"],
         )
         _validate(owner, identity, stream_epoch)
-        return owner, identity, stream_epoch
+        execution = value.get("execution_grant_digest", "")
+        if execution and (
+            not isinstance(execution, str)
+            or len(execution) != 64
+            or any(c not in "0123456789abcdef" for c in execution)
+            or stream_epoch == 0
+        ):
+            raise ValueError("execution owner digest is invalid")
+        return owner, identity, stream_epoch, bytes.fromhex(execution)
     except (OSError, ValueError, TypeError) as exc:
         raise LaunchRefusal("worker_ownership_invalid", "control history is invalid") from exc
 
 
-def write(path: Path, boot_id: str, owner: int, identity: str, stream_epoch: int) -> None:
+def write(
+    path: Path,
+    boot_id: str,
+    owner: int,
+    identity: str,
+    stream_epoch: int,
+    execution_grant_digest: bytes = b"",
+) -> None:
     """Publish and sync the next stream before any ClaimAck can name it."""
     _validate(owner, identity, stream_epoch)
-    raw = _encode(
-        {
-            "worker_boot_id": boot_id,
-            "record_owner_epoch": owner,
-            "record_owner_id": identity,
-            "control_stream_epoch": stream_epoch,
-        }
-    )
+    if execution_grant_digest and (len(execution_grant_digest) != 32 or stream_epoch == 0):
+        raise ValueError("execution owner digest is invalid")
+    body = {
+        "worker_boot_id": boot_id,
+        "record_owner_epoch": owner,
+        "record_owner_id": identity,
+        "control_stream_epoch": stream_epoch,
+    }
+    if execution_grant_digest:
+        body["execution_grant_digest"] = execution_grant_digest.hex()
+    raw = _encode(body)
     if len(raw) > _MAX_BYTES:
         raise ValueError("control history exceeds its fixed bound")
     temporary = path.with_suffix(".pending")

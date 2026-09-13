@@ -1600,14 +1600,91 @@ class NativeSourceStatus(_message.Message):
     byte_output_invocation_spec_digest: bytes
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_request_id: _Optional[str] = ..., parent_attempt_ordinal: _Optional[int] = ..., parent_invocation_spec_digest: _Optional[bytes] = ..., call_index: _Optional[int] = ..., intent_digest: _Optional[bytes] = ..., service_id: _Optional[str] = ..., state: _Optional[_Union[NativeSourceState, str]] = ..., selection: _Optional[_Union[NativeSourceSelection, _Mapping]] = ..., result_canonical_bytes: _Optional[bytes] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., native_receipt_canonical_bytes: _Optional[bytes] = ..., computation_digest: _Optional[bytes] = ..., memo_hit: bool = ..., byte_output: _Optional[_Union[NativeByteTreeRef, _Mapping]] = ..., byte_output_attempt_ordinal: _Optional[int] = ..., byte_output_invocation_spec_digest: _Optional[bytes] = ...) -> None: ...
 
+class PrepareExecutionOwnerCall(_message.Message):
+    __slots__ = ("claim",)
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
+
+class PreparedExecutionOwner(_message.Message):
+    __slots__ = ("worker_id", "worker_boot_id", "execution_public_key")
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_PUBLIC_KEY_FIELD_NUMBER: _ClassVar[int]
+    worker_id: str
+    worker_boot_id: str
+    execution_public_key: bytes
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_public_key: _Optional[bytes] = ...) -> None: ...
+
+class ExecutionOwnerGrant(_message.Message):
+    __slots__ = ("record_owner_epoch", "record_owner_id", "worker_id", "worker_boot_id", "worker_tls_certificate_digest", "execution_public_key", "initial_capsule_digest")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    RECORD_OWNER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_TLS_CERTIFICATE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_PUBLIC_KEY_FIELD_NUMBER: _ClassVar[int]
+    INITIAL_CAPSULE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    record_owner_id: str
+    worker_id: str
+    worker_boot_id: str
+    worker_tls_certificate_digest: bytes
+    execution_public_key: bytes
+    initial_capsule_digest: bytes
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., record_owner_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., worker_tls_certificate_digest: _Optional[bytes] = ..., execution_public_key: _Optional[bytes] = ..., initial_capsule_digest: _Optional[bytes] = ...) -> None: ...
+
+class SignedExecutionOwnerGrant(_message.Message):
+    __slots__ = ("grant", "signature")
+    GRANT_FIELD_NUMBER: _ClassVar[int]
+    SIGNATURE_FIELD_NUMBER: _ClassVar[int]
+    grant: ExecutionOwnerGrant
+    signature: bytes
+    def __init__(self, grant: _Optional[_Union[ExecutionOwnerGrant, _Mapping]] = ..., signature: _Optional[bytes] = ...) -> None: ...
+
+class AcceptExecutionOwnerCall(_message.Message):
+    __slots__ = ("authorization", "initial_capsule")
+    AUTHORIZATION_FIELD_NUMBER: _ClassVar[int]
+    INITIAL_CAPSULE_FIELD_NUMBER: _ClassVar[int]
+    authorization: SignedExecutionOwnerGrant
+    initial_capsule: bytes
+    def __init__(self, authorization: _Optional[_Union[SignedExecutionOwnerGrant, _Mapping]] = ..., initial_capsule: _Optional[bytes] = ...) -> None: ...
+
+class ExecutionOwnerAcceptance(_message.Message):
+    __slots__ = ("execution_grant_digest", "record_owner_epoch", "record_owner_id")
+    EXECUTION_GRANT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    RECORD_OWNER_ID_FIELD_NUMBER: _ClassVar[int]
+    execution_grant_digest: bytes
+    record_owner_epoch: int
+    record_owner_id: str
+    def __init__(self, execution_grant_digest: _Optional[bytes] = ..., record_owner_epoch: _Optional[int] = ..., record_owner_id: _Optional[str] = ...) -> None: ...
+
+class ExecutionClaimProof(_message.Message):
+    __slots__ = ("execution_grant_digest", "record_owner_epoch", "record_owner_id", "worker_id", "worker_boot_id", "worker_tls_certificate_digest")
+    EXECUTION_GRANT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    RECORD_OWNER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_TLS_CERTIFICATE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    execution_grant_digest: bytes
+    record_owner_epoch: int
+    record_owner_id: str
+    worker_id: str
+    worker_boot_id: str
+    worker_tls_certificate_digest: bytes
+    def __init__(self, execution_grant_digest: _Optional[bytes] = ..., record_owner_epoch: _Optional[int] = ..., record_owner_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., worker_tls_certificate_digest: _Optional[bytes] = ...) -> None: ...
+
 class Claim(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "record_owner_id", "worker_id", "wire_minor", "proof")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "record_owner_id", "worker_id", "wire_minor", "execution_owner", "proof")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     RECORD_OWNER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_OWNER_FIELD_NUMBER: _ClassVar[int]
     PROOF_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
@@ -1615,8 +1692,9 @@ class Claim(_message.Message):
     record_owner_id: str
     worker_id: str
     wire_minor: int
+    execution_owner: SignedExecutionOwnerGrant
     proof: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., record_owner_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., wire_minor: _Optional[int] = ..., proof: _Optional[bytes] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., record_owner_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., wire_minor: _Optional[int] = ..., execution_owner: _Optional[_Union[SignedExecutionOwnerGrant, _Mapping]] = ..., proof: _Optional[bytes] = ...) -> None: ...
 
 class ClaimProof(_message.Message):
     __slots__ = ("record_owner_epoch", "worker_boot_id", "worker_id", "worker_tls_certificate_digest")

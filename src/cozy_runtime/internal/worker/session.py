@@ -1085,12 +1085,13 @@ class Worker:
         )
         # ExecutorSupervision already holds the process-lifetime worker-root lease.
         # Restore only under that lease so two processes cannot allocate one stream.
+        self.execution_grant_digest = b""
         self.ownership_path = self.root / "ownership.json" if options.worker_boot_id else None
         if self.ownership_path is not None:
             from cozy_runtime.internal.worker import ownership
 
             try:
-                owner, identity, stream = ownership.read(
+                owner, identity, stream, self.execution_grant_digest = ownership.read(
                     self.ownership_path,
                     self.fence.worker_boot_id,
                     required=options.ownership_required,
@@ -1996,13 +1997,17 @@ class Worker:
                 ):
                     raise WorkspaceRefusal("workspace proof names another worker lifetime")
                 try:
-                    downloads.verify_claim_proof(
+                    execution_digest = downloads.verify_claim_proof(
                         claim,
                         self.config.record_owner_public_key,
                         worker_id=self.options.worker_id,
                         worker_boot_id=self.fence.worker_boot_id,
                         worker_tls_certificate_digest=self.options.worker_tls_certificate_digest,
                     )
+                    if execution_digest != self.execution_grant_digest:
+                        raise WorkspaceRefusal(
+                            "workspace execution authority differs from its owner"
+                        )
                 except downloads.DownloadRefusal as exc:
                     raise WorkspaceRefusal("workspace owner proof was refused") from exc
             elif (
@@ -2631,9 +2636,15 @@ class Worker:
         # token, so neither does whoever provisioned it — and a self-spawned worker
         # compares against the credential its own launcher minted. Both are constant-time
         # and neither ever renders what it holds into a refusal.
+        execution_digest = b""
+        if claim.HasField("execution_owner") and not self.config.record_owner_public_key:
+            return reject(
+                pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
+                "execution delegation requires the private rental authority",
+            )
         if self.config.record_owner_public_key:
             try:
-                downloads.verify_claim_proof(
+                execution_digest = downloads.verify_claim_proof(
                     claim,
                     self.config.record_owner_public_key,
                     worker_id=self.options.worker_id,
@@ -2663,6 +2674,11 @@ class Worker:
                 f"this worker is {self.options.worker_id!r}",
             )
         with self.claim_lock:
+            if self.execution_grant_digest and execution_digest != self.execution_grant_digest:
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_UNAUTHENTICATED,
+                    "this worker boot already belongs to another execution grant",
+                )
             if not self.claim_ready.is_set() or self.stop.is_set():
                 return reject(
                     pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
@@ -2693,7 +2709,7 @@ class Worker:
             # The existing stream counter is synced before its ClaimAck. A failed
             # write closes admission; a fresh process must read the stored authority.
             try:
-                self.record_ownership(claim)
+                self.record_ownership(claim, execution_digest)
             except (OSError, ValueError):
                 self.claim_ready.clear()
                 self.fence.dispatch_open = False
@@ -2732,7 +2748,7 @@ class Worker:
 
         self.claim_ready.set()
 
-    def record_ownership(self, claim: pb.Claim) -> None:
+    def record_ownership(self, claim: pb.Claim, execution_digest: bytes = b"") -> None:
         """Record the authority this claim carries before ClaimAck.
 
         Called under `claim_lock` and the existing process-lifetime worker-root lease.
@@ -2746,7 +2762,9 @@ class Worker:
                 claim.record_owner_epoch,
                 claim.record_owner_id,
                 self.fence.control_stream_epoch + 1,
+                execution_digest,
             )
+        self.execution_grant_digest = execution_digest
         self.records.append(
             "ownership",
             {
