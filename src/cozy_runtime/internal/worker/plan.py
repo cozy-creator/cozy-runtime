@@ -425,6 +425,10 @@ class DeclaredBinding:
             degrees = declared if degrees is None else degrees & declared
         return tuple(sorted(degrees or ()))
 
+    def group_weight_bytes(self) -> int:
+        """Declared per-rank weight requirement before measured executor preparation."""
+        return self.model_weight_bytes
+
     def snapshot_for(self, component: str) -> str:
         """This component's snapshot, or the binding's own when the map omits it."""
         return self.snapshots.get(component, self.reference_snapshot)

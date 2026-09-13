@@ -1444,6 +1444,8 @@ class Worker:
         # THE PIN (cr-068): the RecordOwner's placement of this placement on THIS worker,
         # validated here and never chosen here. The declared degrees are the package's.
         pin = placement.device_pin
+        if pin is not None and len(pin) > 1:
+            declared = sum(binding.group_weight_bytes() for binding in bindings.values())
         degrees: set[int] | None = None
         for binding in bindings.values():
             if binding.weightless:
