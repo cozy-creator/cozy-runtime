@@ -14,7 +14,13 @@ from cozy_runtime.internal import builtin_operations, numerical_environment, pac
 from cozy_runtime.internal.exits import Exit
 
 
-def run(args: list[str], _opts: Options, *, capture: bool = False) -> Result:
+def run(
+    args: list[str],
+    _opts: Options,
+    *,
+    capture: bool = False,
+    dependency_cache: Path | None = None,
+) -> Result:
     if not args or args[0] != "operations":
         raise CliError(
             "usage",
@@ -53,6 +59,7 @@ def run(args: list[str], _opts: Options, *, capture: bool = False) -> Result:
             Path(sys.executable),
             base,
             builtin_capture=capture,
+            dependency_cache=dependency_cache,
         )
         builtin_operations.validate_installed(
             installed.site_packages / f"cozy_runtime_operations-{version}.dist-info"

@@ -405,6 +405,7 @@ def materialize(
     base: base_observation.Observation | None = None,
     dependency_python: Path | None = None,
     exact_dependencies: bool = False,
+    dependency_cache: Path | None = None,
 ) -> InstalledEnvironment:
     """Verify exact wheels and atomically publish one ordinary uv virtual environment.
 
@@ -430,7 +431,15 @@ def materialize(
                 "package_environment_dependency_snapshot_local_only",
                 "rented execution requires the declared exact dependency wheels",
             )
-        return _materialize_dependency_snapshot(source, root, python, dependency_python, base)
+        return _materialize_dependency_snapshot(
+            source,
+            root,
+            python,
+            dependency_python,
+            base,
+            exact_dependencies=exact_dependencies,
+            dependency_cache=dependency_cache,
+        )
     observed = base or observe_base(python)
     wheels = _verify_inventory(source, observed, venv_precedence=True)
     uv = _uv_binary()
@@ -2096,7 +2105,7 @@ def _run_install_commands(
     staging: Path,
     dependencies: Callable[[Path], None] | None,
 ) -> None:
-    for index, command in enumerate(commands):
+    for command in commands:
         result = subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
@@ -2116,8 +2125,10 @@ def _run_install_commands(
                 detail or f"uv exited {result.returncode}",
             )
 
-        if index == 0 and dependencies is not None:
-            dependencies(staging)
+    # uv must finish before immutable shared dependency inodes enter the venv.
+    # Installation cannot overwrite a prior capture through a shared payload.
+    if dependencies is not None:
+        dependencies(staging)
 
 
 def _verify_boot_installs(
@@ -2365,7 +2376,7 @@ def _remove_tree(path: Path) -> None:
     if not path.exists():
         return
     for item in path.rglob("*"):
-        if not item.is_symlink():
+        if not item.is_symlink() and item.is_dir():
             item.chmod(item.stat().st_mode | stat.S_IWUSR)
     path.chmod(path.stat().st_mode | stat.S_IWUSR)
     shutil.rmtree(path)
@@ -2387,6 +2398,8 @@ def _materialize_dependency_snapshot(
     base: base_observation.Observation | None,
     *,
     builtin_capture: bool | None = None,
+    exact_dependencies: bool = False,
+    dependency_cache: Path | None = None,
 ) -> InstalledEnvironment:
     from cozy_runtime.internal import _installed_dependencies
 
@@ -2407,17 +2420,16 @@ def _materialize_dependency_snapshot(
     provided = {
         item.wheel.distribution: (item.wheel.version, item.requirements) for item in inspected
     }
-    # The fixed carrier has no root extras. Authored local packages can have a
-    # selected CUDA extra, but PrepareLocalPackage does not carry that selection.
-    # Preserve their installed closure until that exact selection is supplied;
-    # inferring it from Requires-Dist alone would silently drop optional inputs.
+    # Creator seals selected root extras into the captured wheel's flattened
+    # Requires-Dist before calling exact preparation. Raw local wheel callers do
+    # not make that claim and keep their conservative installed closure.
     included = None
-    if builtin_capture is not None:
+    if exact_dependencies or builtin_capture is not None:
         included = _installed_dependencies.required_distributions(
             dependency_python,
             provided,
             _marker_environment(observed),
-            allow_absent=frozenset({"numpy"}),
+            allow_absent=frozenset({"numpy"}) if builtin_capture is not None else frozenset(),
         )
     uv = _uv_binary()
     if _observed_uv_version(uv) != observed.uv_version:
@@ -2435,7 +2447,7 @@ def _materialize_dependency_snapshot(
     def copy_dependencies(target: Path) -> None:
         nonlocal manifest
         manifest = _installed_dependencies.snapshot(
-            dependency_python, target, set(provided), included=included
+            dependency_python, target, set(provided), included=included, cache=dependency_cache
         )
 
     try:
@@ -2475,7 +2487,7 @@ def _materialize_dependency_snapshot(
         _installed_dependencies.verify_files(staging, manifest)
         # Re-read the copied metadata after wheel installation: a source edit during
         # capture cannot silently leave an incomplete transitive closure.
-        if builtin_capture is not None:
+        if exact_dependencies or builtin_capture is not None:
             _installed_dependencies.required_distributions(
                 staging / "bin/python",
                 provided,

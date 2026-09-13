@@ -344,3 +344,56 @@ def test_dependency_record_verification_also_returns_canonical_content_digest(
     actual = dependencies._copy_dependency_file(source, target, expected, str(len(body)))
     assert actual == ("sha256:" + hashlib.sha256(body).hexdigest(), len(body))
     assert source.stat().st_ino != target.stat().st_ino
+
+
+def test_cached_payloads_are_immutable_and_independent_of_source_and_cache(tmp_path: Path) -> None:
+    source, first, second, cache = (
+        tmp_path / part for part in ("source", "first", "second", "cache")
+    )
+    site = _venv(source)
+    first_site, second_site = _venv(first), _venv(second)
+    _distribution(
+        site,
+        "dependency",
+        {
+            "dependency.py": b"value = 47\n",
+            "dependency/data.bin": bytes(range(256)) * 4096,
+            "dependency-1.0.dist-info/entry_points.txt": b"[console_scripts]\nproof = sys:exit\n",
+        },
+    )
+    initial = dependencies.snapshot(source / "bin/python", first, set(), cache=cache)
+    dependencies.verify_files(first, initial)
+    repeated = dependencies.snapshot(source / "bin/python", second, set(), cache=cache)
+    assert initial == repeated
+    dependencies.verify_files(second, repeated)
+    payload = "dependency/data.bin"
+    assert (first_site / payload).stat().st_ino == (second_site / payload).stat().st_ino
+    assert (first_site / payload).stat().st_ino != (site / payload).stat().st_ino
+    assert not (first_site / payload).stat().st_mode & 0o222
+    assert (first_site / "dependency-1.0.dist-info/RECORD").stat().st_ino != (
+        second_site / "dependency-1.0.dist-info/RECORD"
+    ).stat().st_ino
+    (site / payload).write_bytes(b"mutated source bytes")
+    shutil.rmtree(source)
+    shutil.rmtree(cache)
+    package_environment._make_read_only(first)
+    package_environment._remove_tree(first)
+    assert not (second_site / payload).stat().st_mode & 0o222
+    dependencies.verify_files(second, repeated)
+
+
+def test_cache_reuse_still_rejects_changed_source_with_unchanged_record(tmp_path: Path) -> None:
+    source, first, second, cache = (
+        tmp_path / part for part in ("source", "first", "second", "cache")
+    )
+    site = _venv(source)
+    _venv(first)
+    _venv(second)
+    _distribution(site, "dependency", {"dependency.py": b"value = 47\n"})
+    initial = dependencies.snapshot(source / "bin/python", first, set(), cache=cache)
+    before = (site / "dependency.py").stat()
+    (site / "dependency.py").write_bytes(b"value = 48\n")
+    os.utime(site / "dependency.py", ns=(before.st_atime_ns, before.st_mtime_ns))
+    with pytest.raises(package_environment.EnvironmentRefusal, match="member_changed"):
+        dependencies.snapshot(source / "bin/python", second, set(), cache=cache)
+    dependencies.verify_files(first, initial)

@@ -12,7 +12,9 @@ import json
 import os
 import re
 import stat
+import uuid
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
@@ -28,6 +30,7 @@ from cozy_runtime.internal.package_environment import (
     MAX_PACKAGE_WHEELS,
     MAX_WHEEL_MEMBERS,
     EnvironmentRefusal,
+    _fsync_dir,
     _hash_file,
     _name,
     _sha,
@@ -178,12 +181,38 @@ def _dependency_entrypoints(info: Path) -> dict[str, str]:
     return output
 
 
-def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) -> tuple[str, int]:
+def _source_info(source: Path, size: str) -> os.stat_result:
     info = source.lstat()
     if not stat.S_ISREG(info.st_mode):
         raise EnvironmentRefusal("package_environment_dependency_member_unsupported", str(source))
     if size and (not size.isdecimal() or int(size) != info.st_size):
         raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
+    return info
+
+
+def _source_unchanged(
+    source: Path, initial: os.stat_result, opened: os.stat_result, after: os.stat_result
+) -> None:
+    # uv cache link churn changes ctime/nlink without changing these bytes.
+    for observed in (initial, opened):
+        if (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_mode,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_mode,
+        ):
+            raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
+
+
+def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) -> tuple[str, int]:
+    info = _source_info(source, size)
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise EnvironmentRefusal("package_environment_dependency_member_collision", str(target))
@@ -205,28 +234,97 @@ def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) 
         outgoing.flush()
         os.fsync(outgoing.fileno())
         after = os.fstat(incoming.fileno())
-    # uv may link/unlink other cache names for this inode while we copy it. That changes
-    # ctime and nlink without changing content; the copied bytes still prove their RECORD hash.
-    for observed in (info, before):
-        if (
-            observed.st_dev,
-            observed.st_ino,
-            observed.st_size,
-            observed.st_mtime_ns,
-            observed.st_mode,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_mode,
-        ):
-            raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
+    _source_unchanged(source, info, before, after)
     if verified is None:
         # Reflink copies in the filesystem, so its target still needs a verification read.
         verified = _verify_dependency_hash(target, expected)
     target.chmod(0o755 if info.st_mode & 0o111 else 0o644)
     return verified
+
+
+def _cached_dependency_file(
+    source: Path, target: Path, expected: str, size: str, cache: Path
+) -> tuple[str, int]:
+    info = _source_info(source, size)
+    algorithm, separator, encoded = expected.partition("=")
+    lengths = {"sha256": 43, "sha384": 64, "sha512": 86}
+    if (
+        not separator
+        or algorithm not in lengths
+        or len(encoded) != lengths[algorithm]
+        or not re.fullmatch(r"[A-Za-z0-9_-]+", encoded)
+    ):
+        # Unhashed RECORD entries have no reusable identity before copying.
+        return _copy_dependency_file(source, target, expected, size)
+    mode = 0o555 if info.st_mode & 0o111 else 0o444
+    member = cache / f"{mode:o}-{algorithm}-{encoded}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if cache.stat().st_dev != target.parent.stat().st_dev:
+        return _copy_dependency_file(source, target, expected, size)
+    if target.exists():
+        raise EnvironmentRefusal("package_environment_dependency_member_collision", str(target))
+    try:
+        held = member.lstat()
+    except FileNotFoundError:
+        held = None
+    if held is not None:
+        if (
+            not stat.S_ISREG(held.st_mode)
+            or held.st_uid != os.geteuid()
+            or stat.S_IMODE(held.st_mode) != mode
+            or held.st_size != info.st_size
+        ):
+            raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(member))
+        with source.open("rb") as incoming:
+            opened = os.fstat(incoming.fileno())
+            verified = _verify_dependency_stream(incoming, source, expected)
+            _source_unchanged(source, info, opened, os.fstat(incoming.fileno()))
+        try:
+            os.link(member, target, follow_symlinks=False)
+        except FileNotFoundError:
+            pass  # Cache eviction raced reuse; the source still supplies the exact bytes.
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            return _copy_dependency_file(source, target, expected, size)
+        else:
+            linked = target.lstat()
+            if (linked.st_dev, linked.st_ino) != (held.st_dev, held.st_ino):
+                raise EnvironmentRefusal(
+                    "package_environment_dependency_cache_changed", str(member)
+                )
+            _fsync_dir(target.parent)
+            return verified
+    temporary = cache / f".copy-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        verified = _copy_dependency_file(source, temporary, expected, size)
+        _source_unchanged(source, info, info, source.lstat())
+        temporary.chmod(mode)
+        with suppress(FileExistsError):
+            os.link(temporary, member)
+        try:
+            cached = member.lstat()
+        except FileNotFoundError:
+            cached = None
+        if cached is not None and (
+            not stat.S_ISREG(cached.st_mode)
+            or cached.st_uid != os.geteuid()
+            or stat.S_IMODE(cached.st_mode) != mode
+            or cached.st_size != verified[1]
+        ):
+            raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(member))
+        try:
+            os.link(member if cached is not None else temporary, target, follow_symlinks=False)
+        except FileNotFoundError:
+            os.link(temporary, target)  # Disposable cache was evicted after publication.
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            return _copy_dependency_file(source, target, expected, size)
+        _fsync_dir(target.parent)
+        return verified
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _verify_dependency_hash(target: Path, expected: str) -> tuple[str, int]:
@@ -266,6 +364,7 @@ def snapshot(
     *,
     included: set[str] | None = None,
     inventory_only: bool = False,
+    cache: Path | None = None,
 ) -> bytes:
     # Metadata discovery must never start this interpreter: its editable hooks are mutable.
     prefix = source_python.parent.parent
@@ -290,6 +389,17 @@ def snapshot(
             "package_environment_dependency_source_invalid", str(source_python)
         )
     source_site = sites[0]
+    if cache is not None:
+        cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cache_info = cache.lstat()
+        if (
+            not cache.is_absolute()
+            or cache.resolve() != cache
+            or not stat.S_ISDIR(cache_info.st_mode)
+            or cache_info.st_uid != os.geteuid()
+            or stat.S_IMODE(cache_info.st_mode) != 0o700
+        ):
+            raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(cache))
     target_site = staging / source_site.relative_to(prefix)
     distributions: list[dict[str, Any]] = []
     copied: set[Path] = set()
@@ -370,7 +480,15 @@ def snapshot(
                     )
                 verified[destination] = _verify_dependency_hash(member, digest)
             else:
-                verified[destination] = _copy_dependency_file(member, destination, digest, length)
+                metadata_member = any(part.endswith(".dist-info") for part in relative.split("/"))
+                if cache is not None and not metadata_member:
+                    verified[destination] = _cached_dependency_file(
+                        member, destination, digest, length, cache
+                    )
+                else:
+                    verified[destination] = _copy_dependency_file(
+                        member, destination, digest, length
+                    )
             copied.add(destination)
         if metadata not in {source_site / relative for relative, _, _ in rows}:
             raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(metadata))

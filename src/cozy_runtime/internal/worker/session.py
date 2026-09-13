@@ -1920,6 +1920,7 @@ class Worker:
                 base=self.base,
                 materialized=materialized.append,
                 dependency_python=self.options.environment_python,
+                dependency_cache=self.config.dependency_cache,
             )
             prepared = read_placement_set(result.placement_set)
             if len(prepared) != 1 or not prepared[0].get("development"):
