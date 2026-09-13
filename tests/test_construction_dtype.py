@@ -1,29 +1,21 @@
 """Checkpoint dtype is immutable constructor input, before census and allocation."""
 
-import json
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
 import msgspec
 import pytest
 import tensorfs
+from tensorfs.derived import Config as NativeConfig
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import (
-    Artifact,
-    Config,
-    ConformanceError,
-    Loader,
-    WeightsConfig,
-    WeightsPart,
-    WeightsTarget,
-    WeightsTensor,
-)
+from cozy_runtime.author import Artifact, Config, ConformanceError, Loader
 from cozy_runtime.author._loader import TensorSpec
-from cozy_runtime.author._weights import WeightsCommit
 from cozy_runtime.internal import derive_child
 from cozy_runtime.internal.encoding import SPEC_PLAIN
 from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, tensor_schema_of
-from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+from cozy_runtime.internal.weights_sink import weights_transaction_id
 
 torch = pytest.importorskip("torch")
 
@@ -90,37 +82,26 @@ def test_native_checkpoint_fills_the_dtype_selected_constructor(
     selected_dtype = {"f32": torch.float32, "f16": torch.float16}[dtype]
     source = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=selected_dtype)
     store = tensorfs.Store.ensure(str(tmp_path / "store"))
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="dtype-proof",
-        request_id="proof",
-        invocation_spec_digest="sha256:" + "1" * 64,
-        work_fingerprint="sha256:" + "2" * 64,
-        writer_session_id=1,
-        allowed_sources={},
-        output_bounds={"model": 8192},
-    )
-    transaction = host.open(
-        WeightsCommit(
-            output_slot="model",
+    transaction = store.begin_derived(
+        weights_transaction_id("dtype-proof", "proof", "sha256:" + "1" * 64, "model"),
+        1,
+        *Derivation(
             sources={},
             targets={
-                "linear": WeightsTarget(
+                "linear": Target(
                     add={
-                        "weight": WeightsTensor(
-                            dtype, (3, 2), SPEC_PLAIN, {"value": WeightsPart(dtype, (3, 2))}
-                        )
+                        "weight": Tensor(dtype, (3, 2), SPEC_PLAIN, {"value": Part(dtype, (3, 2))})
                     }
                 )
             },
-            configs={"model": WeightsConfig(data=b"{}")},
+            configs={"model": NativeConfig("add")},
             order=(("linear", "weight"),),
-            max_new_bytes=8192,
-        )
+        ).native_arguments(8192),
+        work_fingerprint="sha256:" + "2" * 64,
     )
-    transaction.add_part("linear", "weight", "value", source.numpy().tobytes())
-    transaction.add_config("model", b"{}", 2)
-    receipt = json.loads(transaction.commit().tensorfs_receipt)
+    transaction.add_part("linear", "weight", "value", io.BytesIO(source.numpy().tobytes()))
+    transaction.add_config("model", io.BytesIO(b"{}"))
+    receipt = transaction.commit()
     manifest = "sha256:" + receipt["manifest"]["sha256"]
     checkpoint = Checkpoint(tmp_path / "store", manifest)
     rows = checkpoint.rows("linear")

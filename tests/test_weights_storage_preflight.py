@@ -14,13 +14,14 @@ from typing import Any
 
 import pytest
 import tensorfs
+from tensorfs.derived import Derivation, Part, Source, Target, Tensor
 
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal import storage_admission as storage
-from cozy_runtime.internal.weights_writer import StoreProxy, WriterBroker
+from cozy_runtime.internal.weights_writer import WriterBroker
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from test_storage_admission import operation
-from weights_channel import exchange as writer_exchange
+from weights_channel import open_output
 
 
 def _rig(
@@ -29,26 +30,9 @@ def _rig(
     store = tensorfs.Store.init(root / "store")
     spool = root / "spool"
     spool.mkdir()
-    targets = {
-        "model": {
-            "drop": [],
-            "add": {
-                key: {
-                    "logical_dtype": "u8",
-                    "shape": [length],
-                    "encoding": dict(tensorfs.seed_digests())["plain/1"],
-                    "parts": {"value": {"dtype": "u8", "shape": [length]}},
-                }
-                for key, length in lengths.items()
-            },
-        }
-    }
     order = [("model", key) for key in lengths]
     fingerprint = "sha256:" + "71" * 32
     transaction = "sha256:" + "72" * 32
-    declaration = store.derived_declaration(
-        {}, targets, {}, order, maximum, work_fingerprint=fingerprint
-    )
     attempt = SimpleNamespace(
         request_id="storage-preflight",
         attempt=1,
@@ -65,30 +49,35 @@ def _rig(
         checkpoint=lambda _a, _t, _b, facts: recorded.append(facts),
         receipt=lambda _a, _t, _b, facts: recorded.append(facts),
     )
-    proxy = StoreProxy(store, spool, writer_exchange(lambda frame: broker.handle(attempt, frame)))
+    definition = Derivation(
+        {},
+        {
+            "model": Target(
+                add={
+                    key: Tensor(
+                        "u8",
+                        (length,),
+                        dict(tensorfs.seed_digests())["plain/1"],
+                        {"value": Part("u8", (length,))},
+                    )
+                    for key, length in lengths.items()
+                }
+            )
+        },
+        {},
+        order,
+    )
 
     def opened(output: str = "model", selected: str = transaction) -> Any:
-        broker.authorize(
-            attempt, selected, attempt.attempt, hashlib.sha256(declaration).digest(), output
-        )
-        return proxy.begin_derived(
-            selected,
-            attempt.attempt,
-            {},
-            targets,
-            {},
-            order,
-            maximum,
-            work_fingerprint=fingerprint,
-        )
+        return open_output(broker, attempt, selected, definition, output=output)
 
     return store, broker, attempt, opened
 
 
 def _host(channel: socket.socket, accept: bool, rows: list[list[dict[str, Any]]]) -> None:
-    # One native preflight includes metadata and all missing bodies. Runtime has
-    # no role spool to reserve, and the hold ends before subsequent part calls.
-    for _index in range(1):
+    # The output door first admits remaining bytes, then accepts the native handle
+    # through its metadata-only receipt query. Neither call reserves a role spool.
+    for _index in range(2 if accept else 1):
         try:
             if not channel.recv(1, socket.MSG_PEEK):
                 return
@@ -98,10 +87,7 @@ def _host(channel: socket.socket, accept: bool, rows: list[list[dict[str, Any]]]
         rows.append(writes)
         with connection:
             connection.sendall(
-                json.dumps(
-                    {"ok": accept, "facts": {"available": 4_883_300_352}}
-                ).encode()
-                + b"\n"
+                json.dumps({"ok": accept, "facts": {"available": 4_883_300_352}}).encode() + b"\n"
             )
             if accept:
                 assert connection.recv(1) == b""
@@ -175,8 +161,11 @@ def test_inherited_checkpoint_needs_no_new_payload_budget(
         {"input_id": MODEL_PREFIX + "source", "digest": source, "length": manifest["length"]}
     ]
     attempt.spec["outputs"].append({"output_id": "inherited", "max_bytes": 0})
-    proxy = StoreProxy(
-        store, attempt.spool, writer_exchange(lambda frame: broker.handle(attempt, frame))
+    definition = Derivation(
+        {"source": Source(source, manifest["length"])},
+        {"model": Target(source="source", source_component="model")},
+        {},
+        order,
     )
     host, worker = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     rows: list[list[dict[str, Any]]] = []
@@ -185,16 +174,7 @@ def test_inherited_checkpoint_needs_no_new_payload_budget(
         thread = threading.Thread(target=_host, args=(host, True, rows), daemon=True)
         thread.start()
         try:
-            inherited = proxy.begin_derived(
-                transaction,
-                1,
-                sources,
-                targets,
-                {},
-                order,
-                0,
-                work_fingerprint=attempt.weights_work_fingerprint,
-            )
+            inherited = open_output(broker, attempt, transaction, definition, output="inherited")
             assert inherited.receipt is None
         finally:
             broker.close_attempt(attempt)

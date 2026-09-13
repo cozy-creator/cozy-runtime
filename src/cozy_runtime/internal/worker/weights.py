@@ -175,7 +175,7 @@ class WeightsExchange:
     ) -> None:
         """Record the native winner before acknowledging the scoped TensorFS commit."""
         from cozy_runtime import canonical_json
-        from cozy_runtime.internal.weights_sink import WeightsTransactionHost, protocol_receipt
+        from cozy_runtime.internal.weights_sink import protocol_receipt, receipt_from_native
 
         if (
             facts.get("transaction_id") != transaction
@@ -185,7 +185,7 @@ class WeightsExchange:
             raise WeightsExchangeError(
                 "weights_receipt_identity_mismatch", "native commit differs from intent"
             )
-        wrapped = WeightsTransactionHost._wrap(
+        wrapped = receipt_from_native(
             binding.slot, transaction, facts, replayed=False, request_id=attempt.request_id
         )
         _, canonical_receipt, digest = protocol_receipt(

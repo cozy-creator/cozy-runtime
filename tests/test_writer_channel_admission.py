@@ -9,11 +9,12 @@ from typing import Any
 
 import pytest
 import tensorfs
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.internal import storage_admission as storage
-from cozy_runtime.internal.weights_writer import StoreProxy, WriterBroker
+from cozy_runtime.internal.weights_writer import WriterBroker
 from test_storage_admission import operation
-from weights_channel import exchange
+from weights_channel import open_output
 
 
 @pytest.mark.parametrize("finish", ["part", "cancel", "producer_error"])
@@ -56,10 +57,24 @@ def test_native_channel_admission_releases_on_completion_cancel_or_producer_loss
         receipt=lambda _a, _t, _b, facts: recorded.append(facts),
     )
     broker.authorize(attempt, transaction, 1, hashlib.sha256(declaration).digest(), "model")
-    proxy = StoreProxy(store, spool, exchange(lambda frame: broker.handle(attempt, frame)))
-    writer = proxy.begin_derived(
-        transaction, 1, {}, targets, {}, order, 4, work_fingerprint=fingerprint
+    definition = Derivation(
+        {},
+        {
+            "model": Target(
+                add={
+                    "w": Tensor(
+                        "bf16",
+                        (2,),
+                        dict(tensorfs.seed_digests())["plain/1"],
+                        {"value": Part("bf16", (2,))},
+                    )
+                }
+            )
+        },
+        {},
+        order,
     )
+    writer = open_output(broker, attempt, transaction, definition)
     host, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     released, pulling, supply = threading.Event(), threading.Event(), threading.Event()
     seen: list[dict[str, Any]] = []

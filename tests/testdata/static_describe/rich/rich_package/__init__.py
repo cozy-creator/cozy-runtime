@@ -9,7 +9,6 @@ from cozy_runtime.author import (
     Preflight,
     Telemetry,
     WeightsOutput,
-    WeightsSink,
 )
 
 from .bounds import LANE_BYTES, LANE_ENCODINGS, Stills
@@ -57,7 +56,6 @@ def quantize(
     ctx: Context,
     payload: QuantizeRequest,
     source: SourceModel,
-    weights: WeightsSink,
     tel: Telemetry,
 ) -> QuantizedLanes:
     raise NotImplementedError

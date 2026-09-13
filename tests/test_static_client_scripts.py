@@ -35,8 +35,8 @@ def project(root: Path, code: str) -> Path:
         "def main(*, out: Outputs, tel: Telemetry) -> ImageAsset: raise RuntimeError('body')\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# [tool.cozy.models]\n"
         "# source='owner/model'\n# ///\n"
-        "from cozy_runtime.author import Model, ModelArtifact, WeightsSink, Telemetry\n"
-        "def main(*, source: Model[object], artifacts: WeightsSink,\n"
+        "from cozy_runtime.author import Context, Model, ModelArtifact, Telemetry\n"
+        "def main(ctx: Context, *, source: Model[object],\n"
         "         tel: Telemetry) -> ModelArtifact:\n"
         "    raise RuntimeError('body')\n",
     ],

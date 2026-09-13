@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import tempfile
 import threading
@@ -14,10 +15,14 @@ from typing import Any
 
 import grpc
 import tensorfs
+from tensorfs.derived import Config as NativeConfig
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import WeightsConfig, WeightsPart, WeightsTarget, WeightsTensor
-from cozy_runtime.author._weights import WeightsCommit
-from cozy_runtime.internal.weights_sink import WeightsTransactionHost, protocol_receipt
+from cozy_runtime.internal.weights_sink import (
+    protocol_receipt,
+    receipt_from_native,
+    weights_transaction_id,
+)
 from cozy_runtime.internal.worker.control import _RuntimeWeightsServicer
 from cozy_runtime.internal.worker.weights import WeightsExchange
 from cozy_runtime.protocol import worker_pb2 as p
@@ -30,42 +35,36 @@ with tempfile.TemporaryDirectory(prefix="runtime-native-uploads-") as directory:
     length = 8 << 20
     bodies = {f"weight_{i}": bytes([i + 1]) * length for i in range(4)}
     output_bound = 4 * length + 4096
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="upload-owner",
-        request_id="upload-request",
-        invocation_spec_digest="sha256:" + "a" * 64,
-        work_fingerprint="sha256:" + "b" * 64,
-        writer_session_id=1,
-        allowed_sources={},
-        output_bounds={"model": output_bound},
-    )
-    transaction = host.open(
-        WeightsCommit(
-            output_slot="model",
+    transaction = store.begin_derived(
+        weights_transaction_id("upload-owner", "upload-request", "sha256:" + "a" * 64, "model"),
+        1,
+        *Derivation(
             sources={},
             targets={
-                "model": WeightsTarget(
+                "model": Target(
                     add={
-                        name: WeightsTensor(
+                        name: Tensor(
                             logical_dtype="f32",
                             shape=(length // 4,),
                             encoding=plain,
-                            parts={"value": WeightsPart(dtype="f32", shape=(length // 4,))},
+                            parts={"value": Part(dtype="f32", shape=(length // 4,))},
                         )
                         for name in bodies
                     }
                 )
             },
-            configs={"model": WeightsConfig(data=b"{}")},
+            configs={"model": NativeConfig("add")},
             order=tuple(("model", name) for name in bodies),
-            max_new_bytes=output_bound,
-        )
+        ).native_arguments(output_bound),
+        work_fingerprint="sha256:" + "b" * 64,
     )
     for name, body in bodies.items():
-        transaction.add_part("model", name, "value", body)
-    transaction.add_config("model", b"{}", 2)
-    receipt = transaction.commit()
+        transaction.add_part("model", name, "value", io.BytesIO(body))
+    transaction.add_config("model", io.BytesIO(b"{}"))
+    facts = transaction.commit()
+    receipt = receipt_from_native(
+        "model", facts["transaction_id"], facts, replayed=False, request_id="upload-request"
+    )
     reference, _, _ = protocol_receipt(
         receipt,
         owner_scope="upload-owner",

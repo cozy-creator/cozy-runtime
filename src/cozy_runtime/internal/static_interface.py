@@ -1692,8 +1692,16 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
     models: list[dict[str, Json]] = []
     model_names: set[str] = set()
     services: set[str] = set()
+    native_context = False
     for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
         if arg.arg == "ctx":
+            if arg.annotation is not None:
+                found_context = reader.resolve(
+                    module, _script_annotation(reader, module, arg.annotation)
+                )
+                native_context = (
+                    isinstance(found_context, Vocab) and found_context.key == "author.Context"
+                )
             continue
         if arg.annotation is None:
             reader.refuse(module, arg, "script injected parameters require a type")
@@ -1741,8 +1749,8 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
         )
     if set(defaults) - model_names:
         reader.refuse(module, fn, "script model default names an undeclared model")
-    if bool(weights) != ("weights" in services):
-        reader.refuse(module, fn, "script weights declarations and WeightsSink must agree")
+    if weights and not native_context:
+        reader.refuse(module, fn, "script model outputs require ctx: Context")
     if weights and (not models or "save" in services):
         reader.refuse(module, fn, "script weights need a model and cannot mix with media outputs")
     returned = (

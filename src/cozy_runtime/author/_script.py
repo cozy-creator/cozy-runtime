@@ -106,6 +106,8 @@ def script_app(module: str) -> App:
             if _classify(name, value, "script main").role == "model"
         }:
             raise ValueError("model default names an undeclared model parameter")
+        if weights and not execution_context:
+            raise ValueError("model outputs require ctx: Context")
         returned = annotation(definition.returns, tree) if definition.returns else type(None)
     except Exception as exc:
         raise ConformanceError(

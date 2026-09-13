@@ -7,15 +7,17 @@ the driver's actual total VRAM. No capacity reading or declared binding is patch
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 from pathlib import Path
 
-from cozy_runtime.author import WeightsConfig, WeightsPart, WeightsTarget, WeightsTensor
-from cozy_runtime.author._weights import WeightsCommit
+from tensorfs.derived import Config as NativeConfig
+from tensorfs.derived import Derivation, Part, Target, Tensor
+
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.encoding import SPEC_PLAIN
-from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+from cozy_runtime.internal.weights_sink import weights_transaction_id
 from test_shared_lane import TenantStore, _drive, _turn, _workspace, needs_tenant
 
 PACKAGE = Path(__file__).resolve().parent.parent / "corpus" / "staged-lane"
@@ -29,37 +31,25 @@ def write_staged(root: Path, component_bytes: int) -> TenantStore:
     elements = component_bytes // 2
     config = json.dumps({"elements": elements}).encode()
     bound = component_bytes * len(names) + len(config)
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="staged-lane-proof",
-        request_id="create",
-        invocation_spec_digest="sha256:" + "a" * 64,
-        work_fingerprint="sha256:" + "b" * 64,
-        writer_session_id=1,
-        allowed_sources={},
-        output_bounds={"model": bound},
-    )
-    writer = host.open(
-        WeightsCommit(
-            output_slot="model",
+    writer = store.begin_derived(
+        weights_transaction_id("staged-lane-proof", "create", "sha256:" + "a" * 64, "model"),
+        1,
+        *Derivation(
             sources={},
             targets={
-                name: WeightsTarget(
+                name: Target(
                     add={
-                        "weight": WeightsTensor(
-                            "bf16",
-                            (elements,),
-                            SPEC_PLAIN,
-                            {"value": WeightsPart("bf16", (elements,))},
+                        "weight": Tensor(
+                            "bf16", (elements,), SPEC_PLAIN, {"value": Part("bf16", (elements,))}
                         )
                     }
                 )
                 for name in names
             },
-            configs={"model": WeightsConfig(data=config)},
+            configs={"model": NativeConfig("add")},
             order=tuple((name, "weight") for name in names),
-            max_new_bytes=bound,
-        )
+        ).native_arguments(bound),
+        work_fingerprint="sha256:" + "b" * 64,
     )
     # A sparse input file supplies real zero bytes. TensorFS hashes/objectizes the
     # complete stream; equal 64 MiB objects deduplicate, without a host state dict.
@@ -69,8 +59,8 @@ def write_staged(root: Path, component_bytes: int) -> TenantStore:
             source.seek(0)
             writer.add_part(name, "weight", "value", source)
     (root / "zeros").unlink()
-    writer.add_config("model", config, len(config))
-    receipt = json.loads(writer.commit().tensorfs_receipt)
+    writer.add_config("model", io.BytesIO(config))
+    receipt = writer.commit()
     manifest = "sha256:" + receipt["manifest"]["sha256"]
     length = receipt["manifest"]["length"]
     operation = store.begin_operation("source", "cozytest", "staged-lane")

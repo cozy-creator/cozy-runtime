@@ -2461,7 +2461,7 @@ class Executor:
 
     # ------------------------------------------------------------------ job
 
-    def _job_models(self, surface: Any, command: Mapping[str, Any], store: Any) -> dict[str, Any]:
+    def _job_models(self, surface: Any, command: Mapping[str, Any]) -> dict[str, Any]:
         """Create typed Manifest-only Model instances; construct/load no package state."""
         declared = {binding.param: binding for binding in surface.model_bindings}
         rows = command.get("models")
@@ -2517,16 +2517,6 @@ class Executor:
                         "model call artifact differs from its admitted native input",
                         code="model_artifact_binding",
                     )
-            if store is not None:
-                try:
-                    held = store.manifest(manifest)
-                    if len(bytes(held["manifest"])) != length:
-                        raise ValueError("Manifest length changed")
-                except Exception as exc:
-                    raise CapabilityError(
-                        f"job Model parameter {parameter!r} is absent or stale in TensorFS",
-                        code="job_model_manifest_unavailable",
-                    ) from exc
             models[parameter] = _derive_model(binding.model_class, manifest)
         return models
 
@@ -2593,43 +2583,8 @@ class Executor:
         if scratch is not None:
             scratch.mkdir(parents=True, exist_ok=True)
 
-        job_models: dict[str, Any] = {}
-        store = None
-        legacy_weights = any(p.capability == "weights" for p in surface.params)
-        if surface.model_bindings and legacy_weights:
-            from cozy_runtime.internal import fill
-
-            store_value = str(command.get("tensorfs_root", ""))
-            if not store_value or not Path(store_value).is_dir():
-                return {
-                    "ok": False,
-                    "code": "job_model_store_unavailable",
-                    "detail": "this model-bound job has no existing TensorFS store",
-                }
-            try:
-                store = fill.tensorfs_module().Store.open(store_value)
-            except Exception as exc:
-                return {
-                    "ok": False,
-                    "code": "job_model_store_unavailable",
-                    "detail": f"TensorFS store refused ({type(exc).__name__})",
-                }
-        elif surface.weights_outputs and legacy_weights:
-            from cozy_runtime.internal import fill
-
-            store_value = str(command.get("tensorfs_root", ""))
-            if not store_value:
-                return {
-                    "ok": False,
-                    "code": "tensorfs_store_unavailable",
-                    "detail": "this weights-producing job has no verified TensorFS store",
-                }
-            try:
-                store = fill.open_store(fill.tensorfs_module(), Path(store_value))
-            except fill.FillRefusal as exc:
-                return {"ok": False, "code": "tensorfs_store_unavailable", "detail": str(exc)}
         try:
-            job_models = self._job_models(surface, command, store)
+            job_models = self._job_models(surface, command)
         except CapabilityError as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:1024]}
 
@@ -2639,107 +2594,6 @@ class Executor:
 
             def weights_reader(manifest: str) -> ModelReaderProxy:
                 return ModelReaderProxy.open(spool, self._durable, manifest)
-
-        weights_open = None
-        weights_source_structure = None
-        weights_source_config = None
-        tensorfs_source = None
-        tensorfs_output = None
-        tensorfs_adopt = None
-        if surface.weights_outputs and legacy_weights:
-            from cozy_runtime.internal import weights_sink
-
-            if store is None:
-                return {
-                    "ok": False,
-                    "code": "tensorfs_store_unavailable",
-                    "detail": "this weights-producing job has no verified TensorFS store",
-                }
-            allowed_sources = {
-                model.checkpoint_ref: int(command["models"][parameter]["length"])
-                for parameter, model in job_models.items()
-            }
-
-            owner_scope = str(command.get("weights_owner_scope", ""))
-            weights_request_id = str(command.get("weights_request_id", ""))
-            invocation_spec_digest = str(command.get("invocation_spec_digest", ""))
-
-            def bind_intent(
-                output_slot: str, transaction_id: str, declaration_digest: bytes, declaration: bytes
-            ) -> weights_sink.WeightsHostBinding:
-                weights_sink.write_exchange_file(spool, output_slot, "declaration", declaration)
-                answer = self._durable(
-                    "weights_intent",
-                    {
-                        "output_slot": output_slot,
-                        "weights_transaction_id": transaction_id,
-                        "tensorfs_declaration_digest": documents.spell(declaration_digest),
-                        "tensorfs_declaration_length": len(declaration),
-                        "requested_writer_epoch": 0,
-                    },
-                )
-                if not answer.get("ok"):
-                    raise CapabilityError(
-                        str(answer.get("detail", "the weights host refused intent")),
-                        code=str(answer.get("code", "weights_host_refused")),
-                    )
-                receipt_digest = str(answer.get("weights_receipt_digest", ""))
-                return weights_sink.WeightsHostBinding(
-                    transaction_id=str(answer.get("weights_transaction_id", "")),
-                    writer_epoch=int(answer.get("writer_epoch", 0)),
-                    weights_receipt_digest=(
-                        documents.raw(receipt_digest) if receipt_digest else b""
-                    ),
-                    checkpoint=(tuple(answer["checkpoint"]) if answer.get("checkpoint") else None),
-                )
-
-            def record_receipt(receipt: Any) -> None:
-                _, canonical_receipt, receipt_digest = weights_sink.protocol_receipt(
-                    receipt,
-                    owner_scope=owner_scope,
-                    request_id=weights_request_id,
-                    invocation_spec_digest=invocation_spec_digest,
-                )
-                weights_sink.write_exchange_file(
-                    spool, receipt.output_slot, "receipt", canonical_receipt
-                )
-                answer = self._durable(
-                    "weights_receipt",
-                    {
-                        "output_slot": receipt.output_slot,
-                        "weights_transaction_id": receipt.weights_transaction_id,
-                        "weights_receipt_digest": documents.spell(receipt_digest),
-                        "weights_receipt_length": len(canonical_receipt),
-                    },
-                )
-                if not answer.get("ok") or answer.get("weights_receipt_digest") != documents.spell(
-                    receipt_digest
-                ):
-                    raise CapabilityError(
-                        str(answer.get("detail", "the weights host refused receipt")),
-                        code=str(answer.get("code", "weights_host_refused")),
-                    )
-
-            from cozy_runtime.internal.weights_writer import StoreProxy
-
-            weights_store = StoreProxy(store, spool, self._durable)
-            weights_host = weights_sink.WeightsTransactionHost(
-                store=weights_store,
-                owner_scope=owner_scope,
-                request_id=weights_request_id,
-                invocation_spec_digest=invocation_spec_digest,
-                writer_session_id=1,
-                work_fingerprint=str(command.get("weights_work_fingerprint", "")),
-                allowed_sources=allowed_sources,
-                output_bounds={
-                    output.name: output.max_new_bytes for output in surface.weights_outputs
-                },
-                bind_intent=bind_intent,
-                record_receipt=record_receipt,
-            )
-            weights_open = weights_host.open
-            weights_source_structure = weights_host.structure
-            weights_source_config = weights_store.config
 
         from cozy_runtime.internal.weights_writer import ExecutionStorage
 
@@ -2814,10 +2668,7 @@ class Executor:
                 max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
                 scratch=scratch,
                 checkpoints=durable_checkpoint,
-                weights=weights_open,
                 weights_reader=weights_reader,
-                weights_source_structure=weights_source_structure,
-                weights_source_config=weights_source_config,
                 tensorfs_source=tensorfs_source,
                 tensorfs_output=tensorfs_output,
                 tensorfs_adopt=tensorfs_adopt,
