@@ -313,3 +313,19 @@ def test_dependency_copy_refuses_changed_bytes_even_with_restored_mtime(tmp_path
     assert source.stat().st_mtime_ns == before.st_mtime_ns
     with pytest.raises(package_environment.EnvironmentRefusal, match="member_changed"):
         dependencies._copy_dependency_file(source, target, expected, str(len(original)))
+
+
+@pytest.mark.parametrize("algorithm", ["sha256", "sha384", "sha512", ""])
+def test_dependency_record_verification_also_returns_canonical_content_digest(
+    tmp_path: Path, algorithm: str
+) -> None:
+    source, target = tmp_path / "source", tmp_path / "copied"
+    body = b"installed bytes with an independently recorded hash\n" * 1024
+    source.write_bytes(body)
+    expected = ""
+    if algorithm:
+        encoded = base64.urlsafe_b64encode(hashlib.new(algorithm, body).digest()).rstrip(b"=")
+        expected = algorithm + "=" + encoded.decode()
+    actual = dependencies._copy_dependency_file(source, target, expected, str(len(body)))
+    assert actual == ("sha256:" + hashlib.sha256(body).hexdigest(), len(body))
+    assert source.stat().st_ino != target.stat().st_ino

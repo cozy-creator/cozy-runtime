@@ -2442,10 +2442,10 @@ def _materialize_dependency_snapshot(
         _install_with_uv(
             uv, python, staging, inspected, supplements, dependencies=copy_dependencies
         )
-        _installed_dependencies.verify_files(staging, manifest)
         if supplements:
             # Only newly resolved optional numerical files join the existing immutable
-            # snapshot. Verify original SDK bytes first; the resolver cannot replace them.
+            # snapshot. The final verification below covers both the original SDK bytes
+            # and the supplement; the resolver cannot replace a captured dependency.
             additional = _installed_dependencies.snapshot(
                 staging / "bin/python", staging, set(), included={"numpy"}, inventory_only=True
             )
