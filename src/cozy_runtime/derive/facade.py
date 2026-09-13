@@ -9,7 +9,7 @@ plan's selected GEMM weights, and runs the tier-1 tripwire INSIDE (per-tensor
 round-trip against the encoding bound, worst relative Frobenius against the declared
 threshold), refusing typed with code ``quantization_tripwire`` on encoding breakage.
 The ``encoding=None`` lane is the canonical ingest lane and its result says so.
-Plain non-normalizing derivation stays ``derive_fp8``/``derive_mxfp8``.
+The managed operation can preserve source precision through its explicit policy.
 """
 
 from __future__ import annotations
@@ -17,11 +17,10 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import msgspec
-import tensorfs
-from tensorfs.derived import Derivation, SourceInspection, Target
+from tensorfs.derived import Derivation, SourceInspection, Target, derive
 
 from cozy_runtime.author import (
     Context,
@@ -29,9 +28,6 @@ from cozy_runtime.author import (
     ModelArtifact,
     Telemetry,
     UnsupportedInput,
-    WeightsReceipt,
-    WeightsSink,
-    WeightsSource,
 )
 
 if TYPE_CHECKING:
@@ -134,11 +130,10 @@ def plan(
 
 
 def quantize(
-    source: Model[Any] | WeightsSource,
+    source: Model[Any] | SourceInspection,
     plan: QuantizePlan,
     /,
     *,
-    sink: WeightsSink | None = None,
     ctx: Context,
     tel: Telemetry,
     output: str = "model",
@@ -146,17 +141,16 @@ def quantize(
     """Run one lane end-to-end and commit it, tier-1 tripwire inside.
 
     ``source`` is the granted source Model (constructed or derive-only) or the
-    ``WeightsSink.structure`` view already fetched from it — both reach the same tensors.
+    native source inspection already fetched from it — both reach the same tensors.
     """
-    return _quantize(source, plan, sink=sink, ctx=ctx, tel=tel, output=output)[0]
+    return _quantize(source, plan, ctx=ctx, tel=tel, output=output)[0]
 
 
 def quantize_artifact(
-    source: Model[Any] | WeightsSource,
+    source: Model[Any] | SourceInspection,
     plan: QuantizePlan,
     /,
     *,
-    sink: WeightsSink | None = None,
     ctx: Context,
     tel: Telemetry,
     output: str = "model",
@@ -166,12 +160,12 @@ def quantize_artifact(
     Measurements and receipt provenance remain on the original execution. The result
     contains no per-attempt counters, so memoized operations can retain it unchanged.
     """
-    result, receipt = _quantize(source, plan, sink=sink, ctx=ctx, tel=tel, output=output)
+    result, receipt = _quantize(source, plan, ctx=ctx, tel=tel, output=output)
     return _artifact_result(result, receipt, tel, output)
 
 
 def _artifact_result(
-    result: QuantizeResult, artifact: ModelArtifact | WeightsReceipt, tel: Telemetry, output: str
+    result: QuantizeResult, artifact: ModelArtifact, tel: Telemetry, output: str
 ) -> ModelArtifact:
     tel.log(
         "quantization measurement",
@@ -184,22 +178,21 @@ def _artifact_result(
         worst_relative_frobenius=result.worst_relative_frobenius,
         normalization_worst_relative_frobenius=result.normalization_worst_relative_frobenius,
     )
-    return artifact if isinstance(artifact, ModelArtifact) else artifact.artifact
+    return artifact
 
 
 def _quantize(
-    source: Model[Any] | WeightsSource,
+    source: Model[Any] | SourceInspection,
     plan: QuantizePlan,
     /,
     *,
-    sink: WeightsSink | None = None,
     ctx: Context,
     tel: Telemetry,
     output: str,
     selection: ArtifactQuantizationPlan | None = None,
     preserve_precision: bool = False,
     source_view: SourceInspection | None = None,
-) -> tuple[QuantizeResult, ModelArtifact | WeightsReceipt]:
+) -> tuple[QuantizeResult, ModelArtifact]:
     from .quantization import (
         ArtifactQuantizationRequest,
         bf16_targets,
@@ -212,16 +205,12 @@ def _quantize(
         write_bf16,
     )
 
-    native = ctx._tensorfs_output is not None
-    structure: SourceInspection | WeightsSource
-    if native:
-        model = source if not isinstance(source, WeightsSource) else _resolve(source, sink)[0]
-        source_capability = ctx.tensorfs_source(model)
-        structure = source_view or source_capability.inspect()
+    if isinstance(source, SourceInspection):
+        source_capability = source.source
+        structure = source
     else:
-        # Active released callers and standalone native harnesses retain this
-        # input adapter until their coordinated Context migration is complete.
-        model, structure = _resolve(source, sink)
+        source_capability = ctx.tensorfs_source(source)
+        structure = source_view or source_capability.inspect()
     keep = (
         tuple(dict.fromkeys(component for component, _, _ in source_rows(structure)))
         if preserve_precision
@@ -263,21 +252,14 @@ def _quantize(
     inherited = len(bf16.order) - len(converted) - encoded
 
     configs = inherited_configs(bf16, source="source")
-    manager: Any = (
-        tensorfs.derive(
-            ctx.output(output),
-            Derivation({"source": source_capability}, targets, configs, bf16.order),
-        )
-        if native
-        else cast(Any, sink).open(
-            output, sources={"source": model}, targets=targets, configs=configs, order=bf16.order
-        )
+    manager = derive(
+        ctx.output(output), Derivation({"source": source_capability}, targets, configs, bf16.order)
     )
     with manager as transaction:
         if transaction.receipt is not None:
             receipt = transaction.receipt
-            result_artifact = ctx.adopt_model(receipt) if native else receipt
-            transaction_id = receipt["transaction_id"] if native else receipt.weights_transaction_id
+            result_artifact = ctx.adopt_model(receipt)
+            transaction_id = receipt["transaction_id"]
             return QuantizeResult(
                 output=output,
                 weights_transaction_id=transaction_id,
@@ -330,8 +312,8 @@ def _quantize(
                     else None
                 )
         receipt = transaction.commit()
-        result_artifact = ctx.adopt_model(receipt) if native else receipt
-        transaction_id = receipt["transaction_id"] if native else receipt.weights_transaction_id
+        result_artifact = ctx.adopt_model(receipt)
+        transaction_id = receipt["transaction_id"]
     return QuantizeResult(
         output=output,
         weights_transaction_id=transaction_id,
@@ -349,23 +331,3 @@ def _quantize(
         normalization_worst_relative_frobenius=normalization.worst_relative_frobenius,
         canonical=canonical,
     ), result_artifact
-
-
-def _resolve(
-    source: Model[Any] | WeightsSource, sink: WeightsSink | None
-) -> tuple[Model[Any], WeightsSource]:
-    """The granted source Model and its structure view, whichever half was handed in."""
-    if sink is None:
-        raise UnsupportedInput(
-            "quantization needs admitted Context capabilities", code="quantization_source"
-        )
-    if isinstance(source, WeightsSource):
-        granted = {id(model): model for model in sink.models.values()}
-        if len(granted) != 1:
-            raise UnsupportedInput(
-                "quantize over a pre-fetched structure is unambiguous only for a job with "
-                "exactly one granted model input; pass the source Model instead",
-                code="quantization_source",
-            )
-        return next(iter(granted.values())), source
-    return source, sink.structure(source)

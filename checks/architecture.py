@@ -51,7 +51,7 @@ DENY_TOKENS = (
 PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
     "author": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
     # Public derivation surface (cr-071): job packages import it directly. It builds only
-    # on the author surface — never the worker planes, the CLI, or TensorFS.
+    # on the author surface and scoped TensorFS API, never worker storage or CLI authority.
     "derive": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
     # The activation probe (cr-075): a public mechanism surface shaped like `derive` — job
     # code and the runtime verb both build on it; it never reaches the worker planes.
@@ -59,6 +59,17 @@ PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
     "internal": ("cozy_runtime.cli",),
     "cli": (),
 }
+# cr-174: TensorFS owns public derivation declarations and scoped handles. These
+# execution bindings may import that API; direct Store and native internals stay fenced.
+SCOPED_TENSORFS_FILES = frozenset(
+    {
+        "author/_context.py",
+        "author/_invoke.py",
+        "derive/facade.py",
+        "derive/operations.py",
+        "derive/quantization.py",
+    }
+)
 GENERATED_PROTOCOL_PREFIX = "cozy.worker.v1"
 # Pillow is a base dependency and the actual public Image value type; imports stay at module scope.
 AUTHOR_ALLOWED_THIRD_PARTY = ("msgspec", "PIL")
@@ -194,6 +205,10 @@ def fence_package_imports() -> list[str]:
         }
         for name in imports(tree):
             rel = path.relative_to(ROOT)
+            scoped_tensorfs = (
+                name == "tensorfs.derived"
+                and path.relative_to(SRC).as_posix() in SCOPED_TENSORFS_FILES
+            )
             if pkg != "protocol" and (
                 name == GENERATED_PROTOCOL_PREFIX
                 or name.startswith(GENERATED_PROTOCOL_PREFIX + ".")
@@ -202,13 +217,16 @@ def fence_package_imports() -> list[str]:
                     f"{rel}: Runtime modules must import generated bindings through "
                     "cozy_runtime.protocol"
                 )
-            if any(name == f or name.startswith(f + ".") for f in forbidden):
+            if not scoped_tensorfs and any(
+                name == f or name.startswith(f + ".") for f in forbidden
+            ):
                 bad.append(f"{rel}: {module_of(path)} may not import {name}")
             root = name.split(".")[0]
             if (
                 pkg == "author"
                 and root not in stdlib
                 and root != "cozy_runtime"
+                and not scoped_tensorfs
                 and root not in AUTHOR_ALLOWED_THIRD_PARTY
                 and not (
                     root in AUTHOR_ALLOWED_LAZY
