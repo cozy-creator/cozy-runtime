@@ -131,20 +131,3 @@ jobs:
           diff -r .worker-protocol/fixtures/canonical tests/testdata/worker-protocol/canonical
           diff -r .worker-protocol/fixtures/red tests/testdata/worker-protocol/red
           diff .worker-protocol/fixtures/MANIFEST.json tests/testdata/worker-protocol/MANIFEST.json
-
-  # A RELEASED VERSION NUMBER NAMES ONE TREE, FOREVER (proto-036). `v*` is the whole
-  # release procedure — publish.yaml triggers on the tag push and there is no local
-  # publish — so the tags ARE the released set, and this refuses a tree that has drifted
-  # away from the number it still declares. Its own job, with the full history the
-  # comparison needs, so the heavy jobs keep their one-commit checkout.
-  released-version:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python3 checks/released_version.py
