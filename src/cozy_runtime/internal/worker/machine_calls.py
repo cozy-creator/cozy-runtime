@@ -75,7 +75,7 @@ class Calls:
                 executions.control(
                     owner,
                     call.child_request,
-                    f"parent-pause.{parent.attempt}",
+                    f"parent-pause.{parent.attempt}.{state.generation}",
                     state.generation,
                     "pause",
                 )
@@ -92,6 +92,8 @@ class Calls:
             state=pb.CHILD_CALL_STATE_PENDING,
         )
         if call.result:
+            assert self.worker.workspace is not None
+            workspace_memo.release_lookup(self.worker.workspace, owner, call.child_request)
             result.state, result.result_canonical_bytes = pb.CHILD_CALL_STATE_SUCCEEDED, call.result
             return result
         if call.safe_code:
@@ -158,10 +160,6 @@ class Calls:
                 if request.HasField("capture"):
                     raise WorkspaceRefusal("activation capture requires a serving child")
                 target = machine_child_target.resolve(self.worker, parent, call)
-                if target.declaration.get("models") or target.declaration.get("weights_outputs"):
-                    raise WorkspaceRefusal(
-                        "model child requires native input and output delegation"
-                    )
                 payload = request.request_canonical_bytes
                 arguments = canonical_json.decode(payload)
                 memoized = bool(target.declaration.get("invocable", {}).get("memoize"))
@@ -178,6 +176,7 @@ class Calls:
                     "entrypoint": target.entrypoint,
                     "parent_attempt": parent.attempt,
                     "computation": key.hex(),
+                    "result_schema": target.declaration["result"],
                 }
                 self.journal.freeze(owner, call, canonical_json.encode(plan))
                 call = self.journal.get(owner, parent.request_id, request.call_index)
@@ -193,14 +192,27 @@ class Calls:
                         body = documents.read(
                             found.source.outcome_canonical_bytes, pb.AttemptOutcomeBody
                         )
-                        self.journal.observe_result(
-                            owner,
-                            call,
-                            base64.b64decode(body["result"]["inline_result"], validate=True),
+                        raw_result = base64.b64decode(
+                            body["result"]["inline_result"], validate=True
                         )
+                        self._retain_result(owner, call, raw_result, target.declaration["result"])
+                        self.journal.observe_result(owner, call, raw_result)
                         workspace_memo.delivered(executions.workspace, owner, call.child_request)
+                        workspace_memo.release_lookup(
+                            executions.workspace, owner, call.child_request
+                        )
                         continue
                 self._check_ancestors(owner, parent, target, payload)
+                from . import machine_models
+
+                model_inputs, model_access = machine_models.inputs(
+                    executions.workspace,
+                    owner,
+                    call.child_request,
+                    target.entrypoint,
+                    target.declaration,
+                    arguments,
+                )
                 spec = pb.InvocationSpec(
                     environment_digest=target.prepared_revision["placement"]["environment_digest"],
                     payload_digest=documents.spell(hashlib.sha256(payload).digest()),
@@ -212,11 +224,16 @@ class Calls:
                             kind_mime="application/json",
                         )
                     ],
+                    outputs=[
+                        pb.OutputBinding(**output)
+                        for output in target.declaration.get("weights_outputs", [])
+                    ],
                     deadline_unix_ms=int(parent.spec.get("deadline_unix_ms", 0)),
                     job=pb.JobInvocationSpec(
                         build_id=target.revision, job_descriptor_id=target.binding.job_descriptor_id
                     ),
                 )
+                spec.inputs.extend(model_inputs)
                 raw, digest = documents.identity(spec)
                 offer = pb.AttemptOffer(
                     request_id=call.child_request,
@@ -232,15 +249,19 @@ class Calls:
                                 + base64.b64encode(payload).decode(),
                             )
                         ],
+                        outputs=[
+                            pb.OutputAccess(output_id=output.output_id) for output in spec.outputs
+                        ],
                     ),
                 )
+                offer.grant.inputs.extend(model_access)
                 desired = pb.DesiredWorkerState(
                     wire_minor=self.worker.fence.wire_minor,
                     posture=pb.POSTURE_ACCEPTING,
                     job=pb.JobDirective(
                         build_id=target.revision,
                         job_descriptor_id=target.binding.job_descriptor_id,
-                        orchestration=True,
+                        orchestration=not bool(target.declaration.get("models") or spec.outputs),
                         reclaim_on_terminal=True,
                     ),
                 )
@@ -306,7 +327,7 @@ class Calls:
             executions.control(
                 owner,
                 row["child_request"],
-                f"ancestor-{action}.{row['parent']}.{row['generation']}",
+                f"ancestor-{action}.{row['parent']}.{row['generation']}.{state.generation}",
                 state.generation,
                 action,
             )
@@ -335,6 +356,10 @@ class Calls:
                     outcome_digest=terminal.outcome_digest,
                 ),
             )
+        body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        raw_result = base64.b64decode(body["result"]["inline_result"], validate=True)
+        self._retain_result(owner, call, raw_result, plan.get("result_schema", {}))
+        self.journal.observe_result(owner, call, raw_result)
         ack = pb.AttemptOutcomeAck(
             request_id=call.child_request,
             attempt_ordinal=terminal.attempt_ordinal,
@@ -344,6 +369,19 @@ class Calls:
         )
         executions.acknowledge_collection(owner, ack)
         executions.workspace.acknowledge(owner, ack)
+
+    def _retain_result(self, owner: str, call: Call, raw: bytes, schema: Any) -> None:
+        from . import machine_models
+
+        assert self.worker.workspace is not None
+        machine_models.retain_result(
+            self.worker.workspace,
+            owner,
+            call.parent_request,
+            f"call.{call.call_index}.result",
+            canonical_json.decode(raw),
+            schema,
+        )
 
     def _check_ancestors(
         self, owner: str, parent: AttemptRecord, target: machine_child_target.Target, payload: bytes

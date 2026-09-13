@@ -98,10 +98,7 @@ def _host(channel: socket.socket, accept: bool, rows: list[list[dict[str, Any]]]
         rows.append(writes)
         with connection:
             connection.sendall(
-                json.dumps(
-                    {"ok": accept, "facts": {"available": 4_883_300_352}}
-                ).encode()
-                + b"\n"
+                json.dumps({"ok": accept, "facts": {"available": 4_883_300_352}}).encode() + b"\n"
             )
             if accept:
                 assert connection.recv(1) == b""

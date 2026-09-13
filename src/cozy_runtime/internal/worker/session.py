@@ -2282,7 +2282,12 @@ class Worker:
         if same:
             return True
         if any(
-            attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD
+            (attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD)
+            and not (
+                desired.WhichOneof("mode") == "job"
+                and not desired.job.orchestration
+                and attempt.lane_id.startswith("cpu-")
+            )
             for attempt in self.engine.history.values()
         ):
             # on_offer journals the queue before a lane begins accepting it. That queue
@@ -3510,7 +3515,7 @@ class Worker:
         self.calls.close(acked.request_id, acked.attempt_ordinal)
         from . import machine_slots
 
-        machine_slots.release(self, acked.request_id)
+        machine_slots.release(self, acked.request_id, ordinal=acked.attempt_ordinal)
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
         # An acknowledged stopped attempt can leave retained work for another
@@ -5993,8 +5998,15 @@ class Worker:
                 descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
                 # Execution attaches attempt.job later. The prepared engine binding
                 # is available on both local and placement-hosted paths at offer time.
-                binding = self.engine.jobs.get(descriptor)
-                if binding is None:
+                from . import machine_slots
+
+                child_slot = self.job_slots.get(machine_slots.key(attempt.request_id))
+                binding = (
+                    child_slot.binding
+                    if child_slot is not None
+                    else self.engine.jobs.get(descriptor)
+                )
+                if binding is None or binding.build_id != attempt.spec["job"]["build_id"]:
                     self.refuse(
                         offered,
                         "job_binding_unavailable",
