@@ -18,6 +18,7 @@ CREATE TABLE execution_calls (
  owner TEXT NOT NULL, parent_request TEXT NOT NULL, call_index INTEGER NOT NULL,
  parent_ordinal INTEGER NOT NULL, parent_generation INTEGER NOT NULL,
  intent_digest BLOB NOT NULL, intent BLOB NOT NULL, child_request TEXT NOT NULL,
+ prepared BLOB NOT NULL DEFAULT x'',
  sent INTEGER NOT NULL DEFAULT 0, result BLOB NOT NULL DEFAULT x'',
  safe_code TEXT NOT NULL DEFAULT '', safe_detail TEXT NOT NULL DEFAULT '',
  created_ms INTEGER NOT NULL,
@@ -35,6 +36,7 @@ class Call:
     intent_digest: bytes
     intent: bytes
     child_request: str
+    prepared: bytes
     sent: bool
     result: bytes
     safe_code: str
@@ -82,7 +84,39 @@ class Calls:
             or (generation is not None and row["generation"] != generation)
         ):
             raise WorkspaceRefusal("call parent is no longer the admitted running generation")
+        stopped = db.execute(
+            "WITH RECURSIVE ancestors(request) AS (VALUES(?) UNION "
+            "SELECT c.parent_request FROM execution_calls c JOIN ancestors a "
+            "ON c.child_request=a.request WHERE c.owner=?) "
+            "SELECT 1 FROM executions e JOIN ancestors a ON e.request=a.request "
+            "WHERE e.owner=? AND (e.desired<>'run' OR e.state<>'running') LIMIT 1",
+            (parent, owner, owner),
+        ).fetchone()
+        if stopped:
+            raise WorkspaceRefusal("call ancestor is no longer an admitted running generation")
         return cast(Row, row)
+
+    @staticmethod
+    def unsettled_effects_in(db: Journal, owner: str, root_request: str) -> bool:
+        """Include descendants: canceling a root cannot waive an uncertain child effect."""
+        from cozy_runtime.internal.effect_interfaces import MODULE
+
+        return (
+            db.execute(
+                "WITH RECURSIVE descendants(request) AS (VALUES(?) UNION "
+                "SELECT c.child_request FROM execution_calls c JOIN descendants d "
+                "ON c.parent_request=d.request WHERE c.owner=?) "
+                "SELECT 1 FROM execution_calls c JOIN descendants d ON c.parent_request=d.request "
+                "WHERE c.owner=? AND c.sent=1 AND c.result=x'' AND c.safe_code='' "
+                "AND json_extract(CAST(c.intent AS TEXT),'$.module')=? LIMIT 1",
+                (root_request, owner, owner, MODULE),
+            ).fetchone()
+            is not None
+        )
+
+    def has_unsettled_effects(self, owner: str, root_request: str) -> bool:
+        with self.workspace.locked() as db:
+            return self.unsettled_effects_in(db, owner, root_request)
 
     def accept(self, owner: str, request: pb.ChildCallRequest) -> Call:
         self.workspace.owner(owner)
@@ -163,6 +197,62 @@ class Calls:
     def get(self, owner: str, parent: str, index: int) -> Call:
         with self.workspace.locked() as db:
             return self._call(self._row(db, owner, parent, index))
+
+    def freeze(self, owner: str, call: Call, prepared: bytes) -> Call:
+        """Bind read-dependent metadata before a write, once for this exact call.
+
+        For example, a release's original revision and complete desired lane set
+        are frozen here. Retrying may not read a newer baseline and overwrite it.
+        Byte inventories remain in TensorFS; only their identities belong here.
+        """
+        if not 0 < len(prepared) <= 48 << 10:
+            raise WorkspaceRefusal("prepared call metadata exceeds its inline bound")
+        if canonical_json.encode(canonical_json.decode(prepared)) != prepared:
+            raise WorkspaceRefusal("prepared call metadata must be canonical")
+        with self.workspace.locked() as db, transaction(db):
+            row = self._row(db, owner, call.parent_request, call.call_index)
+            if row["intent_digest"] != call.intent_digest:
+                raise WorkspaceRefusal("prepared call names a different intent")
+            if row["prepared"]:
+                if row["prepared"] != prepared:
+                    raise WorkspaceRefusal("prepared call cannot change its frozen baseline")
+                return self._call(row)
+            self._parent(
+                db, owner, call.parent_request, call.parent_ordinal, call.parent_generation
+            )
+            if row["sent"] or row["result"] or row["safe_code"]:
+                raise WorkspaceRefusal(
+                    "prepared call cannot be invented after a send or settlement"
+                )
+            db.execute(
+                "UPDATE execution_calls SET prepared=? "
+                "WHERE owner=? AND parent_request=? AND call_index=?",
+                (prepared, owner, call.parent_request, call.call_index),
+            )
+            return self._call(self._row(db, owner, call.parent_request, call.call_index))
+
+    def observe_result(self, owner: str, call: Call, result: bytes) -> None:
+        """Settle read-only convergence without inventing a remote-write marker."""
+        if not 0 < len(result) <= 48 << 10:
+            raise WorkspaceRefusal("call result exceeds its inline bound")
+        if canonical_json.encode(canonical_json.decode(result)) != result:
+            raise WorkspaceRefusal("call result must be canonical")
+        with self.workspace.locked() as db, transaction(db):
+            row = self._row(db, owner, call.parent_request, call.call_index)
+            self._parent(
+                db, owner, call.parent_request, call.parent_ordinal, call.parent_generation
+            )
+            if (
+                row["intent_digest"] != call.intent_digest
+                or row["safe_code"]
+                or row["result"] not in (b"", result)
+            ):
+                raise WorkspaceRefusal("call observation changed its intent or prior result")
+            db.execute(
+                "UPDATE execution_calls SET result=? "
+                "WHERE owner=? AND parent_request=? AND call_index=?",
+                (result, owner, call.parent_request, call.call_index),
+            )
 
     def before_write(self, owner: str, call: Call) -> None:
         """Record possible remote mutation before IO, under the current parent fence."""

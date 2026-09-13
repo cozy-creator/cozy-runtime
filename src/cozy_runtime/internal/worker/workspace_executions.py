@@ -369,6 +369,7 @@ class Executions:
     def abandon(self, owner: str, request: str) -> bool:
         """Relinquish this stopped root through existing native release operations."""
         from . import workspace_finalize
+        from .workspace_calls import Calls
 
         with self.workspace.locked() as db:
             row = self._row(db, owner, request)
@@ -376,6 +377,7 @@ class Executions:
                 row["desired"] != "cancel"
                 or row["state"] not in TERMINAL
                 or row["retention_waived"]
+                or Calls.unsettled_effects_in(db, owner, request)
             ):
                 return False
             attempts = db.execute(
