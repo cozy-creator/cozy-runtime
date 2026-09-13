@@ -117,6 +117,19 @@ def test_new_tag_can_publish_an_unpublished_version(release: ReleaseFixture) -> 
     assert registry.requests == ["/pypi/cozy-runtime/1.2.3/json"]
 
 
+def test_new_tag_retry_before_any_upload_is_allowed(
+    release: ReleaseFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard, _, _, registry = release
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    assert guard.main() == 0
+    # A build failure before upload leaves the same immutable push event and no
+    # PyPI version. Rerunning that event needs neither a new tag nor a new version.
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    assert guard.main() == 0
+    assert registry.requests == ["/pypi/cozy-runtime/1.2.3/json"] * 2
+
+
 @pytest.mark.parametrize(
     "field,value", [("created", False), ("deleted", True), ("before", "a" * 40)]
 )
