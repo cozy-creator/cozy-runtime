@@ -1,0 +1,128 @@
+{
+  "manifest": "sha256:d64f250c556b28889fb0c900643bf2028fa92cad619d8cc4b716d6145ca7d275",
+  "component_census": {
+    "fl2va_dit": {
+      "tensor_count": 583,
+      "logical_tensor_bytes": 41158865920,
+      "stored_role_bytes": 21105747968,
+      "inline_bytes_in_header": 26752,
+      "unique_segment_object_bytes": 21105721216,
+      "conservative_component_floor": 41158865920
+    },
+    "ref2va_dit": {
+      "tensor_count": 583,
+      "logical_tensor_bytes": 41158865920,
+      "stored_role_bytes": 21105747968,
+      "inline_bytes_in_header": 26752,
+      "unique_segment_object_bytes": 21105721216,
+      "conservative_component_floor": 41158865920
+    },
+    "text_encoder": {
+      "tensor_count": 902,
+      "logical_tensor_bytes": 51506191840,
+      "stored_role_bytes": 51506191840,
+      "inline_bytes_in_header": 25600,
+      "unique_segment_object_bytes": 51506166240,
+      "conservative_component_floor": 51506191840
+    },
+    "video_vae": {
+      "tensor_count": 703,
+      "logical_tensor_bytes": 10415475936,
+      "stored_role_bytes": 10415475936,
+      "inline_bytes_in_header": 480,
+      "unique_segment_object_bytes": 10415475456,
+      "conservative_component_floor": 10415475936
+    },
+    "audio_vae": {
+      "tensor_count": 1087,
+      "logical_tensor_bytes": 605306340,
+      "stored_role_bytes": 605306340,
+      "inline_bytes_in_header": 55012,
+      "unique_segment_object_bytes": 605251328,
+      "conservative_component_floor": 605306340
+    }
+  },
+  "declared_scopes": {
+    "condition_fl2va_media": {
+      "components": [
+        "video_vae"
+      ],
+      "logical_tensor_bytes": 10415475936,
+      "stored_role_bytes": 10415475936,
+      "conservative_component_floor": 10415475936
+    },
+    "condition_ref2va_media": {
+      "components": [
+        "audio_vae",
+        "video_vae"
+      ],
+      "logical_tensor_bytes": 11020782276,
+      "stored_role_bytes": 11020782276,
+      "conservative_component_floor": 11020782276
+    },
+    "condition_text": {
+      "components": [
+        "text_encoder"
+      ],
+      "logical_tensor_bytes": 51506191840,
+      "stored_role_bytes": 51506191840,
+      "conservative_component_floor": 51506191840
+    },
+    "decode_audio": {
+      "components": [
+        "audio_vae"
+      ],
+      "logical_tensor_bytes": 605306340,
+      "stored_role_bytes": 605306340,
+      "conservative_component_floor": 605306340
+    },
+    "decode_video": {
+      "components": [
+        "video_vae"
+      ],
+      "logical_tensor_bytes": 10415475936,
+      "stored_role_bytes": 10415475936,
+      "conservative_component_floor": 10415475936
+    },
+    "sample_fl2va": {
+      "components": [
+        "fl2va_dit"
+      ],
+      "logical_tensor_bytes": 41158865920,
+      "stored_role_bytes": 21105747968,
+      "conservative_component_floor": 41158865920
+    },
+    "sample_ref2va": {
+      "components": [
+        "ref2va_dit"
+      ],
+      "logical_tensor_bytes": 41158865920,
+      "stored_role_bytes": 21105747968,
+      "conservative_component_floor": 41158865920
+    },
+    "warm_fl2va": {
+      "components": [
+        "fl2va_dit"
+      ],
+      "logical_tensor_bytes": 41158865920,
+      "stored_role_bytes": 21105747968,
+      "conservative_component_floor": 41158865920
+    },
+    "warm_ref2va": {
+      "components": [
+        "ref2va_dit"
+      ],
+      "logical_tensor_bytes": 41158865920,
+      "stored_role_bytes": 21105747968,
+      "conservative_component_floor": 41158865920
+    }
+  },
+  "max_declared_scope_floor": 51506191840,
+  "fault_snapshot_bytes_per_rank": 104738993849,
+  "fault_measured_headroom_per_rank": [
+    85017493504,
+    85017493504
+  ],
+  "separate_tensor_blob_reads": 0,
+  "measurement_scope": "Metadata geometry only; excludes construction/fill overhead, derived buffers and activation workspace. Runtime fill remains their owner."
+}
