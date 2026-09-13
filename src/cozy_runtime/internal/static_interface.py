@@ -1743,8 +1743,8 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
         reader.refuse(module, fn, "script model default names an undeclared model")
     if bool(weights) != ("weights" in services):
         reader.refuse(module, fn, "script weights declarations and WeightsSink must agree")
-    if weights and (not models or "save" in services):
-        reader.refuse(module, fn, "script weights need a model and cannot mix with media outputs")
+    if weights and "save" in services:
+        reader.refuse(module, fn, "script weights cannot mix with media outputs")
     returned = (
         reader.translate(module, _script_annotation(reader, module, fn.returns))
         if fn.returns

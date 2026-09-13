@@ -39,6 +39,10 @@ def project(root: Path, code: str) -> Path:
         "def main(*, source: Model[object], artifacts: WeightsSink,\n"
         "         tel: Telemetry) -> ModelArtifact:\n"
         "    raise RuntimeError('body')\n",
+        "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# ///\n"
+        "from cozy_runtime.author import ModelArtifact, WeightsSink\n"
+        "def main(*, artifacts: WeightsSink) -> ModelArtifact:\n"
+        "    raise RuntimeError('body')\n",
     ],
 )
 def test_static_main_equals_execution_adapter(tmp_path: Path, body: str) -> None:
