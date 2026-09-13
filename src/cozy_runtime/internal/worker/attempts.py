@@ -278,6 +278,8 @@ class AttemptSlot:
     devices: str = ""
     job_device_count: int = 0
     orchestration: bool = False
+    job_binding: JobBinding | None = None
+    job_resource_caps: Mapping[str, int] = dataclasses_field(default_factory=dict)
     bindings_digest: str = ""
 
 
@@ -1016,8 +1018,8 @@ class AttemptEngine:
         """
         job = attempt.spec["job"]
         descriptor_id = str(job["job_descriptor_id"])
-        binding = self.jobs.get(descriptor_id)
-        if binding is None:
+        binding = self.slot_of(attempt).job_binding or self.jobs.get(descriptor_id)
+        if binding is None or binding.build_id != job.get("build_id"):
             raise AttemptRefusal(
                 "unknown_job_descriptor",
                 f"no job descriptor {descriptor_id[:24]}… is bound on this worker (it has "
@@ -1060,11 +1062,11 @@ class AttemptEngine:
                 else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             ) from exc
 
-        caps = attempt.spec.get("resource_caps") or {}
+        caps = slot.job_resource_caps
         plan = AttemptPlan.for_job(
             binding,
             {
-                "vram": int(caps.get("max_vram_bytes", 0)),
+                "vram": int(caps.get("max_device_memory_bytes", 0)),
                 "rss": int(caps.get("max_rss_bytes", 0)),
                 "disk": int(caps.get("max_disk_bytes", 0)),
             },
