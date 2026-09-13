@@ -837,14 +837,26 @@ class Executions:
         if schema and (raw := body.get("result", {}).get("inline_result")):
             from . import machine_models
 
-            machine_models.retain_result(
+            records = machine_models.result_records(
                 self.workspace,
                 owner,
                 outcome.request_id,
-                "result",
                 canonical_json.decode(base64.b64decode(raw, validate=True)),
                 canonical_json.decode(schema),
             )
+            if supplied := body["result"].get("retained_models"):
+                expected = [
+                    documents.body(
+                        pb.RetainedModelResult(
+                            result_pointer=pointer,
+                            model_artifact_canonical_bytes=artifact,
+                            retention=retention,
+                        )
+                    )
+                    for pointer, artifact, retention in records
+                ]
+                if supplied != expected:
+                    raise WorkspaceRefusal("terminal Model custody differs from its typed result")
         manifests = set()
         for reference in body.get("weights_receipts", []):
             receipt = documents.read(

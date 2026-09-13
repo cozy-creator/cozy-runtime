@@ -11,6 +11,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import machine_models, workspace_memo
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import Executions
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_machine_execution import ack, complete, offer
 from test_workspace_custody import produced
@@ -139,3 +140,47 @@ def test_metadata_file_resolver_requires_actual_parent_received_custody(tmp_path
         pass
     with pytest.raises(WorkspaceRefusal, match="received"):
         machine_models.file_source(workspace, "owner", "parent", digest, len(data))
+
+
+def test_terminal_model_records_bind_typed_pointer_artifact_and_native_hold(tmp_path: Path) -> None:
+    _, workspace, receipt = produced(tmp_path)
+    artifact = msgspec.to_builtins(receipt.artifact)
+    schema = {"fields": [{"name": "model", "type": {"input": "model"}}]}
+    records = machine_models.result_records(workspace, "owner", "root", {"model": artifact}, schema)
+    assert records == machine_models.result_records(
+        workspace, "owner", "root", {"model": artifact}, schema
+    )
+    pointer, raw, retention = records[0]
+    assert pointer == "/model" and canonical_json.decode(raw) == artifact
+    assert retention.weights_transaction_id == receipt.weights_transaction_id
+    with pytest.raises(WorkspaceRefusal, match="32 entries"):
+        machine_models.result_records(
+            workspace, "owner", "root", [artifact] * 33, {"list": {"input": "model"}}
+        )
+    envelope = pb.ResultEnvelope(
+        inline_result=canonical_json.encode({"model": artifact}),
+        retained_models=[
+            pb.RetainedModelResult(
+                result_pointer=pointer,
+                model_artifact_canonical_bytes=raw,
+                retention=retention,
+            )
+        ],
+    )
+    body = pb.AttemptOutcomeBody(
+        request_id="root",
+        attempt_ordinal=1,
+        invocation_spec_digest="sha256:" + "ab" * 32,
+        status=pb.OUTCOME_STATUS_SUCCEEDED,
+        result=envelope,
+    )
+    canonical, digest = documents.identity(body)
+    terminal = pb.AttemptOutcome(
+        request_id="root", outcome_canonical_bytes=canonical, outcome_digest=digest
+    )
+    Executions(workspace)._verify_outputs("owner", terminal, canonical_json.encode(schema))
+    body.result.retained_models[0].result_pointer = "/other"
+    canonical, digest = documents.identity(body)
+    terminal.outcome_canonical_bytes, terminal.outcome_digest = canonical, digest
+    with pytest.raises(WorkspaceRefusal, match="typed result"):
+        Executions(workspace)._verify_outputs("owner", terminal, canonical_json.encode(schema))

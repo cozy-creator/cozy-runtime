@@ -127,6 +127,34 @@ async def nested(ctx: Context, payload: Request) -> Result:
 """
 
 
+FILE_SOURCE = """import msgspec
+from cozy_runtime.author import App, Context, FileAsset, Outputs, invocable
+app = App()
+class Request(msgspec.Struct):
+    pass
+class Result(msgspec.Struct):
+    value: int
+class Report(msgspec.Struct):
+    report: FileAsset
+@invocable(memoize=True)
+async def leaf(ctx: Context, out: Outputs, *, n: int) -> Report:
+    path = out.temporary_file('.json')
+    path.write_bytes(b'{"observed":7}')
+    return Report(out.save_file(path, media_type='application/json'))
+app.job(leaf)
+@invocable
+async def compose(ctx: Context, *, n: int) -> Result:
+    first = await leaf(n=n)
+    second = await leaf(n=n)
+    assert first.report.read_bytes() == second.report.read_bytes() == b'{"observed":7}'
+    return Result(12)
+app.job(compose)
+@app.job
+async def nested(ctx: Context, payload: Request) -> Result:
+    return await compose(n=3)
+"""
+
+
 def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread]:
     fixture = Path(__file__).parent / "testdata/native_source"
     body = (fixture / "first.safetensors").read_bytes()
@@ -169,7 +197,8 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 @pytest.mark.parametrize(
-    "case", ["normal", "pause", "loss", "cycle", "capacity", "model", "source"]
+    "case",
+    ["normal", "pause", "loss", "cycle", "capacity", "model", "model_result", "source", "file"],
 )
 def test_nested_capture_and_leaf_memoization_without_control_stream(
     monkeypatch: pytest.MonkeyPatch, case: str
@@ -179,7 +208,14 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
 
     with tempfile.TemporaryDirectory(prefix="cz-child.") as directory:
         root = Path(directory)
-        source = MODEL_SOURCE if case in ("model", "source") else SOURCE
+        source = MODEL_SOURCE if case in ("model", "model_result", "source") else SOURCE
+        if case == "model_result":
+            source = source.replace(
+                "async def nested(ctx: Context, payload: Request) -> Result:",
+                "async def nested(ctx: Context, payload: Request) -> ModelArtifact:",
+            ).replace("    return await compose(n=3)", "    return await leaf(n=3)")
+        if case == "file":
+            source = FILE_SOURCE
         if case == "source":
             source = source.replace(
                 'return Result(len(view.components["body"]))',
@@ -281,7 +317,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                         )
                         for export in (
                             ("compose", "consume", "leaf")
-                            if case in ("model", "source")
+                            if case in ("model", "model_result", "source")
                             else ("compose", "leaf")
                         )
                     ],
@@ -410,6 +446,39 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             assert not worker.stop.is_set()
             import base64
 
+            if case == "model_result":
+                import tensorfs
+
+                from test_machine_execution import ack
+
+                value = canonical_json.decode(base64.b64decode(body["result"]["inline_result"]))
+                assert not body.get("weights_receipts")
+                (retained,) = body["result"]["retained_models"]
+                assert retained.get("result_pointer", "") == ""
+                assert (
+                    canonical_json.decode(
+                        base64.b64decode(retained["model_artifact_canonical_bytes"])
+                    )
+                    == value
+                )
+                assert worker.workspace is not None
+                received = worker.workspace.retain(
+                    "owner",
+                    pb.DerivedRetentionRequest(
+                        weights_transaction_id=retained["retention"]["weights_transaction_id"],
+                        tensorfs_receipt_digest=documents.raw(
+                            retained["retention"]["tensorfs_receipt_digest"]
+                        ),
+                        retention_id="sha256:" + "e7" * 32,
+                    ),
+                )
+                worker.acknowledge_execution_collection(claim, ack(outcome))
+                tensorfs.gc(str(worker.workspace.store_root))
+                assert documents.body(received.manifest) == value["manifest"]
+                assert tensorfs.Store.open(str(worker.workspace.store_root)).manifest(
+                    value["manifest"]["digest"]
+                )
+                return
             assert canonical_json.decode(base64.b64decode(body["result"]["inline_result"])) == {
                 "value": 1 if case == "source" else 2 if case == "model" else 12
             }
@@ -459,7 +528,7 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
         parents.append(selected)
         selected = calls.accept("owner", request(parent)).child_request
     dispatcher = Dispatcher(cast(Worker, SimpleNamespace(workspace=workspace)))
-    target = cast(Target, SimpleNamespace(revision="different", binding=None))
+    target = cast(Target, SimpleNamespace(revision="different", binding=None, declaration={}))
     dispatcher._check_ancestors(
         "owner", cast(AttemptRecord, SimpleNamespace(request_id=parents[-2])), target, b"{}"
     )
@@ -467,3 +536,30 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
         dispatcher._check_ancestors(
             "owner", cast(AttemptRecord, SimpleNamespace(request_id=parents[-1])), target, b"{}"
         )
+
+
+def test_canceling_root_also_abandons_failed_descendants(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from cozy_runtime.internal.worker.machine_calls import Calls as Dispatcher
+    from cozy_runtime.internal.worker.workspace import Workspace
+    from cozy_runtime.internal.worker.workspace_calls import Calls
+    from cozy_runtime.internal.worker.workspace_executions import Executions
+    from test_machine_calls import request, running
+    from test_machine_execution import complete, offer
+
+    workspace = Workspace(tmp_path / "store")
+    executions, calls = Executions(workspace), Calls(workspace)
+    executions.submit("owner", "root", b"c" * 32, offer())
+    call = calls.accept("owner", request(running(executions, "root")))
+    executions.submit("owner", "child", b"c" * 32, offer(call.child_request))
+    complete(executions, call.child_request, status=pb.OUTCOME_STATUS_FAILED)
+    complete(executions, "root", status=pb.OUTCOME_STATUS_FAILED)
+    executions.control("owner", "root", "cancel-root", 1, "cancel")
+    dispatcher = Dispatcher(
+        cast(Worker, SimpleNamespace(workspace=workspace, executions=executions))
+    )
+    dispatcher._stop_descendants("owner")
+    assert executions.abandon("owner", "root")
+    assert executions.abandon("owner", call.child_request)
+    assert not executions.retention_required("owner")
