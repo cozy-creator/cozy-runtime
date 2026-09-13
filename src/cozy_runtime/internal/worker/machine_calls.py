@@ -440,18 +440,12 @@ class Calls:
         with self.worker.workspace.locked() as db:
             while request not in seen and len(seen) < MAX_ACTIVE_CALLS - 1:
                 seen.add(request)
-                held = self.worker.engine.live.get(request)
-                if (
-                    held is not None
-                    and not held.lane_id.startswith("cpu-")
-                    and (
-                        target.declaration.get("models")
-                        or target.declaration.get("weights_outputs")
-                    )
-                ):
-                    raise WorkspaceRefusal(
-                        "managed child cannot coexist with an ancestor occupying the device lane"
-                    )
+                if target.declaration.get("models") or target.declaration.get("weights_outputs"):
+                    held = self.worker.engine.live.get(request)
+                    if held is not None and not held.lane_id.startswith("cpu-"):
+                        raise WorkspaceRefusal(
+                            "managed child cannot coexist with an ancestor on the device lane"
+                        )
                 row = db.execute(
                     "SELECT a.invocation FROM attempts a JOIN executions e "
                     "ON a.owner=e.owner AND a.request=e.request AND a.ordinal=e.ordinal "

@@ -236,8 +236,11 @@ def test_native_quality_refusal_accepts_no_role(tmp_path: Path) -> None:
     assert sum(reads) == 16384
     row = captured[0]
     artifact = ModelArtifact("source", "model", ObjectRef(source, length), "sha256:" + "11" * 32)
-    with NativeExecution(
-        store, tmp_path, "quantize", {"source": artifact}, {"model": BOUND}, epoch=2
-    ) as owner, owner.client.open_output("model", row.definition) as resumed:
+    with (
+        NativeExecution(
+            store, tmp_path, "quantize", {"source": artifact}, {"model": BOUND}, epoch=2
+        ) as owner,
+        owner.client.open_output("model", row.definition) as resumed,
+    ):
         assert resumed.completed_parts() == []
         assert resumed.completed_configs() == []

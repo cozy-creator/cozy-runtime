@@ -489,7 +489,7 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
         parents.append(selected)
         selected = calls.accept("owner", request(parent)).child_request
     dispatcher = Dispatcher(cast(Worker, SimpleNamespace(workspace=workspace)))
-    target = cast(Target, SimpleNamespace(revision="different", binding=None))
+    target = cast(Target, SimpleNamespace(revision="different", binding=None, declaration={}))
     dispatcher._check_ancestors(
         "owner", cast(AttemptRecord, SimpleNamespace(request_id=parents[-2])), target, b"{}"
     )
