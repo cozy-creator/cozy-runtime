@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -11,8 +13,9 @@ from cozy_runtime.internal import base_observation, canonical, package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.plan import DeclaredBinding
-from cozy_runtime.internal.worker.session import Placement
+from cozy_runtime.internal.worker.session import Placement, read_placement_set
 from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
 
 
 def _schema() -> dict[str, Json]:
@@ -37,7 +40,13 @@ def _interface(entrypoints: list[Json]) -> dict[str, Json]:
 
 
 def _bindings(
-    tmp_path: Path, body: dict[str, Json], selected: tuple[str, ...] = ()
+    tmp_path: Path,
+    body: dict[str, Json],
+    selected: tuple[str, ...] = (),
+    *,
+    development: bool = False,
+    models: tuple[dict[str, Json], ...] = (),
+    prepared: Placement | None = None,
 ) -> tuple[Mapping[str, DeclaredBinding], int]:
     raw = canonical.write(body)
     digest = canonical.digest(body)
@@ -57,12 +66,14 @@ def _bindings(
     placement = Placement(
         placement_id="package-job-only",
         placement_set_digest=b"\x11" * 32,
-        package={"project_wheel": {"ref": {"digest": "sha256:" + "22" * 32}}},
-        development={},
+        package={}
+        if development
+        else {"project_wheel": {"ref": {"digest": "sha256:" + "22" * 32}}},
+        development={"source_digest": "sha256:" + "22" * 32} if development else {},
         environment_digest=b"\x33" * 32,
         package_interface=(digest, len(raw)),
         bindings_digest=documents.digest_of(canonical.write({"entrypoints": [], "models": []})),
-        models=(),
+        models=models,
         entrypoints=tuple(
             {
                 "name": name,
@@ -74,7 +85,7 @@ def _bindings(
         environment={},
         document={},
     )
-    return acquirer._bindings(placement)
+    return acquirer._bindings(prepared or placement)
 
 
 def test_job_only_package_set_has_no_serving_bindings(tmp_path: Path) -> None:
@@ -122,3 +133,73 @@ def test_package_set_refuses_empty_or_unknown_selection(
     with pytest.raises(AcquisitionRefusal) as refused:
         _bindings(tmp_path, _interface([_entrypoint("first"), _entrypoint("second")]), selected)
     assert refused.value.code == code
+
+
+def test_h3_prepared_code_only_set_has_no_executable_bindings(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "testdata" / "h3-code-only"
+    raw = (fixture / "placement-set.json").read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == (
+        "384edb7272a8b760fa30b5c500b282c6726aede1613be17c9c52f5f3c6257991"
+    )
+    desired = pb.DesiredPlacementSet(
+        placement_set_digest=documents.digest_of(raw), placement_set_canonical_bytes=raw
+    )
+    (entry,) = read_placement_set(desired)
+    assert entry["development"]["local_revision_digest"] == (
+        "sha256:2b96d8193a4933d9a62a4bdc51d9fdd2f8d80695025142e103c284f578a095aa"
+    )
+    assert entry["entrypoints"] == entry["models"] == []
+    interface = (fixture / "package-interface.json").read_bytes()
+    assert entry["package_interface"] == {
+        "digest": "sha256:" + hashlib.sha256(interface).hexdigest(),
+        "length": len(interface),
+    }
+    body = json.loads(interface)
+    assert all(row["models"] for row in body["entrypoints"])
+    placement = Placement(
+        placement_id=entry["placement_id"],
+        placement_set_digest=desired.placement_set_digest,
+        package={},
+        development=entry["development"],
+        environment_digest=documents.raw(entry["environment_digest"]),
+        package_interface=(
+            entry["package_interface"]["digest"],
+            entry["package_interface"]["length"],
+        ),
+        bindings_digest=documents.raw(entry["bindings_digest"]),
+        models=tuple(entry["models"]),
+        entrypoints=tuple(entry["entrypoints"]),
+        environment=entry["environment"],
+        document=entry,
+    )
+    bindings, count = _bindings(tmp_path, body, prepared=placement)
+    assert bindings == {} and count == 1
+
+
+@pytest.mark.parametrize("development", [False, True])
+def test_empty_selection_cannot_drop_declared_weightless_binding(
+    tmp_path: Path, development: bool
+) -> None:
+    with pytest.raises(AcquisitionRefusal) as refused:
+        _bindings(tmp_path, _interface([_entrypoint("serve")]), development=development)
+    assert refused.value.code == "binding_entrypoint_set_mismatch"
+
+
+def test_empty_development_selection_cannot_hide_selected_models(tmp_path: Path) -> None:
+    modeled = {
+        **_entrypoint("serve"),
+        "models": [{"class": "Model", "path": "serve.models.model", "component_use": {}}],
+    }
+    with pytest.raises(AcquisitionRefusal) as refused:
+        _bindings(tmp_path, _interface([modeled]), development=True, models=({"id": "selected"},))
+    assert refused.value.code == "binding_entrypoint_set_mismatch"
+
+
+def test_code_only_exception_cannot_hide_missing_model_slots(tmp_path: Path) -> None:
+    modeled = {
+        **_entrypoint("serve"),
+        "models": [{"class": "Model", "path": "serve.models.model", "component_use": {}}],
+    }
+    with pytest.raises(AcquisitionRefusal) as refused:
+        _bindings(tmp_path, _interface([modeled]), ("serve",), development=True)
+    assert refused.value.code == "binding_slot_set_mismatch"

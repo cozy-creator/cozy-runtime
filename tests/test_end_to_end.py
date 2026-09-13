@@ -34,12 +34,19 @@ from typing import Any
 import pytest
 
 from conftest import image_python
-from cozy_runtime.internal import base_observation, package_environment
+from cozy_runtime.internal import (
+    base_observation,
+    package_environment,
+    package_interface,
+    static_interface,
+)
+from cozy_runtime.internal.worker.acquire import Acquirer
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     prepare_local_package,
     prepare_package,
 )
+from cozy_runtime.internal.worker.session import Placement, read_placement_set
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -416,6 +423,125 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
         dependency_wheel.write_bytes(original_dependency)
         prepare([project_wheel, dependency_wheel], revision)
         assert all(path.read_bytes() == raw for path, raw in first_plans.items())
+
+
+def test_real_modeled_package_prepare_can_be_acquired_before_model_selection(
+    tmp_path: Path,
+) -> None:
+    """The real producer/consumer handoff, before any model or handler may execute."""
+    project = tmp_path / "project"
+    _write_pure_project(project, "code-only", "1.0.0", "code_only_package")
+    metadata = project / "pyproject.toml"
+    metadata.write_text(
+        metadata.read_text()
+        + '\n[project.entry-points."cozy.application"]\ndefault="code_only_package:app"\n'
+    )
+    (project / "package.toml").write_text('[application]\nobject="code_only_package:app"\n')
+    source = """import msgspec
+from cozy_runtime.author import App, Context, Model
+class Request(msgspec.Struct):
+    prompt: str
+class Result(msgspec.Struct):
+    value: int
+class Weights(Model[object]):
+    def load(self, loader) -> None:
+        raise AssertionError("code preparation cannot load a model")
+app = App()
+@app.entrypoint
+def generate(ctx: Context, payload: Request, model: Weights) -> Result:
+    raise AssertionError("code preparation cannot execute a handler")
+"""
+    (project / "src/code_only_package/__init__.py").write_text(source)
+    captured = package_interface.canonical_bytes(static_interface.build(project))
+    artifacts, environment = tmp_path / "artifacts", tmp_path / "environment"
+    artifacts.mkdir()
+    wheel_root = environment / ".stage" / "code-only-proof" / "wheels"
+    wheel_root.mkdir(parents=True)
+    _run("uv", "build", "--wheel", "--out-dir", str(wheel_root), str(project))
+    rows = _wheel_rows(list(wheel_root.glob("*.whl")))
+    assert len(rows) == 1
+    source_digest = hashlib.sha256(source.encode()).digest()
+    # Author the expected identity before preparation, as the caller does. Never
+    # replace it with a digest learned from a worker refusal.
+    _, revision = documents.identity(
+        pb.LocalPackageRevision(
+            package="local/code-only",
+            release="1.0.0",
+            source_digest=source_digest,
+            package_interface=pb.Ref(digest=documents.digest_of(captured), length=len(captured)),
+            files=[
+                pb.LocalPackageFileRef(digest=r.digest, filename=r.filename, length=r.length)
+                for r in rows
+            ],
+        )
+    )
+    python = image_python()
+    base = package_environment.observe_base(python)
+    installed: list[package_environment.InstalledEnvironment] = []
+
+    def describe(selected: package_environment.InstalledEnvironment, distribution: str) -> bytes:
+        program = (
+            "import sys; from cozy_runtime.internal import package_interface; "
+            "from cozy_runtime.internal.discovery import discover_distribution; "
+            f"body=package_interface.build(discover_distribution({distribution!r})); "
+            "sys.stdout.buffer.write(package_interface.canonical_bytes(body))"
+        )
+        measured = _run(str(selected.python), "-I", "-c", program, cwd="/").stdout.encode()
+        assert measured == captured
+        return measured
+
+    prepared = prepare_local_package(
+        pb.PrepareLocalPackageRequest(
+            operation_id="code-only-proof",
+            package=pb.DevelopmentPackage(
+                package="local/code-only",
+                release="1.0.0",
+                source_digest=source_digest,
+                local_revision_digest=revision,
+            ),
+            wheels=rows,
+            install_root=str(environment),
+        ),
+        artifact_cache=artifacts,
+        install_root=environment,
+        python=python,
+        describe=describe,
+        verified=lambda _digest, _length, _path: None,
+        base=base,
+        job_plan_root=tmp_path / "job-plans",
+        materialized=installed.append,
+    )
+    (entry,) = read_placement_set(prepared.placement_set)
+    assert entry["entrypoints"] == entry["models"] == []
+    placement = Placement(
+        placement_id=entry["placement_id"],
+        placement_set_digest=prepared.placement_set.placement_set_digest,
+        package={},
+        development=entry["development"],
+        environment_digest=documents.raw(entry["environment_digest"]),
+        package_interface=(
+            entry["package_interface"]["digest"],
+            entry["package_interface"]["length"],
+        ),
+        bindings_digest=documents.raw(entry["bindings_digest"]),
+        models=(),
+        entrypoints=(),
+        environment=entry["environment"],
+        document=entry,
+    )
+    acquirer = Acquirer(
+        cache_root=artifacts,
+        install_root=environment,
+        selection_root=tmp_path / "selection",
+        tensorfs_root=tmp_path / "tensorfs",
+        python=python,
+        base=base,
+        installed_environment=installed[0],
+    )
+    acquired = acquirer.acquire(placement)
+    assert acquired.bindings == {}
+    assert acquired.model_objects == 0 and acquired.documents == 1
+    assert acquired.installed == installed[0]
 
 
 def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> None:
