@@ -454,7 +454,7 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     workspace.accept("owner", offer("legacy"))
     with workspace.locked() as db:
-        for table in ("execution_commands", "execution_events", "executions"):
+        for table in ("execution_calls", "execution_commands", "execution_events", "executions"):
             db.execute("DROP TABLE " + table)
         db.execute("ALTER TABLE workspace_state DROP COLUMN execution_workspace_id")
         db.execute("PRAGMA user_version=6")
@@ -466,7 +466,7 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     assert Executions(Workspace(tmp_path / "other-store")).workspace_id != e.workspace_id
     e.submit("owner", "new", b"c" * 32, offer("new"))
     with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
         assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 2
 
 
