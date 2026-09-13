@@ -437,7 +437,6 @@ def materialize(
             python,
             dependency_python,
             base,
-            exact_dependencies=exact_dependencies,
             dependency_cache=dependency_cache,
         )
     observed = base or observe_base(python)
@@ -2398,7 +2397,6 @@ def _materialize_dependency_snapshot(
     base: base_observation.Observation | None,
     *,
     builtin_capture: bool | None = None,
-    exact_dependencies: bool = False,
     dependency_cache: Path | None = None,
 ) -> InstalledEnvironment:
     from cozy_runtime.internal import _installed_dependencies
@@ -2420,11 +2418,12 @@ def _materialize_dependency_snapshot(
     provided = {
         item.wheel.distribution: (item.wheel.version, item.requirements) for item in inspected
     }
-    # Creator seals selected root extras into the captured wheel's flattened
-    # Requires-Dist before calling exact preparation. Raw local wheel callers do
-    # not make that claim and keep their conservative installed closure.
+    # Creator's authored venv already supplies the selected installed closure.
+    # Keep that closure for older/raw callers too: exact_dependencies controls
+    # online boot resolution, not whether root extras were flattened. Only the
+    # fixed carrier, which has no root extras, prunes an arbitrary SDK roster.
     included = None
-    if exact_dependencies or builtin_capture is not None:
+    if builtin_capture is not None:
         included = _installed_dependencies.required_distributions(
             dependency_python,
             provided,
@@ -2487,7 +2486,7 @@ def _materialize_dependency_snapshot(
         _installed_dependencies.verify_files(staging, manifest)
         # Re-read the copied metadata after wheel installation: a source edit during
         # capture cannot silently leave an incomplete transitive closure.
-        if exact_dependencies or builtin_capture is not None:
+        if builtin_capture is not None:
             _installed_dependencies.required_distributions(
                 staging / "bin/python",
                 provided,

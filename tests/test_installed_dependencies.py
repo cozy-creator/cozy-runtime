@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -397,3 +398,48 @@ def test_cache_reuse_still_rejects_changed_source_with_unchanged_record(tmp_path
     with pytest.raises(package_environment.EnvironmentRefusal, match="member_changed"):
         dependencies.snapshot(source / "bin/python", second, set(), cache=cache)
     dependencies.verify_files(first, initial)
+
+
+def test_concurrent_captures_publish_only_complete_immutable_objects(tmp_path: Path) -> None:
+    source, cache = tmp_path / "source", tmp_path / "cache"
+    site = _venv(source)
+    _distribution(site, "dependency", {"payload.bin": bytes(range(256)) * (1 << 14)})
+    barrier = threading.Barrier(2)
+
+    def capture(name: str) -> tuple[Path, bytes]:
+        target = tmp_path / name
+        _venv(target)
+        barrier.wait()
+        manifest = dependencies.snapshot(source / "bin/python", target, set(), cache=cache)
+        dependencies.verify_files(target, manifest)
+        return target, manifest
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(capture, ["first", "second"]))
+    assert first[1] == second[1]
+    payload = Path("lib/python3.12/site-packages/payload.bin")
+    assert (first[0] / payload).samefile(second[0] / payload)
+    assert not list(cache.glob(".copy-*"))
+    assert all(not path.stat().st_mode & 0o222 for path in cache.iterdir())
+
+
+def test_cached_capture_refuses_mutable_cache_and_staged_collisions(tmp_path: Path) -> None:
+    source, first, second, cache = (
+        tmp_path / part for part in ("source", "first", "second", "cache")
+    )
+    site = _venv(source)
+    _venv(first)
+    target_site = _venv(second)
+    _distribution(site, "dependency", {"payload.bin": b"retained immutable bytes"})
+    original = dependencies.snapshot(source / "bin/python", first, set(), cache=cache)
+    (target_site / "payload.bin").write_bytes(b"installed package owns this path")
+    with pytest.raises(package_environment.EnvironmentRefusal, match="member_collision"):
+        dependencies.snapshot(source / "bin/python", second, set(), cache=cache)
+    dependencies.verify_files(first, original)
+    # A writable cache inode cannot become a shared captured dependency.
+    target = tmp_path / "third"
+    _venv(target)
+    cached = next(cache.iterdir())
+    cached.chmod(0o644)
+    with pytest.raises(package_environment.EnvironmentRefusal, match="cache_invalid"):
+        dependencies.snapshot(source / "bin/python", target, set(), cache=cache)

@@ -246,6 +246,8 @@ def _cached_dependency_file(
     source: Path, target: Path, expected: str, size: str, cache: Path
 ) -> tuple[str, int]:
     info = _source_info(source, size)
+    if os.name != "posix":
+        return _copy_dependency_file(source, target, expected, size)
     algorithm, separator, encoded = expected.partition("=")
     lengths = {"sha256": 43, "sha384": 64, "sha512": 86}
     if (
@@ -284,7 +286,7 @@ def _cached_dependency_file(
         except FileNotFoundError:
             pass  # Cache eviction raced reuse; the source still supplies the exact bytes.
         except OSError as exc:
-            if exc.errno != errno.EXDEV:
+            if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP}:
                 raise
             return _copy_dependency_file(source, target, expected, size)
         else:
@@ -318,7 +320,7 @@ def _cached_dependency_file(
         except FileNotFoundError:
             os.link(temporary, target)  # Disposable cache was evicted after publication.
         except OSError as exc:
-            if exc.errno != errno.EXDEV:
+            if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP}:
                 raise
             return _copy_dependency_file(source, target, expected, size)
         _fsync_dir(target.parent)
@@ -389,6 +391,8 @@ def snapshot(
             "package_environment_dependency_source_invalid", str(source_python)
         )
     source_site = sites[0]
+    if os.name != "posix":
+        cache = None
     if cache is not None:
         cache.mkdir(parents=True, exist_ok=True, mode=0o700)
         cache_info = cache.lstat()
