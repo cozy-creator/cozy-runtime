@@ -340,6 +340,10 @@ class Calls:
             except Exception as exc:
                 # Admission refusal has no accepted child attempt to duplicate. Keep its
                 # exact failure beside the frozen call so a polling parent receives it.
+                if not executions.owns(owner, call.child_request):
+                    from . import machine_models
+
+                    machine_models.release(executions.workspace, owner, call.child_request)
                 with executions.workspace.locked() as db:
                     db.execute(
                         "UPDATE execution_calls SET safe_code=?,safe_detail=? "

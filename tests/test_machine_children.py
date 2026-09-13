@@ -198,7 +198,18 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 @pytest.mark.parametrize(
     "case",
-    ["normal", "pause", "loss", "cycle", "capacity", "model", "model_result", "source", "file"],
+    [
+        "normal",
+        "pause",
+        "loss",
+        "cycle",
+        "capacity",
+        "model",
+        "model_result",
+        "model_admission",
+        "source",
+        "file",
+    ],
 )
 def test_nested_capture_and_leaf_memoization_without_control_stream(
     monkeypatch: pytest.MonkeyPatch, case: str
@@ -208,7 +219,22 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
 
     with tempfile.TemporaryDirectory(prefix="cz-child.") as directory:
         root = Path(directory)
-        source = MODEL_SOURCE if case in ("model", "model_result", "source") else SOURCE
+        source = (
+            MODEL_SOURCE
+            if case in ("model", "model_result", "model_admission", "source")
+            else SOURCE
+        )
+        if case == "model_admission":
+            source = source.replace(
+                "async def consume(ctx: Context, *, model: Source) -> Result:",
+                "async def consume(ctx: Context, *, model: Source, z_other: Source) -> Result:",
+            ).replace(
+                "    return await consume(model=first)",
+                "    bad = ModelArtifact(\n"
+                "        'unowned', first.output_slot, first.manifest,\n"
+                "        first.tensorfs_receipt_digest)\n"
+                "    return await consume(model=first, z_other=bad)",
+            )
         if case == "model_result":
             source = source.replace(
                 "async def nested(ctx: Context, payload: Request) -> Result:",
@@ -317,7 +343,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                         )
                         for export in (
                             ("compose", "consume", "leaf")
-                            if case in ("model", "model_result", "source")
+                            if case in ("model", "model_result", "model_admission", "source")
                             else ("compose", "leaf")
                         )
                     ],
@@ -426,7 +452,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 time.sleep(0.02)
             outcome = worker.collect_execution(claim, "root")
             body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
-            if case in ("cycle", "capacity"):
+            if case in ("cycle", "capacity", "model_admission"):
                 assert body["status"] == pb.OUTCOME_STATUS_FAILED, body
                 assert worker.workspace is not None
                 with worker.workspace.locked() as db:
@@ -437,6 +463,23 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                             "SELECT 1 FROM execution_calls WHERE safe_detail "
                             "LIKE '%active ancestor%'"
                         ).fetchone()
+                    if case == "model_admission":
+                        refused = db.execute(
+                            "SELECT child_request FROM execution_calls "
+                            "WHERE safe_detail LIKE '%provenance%'"
+                        ).fetchone()
+                        assert refused is not None
+                        (row,) = db.execute(
+                            "SELECT retention FROM execution_model_holds WHERE recipient=?",
+                            (refused[0],),
+                        ).fetchall()
+                        hold = pb.DerivedRetentionRequest.FromString(row[0])
+                        assert (
+                            db.execute(
+                                "SELECT state FROM holds WHERE id=?", (hold.retention_id,)
+                            ).fetchone()[0]
+                            == "released"
+                        )
                 while worker.lanes.composition:
                     assert thread.is_alive() and time.monotonic() < deadline
                     time.sleep(0.02)
