@@ -516,9 +516,7 @@ class LaneSet:
                 f"got {list(pin)}",
             )
         if pin is not None and len(pin) > 1:
-            return self._assign_group(
-                placement_id, pin, model_bearing, measured, degrees
-            )
+            return self._assign_group(placement_id, pin, model_bearing, measured, degrees)
         if not model_bearing:
             if pin is None:
                 pool = [lane for lane in self.lanes if not lane.group] or list(self.lanes)
