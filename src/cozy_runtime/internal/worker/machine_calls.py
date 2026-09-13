@@ -306,7 +306,10 @@ class Calls:
                     job=pb.JobDirective(
                         build_id=target.revision,
                         job_descriptor_id=target.binding.job_descriptor_id,
-                        orchestration=not bool(target.declaration.get("models") or spec.outputs),
+                        orchestration=not bool(
+                            target.declaration.get("models")
+                            or target.declaration.get("weights_outputs")
+                        ),
                         reclaim_on_terminal=True,
                     ),
                 )

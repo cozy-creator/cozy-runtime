@@ -12,7 +12,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.internal.worker import grants
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 SCHEMA9 = """
@@ -265,12 +265,41 @@ def retain_result(
     value: Any,
     schema: Any,
 ) -> None:
-    for field, artifact in artifacts(value, schema):
-        hold, observed = retain(workspace, owner, recipient, path + field, artifact)
+    result_records(workspace, owner, recipient, value, schema, prefix=path)
+
+
+def result_records(
+    workspace: Workspace,
+    owner: str,
+    recipient: str,
+    value: Any,
+    schema: Any,
+    *,
+    prefix: str = "result",
+) -> list[tuple[str, bytes, pb.DerivedRetentionRequest]]:
+    """Freeze exact, bounded Model custody metadata before the terminal is hashed."""
+    selected = list(artifacts(value, schema))
+    if len(selected) > weights_limits.MAX_RETAINED_MODEL_RESULTS:
+        raise WorkspaceRefusal("native Model result inventory exceeds 32 entries")
+    encoded = [
+        (path, canonical_json.encode(msgspec.to_builtins(artifact)), artifact)
+        for path, artifact in selected
+    ]
+    if any(
+        len(path.encode()) > weights_limits.MAX_MODEL_RESULT_POINTER_BYTES
+        or len(raw) > weights_limits.MAX_RETAINED_MODEL_ARTIFACT_BYTES
+        for path, raw, _ in encoded
+    ):
+        raise WorkspaceRefusal("native Model result metadata exceeds its inline bounds")
+    records = []
+    for path, raw, artifact in encoded:
+        hold, observed = retain(workspace, owner, recipient, prefix + path, artifact)
         if (documents.spell(observed.manifest.digest), observed.manifest.length) != (
             artifact.manifest.digest,
             artifact.manifest.length,
         ):
-            raise WorkspaceRefusal("returned Model custody differs from the typed result")
+            raise WorkspaceRefusal("native result retention differs from its exact artifact")
         with workspace.held_model(owner, hold, observed.manifest):
             pass
+        records.append((path, raw, hold))
+    return records

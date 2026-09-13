@@ -2611,6 +2611,62 @@ class AttemptEngine:
             body.metrics.CopyFrom(self.attest(attempt, metrics, manifest))
         if result is not None:
             body.result.CopyFrom(self._envelope(result))
+            if (
+                status == pb.OUTCOME_STATUS_SUCCEEDED
+                and attempt.job is not None
+                and self.tensorfs_root is not None
+            ):
+                from cozy_runtime.internal.worker import machine_models
+                from cozy_runtime.internal.worker.workspace import Workspace
+                from cozy_runtime.protocol import RETAINED_MODEL_RESULTS_WIRE_MINOR
+
+                workspace = Workspace(self.tensorfs_root)
+                owner = self.owner_scope()
+                with workspace.locked() as db:
+                    managed = (
+                        db.execute(
+                            "SELECT 1 FROM executions WHERE owner=? AND request=?",
+                            (owner, attempt.request_id),
+                        ).fetchone()
+                        is not None
+                    )
+                if managed:
+                    try:
+                        schema = self._job_declaration(attempt.job, attempt.job.job_descriptor_id)[
+                            "result"
+                        ]
+                        records = machine_models.result_records(
+                            workspace,
+                            owner,
+                            attempt.request_id,
+                            canonical.parse_canonical(result.canonical),
+                            schema,
+                        )
+                        if records and (
+                            self.calls is None
+                            or self.calls.minor() < RETAINED_MODEL_RESULTS_WIRE_MINOR
+                        ):
+                            raise ValueError("native Model collection requires wire53")
+                        for pointer, artifact, retention in records:
+                            body.result.retained_models.append(
+                                pb.RetainedModelResult(
+                                    result_pointer=pointer,
+                                    model_artifact_canonical_bytes=artifact,
+                                    retention=retention,
+                                )
+                            )
+                    except Exception as exc:
+                        status, cause, origin = (
+                            pb.OUTCOME_STATUS_FAILED,
+                            pb.CAUSE_CODE_LOCAL_SAFETY,
+                            pb.CAUSE_ORIGIN_WORKER,
+                        )
+                        detail = "result_custody_unavailable: " + safe(str(exc), 1024)
+                        body.status, body.safe_message = status, detail
+                        body.cause.CopyFrom(
+                            pb.OutcomeCause(code=cause, origin=origin, detail=detail)
+                        )
+                        body.ClearField("result")
         for output_slot in sorted(attempt.weights_receipts):
             body.weights_receipts.append(attempt.weights_receipts[output_slot])
         receipt = self.commit_bundle(attempt, status, cause, origin, detail)

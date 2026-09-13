@@ -3248,18 +3248,30 @@ class WeightsFinalizeResult(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., outcome: _Optional[_Union[WeightsFinalizeOutcome, str]] = ..., weights_receipt: _Optional[_Union[WeightsReceiptRef, _Mapping]] = ..., owner_authority_scope: _Optional[str] = ...) -> None: ...
 
 class ResultEnvelope(_message.Message):
-    __slots__ = ("result_schema_digest", "inline_result", "result_blob", "adjustments", "checkpoint_ref")
+    __slots__ = ("result_schema_digest", "inline_result", "result_blob", "adjustments", "checkpoint_ref", "retained_models")
     RESULT_SCHEMA_DIGEST_FIELD_NUMBER: _ClassVar[int]
     INLINE_RESULT_FIELD_NUMBER: _ClassVar[int]
     RESULT_BLOB_FIELD_NUMBER: _ClassVar[int]
     ADJUSTMENTS_FIELD_NUMBER: _ClassVar[int]
     CHECKPOINT_REF_FIELD_NUMBER: _ClassVar[int]
+    RETAINED_MODELS_FIELD_NUMBER: _ClassVar[int]
     result_schema_digest: bytes
     inline_result: bytes
     result_blob: OutputEntry
     adjustments: _containers.RepeatedCompositeFieldContainer[AdjustmentRow]
     checkpoint_ref: str
-    def __init__(self, result_schema_digest: _Optional[bytes] = ..., inline_result: _Optional[bytes] = ..., result_blob: _Optional[_Union[OutputEntry, _Mapping]] = ..., adjustments: _Optional[_Iterable[_Union[AdjustmentRow, _Mapping]]] = ..., checkpoint_ref: _Optional[str] = ...) -> None: ...
+    retained_models: _containers.RepeatedCompositeFieldContainer[RetainedModelResult]
+    def __init__(self, result_schema_digest: _Optional[bytes] = ..., inline_result: _Optional[bytes] = ..., result_blob: _Optional[_Union[OutputEntry, _Mapping]] = ..., adjustments: _Optional[_Iterable[_Union[AdjustmentRow, _Mapping]]] = ..., checkpoint_ref: _Optional[str] = ..., retained_models: _Optional[_Iterable[_Union[RetainedModelResult, _Mapping]]] = ...) -> None: ...
+
+class RetainedModelResult(_message.Message):
+    __slots__ = ("result_pointer", "model_artifact_canonical_bytes", "retention")
+    RESULT_POINTER_FIELD_NUMBER: _ClassVar[int]
+    MODEL_ARTIFACT_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    RETENTION_FIELD_NUMBER: _ClassVar[int]
+    result_pointer: str
+    model_artifact_canonical_bytes: bytes
+    retention: DerivedRetentionRequest
+    def __init__(self, result_pointer: _Optional[str] = ..., model_artifact_canonical_bytes: _Optional[bytes] = ..., retention: _Optional[_Union[DerivedRetentionRequest, _Mapping]] = ...) -> None: ...
 
 class AdjustmentRow(_message.Message):
     __slots__ = ("field", "requested", "applied", "reason")

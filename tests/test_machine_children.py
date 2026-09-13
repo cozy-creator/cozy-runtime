@@ -197,7 +197,8 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 @pytest.mark.parametrize(
-    "case", ["normal", "pause", "loss", "cycle", "capacity", "model", "source", "file"]
+    "case",
+    ["normal", "pause", "loss", "cycle", "capacity", "model", "model_result", "source", "file"],
 )
 def test_nested_capture_and_leaf_memoization_without_control_stream(
     monkeypatch: pytest.MonkeyPatch, case: str
@@ -207,7 +208,12 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
 
     with tempfile.TemporaryDirectory(prefix="cz-child.") as directory:
         root = Path(directory)
-        source = MODEL_SOURCE if case in ("model", "source") else SOURCE
+        source = MODEL_SOURCE if case in ("model", "model_result", "source") else SOURCE
+        if case == "model_result":
+            source = source.replace(
+                "async def nested(ctx: Context, payload: Request) -> Result:",
+                "async def nested(ctx: Context, payload: Request) -> ModelArtifact:",
+            ).replace("    return await compose(n=3)", "    return await leaf(n=3)")
         if case == "file":
             source = FILE_SOURCE
         if case == "source":
@@ -311,7 +317,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                         )
                         for export in (
                             ("compose", "consume", "leaf")
-                            if case in ("model", "source")
+                            if case in ("model", "model_result", "source")
                             else ("compose", "leaf")
                         )
                     ],
@@ -440,6 +446,39 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             assert not worker.stop.is_set()
             import base64
 
+            if case == "model_result":
+                import tensorfs
+
+                from test_machine_execution import ack
+
+                value = canonical_json.decode(base64.b64decode(body["result"]["inline_result"]))
+                assert not body.get("weights_receipts")
+                (retained,) = body["result"]["retained_models"]
+                assert retained.get("result_pointer", "") == ""
+                assert (
+                    canonical_json.decode(
+                        base64.b64decode(retained["model_artifact_canonical_bytes"])
+                    )
+                    == value
+                )
+                assert worker.workspace is not None
+                received = worker.workspace.retain(
+                    "owner",
+                    pb.DerivedRetentionRequest(
+                        weights_transaction_id=retained["retention"]["weights_transaction_id"],
+                        tensorfs_receipt_digest=documents.raw(
+                            retained["retention"]["tensorfs_receipt_digest"]
+                        ),
+                        retention_id="sha256:" + "e7" * 32,
+                    ),
+                )
+                worker.acknowledge_execution_collection(claim, ack(outcome))
+                tensorfs.gc(str(worker.workspace.store_root))
+                assert documents.body(received.manifest) == value["manifest"]
+                assert tensorfs.Store.open(str(worker.workspace.store_root)).manifest(
+                    value["manifest"]["digest"]
+                )
+                return
             assert canonical_json.decode(base64.b64decode(body["result"]["inline_result"])) == {
                 "value": 1 if case == "source" else 2 if case == "model" else 12
             }
