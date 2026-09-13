@@ -362,9 +362,27 @@ class Executions:
             )
 
     def capture(self, owner: str, request: str) -> dict[str, Any]:
+        root = self.capture_root(owner, request)
         with self.workspace.locked() as db:
-            raw = self._row(db, owner, request)["capture_document"]
+            raw = self._row(db, owner, root)["capture_document"]
             return documents.read(raw, pb.MachineExecutionCapture)
+
+    def capture_root(self, owner: str, request: str) -> str:
+        """Children reference their original capture instead of copying its package inventory."""
+        with self.workspace.locked() as db:
+            seen: set[str] = set()
+            while request not in seen and len(seen) <= 32:
+                seen.add(request)
+                if self._row(db, owner, request)["capture_document"]:
+                    return request
+                parent = db.execute(
+                    "SELECT parent_request FROM execution_calls WHERE owner=? AND child_request=?",
+                    (owner, request),
+                ).fetchone()
+                if parent is None:
+                    break
+                request = parent[0]
+        raise WorkspaceRefusal("execution has no bounded original capture ancestry")
 
     def abandon(self, owner: str, request: str) -> bool:
         """Relinquish this stopped root through existing native release operations."""
