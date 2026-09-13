@@ -125,7 +125,7 @@ async def nested(ctx: Context, payload: Request) -> Result:
 
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-@pytest.mark.parametrize("case", ["normal", "pause", "cycle", "capacity", "model"])
+@pytest.mark.parametrize("case", ["normal", "pause", "loss", "cycle", "capacity", "model"])
 def test_nested_capture_and_leaf_memoization_without_control_stream(
     monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
@@ -135,7 +135,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
     with tempfile.TemporaryDirectory(prefix="cz-child.") as directory:
         root = Path(directory)
         source = MODEL_SOURCE if case == "model" else SOURCE
-        if case == "pause":
+        if case in ("pause", "loss"):
             source = source.replace(
                 "    return Result(n * 2)",
                 "    from pathlib import Path\n    import asyncio\n"
@@ -273,6 +273,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     offer=offered.attempt_offer,
                     prepared_state=state,
                     payload_canonical_bytes=canonical_json.encode({}),
+                    max_attempts=2 if case == "loss" else 1,
                 )
             )
             if case == "pause":
@@ -292,6 +293,35 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 (root / "gate").touch()
                 paused = worker.execution_status(claim, "root")
                 worker.control_execution(claim, "root", "resume-root", paused.generation, "resume")
+            if case == "loss":
+                import signal
+
+                while not (root / "entered").exists():
+                    assert thread.is_alive() and time.monotonic() < deadline
+                    time.sleep(0.02)
+                leaf = next(
+                    attempt
+                    for attempt in worker.engine.live.values()
+                    if attempt.job is not None and attempt.job.job == "leaf"
+                )
+                parent_pids = {
+                    attempt.request_id: attempt.executor_pid
+                    for attempt in worker.engine.live.values()
+                    if attempt is not leaf
+                }
+                os.kill(leaf.executor_pid, signal.SIGKILL)
+                while worker.execution_status(claim, leaf.request_id).attempt_ordinal != 2:
+                    observed = worker.execution_status(claim, leaf.request_id)
+                    assert observed.state != "failed", documents.read(
+                        worker.collect_execution(claim, leaf.request_id).outcome_canonical_bytes,
+                        pb.AttemptOutcomeBody,
+                    )
+                    assert thread.is_alive() and time.monotonic() < deadline
+                    time.sleep(0.02)
+                for identifier, pid in parent_pids.items():
+                    parent = worker.engine.live[identifier]
+                    assert parent.attempt == 1 and parent.executor_pid == pid
+                (root / "gate").touch()
             while worker.execution_status(claim, "root").state not in ("succeeded", "failed"):
                 assert thread.is_alive() and time.monotonic() < deadline
                 time.sleep(0.02)

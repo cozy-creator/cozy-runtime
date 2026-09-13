@@ -554,13 +554,21 @@ class Executions:
 
     def _retryable(self, row: Row, body: dict[str, Any]) -> bool:
         cause = body.get("cause", {})
+        executor_loss = (
+            body.get("status") == pb.OUTCOME_STATUS_ABANDONED
+            and cause.get("code") == pb.CAUSE_CODE_EXECUTOR_INVALIDATED
+            and cause.get("origin") == pb.CAUSE_ORIGIN_EXECUTOR
+        )
         if (
             row["desired"] != "run"
             or row["ordinal"] >= row["max_attempts"]
             or body.get("status") not in (pb.OUTCOME_STATUS_FAILED, pb.OUTCOME_STATUS_ABANDONED)
             or cause.get("code")
             not in (pb.CAUSE_CODE_EXECUTOR_FAULT, pb.CAUSE_CODE_EXECUTOR_INVALIDATED)
-            or cause.get("origin") not in (pb.CAUSE_ORIGIN_WORKER, pb.CAUSE_ORIGIN_RUNTIME)
+            or (
+                not executor_loss
+                and cause.get("origin") not in (pb.CAUSE_ORIGIN_WORKER, pb.CAUSE_ORIGIN_RUNTIME)
+            )
         ):
             return False
         spec = documents.read(
