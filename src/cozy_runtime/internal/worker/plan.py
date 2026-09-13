@@ -367,6 +367,10 @@ class DeclaredBinding:
     index row on the machine that holds it. A launcher constant here was the ninth field of
     the same mistake — `vramBudget = 7 * gib` priced every model ever bound, and the fill
     of a 92.42 GiB artifact refused `budget_overrun` against it."""
+    staged_weight_bytes: int | None = None
+    """Header-derived weight requirement of the largest declared component-use scope,
+    summed across independent model slots. A preflight bound, excluding derived buffers,
+    fill scratch and activations; actual executor preparation still measures those."""
     custody: str = "canonical"
     """`canonical` (the border classified every key: a serve-time extra is drift and
     refuses) or `local` (an un-bordered local bind: extras are listed, ignored and
@@ -427,7 +431,11 @@ class DeclaredBinding:
 
     def group_weight_bytes(self) -> int:
         """Declared per-rank weight requirement before measured executor preparation."""
-        return self.model_weight_bytes
+        return (
+            self.model_weight_bytes
+            if self.staged_weight_bytes is None
+            else self.staged_weight_bytes
+        )
 
     def snapshot_for(self, component: str) -> str:
         """This component's snapshot, or the binding's own when the map omits it."""

@@ -1429,8 +1429,9 @@ class Worker:
 
         The declared bytes are the placement's model weight bytes from its bindings' MCC
         census; the measured side is each lane's driver-reported free and total bytes, read
-        now. Full weight size ranks lanes, while the measured prepare ceiling and actual
-        construction/residency working set determine fit. Assignment grants no bytes. The row
+        now. Full weight size ranks single-device lanes. Group preflight uses the declared
+        simultaneous component requirement on each rank; measured preparation and actual
+        construction/residency still determine fit. Assignment grants no bytes. The row
         the lane keeps for it remembers `supervision`, the slot the lane asks to vacate
         when a co-tenant needs the card (cr-022).
         """

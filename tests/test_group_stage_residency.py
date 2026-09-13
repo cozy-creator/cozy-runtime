@@ -12,16 +12,18 @@ import tensorfs
 
 from cozy_runtime.internal import accel, base_observation, canonical
 from cozy_runtime.internal.worker.acquire import Acquirer
-from cozy_runtime.internal.worker.lanes import LaneRefusal, LaneSet
+from cozy_runtime.internal.worker.lanes import DeviceLane, LaneRefusal, LaneSet
+from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.session import Placement, read_placement_set
-from cozy_runtime.protocol import documents, worker_pb2 as pb
+from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
 
 FIXTURE = Path(__file__).parent / "testdata/h3-group-residency"
 HEADROOM = 85_017_493_504
 TEXT_ENCODER = 51_506_191_840
 
 
-def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1):
+def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1) -> DeclaredBinding:
     """Resolve the actual native header without fetching its 104 GB tensor payloads."""
     store_root = tmp_path / "store"
     store = tensorfs.Store.ensure(str(store_root))
@@ -90,7 +92,7 @@ def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1):
     return next(iter(resolved.values()))
 
 
-def assign(resolved, degree: int = 2, room: int = HEADROOM):
+def assign(resolved: DeclaredBinding, degree: int = 2, room: int = HEADROOM) -> DeviceLane:
     lanes = LaneSet.from_envelope(",".join(str(i) for i in range(degree)), worker_pid=os.getpid())
     return lanes.assign(
         "h3",

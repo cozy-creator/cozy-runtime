@@ -493,8 +493,8 @@ class LaneSet:
 
         A pin of K > 1 ordinals is a GROUP (cr-068): every named lane must be empty, the
         package must declare degree K, and every device's headroom must cover the declared
-        bytes (each rank holds the full weights) — then the K lanes FUSE. Refusals are
-        typed and move no other placement: `device_pin_infeasible` (envelope, occupancy),
+        simultaneous component weight requirement on every rank — then the K lanes FUSE.
+        Refusals move no other placement: `device_pin_infeasible` (envelope, occupancy),
         `device_group_unsupported` (no construction declared at K), `device_group_infeasible`
         (a device unreadable or short). A model-bearing placement with NO pin on a WIDE
         envelope refuses `device_group_unsupported`: the RecordOwner chose neither a device
@@ -664,8 +664,8 @@ class LaneSet:
             if room < declared_bytes:
                 short.append(
                     f"ordinal {ordinal} ({self.entries[ordinal]!r}) has {room} B measured "
-                    f"headroom for {declared_bytes} B of declared weights (every rank holds "
-                    "the full weights)"
+                    f"headroom for {declared_bytes} B of declared simultaneous weights "
+                    "(replicated on every rank)"
                 )
         if short:
             raise LaneRefusal(
