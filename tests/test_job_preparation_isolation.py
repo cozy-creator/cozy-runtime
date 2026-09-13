@@ -125,6 +125,13 @@ def test_job_only_worker_preparation_preserves_running_job_and_exact_readiness()
         measure(worker, other)
         measure(worker, first)
         worker.prepare_local_package(first)
+        # These fixture preparations precede control-service startup. Retire an
+        # older Runtime's idle describe process before run's orphan sweep; the
+        # regression below concerns the later preparation during actual work.
+        if worker.supervision.current is not None:
+            worker.supervision.retire_current(
+                worker.supervision.current, "fixture begins control service"
+            )
         plans = root / "home/job-plans"
         records = [json.loads(p.read_bytes()) for p in plans.glob("*/*.json")]
         plan = next(row for row in records if row.get("job") == "first")
