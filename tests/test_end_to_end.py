@@ -45,6 +45,7 @@ from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     prepare_local_package,
     prepare_package,
+    prepare_unpublished_placement,
 )
 from cozy_runtime.internal.worker.session import Placement, read_placement_set
 from cozy_runtime.protocol import documents
@@ -425,8 +426,9 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
         assert all(path.read_bytes() == raw for path, raw in first_plans.items())
 
 
+@pytest.mark.parametrize("bind_model", [False, True], ids=["code-only", "native-model"])
 def test_real_modeled_package_prepare_can_be_acquired_before_model_selection(
-    tmp_path: Path,
+    tmp_path: Path, bind_model: bool
 ) -> None:
     """The real producer/consumer handoff, before any model or handler may execute."""
     project = tmp_path / "project"
@@ -438,14 +440,25 @@ def test_real_modeled_package_prepare_can_be_acquired_before_model_selection(
     )
     (project / "package.toml").write_text('[application]\nobject="code_only_package:app"\n')
     source = """import msgspec
-from cozy_runtime.author import App, Context, Model
+from cozy_runtime.author import App, Config, Context, Loader, Model, uses_components
 class Request(msgspec.Struct):
     prompt: str
 class Result(msgspec.Struct):
     value: int
-class Weights(Model[object]):
-    def load(self, loader) -> None:
-        raise AssertionError("code preparation cannot load a model")
+class Pipeline:
+    def __init__(self, config: Config):
+        import torch
+        class Scalar(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self.components = {"unet": Scalar()}
+class Weights(Model[Pipeline]):
+    def load(self, loader: Loader) -> None:
+        self.pipe = loader.construct(Pipeline, factory=Pipeline)
+    @uses_components("unet")
+    def measure(self) -> int:
+        raise AssertionError("model preparation cannot execute a handler")
 app = App()
 @app.entrypoint
 def generate(ctx: Context, payload: Request, model: Weights) -> Result:
@@ -476,6 +489,23 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
         )
     )
     python = image_python()
+    if bind_model:
+        torch = pytest.importorskip("torch", reason="native derivation needs the CPU torch CI lane")
+        assert torch.version.cuda is None, "this proof uses CPU/meta derivation only"
+        # A separate real base prefix keeps the torch-free image fixture unchanged.
+        native_image = tmp_path / "cpu-image"
+        shutil.copytree(python.parent.parent, native_image, symlinks=True)
+        python = native_image / "bin" / python.name
+        _run(
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--index",
+            "https://download.pytorch.org/whl/cpu",
+            "torch==2.13.0",
+        )
     base = package_environment.observe_base(python)
     installed: list[package_environment.InstalledEnvironment] = []
 
@@ -542,6 +572,65 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
     assert acquired.bindings == {}
     assert acquired.model_objects == 0 and acquired.documents == 1
     assert acquired.installed == installed[0]
+    (tmp_path / "prepared-code.json").write_bytes(
+        prepared.placement_set.placement_set_canonical_bytes
+    )
+    if bind_model:
+        from test_model_runtime_closure import _snapshot
+
+        native_root = tmp_path / "native"
+        native_root.mkdir()
+        store_root, manifest, length, _store = _snapshot(
+            native_root, include_asset=True, checkpoint_only=True
+        )
+        modeled = prepare_unpublished_placement(
+            pb.PreparePrivatePlacementRequest(
+                operation_id="code-only-proof-model",
+                local_revision_digest=revision,
+                native_models=[
+                    pb.NativeModelBinding(
+                        slot="generate.models.model",
+                        model="proof/native",
+                        manifest=pb.Ref(digest=documents.raw(manifest), length=length),
+                    )
+                ],
+            ),
+            prepared=entry,
+            installed=installed[0],
+            artifact_cache=artifacts,
+            tensorfs_root=store_root,
+            verified=lambda _digest, _length, _path: None,
+        )
+        (joined,) = read_placement_set(modeled.placement_set)
+        assert [row["name"] for row in joined["entrypoints"]] == ["generate"]
+        assert len(joined["models"]) == 1
+        bound = Placement(
+            placement_id=joined["placement_id"],
+            placement_set_digest=modeled.placement_set.placement_set_digest,
+            package={},
+            development=joined["development"],
+            environment_digest=documents.raw(joined["environment_digest"]),
+            package_interface=placement.package_interface,
+            bindings_digest=documents.raw(joined["bindings_digest"]),
+            models=tuple(joined["models"]),
+            entrypoints=tuple(joined["entrypoints"]),
+            environment=joined["environment"],
+            document=joined,
+        )
+        selected = Acquirer(
+            cache_root=artifacts,
+            install_root=environment,
+            selection_root=tmp_path / "selected-model",
+            tensorfs_root=store_root,
+            python=python,
+            base=base,
+            installed_environment=installed[0],
+        ).acquire(bound)
+        assert {binding.entrypoint for binding in selected.bindings.values()} == {"generate"}
+        assert selected.model_objects == 3
+        (tmp_path / "prepared-model.json").write_bytes(
+            modeled.placement_set.placement_set_canonical_bytes
+        )
 
 
 def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> None:

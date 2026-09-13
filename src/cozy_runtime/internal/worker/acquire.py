@@ -736,7 +736,14 @@ class Acquirer:
         # Preparation selects the entrypoints whose model slots were supplied. Each
         # selected entrypoint and its complete slot set was checked above; the package
         # may also declare other entrypoints that this placement does not bind.
-        if not selected_entrypoints and (development or visible):
+        # Development code is prepared before its models are selected. That intermediate
+        # state has no executable bindings; a weightless entrypoint must still be selected.
+        code_only_preparation = (
+            bool(development)
+            and not models
+            and all(entrypoint.get("models") for entrypoint in visible.values())
+        )
+        if not selected_entrypoints and (development or visible) and not code_only_preparation:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
                 "binding_entrypoint_set_mismatch",

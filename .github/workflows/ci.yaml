@@ -69,7 +69,8 @@ jobs:
       - run: .venv/bin/python -c "import torch; assert torch.version.cuda is None"
       - run: >-
           .venv/bin/python -m pytest tests/test_parallel_calls.py
-          tests/test_job_source_derivation.py tests/test_construction_dtype.py -q -rs
+          tests/test_job_source_derivation.py tests/test_construction_dtype.py
+          tests/test_end_to_end.py::test_real_modeled_package_prepare_can_be_acquired_before_model_selection -q -rs
 
   # THE VENDORED-DRIFT GATE (#536d). `src/cozy/worker/v1/` is a COPY of another repo's
   # generated output, and a copy is only a copy while somebody compares the bytes.

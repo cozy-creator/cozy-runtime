@@ -88,8 +88,9 @@ def _bindings(
     return acquirer._bindings(prepared or placement)
 
 
-def test_job_only_package_set_has_no_serving_bindings(tmp_path: Path) -> None:
-    bindings, documents = _bindings(tmp_path, _interface([]))
+@pytest.mark.parametrize("development", [False, True])
+def test_job_only_package_set_has_no_serving_bindings(tmp_path: Path, development: bool) -> None:
+    bindings, documents = _bindings(tmp_path, _interface([]), development=development)
 
     assert bindings == {}
     assert documents == 1
@@ -127,11 +128,17 @@ def test_package_set_admits_selected_interface_entrypoints(
     ("selected", "code"),
     [((), "binding_entrypoint_set_mismatch"), (("absent",), "binding_package_interface_invalid")],
 )
+@pytest.mark.parametrize("development", [False, True])
 def test_package_set_refuses_empty_or_unknown_selection(
-    tmp_path: Path, selected: tuple[str, ...], code: str
+    tmp_path: Path, selected: tuple[str, ...], code: str, development: bool
 ) -> None:
     with pytest.raises(AcquisitionRefusal) as refused:
-        _bindings(tmp_path, _interface([_entrypoint("first"), _entrypoint("second")]), selected)
+        _bindings(
+            tmp_path,
+            _interface([_entrypoint("first"), _entrypoint("second")]),
+            selected,
+            development=development,
+        )
     assert refused.value.code == code
 
 
@@ -192,6 +199,16 @@ def test_empty_development_selection_cannot_hide_selected_models(tmp_path: Path)
     }
     with pytest.raises(AcquisitionRefusal) as refused:
         _bindings(tmp_path, _interface([modeled]), development=True, models=({"id": "selected"},))
+    assert refused.value.code == "binding_entrypoint_set_mismatch"
+
+
+def test_empty_published_modeled_selection_remains_a_refusal(tmp_path: Path) -> None:
+    modeled = {
+        **_entrypoint("serve"),
+        "models": [{"class": "Model", "path": "serve.models.model", "component_use": {}}],
+    }
+    with pytest.raises(AcquisitionRefusal) as refused:
+        _bindings(tmp_path, _interface([modeled]))
     assert refused.value.code == "binding_entrypoint_set_mismatch"
 
 
