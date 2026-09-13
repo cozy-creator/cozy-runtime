@@ -3557,8 +3557,6 @@ class Worker:
 
     def shutdown_from_stream(self) -> None:
         self.request_stop()
-        if self.machine_effects is not None:
-            self.machine_effects.close()
         self.weights.close()
         self.watches.end_all()
         self.host.stop()
@@ -6924,6 +6922,8 @@ class Worker:
             if supervision.current is not None
         ]
         self.request_stop()
+        if self.machine_effects is not None:
+            self.machine_effects.close()
         self.weights.close()
         if self.artifact_transfers is not None:
             self.artifact_transfers.close()

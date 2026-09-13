@@ -12,6 +12,7 @@ import msgspec
 from cozy_runtime import canonical_json
 from cozy_runtime.author.publication import CheckpointRef
 from cozy_runtime.internal import effect_interfaces, fill
+from cozy_runtime.internal.worker import machine_models
 from cozy_runtime.internal.worker.machine_artifacts import model_retention
 from cozy_runtime.internal.worker.machine_publication import (
     PublicationClient,
@@ -141,6 +142,22 @@ class Effects:
                 return
             # An interrupted/revoked authority does not establish whether a prior
             # send committed. Keep the obligation and exact baseline for readback.
+            self.executions.progress(
+                owner,
+                call.parent_request,
+                call.parent_ordinal,
+                {
+                    "type": "progress",
+                    "payload": {
+                        "operation": "publication",
+                        "call_index": call.call_index,
+                        "phase": "reconciling" if latest.sent else "retrying",
+                        "code": exc.code
+                        if isinstance(exc, PublicationRefusal)
+                        else "publication.parent_stopped",
+                    },
+                },
+            )
             raise
 
     def _upload(
@@ -157,7 +174,11 @@ class Effects:
         else:
             self.journal.check_active(owner, call)
             call = self.journal.freeze(owner, call, canonical_json.encode({"source": serialized}))
-        self.workspace.retain(owner, source)
+        registered, _ = machine_models.retain(
+            self.workspace, owner, call.child_request, "artifact", artifact
+        )
+        if registered != source:
+            raise WorkspaceRefusal("publication input changed its semantic custody")
         manifest = pb.Ref(
             digest=documents.raw(artifact.manifest.digest), length=artifact.manifest.length
         )
@@ -212,4 +233,6 @@ class Effects:
                 tensorfs_receipt_digest=documents.raw(value["tensorfs_receipt_digest"]),
                 retention_id=value["retention_id"],
             )
+            # The same semantic model registry is used by ordinary child outputs.
+            # Its native releases are exact and idempotent after a lost reply.
             self.workspace.retain(owner, source, release=True)
