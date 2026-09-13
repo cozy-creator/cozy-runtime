@@ -425,7 +425,8 @@ class WriterBroker:
         fingerprint: str,
     ) -> Iterator[None]:
         if not storage_admission.pressure_enabled():
-            yield
+            with storage_admission.admit(storage_admission.native_write(self.store_root)):
+                yield
             return
         store = self.store()
         estimate = store.derived_write_estimate(
@@ -446,7 +447,6 @@ class WriterBroker:
                 live.binding.epoch,
                 *live.arguments,
                 work_fingerprint=live.fingerprint,
-                checkpoint=live.binding.checkpoint,
             )
             payload += int(pending["payload_bytes"])
             parts += int(pending["parts"])
