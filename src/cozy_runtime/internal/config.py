@@ -99,6 +99,9 @@ class RuntimeConfig:
     Empty on local/public workers. It never enters an executor environment.
     """
 
+    dependency_cache: Path | None = None
+    """Creator-owned local cache of immutable dependency payloads; not executor authority."""
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerHostConfig:
@@ -282,6 +285,13 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
         )
     creds = Credentials(**{source: (env.get(var) or None) for source, var in CREDENTIAL_ENV})
     bootstrap = env.get("COZY_BOOTSTRAP_CREDENTIAL", "").strip()
+    dependency_cache = env.get("COZY_DEPENDENCY_CACHE", "").strip()
+    if dependency_cache and not Path(dependency_cache).is_absolute():
+        raise ConfigError(
+            "config",
+            "COZY_DEPENDENCY_CACHE must be an absolute path",
+            "provide the Creator-owned local dependency cache path",
+        )
     _read = True
     return RuntimeConfig(
         cozy_home=home,
@@ -295,6 +305,7 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
             )
         ),
         fill_forensics_dir=env.get(child_env.FILL_FORENSICS_DIR, "").strip(),
+        dependency_cache=Path(dependency_cache) if dependency_cache else None,
     )
 
 

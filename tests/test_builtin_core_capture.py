@@ -89,7 +89,8 @@ assert broker is not None and 'numpy' not in sys.modules
         "source = p.Input('sha256:' + 'a'*64, wheel.digest, (wheel,), "
         "(p.BlobGrant(wheel.digest, wheel.length, path, verified),)); "
         f"result = p.materialize(source, Path({str(tmp_path / 'authored')!r}), "
-        "base=base, dependency_python=Path(sys.executable)); print(result.python)",
+        "base=base, dependency_python=Path(sys.executable), exact_dependencies=True); "
+        "print(result.python)",
     )
     (site / "snapshotextra.py").write_text("raise AssertionError('original extra used')\n")
     python(authored_python, "from snapshotproject import value; assert value == 47")

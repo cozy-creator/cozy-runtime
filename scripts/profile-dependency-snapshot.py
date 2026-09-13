@@ -65,6 +65,7 @@ def main() -> None:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--warm-source", action="store_true")
+    parser.add_argument("--cache", type=Path)
     args = parser.parse_args()
     fixture(args.source)
     venv(args.target)
@@ -77,7 +78,12 @@ def main() -> None:
     before = io_counts()
     usage_before = resource.getrusage(resource.RUSAGE_SELF)
     started = time.monotonic()
-    manifest = dependencies.snapshot(args.source / "bin/python", args.target, set())
+    if args.cache is None:
+        manifest = dependencies.snapshot(args.source / "bin/python", args.target, set())
+    else:
+        manifest = dependencies.snapshot(
+            args.source / "bin/python", args.target, set(), cache=args.cache
+        )
     dependencies.verify_files(args.target, manifest)
     elapsed = time.monotonic() - started
     after = io_counts()
@@ -101,6 +107,7 @@ def main() -> None:
                 "source": str(args.source),
                 "target": str(args.target),
                 "warm_source": args.warm_source,
+                "cache": str(args.cache) if args.cache is not None else None,
             },
             indent=2,
         )
