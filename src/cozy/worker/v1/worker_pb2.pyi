@@ -631,28 +631,34 @@ class WorkspaceActivationCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ...) -> None: ...
 
 class ProtocolInfoResult(_message.Message):
-    __slots__ = ("wire_minor", "minimum_wire_minor")
+    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery")
     WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     MINIMUM_WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_MIXED_MODEL_INPUTS_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_MODEL_MATERIALIZATION_RECOVERY_FIELD_NUMBER: _ClassVar[int]
     wire_minor: int
     minimum_wire_minor: int
-    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ...) -> None: ...
+    supports_mixed_model_inputs: bool
+    supports_model_materialization_recovery: bool
+    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
-    __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements")
+    __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "supports_model_materialization_recovery")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
     APPLICATION_FIELD_NUMBER: _ClassVar[int]
     MODEL_SLOT_PATHS_FIELD_NUMBER: _ClassVar[int]
     IMAGE_INVENTORY_FIELD_NUMBER: _ClassVar[int]
     LOCKED_REQUIREMENTS_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_MODEL_MATERIALIZATION_RECOVERY_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     package_set: DesiredPackageSet
     application: str
     model_slot_paths: _containers.RepeatedScalarFieldContainer[str]
     image_inventory: ImageInventory
     locked_requirements: bytes
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ...) -> None: ...
+    supports_model_materialization_recovery: bool
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., supports_model_materialization_recovery: bool = ...) -> None: ...
 
 class PrepareLocalPackageCall(_message.Message):
     __slots__ = ("claim", "local_package_set")
@@ -663,12 +669,14 @@ class PrepareLocalPackageCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., local_package_set: _Optional[_Union[DesiredLocalPackageSet, _Mapping]] = ...) -> None: ...
 
 class PreparePrivatePlacementCall(_message.Message):
-    __slots__ = ("claim", "private_placement_set")
+    __slots__ = ("claim", "private_placement_set", "supports_model_materialization_recovery")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     PRIVATE_PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_MODEL_MATERIALIZATION_RECOVERY_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     private_placement_set: DesiredPrivatePlacementSet
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., private_placement_set: _Optional[_Union[DesiredPrivatePlacementSet, _Mapping]] = ...) -> None: ...
+    supports_model_materialization_recovery: bool
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., private_placement_set: _Optional[_Union[DesiredPrivatePlacementSet, _Mapping]] = ..., supports_model_materialization_recovery: bool = ...) -> None: ...
 
 class PrepareEvent(_message.Message):
     __slots__ = ("stage", "total_bytes", "transferred_bytes", "placement_set", "safe_code", "safe_detail", "model_progress")

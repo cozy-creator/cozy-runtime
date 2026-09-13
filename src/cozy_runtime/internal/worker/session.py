@@ -3486,6 +3486,7 @@ class Worker:
             and previous.placement_id == placement_id
             and previous.document == candidate.document
             and previous.device_pin == candidate.device_pin
+            and previous.materialization == pb.MaterializationState.MATERIALIZATION_STATE_STAGED
             and previous.serving != pb.ServingState.SERVING_STATE_DRAINING
         ):
             previous.placement_set_digest = desired_set.placement_set_digest

@@ -673,6 +673,11 @@
       "sha256": "cce2d53741f1b1f90eea316c0c46a48d497a0d315b93724c64de941a8d609300",
       "type": "cozy.worker.v1.ProtocolInfoResult"
     },
+    "protocol_info_result_mixed_model_inputs": {
+      "bytes": 6,
+      "sha256": "cc1f4be2ca6462de180c5eae8bae55da8e39c79c57250ba8134c7cf51415d4ee",
+      "type": "cozy.worker.v1.ProtocolInfoResult"
+    },
     "runtime_prepare_private_native": {
       "bytes": 446,
       "sha256": "12b256ead303a5562f2c260c6f0bd77528ba79db1259af7e37ba2e47e36f7761",

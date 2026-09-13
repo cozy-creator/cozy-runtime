@@ -538,18 +538,10 @@ class Acquirer:
             count = 0
             for model in placement.models:
                 manifest_digest, manifest_length = _ref(model["manifest"], "model.manifest")
-                try:
-                    manifest_raw = bytes(store.manifest(manifest_digest)["manifest"])
-                    _verify_bytes(manifest_raw, manifest_digest, manifest_length)
-                except Exception as exc:
-                    if getattr(exc, "code", "") != "OBJECT_ABSENT":
-                        raise
-                    manifest_path = self.fetch(manifest_digest, manifest_length)
-                    manifest_raw = manifest_path.read_bytes()
-                    store.put_manifest(manifest_raw, manifest_digest, manifest_length)
-                    header_digest, header_length = cozytensors_ref(tensorfs, manifest_raw)
-                    header_path = self.fetch(header_digest, header_length)
-                    store.put_file(str(header_path), header_digest, header_length)
+                # TensorFS owns model materialization. A cache miss asks the owner to
+                # ensure this exact selection again, including manifest and header.
+                manifest_raw = bytes(store.manifest(manifest_digest)["manifest"])
+                _verify_bytes(manifest_raw, manifest_digest, manifest_length)
                 reached = {
                     (str(row["id"]), int(row["length"]))
                     for row in store.walk_cozytensors(manifest_digest)
@@ -567,12 +559,18 @@ class Acquirer:
             raise
         except fill.FillRefusal as exc:
             raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED, "tensorfs_refused", str(exc)
+                pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
+                "model_materialization_required"
+                if exc.code == "missing_object"
+                else "tensorfs_refused",
+                str(exc),
             ) from exc
         except Exception as exc:
             raise AcquisitionRefusal(
                 pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED,
-                "tensorfs_refused",
+                "model_materialization_required"
+                if getattr(exc, "code", "") == "OBJECT_ABSENT"
+                else "tensorfs_refused",
                 f"{type(exc).__name__}: {exc}",
             ) from exc
 
