@@ -11,12 +11,11 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 from collections.abc import Mapping, Sequence
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -179,7 +178,7 @@ def _dependency_entrypoints(info: Path) -> dict[str, str]:
     return output
 
 
-def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) -> None:
+def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) -> tuple[str, int]:
     info = source.lstat()
     if not stat.S_ISREG(info.st_mode):
         raise EnvironmentRefusal("package_environment_dependency_member_unsupported", str(source))
@@ -188,6 +187,7 @@ def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) 
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise EnvironmentRefusal("package_environment_dependency_member_collision", str(target))
+    verified = None
     with source.open("rb") as incoming, target.open("xb") as outgoing:
         before = os.fstat(incoming.fileno())
         try:
@@ -201,7 +201,7 @@ def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) 
                 errno.ENOSYS,
             }:
                 raise
-            shutil.copyfileobj(incoming, outgoing, 1 << 20)
+            verified = _verify_dependency_stream(incoming, target, expected, outgoing=outgoing)
         outgoing.flush()
         os.fsync(outgoing.fileno())
         after = os.fstat(incoming.fileno())
@@ -222,21 +222,41 @@ def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) 
             after.st_mode,
         ):
             raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
-    _verify_dependency_hash(target, expected)
+    if verified is None:
+        # Reflink copies in the filesystem, so its target still needs a verification read.
+        verified = _verify_dependency_hash(target, expected)
     target.chmod(0o755 if info.st_mode & 0o111 else 0o644)
+    return verified
 
 
-def _verify_dependency_hash(target: Path, expected: str) -> None:
+def _verify_dependency_hash(target: Path, expected: str) -> tuple[str, int]:
+    with target.open("rb") as incoming:
+        return _verify_dependency_stream(incoming, target, expected)
+
+
+def _verify_dependency_stream(
+    incoming: BinaryIO, target: Path, expected: str, *, outgoing: BinaryIO | None = None
+) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    recorded = digest
+    encoded = ""
     if expected:
         algorithm, separator, encoded = expected.partition("=")
         if not separator or algorithm not in {"sha256", "sha384", "sha512"}:
             raise EnvironmentRefusal("package_environment_dependency_hash_unsupported", str(target))
-        digest = hashlib.new(algorithm)
-        with target.open("rb") as copied:
-            while chunk := copied.read(1 << 20):
-                digest.update(chunk)
-        if base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode() != encoded:
-            raise EnvironmentRefusal("package_environment_dependency_member_changed", str(target))
+        if algorithm != "sha256":
+            recorded = hashlib.new(algorithm)
+    length = 0
+    while chunk := incoming.read(1 << 20):
+        if outgoing is not None:
+            outgoing.write(chunk)
+        digest.update(chunk)
+        if recorded is not digest:
+            recorded.update(chunk)
+        length += len(chunk)
+    if expected and base64.urlsafe_b64encode(recorded.digest()).rstrip(b"=").decode() != encoded:
+        raise EnvironmentRefusal("package_environment_dependency_member_changed", str(target))
+    return "sha256:" + digest.hexdigest(), length
 
 
 def snapshot(
@@ -273,6 +293,7 @@ def snapshot(
     target_site = staging / source_site.relative_to(prefix)
     distributions: list[dict[str, Any]] = []
     copied: set[Path] = set()
+    verified: dict[Path, tuple[str, int]] = {}
     names: set[str] = set()
     selected_infos: list[Path] = []
     for info in sorted(source_site.glob("*.dist-info")):
@@ -347,9 +368,9 @@ def snapshot(
                     raise EnvironmentRefusal(
                         "package_environment_dependency_member_changed", str(member)
                     )
-                _verify_dependency_hash(member, digest)
+                verified[destination] = _verify_dependency_hash(member, digest)
             else:
-                _copy_dependency_file(member, destination, digest, length)
+                verified[destination] = _copy_dependency_file(member, destination, digest, length)
             copied.add(destination)
         if metadata not in {source_site / relative for relative, _, _ in rows}:
             raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(metadata))
@@ -360,7 +381,9 @@ def snapshot(
             raise EnvironmentRefusal(
                 "package_environment_dependency_snapshot_oversized", str(source_site)
             )
-    rewrite_launchers(staging, target_site, selected_infos, copied, replace=inventory_only)
+    rewrite_launchers(
+        staging, target_site, selected_infos, copied, replace=inventory_only, verified=verified
+    )
     manifest = canonical.write(
         {
             "format": "cozy.runtime.InstalledDependencySnapshot/1",
@@ -368,8 +391,8 @@ def snapshot(
             "files": [
                 {
                     "path": str(path.relative_to(staging)),
-                    "digest": _hash_file(path),
-                    "length": path.stat().st_size,
+                    "digest": verified[path][0],
+                    "length": verified[path][1],
                 }
                 for path in sorted(copied)
             ],
@@ -389,6 +412,7 @@ def rewrite_launchers(
     copied: set[Path],
     *,
     replace: bool = False,
+    verified: dict[Path, tuple[str, int]] | None = None,
 ) -> None:
     # Rewrite installed launchers without the old environment shebangs. The shell/Python
     # wrapper is relative to its own bin directory, so atomic rename cannot break it.
@@ -412,6 +436,9 @@ def rewrite_launchers(
             path.write_text(body)
             path.chmod(0o755)
             copied.add(path)
+            if verified is not None:
+                raw = body.encode()
+                verified[path] = (_sha(raw), len(raw))
         existing = {relative for relative, _, _ in rows}
         for name in entries:
             existing.add(os.path.relpath(staging / "bin" / name, target_site))
@@ -425,14 +452,19 @@ def rewrite_launchers(
                 if path == record:
                     writer.writerow((relative, "", ""))
                 else:
+                    digest, length = (
+                        verified[path]
+                        if verified is not None and path in verified
+                        else (_hash_file(path), path.stat().st_size)
+                    )
                     encoded = (
-                        base64.urlsafe_b64encode(
-                            bytes.fromhex(_hash_file(path).removeprefix("sha256:"))
-                        )
+                        base64.urlsafe_b64encode(bytes.fromhex(digest.removeprefix("sha256:")))
                         .rstrip(b"=")
                         .decode()
                     )
-                    writer.writerow((relative, "sha256=" + encoded, path.stat().st_size))
+                    writer.writerow((relative, "sha256=" + encoded, length))
+        if verified is not None:
+            verified[record] = (_hash_file(record), record.stat().st_size)
 
 
 def read_manifest(generation: Path, ref: object) -> dict[str, Any]:
