@@ -1,36 +1,13 @@
-"""What this worker is doing, published for the ONE process that outlives it.
+"""Runtime lifecycle facts for the fixed Host that supervises this worker.
 
-On a pod there are two processes: this worker, and the supervisor that exec'd it. The
-supervisor is the only one that can end the rental — the pod cannot delete itself (RunPod's
-injected key refuses it, proven live 2026-09-02) and release is an mTLS ask on the leaf the
-supervisor minted — so the supervisor has to know whether anyone is using the pod. It used
-to learn that by being in the middle of the control stream. It is not, and the coupling that
-replaces the forwarder is the same one `podmedia` already has with this worker: A FILE.
+The reporter publishes observer attachment, active attempts and required execution
+retention independently. Accepted work and uncollected results remain owned when
+no client is connected; a quiet progress meter does not relinquish that retention.
+The Host still enforces its external rental allowance and shutdown authority.
 
-Two facts and a meter, rewritten on the reporter tick:
-
-* `owner_attached` / `attempts_in_flight` — what the worker is being asked to do. A pod
-  nobody holds and nothing is running on is unused, which is the whole of th-105's rule,
-  now answered by the worker that knows it instead of by a proxy that guessed.
-* `meter` — an OPAQUE reading of whether the work those two facts claim is actually moving:
-  the working threads' and descendants' `progress_burn` (CPU plus bytes moved), the boot and
-  attempt cursors' positions, and the attempts' own states. Any CHANGE is movement. The
-  supervisor compares it for equality and interprets nothing, so this worker's internals stay
-  this worker's.
-
-The meter is what makes STALE mean IDLE without a clock. The supervisor runs `liveness.Pace`
-over it — still for longer than `STILL_FACTOR` times the longest pause THIS subject has
-itself shown, and never less than the floor below — so a slow attempt teaches its own pace
-and is left alone, and one that has stopped is not counted as use. The terms of that patience
-travel in the file rather than being restated in Go: `still_factor` and `still_floor_seconds`
-are this runtime's own constants, and the floor is `STILL_FACTOR * noise_floor()` — what
-`local.run_slice`'s readiness watch already gives a boot it is watching from outside, because
-an outside observer must be more patient than the inner machinery by the same factor the
-inner one applies to itself.
-
-A worker that never writes this file has published nothing to hold the pod with, and the
-supervisor reads absence as idle. That is deliberate: it is what bounds a boot that wedges
-before the reporter ever ticks, which nothing bounded before (th-105's open follow-up).
+The versioned file is atomically replaced in the Host's bootstrap directory. Its
+sequence identifies a fresh reporter sample. The opaque meter and timing fields
+remain available to compatible observers; they are not execution or custody state.
 """
 
 from __future__ import annotations

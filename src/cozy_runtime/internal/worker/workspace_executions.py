@@ -764,7 +764,7 @@ class Executions:
                 db.execute(
                     "SELECT 1 FROM executions WHERE owner=? AND "
                     "retention_waived=0 AND "
-                    "(state NOT IN ('succeeded','failed','canceled') OR collected=0) LIMIT 1",
+                    "(state NOT IN ('succeeded','canceled') OR collected=0) LIMIT 1",
                     (owner,),
                 ).fetchone()
                 is not None

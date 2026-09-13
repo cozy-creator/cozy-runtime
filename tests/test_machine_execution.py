@@ -148,6 +148,8 @@ def test_controls_fence_generation_and_replay_commands_without_another_attempt(
     e = Executions(Workspace(tmp_path / "store"))
     e.submit("owner", "s", b"c" * 32, offer())
     terminal = complete(e, "root", status=pb.OUTCOME_STATUS_FAILED)
+    assert e.acknowledge_collection("owner", ack(terminal)).collected
+    assert e.retention_required("owner")  # reading an error does not abandon interrupted work
     second = e.control("owner", "root", "resume-1", 1, "resume")
     assert second.attempt_ordinal == 2 and second.generation == 2
     assert e.control("owner", "root", "resume-1", 1, "resume") == second
@@ -738,6 +740,8 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
             channel = grpc.insecure_channel((root / "control.addr").read_text().strip())
             client = rpc.WorkerControlStub(channel)
             query.expected_execution_workspace_id = receipt.execution_workspace_id
+            assert client.SubmitMachineExecution(submission, timeout=5) == receipt
+            assert not worker.local_revisions and not worker.engine.jobs
             query.request_id = "second"
             assert (
                 client.CollectMachineExecution(

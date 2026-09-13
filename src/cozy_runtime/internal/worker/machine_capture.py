@@ -175,16 +175,16 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             or selected_entry.get("development", {}).get("local_revision_digest") != root
         ):
             raise WorkspaceRefusal("execution inference does not name the captured root")
+    return canonical.write({"revisions": prepared, "state": state_identity(state)})
+
+
+def state_identity(state: pb.DesiredWorkerState) -> str:
+    """Strip observer/revision stamps, retaining every admitted placement/resource field."""
     copied = pb.DesiredWorkerState()
     copied.CopyFrom(state)
     for name in ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "revision"):
         copied.ClearField(name)
-    return canonical.write(
-        {
-            "revisions": prepared,
-            "state": base64.b64encode(copied.SerializeToString(deterministic=True)).decode(),
-        }
-    )
+    return base64.b64encode(copied.SerializeToString(deterministic=True)).decode()
 
 
 def restore(worker: Worker, preparation: dict[str, Any]) -> pb.DesiredWorkerState:

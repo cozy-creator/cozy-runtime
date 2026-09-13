@@ -85,17 +85,36 @@ class MachineExecutionRPC:
             if len(inputs) != 1:
                 raise WorkspaceRefusal("execution payload has no unique input grant")
             inputs[0].url = "data:application/json;base64," + base64.b64encode(payload).decode()
-            preparation = machine_capture.verify(self.worker, request)
-            receipt = self.worker.submit_execution(
-                request.claim,
-                request.submission_id,
-                request.capture_digest,
-                offered,
-                max_attempts=request.max_attempts or 1,
-                retry_delay_ms=request.retry_delay_ms,
-                capture_document=request.capture_canonical_bytes,
-                preparation=preparation,
-            )
+            executions = self.worker.executions
+            owner = self.worker.authorize_workspace(request.claim)
+            if executions.owns(owner, offered.request_id):
+                # Reconcile lost acceptance replies from the durable record itself,
+                # even after the worker's in-memory prepared registry disappeared.
+                prepared = executions.preparation(owner, offered.request_id)
+                if prepared.get("state") != machine_capture.state_identity(request.prepared_state):
+                    raise WorkspaceRefusal("execution submission changed its prepared state")
+                receipt = executions.submit(
+                    owner,
+                    request.submission_id,
+                    request.capture_digest,
+                    offered,
+                    max_attempts=request.max_attempts or 1,
+                    retry_delay_ms=request.retry_delay_ms,
+                    capture_document=request.capture_canonical_bytes,
+                    preparation=canonical.write(prepared),
+                )
+            else:
+                preparation = machine_capture.verify(self.worker, request)
+                receipt = self.worker.submit_execution(
+                    request.claim,
+                    request.submission_id,
+                    request.capture_digest,
+                    offered,
+                    max_attempts=request.max_attempts or 1,
+                    retry_delay_ms=request.retry_delay_ms,
+                    capture_document=request.capture_canonical_bytes,
+                    preparation=preparation,
+                )
             assert self.worker.executions is not None
             return pb.MachineExecutionReceipt(
                 **dataclasses.asdict(receipt),
