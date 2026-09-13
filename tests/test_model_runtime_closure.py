@@ -18,12 +18,15 @@ from cozy_runtime.author import Artifact, CapabilityError, Config, Loader
 from cozy_runtime.author._loader import loading
 from cozy_runtime.internal import base_observation, canonical, fill, package_interface
 from cozy_runtime.internal.encoding import SPEC_PLAIN, launch_providers
+from cozy_runtime.internal.worker import grants
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal, HeldManifests
+from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRefusal
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     _compatibility_models,
     _selected_models,
 )
+from cozy_runtime.protocol import worker_pb2 as pb
 
 # Canonical CozyTensors header produced by TensorFS itself. It contains one inline JCS config, one
 # inline f32 tensor, and one six-byte tokenizer asset. Keeping the bytes fixed makes this a border
@@ -132,7 +135,7 @@ def test_model_prep_still_requires_header_assets(tmp_path: Path) -> None:
     with pytest.raises(AcquisitionRefusal) as refused:
         _acquirer(tmp_path, store_root)._models(placement)
 
-    assert refused.value.code == "tensorfs_refused"
+    assert refused.value.code == "model_materialization_required"
     assert hashlib.sha256(_ASSET).hexdigest() in refused.value.detail
 
 
@@ -380,3 +383,66 @@ def test_checkpoint_selection_refuses_corrupt_header(tmp_path: Path) -> None:
         _compatibility_models([selection], tensorfs_root=root)
     with pytest.raises(PreparationRefusal):
         _selected_models("example/package", [selection], root, lambda *_args: None)
+
+
+def test_evicted_preparation_rechecks_native_bytes(tmp_path: Path) -> None:
+    root, manifest, length, _native = _snapshot(tmp_path, include_asset=True)
+    placement = SimpleNamespace(models=({"manifest": {"digest": manifest, "length": length}},))
+    acquirer = _acquirer(tmp_path, root)
+    assert acquirer._models(placement) == 3
+    # These are unowned cached bytes. An earlier preparation is not a root.
+    assert tensorfs.gc(str(root))["reclaimed_bytes"] > 0
+    with pytest.raises(AcquisitionRefusal) as missing:
+        acquirer._models(placement)
+    assert missing.value.code == "model_materialization_required"
+    assert missing.value.kind == pb.FAULT_KIND_ARTIFACT_FETCH_FAILED
+
+
+def test_job_input_lease_owns_bytes_before_acceptance(tmp_path: Path) -> None:
+    root, manifest, length, native = _snapshot(tmp_path, include_asset=False)
+    entry = grants.BoundInput(
+        "model.source", "", bytes.fromhex(manifest[7:]), length, grants.MODEL_MIME, 0
+    )
+    grant = grants.BoundGrant(inputs={"model:source": entry})
+    attempt: Any = SimpleNamespace(grant=grant, model_leases=[], job_models={})
+    engine: Any = SimpleNamespace(
+        tensorfs_root=root, _job_model_declarations=lambda *args: {"source": "Model"}
+    )
+    binding: Any = None
+    with pytest.raises(AttemptRefusal) as missing:
+        AttemptEngine._hold_job_models(engine, attempt, binding, "descriptor")
+    assert missing.value.code == "model_materialization_required"
+    assert missing.value.cause == pb.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE
+    assert attempt.model_leases == []
+    # The same already-bound input succeeds after only the missing asset arrives.
+    asset = tmp_path / "late-asset"
+    asset.write_bytes(_ASSET)
+    native.put_file(str(asset), "sha256:" + hashlib.sha256(_ASSET).hexdigest(), len(_ASSET))
+    AttemptEngine._hold_job_models(engine, attempt, binding, "descriptor")
+    assert len(attempt.model_leases) == 1
+    try:
+        with pytest.raises(Exception) as busy:
+            tensorfs.gc(str(root))
+        assert getattr(busy.value, "code", "") == "STORE_BUSY"
+    finally:
+        AttemptEngine._release_job_models(engine, attempt)
+    assert tensorfs.gc(str(root))["reclaimed_bytes"] > 0
+
+
+def test_job_model_identity_mismatch_is_not_a_cache_miss(tmp_path: Path) -> None:
+    root, manifest, length, _native = _snapshot(tmp_path, include_asset=True)
+    entry = grants.BoundInput(
+        "model:source", "", bytes.fromhex(manifest[7:]), length + 1, grants.MODEL_MIME, 0
+    )
+    attempt: Any = SimpleNamespace(
+        grant=grants.BoundGrant(inputs={"model:source": entry}), model_leases=[], job_models={}
+    )
+    engine: Any = SimpleNamespace(
+        tensorfs_root=root, _job_model_declarations=lambda *args: {"source": "Model"}
+    )
+    binding: Any = None
+    with pytest.raises(AttemptRefusal) as invalid:
+        AttemptEngine._hold_job_models(engine, attempt, binding, "descriptor")
+    assert invalid.value.code == "job_model_manifest_unavailable"
+    assert invalid.value.cause == pb.CAUSE_CODE_LOCAL_SAFETY
+    assert attempt.model_leases == []

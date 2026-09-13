@@ -970,6 +970,15 @@ class AttemptEngine:
         except Exception as exc:
             for lease in leases.values():
                 lease.release()
+            if getattr(exc, "code", "") == "OBJECT_ABSENT":
+                # No accepted/executed record exists yet. Use the existing bounded
+                # pre-execution requeue path so the owner re-enters TensorFS ensure;
+                # every later attempt reacquires its own native read leases.
+                raise AttemptRefusal(
+                    "model_materialization_required",
+                    "a selected job model needs TensorFS materialization before admission",
+                    cause=CAUSE.CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE,
+                ) from exc
             raise AttemptRefusal(
                 "job_model_manifest_unavailable",
                 "a selected job Model Manifest is absent, stale, or invalid "

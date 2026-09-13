@@ -35,7 +35,7 @@ def placement(digest: str) -> SimpleNamespace:
     return SimpleNamespace(document={"models": [{"manifest": {"digest": digest}}]})
 
 
-def test_collection_protects_all_existing_placement_owners(
+def test_collection_protects_active_intent_without_treating_prepared_metadata_as_custody(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     w = worker(tmp_path)
@@ -61,9 +61,7 @@ def test_collection_protects_all_existing_placement_owners(
                     "current",
                     "hosted",
                     "incoming",
-                    "operation",
                     "pending",
-                    "revision",
                 ]
             },
         )
