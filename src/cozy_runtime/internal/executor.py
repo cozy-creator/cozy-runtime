@@ -2959,7 +2959,9 @@ class Executor:
             bindings[(interface, module, export)] = binding
         return _Broker(str(command["request_id"]), bindings, self._durable)
 
-    def _durable(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
+    def _durable(
+        self, kind: str, body: dict[str, Any], *, descriptor: bool = False
+    ) -> dict[str, Any]:
         """One DURABLE mid-attempt exchange. Blocks until the worker answers.
 
         This is the seam's other half of `child.Executor.call(on_request=…)`. It is a
@@ -2974,6 +2976,13 @@ class Executor:
             if frame is None:
                 raise SeamError("seam_closed", f"the worker closed during {kind!r}")
             if frame.get("event") == "answer" and int(frame.get("seq", -1)) == seq:
+                if frame.get("descriptor") is True:
+                    if not descriptor:
+                        self.channel.close()
+                        raise SeamError("seam_descriptor", "unexpected capability in control reply")
+                    frame["descriptor"] = self.channel.recv_descriptor()
+                elif descriptor and frame.get("ok") is True:
+                    raise SeamError("seam_descriptor", "successful reply omitted its capability")
                 return frame
             raise SeamError(
                 "seam_out_of_order",
