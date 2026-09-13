@@ -325,6 +325,17 @@ class Executions:
                 )
             )
 
+    def active(self, owner: str) -> bool:
+        with self.workspace.locked() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM executions WHERE owner=? "
+                    "AND state IN ('queued','running','pausing','canceling') LIMIT 1",
+                    (owner,),
+                ).fetchone()
+                is not None
+            )
+
     def preparation(self, owner: str, request: str) -> dict[str, Any]:
         with self.workspace.locked() as db:
             raw = self._row(db, owner, request)["preparation"]

@@ -122,7 +122,13 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         caller, callee = binding["caller_revision_digest"], binding["callee_revision_digest"]
         target = (binding["interface_digest"], binding["module"], binding["export"])
         keys.append((caller, *target))
-        if caller not in revisions or callee not in revisions or target not in exports[caller]:
+        if caller not in revisions or callee not in revisions:
+            raise WorkspaceRefusal("execution callable names an uncaptured revision")
+        is_self = (
+            caller == callee
+            and binding["interface_digest"] == revisions[caller]["package_interface"]["digest"]
+        )
+        if target not in exports[caller] and not is_self:
             raise WorkspaceRefusal("execution callable is outside the prepared caller inventory")
         if binding["interface_digest"] != revisions[callee]["package_interface"]["digest"]:
             raise WorkspaceRefusal("execution callable names a different callee interface")
@@ -137,7 +143,8 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         invocable = entry.get("invocable", {}) if entry else {}
         if (invocable.get("module"), invocable.get("export")) != target[1:]:
             raise WorkspaceRefusal("execution callable does not identify the prepared callee")
-        bound[caller].add(target)
+        if target in exports[caller]:
+            bound[caller].add(target)
     if len(keys) > 4096 or keys != sorted(set(keys)) or bound != exports:
         raise WorkspaceRefusal("execution callable inventory is incomplete or ambiguous")
     spec = documents.read(request.offer.invocation_spec_canonical_bytes, pb.InvocationSpec)

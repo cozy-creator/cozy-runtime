@@ -2366,16 +2366,30 @@ class Worker:
         )
         if managed and self.executions is not None:
             self.executions.observe(self.fence.record_owner_id, frame)
-        detached_execution = (
-            not self.connected.is_set()
-            and self.executions is not None
-            and bool(getattr(inner, "request_id", ""))
-            and self.executions.owns(self.fence.record_owner_id, inner.request_id)
+        subject_id = getattr(inner, "request_id", "") or getattr(inner, "parent_request_id", "")
+        machine_message = (
+            self.executions is not None
+            and bool(subject_id)
+            and self.executions.owns(self.fence.record_owner_id, subject_id)
         )
+        if machine_message and frame.HasField("child_call_request"):
+            request = frame.child_call_request
+            self.calls.absorb(
+                pb.ChildCallResult(
+                    parent_request_id=request.parent_request_id,
+                    parent_attempt_ordinal=request.parent_attempt_ordinal,
+                    parent_invocation_spec_digest=request.parent_invocation_spec_digest,
+                    call_index=request.call_index,
+                    intent_digest=request.intent_digest,
+                    state=pb.CHILD_CALL_STATE_REFUSED,
+                    safe_code="machine_children_unavailable",
+                    safe_detail="This Runtime does not yet support child operations for scripts.",
+                )
+            )
         with self.claim_lock:
             if frame.WhichOneof("msg") != "weights_transaction":
                 self.stamp(inner)
-            if not detached_execution:
+            if not machine_message:
                 self.outbound.put(frame)
         if managed and frame.HasField("attempt_outcome"):
             terminal = frame.attempt_outcome
@@ -3237,6 +3251,18 @@ class Worker:
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
             return
         if kind == "desired_state":
+            if self.executions is not None and self.executions.active(self.fence.record_owner_id):
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FAULT_KIND_CONFIG_REFUSED,
+                        subject=f"revision {inner.revision}",
+                        reason="machine_execution_owns_worker",
+                        detail="Accepted execution controls its prepared state; "
+                        "submit through the execution API.",
+                    )
+                )
+                self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+                return
             try:
                 self._apply_desired_state(inner)
             except ExecutorGone as exc:
@@ -3254,7 +3280,7 @@ class Worker:
             self.note("fence", f"dropped a {kind} before SnapshotAck: dispatch is closed")
             return
         if (
-            kind in ("attempt_offer", "cancel_attempt")
+            kind in ("attempt_offer", "cancel_attempt", "outcome_ack", "weights_finalize_request")
             and self.executions is not None
             and self.executions.owns(self.fence.record_owner_id, inner.request_id)
         ):

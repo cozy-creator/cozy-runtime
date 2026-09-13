@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 import hashlib
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -522,12 +525,31 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
     from cozy_runtime.internal.worker.session import Worker, WorkerOptions
     from cozy_runtime.protocol import WIRE_MINOR
     from cozy_runtime.protocol import worker_pb2_grpc as rpc
+    from test_end_to_end import _run, _wheel_rows
     from test_job_preparation_isolation import measure, package
 
     with tempfile.TemporaryDirectory(prefix="cz-machine.") as raw:
         root = Path(raw)
         environment, preparation = package(root, "offline")
         _, second_preparation = package(root, "different")
+        project = root / "project_offline"
+        source = project / "prepare_offline.py"
+        source.write_text(
+            source.read_text()
+            + """
+from cozy_runtime.author import invocable
+@invocable(memoize=True)
+async def helper(ctx: Context, *, n: int) -> Result:
+    return Result(n)
+app.job(helper)
+"""
+        )
+        uv = shutil.which("uv")
+        assert uv is not None
+        wheels = environment / ".stage/offline/wheels"
+        _run(uv, "build", "--wheel", "--out-dir", str(wheels), str(project))
+        preparation.ClearField("wheels")
+        preparation.wheels.extend(_wheel_rows(list(wheels.glob("*.whl"))))
         (root / "artifacts").mkdir()
         worker = Worker(
             RuntimeConfig(
@@ -583,6 +605,18 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
                     pb.MachineExecutionCapture(
                         root_revision_digest=current_preparation.package.local_revision_digest,
                         revisions=[revision],
+                        bindings=[
+                            pb.MachineCallableBinding(
+                                caller_revision_digest=current_preparation.package.local_revision_digest,
+                                interface_digest=revision.package_interface.digest,
+                                module="prepare_offline",
+                                export="helper",
+                                callee_revision_digest=current_preparation.package.local_revision_digest,
+                                entrypoint="helper",
+                            )
+                        ]
+                        if current_preparation.operation_id == "offline"
+                        else [],
                     )
                 )
                 captures[current_preparation.operation_id] = (capture, capture_digest)
@@ -628,6 +662,39 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
             worker._apply_desired_state(generator._desired_state())
             while not worker.job_ready:
                 assert time.monotonic() < until, worker.latched
+                time.sleep(0.02)
+            incoming: queue.Queue[pb.RecordOwnerFrame | None] = queue.Queue()
+            observed: list[pb.WorkerFrame] = []
+
+            def frames() -> Iterator[pb.RecordOwnerFrame]:
+                yield pb.RecordOwnerFrame(claim=claim)
+                while (frame := incoming.get()) is not None:
+                    yield frame
+
+            control = client.Control(frames(), timeout=30)
+            admitted = next(control).claim_ack
+            assert admitted.accepted
+            snapshot = next(control).snapshot
+            incoming.put(
+                pb.RecordOwnerFrame(
+                    snapshot_ack=pb.SnapshotAck(
+                        record_owner_epoch=admitted.record_owner_epoch,
+                        control_stream_epoch=admitted.control_stream_epoch,
+                        worker_boot_id=admitted.worker_boot_id,
+                        snapshot_id=snapshot.snapshot_id,
+                        snapshot_digest=snapshot.snapshot_digest,
+                    )
+                )
+            )
+
+            def watch_control() -> None:
+                with contextlib.suppress(grpc.RpcError):
+                    observed.extend(control)
+
+            observer = threading.Thread(target=watch_control, daemon=True)
+            observer.start()
+            while not worker.connected.is_set():
+                assert time.monotonic() < until
                 time.sleep(0.02)
             for identifier in ("first", "second", "canceled", "paused"):
                 selected = second_binding if identifier == "second" else binding
@@ -675,6 +742,34 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
                 assert time.monotonic() < until
                 time.sleep(0.02)
             assert worker.execution_status(claim, "second").state == "queued"
+            incoming.put(
+                pb.RecordOwnerFrame(
+                    desired_state=pb.DesiredWorkerState(
+                        record_owner_epoch=admitted.record_owner_epoch,
+                        control_stream_epoch=admitted.control_stream_epoch,
+                        worker_boot_id=admitted.worker_boot_id,
+                        revision=999,
+                        wire_minor=WIRE_MINOR,
+                        posture=pb.POSTURE_ACCEPTING,
+                    )
+                )
+            )
+            while not any(
+                fault.reason == "machine_execution_owns_worker" for fault in worker.engine.faults
+            ):
+                assert time.monotonic() < until
+                time.sleep(0.02)
+            assert worker.accepted.accepted_desired_state_revision == 1
+            assert not any(
+                frame.HasField("attempt_accepted") or frame.HasField("attempt_outcome")
+                for frame in observed
+            )
+            incoming.put(None)
+            control.cancel()
+            observer.join(5)
+            while worker.connected.is_set():
+                assert time.monotonic() < until
+                time.sleep(0.02)
             worker.control_execution(claim, "canceled", "cancel", 1, "cancel")
             assert worker.execution_status(claim, "canceled").state == "canceled"
             worker.control_execution(claim, "paused", "pause", 1, "pause")
