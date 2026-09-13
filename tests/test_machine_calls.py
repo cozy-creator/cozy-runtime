@@ -178,3 +178,33 @@ def test_accepted_publication_authority_is_immutable_and_survives_reopen(tmp_pat
             )
     with pytest.raises(WorkspaceRefusal, match="not held"):
         reopened.publication_authorization("another-owner", "parent")
+
+
+def test_descendant_cannot_borrow_or_broaden_another_publication_grant(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    grant = "019aaaab-0000-7000-8000-000000000003"
+    other_grant = "019aaaab-0000-7000-8000-000000000004"
+    executions.submit(
+        "owner", "root", b"c" * 32, offer("parent"), publication_authorization_id=grant
+    )
+    calls = Calls(workspace)
+    child = calls.accept("owner", request(running(executions))).child_request
+    executions.submit("owner", child, b"d" * 32, offer(child))
+    assert executions.publication_authorization("owner", child) == grant
+    executions.submit(
+        "owner", "other", b"e" * 32, offer("other"), publication_authorization_id=other_grant
+    )
+    assert executions.publication_authorization("owner", child) != other_grant
+
+
+def test_refusal_cannot_overwrite_an_accepted_child_or_uncertain_send(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    calls = Calls(workspace)
+    call = calls.accept("owner", request(running(executions)))
+    calls.before_write("owner", call)
+    with pytest.raises(WorkspaceRefusal, match="accepted work"):
+        calls.refuse("owner", call, "test.refusal", "rejected")
+    assert calls.get("owner", "parent", 0).sent

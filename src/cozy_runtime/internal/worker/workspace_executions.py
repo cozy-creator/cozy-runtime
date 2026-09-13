@@ -325,7 +325,23 @@ class Executions:
 
     def publication_authorization(self, owner: str, request: str) -> str:
         with self.workspace.locked() as db:
-            return str(self._row(db, owner, request)["publication_authorization_id"])
+            seen: set[str] = set()
+            claimed: set[str] = set()
+            while request not in seen and len(seen) <= 32:
+                seen.add(request)
+                grant = str(self._row(db, owner, request)["publication_authorization_id"])
+                if grant:
+                    claimed.add(grant)
+                parent = db.execute(
+                    "SELECT parent_request FROM execution_calls WHERE owner=? AND child_request=?",
+                    (owner, request),
+                ).fetchone()
+                if parent is None:
+                    if claimed and claimed != {grant}:
+                        raise WorkspaceRefusal("child publication authority differs from its root")
+                    return grant
+                request = parent[0]
+        raise WorkspaceRefusal("publication authority has no bounded root ancestry")
 
     def owns(self, owner: str, request: str) -> bool:
         with self.workspace.locked() as db:

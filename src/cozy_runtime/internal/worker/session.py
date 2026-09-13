@@ -1249,8 +1249,14 @@ class Worker:
             local=self._machine_call,
         )
         from .machine_calls import Calls as MachineCalls
+        from .machine_effects import Effects
 
         self.machine_calls = MachineCalls(self) if self.workspace is not None else None
+        self.machine_effects = (
+            Effects(self.workspace, self.executions, options.publication_tls)
+            if self.workspace is not None and self.executions is not None
+            else None
+        )
         self.engine.calls = self.calls
         from cozy_runtime.internal.worker.source_calls import SourceCalls
 
@@ -2154,6 +2160,8 @@ class Worker:
             return
         with self.control_lock:
             owner = self.fence.record_owner_id
+            if self.machine_effects is not None:
+                self.machine_effects.drive(owner)
             if self.machine_calls is not None:
                 self.machine_calls.drive()
             self.executions.retry_due(owner, worker_boot=self.fence.worker_boot_id)
@@ -3535,6 +3543,8 @@ class Worker:
 
     def shutdown_from_stream(self) -> None:
         self.request_stop()
+        if self.machine_effects is not None:
+            self.machine_effects.close()
         self.weights.close()
         self.watches.end_all()
         self.host.stop()

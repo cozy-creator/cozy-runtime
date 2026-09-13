@@ -199,6 +199,57 @@ class Calls:
         with self.workspace.locked() as db:
             return self._call(self._row(db, owner, parent, index))
 
+    def check_active(self, owner: str, call: Call) -> None:
+        with self.workspace.locked() as db:
+            row = self._row(db, owner, call.parent_request, call.call_index)
+            self._parent(
+                db, owner, call.parent_request, call.parent_ordinal, call.parent_generation
+            )
+            if row["intent_digest"] != call.intent_digest or row["result"] or row["safe_code"]:
+                raise WorkspaceRefusal("call cannot act after settlement")
+
+    def refuse(self, owner: str, call: Call, code: str, detail: str) -> None:
+        """Settle admission failure only before a child or external write is accepted."""
+        if not 0 < len(code.encode()) <= 128 or len(detail.encode()) > 1024:
+            raise WorkspaceRefusal("call refusal exceeds its bound")
+        with self.workspace.locked() as db, transaction(db):
+            row = self._row(db, owner, call.parent_request, call.call_index)
+            if (
+                row["intent_digest"] != call.intent_digest
+                or row["sent"]
+                or row["result"]
+                or (row["safe_code"] and (row["safe_code"], row["safe_detail"]) != (code, detail))
+                or db.execute(
+                    "SELECT 1 FROM executions WHERE owner=? AND request=?",
+                    (owner, call.child_request),
+                ).fetchone()
+            ):
+                raise WorkspaceRefusal("accepted work cannot be replaced by an admission refusal")
+            db.execute(
+                "UPDATE execution_calls SET safe_code=?,safe_detail=? "
+                "WHERE owner=? AND parent_request=? AND call_index=?",
+                (code, detail, owner, call.parent_request, call.call_index),
+            )
+
+    def pending_effects(self, owner: str, *, limit: int = 32) -> list[Call]:
+        from cozy_runtime.internal.effect_interfaces import MODULE
+
+        if not 1 <= limit <= 32:
+            raise WorkspaceRefusal("effect page exceeds its bound")
+        with self.workspace.locked() as db:
+            return [
+                self._call(row)
+                for row in db.execute(
+                    "SELECT c.* FROM execution_calls c JOIN executions e "
+                    "ON e.owner=c.owner AND e.request=c.parent_request "
+                    "WHERE c.owner=? AND c.result=x'' AND c.safe_code='' "
+                    "AND json_extract(CAST(c.intent AS TEXT),'$.module')=? "
+                    "AND (c.sent=1 OR (e.state='running' AND e.desired='run')) "
+                    "ORDER BY c.created_ms,c.child_request LIMIT ?",
+                    (owner, MODULE, limit),
+                )
+            ]
+
     def freeze(self, owner: str, call: Call, prepared: bytes) -> Call:
         """Bind read-dependent metadata before a write, once for this exact call.
 
