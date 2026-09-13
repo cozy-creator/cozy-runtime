@@ -755,15 +755,15 @@ class PlanChooser:
         # bytes the tenant already holds, and everything where a rung would have to ACQUIRE
         # bytes: declining to move gigabytes on a guess is conservative, while spending
         # residency that is already paid for on the same guess is not.
-        enforceable_headroom = 0 if activations.provenance == "bound" else activations.value
+        planning_headroom = 0 if activations.provenance == "bound" else activations.value
         measured_scopes = self.ledger.activation_scopes_for(cell)
-        scope_headrooms = {
-            method: measured_scopes.get(method, enforceable_headroom)
+        planning_scope_headrooms = {
+            method: measured_scopes.get(method, planning_headroom)
             for method in self.ledger.declared_scopes
         }
         scope_demands = {
             method: sum(sizes.get(name, 0) for name in dict.fromkeys(names))
-            + scope_headrooms[method]
+            + planning_scope_headrooms[method]
             for method, names in self.ledger.declared_scopes.items()
         }
         # THE SHALLOW RUNG'S HEADROOM, and the two direct observations that may overrule
@@ -774,7 +774,7 @@ class PlanChooser:
         #   * a SUFFICIENCY — this cell already COMPLETED, with its resident set standing
         #     still, on a card with no more room than this one. That is the outcome the
         #     rung is trying to predict, already observed, so it outranks an envelope.
-        resident_headroom = enforceable_headroom if absent_bytes == 0 else activations.value
+        resident_headroom = planning_headroom if absent_bytes == 0 else activations.value
         headroom_basis = activations.provenance if resident_headroom else "already_resident"
         sufficiency = self.ledger.resident_sufficiency(cell)
         if absent_bytes == 0 and sufficiency and free >= 0 and sufficiency <= free:
@@ -829,7 +829,7 @@ class PlanChooser:
                 capacity = allocatable
                 denied = shortfall
             else:
-                headroom = max(scope_demands.values(), default=enforceable_headroom + largest)
+                headroom = max(scope_demands.values(), default=planning_headroom + largest)
                 capacity = allocatable + sum(resident.values())
             fits = (allocatable < 0 or capacity >= headroom) and not denied
             row = {
@@ -851,6 +851,14 @@ class PlanChooser:
                 chosen = placement
                 row["verdict"] = "chosen"
 
+        # Estimates can select a conservative strategy without becoming a required
+        # allocation. In particular, the uncalibrated 1 GiB reserve must not refuse
+        # a small staged model. Actual component/block checks still run in the executor.
+        admitted_headroom = activations.value if activations.enforceable else 0
+        scope_headrooms = {
+            method: measured_scopes.get(method, admitted_headroom)
+            for method in self.ledger.declared_scopes
+        }
         walk = {
             "coefficients": [c.document() for c in terms.values()],
             "allocatable_bytes": allocatable,
@@ -868,7 +876,7 @@ class PlanChooser:
             # with. They are the same number whenever the envelope may be enforced, and
             # they part company exactly when it may not — which is the fact a reader needs
             # in front of them rather than one they have to reconstruct.
-            "enforceable_headroom_bytes": enforceable_headroom,
+            "enforceable_headroom_bytes": admitted_headroom,
             "resident_headroom_bytes": resident_headroom,
             "headroom_basis": headroom_basis,
             "device_free_bytes": free,
