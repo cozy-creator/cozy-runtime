@@ -226,7 +226,13 @@ def test_native_commit_before_journal_result_replays_original_adoption(tmp_path:
 def test_schema_two_migrates_conservatively_and_future_schema_refuses(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     with workspace.locked() as db:
-        for table in ("execution_calls", "execution_commands", "execution_events", "executions"):
+        for table in (
+            "execution_model_holds",
+            "execution_calls",
+            "execution_commands",
+            "execution_events",
+            "executions",
+        ):
             db.execute("DROP TABLE " + table)
         db.execute("ALTER TABLE workspace_state DROP COLUMN execution_workspace_id")
         db.execute("DROP TABLE byte_outputs")
@@ -238,7 +244,7 @@ def test_schema_two_migrates_conservatively_and_future_schema_refuses(tmp_path: 
             db.execute(f"ALTER TABLE weights DROP COLUMN {column}")
         db.execute("PRAGMA user_version=2")
     with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
         assert "memoize" in {row[1] for row in db.execute("PRAGMA table_info(attempts)")}
     with sqlite3.connect(workspace.directory / "journal.sqlite3") as db:
         db.execute("PRAGMA user_version=99")
