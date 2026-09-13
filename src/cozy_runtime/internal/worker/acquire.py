@@ -647,6 +647,7 @@ class Acquirer:
                     f"{name}: duplicate or malformed interface model slot",
                 )
             members: list[ModelBinding] = []
+            staged_weights: list[int] = []
             tensorfs = fill.tensorfs_module()
             store = fill.open_store(tensorfs, self.tensorfs_root)
             for slot in slots:
@@ -674,6 +675,14 @@ class Acquirer:
                 try:
                     model_weight_bytes = sum(
                         int(row["length"]) for row in store.walk_cozytensors(reference_manifest)
+                    )
+                    staged_weights.append(
+                        _model_group_weight_bytes(
+                            self.tensorfs_root,
+                            snapshots,
+                            declared.get("component_use", {}),
+                            model_weight_bytes,
+                        )
                     )
                 except Exception as exc:
                     raise AcquisitionRefusal(
@@ -726,6 +735,7 @@ class Acquirer:
                 components=first.components,
                 snapshots=first.snapshots,
                 model_weight_bytes=sum(member.model_weight_bytes for member in model_set),
+                staged_weight_bytes=sum(staged_weights),
                 package=(
                     f"{development['package']}@{development['release']}"
                     if development
@@ -779,6 +789,39 @@ class Acquirer:
         temporary.chmod(0o444)
         temporary.replace(target)
         return target
+
+
+def _model_group_weight_bytes(
+    root: Path, snapshots: Mapping[str, str], scopes: Mapping[str, list[str]], artifact_bytes: int
+) -> int:
+    """Price complete staging declarations; otherwise retain full artifact accounting."""
+    covered = {name for names in scopes.values() for name in names}
+    if not scopes or covered != set(snapshots):
+        return artifact_bytes
+    checkpoints = {
+        snapshot: fill.Checkpoint(root, snapshot) for snapshot in set(snapshots.values())
+    }
+    checkpoint_sizes = {}
+    for snapshot, checkpoint in checkpoints.items():
+        sizes = {}
+        for component in checkpoint.header["components"]:
+            rows = checkpoint.rows(component)
+            # Fill adds scratch/derived buffers to this header bound later.
+            sizes[component] = max(
+                sum(row.nbytes for row in rows), sum(row.stored_nbytes for row in rows)
+            )
+        checkpoint_sizes[snapshot] = sizes
+    full = max(artifact_bytes, sum(sum(sizes.values()) for sizes in checkpoint_sizes.values()))
+    if any(
+        component not in checkpoint_sizes[snapshot] for component, snapshot in snapshots.items()
+    ):
+        # The derive's constructed components need not be in the checkpoint.
+        # Only model-code-fit judges that mismatch; it cannot justify cheap staging.
+        return full
+    components = {name: checkpoint_sizes[snapshot][name] for name, snapshot in snapshots.items()}
+    return max(
+        (sum(components[name] for name in set(names)) for names in scopes.values()), default=full
+    )
 
 
 def _verify_file(path: Path, digest: str, length: int | None) -> bytes:
