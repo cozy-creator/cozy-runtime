@@ -1,8 +1,8 @@
 # Local dependency snapshot scope
 
 Owner: `/root/dependency_snapshot_fix`  
-Branch: `fix/dependency-snapshot-closure-20260913`  
-Base: `76dcf0bc44fd1c159c04e7af674c3cbb2d398a35`
+Branch: `fix/builtin-dependency-snapshot-scope-20260913`  
+Base: `ec69d727a860bde3949896cc4cccee062f03c506`
 
 Unpublished package preparation currently copies every distribution installed in
 its dependency interpreter. The fixed Runtime operations carrier therefore copies
@@ -25,6 +25,7 @@ immutable dependency generation rather than a symlink into a mutable SDK.
 
 ## Delivered closure selection
 
+For the fixed Runtime operations carrier,
 `_installed_dependencies.required_distributions` traverses the exact installed
 `Requires-Dist` metadata. It does not resolve or download packages. Captured wheels
 take precedence, dependency extras propagate across cycles, false platform markers
@@ -34,7 +35,16 @@ The fixed offline operations capture retains its existing exception for absent
 NumPy; owned operation preparation installs it later. After installation, the
 copied dependency graph and files are verified again before publication.
 
-The installed-dependency and carrier tests pass (22 cases). The real core-only SDK
+Authored local-package preparation retains its existing full installed snapshot.
+Creator can choose a root CUDA extra via `uv sync --extra`, but the current
+`PrepareLocalPackage` message does not carry that selected extra. Installed wheel
+metadata cannot recover which optional root extras were selected. The fixed
+carrier has no root extras, so closure pruning is safe there; applying it to an
+arbitrary authored package would silently omit selected optional dependencies.
+The follow-up regression captures a real authored wheel with an installed root
+extra, changes the original extra's code, and executes the retained capture.
+
+The initial installed-dependency and carrier tests pass (22 cases). The real core-only SDK
 test also passes: capture works offline, unrelated missing bytes are never touched,
 changing source Runtime code cannot affect the retained capture, and later operation
 preparation installs NumPy using the original retained Runtime code.
@@ -71,3 +81,6 @@ treating same version strings as proof of same bytes, would break capture isolat
 The existing package environment/content identities should own that reuse; a new
 preparation database is unnecessary. Repeated file hashing inside snapshot creation
 is a separate measurable optimization, not part of the closure-selection fix.
+Before pruning authored packages, pass the already selected root-extra/lock closure
+through local preparation; do not rediscover selection from whatever happens to be
+installed or add another version resolver.
