@@ -11,12 +11,11 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 from collections.abc import Mapping, Sequence
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -188,6 +187,7 @@ def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) 
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise EnvironmentRefusal("package_environment_dependency_member_collision", str(target))
+    verified = None
     with source.open("rb") as incoming, target.open("xb") as outgoing:
         before = os.fstat(incoming.fileno())
         try:
@@ -201,7 +201,7 @@ def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) 
                 errno.ENOSYS,
             }:
                 raise
-            shutil.copyfileobj(incoming, outgoing, 1 << 20)
+            verified = _verify_dependency_stream(incoming, target, expected, outgoing=outgoing)
         outgoing.flush()
         os.fsync(outgoing.fileno())
         after = os.fstat(incoming.fileno())
@@ -222,12 +222,21 @@ def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) 
             after.st_mode,
         ):
             raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
-    verified = _verify_dependency_hash(target, expected)
+    if verified is None:
+        # Reflink copies in the filesystem, so its target still needs a verification read.
+        verified = _verify_dependency_hash(target, expected)
     target.chmod(0o755 if info.st_mode & 0o111 else 0o644)
     return verified
 
 
 def _verify_dependency_hash(target: Path, expected: str) -> tuple[str, int]:
+    with target.open("rb") as incoming:
+        return _verify_dependency_stream(incoming, target, expected)
+
+
+def _verify_dependency_stream(
+    incoming: BinaryIO, target: Path, expected: str, *, outgoing: BinaryIO | None = None
+) -> tuple[str, int]:
     digest = hashlib.sha256()
     recorded = digest
     encoded = ""
@@ -238,12 +247,13 @@ def _verify_dependency_hash(target: Path, expected: str) -> tuple[str, int]:
         if algorithm != "sha256":
             recorded = hashlib.new(algorithm)
     length = 0
-    with target.open("rb") as copied:
-        while chunk := copied.read(1 << 20):
-            digest.update(chunk)
-            if recorded is not digest:
-                recorded.update(chunk)
-            length += len(chunk)
+    while chunk := incoming.read(1 << 20):
+        if outgoing is not None:
+            outgoing.write(chunk)
+        digest.update(chunk)
+        if recorded is not digest:
+            recorded.update(chunk)
+        length += len(chunk)
     if expected and base64.urlsafe_b64encode(recorded.digest()).rstrip(b"=").decode() != encoded:
         raise EnvironmentRefusal("package_environment_dependency_member_changed", str(target))
     return "sha256:" + digest.hexdigest(), length

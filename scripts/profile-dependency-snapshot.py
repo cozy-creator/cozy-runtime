@@ -64,20 +64,35 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--target", type=Path, required=True)
+    parser.add_argument("--warm-source", action="store_true")
     args = parser.parse_args()
     fixture(args.source)
     venv(args.target)
+    if args.warm_source:
+        for path in args.source.rglob("*"):
+            if path.is_file():
+                with path.open("rb") as source:
+                    while source.read(1 << 20):
+                        pass
     before = io_counts()
+    usage_before = resource.getrusage(resource.RUSAGE_SELF)
     started = time.monotonic()
     manifest = dependencies.snapshot(args.source / "bin/python", args.target, set())
     dependencies.verify_files(args.target, manifest)
     elapsed = time.monotonic() - started
     after = io_counts()
+    usage_after = resource.getrusage(resource.RUSAGE_SELF)
     value = json.loads(manifest)
     print(
         json.dumps(
             {
                 "elapsed_s": elapsed,
+                "cpu_s": (
+                    usage_after.ru_utime
+                    + usage_after.ru_stime
+                    - usage_before.ru_utime
+                    - usage_before.ru_stime
+                ),
                 "process_io": {key: after[key] - before[key] for key in before},
                 "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
                 "captured_bytes": sum(row["length"] for row in value["files"]),
@@ -85,6 +100,7 @@ def main() -> None:
                 "max_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
                 "source": str(args.source),
                 "target": str(args.target),
+                "warm_source": args.warm_source,
             },
             indent=2,
         )
