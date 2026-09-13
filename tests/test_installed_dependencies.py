@@ -229,7 +229,9 @@ def test_required_closure_tracks_extras_markers_cycles_and_captured_wheels(tmp_p
     (unrelated / "RECORD").unlink()
     provided = {"model": ("2.0", (Requirement("codec[images]>=1"),))}
     included = dependencies.required_distributions(
-        source / "bin/python", provided, default_environment()
+        source / "bin/python",
+        provided,
+        {key: str(value) for key, value in default_environment().items()},
     )
     assert included == {"cozy-runtime", "codec", "cycle", "pixels", "sound"}
     manifest = dependencies.snapshot(
@@ -259,7 +261,7 @@ def test_required_closure_refuses_incomplete_or_incompatible_graph(
         dependencies.required_distributions(
             tmp_path / "source/bin/python",
             {"project": ("1.0", (Requirement(requirement),))},
-            default_environment(),
+            {key: str(value) for key, value in default_environment().items()},
         )
 
 
