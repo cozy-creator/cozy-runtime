@@ -117,10 +117,10 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         if kind == "h3"
         else collective_model(tmp_path / "rank-0" if kind == "staged" else None)
     )
-    batch = h3_batch() if kind == "h3" else {}
     if kind == "h3":
         with torch.no_grad():
-            expected = model.dit(**batch)
+            batches = [h3_batch(), h3_batch(mixed_lengths=True)]
+            expected = [(batch, model.dit(**batch)) for batch in batches]
     spool = tmp_path / "attempt-a"
     ours, theirs = socket.socketpair()
     leader: Any = Executor(Channel(ours), tmp_path, world=degree)
@@ -169,35 +169,36 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                     "component_staged", 37, {"sample": 11, "fail_before_collective": 13}
                 )
             if kind == "h3":
-                # Observe the inputs of real SDPA calls, not just approximately equal
-                # model outputs: replicated text must not become a degree-times-long
-                # attention document before the packed sequence is sharded.
-                with torch.profiler.profile(
-                    activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True
-                ) as profile:
-                    model.compute(batch, expected)
-                attention_shapes = [
-                    event.input_shapes[0]
-                    for event in profile.events()
-                    if event.name == "aten::scaled_dot_product_attention"
-                ]
-                config = model.dit.config
-                local_text = [
-                    1,
-                    config.num_attention_heads,
-                    batch["encoder_hidden_states"].shape[1],
-                    config.attention_head_dim,
-                ]
-                distributed_packed = [
-                    1,
-                    config.num_attention_heads // degree,
-                    batch["position_ids"].shape[0],
-                    config.attention_head_dim,
-                ]
-                assert attention_shapes == (
-                    [local_text] * config.num_refiner_layers
-                    + [distributed_packed] * config.num_layers
-                )
+                for batch, full_output in expected:
+                    # Observe the inputs of real SDPA calls, not just approximately equal
+                    # model outputs: replicated text must not become a degree-times-long
+                    # attention document before the packed sequence is sharded.
+                    with torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True
+                    ) as profile:
+                        model.compute(batch, full_output)
+                    attention_shapes = [
+                        event.input_shapes[0]
+                        for event in profile.events()
+                        if event.name == "aten::scaled_dot_product_attention"
+                    ]
+                    config = model.dit.config
+                    local_text = [
+                        1,
+                        config.num_attention_heads,
+                        batch["encoder_hidden_states"].shape[1],
+                        config.attention_head_dim,
+                    ]
+                    distributed_packed = [
+                        1,
+                        config.num_attention_heads // degree,
+                        batch["position_ids"].shape[0],
+                        config.attention_head_dim,
+                    ]
+                    assert attention_shapes == (
+                        [local_text] * config.num_refiner_layers
+                        + [distributed_packed] * config.num_layers
+                    )
             else:
                 state = SimpleNamespace(
                     value=torch.tensor([2.0, 4.0, 8.0]),
