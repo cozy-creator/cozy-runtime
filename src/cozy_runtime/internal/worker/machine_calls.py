@@ -29,6 +29,12 @@ class Calls:
         self.journal = JournalCalls(worker.workspace)
         self.lock = threading.Lock()
         self.pending: dict[tuple[str, int], pb.ChildCallRequest] = {}
+        from .machine_serving import Serving
+
+        self.serving = Serving(worker)
+
+    def close(self) -> None:
+        self.serving.close()
 
     def handle(
         self, parent: AttemptRecord, request: pb.ChildCallRequest, action: str
@@ -157,6 +163,7 @@ class Calls:
     def drive(self) -> None:
         owner, executions = self.worker.fence.record_owner_id, self.worker.executions
         assert executions is not None
+        self.serving.sweep(owner)
         self._stop_descendants(owner)
         with self.lock:
             requests = list(self.pending.values())
@@ -189,9 +196,13 @@ class Calls:
                     assert self.worker.machine_effects is not None
                     self.worker.machine_effects.schedule(owner, call)
                     continue
+                target = machine_child_target.resolve(self.worker, parent, call)
+                if target.binding is None:
+                    self._check_ancestors(owner, parent, target, request.request_canonical_bytes)
+                    self.serving.drive(owner, call, target, request)
+                    continue
                 if request.HasField("capture"):
                     raise WorkspaceRefusal("activation capture requires a serving child")
-                target = machine_child_target.resolve(self.worker, parent, call)
                 payload = request.request_canonical_bytes
                 arguments = canonical_json.decode(payload)
                 memoized = bool(target.declaration.get("invocable", {}).get("memoize"))
@@ -477,7 +488,11 @@ class Calls:
         with self.worker.workspace.locked() as db:
             while request not in seen and len(seen) < MAX_ACTIVE_CALLS - 1:
                 seen.add(request)
-                if target.declaration.get("models") or target.declaration.get("weights_outputs"):
+                if (
+                    target.binding is None
+                    or target.declaration.get("models")
+                    or target.declaration.get("weights_outputs")
+                ):
                     held = self.worker.engine.live.get(request)
                     if held is not None and not held.lane_id.startswith("cpu-"):
                         raise WorkspaceRefusal(
@@ -492,7 +507,8 @@ class Calls:
                 if row is not None:
                     spec = documents.read(row["invocation"], pb.InvocationSpec)
                     if (
-                        spec.get("job", {}).get("build_id") == target.revision
+                        target.binding is not None
+                        and spec.get("job", {}).get("build_id") == target.revision
                         and spec.get("job", {}).get("job_descriptor_id")
                         == target.binding.job_descriptor_id
                         and spec.get("payload_digest")

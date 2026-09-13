@@ -209,6 +209,7 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
         "model_admission",
         "source",
         "file",
+        "serving",
     ],
 )
 def test_nested_capture_and_leaf_memoization_without_control_stream(
@@ -242,6 +243,10 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             ).replace("    return await compose(n=3)", "    return await leaf(n=3)")
         if case == "file":
             source = FILE_SOURCE
+        if case == "serving":
+            source = SOURCE.replace("@invocable(memoize=True)", "@invocable").replace(
+                "app.job(leaf)", "app.entrypoint(leaf)"
+            )
         if case == "source":
             source = source.replace(
                 'return Result(len(view.components["body"]))',
@@ -529,13 +534,13 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             assert worker.workspace is not None
             with worker.workspace.locked() as db:
                 assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == (
-                    2 if case == "source" else 4 if case == "model" else 3
+                    2 if case == "source" else 4 if case in ("model", "serving") else 3
                 )
                 assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == (
                     4 if case in ("model", "source") else 3
                 )
                 assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == (
-                    2 if case == "source" else 1
+                    2 if case == "source" else 0 if case == "serving" else 1
                 )
         finally:
             worker.request_stop()
@@ -571,7 +576,14 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
         parents.append(selected)
         selected = calls.accept("owner", request(parent)).child_request
     dispatcher = Dispatcher(cast(Worker, SimpleNamespace(workspace=workspace)))
-    target = cast(Target, SimpleNamespace(revision="different", binding=None, declaration={}))
+    target = cast(
+        Target,
+        SimpleNamespace(
+            revision="different",
+            binding=SimpleNamespace(job_descriptor_id="different"),
+            declaration={},
+        ),
+    )
     dispatcher._check_ancestors(
         "owner", cast(AttemptRecord, SimpleNamespace(request_id=parents[-2])), target, b"{}"
     )

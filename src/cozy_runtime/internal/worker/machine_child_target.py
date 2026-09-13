@@ -27,7 +27,7 @@ class Target:
     interface_digest: str
     declaration: dict[str, Any]
     prepared_revision: dict[str, Any]
-    binding: JobBinding
+    binding: JobBinding | None
     digest: str
 
 
@@ -73,9 +73,16 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     ):
         raise WorkspaceRefusal("captured child interface bytes are unavailable")
     interface = package_interface.read_bytes(raw, "captured child")
-    declared = next((entry for entry in interface["jobs"] if entry["name"] == entrypoint), None)
+    declared = next(
+        (
+            entry
+            for entry in [*interface["jobs"], *interface["entrypoints"]]
+            if entry["name"] == entrypoint
+        ),
+        None,
+    )
     if declared is None:
-        raise WorkspaceRefusal("captured child is not a supported job declaration")
+        raise WorkspaceRefusal("captured child has no callable declaration")
     invocable = declared.get("invocable", {})
     if (invocable.get("module"), invocable.get("export")) != (intent["module"], intent["export"]):
         raise WorkspaceRefusal("captured child export changed")
@@ -86,12 +93,16 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     parent_declaration = worker.engine._job_declaration(parent.job, parent.job.job_descriptor_id)
     if parent_declaration.get("invocable", {}).get("memoize") and not invocable.get("memoize"):
         raise WorkspaceRefusal("memoized parent cannot invoke an impure child")
-    descriptor = package_interface.job_descriptor_id(interface, entrypoint)
-    binding = JobBinding.read(
-        json.loads(
-            job_plan.path(worker.config.cozy_home / "job-plans", revision, descriptor).read_bytes()
+    binding = None
+    if declared in interface["jobs"]:
+        descriptor = package_interface.job_descriptor_id(interface, entrypoint)
+        binding = JobBinding.read(
+            json.loads(
+                job_plan.path(
+                    worker.config.cozy_home / "job-plans", revision, descriptor
+                ).read_bytes()
+            )
         )
-    )
     identity = canonical_json.encode(
         {
             "local_revision_digest": revision,
