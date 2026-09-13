@@ -145,9 +145,44 @@ class WeightsExchange:
         self._held: dict[str, _Held] = {}
         self._abandoned: set[str] = set()
         self.writer_broker = WriterBroker(
-            self._store, checkpoint=self.record_checkpoint, store_root=store_root
+            self._store,
+            checkpoint=self.record_checkpoint,
+            receipt=self.record_native_receipt,
+            store_root=store_root,
         )
         self.reader_broker = ModelReaderBroker(self._store, store_root=store_root)
+
+    def record_native_receipt(
+        self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]
+    ) -> None:
+        """Record the native winner before acknowledging the scoped TensorFS commit."""
+        from cozy_runtime import canonical_json
+        from cozy_runtime.internal.weights_sink import WeightsTransactionHost, protocol_receipt
+
+        if (
+            facts.get("transaction_id") != transaction
+            or hashlib.sha256(canonical_json.encode(facts.get("declaration"))).digest()
+            != binding.declaration_digest
+        ):
+            raise WeightsExchangeError(
+                "weights_receipt_identity_mismatch", "native commit differs from intent"
+            )
+        wrapped = WeightsTransactionHost._wrap(
+            binding.slot, transaction, facts, replayed=False, request_id=attempt.request_id
+        )
+        _, canonical_receipt, digest = protocol_receipt(
+            wrapped,
+            owner_scope=self.owner_scope(),
+            request_id=attempt.request_id,
+            invocation_spec_digest=documents.spell(attempt.digest),
+        )
+        self.receipt(
+            attempt,
+            output_slot=binding.slot,
+            transaction_id=transaction,
+            receipt_digest=digest,
+            canonical_receipt=canonical_receipt,
+        )
 
     def record_checkpoint(
         self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]

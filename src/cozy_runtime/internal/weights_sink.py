@@ -688,8 +688,15 @@ class OpenedWeightsTransaction:
         if self.replayed:
             return
         try:
-            facts = self._writer("checkpoint").checkpoint(
-                self.host.request_id, self.request.output_slot, previous=self.checkpoint_head
+            from tensorfs.derived import DerivedTransaction
+
+            writer = self._writer("checkpoint")
+            facts = (
+                writer.checkpoint()
+                if isinstance(writer, DerivedTransaction)
+                else writer.checkpoint(
+                    self.host.request_id, self.request.output_slot, previous=self.checkpoint_head
+                )
             )
             if not isinstance(facts, dict):
                 raise ValueError("checkpoint has no exact TensorFS facts")
