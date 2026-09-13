@@ -25,6 +25,12 @@ from cozy_runtime.internal.parallel import cp, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.parallel.mirror import mirror_component  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
+from cozy_runtime.internal.worker.lanes import LaneSet  # noqa: E402
+from cozy_runtime.internal.worker.plan import (  # noqa: E402
+    DeclaredBinding,
+    PreparedModel,
+    PreparedRequest,
+)
 from testdata.parallel_calls import collective_model, h3_batch, h3_model  # noqa: E402
 
 
@@ -161,12 +167,58 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                 group=group,
                 spool=lambda: spool,
             )
+        if kind == "staged":
+            # Exercise the real group chooser, then carry its result through native
+            # CUDA residency and the follower's actual mirrored scope. The tiny
+            # capacity here is a conservative planner input, not a GPU limit claim.
+            lanes = LaneSet.from_envelope(
+                ",".join(str(rank) for rank in range(degree)), worker_pid=os.getpid()
+            )
+            row = lanes.fuse(tuple(range(degree))).row("fixture")
+            backend = model._cozy_residency.backend
+            row.ledger.observe_construction(
+                {
+                    "filled_bytes": 12,
+                    "allocator_bytes": 4,
+                    "reserved_bytes": 4,
+                    "resident": {name: backend.vram_charge[name] for name in backend.components},
+                    "parked": sorted(backend.parked),
+                    "evicted": {
+                        name: backend.component_memory[name].settled for name in backend.parked
+                    },
+                    "declared_scopes": {
+                        "sample": ["block", "overlay"],
+                        "fail_before_collective": ["block", "overlay"],
+                    },
+                    "device_free_bytes": 1,
+                    "device_total_bytes": 1024,
+                }
+            )
+            row.ledger.activations_by_cell["-"] = 37
+            row.ledger.activation_scopes_by_cell["-"] = {"sample": 11, "fail_before_collective": 13}
+            binding = DeclaredBinding(
+                entrypoint_binding_digest="sha256:" + "0" * 64,
+                entrypoint="sample",
+                model_class="ModelCalls",
+                model_binding_path="fixture",
+                model_parameter_name="model",
+                release="fixture/1",
+                model_weight_bytes=12,
+            )
+            assert row.chooser.fits(binding, "-") == ""
+            plan = row.chooser.choose(
+                binding,
+                PreparedModel(delivery_rung="verbatim"),
+                PreparedRequest.unresolved("sample", {}),
+            )
+            assert plan.placement == "component_staged"
+            assert row.chooser.walks[-1]["deepened_to"] == "component_staged"
         for attempt in ("attempt-a", "attempt-b"):
             spool = tmp_path / attempt
             leader._attempt_spool = spool
             if kind == "staged":
                 model._cozy_residency.open_attempt(
-                    "component_staged", 37, {"sample": 11, "fail_before_collective": 13}
+                    plan.placement, plan.headroom_bytes, dict(plan.scope_headroom_bytes)
                 )
             if kind == "h3":
                 # Observe the inputs of real SDPA calls, not just approximately equal

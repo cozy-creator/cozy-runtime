@@ -610,13 +610,8 @@ class PlanChooser:
     PRECOMPUTED ordered set.
     """
 
-    def __init__(self, ledger: Ledger, *, degree: int = 1) -> None:
+    def __init__(self, ledger: Ledger) -> None:
         self.ledger = ledger
-        #: the lane's sequence-parallel degree (cr-068). Above 1 the ladder is REFUSED, not
-        #: deepened: K ranks run ONE plan priced against the tightest card (the ledger's
-        #: `device_free` is the MIN over the lane's devices), and a rung one rank would
-        #: need to deepen is a rung the group cannot run.
-        self.degree = int(degree)
         self.choices = 0
         #: every choice's ladder walk, for the envelope and the triage bundle
         self.walks: list[dict[str, Any]] = []
@@ -951,7 +946,7 @@ class PlanChooser:
                         "evidence_class": "measured",
                     },
                 )
-            chosen, confession = self._deepen(declared, activations, allocatable, walk)
+            chosen, confession = self._deepen(activations, allocatable, walk)
         else:
             confession = ""
         rung = self._delivery(prepared_model, chosen, walk)
@@ -1119,41 +1114,18 @@ class PlanChooser:
 
     def _deepen(
         self,
-        declared: DeclaredBinding,
         activations: Coefficient,
         allocatable: int,
         walk: dict[str, Any],
     ) -> tuple[str, str]:
-        """Nothing on the ladder fits. What happens next depends on TENANCY (§3.2).
+        """Use the deepest supported residency plan before judging an active working set.
 
-        LOCAL single-tenant: capacity NEVER refuses above the physical floor. The ladder
-        deepens to the deepest authorized rung with a quantified confession, because the
-        person in front of it wants their image, not a lecture about their card.
-
-        SHARED cloud: a shortfall is a RESCHEDULE-shaped fact for the RecordOwner, never a
-        structural-incompatibility claim — a different worker may fit it exactly.
-
-        A GROUP (cr-068, cr-018): never deepened. Every rank runs the same plan, so a
-        per-rank downgrade is unrepresentable; the refusal is `CONSTRAINT_INFEASIBLE`,
-        priced against the MIN over the K devices' headroom, and the RecordOwner reads it
-        as a placement that does not fit this group.
+        A group already has one ledger priced against its tightest rank. Its leader
+        broadcasts this same plan and scope headroom to every follower; rank-local
+        fallback is neither required nor allowed. The executor still enforces the
+        actual component/block working set before allocation. A plan that was already
+        falsified on this generation is rejected by `choose`, not retried here.
         """
-        if self.degree > 1:
-            walk["refused_under_group"] = self.degree
-            raise PlanRefusal(
-                "group_constraint_infeasible",
-                f"no proven placement rung fits this {self.degree}-device group: needed "
-                f"{activations.value} B of headroom ({activations.provenance}) against "
-                f"{max(allocatable, 0)} B allocatable on the tightest device; the ladder is "
-                "not deepened under a group because every rank runs one plan",
-                {
-                    "resource": "vram",
-                    "scope": "group",
-                    "needed_bytes": activations.value,
-                    "available_bytes": max(allocatable, 0),
-                    "evidence_class": "measured" if activations.enforceable else "bound",
-                },
-            )
         if not activations.enforceable:
             # A NON-MEASURED coefficient MAY NOT REFUSE. It may deepen the ladder, because
             # a placement rung changes weight placement only — never the kernel, never the
@@ -1188,6 +1160,6 @@ class PlanChooser:
         return deepest, (
             f" | DEGRADED: needed {activations.value} B of headroom, had "
             f"{max(allocatable, 0)} B, short by {max(activations.value - allocatable, 0)} B; "
-            f"the ladder deepened to {deepest} rather than refusing a single-tenant request "
-            "above its physical floor"
+            f"the ladder deepened to {deepest}; every executing rank retains its "
+            "measured component and block admission checks"
         )
