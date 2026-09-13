@@ -1522,10 +1522,10 @@ class AttemptEngine:
                 # Exact Model inputs already grant read access. The broker verifies
                 # those immutable input refs; it grants no output or write authority.
                 return self.weights.reader_broker.handle(attempt, frame)
-            if kind == "weights_writer":
-                return self.weights.writer_broker.handle(attempt, frame)
             output_slot = str(frame.get("output_slot", ""))
-            if kind == "weights_intent":
+            if kind == "weights_intent" or (
+                kind == "weights_writer" and frame.get("operation") == "output"
+            ):
                 if attempt.job is None:
                     raise ValueError("a weights intent requires the current job")
                 declared = self._job_declaration(attempt.job, attempt.job.job_descriptor_id)
@@ -1544,6 +1544,9 @@ class AttemptEngine:
                     raise ValueError(
                         "weights intent is outside the package and invocation output contract"
                     )
+            if kind == "weights_writer":
+                return self.weights.writer_broker.handle(attempt, frame)
+            if kind == "weights_intent":
                 length = int(frame.get("tensorfs_declaration_length", 0))
                 raw = weights_exchange_bytes(attempt.spool, output_slot, "declaration", length)
                 return self.weights.intent(

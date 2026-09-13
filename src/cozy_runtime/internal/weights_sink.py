@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from cozy_runtime.internal.hostfacts import HostFacts
 
 _OUTPUT_SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")
-_EXCHANGE_KINDS = frozenset({"declaration", "receipt"})
+_EXCHANGE_KINDS = frozenset({"declaration", "receipt", "derivation", "native-receipt"})
 
 
 def work_fingerprint(

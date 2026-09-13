@@ -19,7 +19,7 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._weights import MAX_WEIGHTS_SOURCE_READ
@@ -28,8 +28,81 @@ from cozy_runtime.internal.seam import DescriptorReply
 from cozy_runtime.internal.weights_sink import source_config
 from cozy_runtime.protocol import weights_limits
 
+if TYPE_CHECKING:
+    from tensorfs.derived import Derivation, DerivedTransaction, SourceCapability
+
+    from cozy_runtime.author._artifacts import ModelArtifact
+
 _TRANSACTION = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CHUNK = 1 << 20
+
+
+class ExecutionStorage:
+    """Execution bindings only: the executor receives TensorFS handles, never a Store."""
+
+    def __init__(
+        self, spool: Path, exchange: Callable[..., dict[str, Any]], outputs: Mapping[str, int]
+    ) -> None:
+        self.spool, self.exchange, self.outputs = spool, exchange, dict(outputs)
+        self.opened: dict[str, str] = {}
+
+    def _call(self, operation: str, *, descriptor: bool = False, **fields: Any) -> dict[str, Any]:
+        answer = self.exchange(
+            "weights_writer", {"operation": operation, **fields}, descriptor=descriptor
+        )
+        if not answer.get("ok"):
+            raise CapabilityError(
+                str(answer.get("detail", "execution storage refused")),
+                code=str(answer.get("code", "weights_host_refused")),
+            )
+        return answer
+
+    def source(self, manifest: str) -> SourceCapability:
+        from tensorfs.derived import SourceCapability
+
+        answer = self._call("source", manifest=manifest, descriptor=True)
+        return SourceCapability.from_fd(manifest, answer["length"], answer["descriptor"])
+
+    def open_output(self, output_slot: str, definition: Derivation) -> DerivedTransaction:
+        from tensorfs.derived import DerivedTransaction
+
+        from cozy_runtime.internal.weights_sink import exchange_file
+
+        maximum = self.outputs.get(output_slot)
+        if maximum is None:
+            raise CapabilityError("output is not declared", code="weights_output_ungranted")
+        data = json.dumps(definition.native_arguments(maximum), separators=(",", ":")).encode()
+        length = _write(
+            exchange_file(self.spool, output_slot, "derivation"),
+            io.BytesIO(data),
+            weights_limits.MAX_WEIGHTS_DECLARATION_BYTES,
+        )
+        answer = self._call("output", output_slot=output_slot, length=length, descriptor=True)
+        writer = DerivedTransaction.accept(answer["descriptor"])
+        self.opened[answer["transaction"]] = output_slot
+        return writer
+
+    def adopt_model(self, facts: Mapping[str, Any]) -> ModelArtifact:
+        from cozy_runtime import canonical_json
+        from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
+        from cozy_runtime.internal.weights_sink import exchange_file
+
+        transaction = str(facts.get("transaction_id", ""))
+        slot = self.opened.get(transaction)
+        if slot is None:
+            raise CapabilityError("receipt has no opened output", code="weights_receipt_mismatch")
+        length = _write(
+            exchange_file(self.spool, slot, "native-receipt"),
+            io.BytesIO(canonical_json.encode(dict(facts))),
+            weights_limits.MAX_WEIGHTS_RECEIPT_BYTES,
+        )
+        answer = self._call("adopt", output_slot=slot, transaction=transaction, length=length)
+        return ModelArtifact(
+            answer["request_id"],
+            slot,
+            ObjectRef(answer["manifest"], answer["manifest_length"]),
+            answer["receipt_digest"],
+        )
 
 
 def _path(spool: Path, transaction: str, kind: str) -> Path:
@@ -173,14 +246,17 @@ class WriterBroker:
         checkpoint: Callable[[Any, str, _Binding, dict[str, Any]], None] | None = None,
         store_root: Path | None = None,
         receipt: Callable[[Any, str, _Binding, dict[str, Any]], None] | None = None,
+        bind_output: Callable[[Any, str, bytes], tuple[str, int]] | None = None,
     ) -> None:
         self.store = store
         self.record_checkpoint = checkpoint
         self.record_receipt = receipt
+        self.bind_output = bind_output
         self.store_root = store_root
         self.bindings: dict[tuple[str, int, str], _Binding] = {}
         self.lock = threading.RLock()
         self.writers: dict[tuple[str, int, str], _LiveWriter] = {}
+        self.sources: dict[tuple[str, int], set[socket.socket]] = {}
 
     @staticmethod
     def key(attempt: Any, transaction: str) -> tuple[str, int, str]:
@@ -259,6 +335,12 @@ class WriterBroker:
 
     def handle(self, attempt: Any, frame: Mapping[str, Any]) -> dict[str, Any]:
         try:
+            if frame.get("operation") == "source":
+                return self._source(attempt, frame)
+            if frame.get("operation") == "output":
+                return self._output(attempt, frame)
+            if frame.get("operation") == "adopt":
+                return self._adopt(attempt, frame)
             if frame.get("operation") == "source_config":
                 return self._source_config(attempt, frame)
             if frame.get("operation") != "open":
@@ -270,8 +352,181 @@ class WriterBroker:
         except Exception as exc:
             return self._refused(exc)
 
+    def _source(self, attempt: Any, frame: Mapping[str, Any]) -> DescriptorReply:
+        from tensorfs.derived import Source, serve_source
+
+        from cozy_runtime.internal.worker.grants import MODEL_PREFIX
+
+        manifest = str(frame.get("manifest", ""))
+        allowed = {
+            row["digest"]: row["length"]
+            for row in attempt.spec.get("inputs", [])
+            if str(row.get("input_id", "")).startswith(MODEL_PREFIX)
+        }
+        length = allowed.get(manifest)
+        if type(length) is not int or length <= 0:
+            raise CapabilityError(
+                "source is outside the invocation", code="weights_source_ungranted"
+            )
+        key = attempt.request_id, attempt.attempt
+        client, server = socket.socketpair()
+        stop = server.dup()
+        with self.lock:
+            self.sources.setdefault(key, set()).add(stop)
+
+        def current() -> None:
+            with self.lock:
+                if (
+                    attempt.canceling
+                    or attempt.state != "running"
+                    or stop not in self.sources.get(key, ())
+                ):
+                    raise CapabilityError(
+                        "source attempt is no longer current", code="weights_writer_closed"
+                    )
+                if self.payload_pending(attempt):
+                    raise CapabilityError(
+                        "writer payload is pending", code="weights_writer_payload_pending"
+                    )
+
+        @contextlib.contextmanager
+        def admit() -> Iterator[None]:
+            current()  # Refuse nested inspection before waiting on the native disk exclusion.
+            with storage_admission.admit(storage_admission.native_write(self.store_root)):
+                current()
+                yield
+
+        def serve() -> None:
+            try:
+                serve_source(
+                    self.store(),
+                    Source(manifest, length),
+                    server.detach(),
+                    check_current=current,
+                    admit_io=admit,
+                )
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "source channel closed with refusal", exc_info=True
+                )
+            finally:
+                with self.lock:
+                    held = self.sources.get(key)
+                    if held is not None:
+                        held.discard(stop)
+                        if not held:
+                            self.sources.pop(key, None)
+                stop.close()
+
+        try:
+            current()
+            threading.Thread(target=serve, name="tensorfs-source", daemon=True).start()
+        except BaseException:
+            client.close()
+            server.close()
+            with self.lock:
+                self.sources[key].discard(stop)
+                if not self.sources[key]:
+                    self.sources.pop(key)
+            stop.close()
+            raise
+        return DescriptorReply({"ok": True, "length": length}, client)
+
+    def _arguments(self, attempt: Any, slot: str, args: Any) -> tuple[Any, ...]:
+        from cozy_runtime.internal.worker.grants import MODEL_PREFIX
+
+        if not isinstance(args, list) or len(args) != 5:
+            raise CapabilityError("invalid derivation arguments", code="weights_writer_declaration")
+        outputs = {
+            row["output_id"]: row.get("max_bytes", 0) for row in attempt.spec.get("outputs", [])
+        }
+        if type(args[4]) is not int or args[4] < 0 or args[4] != outputs.get(slot):
+            raise CapabilityError(
+                "output exceeds invocation grant", code="weights_writer_ungranted"
+            )
+        permitted = {
+            row["digest"]: row["length"]
+            for row in attempt.spec.get("inputs", [])
+            if str(row.get("input_id", "")).startswith(MODEL_PREFIX)
+        }
+        if not isinstance(args[0], dict) or any(
+            not isinstance(ref, (list, tuple))
+            or len(ref) != 2
+            or not isinstance(ref[0], str)
+            or type(ref[1]) is not int
+            or permitted.get(ref[0]) != ref[1]
+            for ref in args[0].values()
+        ):
+            raise CapabilityError(
+                "source is outside invocation grant", code="weights_source_ungranted"
+            )
+        args[0] = {alias: tuple(ref) for alias, ref in args[0].items()}
+        args[3] = [tuple(row) for row in args[3]]
+        return tuple(args)
+
+    def _output(self, attempt: Any, frame: Mapping[str, Any]) -> DescriptorReply:
+        from cozy_runtime.internal.weights_sink import exchange_file
+
+        slot = str(frame.get("output_slot", ""))
+        if self.bind_output is None:
+            raise CapabilityError("output has no execution owner", code="weights_host_unavailable")
+        if attempt.canceling or attempt.state != "running":
+            raise CapabilityError("output attempt is not running", code="weights_writer_closed")
+        if self.payload_pending(attempt):
+            raise CapabilityError(
+                "writer payload is pending", code="weights_writer_payload_pending"
+            )
+        with _read(
+            exchange_file(attempt.spool, slot, "derivation"),
+            int(frame["length"]),
+            weights_limits.MAX_WEIGHTS_DECLARATION_BYTES,
+        ) as source:
+            args = self._arguments(attempt, slot, json.load(source))
+        fingerprint = attempt.weights_work_fingerprint
+        declaration = self.store().derived_declaration(*args, work_fingerprint=fingerprint)
+        transaction, epoch = self.bind_output(attempt, slot, declaration)
+        binding = self.bindings[self.key(attempt, transaction)]
+        if binding.epoch != epoch:
+            raise CapabilityError("output epoch changed", code="weights_writer_closed")
+        result = self._open_native(attempt, transaction, binding, args, fingerprint)
+        result["transaction"] = transaction
+        return result
+
+    def _adopt(self, attempt: Any, frame: Mapping[str, Any]) -> dict[str, Any]:
+        from cozy_runtime import canonical_json
+        from cozy_runtime.internal.weights_sink import exchange_file
+
+        slot, transaction = str(frame.get("output_slot", "")), str(frame.get("transaction", ""))
+        binding = self.bindings.get(self.key(attempt, transaction))
+        if binding is None or binding.slot != slot:
+            raise CapabilityError("receipt has no bound output", code="weights_receipt_mismatch")
+        self._current(attempt, transaction, binding)
+        with _read(
+            exchange_file(attempt.spool, slot, "native-receipt"),
+            int(frame["length"]),
+            weights_limits.MAX_WEIGHTS_RECEIPT_BYTES,
+        ) as source:
+            facts = canonical_json.decode(source.read())
+        native = self.store().derived_lookup(transaction)
+        if native.get("state") != "committed" or native.get("receipt") != facts:
+            raise CapabilityError(
+                "receipt differs from native custody", code="weights_receipt_mismatch"
+            )
+        if self.record_receipt is None:
+            raise CapabilityError(
+                "receipt has no execution recorder", code="weights_host_unavailable"
+            )
+        self.record_receipt(attempt, transaction, binding, facts)
+        self._current(attempt, transaction, binding)
+        return {
+            "ok": True,
+            "request_id": attempt.request_id,
+            "manifest": "sha256:" + facts["manifest"]["sha256"],
+            "manifest_length": facts["manifest"]["length"],
+            "receipt_digest": "sha256:" + hashlib.sha256(canonical_json.encode(facts)).hexdigest(),
+        }
+
     def _open(self, attempt: Any, frame: Mapping[str, Any]) -> DescriptorReply:
-        from tensorfs.derived import serve_derived
 
         from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 
@@ -338,15 +593,71 @@ class WriterBroker:
             raise CapabilityError(
                 "writer declaration changed after intent", code="weights_writer_declaration"
             )
-        with self._preflight_writers(attempt, transaction, binding, tuple(args), fingerprint):
-            self._current(attempt, transaction, binding)
-            writer = store.begin_derived(
-                transaction,
-                binding.epoch,
-                *args,
-                work_fingerprint=fingerprint,
-                checkpoint=binding.checkpoint,
+        return self._open_native(attempt, transaction, binding, tuple(args), fingerprint)
+
+    def _open_native(
+        self,
+        attempt: Any,
+        transaction: str,
+        binding: _Binding,
+        args: tuple[Any, ...],
+        fingerprint: str,
+    ) -> DescriptorReply:
+        from tensorfs.derived import serve_derived, serve_derived_replay
+
+        from cozy_runtime import canonical_json
+
+        key = self.key(attempt, transaction)
+        self._current(attempt, transaction, binding)
+        with self.lock:
+            if key in self.writers:
+                raise CapabilityError("writer is already open", code="weights_writer_closed")
+        checkpoint_recorder, receipt_recorder = self.record_checkpoint, self.record_receipt
+        if checkpoint_recorder is None or receipt_recorder is None:
+            raise CapabilityError(
+                "writer has no execution recorder", code="weights_host_unavailable"
             )
+        store = self.store()
+        existing = store.derived_lookup(transaction)
+        replay = existing.get("receipt") if existing.get("state") == "committed" else None
+        writer = None
+        if replay is not None:
+            disposition = existing.get("disposition")
+            if not isinstance(disposition, dict) or disposition.get("kind") not in {
+                "pending",
+                "adopted",
+            }:
+                raise CapabilityError(
+                    "output is no longer retained", code="weights_transaction_closed"
+                )
+            if (
+                replay.get("transaction_id") != transaction
+                or hashlib.sha256(canonical_json.encode(replay.get("declaration"))).digest()
+                != binding.declaration_digest
+            ):
+                raise CapabilityError(
+                    "native receipt differs from intent", code="weights_receipt_mismatch"
+                )
+            manifest = replay["manifest"]
+            try:
+                store.inspect_derived_source(
+                    "sha256:" + manifest["sha256"], manifest["length"], list(args[1]), list(args[2])
+                )
+            except Exception as exc:
+                raise CapabilityError(
+                    "completed output is not retained and complete",
+                    code="weights_receipt_unavailable",
+                ) from exc
+        else:
+            with self._preflight_writers(attempt, transaction, binding, args, fingerprint):
+                self._current(attempt, transaction, binding)
+                writer = store.begin_derived(
+                    transaction,
+                    binding.epoch,
+                    *args,
+                    work_fingerprint=fingerprint,
+                    checkpoint=binding.checkpoint,
+                )
         client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         live = _LiveWriter(writer, tuple(args), fingerprint, binding, server.dup())
         with self.lock:
@@ -375,21 +686,32 @@ class WriterBroker:
 
         def serve() -> None:
             try:
-                serve_derived(
-                    writer,
-                    server.detach(),
-                    operation_id=attempt.request_id,
-                    slot=binding.slot,
-                    checkpoint=binding.checkpoint,
-                    check_current=lambda: self._current(attempt, transaction, binding),
-                    admit_io=admit,
-                    record_checkpoint=lambda facts: checkpoint_recorder(
-                        attempt, transaction, binding, facts
-                    ),
-                    record_receipt=lambda facts: receipt_recorder(
-                        attempt, transaction, binding, facts
-                    ),
-                )
+                if replay is not None:
+                    serve_derived_replay(
+                        replay,
+                        server.detach(),
+                        check_current=lambda: self._current(attempt, transaction, binding),
+                        record_receipt=lambda facts: receipt_recorder(
+                            attempt, transaction, binding, facts
+                        ),
+                    )
+                else:
+                    assert writer is not None
+                    serve_derived(
+                        writer,
+                        server.detach(),
+                        operation_id=attempt.request_id,
+                        slot=binding.slot,
+                        checkpoint=binding.checkpoint,
+                        check_current=lambda: self._current(attempt, transaction, binding),
+                        admit_io=admit,
+                        record_checkpoint=lambda facts: checkpoint_recorder(
+                            attempt, transaction, binding, facts
+                        ),
+                        record_receipt=lambda facts: receipt_recorder(
+                            attempt, transaction, binding, facts
+                        ),
+                    )
             except Exception:
                 # TensorFS sends the typed refusal on this same channel before raising.
                 logging.getLogger(__name__).debug(
@@ -407,7 +729,8 @@ class WriterBroker:
             client.close()
             server.close()
             live.stop_socket.close()
-            writer.fence()
+            if writer is not None:
+                writer.fence()
             with self.lock:
                 self.writers.pop(key, None)
             raise
@@ -436,7 +759,7 @@ class WriterBroker:
             with self.lock:
                 existing = tuple(self.writers.items())
             for key, live in existing:
-                if key[:2] != (attempt.request_id, attempt.attempt):
+                if key[:2] != (attempt.request_id, attempt.attempt) or live.writer is None:
                     continue
                 pending = store.derived_write_estimate(
                     key[2],
@@ -457,6 +780,11 @@ class WriterBroker:
 
     def close_attempt(self, attempt: Any) -> None:
         with self.lock:
+            sources = self.sources.pop((attempt.request_id, attempt.attempt), set())
+        for channel in sources:
+            with contextlib.suppress(OSError):
+                channel.shutdown(socket.SHUT_RDWR)
+        with self.lock:
             keys = [
                 key for key in self.bindings if key[:2] == (attempt.request_id, attempt.attempt)
             ]
@@ -464,6 +792,13 @@ class WriterBroker:
             self._close(key)
 
     def close(self, transaction: str | None = None) -> None:
+        if transaction is None:
+            with self.lock:
+                sources = [channel for channels in self.sources.values() for channel in channels]
+                self.sources.clear()
+            for channel in sources:
+                with contextlib.suppress(OSError):
+                    channel.shutdown(socket.SHUT_RDWR)
         with self.lock:
             keys = [key for key in self.bindings if transaction is None or key[2] == transaction]
         for key in keys:
@@ -476,4 +811,5 @@ class WriterBroker:
         if live is not None:
             with contextlib.suppress(OSError):
                 live.stop_socket.shutdown(socket.SHUT_RDWR)
-            live.writer.fence()
+            if live.writer is not None:
+                live.writer.fence()
