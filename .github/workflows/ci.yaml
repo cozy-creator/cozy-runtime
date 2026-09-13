@@ -77,14 +77,18 @@ jobs:
           tests/test_end_to_end.py::test_real_modeled_package_prepare_can_be_acquired_before_model_selection -q -rs
       - name: Cross the real pod executor UID boundary during warmup
         run: |
-          # The runner's checkout parents can also be private. Copy only the test
-          # environment and source into an explicit, traversable proof directory.
+          # Install a real wheel into a traversable environment: an editable venv
+          # can retain references to the runner's private checkout or package cache.
           proof_root=$(mktemp -d /tmp/cozy-runtime-uid.XXXXXX)
           trap 'sudo rm -rf "$proof_root"' EXIT
           chmod 0755 "$proof_root"
-          cp -a .venv src tests pyproject.toml "$proof_root/"
+          uv build --wheel --out-dir "$proof_root/wheels"
+          uv venv --python 3.12 "$proof_root/.venv"
+          UV_LINK_MODE=copy uv pip install --python "$proof_root/.venv/bin/python" "$proof_root"/wheels/*.whl pytest
+          UV_LINK_MODE=copy uv pip install --python "$proof_root/.venv/bin/python" --index https://download.pytorch.org/whl/cpu "torch==2.13.0"
+          cp -a tests "$proof_root/"
           cd "$proof_root"
-          sudo -E env PYTHONPATH="$proof_root/src" .venv/bin/python -m pytest tests/test_warm_isolation.py -q -rs
+          sudo -E .venv/bin/python -m pytest tests/test_warm_isolation.py -q -rs
 
   # THE VENDORED-DRIFT GATE (#536d). `src/cozy/worker/v1/` is a COPY of another repo's
   # generated output, and a copy is only a copy while somebody compares the bytes.
