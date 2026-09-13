@@ -2517,15 +2517,16 @@ class Executor:
                         "model call artifact differs from its admitted native input",
                         code="model_artifact_binding",
                     )
-            try:
-                held = store.manifest(manifest)
-                if len(bytes(held["manifest"])) != length:
-                    raise ValueError("Manifest length changed")
-            except Exception as exc:
-                raise CapabilityError(
-                    f"job Model parameter {parameter!r} is absent or stale in TensorFS",
-                    code="job_model_manifest_unavailable",
-                ) from exc
+            if store is not None:
+                try:
+                    held = store.manifest(manifest)
+                    if len(bytes(held["manifest"])) != length:
+                        raise ValueError("Manifest length changed")
+                except Exception as exc:
+                    raise CapabilityError(
+                        f"job Model parameter {parameter!r} is absent or stale in TensorFS",
+                        code="job_model_manifest_unavailable",
+                    ) from exc
             models[parameter] = _derive_model(binding.model_class, manifest)
         return models
 
@@ -2594,7 +2595,8 @@ class Executor:
 
         job_models: dict[str, Any] = {}
         store = None
-        if surface.model_bindings:
+        legacy_weights = any(p.capability == "weights" for p in surface.params)
+        if surface.model_bindings and legacy_weights:
             from cozy_runtime.internal import fill
 
             store_value = str(command.get("tensorfs_root", ""))
@@ -2612,7 +2614,7 @@ class Executor:
                     "code": "job_model_store_unavailable",
                     "detail": f"TensorFS store refused ({type(exc).__name__})",
                 }
-        elif surface.weights_outputs:
+        elif surface.weights_outputs and legacy_weights:
             from cozy_runtime.internal import fill
 
             store_value = str(command.get("tensorfs_root", ""))
@@ -2641,7 +2643,10 @@ class Executor:
         weights_open = None
         weights_source_structure = None
         weights_source_config = None
-        if surface.weights_outputs:
+        tensorfs_source = None
+        tensorfs_output = None
+        tensorfs_adopt = None
+        if surface.weights_outputs and legacy_weights:
             from cozy_runtime.internal import weights_sink
 
             if store is None:
@@ -2736,6 +2741,17 @@ class Executor:
             weights_source_structure = weights_host.structure
             weights_source_config = weights_store.config
 
+        from cozy_runtime.internal.weights_writer import ExecutionStorage
+
+        execution_storage = ExecutionStorage(
+            spool,
+            self._durable,
+            {output.name: output.max_new_bytes for output in surface.weights_outputs},
+        )
+        tensorfs_source = execution_storage.source
+        tensorfs_output = execution_storage.open_output
+        tensorfs_adopt = execution_storage.adopt_model
+
         from cozy_runtime.author._services import (
             BudgetFacts,
             CheckpointDeclaration,
@@ -2802,6 +2818,9 @@ class Executor:
                 weights_reader=weights_reader,
                 weights_source_structure=weights_source_structure,
                 weights_source_config=weights_source_config,
+                tensorfs_source=tensorfs_source,
+                tensorfs_output=tensorfs_output,
+                tensorfs_adopt=tensorfs_adopt,
                 budget=BudgetFacts(
                     gpu_rate_usd_per_hour=int(budget.get("gpu_rate_micro_usd_per_hour", 0)) / 1e6,
                     gpu_count=int(budget.get("gpu_count", 0)),
@@ -2959,7 +2978,9 @@ class Executor:
             bindings[(interface, module, export)] = binding
         return _Broker(str(command["request_id"]), bindings, self._durable)
 
-    def _durable(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
+    def _durable(
+        self, kind: str, body: dict[str, Any], *, descriptor: bool = False
+    ) -> dict[str, Any]:
         """One DURABLE mid-attempt exchange. Blocks until the worker answers.
 
         This is the seam's other half of `child.Executor.call(on_request=…)`. It is a
@@ -2974,6 +2995,13 @@ class Executor:
             if frame is None:
                 raise SeamError("seam_closed", f"the worker closed during {kind!r}")
             if frame.get("event") == "answer" and int(frame.get("seq", -1)) == seq:
+                if frame.get("descriptor") is True:
+                    if not descriptor:
+                        self.channel.close()
+                        raise SeamError("seam_descriptor", "unexpected capability in control reply")
+                    frame["descriptor"] = self.channel.recv_descriptor()
+                elif descriptor and frame.get("ok") is True:
+                    raise SeamError("seam_descriptor", "successful reply omitted its capability")
                 return frame
             raise SeamError(
                 "seam_out_of_order",

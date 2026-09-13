@@ -1,10 +1,10 @@
 """`Context` and `RequestView` — where a handler runs, and its request-local model state.
 
-`Context` answers exactly one question — where and under what conditions am I executing.
-The member list below is the COMPLETE committed inventory (§1.3): anything absent is
-absent on purpose. No checkpoint paths, no placement or offload knobs, no config or
-environment, no provider facts, no child-call surface — and no `ctx.generator`: the
-seeded per-request generator is `view.generator`, the ONE spelling.
+`Context` carries execution lifetime and capabilities for admitted model inputs and
+declared outputs. TensorFS owns the returned source/output handles and native receipts;
+Context binds them to this invocation. Store paths, placement/offload controls and
+provider credentials remain outside this surface. The seeded request generator is
+`view.generator`.
 
 The `Model` boundary itself is `author/_model.py`; this module holds only what both it and
 the handler surface need, so the construction plane can import the request plane and never
@@ -18,12 +18,16 @@ import random
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, final
+from typing import TYPE_CHECKING, Any, Literal, final
 
 from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
 
 if TYPE_CHECKING:
+    from tensorfs.derived import OutputCapability, SourceCapability
+
+    from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
+    from cozy_runtime.author._model import Model
 
 DeviceType = Literal["cuda", "cpu", "mps"]
 
@@ -123,6 +127,40 @@ class Context:
     device: Device = field(default_factory=Device)
     _cancel: Callable[[], bool] = field(default=lambda: False, repr=False)
     _adapters: tuple[AdapterRef, ...] = field(default=(), repr=False)
+    _tensorfs_source: Callable[[Model[object]], SourceCapability] | None = field(
+        default=None, repr=False
+    )
+    _tensorfs_output: Callable[[str], OutputCapability] | None = field(default=None, repr=False)
+    _tensorfs_adopt: Callable[[Mapping[str, Any]], ModelArtifact] | None = field(
+        default=None, repr=False
+    )
+
+    def tensorfs_source(self, model: Model[object]) -> SourceCapability:
+        """Bind an admitted model input to TensorFS's source capability."""
+        self.raise_if_cancelled()
+        if self._tensorfs_source is None:
+            raise CapabilityError(
+                "this attempt has no TensorFS source binding", code="weights_source_ungranted"
+            )
+        return self._tensorfs_source(model)
+
+    def output(self, slot: str) -> OutputCapability:
+        """Return one interface-declared TensorFS output, without enlarging its bound."""
+        self.raise_if_cancelled()
+        if self._tensorfs_output is None:
+            raise CapabilityError(
+                "this attempt has no TensorFS output binding", code="weights_output_ungranted"
+            )
+        return self._tensorfs_output(slot)
+
+    def adopt_model(self, receipt: Mapping[str, Any]) -> ModelArtifact:
+        """Adopt the exact native result of this attempt's declared output."""
+        self.raise_if_cancelled()
+        if self._tensorfs_adopt is None:
+            raise CapabilityError(
+                "this attempt has no TensorFS receipt binding", code="weights_receipt_mismatch"
+            )
+        return self._tensorfs_adopt(receipt)
 
     @property
     def cancelled(self) -> bool:

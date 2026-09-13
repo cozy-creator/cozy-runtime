@@ -7,6 +7,7 @@ no supervisor ACK authority and no fallback execution lane.
 from __future__ import annotations
 
 import io
+import socket
 import threading
 from collections.abc import Iterator
 from concurrent import futures
@@ -268,6 +269,72 @@ def test_intent_uses_durable_epoch_and_ordered_control_without_host_ack(rig: Rig
     assert second == first
     assert rig.control.frames[-2].weights_intent.control_stream_epoch == 2
     assert Workspace(Path(rig.store.root)).weights_row(OWNER, TRANSACTION)["epoch"] == 1
+
+
+def test_worker_binds_native_output_replay_and_adoption_without_executor_store(
+    rig: Rig, tmp_path: Path
+) -> None:
+    from tensorfs.derived import Derivation, Part, Source, Target, Tensor
+
+    from cozy_runtime import canonical_json
+    from cozy_runtime.author import CapabilityError
+    from cozy_runtime.internal.weights_writer import ExecutionStorage
+    from weights_channel import exchange as channel_exchange
+
+    attempt = rig.accept()
+    attempt.state = "running"
+    attempt.spool = tmp_path / "spool"
+    attempt.spool.mkdir()
+    attempt.spec = canonical_json.decode(rig.invocation)
+    attempt.weights_work_fingerprint = "sha256:" + "65" * 32
+    maximum = attempt.spec["outputs"][0]["max_bytes"]
+    client = ExecutionStorage(
+        attempt.spool,
+        channel_exchange(lambda frame: rig.exchange.writer_broker.handle(attempt, frame)),
+        {"model": maximum},
+    )
+    plain = dict(tensorfs.seed_digests())["plain/1"]
+    definition = Derivation(
+        {},
+        {
+            "model": Target(
+                add={"weight": Tensor("f32", (512,), plain, {"value": Part("f32", (512,))})}
+            )
+        },
+        {},
+        [("model", "weight")],
+    )
+    forged = Derivation(
+        {"base": Source("sha256:" + "f1" * 32, 1)}, definition.targets, {}, definition.order
+    )
+    with pytest.raises(CapabilityError) as refused:
+        client.open_output("model", forged)
+    assert refused.value.code == "weights_source_ungranted"
+    assert rig.store.derived_lookup(TRANSACTION)["state"] == "absent"
+
+    writer = client.open_output("model", definition)
+    assert writer.receipt is None
+    row = rig.workspace.weights_row(OWNER, TRANSACTION)
+    assert row["ready"] and row["epoch"] == 1
+    writer.add_part("model", "weight", "value", io.BytesIO(bytes(2048)))
+    facts = writer.commit()
+    assert rig.workspace.weights_row(OWNER, TRANSACTION)["receipt"]
+    with pytest.raises(CapabilityError) as refused:
+        client.adopt_model({**facts, "manifest": {"sha256": "f2" * 32, "length": 1}})
+    assert refused.value.code == "weights_receipt_mismatch"
+    artifact = client.adopt_model(facts)
+    assert artifact.manifest.digest == "sha256:" + facts["manifest"]["sha256"]
+    assert attempt.weights_receipts["model"].weights_receipt_canonical_bytes
+
+    # Replay is the worker's retained native decision and journals before FD receipt reply.
+    replay = client.open_output("model", definition)
+    assert replay.receipt == facts
+    assert client.adopt_model(replay.receipt) == artifact
+    assert rig.store.derived_lookup(TRANSACTION)["state"] == "committed"
+    rig.exchange.writer_broker.close_attempt(attempt)
+    with pytest.raises(CapabilityError) as refused:
+        client.adopt_model(facts)
+    assert refused.value.code == "weights_receipt_mismatch"
 
 
 def test_new_attempt_fences_prior_epoch_and_cannot_change_transaction(rig: Rig) -> None:
@@ -532,3 +599,67 @@ def test_retired_exchange_cannot_grant_custody(rig: Rig) -> None:
     assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
     assert not rig.exchange.writer_broker.bindings
     assert not rig.control.frames
+
+
+def test_scoped_native_commit_records_workspace_before_return_and_has_no_tensor_spool(
+    rig: Rig, tmp_path: Path
+) -> None:
+    from cozy_runtime import canonical_json
+    from cozy_runtime.internal.seam import Channel, DescriptorReply
+    from cozy_runtime.internal.weights_writer import StoreProxy
+
+    spec = canonical_json.decode(rig.invocation)
+    maximum = spec["outputs"][0]["max_bytes"]
+    fingerprint = "sha256:" + "65" * 32
+    order = [("model", "weight")]
+    rig.declaration = rig.store.derived_declaration(
+        {}, rig.targets, {}, order, maximum, work_fingerprint=fingerprint
+    )
+    attempt = rig.accept()
+    attempt.state = "running"
+    attempt.spool = tmp_path / "scoped-executor"
+    attempt.spool.mkdir()
+    attempt.spec = spec
+    attempt.weights_work_fingerprint = fingerprint
+    rig.intent(attempt)
+    control_requests: list[str] = []
+
+    def exchange(kind: str, frame: dict[str, Any], *, descriptor: bool = False) -> dict[str, Any]:
+        assert kind == "weights_writer"
+        control_requests.append(frame["operation"])
+        reply = rig.exchange.writer_broker.handle(attempt, frame)
+        if not isinstance(reply, DescriptorReply):
+            return reply
+        assert descriptor
+        left, right = socket.socketpair()
+        try:
+            with left, right:
+                sender, recipient = Channel(left), Channel(right)
+                sender.send(dict(reply))
+                sender.send_descriptor(reply.descriptor)
+                received = recipient.recv()
+                assert received is not None
+                received["descriptor"] = recipient.recv_descriptor()
+                return received
+        finally:
+            reply.descriptor.close()
+
+    proxy = StoreProxy(rig.store, attempt.spool, exchange)
+    writer = proxy.begin_derived(
+        TRANSACTION, 1, {}, rig.targets, {}, order, maximum, work_fingerprint=fingerprint
+    )
+    writer.add_part("model", "weight", "value", bytes(2048))
+    writer.checkpoint()
+    receipt = writer.commit()
+    recorded = rig.workspace.weights_row(OWNER, TRANSACTION)
+    assert recorded["receipt"], "native commit escaped its durable Runtime receipt recorder"
+    body = documents.read(recorded["receipt"], pb.WeightsReceipt)
+    assert body["tensorfs_receipt_digest"] == (
+        "sha256:" + sha256(canonical_json.encode(receipt)).hexdigest()
+    )
+    assert control_requests == ["open"], "per-role traffic still crossed Runtime control"
+    assert not list(attempt.spool.glob("*-input"))
+    assert not list(attempt.spool.glob("*-output"))
+    assert not list(attempt.spool.glob("*-receipt.canonical"))
+    assert rig.store.derived_lookup(TRANSACTION)["state"] == "committed"
+    rig.exchange.writer_broker.close_attempt(attempt)

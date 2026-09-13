@@ -154,6 +154,8 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
         publishes=registration.publishes,
         weights_outputs=registration.weights,
     )
+    if registration.weights and "weights" not in capabilities:
+        capabilities.append("weights")
     check_model_arguments(
         registration.model_defaults,
         [str(slot["path"]).rsplit(".", 1)[-1] for slot in models],

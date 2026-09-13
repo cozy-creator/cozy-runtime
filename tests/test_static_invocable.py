@@ -132,6 +132,16 @@ def test_invocable_defaults_are_part_of_the_static_interface_identity(tmp_path: 
     assert before != after
 
 
+def test_declared_tensorfs_output_is_a_capability_without_a_weights_sink_parameter(
+    tmp_path: Path,
+) -> None:
+    source = OPERATIONS.replace("weights: WeightsSink, tel: Telemetry", "tel: Telemetry")
+    document = static_interface.build(project(tmp_path, source))
+    jobs = {row["name"]: row for row in cast(list[dict[str, Any]], document["jobs"])}
+    assert jobs["quantize-artifact"]["invocable"]["capabilities"] == ["telemetry", "weights"]
+    assert jobs["quantize-artifact"]["weights_outputs"][0]["output_id"] == "model"
+
+
 @pytest.mark.parametrize(
     ("old", "new"),
     [

@@ -90,8 +90,9 @@ def test_graft_is_native_declared_granted_and_retained(tmp_path: Path) -> None:
     header = tensorfs.parse_header(result_bytes)
     assert header["components"]["model"]["table"] == bank_header["components"]["model"]["weight"]
 
-    with pytest.raises(CapabilityError, match="immutable grant"):
+    with pytest.raises(CapabilityError) as ungranted:
         _host(store, "ungranted", {body: body_length}, 0).open(request)
+    assert ungranted.value.code == "weights_source_ungranted"
     with pytest.raises(CapabilityError):
         host.open(
             replace(
