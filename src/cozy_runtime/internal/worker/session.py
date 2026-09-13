@@ -2260,6 +2260,8 @@ class Worker:
             attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD
             for attempt in self.engine.history.values()
         ):
+            # on_offer journals the queue before a lane begins accepting it. That queue
+            # already owns its preparation and admission epoch, just like a running job.
             return False
         desired = machine_capture.restore(self, preparation)
         desired.revision = self.accepted.accepted_desired_state_revision + 1

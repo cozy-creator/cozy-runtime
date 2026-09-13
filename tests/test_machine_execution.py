@@ -920,3 +920,24 @@ app.job(helper)
             else:
                 worker.shutdown()
             assert not thread.is_alive()
+
+
+def test_queued_offer_prevents_preparation_switch_before_lane_accepts() -> None:
+    from types import SimpleNamespace
+
+    from cozy_runtime.internal.worker.attempts import AttemptEngine
+    from cozy_runtime.internal.worker.session import Worker
+
+    # No lane consumer has accepted this offer yet. A second captured package must
+    # leave the first package's preparation and admission epoch intact during that gap.
+    worker = SimpleNamespace(
+        accepted=SimpleNamespace(accepted_desired_state_revision=1, desired_state_body=b"first"),
+        engine=SimpleNamespace(
+            history={("first", 1): SimpleNamespace(state="queued")},
+            ON_DEVICE=AttemptEngine.ON_DEVICE,
+            HELD=AttemptEngine.HELD,
+        ),
+    )
+    state = pb.DesiredWorkerState(job=pb.JobDirective(build_id="different"))
+    preparation = {"state": base64.b64encode(state.SerializeToString()).decode()}
+    assert Worker._prepare_execution(worker, preparation) is False  # type: ignore[arg-type]
