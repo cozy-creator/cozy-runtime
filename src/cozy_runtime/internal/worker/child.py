@@ -117,6 +117,9 @@ class Executor:
     #: this is what the executor actually serves, and reusing it for a lane whose
     #: `devices` differ is what `executor.py` refuses as `env_seal_broken`.
     sealed_devices: str = ""
+    #: Frozen launch environment, independent of the supervision's next selection.
+    launch_python: str = ""
+    environment_content_digest: str = ""
     hello: dict[str, Any] = field(default_factory=dict)
     ready_bindings: set[str] = field(default_factory=set)
     construction_key: str = ""
@@ -689,11 +692,12 @@ class ExecutorSupervision:
 
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_digest):
             raise ExecutorGone(f"invalid package content digest for JIT cache: {content_digest!r}")
-        if (self.python, self.environment_content_digest) == (python, content_digest):
-            return False
-        self.python = python
-        self.environment_content_digest = content_digest
-        return True
+        with self._lifecycle:
+            if (self.python, self.environment_content_digest) == (python, content_digest):
+                return False
+            self.python = python
+            self.environment_content_digest = content_digest
+            return True
 
     def _prepare_jit_cache(self) -> dict[str, str]:
         """Impose every upstream cache path before Python can import Torch.
@@ -830,6 +834,8 @@ class ExecutorSupervision:
                 channel=Channel(conn),
                 seal_digest=spawned.seal_digest,
                 sealed_devices=spawned.env.get("CUDA_VISIBLE_DEVICES", ""),
+                launch_python=self.python,
+                environment_content_digest=self.environment_content_digest,
                 spawned_at=started,
             )
             # Identity is checked before `current` can point at it: a stale connector is not

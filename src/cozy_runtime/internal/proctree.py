@@ -321,6 +321,13 @@ def _full_proc_visibility(process_uid: int, *, require_environment: bool) -> boo
                 (entry / "environ").read_bytes()
         except FileNotFoundError:
             continue  # one birth ended during the census
+        except ProcessLookupError as exc:
+            # _linux_stat wraps filesystem errors. Only a confirmed vanished
+            # birth is harmless; permission and unknown I/O failures still refuse.
+            cause = exc.__cause__
+            if isinstance(cause, OSError) and cause.errno in (errno.ENOENT, errno.ESRCH):
+                continue
+            return False
         except (OSError, StopIteration, ValueError):
             return False
     return True
