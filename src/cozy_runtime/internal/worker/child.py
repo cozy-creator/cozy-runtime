@@ -326,6 +326,14 @@ class ExecutorSupervision:
             raise ExecutorGone(
                 f"worker root {self.root} is already supervised by another live worker"
             ) from exc
+        # Rank 0 writes warm-call tensors before any request has an attempt spool.
+        # Provision that subtree before dropping privileges; the worker root remains
+        # traverse-only for the executor and cannot be created beneath by that UID.
+        warm = self.root / "warm"
+        warm.mkdir(mode=0o700, exist_ok=True)
+        if self.isolated:
+            os.chown(warm, self.executor_uid, self.executor_gid)
+        warm.chmod(0o700)
         # The epoch starts at 1 (02 §0): a worker that has not spawned yet already
         # carries a valid fence rather than a zero.
         self.epoch = 1
@@ -381,10 +389,9 @@ class ExecutorSupervision:
         path.chmod(0o700)
 
     def handoff(self, epoch: int, document: str) -> Path:
-        """The one path under this worker's run root the current executor may write a
-        control document to (a derived interface); the reader unlinks it at once. There
-        is no executor scratch tree: bytes a job stages live in the owner's `tmp/<id>/`
-        through the grant, and a worker root holds nothing but `run/` and its log.
+        """Grant the current executor a derived control document; the reader unlinks it
+        at once. Request scratch remains in the owner's `tmp/<id>/` through its grant;
+        preparation's warm tensor spool is provisioned separately at supervisor startup.
 
         THE GRANTED DIRECTORY IS THE WHOLE SURFACE, which is why this returns the document
         and not the directory holding it. Callers used to append their own subdirectory and
