@@ -184,7 +184,7 @@ class DeviceLane:
     def memory(self, kind: str) -> DeviceMemory:
         """The lane's ONE reading: the MIN over its devices, UNREADABLE if any is.
 
-        A group holds the full weights on every card, so what the lane can hold is what
+        Every rank follows one residency plan, so what the lane can hold is what
         its tightest card can hold; one card the driver cannot read makes the lane
         unreadable rather than "the others looked fine" (never authorized zero).
         """
@@ -658,11 +658,8 @@ class LaneSet:
         short: list[str] = []
         for ordinal in pin:
             memory = measured.get(ordinal)
-            holder = self.holder_of(ordinal)
-            assert holder is not None
             if memory is None or memory.state != "measured":
                 short.append(f"ordinal {ordinal} ({self.entries[ordinal]!r}) free bytes unreadable")
-                continue
         if short:
             raise LaneRefusal(
                 "device_group_infeasible",
