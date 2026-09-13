@@ -160,15 +160,15 @@ wheels = [
 
 [[package]]
 name = "cozy-eval"
-version = "0.4.0"
+version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "msgspec" },
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e5/47/be8ded1dbc4d520d588a8770a0c7e597c7edd42d8949eb3006a7df5a1e45/cozy_eval-0.4.0.tar.gz", hash = "sha256:6f1193f3984222415b8db404a8d601cda58d14e903138f6818811493bc3d90ff", size = 1834890, upload-time = "2026-09-08T06:21:58.108Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/34/b1/b690850af5bea5c31e1493be8fcc02cf5671a0ba1631c0c53fcd114745f8/cozy_eval-0.7.0.tar.gz", hash = "sha256:51dd344a72aeca4573cf8901db9de48598142ee6b7cc7b6266a032c4fb458e24", size = 1891260, upload-time = "2026-09-09T04:09:22.098Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c4/6d/e5f9de8ef070302df96e300eada3a4047c9299d72618832d9e061438420a/cozy_eval-0.4.0-py3-none-any.whl", hash = "sha256:4442b4ad918e9233263598bd60655620fb01d6118afc23bc7a8b06b380df4d07", size = 337794, upload-time = "2026-09-08T06:21:56.473Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/6d/c18b83d1397e8c099f32e9a1752312ad4d4727d37532e78a4b86ce3de470/cozy_eval-0.7.0-py3-none-any.whl", hash = "sha256:7d4626361e08eaab30db46963783d2c06e9592ced1f38115ac352bc1f7449db1", size = 381704, upload-time = "2026-09-09T04:09:20.094Z" },
 ]
 
 [[package]]
@@ -186,6 +186,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+assessment = [
+    { name = "cozy-eval" },
+]
 corpus = [
     { name = "diffusers" },
     { name = "torch" },
@@ -216,6 +219,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "av", marker = "extra == 'media'", specifier = ">=18.1,<19" },
+    { name = "cozy-eval", marker = "extra == 'assessment'", specifier = ">=0.7,<0.8" },
     { name = "cryptography", specifier = ">=45" },
     { name = "diffusers", marker = "extra == 'corpus'", specifier = ">=0.36" },
     { name = "grpcio", specifier = ">=1.76" },
@@ -223,23 +227,23 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "pillow", specifier = ">=12,<13" },
     { name = "protobuf", specifier = ">=6.31" },
-    { name = "tensorfs", specifier = ">=0.3.39,<0.4" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.39,<0.4" },
+    { name = "tensorfs", specifier = ">=0.3.41,<0.4" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.41,<0.4" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
 ]
-provides-extras = ["derive", "corpus", "media", "model-execution"]
+provides-extras = ["assessment", "derive", "corpus", "media", "model-execution"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "av", specifier = ">=18.1,<19" },
-    { name = "cozy-eval", specifier = "==0.4.0" },
+    { name = "cozy-eval", specifier = "==0.7.0" },
     { name = "mypy", specifier = ">=1.13" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=8.4" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.3.39,<0.4" },
+    { name = "tensorfs", specifier = ">=0.3.41,<0.4" },
     { name = "types-protobuf", specifier = ">=6.30" },
 ]
 
@@ -1022,11 +1026,11 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.3.39"
+version = "0.3.41"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ea/a2/6073c8094592ce4301748e0b49c26b329eb39bc3f4b30558cd5b9c234052/tensorfs-0.3.39.tar.gz", hash = "sha256:3930ea8b8352f27acac120fcb890a4d099d4dced40fef030c8e6d2e972ebf6b4", size = 736331, upload-time = "2026-09-13T01:22:05.87Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/54/d9/704ef93804aa2e4704cad5545cb58e7bdf83528cae5a7d9e991199d57d96/tensorfs-0.3.41.tar.gz", hash = "sha256:81cf689281c0c88c5f6f3a5848a4568a87313733e5e8d74a2e7f5dd3f204cf9a", size = 746710, upload-time = "2026-09-13T23:18:39.333Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b0/52/6a2a73a18893edaa82793ca9edcb891fb6b1b917f0a149493dfd1943a3a2/tensorfs-0.3.39-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:dbd88b81d9c16dd05a898e574a3ada72b159b106ffd43c43a4c9c856904a04a0", size = 7654415, upload-time = "2026-09-13T01:22:03.616Z" },
+    { url = "https://files.pythonhosted.org/packages/72/70/a249c23d1e2460119c24c345d592f4a414966340f96c73a0699443872f10/tensorfs-0.3.41-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c29a9f5370e84d79c4ec82a6592d055142d6814e1ab2d1250c4233756933029a", size = 7670456, upload-time = "2026-09-13T23:18:37.415Z" },
 ]
 
 [[package]]
