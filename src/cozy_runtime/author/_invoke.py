@@ -265,7 +265,7 @@ def _bind_tensorfs(ctx: Context, record: Attempt, inv: Invocation, surface: Surf
             current()
             return capability.inspect(components=components, configs=configs)
 
-        return SourceCapability(capability.manifest, capability.length, inspect)
+        return SourceCapability(capability.manifest, capability.length, inspect, capability.close)
 
     def output(slot: str) -> OutputCapability:
         current()
