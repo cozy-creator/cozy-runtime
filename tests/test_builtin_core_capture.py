@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from test_builtin_operation_carrier import carrier
+from test_installed_dependencies import _distribution
 
 
 def test_core_sdk_capture_is_offline_and_later_preparation_uses_captured_code(
@@ -56,6 +57,11 @@ assert broker is not None and 'numpy' not in sys.modules
         str(core / "bin/python"), "import importlib.metadata as m; print(m.version('cozy-runtime'))"
     )
     capsule = carrier(tmp_path / "carrier", version=version)
+    site = next(core.glob("lib/python*/site-packages"))
+    unrelated = _distribution(site, "unrelated-sdk-tool", {"unused.dat": b"not needed"})
+    # Deliberately absent bytes prove capture never tries copying an unrelated
+    # installed dependency; the real Runtime closure still gets captured below.
+    (site / "unused.dat").unlink()
 
     def operation(
         executable: str, verb: str, target: Path, *, offline: bool = False
@@ -83,6 +89,10 @@ assert broker is not None and 'numpy' not in sys.modules
     captured = operation(
         str(core / "bin/python"), "builtin-capture", tmp_path / "captured", offline=True
     )
+    assert "unrelated-sdk-tool" not in captured["closure"]
+    assert not (
+        Path(captured["environment_python"]).parent.parent / unrelated.relative_to(core)
+    ).exists()
     python(captured["environment_python"], probe)
     # Replace code in the original SDK after capture. The later operation must use
     # the retained snapshot; source freezing is byte custody, not a version check.
