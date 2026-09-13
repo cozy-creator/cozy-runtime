@@ -39,29 +39,42 @@ def public_bindings(root: Path) -> tuple[Placement, dict[str, DeclaredBinding]]:
         raw = manifest.read_bytes()
         store.put_manifest(raw, documents.spell(documents.digest_of(raw)), len(raw))
         store.put_file(
-            str(header), documents.spell(documents.digest_of(header.read_bytes())),
+            str(header),
+            documents.spell(documents.digest_of(header.read_bytes())),
             header.stat().st_size,
         )
     raw = (FIXTURE / "placement.json").read_bytes()
-    (entry,) = read_placement_set(pb.DesiredPlacementSet(
-        placement_set_digest=documents.digest_of(raw), placement_set_canonical_bytes=raw,
-    ))
+    (entry,) = read_placement_set(
+        pb.DesiredPlacementSet(
+            placement_set_digest=documents.digest_of(raw),
+            placement_set_canonical_bytes=raw,
+        )
+    )
     interface = (FIXTURE / "package-interface.json").read_bytes()
     assert canonical.digest(json.loads(interface)) == entry["package_interface"]["digest"]
     cache = root / "artifacts"
     cache.mkdir()
     (cache / entry["package_interface"]["digest"].removeprefix("sha256:")).write_bytes(interface)
     placement = Placement(
-        placement_id=entry["placement_id"], placement_set_digest=documents.digest_of(raw),
-        package=entry["package"], development={},
+        placement_id=entry["placement_id"],
+        placement_set_digest=documents.digest_of(raw),
+        package=entry["package"],
+        development={},
         environment_digest=documents.raw(entry["environment_digest"]),
         package_interface=(entry["package_interface"]["digest"], len(interface)),
-        bindings_digest=documents.raw(entry["bindings_digest"]), models=tuple(entry["models"]),
-        entrypoints=tuple(entry["entrypoints"]), environment=entry["environment"], document=entry,
+        bindings_digest=documents.raw(entry["bindings_digest"]),
+        models=tuple(entry["models"]),
+        entrypoints=tuple(entry["entrypoints"]),
+        environment=entry["environment"],
+        document=entry,
     )
     result, _ = Acquirer(
-        cache_root=cache, install_root=root / "environment", selection_root=root / "selection",
-        tensorfs_root=store_root, base=base_observation.current(), python=Path("/usr/bin/python3"),
+        cache_root=cache,
+        install_root=root / "environment",
+        selection_root=root / "selection",
+        tensorfs_root=store_root,
+        base=base_observation.current(),
+        python=Path("/usr/bin/python3"),
     )._bindings(placement)
     return placement, dict(result)
 
