@@ -127,6 +127,34 @@ async def nested(ctx: Context, payload: Request) -> Result:
 """
 
 
+FILE_SOURCE = """import msgspec
+from cozy_runtime.author import App, Context, FileAsset, Outputs, invocable
+app = App()
+class Request(msgspec.Struct):
+    pass
+class Result(msgspec.Struct):
+    value: int
+class Report(msgspec.Struct):
+    report: FileAsset
+@invocable(memoize=True)
+async def leaf(ctx: Context, out: Outputs, *, n: int) -> Report:
+    path = out.temporary_file('.json')
+    path.write_bytes(b'{"observed":7}')
+    return Report(out.save_file(path, media_type='application/json'))
+app.job(leaf)
+@invocable
+async def compose(ctx: Context, *, n: int) -> Result:
+    first = await leaf(n=n)
+    second = await leaf(n=n)
+    assert first.report.read_bytes() == second.report.read_bytes() == b'{"observed":7}'
+    return Result(12)
+app.job(compose)
+@app.job
+async def nested(ctx: Context, payload: Request) -> Result:
+    return await compose(n=3)
+"""
+
+
 def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread]:
     fixture = Path(__file__).parent / "testdata/native_source"
     body = (fixture / "first.safetensors").read_bytes()
@@ -169,7 +197,7 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
 @pytest.mark.parametrize(
-    "case", ["normal", "pause", "loss", "cycle", "capacity", "model", "source"]
+    "case", ["normal", "pause", "loss", "cycle", "capacity", "model", "source", "file"]
 )
 def test_nested_capture_and_leaf_memoization_without_control_stream(
     monkeypatch: pytest.MonkeyPatch, case: str
@@ -180,6 +208,8 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
     with tempfile.TemporaryDirectory(prefix="cz-child.") as directory:
         root = Path(directory)
         source = MODEL_SOURCE if case in ("model", "source") else SOURCE
+        if case == "file":
+            source = FILE_SOURCE
         if case == "source":
             source = source.replace(
                 'return Result(len(view.components["body"]))',

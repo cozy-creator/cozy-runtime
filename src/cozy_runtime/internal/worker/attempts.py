@@ -2265,7 +2265,8 @@ class AttemptEngine:
                     and str(row["asset_ref"]).startswith("sha256:")
                     else None
                 )
-                if row.get("kind") == "tree":
+                tree = row.get("kind") == "tree"
+                if tree or (native and not attempt.grant.outputs[output_id].url):
                     if not native:
                         raise grants.GrantRefusal(
                             "native_tree_unsupported", "tree outputs require wire43 native custody"
@@ -2275,7 +2276,11 @@ class AttemptEngine:
                     from .workspace_byte_outputs import TREE_MIME
 
                     root = (
-                        received[0] if received else self._blob_path(spool, str(row["asset_ref"]))
+                        received[0]
+                        if received
+                        else self._blob_path(spool, str(row["asset_ref"]))
+                        if tree
+                        else self._blob(spool, str(row["asset_ref"]))
                     )
                     if root is None or self.tensorfs_root is None:
                         raise grants.GrantRefusal(
@@ -2283,7 +2288,9 @@ class AttemptEngine:
                         )
                     destination = attempt.grant.outputs[output_id]
                     media_type = grants._output_media_type(
-                        output_id, destination.mime_type, TREE_MIME
+                        output_id,
+                        destination.mime_type,
+                        TREE_MIME if tree else str(row.get("media_type") or ""),
                     )
                     if received:
                         entry = byte_outputs.reexport(
@@ -2294,7 +2301,7 @@ class AttemptEngine:
                             attempt.digest,
                             output_id,
                             received[1],
-                            tree=True,
+                            tree=tree,
                             max_bytes=destination.max_bytes or (256 << 20),
                             media_type=media_type,
                         )
@@ -2307,7 +2314,7 @@ class AttemptEngine:
                             attempt.digest,
                             output_id,
                             root,
-                            tree=True,
+                            tree=tree,
                             max_bytes=destination.max_bytes or (256 << 20),
                             media_type=media_type,
                         )
