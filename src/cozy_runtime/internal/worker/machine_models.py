@@ -111,13 +111,13 @@ def release(workspace: Workspace, owner: str, recipient: str) -> None:
 
 
 def file_source(
-    workspace: Workspace, owner: str, parent: str, digest: str, length: int
+    workspace: Workspace, owner: str, parent: str, digest: str, length: int | None = None
 ) -> pb.NativeByteRetentionRequest:
     """Resolve a typed file only among native payload trees actually received by this parent."""
     from . import workspace_byte_outputs
 
     documents.raw(digest)
-    if type(length) is not int or not 0 <= length <= 8 << 20:
+    if length is not None and (type(length) is not int or not 0 <= length <= 8 << 20):
         raise WorkspaceRefusal("received metadata file exceeds its 8 MiB bound")
     with workspace.locked() as db:
         rows = db.execute(
@@ -131,8 +131,9 @@ def file_source(
             held = db.execute(
                 "SELECT h.*,b.content_bytes FROM holds h JOIN byte_outputs b ON b.owner=h.owner "
                 "AND b.id=h.transaction_id WHERE h.owner=? AND h.id=? AND h.state='held' "
-                "AND h.kind='tree' AND h.native_digest=? AND b.content_bytes=?",
-                (owner, hold.retention_id, hold.tensorfs_receipt_digest, length),
+                "AND h.kind='tree' AND h.native_digest=? AND b.content_bytes<=? "
+                "AND (? IS NULL OR b.content_bytes=?)",
+                (owner, hold.retention_id, hold.tensorfs_receipt_digest, 8 << 20, length, length),
             ).fetchone()
             if held is not None:
                 candidates.append(
@@ -154,7 +155,7 @@ def file_source(
                 {
                     "kind": "file",
                     "path": "payload",
-                    "blob": {"sha256": digest[7:], "length": length},
+                    "blob": {"sha256": digest[7:], "length": candidate.source.content_bytes},
                 }
             ]:
                 return candidate

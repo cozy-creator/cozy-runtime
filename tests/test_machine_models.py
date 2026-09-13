@@ -118,6 +118,7 @@ def test_metadata_file_resolver_requires_actual_parent_received_custody(tmp_path
     grant = machine_models.retain_bytes(workspace, "owner", "parent", "call.0.report", source)
     held = machine_models.file_source(workspace, "owner", "parent", digest, len(data))
     assert held.source == source and held.retention_id == grant.retention_id
+    assert machine_models.file_source(workspace, "owner", "parent", digest) == held
     for owner, parent, wrong in (
         ("foreign", "parent", digest),
         ("owner", "different", digest),
