@@ -531,7 +531,8 @@ def analyze(
         params=tuple(params),
         payload_type=payload_type,
         result_type=strip(result)[0],
-        capabilities=frozenset(p.capability for p in params if p.capability),
+        capabilities=frozenset(p.capability for p in params if p.capability)
+        | ({"weights"} if weights_outputs else set()),
         publishes=publishes,
         emits_media=emits_media,
         weights_outputs=weights_outputs,

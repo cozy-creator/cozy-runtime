@@ -96,6 +96,67 @@ def test_executor_config_uses_parent_store_and_exact_input_grant(tmp_path: Path)
     assert failure.value.code == "weights_writer_closed"
 
 
+def test_native_source_fd_uses_exact_grant_and_is_fenced_with_attempt(tmp_path: Path) -> None:
+    from tensorfs.derived import SourceCapability
+
+    from cozy_runtime.internal.weights_writer import ExecutionStorage
+    from weights_channel import exchange as channel_exchange
+
+    store, manifest, length = _released_source(tmp_path)
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    attempt = SimpleNamespace(
+        request_id="native-source",
+        attempt=1,
+        state="running",
+        canceling="",
+        spool=spool,
+        spec={
+            "inputs": [{"input_id": MODEL_PREFIX + "source", "digest": manifest, "length": length}]
+        },
+    )
+    broker = WriterBroker(lambda: store, store_root=Path(store.root))
+    client = ExecutionStorage(
+        spool, channel_exchange(lambda frame: broker.handle(attempt, frame)), {}
+    )
+    try:
+        with client.source(manifest) as source:
+            inspection = source.inspect()
+            assert inspection.source.manifest == manifest
+            assert inspection.source.length == length
+            assert inspection.configs["unet"] == _CONFIG
+            assert inspection.components
+        assert list(spool.iterdir()) == []
+        with pytest.raises(CapabilityError) as refused:
+            client.source("sha256:" + "ff" * 32)
+        assert refused.value.code == "weights_source_ungranted"
+
+        answer = client._call("source", manifest=manifest, descriptor=True)
+        with SourceCapability.from_fd(manifest, length + 1, answer["descriptor"]) as forged:
+            with pytest.raises(Exception) as refused_native:
+                forged.inspect()
+            assert getattr(refused_native.value, "code", "") == "TRANSACTION_CONFLICT"
+
+        # Native source validation independently verifies the worker's exact admitted length.
+        attempt.spec["inputs"][0]["length"] += 1
+        with client.source(manifest) as stale, pytest.raises(Exception) as absent:
+            stale.inspect()
+        assert getattr(absent.value, "code", "")
+        attempt.spec["inputs"][0]["length"] = length
+        outstanding = client.source(manifest)
+        outstanding.inspect()
+        broker.close_attempt(attempt)
+        with pytest.raises((EOFError, OSError)):
+            outstanding.inspect()
+        assert broker.sources == {}
+        attempt.canceling = "canceled"
+        with pytest.raises(CapabilityError) as refused:
+            client.source(manifest)
+        assert refused.value.code == "weights_writer_closed"
+    finally:
+        broker.close()
+
+
 @pytest.mark.skipif(os.geteuid() != 0, reason="separate executor UID requires root/container")
 def test_parent_config_read_preserves_repository_permissions(tmp_path: Path) -> None:
     store, manifest, length = _released_source(tmp_path)

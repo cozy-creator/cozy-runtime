@@ -1,4 +1,4 @@
-"""The real parent broker moves native role state through its existing bounded spool."""
+"""The native writer channel preserves completed roles across attempt replacement."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from cozy_runtime.internal.weights_writer import StoreProxy, WriterBroker
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+from weights_channel import exchange as writer_exchange
 
 
 def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_head(
@@ -49,8 +50,11 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
     )
     digest = hashlib.sha256(declaration).digest()
     observed: list[dict[str, Any]] = []
+    committed: list[dict[str, Any]] = []
     broker = WriterBroker(
-        lambda: store, checkpoint=lambda _a, _t, _b, facts: observed.append(facts)
+        lambda: store,
+        checkpoint=lambda _a, _t, _b, facts: observed.append(facts),
+        receipt=lambda _a, _t, _b, facts: committed.append(facts),
     )
     attempt = SimpleNamespace(
         request_id="request",
@@ -63,12 +67,11 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
     )
     frames: list[dict[str, Any]] = []
 
-    def exchange(kind: str, frame: dict[str, Any]) -> dict[str, Any]:
-        assert kind == "weights_writer"
+    def handle(frame: dict[str, Any]) -> dict[str, Any]:
         frames.append(dict(frame))
         return broker.handle(attempt, frame)
 
-    proxy = StoreProxy(store, spool, exchange)
+    proxy = StoreProxy(store, spool, writer_exchange(handle))
     transaction = "sha256:" + "72" * 32
     broker.authorize(attempt, transaction, 1, digest, "model")
     with pytest.raises(CapabilityError) as changed:
@@ -83,10 +86,10 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
     assert writer.completed_parts() == []
     data = b"\x31" * (4 << 20)
     writer.add_part("model", "weight", "data", io.BytesIO(data))
-    assert writer.completed_parts() == [["model", "weight", "data"]]
-    head = writer.checkpoint("request", "model")
+    assert writer.completed_parts() == [("model", "weight", "data")]
+    head = writer.checkpoint()
     assert observed == [head]
-    with pytest.raises(CapabilityError):
+    with pytest.raises(tensorfs.errors.ArtifactIncomplete):
         writer.commit()  # Native refusal fences only authority, preserving the complete role.
     broker.close_attempt(attempt)
     assert broker.writers == {} and broker.bindings == {}
@@ -111,14 +114,17 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
         work_fingerprint=fingerprint,
         checkpoint=restored_head,
     )
-    assert writer.completed_parts() == [["model", "weight", "data"]]
+    assert writer.completed_parts() == [("model", "weight", "data")]
     assert writer.completed_configs() == []
-    assert writer.checkpoint("request", "model", previous=restored_head) == head
+    assert writer.checkpoint() == head
     writer.add_part("model", "weight", "scale", io.BytesIO(bytes(2048)))
     receipt = writer.commit()
+    assert committed == [receipt]
     assert len(receipt["added_objects"]) == 2
     broker.close_attempt(attempt)
     assert broker.writers == {} and broker.bindings == {}
+    assert {frame["operation"] for frame in frames} == {"open"}
+    assert not list(spool.glob("*-input")) and not list(spool.glob("*-output"))
     # No payload or model-sized role inventory crosses the durable control request.
     assert all(
         set(frame)
@@ -200,10 +206,15 @@ def test_parent_broker_spends_zero_protobuf_output_grant_on_native_graft(tmp_pat
         weights_work_fingerprint=fingerprint,
         spec=spec,
     )
-    broker = WriterBroker(lambda: store)
+    recorded: list[dict[str, Any]] = []
+    broker = WriterBroker(
+        lambda: store,
+        checkpoint=lambda _a, _t, _b, facts: recorded.append(facts),
+        receipt=lambda _a, _t, _b, facts: recorded.append(facts),
+    )
     transaction = "sha256:" + "84" * 32
     broker.authorize(attempt, transaction, 1, hashlib.sha256(declaration).digest(), "model")
-    proxy = StoreProxy(store, spool, lambda _kind, frame: broker.handle(attempt, frame))
+    proxy = StoreProxy(store, spool, writer_exchange(lambda frame: broker.handle(attempt, frame)))
     with pytest.raises(CapabilityError) as excess:
         proxy.begin_derived(
             transaction, 1, sources, targets, {}, order, 1, work_fingerprint=fingerprint
@@ -213,6 +224,7 @@ def test_parent_broker_spends_zero_protobuf_output_grant_on_native_graft(tmp_pat
         transaction, 1, sources, targets, {}, order, 0, work_fingerprint=fingerprint
     )
     receipt = writer.commit()
+    assert recorded == [receipt]
     assert receipt["added_objects"] == []
     assert receipt["manifest"] == manifest
     broker.close_attempt(attempt)

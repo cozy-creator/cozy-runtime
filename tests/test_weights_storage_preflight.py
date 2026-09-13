@@ -16,11 +16,11 @@ import pytest
 import tensorfs
 
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.author._weights import MAX_WEIGHTS_SOURCE_READ
 from cozy_runtime.internal import storage_admission as storage
 from cozy_runtime.internal.weights_writer import StoreProxy, WriterBroker
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from test_storage_admission import operation
+from weights_channel import exchange as writer_exchange
 
 
 def _rig(
@@ -58,8 +58,14 @@ def _rig(
         weights_work_fingerprint=fingerprint,
         spec={"inputs": [], "outputs": [{"output_id": "model", "max_bytes": maximum}]},
     )
-    broker = WriterBroker(lambda: store, store_root=Path(store.root))
-    proxy = StoreProxy(store, spool, lambda _kind, frame: broker.handle(attempt, frame))
+    recorded: list[dict[str, Any]] = []
+    broker = WriterBroker(
+        lambda: store,
+        store_root=Path(store.root),
+        checkpoint=lambda _a, _t, _b, facts: recorded.append(facts),
+        receipt=lambda _a, _t, _b, facts: recorded.append(facts),
+    )
+    proxy = StoreProxy(store, spool, writer_exchange(lambda frame: broker.handle(attempt, frame)))
 
     def opened(output: str = "model", selected: str = transaction) -> Any:
         broker.authorize(
@@ -80,9 +86,9 @@ def _rig(
 
 
 def _host(channel: socket.socket, accept: bool, rows: list[list[dict[str, Any]]]) -> None:
-    # The first hold admits only opening metadata. The second is the whole pending
-    # writer preflight, whose release is essential before later per-part writes.
-    for index in range(2):
+    # One native preflight includes metadata and all missing bodies. Runtime has
+    # no role spool to reserve, and the hold ends before subsequent part calls.
+    for _index in range(1):
         try:
             if not channel.recv(1, socket.MSG_PEEK):
                 return
@@ -93,11 +99,11 @@ def _host(channel: socket.socket, accept: bool, rows: list[list[dict[str, Any]]]
         with connection:
             connection.sendall(
                 json.dumps(
-                    {"ok": index == 0 or accept, "facts": {"available": 4_883_300_352}}
+                    {"ok": accept, "facts": {"available": 4_883_300_352}}
                 ).encode()
                 + b"\n"
             )
-            if index == 0 or accept:
+            if accept:
                 assert connection.recv(1) == b""
 
 
@@ -116,14 +122,15 @@ def test_model_sized_additions_refuse_before_any_payload_is_requested(
                 opened()
             assert refused.value.code == "insufficient_storage"
             assert "available=4883300352" in str(refused.value)
-            assert not broker.writers and not broker.pending
+            assert not broker.writers
             assert not list(attempt.spool.glob("*-input"))
             assert store.derived_lookup("sha256:" + "72" * 32)["state"] != "committed"
         finally:
             broker.close_attempt(attempt)
         thread.join(3)
         assert not thread.is_alive()
-    assert rows[1][0]["bytes"] == (5 << 30) + 4 * tensorfs.manifest_max_bytes()
+    assert rows[0][0]["bytes"] == (5 << 30) + 4 * tensorfs.manifest_max_bytes()
+    assert len(rows[0]) == 1
 
 
 def test_preflight_uses_geometry_instead_of_the_loose_output_ceiling(
@@ -137,14 +144,15 @@ def test_preflight_uses_geometry_instead_of_the_loose_output_ceiling(
         thread = threading.Thread(target=_host, args=(host, True, rows), daemon=True)
         thread.start()
         try:
-            opened()
+            writer = opened()
             assert broker.writers
+            assert writer.receipt is None
         finally:
             broker.close_attempt(attempt)
         thread.join(3)
         assert not thread.is_alive()
-    assert rows[1][0]["bytes"] == 4096 + 4 * tensorfs.manifest_max_bytes()
-    assert rows[1][1]["bytes"] == 4096 + MAX_WEIGHTS_SOURCE_READ
+    assert rows[0][0]["bytes"] == 4096 + 4 * tensorfs.manifest_max_bytes()
+    assert len(rows[0]) == 1
 
 
 def test_inherited_checkpoint_needs_no_new_payload_budget(
@@ -167,7 +175,9 @@ def test_inherited_checkpoint_needs_no_new_payload_budget(
         {"input_id": MODEL_PREFIX + "source", "digest": source, "length": manifest["length"]}
     ]
     attempt.spec["outputs"].append({"output_id": "inherited", "max_bytes": 0})
-    proxy = StoreProxy(store, attempt.spool, lambda _kind, frame: broker.handle(attempt, frame))
+    proxy = StoreProxy(
+        store, attempt.spool, writer_exchange(lambda frame: broker.handle(attempt, frame))
+    )
     host, worker = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     rows: list[list[dict[str, Any]]] = []
     with host, worker:
@@ -175,7 +185,7 @@ def test_inherited_checkpoint_needs_no_new_payload_budget(
         thread = threading.Thread(target=_host, args=(host, True, rows), daemon=True)
         thread.start()
         try:
-            proxy.begin_derived(
+            inherited = proxy.begin_derived(
                 transaction,
                 1,
                 sources,
@@ -185,12 +195,13 @@ def test_inherited_checkpoint_needs_no_new_payload_budget(
                 0,
                 work_fingerprint=attempt.weights_work_fingerprint,
             )
+            assert inherited.receipt is None
         finally:
             broker.close_attempt(attempt)
         thread.join(3)
         assert not thread.is_alive()
-    assert rows[1][0]["bytes"] == 4 * tensorfs.manifest_max_bytes()
-    assert rows[1][1]["bytes"] == MAX_WEIGHTS_SOURCE_READ
+    assert rows[0][0]["bytes"] == 4 * tensorfs.manifest_max_bytes()
+    assert len(rows[0]) == 1
 
 
 def test_resume_excludes_native_completed_roles(
@@ -208,20 +219,21 @@ def test_resume_excludes_native_completed_roles(
         thread = threading.Thread(target=_host, args=(host, True, rows), daemon=True)
         thread.start()
         try:
-            opened()
+            resumed = opened()
+            assert resumed.receipt is None
         finally:
             broker.close_attempt(attempt)
         thread.join(3)
         assert not thread.is_alive()
-    assert rows[1][0]["bytes"] == 64 + 4 * tensorfs.manifest_max_bytes()
-    assert rows[1][1]["bytes"] == 64 + MAX_WEIGHTS_SOURCE_READ
+    assert rows[0][0]["bytes"] == 64 + 4 * tensorfs.manifest_max_bytes()
+    assert len(rows[0]) == 1
 
 
 def test_open_outputs_share_one_remaining_payload_preflight(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, broker, attempt, opened = _rig(tmp_path, {"weight": 4096}, 1 << 40)
-    opened()
+    first = opened()
     attempt.spec["outputs"].append({"output_id": "second", "max_bytes": 1 << 40})
     host, worker = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     rows: list[list[dict[str, Any]]] = []
@@ -230,10 +242,11 @@ def test_open_outputs_share_one_remaining_payload_preflight(
         thread = threading.Thread(target=_host, args=(host, True, rows), daemon=True)
         thread.start()
         try:
-            opened("second", "sha256:" + "73" * 32)
+            second = opened("second", "sha256:" + "73" * 32)
+            assert first.receipt is None and second.receipt is None
         finally:
             broker.close_attempt(attempt)
         thread.join(3)
         assert not thread.is_alive()
-    assert rows[1][0]["bytes"] == 8192 + 4 * tensorfs.manifest_max_bytes()
-    assert rows[1][1]["bytes"] == 4096 + MAX_WEIGHTS_SOURCE_READ
+    assert rows[0][0]["bytes"] == 8192 + 4 * tensorfs.manifest_max_bytes()
+    assert len(rows[0]) == 1

@@ -139,9 +139,11 @@ def _separation(surface: Surface) -> None:
             f"{surface.name}: weights output names are not unique",
             code="weights_output_duplicate",
         )
-    if surface.weights_outputs and "weights" not in surface.capabilities:
+    if surface.weights_outputs and not any(
+        param.role == "context" or param.capability == "weights" for param in surface.params
+    ):
         raise ConformanceError(
-            f"{surface.name}: declares weights outputs but its signature has no WeightsSink",
+            f"{surface.name}: declares weights outputs but its signature has no Context",
             code="weights_sink_declaration",
         )
     if "weights" in surface.capabilities and not surface.weights_outputs:

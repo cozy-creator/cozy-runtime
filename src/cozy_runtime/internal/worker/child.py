@@ -41,7 +41,7 @@ from cozy_runtime.internal.child_env import (
     EXECUTOR_SCOPE_ENV,
     FLASH_ATTENTION_CACHE_ENABLED_ENV,
 )
-from cozy_runtime.internal.seam import Channel, SeamError, listener
+from cozy_runtime.internal.seam import Channel, DescriptorReply, SeamError, listener
 from cozy_runtime.internal.worker.plan import PreparedModel
 
 #: The grace budget: long enough for the longest uninterruptible kernel plus one loop step,
@@ -201,7 +201,13 @@ class Executor:
                             f"{frame.get('kind')!r}",
                         }
                     )
-                    self.channel.send({"event": "answer", "seq": frame.get("seq"), **answer})
+                    try:
+                        self.channel.send({"event": "answer", "seq": frame.get("seq"), **answer})
+                        if isinstance(answer, DescriptorReply):
+                            self.channel.send_descriptor(answer.descriptor)
+                    finally:
+                        if isinstance(answer, DescriptorReply):
+                            answer.descriptor.close()
                     continue
                 if frame.get("reply") != name:
                     raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")

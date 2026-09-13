@@ -17,9 +17,11 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
+import tensorfs
+from tensorfs.derived import Derivation, SourceInspection, Target
 
 from cozy_runtime.author import (
     Context,
@@ -30,7 +32,6 @@ from cozy_runtime.author import (
     WeightsReceipt,
     WeightsSink,
     WeightsSource,
-    WeightsTarget,
 )
 
 if TYPE_CHECKING:
@@ -137,7 +138,7 @@ def quantize(
     plan: QuantizePlan,
     /,
     *,
-    sink: WeightsSink,
+    sink: WeightsSink | None = None,
     ctx: Context,
     tel: Telemetry,
     output: str = "model",
@@ -155,7 +156,7 @@ def quantize_artifact(
     plan: QuantizePlan,
     /,
     *,
-    sink: WeightsSink,
+    sink: WeightsSink | None = None,
     ctx: Context,
     tel: Telemetry,
     output: str = "model",
@@ -170,7 +171,7 @@ def quantize_artifact(
 
 
 def _artifact_result(
-    result: QuantizeResult, receipt: WeightsReceipt, tel: Telemetry, output: str
+    result: QuantizeResult, artifact: ModelArtifact | WeightsReceipt, tel: Telemetry, output: str
 ) -> ModelArtifact:
     tel.log(
         "quantization measurement",
@@ -183,7 +184,7 @@ def _artifact_result(
         worst_relative_frobenius=result.worst_relative_frobenius,
         normalization_worst_relative_frobenius=result.normalization_worst_relative_frobenius,
     )
-    return receipt.artifact
+    return artifact if isinstance(artifact, ModelArtifact) else artifact.artifact
 
 
 def _quantize(
@@ -191,13 +192,14 @@ def _quantize(
     plan: QuantizePlan,
     /,
     *,
-    sink: WeightsSink,
+    sink: WeightsSink | None = None,
     ctx: Context,
     tel: Telemetry,
     output: str,
     selection: ArtifactQuantizationPlan | None = None,
     preserve_precision: bool = False,
-) -> tuple[QuantizeResult, WeightsReceipt]:
+    source_view: SourceInspection | None = None,
+) -> tuple[QuantizeResult, ModelArtifact | WeightsReceipt]:
     from .quantization import (
         ArtifactQuantizationRequest,
         bf16_targets,
@@ -206,12 +208,22 @@ def _quantize(
         prepare_source_quantization,
         quantization_additions,
         quantize_component_into,
+        source_rows,
         write_bf16,
     )
 
-    model, structure = _resolve(source, sink)
+    native = ctx._tensorfs_output is not None
+    structure: SourceInspection | WeightsSource
+    if native:
+        model = source if not isinstance(source, WeightsSource) else _resolve(source, sink)[0]
+        source_capability = ctx.tensorfs_source(model)
+        structure = source_view or source_capability.inspect()
+    else:
+        # Active released callers and standalone native harnesses retain this
+        # input adapter until their coordinated Context migration is complete.
+        model, structure = _resolve(source, sink)
     keep = (
-        tuple(dict.fromkeys(tensor.component for tensor in structure.tensors))
+        tuple(dict.fromkeys(component for component, _, _ in source_rows(structure)))
         if preserve_precision
         else plan.keep
     )
@@ -238,7 +250,7 @@ def _quantize(
                     for key, tensor in additions.items()
                 },
             }
-            targets[component] = WeightsTarget(
+            targets[component] = Target(
                 source="source",
                 source_component=component,
                 drop=tuple(sorted(combined)),
@@ -250,20 +262,26 @@ def _quantize(
     encoded = 0 if artifact is None else len(artifact.tensors)
     inherited = len(bf16.order) - len(converted) - encoded
 
-    with sink.open(
-        output,
-        sources={"source": model},
-        targets=targets,
-        configs=inherited_configs(bf16, source="source"),
-        order=bf16.order,
-    ) as transaction:
-        if transaction.replayed:
+    configs = inherited_configs(bf16, source="source")
+    manager: Any = (
+        tensorfs.derive(
+            ctx.output(output),
+            Derivation({"source": source_capability}, targets, configs, bf16.order),
+        )
+        if native
+        else cast(Any, sink).open(
+            output, sources={"source": model}, targets=targets, configs=configs, order=bf16.order
+        )
+    )
+    with manager as transaction:
+        if transaction.receipt is not None:
             receipt = transaction.receipt
-            assert receipt is not None
+            result_artifact = ctx.adopt_model(receipt) if native else receipt
+            transaction_id = receipt["transaction_id"] if native else receipt.weights_transaction_id
             return QuantizeResult(
                 output=output,
-                weights_transaction_id=receipt.weights_transaction_id,
-                tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
+                weights_transaction_id=transaction_id,
+                tensorfs_receipt_digest=result_artifact.tensorfs_receipt_digest,
                 replayed=True,
                 encoded_keys=encoded,
                 reused_keys=encoded + len(converted),
@@ -276,7 +294,7 @@ def _quantize(
                 kept_keys=len(bf16.kept),
                 normalization_worst_relative_frobenius=None,
                 canonical=canonical,
-            ), receipt
+            ), result_artifact
         normalization = write_bf16(
             transaction, ctx, tel, plan=bf16, source="source", excluded=selected or None
         )
@@ -312,10 +330,12 @@ def _quantize(
                     else None
                 )
         receipt = transaction.commit()
+        result_artifact = ctx.adopt_model(receipt) if native else receipt
+        transaction_id = receipt["transaction_id"] if native else receipt.weights_transaction_id
     return QuantizeResult(
         output=output,
-        weights_transaction_id=receipt.weights_transaction_id,
-        tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
+        weights_transaction_id=transaction_id,
+        tensorfs_receipt_digest=result_artifact.tensorfs_receipt_digest,
         replayed=False,
         encoded_keys=encoded,
         reused_keys=reused,
@@ -328,13 +348,17 @@ def _quantize(
         kept_keys=len(bf16.kept),
         normalization_worst_relative_frobenius=normalization.worst_relative_frobenius,
         canonical=canonical,
-    ), receipt
+    ), result_artifact
 
 
 def _resolve(
-    source: Model[Any] | WeightsSource, sink: WeightsSink
+    source: Model[Any] | WeightsSource, sink: WeightsSink | None
 ) -> tuple[Model[Any], WeightsSource]:
     """The granted source Model and its structure view, whichever half was handed in."""
+    if sink is None:
+        raise UnsupportedInput(
+            "quantization needs admitted Context capabilities", code="quantization_source"
+        )
     if isinstance(source, WeightsSource):
         granted = {id(model): model for model in sink.models.values()}
         if len(granted) != 1:

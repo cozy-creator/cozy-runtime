@@ -25,13 +25,15 @@ The frames are the ONE vocabulary; there is no second RPC between these two proc
 
 from __future__ import annotations
 
+import array
 import contextlib
 import json
+import os
 import socket
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NoReturn
 
 #: Frames are control. 64 KiB is generous for a payload document and small enough that a
 #: caller trying to move tensors or media through here fails immediately.
@@ -61,6 +63,14 @@ class SeamError(Exception):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+
+
+class DescriptorReply(dict[str, Any]):
+    """A trusted request handler's one connected capability; never a JSON fd number."""
+
+    def __init__(self, body: dict[str, Any], descriptor: socket.socket) -> None:
+        super().__init__({**body, "descriptor": True})
+        self.descriptor = descriptor
 
 
 def _scan(value: Any, path: str = "") -> None:
@@ -107,6 +117,60 @@ class Channel:
         self.sock.sendall(HEADER.pack(len(data)) + data)
         self.sent_bytes += HEADER.size + len(data)
         self.frames_out += 1
+
+    def send_descriptor(self, descriptor: socket.socket) -> None:
+        """Transfer one already-connected local capability after its control answer."""
+        if descriptor.family != socket.AF_UNIX or descriptor.type != socket.SOCK_STREAM:
+            raise SeamError("seam_descriptor", "capability must be a local stream")
+        descriptor.getpeername()
+        try:
+            sent = self.sock.sendmsg(
+                [b"\0"],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [descriptor.fileno()]))],
+            )
+        except OSError as exc:
+            self._raise(exc)
+        if sent != 1:
+            raise SeamError("seam_descriptor", "capability handoff was truncated")
+        self.sent_bytes += 1
+
+    def recv_descriptor(self) -> int:
+        """Receive exactly one connected socket with close-on-exec descriptor custody."""
+        received: list[int] = []
+        width = array.array("i").itemsize
+        try:
+            marker, control, flags, _ = self.sock.recvmsg(
+                1, socket.CMSG_SPACE(width), getattr(socket, "MSG_CMSG_CLOEXEC", 0)
+            )
+            valid = marker == b"\0" and not flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC)
+            for level, kind, data in control:
+                if (level, kind) != (socket.SOL_SOCKET, socket.SCM_RIGHTS):
+                    valid = False
+                    continue
+                descriptors = array.array("i")
+                descriptors.frombytes(data[: len(data) - len(data) % width])
+                received.extend(descriptors)
+                valid = valid and len(data) % width == 0
+            if not valid or len(received) != 1:
+                raise SeamError("seam_descriptor", "expected exactly one scoped capability")
+            # Reject a regular file, listener, TCP socket or datagram before a
+            # storage handle sees it. No address is opened or connected here.
+            descriptor = socket.socket(fileno=received[0])
+            received.clear()  # The socket now owns the received descriptor.
+            try:
+                if descriptor.family != socket.AF_UNIX or descriptor.type != socket.SOCK_STREAM:
+                    raise SeamError("seam_descriptor", "capability must be a local stream")
+                descriptor.getpeername()
+                descriptor.set_inheritable(False)
+                self.recv_bytes += 1
+                return descriptor.detach()
+            finally:
+                descriptor.close()
+        except OSError as exc:
+            self._raise(exc)
+        finally:
+            for descriptor_fd in received:
+                os.close(descriptor_fd)
 
     def recv(
         self, timeout: float | None = None, *, total_timeout: float | None = None
@@ -195,7 +259,7 @@ class Channel:
         return bytes(buf)
 
     @staticmethod
-    def _raise(exc: OSError) -> None:
+    def _raise(exc: OSError) -> NoReturn:
         raise SeamError("seam_io", f"{exc.__class__.__name__}: {exc}") from exc
 
     def close(self) -> None:
