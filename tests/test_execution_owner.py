@@ -64,9 +64,10 @@ def run(root: Path, mode: str) -> dict[str, object]:
         timeout=30,
         check=True,
     )
-    return json.loads(
+    value: dict[str, object] = json.loads(
         next(line[6:] for line in result.stdout.splitlines() if line.startswith("PROOF "))
     )
+    return value
 
 
 def test_execution_role_is_durable_and_cannot_be_claimed_by_observer(tmp_path: Path) -> None:
