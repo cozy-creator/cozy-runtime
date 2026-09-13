@@ -3636,11 +3636,16 @@ class Worker:
         }
         if not self._retire_hosted(keep, revision):
             return
-        if outgoing is not None and outgoing.device_pin != candidate.device_pin:
+        # Retire the old owner before releasing its lane: otherwise a replacement
+        # on the same pins measures the old executor's cached weights as occupied.
+        if outgoing is not None and (
+            outgoing.placement_id != candidate.placement_id
+            or outgoing.device_pin != candidate.device_pin
+        ):
             current = self.supervision.current
             if current is not None:
                 try:
-                    self.supervision.retire_current(current, "placement device pin changed")
+                    self.supervision.retire_current(current, "placement device ownership changed")
                 except ExecutorGone as exc:
                     self.latched = f"executor_reclaim_failed: {exc}"[:200]
                     self._settle()
