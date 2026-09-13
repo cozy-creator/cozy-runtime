@@ -59,8 +59,12 @@ jobs:
     env:
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
+      # The UID proof must execute Python without traversing the runner's private
+      # temporary directory, where setup-uv installs interpreters by default.
+      UV_PYTHON_INSTALL_DIR: /tmp/cozy-runtime-ci-python
     steps:
       - uses: actions/checkout@v4
+      - run: install -d -m 0755 "$UV_PYTHON_INSTALL_DIR"
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12
       - run: uv sync --locked
