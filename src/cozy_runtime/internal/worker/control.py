@@ -32,15 +32,19 @@ import threading
 from collections.abc import Callable, Iterator
 from concurrent import futures
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import grpc
 
+from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionRPC
 from cozy_runtime.internal.worker.workspace_rpc import Service as WorkspaceService
 from cozy_runtime.internal.worker.workspace_rpc import WorkspaceRPC
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
+
+if TYPE_CHECKING:
+    from .session import Worker
 
 
 class ControlPlane(Protocol):
@@ -86,10 +90,11 @@ def write_addr(addr_file: Path, address: str) -> None:
 # --------------------------------------------------------------------------- gRPC
 
 
-class _Servicer:
+class _Servicer(MachineExecutionRPC):
     # Deliberately not a subclass: the generated base is untyped (Any), and registration
     # only needs the two method names.
     def __init__(self, plane: ControlPlane) -> None:
+        super().__init__(cast("Worker", plane))
         self.plane = plane
         self._readers: list[threading.Thread] = []
         self._readers_lock = threading.Lock()
@@ -421,6 +426,8 @@ class _PreparationServicer(WorkspaceRPC):
         return pb.ProtocolInfoResult(
             wire_minor=WIRE_MINOR,
             minimum_wire_minor=MIN_COMPATIBLE_WIRE_MINOR,
+            supports_model_materialization_recovery=True,
+            supports_mixed_model_inputs=self.unpublished_placement_handler is not None,
         )
 
     def NumericalEnvironment(self, _request: pb.NumericalEnvironmentRequest, context: Any) -> Any:

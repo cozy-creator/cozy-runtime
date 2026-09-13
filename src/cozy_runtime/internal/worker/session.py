@@ -49,7 +49,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from cozy_runtime.internal import (
     accel,
@@ -76,6 +76,7 @@ from cozy_runtime.internal.worker import (
     store_gc,
     triage,
     weights,
+    workspace_executions,
 )
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
@@ -1182,6 +1183,9 @@ class Worker:
         self.workspace = (
             Workspace(options.tensorfs_root) if options.tensorfs_root is not None else None
         )
+        self.executions = (
+            workspace_executions.Executions(self.workspace) if self.workspace else None
+        )
         self._pressure_registration = None
         if self.workspace is not None:
             from cozy_runtime.internal import storage_admission
@@ -1643,12 +1647,15 @@ class Worker:
             )
         return any(self._placement_dispatchable(placement_id) for placement_id in lane.placements)
 
-    def _lane_slots(self, lane: DeviceLane) -> int:
+    def _lane_slots(self, lane: DeviceLane, *, machine_owned: bool = False) -> int:
         """Free seats on ONE lane, now: `LANE_SEATS` less what holds its device, NONE while
         more than `LANE_RELEASED` released attempts await their ack (cr-079 D3), and NONE
         while the worker's admission is CLOSED — that is one structural fact per worker,
         and `lanes[]` must never show a seat the worker-level count denies."""
-        if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN:
+        if (
+            self.admission_state(machine_owned=machine_owned)
+            != pb.AdmissionState.ADMISSION_STATE_OPEN
+        ):
             return 0
         if not self._lane_dispatchable(lane):
             return 0
@@ -2022,6 +2029,203 @@ class Worker:
                 raise WorkspaceRefusal("workspace bootstrap proof was refused")
             return self.fence.record_owner_id
 
+    def _execution_service(self, claim: pb.Claim) -> tuple[workspace_executions.Executions, str]:
+        owner = self.authorize_workspace(claim)
+        if self.executions is None:
+            raise ValueError("worker has no execution workspace")
+        return self.executions, owner
+
+    def submit_execution(
+        self,
+        claim: pb.Claim,
+        submission_id: str,
+        capture_digest: bytes,
+        offer: pb.AttemptOffer,
+        *,
+        max_attempts: int = 1,
+        retry_delay_ms: int = 0,
+        capture_document: bytes = b"",
+        preparation: bytes = b"",
+    ) -> workspace_executions.Receipt:
+        """Authenticated root intake; accepted execution never depends on the caller's stream."""
+        with self.control_lock:
+            executions, owner = self._execution_service(claim)
+            result_schema, memoize = b"", False
+            spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+            if "job" in spec:
+                descriptor = spec["job"]["job_descriptor_id"]
+                binding = self.engine.jobs.get(descriptor)
+                if binding is None:
+                    from cozy_runtime.internal import job_plan
+
+                    binding = JobBinding.read(
+                        json.loads(
+                            job_plan.path(
+                                self.config.cozy_home / "job-plans",
+                                spec["job"]["build_id"],
+                                descriptor,
+                            ).read_bytes()
+                        )
+                    )
+                declaration = self.engine._job_declaration(binding, descriptor)
+                result_schema = canonical.write(declaration["result"])
+                memoize = declaration.get("invocable", {}).get("memoize", False) is True
+            receipt = executions.submit(
+                owner,
+                submission_id,
+                capture_digest,
+                offer,
+                result_schema=result_schema,
+                worker_boot=self.fence.worker_boot_id,
+                memoize=memoize,
+                max_attempts=max_attempts,
+                retry_delay_ms=retry_delay_ms,
+                capture_document=capture_document,
+                preparation=preparation,
+                worker_id=self.options.worker_id,
+            )
+            self.publish_activity(strict=True)
+            return receipt
+
+    def execution_status(self, claim: pb.Claim, request_id: str) -> workspace_executions.State:
+        executions, owner = self._execution_service(claim)
+        return executions.status(owner, request_id)
+
+    def execution_events(
+        self, claim: pb.Claim, request_id: str, after: int = 0, limit: int = 256
+    ) -> workspace_executions.EventPage:
+        executions, owner = self._execution_service(claim)
+        return executions.events(owner, request_id, after, limit)
+
+    def control_execution(
+        self,
+        claim: pb.Claim,
+        request_id: str,
+        command_id: str,
+        generation: int,
+        action: Literal["pause", "resume", "cancel"],
+    ) -> workspace_executions.State:
+        if action not in ("pause", "resume", "cancel"):
+            raise ValueError("unknown execution control")
+        with self.control_lock:
+            executions, owner = self._execution_service(claim)
+            state = executions.control(
+                owner,
+                request_id,
+                command_id,
+                generation,
+                action,
+                worker_boot=self.fence.worker_boot_id,
+            )
+            self.publish_activity(strict=True)
+            return state
+
+    def drive_executions(self) -> None:
+        """Admit retained roots through the existing lanes, independently of observers."""
+        if self.executions is None or not self.fence.record_owner_recorded:
+            return
+        with self.control_lock:
+            owner = self.fence.record_owner_id
+            self.executions.retry_due(owner, worker_boot=self.fence.worker_boot_id)
+            for request in self.executions.pending(owner):
+                state = self.executions.status(owner, request)
+                held = self.engine.history.get((request, state.attempt_ordinal))
+                if state.state in workspace_executions.TERMINAL:
+                    if held is None or held.state == "closed":
+                        self.executions.abandon(owner, request)
+                    continue
+                if not self.executions.assigned_here(
+                    owner, request, state.attempt_ordinal, self.fence.worker_boot_id
+                ):
+                    continue
+                if state.state in ("pausing", "canceling"):
+                    if held is None:
+                        self.executions.stop_queued(owner, request)
+                    else:
+                        self.engine.cancel(
+                            pb.CancelAttempt(
+                                request_id=request,
+                                attempt_ordinal=state.attempt_ordinal,
+                                invocation_spec_digest=held.digest,
+                                reason=pb.CANCEL_REASON_CLIENT,
+                            )
+                        )
+                        if self.source_calls is not None:
+                            self.source_calls.cancel_parent(
+                                request, ordinal=state.attempt_ordinal, spec=held.digest
+                            )
+                    continue
+                if state.state != "queued" or held is not None:
+                    continue
+                if any(
+                    attempt.request_id == request
+                    and attempt.attempt < state.attempt_ordinal
+                    and attempt.state != "closed"
+                    for attempt in self.engine.history.values()
+                ):
+                    continue
+                offered = self.executions.offer(owner, request)
+                spec = documents.read(offered.invocation_spec_canonical_bytes, pb.InvocationSpec)
+                deadline = int(spec.get("deadline_unix_ms", 0))
+                if deadline and self.executions.clock_ms() >= deadline:
+                    self.executions.stop_queued(owner, request, deadline=True)
+                    continue
+                preparation = self.executions.preparation(owner, request)
+                try:
+                    if preparation and not self._prepare_execution(preparation):
+                        continue
+                except Exception as exc:
+                    self.refuse(
+                        offered,
+                        "execution_preparation_unavailable",
+                        f"Retained preparation is unavailable ({type(exc).__name__}): {exc}",
+                        pb.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
+                    )
+                    continue
+                # Validation precedes waiting for capacity, so malformed work does not
+                # occupy a durable queue forever. The engine still authors its refusal.
+                try:
+                    attempt = self.engine.offer(offered)
+                except AttemptRefusal:
+                    offered.admission_epoch = self.admission_epoch
+                    self.on_offer(offered, machine_owned=True)
+                    continue
+                lane = self._offer_lane(offered.placement_id, attempt)
+                if self._lane_slots(lane, machine_owned=True) < 1:
+                    continue
+                offered.admission_epoch = self.admission_epoch
+                self.on_offer(offered, machine_owned=True)
+
+    def _prepare_execution(self, preparation: dict[str, Any]) -> bool:
+        """Reuse the existing preparation/convergence engine without replacing live work."""
+        from . import machine_capture
+
+        desired = pb.DesiredWorkerState.FromString(
+            base64.b64decode(preparation["state"], validate=True)
+        )
+        desired.revision = self.accepted.accepted_desired_state_revision
+        same = desired_state_body(desired) == self.accepted.desired_state_body
+        if same:
+            return True
+        if any(attempt.state in self.engine.HELD for attempt in self.engine.history.values()):
+            return False
+        desired = machine_capture.restore(self, preparation)
+        desired.revision = self.accepted.accepted_desired_state_revision + 1
+        self._apply_desired_state(desired)
+        return self.dispatchable()
+
+    def collect_execution(
+        self, claim: pb.Claim, request_id: str, ordinal: int | None = None
+    ) -> pb.AttemptOutcome:
+        executions, owner = self._execution_service(claim)
+        return executions.collect(owner, request_id, ordinal)
+
+    def acknowledge_execution_collection(
+        self, claim: pb.Claim, ack: pb.AttemptOutcomeAck
+    ) -> workspace_executions.State:
+        executions, owner = self._execution_service(claim)
+        return executions.acknowledge_collection(owner, ack)
+
     def workspace_weights_ready(self, call: pb.WeightsIntentReadyCall) -> pb.WeightsHostAck:
         from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 
@@ -2167,10 +2371,61 @@ class Worker:
             # Outcome forwarding follows the same workspace commit that observes
             # native receipts. A transport projection is never the authority.
             self.workspace.outcome(self.fence.record_owner_id, frame.attempt_outcome)
+        execution_subject = (
+            frame.attempt_outcome
+            if frame.HasField("attempt_outcome")
+            else frame.attempt_accepted
+            if frame.HasField("attempt_accepted")
+            else None
+        )
+        managed = (
+            execution_subject is not None
+            and self.executions is not None
+            and self.executions.owns(self.fence.record_owner_id, execution_subject.request_id)
+        )
+        if managed and self.executions is not None:
+            self.executions.observe(self.fence.record_owner_id, frame)
+        subject_id = getattr(inner, "request_id", "") or getattr(inner, "parent_request_id", "")
+        machine_message = (
+            self.executions is not None
+            and bool(subject_id)
+            and self.executions.owns(self.fence.record_owner_id, subject_id)
+        )
+        if machine_message and frame.HasField("child_call_request"):
+            request = frame.child_call_request
+            self.calls.absorb(
+                pb.ChildCallResult(
+                    parent_request_id=request.parent_request_id,
+                    parent_attempt_ordinal=request.parent_attempt_ordinal,
+                    parent_invocation_spec_digest=request.parent_invocation_spec_digest,
+                    call_index=request.call_index,
+                    intent_digest=request.intent_digest,
+                    state=pb.CHILD_CALL_STATE_REFUSED,
+                    safe_code="machine_children_unavailable",
+                    safe_detail="This Runtime does not yet support child operations for scripts.",
+                )
+            )
         with self.claim_lock:
             if frame.WhichOneof("msg") != "weights_transaction":
                 self.stamp(inner)
-            self.outbound.put(frame)
+            if not machine_message:
+                self.outbound.put(frame)
+        if managed and frame.HasField("attempt_outcome"):
+            terminal = frame.attempt_outcome
+            # Runtime has committed exact result custody. Free the lane without
+            # waiting for an observer; collection is a separate durable obligation.
+            self.on_outcome_ack(
+                self.stamp(
+                    pb.AttemptOutcomeAck(
+                        request_id=terminal.request_id,
+                        attempt_ordinal=terminal.attempt_ordinal,
+                        invocation_spec_digest=terminal.invocation_spec_digest,
+                        outcome_id=terminal.outcome_id,
+                        outcome_digest=terminal.outcome_digest,
+                        retain_work=True,
+                    )
+                )
+            )
 
     def set_serving(self, state: pb.ServingState, why: str = "") -> None:
         """Move the placement's SERVING axis and REPORT IT IMMEDIATELY — dispatchability is
@@ -2305,13 +2560,13 @@ class Worker:
             )
         )
 
-    def admission_state(self) -> pb.AdmissionState:
+    def admission_state(self, *, machine_owned: bool = False) -> pb.AdmissionState:
         """CLOSED is STRUCTURAL (#486c): before the snapshot barrier, while draining, while
         the placement is not dispatchable. OPEN with zero slots is TRANSIENT saturation, and
         a RecordOwner backs off differently for each — so the two never collapse into one
         counter here either."""
         if (
-            not self.fence.dispatch_open
+            (not machine_owned and not self.fence.dispatch_open)
             or self.accepted.posture == pb.Posture.POSTURE_DRAINING
             or self.phase != pb.WorkerPhase.WORKER_PHASE_ONLINE
             or not self.dispatchable()
@@ -2527,6 +2782,12 @@ class Worker:
     def emit_progress(self, request_id: str, attempt: int, frame: dict[str, Any]) -> None:
         """The LOSSY lane. Bounded per watch, oldest-first shed, worker-owned sequence."""
         key = (request_id, attempt)
+        if self.executions is not None and self.executions.owns(
+            self.fence.record_owner_id, request_id
+        ):
+            self.executions.progress(
+                self.fence.record_owner_id, request_id, attempt, _progress_document(frame)
+            )
         position = (
             frame.get("advance") if frame.get("kind") == "progress" else frame.get("position")
         )
@@ -2675,6 +2936,16 @@ class Worker:
                 return reject(
                     pb.ClaimRejection.CLAIM_REJECTION_UNDURABLE,
                     "the worker listener is bound but the readiness barrier is not committed",
+                )
+            if (
+                self.fence.record_owner_recorded
+                and claim.record_owner_id != self.fence.record_owner_id
+                and self.executions is not None
+                and self.executions.retention_required(self.fence.record_owner_id)
+            ):
+                return reject(
+                    pb.ClaimRejection.CLAIM_REJECTION_EPOCH_HELD,
+                    "accepted machine execution retains its owner; reconnect is observation",
                 )
             # `record_owner_recorded`, not the epoch: the high-water authority this worker
             # accepted is DURABLE (#494e), so a restart still refuses the owner it superseded
@@ -2999,6 +3270,18 @@ class Worker:
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
             return
         if kind == "desired_state":
+            if self.executions is not None and self.executions.active(self.fence.record_owner_id):
+                self.engine.fault(
+                    pb.Fault(
+                        kind=pb.FAULT_KIND_CONFIG_REFUSED,
+                        subject=f"revision {inner.revision}",
+                        reason="machine_execution_owns_worker",
+                        detail="Accepted execution controls its prepared state; "
+                        "submit through the execution API.",
+                    )
+                )
+                self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+                return
             try:
                 self._apply_desired_state(inner)
             except ExecutorGone as exc:
@@ -3014,6 +3297,13 @@ class Worker:
             return
         if not self.fence.dispatch_open:
             self.note("fence", f"dropped a {kind} before SnapshotAck: dispatch is closed")
+            return
+        if (
+            kind in ("attempt_offer", "cancel_attempt", "outcome_ack", "weights_finalize_request")
+            and self.executions is not None
+            and self.executions.owns(self.fence.record_owner_id, inner.request_id)
+        ):
+            self.note("execution", "machine-owned request requires the execution control API")
             return
         if kind == "attempt_offer":
             self.on_offer(inner)
@@ -3112,7 +3402,10 @@ class Worker:
 
             def finished() -> None:
                 with self.control_lock:
-                    if not self.fenced(acked):
+                    if not self.fenced(acked) or (
+                        self.executions is not None
+                        and self.executions.owns(self.fence.record_owner_id, acked.request_id)
+                    ):
                         self.on_outcome_ack(acked, native_finalized=True)
 
             try:
@@ -3486,6 +3779,7 @@ class Worker:
             and previous.placement_id == placement_id
             and previous.document == candidate.document
             and previous.device_pin == candidate.device_pin
+            and previous.materialization == pb.MaterializationState.MATERIALIZATION_STATE_STAGED
             and previous.serving != pb.ServingState.SERVING_STATE_DRAINING
         ):
             previous.placement_set_digest = desired_set.placement_set_digest
@@ -5530,7 +5824,7 @@ class Worker:
 
     # ------------------------------------------------------------------ dispatch
 
-    def on_offer(self, offered: pb.AttemptOffer) -> None:
+    def on_offer(self, offered: pb.AttemptOffer, *, machine_owned: bool = False) -> None:
         """STREAM THREAD: fence, record, enqueue. Nothing here waits, fetches or leases.
 
         EVERY OFFER GETS A JOURNALED OUTCOME (§7). The outcome-less third state is closed:
@@ -5676,8 +5970,10 @@ class Worker:
         # RecordOwner can read and re-dispatch is strictly more informative than a hold it
         # cannot see. An attempt for placement P may take P's lane's seat and no other.
         lane = self._offer_lane(offered.placement_id, attempt)
-        if self.admission_state() != pb.AdmissionState.ADMISSION_STATE_OPEN or (
-            self._lane_slots(lane) < 1
+        if self.admission_state(
+            machine_owned=machine_owned
+        ) != pb.AdmissionState.ADMISSION_STATE_OPEN or (
+            self._lane_slots(lane, machine_owned=machine_owned) < 1
         ):
             busy = [
                 held
@@ -6156,6 +6452,7 @@ class Worker:
     def watchdog(self) -> None:
         """The deadline and the grace clock — both the WORKER's, never author code's."""
         while not self.stop.wait(0.05):
+            self.drive_executions()
             for attempt in list(self.engine.live.values()):
                 if attempt.state not in ("running", "reclaiming"):
                     continue
@@ -6220,7 +6517,7 @@ class Worker:
             if self.connected.is_set():
                 self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
-    def publish_activity(self) -> None:
+    def publish_activity(self, *, strict: bool = False) -> None:
         """Tell the pod supervisor what this worker is doing (`worker/activity.py`).
 
         It rides the reporter for one reason: a tick that does not happen is the evidence
@@ -6233,9 +6530,16 @@ class Worker:
             self.activity_file.publish(
                 owner_attached=bool(self.attached_streams),
                 attempts_in_flight=self.engine.in_flight(),
+                execution_retention_required=(
+                    self.executions is not None
+                    and self.fence.record_owner_recorded
+                    and self.executions.retention_required(self.fence.record_owner_id)
+                ),
                 meter=activity.meter(self),
             )
         except OSError as exc:
+            if strict:
+                raise
             self.note("activity", f"the supervisor's activity file was not written: {exc}")
 
     def observed_state(self) -> pb.ObservedWorkerState:

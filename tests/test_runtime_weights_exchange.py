@@ -517,6 +517,7 @@ def test_local_control_host_serves_probe_without_preparation_handlers(tmp_path: 
                 WIRE_MINOR,
                 MIN_COMPATIBLE_WIRE_MINOR,
             )
+            assert not info.supports_mixed_model_inputs
             with pytest.raises(grpc.RpcError) as error:
                 api.ValidateWeightsCheckpoint(pb.ValidateWeightsCheckpointRequest(), timeout=WAIT)
             assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
