@@ -676,7 +676,7 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
             installed_environment=installed[0],
         ).acquire(bound)
         assert {binding.entrypoint for binding in selected.bindings.values()} == {"generate"}
-        assert selected.model_objects == 3
+        assert selected.model_objects == (6 if model_source == "mixed" else 3)
         (tmp_path / "prepared-model.json").write_bytes(
             modeled.placement_set.placement_set_canonical_bytes
         )
