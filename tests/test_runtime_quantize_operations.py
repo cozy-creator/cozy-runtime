@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import msgspec
 import pytest
@@ -22,7 +23,7 @@ from cozy_runtime.derive.operations import MAX_QUANTIZED_BYTES, QuantizationPlan
 from cozy_runtime.derive.quantization import QuantizationSource
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import Discovered
-from cozy_runtime.internal.weights_sink import WeightsCheckpoint, WeightsTransactionHost
+from native_weights import NativeExecution
 from test_quantize_artifact_native import _host, _run, _source
 
 
@@ -36,37 +37,36 @@ def _shared(
     request: str | None = None,
     epoch: int = 1,
     canceled: list[bool] | None = None,
-    checkpoint: Callable[[WeightsCheckpoint], None] | None = None,
+    checkpoint: Callable[[Any], None] | None = None,
 ) -> tuple[InvocationResult | None, Outcome, Attempt]:
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="shared-quantize",
-        request_id=request or root.name,
-        invocation_spec_digest="sha256:" + "42" * 32,
-        work_fingerprint="sha256:" + "43" * 32,
-        writer_session_id=epoch,
-        allowed_sources={source.manifest.digest: source.manifest.length},
-        output_bounds={"model": MAX_QUANTIZED_BYTES},
-        record_checkpoint=checkpoint,
-    )
-    describe(app)
-    return attempt(
-        app.get("quantize"),
-        {
-            "source": msgspec.to_builtins(source),
-            "plan": msgspec.to_builtins(plan),
-            "encoding": encoding,
-        },
-        Invocation(
-            host.request_id,
-            root,
-            time.monotonic() + 30,
-            models={"source": _derive_model(QuantizationSource, source.manifest.digest)},
-            weights=host.open,
-            weights_source_structure=host.structure,
-            cancel=lambda: bool(canceled and canceled[0]),
-        ),
-    )
+    with NativeExecution(
+        store,
+        Path(store.root).parent / "shared",
+        request or root.name,
+        {"source": source},
+        {"model": MAX_QUANTIZED_BYTES},
+        epoch=epoch,
+        after_checkpoint=checkpoint,
+    ) as host:
+        describe(app)
+        return attempt(
+            app.get("quantize"),
+            {
+                "source": msgspec.to_builtins(source),
+                "plan": msgspec.to_builtins(plan),
+                "encoding": encoding,
+            },
+            Invocation(
+                host.attempt.request_id,
+                root,
+                time.monotonic() + 600,
+                models={"source": _derive_model(QuantizationSource, source.manifest.digest)},
+                tensorfs_source=host.client.source,
+                tensorfs_output=host.client.open_output,
+                tensorfs_adopt=host.client.adopt_model,
+                cancel=lambda: bool(canceled and canceled[0]),
+            ),
+        )
 
 
 @pytest.mark.parametrize("encoding", ["fp8-rowwise/1", "mxfp8/1"])
@@ -77,7 +77,7 @@ def test_shared_operation_resumes_complete_native_groups(tmp_path: Path, encodin
     canceled = [False]
     checkpoints = []
 
-    def stop(value: WeightsCheckpoint) -> None:
+    def stop(value: Any) -> None:
         checkpoints.append(value)
         canceled[0] = True
 
@@ -155,20 +155,26 @@ def test_shared_native_operation_preserves_existing_family_results(
 def test_native_exact_selection_binds_geometry_and_construction_order(tmp_path: Path) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "control", "f32")
-    structure = _host(store, "inspect", source).structure(source.manifest.digest)
-    selected = next(t for t in structure.tensors if t.key == "a.weight")
+    with (
+        _host(store, "inspect", source) as owner,
+        owner.client.source(source.manifest.digest) as capability,
+    ):
+        structure = capability.inspect()
+    selected = structure.components["control"]["a.weight"]
     schema = canonical_json.digest(
         [
             [
-                selected.component,
-                selected.key,
+                "control",
+                "a.weight",
                 selected.logical_dtype,
                 list(selected.shape),
-                [[p.name, p.dtype, list(p.shape)] for p in selected.parts],
+                [[name, p.dtype, list(p.shape)] for name, p in selected.parts.items()],
             ]
         ]
     )
-    order = canonical_json.digest([[t.component, t.key] for t in structure.tensors])
+    order = canonical_json.digest(
+        [[component, key] for component, rows in structure.components.items() for key in rows]
+    )
     plan = QuantizationPlan(("control",), ("a.weight",), schema, (order,), "preserve")
     result, outcome, _ = _shared(tmp_path / "preserve", store, source, plan)
     assert outcome.terminal == "succeeded", outcome
@@ -178,14 +184,20 @@ def test_native_exact_selection_binds_geometry_and_construction_order(tmp_path: 
     assert source_header is not None and result_header is not None
     before = tensorfs.parse_header(source_header)
     after = tensorfs.parse_header(result_header)
-    assert list(after["components"]["control"]) == [t.key for t in structure.tensors]
+    assert list(after["components"]["control"]) == list(structure.components["control"])
     for key in ("z.weight", "bias"):
         assert after["components"]["control"][key] == before["components"]["control"][key]
     assert after["components"]["control"]["a.weight"]["logical"]["logical_dtype"] == "f32"
     wrong = msgspec.structs.replace(
         plan,
         source_order_digests=(
-            canonical_json.digest([[t.component, t.key] for t in reversed(structure.tensors)]),
+            canonical_json.digest(
+                [
+                    [component, key]
+                    for component, rows in reversed(tuple(structure.components.items()))
+                    for key in reversed(tuple(rows))
+                ]
+            ),
         ),
     )
     result, outcome, _ = _shared(tmp_path / "wrong-order", store, source, wrong)
@@ -198,11 +210,12 @@ def test_native_exact_selection_binds_geometry_and_construction_order(tmp_path: 
     ]:
         with pytest.raises(UnsupportedInput):
             _selection(structure, changed)
-    bad = replace(selected, parts=(replace(selected.parts[0], dtype="bf16"),))
+    bad = replace(selected, parts={"value": replace(selected.parts["value"], dtype="bf16")})
     with pytest.raises(UnsupportedInput):
         _selection(
             replace(
-                structure, tensors=tuple(bad if t.key == bad.key else t for t in structure.tensors)
+                structure,
+                components={"control": {**structure.components["control"], "a.weight": bad}},
             ),
             plan,
         )

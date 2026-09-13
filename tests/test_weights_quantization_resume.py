@@ -12,21 +12,22 @@ from typing import Any
 import numpy as np
 import pytest
 import tensorfs
+from tensorfs.derived import Derivation, OutputCapability
 
 from cozy_runtime.author import (
     App,
     Context,
+    ModelArtifact,
+    ObjectRef,
     Telemetry,
     UnsupportedInput,
     WeightsOutput,
-    WeightsSink,
 )
-from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._model import _derive_model
-from cozy_runtime.author.fakes import invoke_with_fakes
+from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive import QuantizeResult, plan, quantize
 from cozy_runtime.derive.quantization import ArtifactQuantizationRequest, QuantizationSource
-from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+from native_weights import NativeExecution
 
 app = App()
 BOUND = 32768
@@ -37,13 +38,11 @@ def native_quantization(
     ctx: Context,
     source: QuantizationSource,
     payload: ArtifactQuantizationRequest,
-    weights: WeightsSink,
     tel: Telemetry,
 ) -> QuantizeResult:
     return quantize(
         source,
         plan(("model",), "fp8-rowwise/1", max_relative_frobenius=payload.max_relative_frobenius),
-        sink=weights,
         ctx=ctx,
         tel=tel,
     )
@@ -88,8 +87,18 @@ class InterruptedAfterCheckpoint(RuntimeError):
 class ObservedNativeTransaction:
     """Inject a short native scale stream or interrupt after native checkpoint acceptance."""
 
-    def __init__(self, native: Any, mode: str, reads: list[int]) -> None:
+    def __init__(
+        self, native: Any, mode: str, reads: list[int], transaction: str, definition: Derivation
+    ) -> None:
         self.native, self.mode, self.reads = native, mode, reads
+        self.transaction_id, self.definition = transaction, definition
+        self.checkpoint_head: tuple[str, int] | None = None
+
+    def __enter__(self) -> ObservedNativeTransaction:
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.native.close()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.native, name)
@@ -105,7 +114,8 @@ class ObservedNativeTransaction:
         self.native.source_read_into(*args)
 
     def checkpoint(self) -> None:
-        self.native.checkpoint()
+        facts = self.native.checkpoint()
+        self.checkpoint_head = (facts["head"], facts["head_length"])
         if self.mode == "checkpoint":
             raise InterruptedAfterCheckpoint()
 
@@ -121,37 +131,41 @@ def _run(
     threshold: float = 0.25,
 ) -> tuple[Callable[[], QuantizeResult], list[int], list[Any], list[Any]]:
     checkpoints: list[Any] = []
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="native-quantization-proof",
-        request_id="quantize",
-        invocation_spec_digest="sha256:" + "63" * 32,
-        work_fingerprint="sha256:" + "64" * 32,
-        writer_session_id=epoch,
-        allowed_sources={source: length},
-        output_bounds={"model": BOUND},
-        record_checkpoint=checkpoints.append,
-    )
     reads: list[int] = []
     captured: list[Any] = []
-
-    def open_native(request: Any) -> ObservedNativeTransaction:
-        current = host.open(request)
-        captured.append(current)
-        return ObservedNativeTransaction(current, mode, reads)
+    artifact = ModelArtifact("source", "model", ObjectRef(source, length), "sha256:" + "11" * 32)
 
     def invoke() -> QuantizeResult:
-        result = invoke_with_fakes(
-            app.get("native-quantization"),
-            {"max_relative_frobenius": threshold},
-            request_id="quantize",
-            spool=root / f"attempt-{epoch}",
-            models={"source": _derive_model(QuantizationSource, source)},
-            weights=open_native,
-            weights_source_structure=host.structure,
-        ).result
-        assert isinstance(result, QuantizeResult)
-        return result
+        with NativeExecution(
+            store,
+            root,
+            "quantize",
+            {"source": artifact},
+            {"model": BOUND},
+            epoch=epoch,
+            after_checkpoint=checkpoints.append,
+        ) as host:
+
+            def open_native(slot: str, definition: Derivation) -> Any:
+                current = host.client.open_output(slot, definition)
+                wrapped = ObservedNativeTransaction(
+                    current, mode, reads, next(iter(host.client.opened)), definition
+                )
+                captured.append(wrapped)
+                return wrapped
+
+            ctx = host.context()
+            ctx._tensorfs_output = lambda slot: OutputCapability(
+                lambda definition: open_native(slot, definition)
+            )
+            result = quantize(
+                _derive_model(QuantizationSource, source),
+                plan(("model",), "fp8-rowwise/1", max_relative_frobenius=threshold),
+                ctx=ctx,
+                tel=fake_telemetry(fake_attempt("quantize")),
+            )
+            assert isinstance(result, QuantizeResult)
+            return result
 
     return invoke, reads, captured, checkpoints
 
@@ -169,15 +183,14 @@ def test_native_partial_group_recomputes_then_complete_group_reuses_without_read
 ) -> None:
     store, source_id, source, length = _source(tmp_path / "resumed")
     invoke, reads, captured, _ = _run(store, source, length, 1, "short-scale", tmp_path)
-    with pytest.raises(CapabilityError):
+    with pytest.raises(tensorfs.errors.Refusal):
         invoke()
     assert sum(reads) == 16384
     transaction = captured[0].transaction_id
 
     invoke, reads, captured, checkpoints = _run(store, source, length, 2, "checkpoint", tmp_path)
-    with pytest.raises(CapabilityError) as interrupted:
+    with pytest.raises(InterruptedAfterCheckpoint):
         invoke()
-    assert isinstance(interrupted.value.__cause__, InterruptedAfterCheckpoint)
     assert sum(reads) == 16384  # one accepted role is not a complete quality-checked group
     accepted_head = captured[0].checkpoint_head
     assert accepted_head is not None
@@ -198,9 +211,9 @@ def test_native_partial_group_recomputes_then_complete_group_reuses_without_read
         *accepted_head,
         operation_id="quantize",
         slot="model",
-        plan_digest=checkpoints[-1].plan_digest,
+        plan_digest=checkpoints[-1]["plan_digest"],
     )
-    assert page["index"] == checkpoints[-1].index
+    assert page["index"] == checkpoints[-1]["index"]
     with store.acquire_cozytensors("sha256:" + recovered["manifest"]["sha256"]) as lease:
         assert lease.bytes > 0
 
@@ -222,9 +235,9 @@ def test_native_quality_refusal_accepts_no_role(tmp_path: Path) -> None:
     assert error.value.code == "quantization_tripwire"
     assert sum(reads) == 16384
     row = captured[0]
-    again = row.host
-    again.writer_session_id = 2
-    resumed = again.open(row.request)
-    assert resumed.completed_parts == frozenset()
-    assert resumed.completed_configs == frozenset()
-    resumed.fence()
+    artifact = ModelArtifact("source", "model", ObjectRef(source, length), "sha256:" + "11" * 32)
+    with NativeExecution(
+        store, tmp_path, "quantize", {"source": artifact}, {"model": BOUND}, epoch=2
+    ) as owner, owner.client.open_output("model", row.definition) as resumed:
+        assert resumed.completed_parts() == []
+        assert resumed.completed_configs() == []

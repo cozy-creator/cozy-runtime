@@ -18,7 +18,6 @@ from cozy_runtime.author import (
     Telemetry,
     UnsupportedInput,
     WeightsOutput,
-    WeightsSource,
     invocable,
 )
 
@@ -53,9 +52,7 @@ MAX_QUANTIZED_BYTES = MAX_WEIGHTS_NEW_BYTES
 app = App()
 
 
-def _selection(
-    structure: WeightsSource | SourceInspection, plan: QuantizationPlan
-) -> ArtifactQuantizationPlan:
+def _selection(structure: SourceInspection, plan: QuantizationPlan) -> ArtifactQuantizationPlan:
     from .quantization import (
         PLAIN_SPEC,
         ArtifactQuantizationPlan,

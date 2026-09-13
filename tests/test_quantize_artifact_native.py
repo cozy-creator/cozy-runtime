@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
+import io
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import msgspec
 import numpy as np
 import pytest
 import tensorfs
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import (
     App,
@@ -21,10 +23,6 @@ from cozy_runtime.author import (
     ModelArtifact,
     Telemetry,
     WeightsOutput,
-    WeightsPart,
-    WeightsSink,
-    WeightsTarget,
-    WeightsTensor,
     attempt,
     describe,
     invocable,
@@ -32,12 +30,11 @@ from cozy_runtime.author import (
 from cozy_runtime.author._errors import Outcome
 from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._services import Attempt
-from cozy_runtime.author._weights import WeightsCommit
 from cozy_runtime.derive import plan, quantize_artifact
 from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.derive.microscale import encode_fp8_rowwise, encode_mxfp8
 from cozy_runtime.derive.quantization import prepare_source_quantization, quantization_additions
-from cozy_runtime.internal.weights_sink import WeightsCheckpoint, WeightsTransactionHost
+from native_weights import NativeExecution
 
 BOUND = 1 << 20
 
@@ -54,14 +51,12 @@ async def quantize(
     source: Source,
     component: str,
     encoding: str,
-    weights: WeightsSink,
     tel: Telemetry,
     threshold: float | None = None,
 ) -> ModelArtifact:
     return quantize_artifact(
         source,
         plan((component,), encoding, max_relative_frobenius=threshold),
-        sink=weights,
         ctx=ctx,
         tel=tel,
     )
@@ -73,18 +68,16 @@ def _host(
     source: ModelArtifact | None = None,
     *,
     epoch: int = 1,
-    checkpoint: Callable[[WeightsCheckpoint], None] | None = None,
-) -> WeightsTransactionHost:
-    return WeightsTransactionHost(
-        store=store,
-        owner_scope="quantization",
-        request_id=request,
-        invocation_spec_digest="sha256:" + hashlib.sha256(request.encode()).hexdigest(),
-        work_fingerprint="sha256:" + "52" * 32,
-        writer_session_id=epoch,
-        allowed_sources={} if source is None else {source.manifest.digest: source.manifest.length},
-        output_bounds={"model": BOUND},
-        record_checkpoint=checkpoint,
+    checkpoint: Callable[[Any], None] | None = None,
+) -> NativeExecution:
+    return NativeExecution(
+        store,
+        Path(store.root).parent / "executions",
+        request,
+        {} if source is None else {"source": source},
+        {"model": BOUND},
+        epoch=epoch,
+        after_checkpoint=checkpoint,
     )
 
 
@@ -96,25 +89,22 @@ def _source(
     keys: tuple[str, ...] = ("z.weight", "a.weight", "bias"),
 ) -> ModelArtifact:
     plain = dict(tensorfs.seed_digests())["plain/1"]
-    tensors = {
-        key: WeightsTensor(dtype, (8, 64), plain, {"value": WeightsPart(dtype, (8, 64))})
-        for key in keys
-    }
-    host = _host(store, "source")
-    writer = host.open(
-        WeightsCommit(
-            output_slot="model",
-            sources={},
-            targets={component: WeightsTarget(add=tensors)},
-            configs={},
-            order=tuple((component, key) for key in keys),
-            max_new_bytes=BOUND,
-        )
-    )
-    values = np.random.default_rng(22).normal(0, 0.05, (8, 64)).astype(np.float32)
-    for index, key in enumerate(keys):
-        writer.add_part(component, key, "value", st.from_f32(values + index, dtype.upper()))
-    return writer.commit().artifact
+    tensors = {key: Tensor(dtype, (8, 64), plain, {"value": Part(dtype, (8, 64))}) for key in keys}
+    with (
+        _host(store, "source") as host,
+        host.client.open_output(
+            "model",
+            Derivation(
+                {}, {component: Target(add=tensors)}, {}, tuple((component, key) for key in keys)
+            ),
+        ) as writer,
+    ):
+        values = np.random.default_rng(22).normal(0, 0.05, (8, 64)).astype(np.float32)
+        for index, key in enumerate(keys):
+            writer.add_part(
+                component, key, "value", io.BytesIO(st.from_f32(values + index, dtype.upper()))
+            )
+        return host.client.adopt_model(writer.commit())
 
 
 @pytest.mark.parametrize("encoding,payload_bytes", [("fp8-rowwise/1", 544), ("mxfp8/1", 528)])
@@ -124,9 +114,9 @@ def test_two_durable_quantization_groups_skip_source_reads_and_payload_writes(
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "unet", keys=("z.weight", "a.weight", "b.weight", "bias"))
     cancelled = [False]
-    checkpoints: list[WeightsCheckpoint] = []
+    checkpoints: list[Any] = []
 
-    def stop_after_two(value: WeightsCheckpoint) -> None:
+    def stop_after_two(value: Any) -> None:
         checkpoints.append(value)
         cancelled[0] = len(checkpoints) == 2
 
@@ -167,7 +157,7 @@ def test_two_durable_quantization_groups_skip_source_reads_and_payload_writes(
 
 def _run(
     root: Path,
-    host: WeightsTransactionHost,
+    host: NativeExecution,
     source: ModelArtifact,
     component: str,
     encoding: str,
@@ -178,24 +168,26 @@ def _run(
     app = App()
     app.job(quantize, weights=(WeightsOutput("model", BOUND),))
     describe(app)
-    result, outcome, record = attempt(
-        app.get("quantize"),
-        {
-            "source": msgspec.to_builtins(source),
-            "component": component,
-            "encoding": encoding,
-            "threshold": threshold,
-        },
-        Invocation(
-            host.request_id,
-            root,
-            time.monotonic() + 30,
-            models={"source": _derive_model(Source, source.manifest.digest)},
-            weights=host.open,
-            weights_source_structure=host.structure,
-            cancel=lambda: bool(cancelled and cancelled[0]),
-        ),
-    )
+    with host:
+        result, outcome, record = attempt(
+            app.get("quantize"),
+            {
+                "source": msgspec.to_builtins(source),
+                "component": component,
+                "encoding": encoding,
+                "threshold": threshold,
+            },
+            Invocation(
+                host.attempt.request_id,
+                root,
+                time.monotonic() + 30,
+                models={"source": _derive_model(Source, source.manifest.digest)},
+                tensorfs_source=host.client.source,
+                tensorfs_output=host.client.open_output,
+                tensorfs_adopt=host.client.adopt_model,
+                cancel=lambda: bool(cancelled and cancelled[0]),
+            ),
+        )
     artifact = result.result if result is not None else None
     assert artifact is None or isinstance(artifact, ModelArtifact)
     return artifact, outcome, record
@@ -220,9 +212,9 @@ def test_managed_quantization_recovers_groups_and_returns_stable_artifact(
     assert outcome.terminal == "succeeded", outcome
     assert isinstance(uninterrupted, ModelArtifact)
     cancelled = [False]
-    checkpoints: list[WeightsCheckpoint] = []
+    checkpoints: list[Any] = []
 
-    def checkpoint(value: WeightsCheckpoint) -> None:
+    def checkpoint(value: Any) -> None:
         checkpoints.append(value)
         cancelled[0] = True
 
@@ -277,25 +269,27 @@ def test_half_written_group_recomputes_and_inherits_unchanged_parts(
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "unet")
     host = _host(store, "partial-group", source)
-    structure = host.structure(source.manifest.digest)
+    with host.client.source(source.manifest.digest) as capability:
+        structure = capability.inspect()
     selected = prepare_source_quantization(structure, components=("unet",))
     additions = quantization_additions(encoding, selected, "unet", target_logical_dtype="bf16")
-    writer = host.open(
-        WeightsCommit(
-            output_slot="model",
-            sources={"source": source.manifest.digest},
-            targets={
-                "unet": WeightsTarget(
+    writer = host.client.open_output(
+        "model",
+        Derivation(
+            {"source": structure.source},
+            {
+                "unet": Target(
                     source="source",
                     source_component="unet",
                     drop=tuple(sorted(additions)),
                     add=additions,
                 )
             },
-            configs={},
-            order=tuple((t.component, t.key) for t in structure.tensors),
-            max_new_bytes=BOUND,
-        )
+            {},
+            tuple(
+                (component, key) for component, rows in structure.components.items() for key in rows
+            ),
+        ),
     )
     first = selected.tensors[0]
     raw = bytearray(1024)
@@ -304,10 +298,11 @@ def test_half_written_group_recomputes_and_inherits_unchanged_parts(
     encoded = (encode_fp8_rowwise if encoding == "fp8-rowwise/1" else encode_mxfp8)(
         first.key, values
     )
-    writer.add_part("unet", first.key, "data", encoded.payload)
+    writer.add_part("unet", first.key, "data", io.BytesIO(encoded.payload))
     # Persist only the data role. A restarted kernel must not regard half a tensor as done.
     writer.checkpoint()
-    writer.fence()
+    writer.close()
+    host.__exit__()
     resumed, outcome, record = _run(
         tmp_path / "resumed",
         _host(store, "partial-group", source, epoch=2),
