@@ -1663,6 +1663,8 @@ class Worker:
 
     def _lane_dispatchable(self, lane: DeviceLane) -> bool:
         """Whether THIS lane has a placement that takes offers (job mode: the envelope)."""
+        if lane.lane_id.startswith("cpu-") and (slot := self.job_slots.get(lane.lane_id)):
+            return slot.ready()
         if self.accepted.mode == "job":
             slot = self.job_slots.get(lane.lane_id)
             return (
@@ -2287,9 +2289,12 @@ class Worker:
         if any(
             (attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD)
             and not (
-                desired.WhichOneof("mode") == "job"
-                and not desired.job.orchestration
+                (
+                    desired.WhichOneof("mode") == "placement_set"
+                    or (desired.WhichOneof("mode") == "job" and not desired.job.orchestration)
+                )
                 and attempt.lane_id.startswith("cpu-")
+                and attempt.state != "queued"
             )
             for attempt in self.engine.history.values()
         ):
@@ -2636,6 +2641,8 @@ class Worker:
         """Can this worker take an offer AT ALL right now? Serving asks the placement's
         axis; job mode asks whether its one build is ready. Neither answer is a SLOT count —
         `available_attempt_slots` is the other half, and #486c keeps them apart on purpose."""
+        if any(slot.ready() for name, slot in self.job_slots.items() if name.startswith("cpu-")):
+            return True
         if self.accepted.mode == "job":
             return self.job_ready
         return bool(
@@ -3646,8 +3653,15 @@ class Worker:
             and self.job_slots
             and any(
                 self._job_lane_busy(slot.lane)
-                for slot in self.job_slots.values()
+                for name, slot in self.job_slots.items()
                 if slot is not retained_parent
+                and (
+                    not name.startswith("cpu-")
+                    or any(
+                        attempt.lane_id == slot.lane.lane_id and attempt.state == "queued"
+                        for attempt in self.engine.history.values()
+                    )
+                )
             )
         ):
             self.engine.fault(
@@ -3732,9 +3746,11 @@ class Worker:
             if cpu is not None and cpu is not retained_parent:
                 cpu.supervision.close()
                 self.lanes.orchestration.forget("")
-            self.job_slots = (
-                {"orchestration": retained_parent} if retained_parent is not None else {}
-            )
+            self.job_slots = {
+                name: slot for name, slot in self.job_slots.items() if name.startswith("cpu-")
+            }
+            if retained_parent is not None:
+                self.job_slots["orchestration"] = retained_parent
             self.jobs = {
                 slot.binding.job_descriptor_id: slot.binding for slot in self.job_slots.values()
             }
@@ -5941,7 +5957,13 @@ class Worker:
                 CAUSE.CAUSE_CODE_ADMISSION_EPOCH_STALE,
             )
             return
-        if self.accepted.mode == "serving":
+        try:
+            job_offer = machine_owned and "job" in documents.read(
+                offered.invocation_spec_canonical_bytes, pb.InvocationSpec
+            )
+        except documents.DocumentError:
+            job_offer = False  # The ordinary AttemptEngine records the malformed offer refusal.
+        if self.accepted.mode == "serving" and not job_offer:
             selected = self._placement_by_id(offered.placement_id)
             if selected is None:
                 hosted_ids = sorted(self.hosted)
@@ -6105,7 +6127,7 @@ class Worker:
         """The lane an offer draws its seat from: the placement's, or the envelope for a job.
         Called after the placement is known to be hosted, so an unassigned placement here
         is one that is not dispatchable, and its lane is whichever its slot would take."""
-        if self.accepted.mode == "job":
+        if self.accepted.mode == "job" or (attempt is not None and "job" in attempt.spec):
             if attempt is not None:
                 from . import machine_slots
 
@@ -6308,7 +6330,7 @@ class Worker:
                     CAUSE.CAUSE_CODE_ADMISSION_EPOCH_STALE,
                 )
                 return False
-            if self.accepted.mode == "serving":
+            if self.accepted.mode == "serving" and "job" not in attempt.spec:
                 selected = self._placement_by_id(attempt.placement_id)
                 if selected is None:
                     self.note(
