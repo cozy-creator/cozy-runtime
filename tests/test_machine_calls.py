@@ -28,11 +28,13 @@ def running(executions: Executions, request: str = "parent") -> pb.AttemptOffer:
     return selected
 
 
-def request(parent: pb.AttemptOffer, *, value: int = 1) -> pb.ChildCallRequest:
+def request(
+    parent: pb.AttemptOffer, *, value: int = 1, module: str = "library"
+) -> pb.ChildCallRequest:
     interface = b"i" * 32
     intent = {
         "interface_digest": documents.spell(interface),
-        "module": "library",
+        "module": module,
         "export": "publish",
         "request": {"value": value},
     }
@@ -42,7 +44,7 @@ def request(parent: pb.AttemptOffer, *, value: int = 1) -> pb.ChildCallRequest:
         parent_invocation_spec_digest=parent.invocation_spec_digest,
         call_index=0,
         interface_digest=interface,
-        module="library",
+        module=module,
         export="publish",
         request_canonical_bytes=canonical_json.encode({"value": value}),
         intent_digest=hashlib.sha256(canonical_json.encode(intent)).digest(),
@@ -95,3 +97,59 @@ def test_cancel_before_send_performs_no_write_or_forged_completion(tmp_path: Pat
     with pytest.raises(WorkspaceRefusal, match="accepted intent"):
         calls.get("foreign-owner", "parent", 0)
     assert not calls.get("owner", "parent", 0).sent
+
+
+def test_release_baseline_freezes_before_send_and_survives_reopen(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    calls = Calls(workspace)
+    accepted = calls.accept("owner", request(running(executions)))
+    prepared = b'{"baseline_revision":1,"desired":{"bf16":"checkpoint"}}'
+    accepted = calls.freeze("owner", accepted, prepared)
+    calls.before_write("owner", accepted)
+    recovered = Calls(Workspace(tmp_path / "store")).get("owner", "parent", 0)
+    assert recovered.prepared == prepared and recovered.sent
+    assert calls.freeze("owner", recovered, prepared) == recovered
+    with pytest.raises(WorkspaceRefusal, match="frozen baseline"):
+        calls.freeze("owner", recovered, b'{"baseline_revision":2}')
+    executions.control("owner", "parent", "cancel", 1, "cancel")
+    calls.complete("owner", recovered, b'{"revision":2}')
+    assert calls.get("owner", "parent", 0).result == b'{"revision":2}'
+
+
+def test_read_only_convergence_does_not_fabricate_a_send(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    calls = Calls(workspace)
+    accepted = calls.accept("owner", request(running(executions)))
+    calls.observe_result("owner", accepted, b'{"observation":"observed_convergence"}')
+    recovered = calls.get("owner", "parent", 0)
+    assert recovered.result and not recovered.sent
+    with pytest.raises(WorkspaceRefusal, match="settlement"):
+        calls.before_write("owner", accepted)
+
+
+def test_root_cancel_fences_descendant_writes_and_retains_uncertain_effect(tmp_path: Path) -> None:
+    from cozy_runtime.internal.effect_interfaces import MODULE
+
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    calls = Calls(workspace)
+    child = calls.accept("owner", request(running(executions))).child_request
+    executions.submit("owner", child, b"d" * 32, offer(child))
+    effect = calls.accept("owner", request(running(executions, child), module=MODULE))
+    effect = calls.freeze("owner", effect, b'{"baseline_revision":0}')
+    calls.before_write("owner", effect)
+    assert calls.has_unsettled_effects("owner", "parent")
+    complete(executions, "parent", status=pb.OUTCOME_STATUS_FAILED)
+    executions.control("owner", "parent", "cancel", 1, "cancel")
+    with pytest.raises(WorkspaceRefusal, match="ancestor"):
+        calls.before_write("owner", effect)
+    assert not executions.abandon("owner", "parent")
+    assert executions.retention_required("owner")
+    calls.complete("owner", effect, b'{"revision":1}')
+    assert not calls.has_unsettled_effects("owner", "parent")
+    assert executions.abandon("owner", "parent")
