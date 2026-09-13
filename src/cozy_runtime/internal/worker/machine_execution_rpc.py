@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import grpc
 
-from cozy.worker.v1.wire_version import MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
@@ -18,7 +17,7 @@ from cozy_runtime.internal.worker import machine_capture
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import StaleExecutionGeneration
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
