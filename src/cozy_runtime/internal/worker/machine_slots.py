@@ -113,8 +113,16 @@ def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: Jo
         raise
 
 
-def release(worker: Worker, request: str) -> None:
+def release(worker: Worker, request: str, *, ordinal: int | None = None) -> None:
     with worker.control_lock:
+        if ordinal is not None and any(
+            attempt.request_id == request
+            and attempt.attempt > ordinal
+            and attempt.state != "closed"
+            for attempt in worker.engine.history.values()
+        ):
+            # Native finalization of an older attempt may finish after its retry was admitted.
+            return
         slot_key = key(request)
         slot = worker.job_slots.get(slot_key)
         if slot is None:

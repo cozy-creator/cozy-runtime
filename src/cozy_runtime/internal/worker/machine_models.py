@@ -71,6 +71,7 @@ def inputs(
     declaration: dict[str, Any],
     arguments: dict[str, Any],
 ) -> tuple[list[pb.InputBinding], list[pb.InputAccess]]:
+    retain_result(workspace, owner, recipient, "input", arguments, declaration["request"])
     if not declaration.get("models"):
         return [], []
     bindings, accesses = [], []
@@ -86,7 +87,7 @@ def inputs(
             workspace,
             owner,
             recipient,
-            "input." + parameter,
+            "input/" + parameter,
             msgspec.convert(artifact, type=ModelArtifact, strict=True),
         )
         manifest = artifact["manifest"]
@@ -110,6 +111,10 @@ def inputs(
     return bindings, accesses
 
 
+def _path(parent: str, key: str | int) -> str:
+    return parent + "/" + str(key).replace("~", "~0").replace("/", "~1")
+
+
 def artifacts(value: Any, schema: Any, path: str = "") -> Iterator[tuple[str, ModelArtifact]]:
     """Select only schema-declared Models, preserving arbitrary user JSON unchanged."""
     if not isinstance(schema, dict):
@@ -122,18 +127,18 @@ def artifacts(value: Any, schema: Any, path: str = "") -> Iterator[tuple[str, Mo
                 yield from artifacts(
                     value[field["name"]],
                     field["type"],
-                    f"{path}.{field['name']}" if path else field["name"],
+                    _path(path, field["name"]),
                 )
     elif "list" in schema and isinstance(value, list):
         for index, item in enumerate(value):
-            yield from artifacts(item, schema["list"], f"{path}.{index}" if path else str(index))
+            yield from artifacts(item, schema["list"], _path(path, index))
     elif "tuple" in schema and isinstance(value, list):
         for index, (item, member) in enumerate(zip(value, schema["tuple"], strict=True)):
-            yield from artifacts(item, member, f"{path}.{index}" if path else str(index))
+            yield from artifacts(item, member, _path(path, index))
     elif "map" in schema and isinstance(value, dict):
         for key, item in value.items():
             # JSON keys are strings; only the declared value can contain a Model.
-            yield from artifacts(item, schema["map"]["value"], f"{path}.{key}" if path else key)
+            yield from artifacts(item, schema["map"]["value"], _path(path, key))
     elif "union" in schema:
         branches = schema["union"]
         if value is None and "null" in branches:
@@ -162,9 +167,7 @@ def retain_result(
     schema: Any,
 ) -> None:
     for field, artifact in artifacts(value, schema):
-        hold, observed = retain(
-            workspace, owner, recipient, path + ("." + field if field else ""), artifact
-        )
+        hold, observed = retain(workspace, owner, recipient, path + field, artifact)
         if (documents.spell(observed.manifest.digest), observed.manifest.length) != (
             artifact.manifest.digest,
             artifact.manifest.length,

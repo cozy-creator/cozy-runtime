@@ -3499,7 +3499,7 @@ class Worker:
         self.calls.close(acked.request_id, acked.attempt_ordinal)
         from . import machine_slots
 
-        machine_slots.release(self, acked.request_id)
+        machine_slots.release(self, acked.request_id, ordinal=acked.attempt_ordinal)
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
         # An acknowledged stopped attempt can leave retained work for another
@@ -5982,9 +5982,11 @@ class Worker:
                 # is available on both local and placement-hosted paths at offer time.
                 from . import machine_slots
 
-                selected = self.job_slots.get(machine_slots.key(attempt.request_id))
+                child_slot = self.job_slots.get(machine_slots.key(attempt.request_id))
                 binding = (
-                    selected.binding if selected is not None else self.engine.jobs.get(descriptor)
+                    child_slot.binding
+                    if child_slot is not None
+                    else self.engine.jobs.get(descriptor)
                 )
                 if binding is None or binding.build_id != attempt.spec["job"]["build_id"]:
                     self.refuse(

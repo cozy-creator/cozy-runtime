@@ -87,7 +87,8 @@ async def leaf(ctx: Context, *, n: int) -> ModelArtifact:
     with tensorfs.derive(ctx.output("model"), definition) as output:
         if output.receipt is None:
             output.add_part(
-                "body", "layer.weight", "value", struct.pack("<512e", *(i/257-1 for i in range(512)))
+                "body", "layer.weight", "value",
+                struct.pack("<512e", *(i/257-1 for i in range(512)))
             )
             output.add_part("body", "layer.bias", "value", struct.pack("<16e", *range(16)))
             output.add_config("pipeline", b"{}")

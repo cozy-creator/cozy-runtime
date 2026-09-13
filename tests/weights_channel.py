@@ -12,9 +12,7 @@ from cozy_runtime.internal.seam import Channel, DescriptorReply
 def exchange(
     handle: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> Callable[..., dict[str, Any]]:
-    def call(
-        kind: str, frame: dict[str, Any], *, descriptor: bool = False
-    ) -> dict[str, Any]:
+    def call(kind: str, frame: dict[str, Any], *, descriptor: bool = False) -> dict[str, Any]:
         assert kind == "weights_writer"
         answer = handle(frame)
         if not isinstance(answer, DescriptorReply):

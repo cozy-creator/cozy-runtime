@@ -74,7 +74,7 @@ class Calls:
                 executions.control(
                     owner,
                     call.child_request,
-                    f"parent-pause.{parent.attempt}",
+                    f"parent-pause.{parent.attempt}.{state.generation}",
                     state.generation,
                     "pause",
                 )
@@ -91,6 +91,8 @@ class Calls:
             state=pb.CHILD_CALL_STATE_PENDING,
         )
         if call.result:
+            assert self.worker.workspace is not None
+            workspace_memo.release_lookup(self.worker.workspace, owner, call.child_request)
             result.state, result.result_canonical_bytes = pb.CHILD_CALL_STATE_SUCCEEDED, call.result
             return result
         if call.safe_code:
@@ -191,6 +193,9 @@ class Calls:
                         self._retain_result(owner, call, raw_result, target.declaration["result"])
                         self.journal.observe_result(owner, call, raw_result)
                         workspace_memo.delivered(executions.workspace, owner, call.child_request)
+                        workspace_memo.release_lookup(
+                            executions.workspace, owner, call.child_request
+                        )
                         continue
                 self._check_ancestors(owner, parent, target, payload)
                 from . import machine_models
@@ -317,7 +322,7 @@ class Calls:
             executions.control(
                 owner,
                 row["child_request"],
-                f"ancestor-{action}.{row['parent']}.{row['generation']}",
+                f"ancestor-{action}.{row['parent']}.{row['generation']}.{state.generation}",
                 state.generation,
                 action,
             )
