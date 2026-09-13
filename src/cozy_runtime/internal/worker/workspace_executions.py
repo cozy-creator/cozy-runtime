@@ -361,6 +361,13 @@ class Executions:
                 worker_boot,
             )
 
+    def retry_policy(self, owner: str, request: str) -> tuple[int, int]:
+        """Local descendants inherit the root's accepted automatic retry limits."""
+        root = self.capture_root(owner, request)
+        with self.workspace.locked() as db:
+            row = self._row(db, owner, root)
+            return row["max_attempts"], row["retry_delay_ms"]
+
     def capture(self, owner: str, request: str) -> dict[str, Any]:
         root = self.capture_root(owner, request)
         with self.workspace.locked() as db:
@@ -838,7 +845,12 @@ class Executions:
 
     def retention_required(self, owner: str) -> bool:
         Workspace.owner(owner)
-        with self.workspace.locked() as db:
+        with self.workspace.locked(allow_frozen=True) as db:
+            if (
+                db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
+                != "active"
+            ):
+                return True
             return (
                 db.execute(
                     "SELECT 1 FROM executions WHERE owner=? AND "
