@@ -1,0 +1,606 @@
+"""One Runtime request history survives client loss, process death and native release."""
+
+from __future__ import annotations
+
+import base64
+import dataclasses
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+import tensorfs
+
+from cozy_runtime import canonical_json
+from cozy_runtime.internal.worker.machine_execution import Executions
+from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
+from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
+from test_end_to_end import NO_EXECUTOR
+
+
+def offer(request: str = "root", *, job: bool = True) -> pb.AttemptOffer:
+    invocation, digest = documents.identity(
+        pb.InvocationSpec(
+            job=pb.JobInvocationSpec(
+                build_id="sha256:" + "11" * 32, job_descriptor_id="sha256:" + "12" * 32
+            )
+        )
+        if job
+        else pb.InvocationSpec()
+    )
+    return pb.AttemptOffer(
+        request_id=request,
+        attempt_ordinal=1,
+        invocation_spec_digest=digest,
+        invocation_spec_canonical_bytes=invocation,
+    )
+
+
+def complete(
+    executions: Executions,
+    request: str,
+    value: Any = None,
+    status: pb.OutcomeStatus = pb.OUTCOME_STATUS_SUCCEEDED,
+    cause: pb.CauseCode = pb.CAUSE_CODE_UNSPECIFIED,
+) -> pb.AttemptOutcome:
+    selected = executions.offer("owner", request)
+    body, digest = documents.identity(
+        pb.AttemptOutcomeBody(
+            request_id=request,
+            attempt_ordinal=selected.attempt_ordinal,
+            invocation_spec_digest=documents.spell(selected.invocation_spec_digest),
+            status=status,
+            cause=pb.OutcomeCause(code=cause, origin=pb.CAUSE_ORIGIN_WORKER),
+            safe_message="finished",
+            result=pb.ResultEnvelope(inline_result=canonical_json.encode(value)),
+        )
+    )
+    terminal = pb.AttemptOutcome(
+        request_id=request,
+        attempt_ordinal=selected.attempt_ordinal,
+        invocation_spec_digest=selected.invocation_spec_digest,
+        outcome_id="out-" + str(selected.attempt_ordinal),
+        outcome_digest=digest,
+        outcome_canonical_bytes=body,
+    )
+    executions.workspace.outcome("owner", terminal)
+    executions.observe("owner", pb.WorkerFrame(attempt_outcome=terminal))
+    return terminal
+
+
+def ack(outcome: pb.AttemptOutcome, *, retain: bool = False) -> pb.AttemptOutcomeAck:
+    return pb.AttemptOutcomeAck(
+        request_id=outcome.request_id,
+        attempt_ordinal=outcome.attempt_ordinal,
+        invocation_spec_digest=outcome.invocation_spec_digest,
+        outcome_id=outcome.outcome_id,
+        outcome_digest=outcome.outcome_digest,
+        retain_work=retain,
+    )
+
+
+@pytest.mark.parametrize("value", [None, 0, False, "", [], {}, 3.25, {"result": [1, "two"]}])
+def test_exact_results_survive_lost_replies_collection_and_native_release(
+    tmp_path: Path, value: Any
+) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    submitted = offer()
+    receipt = executions.submit("owner", "submission", b"c" * 32, submitted)
+    # A reconnect's stamps are not another semantic request.
+    submitted.record_owner_epoch = 7
+    submitted.control_stream_epoch = 9
+    submitted.worker_boot_id = "later-stream"
+    submitted.admission_epoch = 11
+    assert executions.submit("owner", "submission", b"c" * 32, submitted) == receipt
+    terminal = complete(executions, "root", value)
+    executions.progress("owner", "root", 1, {"type": "progress", "payload": {"position": 100}})
+    reopened = Executions(Workspace(tmp_path / "store"))
+    assert reopened.collect("owner", "root") == terminal
+    assert reopened.retention_required("owner")
+    with pytest.raises(WorkspaceRefusal, match="uncollected"):
+        workspace.acknowledge("owner", ack(terminal))
+    assert reopened.acknowledge_collection("owner", ack(terminal)).collected
+    assert reopened.acknowledge_collection("owner", ack(terminal)).collected
+    workspace.acknowledge("owner", ack(terminal))
+    assert reopened.collect("owner", "root") == terminal
+    assert not reopened.retention_required("owner")
+    with workspace.locked() as db:
+        assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 0
+
+
+def test_submission_conflicts_do_not_rebind_root_or_an_existing_attempt(tmp_path: Path) -> None:
+    e = Executions(Workspace(tmp_path / "store"))
+    original = offer()
+    e.submit("owner", "submission", b"c" * 32, original)
+    for submission, capture, changed in [
+        ("submission", b"d" * 32, original),
+        ("submission", b"c" * 32, offer("other")),
+        ("different", b"c" * 32, original),
+    ]:
+        with pytest.raises(WorkspaceRefusal, match="identity changed"):
+            e.submit("owner", submission, capture, changed)
+    original.placement_id = "another-semantic-target"
+    with pytest.raises(WorkspaceRefusal, match="identity changed"):
+        e.submit("owner", "submission", b"c" * 32, original)
+    with pytest.raises(WorkspaceRefusal, match="this owner"):
+        e.status("foreign", "root")
+    e.workspace.accept("owner", offer("legacy"))
+    with pytest.raises(WorkspaceRefusal, match="another execution path"):
+        e.submit("owner", "legacy", b"c" * 32, offer("legacy"))
+
+
+def test_controls_fence_generation_and_replay_commands_without_another_attempt(
+    tmp_path: Path,
+) -> None:
+    e = Executions(Workspace(tmp_path / "store"))
+    e.submit("owner", "s", b"c" * 32, offer())
+    terminal = complete(e, "root", status=pb.OUTCOME_STATUS_FAILED)
+    second = e.control("owner", "root", "resume-1", 1, "resume")
+    assert second.attempt_ordinal == 2 and second.generation == 2
+    assert e.control("owner", "root", "resume-1", 1, "resume") == second
+    with pytest.raises(WorkspaceRefusal, match="identity changed"):
+        e.control("owner", "root", "resume-1", 2, "cancel")
+    with pytest.raises(WorkspaceRefusal, match="stale"):
+        e.control("owner", "root", "old-cancel", 1, "cancel")
+    canceled = e.control("owner", "root", "cancel", 2, "cancel")
+    assert canceled.state == "canceling" and canceled.generation == 3
+    # Finishing the already-authorized attempt is allowed after the cancellation fence.
+    current = offer()
+    current.attempt_ordinal = 2
+    body, digest = documents.identity(
+        pb.AttemptOutcomeBody(
+            request_id="root",
+            attempt_ordinal=2,
+            invocation_spec_digest=documents.spell(current.invocation_spec_digest),
+            status=pb.OUTCOME_STATUS_CANCELED,
+        )
+    )
+    e.workspace.outcome(
+        "owner",
+        pb.AttemptOutcome(
+            request_id="root",
+            attempt_ordinal=2,
+            invocation_spec_digest=current.invocation_spec_digest,
+            outcome_id="canceled",
+            outcome_digest=digest,
+            outcome_canonical_bytes=body,
+        ),
+    )
+    assert e.status("owner", "root").state == "canceled"
+    with pytest.raises(WorkspaceRefusal, match="only paused or failed"):
+        e.control("owner", "root", "resume-canceled", 3, "resume")
+    assert e.collect("owner", "root", 1) == terminal
+    assert not e.acknowledge_collection("owner", ack(terminal)).collected
+
+
+def test_progress_compaction_reports_gaps_but_preserves_logs_and_days_of_retention(
+    tmp_path: Path,
+) -> None:
+    now = [1_000]
+    e = Executions(Workspace(tmp_path / "store"), clock_ms=lambda: now[0])
+    e.submit("owner", "s", b"c" * 32, offer())
+    e.progress("owner", "root", 1, {"type": "log", "payload": "durable author log"})
+    for index in range(300):
+        e.progress("owner", "root", 1, {"type": "progress", "payload": {"position": index}})
+    now[0] += 7 * 24 * 60 * 60 * 1000  # scoped service clock, never the host clock
+    first = e.events("owner", "root")
+    assert first.compacted_through > 0 and first.events[1].kind == "log"
+    assert e.retention_required("owner")
+    last = first.events[-1].sequence
+    assert e.events("owner", "root", last).events[0].sequence > last
+    with pytest.raises(WorkspaceRefusal, match="ahead"):
+        e.events("owner", "root", 10_000)
+    terminal = complete(e, "root")
+    assert e.collect("owner", "root") == terminal
+    wrong = ack(terminal)
+    wrong.outcome_digest = b"x" * 32
+    with pytest.raises(WorkspaceRefusal, match="changed"):
+        e.acknowledge_collection("owner", wrong)
+    assert e.retention_required("owner")
+
+
+CHILD = """
+import base64,sys
+from pathlib import Path
+from cozy_runtime.internal.worker.machine_execution import Executions
+from cozy_runtime.internal.worker.workspace import Workspace
+from cozy_runtime.protocol import worker_pb2 as pb
+e=Executions(Workspace(Path(sys.argv[1])))
+e.submit('owner','submission',b'c'*32,pb.AttemptOffer.FromString(base64.b64decode(sys.argv[2])))
+print('accepted',flush=True)
+sys.stdin.readline()
+"""
+
+
+def test_actual_process_death_recovers_without_duplicate_execution(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            CHILD,
+            str(root),
+            base64.b64encode(offer().SerializeToString()).decode(),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "accepted"
+        e = Executions(Workspace(root))
+        assert e.status("owner", "root").state == "queued"  # live origin cannot be reclaimed
+        child.kill()
+        child.communicate(timeout=10)
+        assert e.status("owner", "root").state == "failed"
+        original = e.collect("owner", "root")
+        assert (
+            documents.read(original.outcome_canonical_bytes, pb.AttemptOutcomeBody)["status"]
+            == pb.OUTCOME_STATUS_ABANDONED
+        )
+        assert e.submit("owner", "submission", b"c" * 32, offer()).request_id == "root"
+        assert e.status("owner", "root").attempt_ordinal == 1
+        assert e.control("owner", "root", "resume", 1, "resume").attempt_ordinal == 2
+        assert e.collect("owner", "root", 1) == original
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.communicate(timeout=10)
+
+
+def test_native_result_has_separate_collection_and_consumer_custody(tmp_path: Path) -> None:
+    from cozy_runtime.internal import canonical
+    from cozy_runtime.internal.weights_sink import protocol_receipt
+    from test_workspace_custody import produced, retention
+
+    value = json.loads(
+        (
+            Path(__file__).parent / "testdata/worker-protocol/canonical/invocation_spec_job.json"
+        ).read_text()
+    )
+    for outputs in (value["outputs"], value["job"]["publication_contract"]["outputs"]):
+        for output in outputs:
+            output["mime_type"] = "application/vnd.cozy.model-manifest"
+    invocation = canonical.write(value)
+    offered = pb.AttemptOffer(
+        request_id="producer",
+        attempt_ordinal=1,
+        invocation_spec_digest=hashlib.sha256(invocation).digest(),
+        invocation_spec_canonical_bytes=invocation,
+    )
+    e = Executions(Workspace(tmp_path / "store"))
+    e.submit("owner", "native", b"c" * 32, offered)
+    store, workspace, receipt = produced(tmp_path)
+    independent = workspace.retain("owner", retention(receipt, 42))
+    reference, _, _ = protocol_receipt(
+        receipt,
+        owner_scope="owner",
+        request_id="producer",
+        invocation_spec_digest=documents.spell(offered.invocation_spec_digest),
+    )
+    body, digest = documents.identity(
+        pb.AttemptOutcomeBody(
+            request_id="producer",
+            attempt_ordinal=1,
+            invocation_spec_digest=documents.spell(offered.invocation_spec_digest),
+            status=pb.OUTCOME_STATUS_SUCCEEDED,
+            weights_receipts=[reference],
+            result=pb.ResultEnvelope(inline_result=b"null"),
+        )
+    )
+    terminal = pb.AttemptOutcome(
+        request_id="producer",
+        attempt_ordinal=1,
+        invocation_spec_digest=offered.invocation_spec_digest,
+        outcome_id="native",
+        outcome_digest=digest,
+        outcome_canonical_bytes=body,
+    )
+    workspace.outcome("owner", terminal)
+    assert e.collect("owner", "producer") == terminal
+    tensorfs.gc(str(store.root))
+    assert store.manifest(documents.spell(independent.manifest.digest))["manifest"]
+    e.acknowledge_collection("owner", ack(terminal))
+    workspace.release_result(
+        "owner",
+        pb.DerivedResultReleaseRequest(
+            weights_transaction_id=receipt.weights_transaction_id,
+            tensorfs_receipt_digest=documents.raw(receipt.tensorfs_receipt_digest),
+        ),
+    )
+    workspace.acknowledge("owner", ack(terminal))
+    tensorfs.gc(str(store.root))
+    assert store.manifest(documents.spell(independent.manifest.digest))["manifest"]
+    assert Executions(Workspace(tmp_path / "store")).collect("owner", "producer") == terminal
+
+
+def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Path) -> None:
+    from cozy_runtime.internal.config import Credentials, RuntimeConfig
+    from cozy_runtime.internal.worker.attempts import InlineResult
+    from cozy_runtime.internal.worker.control import InMemoryControlHost
+    from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+    from cozy_runtime.protocol import WIRE_MINOR
+
+    worker = Worker(
+        RuntimeConfig(
+            cozy_home=tmp_path / "home",
+            credentials=Credentials(),
+            bootstrap_credential="test-bootstrap",
+        ),
+        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
+        InMemoryControlHost(),
+    )
+    frames: list[pb.WorkerFrame] = []
+    claim = pb.Claim(
+        record_owner_id="owner",
+        record_owner_epoch=1,
+        wire_minor=WIRE_MINOR,
+        proof=b"test-bootstrap",
+    )
+    try:
+        assert worker.accept_claim(claim, frames.append)[0] == 1
+        # No Control stream or watcher is running. Real admission produces a typed terminal.
+        submitted = offer("refused", job=False)
+        receipt = worker.submit_execution(claim, "refused", b"c" * 32, submitted)
+        assert receipt.request_id == "refused"
+        assert worker.execution_status(claim, "refused").state == "failed"
+        refused = worker.collect_execution(claim, "refused")
+        assert documents.read(refused.outcome_canonical_bytes, pb.AttemptOutcomeBody)[
+            "safe_message"
+        ]
+        assert worker.engine.history[("refused", 1)].state == "closed"
+        assert worker.submit_execution(claim, "refused", b"c" * 32, submitted) == receipt
+        # Exercise the real engine's successful terminal path independently of its compute phase.
+        assert worker.executions is not None
+        submitted = offer("scalar", job=False)
+        submitted.grant.invocation_spec_digest = submitted.invocation_spec_digest
+        worker.executions.submit("owner", "scalar", b"d" * 32, submitted)
+        attempt = worker.engine.offer(submitted)
+        worker.engine.hold(attempt)
+        terminal = worker.engine.outcome(
+            attempt,
+            pb.OUTCOME_STATUS_SUCCEEDED,
+            pb.CAUSE_CODE_UNSPECIFIED,
+            pb.CAUSE_ORIGIN_RUNTIME,
+            "completed None",
+            result=InlineResult(
+                canonical=b"null", schema_digest="sha256:" + "34" * 32, adjustments=()
+            ),
+        )
+        worker.send(pb.WorkerFrame(attempt_outcome=terminal))
+        assert (
+            attempt.state == "closed"
+            and worker.execution_status(claim, "scalar").state == "succeeded"
+        )
+        assert worker.collect_execution(claim, "scalar") == terminal
+        assert worker.acknowledge_execution_collection(claim, ack(terminal)).collected
+        worker.executions.progress(
+            "owner", "refused", 1, {"type": "log", "payload": "ignored after terminal"}
+        )
+        assert worker.execution_events(claim, "refused").head_sequence > 0
+        foreign = pb.Claim(
+            record_owner_id="foreign",
+            record_owner_epoch=2,
+            wire_minor=WIRE_MINOR,
+            proof=b"test-bootstrap",
+        )
+        assert worker.accept_claim(foreign, frames.append)[0] == 0
+        assert worker.fence.record_owner_id == "owner"
+        with pytest.raises(WorkspaceRefusal, match="authenticated owner"):
+            worker.execution_status(foreign, "scalar")
+    finally:
+        worker.shutdown()
+
+
+def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    workspace.accept("owner", offer("legacy"))
+    with workspace.locked() as db:
+        for table in ("execution_commands", "execution_events", "executions"):
+            db.execute("DROP TABLE " + table)
+        db.execute("PRAGMA user_version=6")
+    workspace = Workspace(tmp_path / "store")
+    assert workspace.contains("owner", "legacy", 1)
+    e = Executions(workspace)
+    e.submit("owner", "new", b"c" * 32, offer("new"))
+    with workspace.locked() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 2
+
+
+def test_retry_policy_never_retries_authored_errors_or_abandonment(tmp_path: Path) -> None:
+    now = [1000]
+    e = Executions(Workspace(tmp_path / "store"), clock_ms=lambda: now[0])
+    for request, status, cause in [
+        ("transient", pb.OUTCOME_STATUS_FAILED, pb.CAUSE_CODE_EXECUTOR_FAULT),
+        ("author", pb.OUTCOME_STATUS_FAILED, pb.CAUSE_CODE_AUTHOR_EXCEPTION),
+        ("abandoned", pb.OUTCOME_STATUS_ABANDONED, pb.CAUSE_CODE_EXECUTOR_INVALIDATED),
+        ("structural", pb.OUTCOME_STATUS_REFUSED, pb.CAUSE_CODE_LOCAL_SAFETY),
+    ]:
+        e.submit("owner", request, b"c" * 32, offer(request), max_attempts=2, retry_delay_ms=500)
+        complete(e, request, status=status, cause=cause)
+    e.retry_due("owner")
+    assert e.status("owner", "transient").attempt_ordinal == 1
+    now[0] += 500
+    e.retry_due("owner")
+    assert e.status("owner", "transient").attempt_ordinal == 2
+    e.retry_due("owner")
+    assert all(
+        e.status("owner", request).attempt_ordinal == 1
+        for request in ("author", "abandoned", "structural")
+    )
+    complete(e, "transient", status=pb.OUTCOME_STATUS_FAILED, cause=pb.CAUSE_CODE_EXECUTOR_FAULT)
+    now[0] += 500
+    e.retry_due("owner")
+    assert e.status("owner", "transient").attempt_ordinal == 2
+    # An explicit command authorizes another attempt without quietly expanding auto retries.
+    assert e.control("owner", "transient", "user-resume", 2, "resume").attempt_ordinal == 3
+
+
+def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path: Path) -> None:
+    e = Executions(Workspace(tmp_path / "store"), clock_ms=lambda: 2000)
+    e.submit("owner", "cancel", b"c" * 32, offer("cancel"))
+    e.control("owner", "cancel", "cancel", 1, "cancel")
+    e.stop_queued("owner", "cancel")
+    assert e.status("owner", "cancel").state == "canceled"
+    assert not documents.read(
+        e.collect("owner", "cancel").outcome_canonical_bytes, pb.AttemptOutcomeBody
+    ).get("execution_started", False)
+    submitted = offer("expired")
+    spec = pb.InvocationSpec(
+        job=pb.JobInvocationSpec(
+            build_id="sha256:" + "11" * 32, job_descriptor_id="sha256:" + "12" * 32
+        ),
+        deadline_unix_ms=1000,
+    )
+    submitted.invocation_spec_canonical_bytes, submitted.invocation_spec_digest = (
+        documents.identity(spec)
+    )
+    e.submit("owner", "expired", b"c" * 32, submitted)
+    complete(e, "expired", status=pb.OUTCOME_STATUS_FAILED)
+    with pytest.raises(WorkspaceRefusal, match="deadline"):
+        e.control("owner", "expired", "resume", 1, "resume")
+
+
+@pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
+def test_real_executor_and_next_queued_root_finish_without_control_stream() -> None:
+    from conftest import image_python
+    from cozy_runtime.internal import child_env
+    from cozy_runtime.internal.config import Credentials, RuntimeConfig
+    from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
+    from cozy_runtime.internal.worker.control import GrpcControlHost
+    from cozy_runtime.internal.worker.plan import JobBinding
+    from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+    from cozy_runtime.protocol import WIRE_MINOR
+    from test_job_preparation_isolation import measure, package
+
+    with tempfile.TemporaryDirectory(prefix="cz-machine.") as raw:
+        root = Path(raw)
+        environment, preparation = package(root, "offline")
+        (root / "artifacts").mkdir()
+        worker = Worker(
+            RuntimeConfig(
+                cozy_home=root / "home",
+                credentials=Credentials(),
+                bootstrap_credential="offline",
+                child_base_env=tuple(
+                    sorted(
+                        (k, v)
+                        for k, v in os.environ.items()
+                        if not child_env.erased(k)
+                        and k not in ("PYTHONPATH", "COZY_BOOTSTRAP_CREDENTIAL")
+                    )
+                ),
+            ),
+            WorkerOptions(
+                root=root / "worker",
+                devices="",
+                accelerator_backend="none",
+                python=str(image_python()),
+                install_root=environment,
+                artifact_cache=root / "artifacts",
+                tensorfs_root=root / "store",
+                grant_roots=(str(root),),
+            ),
+            GrpcControlHost("127.0.0.1:0", root / "control.addr"),
+        )
+        thread = threading.Thread(target=worker.run, daemon=True)
+        try:
+            measure(worker, preparation)
+            worker.prepare_local_package(preparation)
+            if worker.supervision.current is not None:
+                worker.supervision.retire_current(
+                    worker.supervision.current, "begin worker lifecycle"
+                )
+            plans = [
+                json.loads(path.read_bytes()) for path in (root / "home/job-plans").glob("*/*.json")
+            ]
+            binding = JobBinding.read(next(row for row in plans if row.get("job") == "offline"))
+            thread.start()
+            until = time.monotonic() + 90
+            while not (root / "control.addr").exists():
+                assert thread.is_alive() and time.monotonic() < until
+                time.sleep(0.02)
+            claim = pb.Claim(
+                record_owner_id="owner",
+                record_owner_epoch=1,
+                wire_minor=WIRE_MINOR,
+                proof=b"offline",
+            )
+            # End a real stream immediately. Neither a SnapshotAck nor a sender survives it.
+            worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda frame: None)
+            assert not worker.connected.is_set() and not worker.fence.dispatch_open
+            request = LocalRequest(
+                entrypoint="offline",
+                payload={"entered": str(root / "entered"), "gate": str(root / "gate")},
+                outputs=(),
+                kind="job",
+                request_id="first",
+                job_descriptor_id=binding.job_descriptor_id,
+                timeout_ms=60_000,
+            )
+            generator = LocalRecordOwner(
+                request, {}, root / "grants-first", package_code_digest=binding.build_id
+            )
+            worker._apply_desired_state(generator._desired_state())
+            while not worker.job_ready:
+                assert time.monotonic() < until, worker.latched
+                time.sleep(0.02)
+            for identifier in ("first", "second", "canceled"):
+                generator = LocalRecordOwner(
+                    dataclasses.replace(
+                        request,
+                        request_id=identifier,
+                        payload=request.payload if identifier == "first" else {},
+                    ),
+                    {},
+                    root / ("grants-" + identifier),
+                    package_code_digest=binding.build_id,
+                )
+                generator.host.inbound.get_nowait()  # helper's Claim is not transmitted
+                generator._dispatch()
+                message = generator.host.inbound.get_nowait()
+                assert message is not None
+                worker.submit_execution(claim, identifier, b"c" * 32, message.attempt_offer)
+            while not (root / "entered").exists():
+                assert time.monotonic() < until
+                time.sleep(0.02)
+            assert worker.execution_status(claim, "second").state == "queued"
+            worker.control_execution(claim, "canceled", "cancel", 1, "cancel")
+            assert worker.execution_status(claim, "canceled").state == "canceled"
+            (root / "gate").touch()
+            for identifier in ("first", "second"):
+                while worker.execution_status(claim, identifier).state not in (
+                    "succeeded",
+                    "failed",
+                ):
+                    assert time.monotonic() < until
+                    time.sleep(0.02)
+                outcome = worker.collect_execution(claim, identifier)
+                body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+                assert body["status"] == pb.OUTCOME_STATUS_SUCCEEDED, body
+                assert worker.engine.history[(identifier, 1)].state == "closed"
+                assert worker.execution_status(claim, identifier).state == "succeeded"
+            assert not worker.connected.is_set() and not worker.fence.dispatch_open
+            assert thread.is_alive()  # completed results still await collection
+        finally:
+            worker.request_stop()
+            worker.host.stop()
+            if thread.ident is not None:
+                thread.join(30)
+            else:
+                worker.shutdown()
+            assert not thread.is_alive()
