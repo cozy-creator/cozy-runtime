@@ -110,6 +110,57 @@ def release(workspace: Workspace, owner: str, recipient: str) -> None:
     # Keep the tiny ownership record for idempotent release after a lost reply.
 
 
+def file_source(
+    workspace: Workspace, owner: str, parent: str, digest: str, length: int
+) -> pb.NativeByteRetentionRequest:
+    """Resolve a typed file only among native payload trees actually received by this parent."""
+    from . import workspace_byte_outputs
+
+    documents.raw(digest)
+    if type(length) is not int or not 0 <= length <= 8 << 20:
+        raise WorkspaceRefusal("received metadata file exceeds its 8 MiB bound")
+    with workspace.locked() as db:
+        rows = db.execute(
+            "SELECT retention FROM execution_model_holds "
+            "WHERE owner=? AND recipient=? ORDER BY path",
+            (owner, parent),
+        ).fetchall()
+        candidates = []
+        for row in rows:
+            hold = pb.DerivedRetentionRequest.FromString(row["retention"])
+            held = db.execute(
+                "SELECT h.*,b.content_bytes FROM holds h JOIN byte_outputs b ON b.owner=h.owner "
+                "AND b.id=h.transaction_id WHERE h.owner=? AND h.id=? AND h.state='held' "
+                "AND h.kind='tree' AND h.native_digest=? AND b.content_bytes=?",
+                (owner, hold.retention_id, hold.tensorfs_receipt_digest, length),
+            ).fetchone()
+            if held is not None:
+                candidates.append(
+                    pb.NativeByteRetentionRequest(
+                        retention_id=hold.retention_id,
+                        source=pb.NativeByteTreeRef(
+                            producer_root_id=held["transaction_id"],
+                            receipt_digest=held["native_digest"],
+                            manifest=pb.Ref(
+                                digest=held["manifest"], length=held["manifest_length"]
+                            ),
+                            content_bytes=held["content_bytes"],
+                        ),
+                    )
+                )
+    for candidate in candidates:
+        with workspace_byte_outputs.leased(workspace, owner, candidate) as (_, _, members):
+            if members == [
+                {
+                    "kind": "file",
+                    "path": "payload",
+                    "blob": {"sha256": digest[7:], "length": length},
+                }
+            ]:
+                return candidate
+    raise WorkspaceRefusal("metadata file has no exact received native payload tree")
+
+
 def inputs(
     workspace: Workspace,
     owner: str,

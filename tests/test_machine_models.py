@@ -9,7 +9,7 @@ import tensorfs
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import machine_models, workspace_memo
-from cozy_runtime.internal.worker.workspace import Workspace
+from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_machine_execution import ack, complete, offer
@@ -99,3 +99,42 @@ def test_parent_hold_survives_release_of_temporary_memo_recipient(tmp_path: Path
     assert store.manifest(receipt.artifact.manifest.digest)
     machine_models.release(workspace, "owner", "parent")
     assert workspace_memo.prune(workspace, "owner").removed_entries == 1
+
+
+def test_metadata_file_resolver_requires_actual_parent_received_custody(tmp_path: Path) -> None:
+    import hashlib
+
+    from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
+    from test_workspace_byte_outputs import producing
+
+    workspace, spec, manifest, path = producing(tmp_path)
+    data = path.read_bytes()
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    source = outputs.commit(
+        workspace, "owner", "producer", 1, spec, "report", manifest, [("payload", path)], 200000
+    )
+    with pytest.raises(WorkspaceRefusal, match="received"):
+        machine_models.file_source(workspace, "owner", "parent", digest, len(data))
+    grant = machine_models.retain_bytes(workspace, "owner", "parent", "call.0.report", source)
+    held = machine_models.file_source(workspace, "owner", "parent", digest, len(data))
+    assert held.source == source and held.retention_id == grant.retention_id
+    for owner, parent, wrong in (
+        ("foreign", "parent", digest),
+        ("owner", "different", digest),
+        ("owner", "parent", "sha256:" + "de" * 32),
+    ):
+        with pytest.raises(WorkspaceRefusal, match="received"):
+            machine_models.file_source(workspace, owner, parent, wrong, len(data))
+    with pytest.raises(WorkspaceRefusal, match="8 MiB"):
+        machine_models.file_source(workspace, "owner", "parent", digest, (8 << 20) + 1)
+    effect = machine_models.retain_bytes(workspace, "owner", "effect", "report", source)
+    machine_models.release(workspace, "owner", "parent")
+    tensorfs.gc(str(workspace.store_root))
+    with outputs.leased(
+        workspace,
+        "owner",
+        pb.NativeByteRetentionRequest(source=source, retention_id=effect.retention_id),
+    ):
+        pass
+    with pytest.raises(WorkspaceRefusal, match="received"):
+        machine_models.file_source(workspace, "owner", "parent", digest, len(data))
