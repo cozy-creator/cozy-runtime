@@ -76,7 +76,15 @@ jobs:
           tests/test_job_source_derivation.py tests/test_construction_dtype.py
           tests/test_end_to_end.py::test_real_modeled_package_prepare_can_be_acquired_before_model_selection -q -rs
       - name: Cross the real pod executor UID boundary during warmup
-        run: sudo -E .venv/bin/python -m pytest tests/test_warm_isolation.py -q -rs
+        run: |
+          # The runner's checkout parents can also be private. Copy only the test
+          # environment and source into an explicit, traversable proof directory.
+          proof_root=$(mktemp -d /tmp/cozy-runtime-uid.XXXXXX)
+          trap 'sudo rm -rf "$proof_root"' EXIT
+          chmod 0755 "$proof_root"
+          cp -a .venv src tests pyproject.toml "$proof_root/"
+          cd "$proof_root"
+          sudo -E env PYTHONPATH="$proof_root/src" .venv/bin/python -m pytest tests/test_warm_isolation.py -q -rs
 
   # THE VENDORED-DRIFT GATE (#536d). `src/cozy/worker/v1/` is a COPY of another repo's
   # generated output, and a copy is only a copy while somebody compares the bytes.
