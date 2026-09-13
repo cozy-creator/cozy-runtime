@@ -17,6 +17,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.internal.worker.ledger import Ledger
+from cozy_runtime.internal.worker.plan import (
+    DeclaredBinding,
+    PlanChooser,
+    PreparedModel,
+    PreparedRequest,
+)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -215,6 +223,15 @@ def main() -> None:
         del reference
         gc.collect()
         torch.cuda.empty_cache()
+        # The text-encoder proof has 241 MB total weights but an approximately 9 MB
+        # working set. Enforce a 256 MiB allocator quota without occupying the rest of
+        # the user's GPU. The planner's capacity budget below is this real quota,
+        # not a claim that physical driver-free VRAM was reduced to 256 MiB.
+        allocation_limit = 256 << 20 if component == "text_encoder" else 0
+        if allocation_limit:
+            torch.cuda.set_per_process_memory_fraction(
+                allocation_limit / torch.cuda.get_device_properties(0).total_memory
+            )
         checkpoint = Checkpoint(store_root, manifest)
         rows = checkpoint.rows(component)
         backend = StreamingFillBackend.for_script(
@@ -241,6 +258,50 @@ def main() -> None:
         backend.commit()
         del live, walked
         residency = ComponentResidency(backend=backend, torch=torch, placement="component_staged")
+        ledger = Ledger(worker_pid=1)
+        ledger.begin_generation(1)
+        capacity = allocation_limit or torch.cuda.mem_get_info()[0]
+        ledger.observe_construction(
+            {
+                "filled_bytes": total,
+                "allocator_bytes": 0,
+                "reserved_bytes": 0,
+                "resident": {},
+                "parked": [component],
+                "evicted": {component: total},
+                "paging": {component: layout.document()},
+                "declared_scopes": {"forward": [component]},
+                "device_free_bytes": capacity,
+                "device_total_bytes": capacity,
+            }
+        )
+        plan = PlanChooser(ledger).choose(
+            DeclaredBinding(
+                entrypoint_binding_digest="sha256:paging-proof",
+                entrypoint="forward",
+                model_class="PagingProof",
+                model_binding_path="fixture:model",
+                model_parameter_name="model",
+                release="fixture/1",
+                model_weight_bytes=total,
+            ),
+            PreparedModel(delivery_rung="verbatim"),
+            PreparedRequest.unresolved("forward", {}),
+        )
+        assert plan.placement == "component_staged"
+        assert plan.headroom_bytes == 0 and dict(plan.scope_headroom_bytes) == {"forward": 0}
+        print(
+            json.dumps(
+                {
+                    "phase": "advisory_activation_reserve",
+                    "allocator_limit_bytes": allocation_limit,
+                    "planner_capacity_bytes": capacity,
+                    "activation_estimate_bytes": plan.activation_envelope_bytes,
+                    "enforced_headroom_bytes": plan.headroom_bytes,
+                }
+            ),
+            flush=True,
+        )
         visited: list[Any] = []
         expected_cache = [True]
 
@@ -264,7 +325,9 @@ def main() -> None:
         start = time.monotonic()
         try:
             for iteration in range(2):
-                residency.open_attempt("component_staged", 0)
+                residency.open_attempt(
+                    plan.placement, plan.headroom_bytes, dict(plan.scope_headroom_bytes)
+                )
                 with torch.no_grad():
                     residency.admit("forward", (component,))
                     expected_cache[0] = iteration == 0
@@ -314,6 +377,12 @@ def main() -> None:
                 residency.admit("forward", (component,))
             except ResidencyRefusal as exc:
                 assert exc.code == "device_shortfall" and not residency.poisoned
+                assert exc.shortfall == {
+                    "resource": "vram",
+                    "scope": "forward",
+                    "needed_bytes": layout.working_bytes,
+                    "available_bytes": layout.working_bytes - 1,
+                }
             else:
                 raise AssertionError("undersized working-set ceiling was accepted")
             assert torch.cuda.memory_allocated() == allocated and residency.stages == stages
