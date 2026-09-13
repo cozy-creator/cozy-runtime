@@ -676,22 +676,12 @@ class Acquirer:
                     model_weight_bytes = sum(
                         int(row["length"]) for row in store.walk_cozytensors(reference_manifest)
                     )
-                    checkpoints = {
-                        snapshot: fill.Checkpoint(self.tensorfs_root, snapshot)
-                        for snapshot in set(snapshots.values())
-                    }
-                    component_bytes = {}
-                    for component, snapshot in snapshots.items():
-                        rows = checkpoints[snapshot].rows(component)
-                        # Logical destinations and encoded carriers differ. Neither is
-                        # free; fill's measured envelope adds scratch/derived buffers later.
-                        component_bytes[component] = max(
-                            sum(row.nbytes for row in rows),
-                            sum(row.stored_nbytes for row in rows),
-                        )
                     staged_weights.append(
-                        _staged_weight_bytes(
-                            component_bytes, declared.get("component_use", {}), model_weight_bytes
+                        _model_group_weight_bytes(
+                            self.tensorfs_root,
+                            snapshots,
+                            declared.get("component_use", {}),
+                            model_weight_bytes,
                         )
                     )
                 except Exception as exc:
@@ -801,20 +791,36 @@ class Acquirer:
         return target
 
 
-def _staged_weight_bytes(
-    components: Mapping[str, int], scopes: Mapping[str, list[str]], artifact_bytes: int
+def _model_group_weight_bytes(
+    root: Path, snapshots: Mapping[str, str], scopes: Mapping[str, list[str]], artifact_bytes: int
 ) -> int:
-    """A complete declared scope permits staging; unknown use retains the full bound."""
-    full = max(artifact_bytes, sum(components.values()))
+    """Price complete staging declarations; otherwise retain full artifact accounting."""
     covered = {name for names in scopes.values() for name in names}
-    if not scopes or covered != set(components):
+    if not scopes or covered != set(snapshots):
+        return artifact_bytes
+    checkpoints = {
+        snapshot: fill.Checkpoint(root, snapshot) for snapshot in set(snapshots.values())
+    }
+    checkpoint_sizes = {}
+    for snapshot, checkpoint in checkpoints.items():
+        sizes = {}
+        for component in checkpoint.header["components"]:
+            rows = checkpoint.rows(component)
+            # Fill adds scratch/derived buffers to this header bound later.
+            sizes[component] = max(
+                sum(row.nbytes for row in rows), sum(row.stored_nbytes for row in rows)
+            )
+        checkpoint_sizes[snapshot] = sizes
+    full = max(artifact_bytes, sum(sum(sizes.values()) for sizes in checkpoint_sizes.values()))
+    if any(
+        component not in checkpoint_sizes[snapshot] for component, snapshot in snapshots.items()
+    ):
+        # The derive's constructed components need not be in the checkpoint.
+        # Only model-code-fit judges that mismatch; it cannot justify cheap staging.
         return full
+    components = {name: checkpoint_sizes[snapshot][name] for name, snapshot in snapshots.items()}
     return max(
-        [
-            *components.values(),
-            *(sum(components[name] for name in set(names)) for names in scopes.values()),
-        ],
-        default=full,
+        (sum(components[name] for name in set(names)) for names in scopes.values()), default=full
     )
 
 

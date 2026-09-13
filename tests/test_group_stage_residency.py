@@ -55,6 +55,13 @@ def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1) -> Decla
         model["component_use"] = {"text": ["text_encoder"]}
     elif scope == "absent":
         model["component_use"] = {}
+    elif scope == "missing_component":
+        missing = entry["entrypoints"][0]["slots"][0]["components"][0]["component"]
+        entry["entrypoints"][0]["slots"][0]["components"][0]["component"] = "absent"
+        model["component_use"] = {
+            method: ["absent" if name == missing else name for name in names]
+            for method, names in model["component_use"].items()
+        }
     if slots == 2:
         second = copy.deepcopy(model)
         second["path"] = "fl2va.models.other"
@@ -117,7 +124,9 @@ def test_actual_h3_scopes_fit_each_rank_without_dividing_weights(
         assign(selected, degree, TEXT_ENCODER - 1)
 
 
-@pytest.mark.parametrize("scope", ["simultaneous", "unknown", "uncovered", "absent"])
+@pytest.mark.parametrize(
+    "scope", ["simultaneous", "unknown", "uncovered", "absent", "missing_component"]
+)
 def test_full_or_unknown_scopes_remain_too_large(tmp_path: Path, scope: str) -> None:
     selected = binding(tmp_path, scope=scope)
     with pytest.raises(LaneRefusal, match="device_group_infeasible"):
@@ -130,3 +139,17 @@ def test_independent_slots_of_the_same_checkpoint_still_sum(tmp_path: Path) -> N
     assert selected.group_weight_bytes() == 2 * TEXT_ENCODER
     with pytest.raises(LaneRefusal, match="device_group_infeasible"):
         assign(selected)
+
+
+def test_missing_component_still_refuses_native_model_fit(tmp_path: Path) -> None:
+    selected = binding(tmp_path, scope="missing_component")
+    assert selected.group_weight_bytes() >= selected.model_weight_bytes > 0
+    # The same native fit used by StreamingFillBackend before it reserves any
+    # destinations still judges the deliberately incomplete construction.
+    verdict = tensorfs.fit(
+        [tensorfs.TensorRequirement("absent", "weight", [1], "f32")],
+        (FIXTURE / "header.cbor").read_bytes(),
+        custody="canonical",
+        encoded_leaves=True,
+    )
+    assert not verdict["ok"] and verdict["code"] == "component_missing"
