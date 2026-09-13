@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -204,7 +205,7 @@ def restore(worker: Worker, preparation: dict[str, Any]) -> pb.DesiredWorkerStat
             Path(worker.options.install_root or ""),
             receipt_digest=row["receipt_digest"],
             environment_digest=documents.spell(placement.environment_digest),
-            python=Path(worker.options.python or ""),
+            python=Path(worker.options.python or sys.executable),
         )
         worker.local_revisions[(placement.placement_id, digest)] = placement
     return pb.DesiredWorkerState.FromString(base64.b64decode(preparation["state"], validate=True))

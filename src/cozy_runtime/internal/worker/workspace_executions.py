@@ -56,6 +56,12 @@ MAX_PAGE_BYTES = 256 << 10
 TERMINAL = frozenset({"succeeded", "failed", "paused", "canceled"})
 
 
+class StaleExecutionGeneration(WorkspaceRefusal):
+    """A rejected command, distinct from a lost reply to an accepted command."""
+
+    code = "execution_generation_stale"
+
+
 @dataclass(frozen=True)
 class Receipt:
     request_id: str
@@ -318,7 +324,7 @@ class Executions:
                 row[0]
                 for row in db.execute(
                     "SELECT request FROM executions WHERE owner=? "
-                    "AND (state IN ('queued','running','pausing','canceling') "
+                    "AND (state IN ('queued','running','pausing','canceling','retrying') "
                     "OR (desired='cancel' AND retention_waived=0)) "
                     "ORDER BY accepted_ms,request",
                     (owner,),
@@ -330,7 +336,7 @@ class Executions:
             return (
                 db.execute(
                     "SELECT 1 FROM executions WHERE owner=? "
-                    "AND state IN ('queued','running','pausing','canceling') LIMIT 1",
+                    "AND state IN ('queued','running','pausing','canceling','retrying') LIMIT 1",
                     (owner,),
                 ).fetchone()
                 is not None
@@ -340,6 +346,20 @@ class Executions:
         with self.workspace.locked() as db:
             raw = self._row(db, owner, request)["preparation"]
             return cast(dict[str, Any], canonical_json.decode(raw)) if raw else {}
+
+    def assigned_here(self, owner: str, request: str, ordinal: int, worker_boot: str) -> bool:
+        from .workspace_recovery import process_identity
+
+        with self.workspace.locked() as db:
+            row = db.execute(
+                "SELECT process_owner,worker_boot FROM attempts "
+                "WHERE owner=? AND request=? AND ordinal=?",
+                (owner, request, ordinal),
+            ).fetchone()
+            return row is not None and (row["process_owner"], row["worker_boot"]) == (
+                process_identity(),
+                worker_boot,
+            )
 
     def capture(self, owner: str, request: str) -> dict[str, Any]:
         with self.workspace.locked() as db:
@@ -468,7 +488,7 @@ class Executions:
             ).fetchone()
             if attempt is None:
                 raise WorkspaceRefusal("execution attempt history is missing")
-            if not attempt["outcome"] or row["state"] in TERMINAL:
+            if not attempt["outcome"] or row["state"] in TERMINAL or row["state"] == "retrying":
                 return
             body = documents.read(attempt["outcome"], pb.AttemptOutcomeBody)
             state = (
@@ -480,6 +500,8 @@ class Executions:
                 if body["status"] == pb.OUTCOME_STATUS_SUCCEEDED
                 else "failed"
             )
+            if state == "failed" and self._retryable(row, body):
+                state = "retrying"
             db.execute(
                 "UPDATE executions SET state=?,finished_ms=? WHERE owner=? AND request=?",
                 (state, self.clock_ms(), owner, request),
@@ -502,32 +524,54 @@ class Executions:
         with self.workspace.locked() as db:
             return self._state(self._row(db, owner, request))
 
+    def _retryable(self, row: Row, body: dict[str, Any]) -> bool:
+        cause = body.get("cause", {})
+        if (
+            row["desired"] != "run"
+            or row["ordinal"] >= row["max_attempts"]
+            or body.get("status") not in (pb.OUTCOME_STATUS_FAILED, pb.OUTCOME_STATUS_ABANDONED)
+            or cause.get("code")
+            not in (pb.CAUSE_CODE_EXECUTOR_FAULT, pb.CAUSE_CODE_EXECUTOR_INVALIDATED)
+            or cause.get("origin") not in (pb.CAUSE_ORIGIN_WORKER, pb.CAUSE_ORIGIN_RUNTIME)
+        ):
+            return False
+        spec = documents.read(
+            pb.AttemptOffer.FromString(row["offer"]).invocation_spec_canonical_bytes,
+            pb.InvocationSpec,
+        )
+        deadline = int(spec.get("deadline_unix_ms", 0))
+        return not deadline or self.clock_ms() < deadline
+
     def retry_due(self, owner: str, *, worker_boot: str = "") -> None:
-        """Retry bounded executor failures only; authored errors need an explicit new intent."""
+        """A retryable attempt is not a final execution failure visible to observers."""
         with self.workspace.locked() as db:
             rows = db.execute(
-                "SELECT e.request,e.generation,e.ordinal,e.offer,a.outcome "
-                "FROM executions e JOIN attempts a ON a.owner=e.owner AND a.request=e.request "
-                "AND a.ordinal=e.ordinal WHERE e.owner=? AND e.state='failed' "
-                "AND e.desired='run' AND e.ordinal<e.max_attempts "
-                "AND e.finished_ms+e.retry_delay_ms<=?",
-                (owner, self.clock_ms()),
+                "SELECT e.*,a.outcome FROM executions e JOIN attempts a "
+                "ON a.owner=e.owner AND a.request=e.request AND a.ordinal=e.ordinal "
+                "WHERE e.owner=? AND e.state='retrying' AND e.desired='run'",
+                (owner,),
             ).fetchall()
         for row in rows:
             outcome = documents.read(row["outcome"], pb.AttemptOutcomeBody)
-            if outcome.get("status") != pb.OUTCOME_STATUS_FAILED or outcome.get("cause", {}).get(
-                "code"
-            ) not in (
-                pb.CAUSE_CODE_EXECUTOR_FAULT,
-                pb.CAUSE_CODE_EXECUTOR_INVALIDATED,
-            ):
+            if not self._retryable(row, outcome):
+                with self.workspace.locked() as db, transaction(db):
+                    current = self._row(db, owner, row["request"])
+                    if (
+                        current["generation"] == row["generation"]
+                        and current["state"] == "retrying"
+                    ):
+                        db.execute(
+                            "UPDATE executions SET state='failed' WHERE owner=? AND request=?",
+                            (owner, row["request"]),
+                        )
+                        self._event(
+                            db,
+                            current,
+                            "retry_stopped",
+                            canonical_json.encode({"reason": "accepted retry or deadline bound"}),
+                        )
                 continue
-            spec = documents.read(
-                pb.AttemptOffer.FromString(row["offer"]).invocation_spec_canonical_bytes,
-                pb.InvocationSpec,
-            )
-            deadline = int(spec.get("deadline_unix_ms", 0))
-            if deadline and self.clock_ms() >= deadline:
+            if row["finished_ms"] + row["retry_delay_ms"] > self.clock_ms():
                 continue
             self.control(
                 owner,
@@ -634,7 +678,7 @@ class Executions:
                     raise WorkspaceRefusal("execution command identity changed")
                 return State(**canonical_json.decode(previous["response"]))
             if row["generation"] != expected_generation:
-                raise WorkspaceRefusal("execution command generation is stale")
+                raise StaleExecutionGeneration("execution command generation is stale")
             state, ordinal, desired = row["state"], row["ordinal"], row["desired"]
             if action == "pause" and state in ("succeeded", "canceled"):
                 result = self._state(row)
@@ -644,7 +688,7 @@ class Executions:
                 )
                 return result
             if action == "resume":
-                if state not in ("paused", "failed"):
+                if state not in ("paused", "failed") and not (_automatic and state == "retrying"):
                     raise WorkspaceRefusal("only paused or failed execution can resume")
                 attempt = db.execute(
                     "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
@@ -692,6 +736,10 @@ class Executions:
     def collect(self, owner: str, request: str, ordinal: int | None = None) -> pb.AttemptOutcome:
         """Return the existing exact terminal; its native grants use existing byte readers."""
         state = self.status(owner, request)
+        if ordinal is None and state.state not in TERMINAL:
+            raise WorkspaceRefusal(
+                "execution is not terminal; inspect a specific historical attempt"
+            )
         selected = state.attempt_ordinal if ordinal is None else ordinal
         with self.workspace.locked() as db:
             execution = self._row(db, owner, request)

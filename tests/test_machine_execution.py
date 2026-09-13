@@ -224,7 +224,7 @@ from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import worker_pb2 as pb
 e=Executions(Workspace(Path(sys.argv[1])))
-e.submit('owner','submission',b'c'*32,pb.AttemptOffer.FromString(base64.b64decode(sys.argv[2])))
+e.submit('owner','submission',b'c'*32,pb.AttemptOffer.FromString(base64.b64decode(sys.argv[2])),max_attempts=2)
 print('accepted',flush=True)
 sys.stdin.readline()
 """
@@ -250,17 +250,25 @@ def test_actual_process_death_recovers_without_duplicate_execution(tmp_path: Pat
         assert child.stdout.readline().strip() == "accepted"
         e = Executions(Workspace(root))
         assert e.status("owner", "root").state == "queued"  # live origin cannot be reclaimed
+        assert not e.assigned_here("owner", "root", 1, "")
         child.kill()
         child.communicate(timeout=10)
-        assert e.status("owner", "root").state == "failed"
-        original = e.collect("owner", "root")
+        assert e.status("owner", "root").state == "retrying"
+        with pytest.raises(WorkspaceRefusal, match="not terminal"):
+            e.collect("owner", "root")
+        original = e.collect("owner", "root", 1)
         assert (
             documents.read(original.outcome_canonical_bytes, pb.AttemptOutcomeBody)["status"]
             == pb.OUTCOME_STATUS_ABANDONED
         )
-        assert e.submit("owner", "submission", b"c" * 32, offer()).request_id == "root"
+        assert (
+            e.submit("owner", "submission", b"c" * 32, offer(), max_attempts=2).request_id == "root"
+        )
         assert e.status("owner", "root").attempt_ordinal == 1
-        assert e.control("owner", "root", "resume", 1, "resume").attempt_ordinal == 2
+        e.retry_due("owner")
+        assert e.status("owner", "root").attempt_ordinal == 2
+        assert e.assigned_here("owner", "root", 2, "")
+        assert not e.assigned_here("owner", "root", 2, "foreign-boot")
         assert e.collect("owner", "root", 1) == original
     finally:
         if child.poll() is None:
@@ -384,6 +392,7 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
         # No Control stream or watcher is running. Real admission produces a typed terminal.
         submitted = offer("refused", job=False)
         receipt = worker.submit_execution(claim, "refused", b"c" * 32, submitted)
+        worker.drive_executions()
         assert receipt.request_id == "refused"
         assert json.loads((tmp_path / "activity").read_bytes())["execution_retention_required"]
         assert worker.execution_status(claim, "refused").state == "failed"
@@ -432,6 +441,7 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
         with pytest.raises(WorkspaceRefusal, match="authenticated owner"):
             worker.execution_status(foreign, "scalar")
         worker.control_execution(claim, "refused", "abandon-refused", 1, "cancel")
+        worker.drive_executions()
         assert not worker.execution_status(claim, "refused").collected
         assert not worker.executions.retention_required("owner")
         worker.publish_activity()
@@ -460,27 +470,32 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
         assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 2
 
 
-def test_retry_policy_never_retries_authored_errors_or_abandonment(tmp_path: Path) -> None:
+def test_retry_policy_never_retries_authored_errors_or_user_cancellation(tmp_path: Path) -> None:
     now = [1000]
     e = Executions(Workspace(tmp_path / "store"), clock_ms=lambda: now[0])
     for request, status, cause in [
         ("transient", pb.OUTCOME_STATUS_FAILED, pb.CAUSE_CODE_EXECUTOR_FAULT),
         ("author", pb.OUTCOME_STATUS_FAILED, pb.CAUSE_CODE_AUTHOR_EXCEPTION),
         ("abandoned", pb.OUTCOME_STATUS_ABANDONED, pb.CAUSE_CODE_EXECUTOR_INVALIDATED),
+        ("canceled", pb.OUTCOME_STATUS_CANCELED, pb.CAUSE_CODE_CLIENT_CANCEL),
         ("structural", pb.OUTCOME_STATUS_REFUSED, pb.CAUSE_CODE_LOCAL_SAFETY),
     ]:
         e.submit("owner", request, b"c" * 32, offer(request), max_attempts=2, retry_delay_ms=500)
         complete(e, request, status=status, cause=cause)
     e.retry_due("owner")
     assert e.status("owner", "transient").attempt_ordinal == 1
+    assert e.status("owner", "transient").state == "retrying"
+    with pytest.raises(WorkspaceRefusal, match="not terminal"):
+        e.collect("owner", "transient")
     now[0] += 500
     e.retry_due("owner")
     assert e.status("owner", "transient").attempt_ordinal == 2
     e.retry_due("owner")
     assert all(
         e.status("owner", request).attempt_ordinal == 1
-        for request in ("author", "abandoned", "structural")
+        for request in ("author", "canceled", "structural")
     )
+    assert e.status("owner", "abandoned").attempt_ordinal == 2
     complete(e, "transient", status=pb.OUTCOME_STATUS_FAILED, cause=pb.CAUSE_CODE_EXECUTOR_FAULT)
     now[0] += 500
     e.retry_due("owner")
@@ -730,8 +745,26 @@ app.job(helper)
                 # arguments are available when the queued executor eventually starts.
                 for path in generator.grant_dir.glob("*.json"):
                     path.unlink()
+                if identifier == "first":
+                    invalid = pb.MachineExecutionSubmit()
+                    invalid.CopyFrom(submission)
+                    invalid.offer.request_id = "rejected-input"
+                    invalid.submission_id = "rejected-input"
+                    invalid.payload_canonical_bytes = b"null"
+                    with pytest.raises(grpc.RpcError) as denied:
+                        client.SubmitMachineExecution(invalid, timeout=5)
+                    assert (
+                        dict(denied.value.trailing_metadata())["cozy-error-code"]
+                        == "execution_submission_refused"
+                    )
                 receipt = client.SubmitMachineExecution(submission, timeout=30)
                 assert client.SubmitMachineExecution(submission, timeout=30) == receipt
+                if identifier == "first":
+                    invalid.CopyFrom(submission)
+                    invalid.payload_canonical_bytes = b"null"
+                    with pytest.raises(grpc.RpcError) as ambiguous:
+                        client.SubmitMachineExecution(invalid, timeout=5)
+                    assert "cozy-error-code" not in dict(ambiguous.value.trailing_metadata())
             query = pb.MachineExecutionQuery(
                 claim=claim,
                 request_id="second",
@@ -771,8 +804,14 @@ app.job(helper)
                 assert time.monotonic() < until
                 time.sleep(0.02)
             worker.control_execution(claim, "canceled", "cancel", 1, "cancel")
+            while worker.execution_status(claim, "canceled").state != "canceled":
+                assert time.monotonic() < until
+                time.sleep(0.02)
             assert worker.execution_status(claim, "canceled").state == "canceled"
             worker.control_execution(claim, "paused", "pause", 1, "pause")
+            while worker.execution_status(claim, "paused").state != "paused":
+                assert time.monotonic() < until
+                time.sleep(0.02)
             assert worker.execution_status(claim, "paused").state == "paused"
             (root / "gate").touch()
             for identifier in ("first", "second"):
@@ -815,7 +854,7 @@ app.job(helper)
             channel.close()
             # Replace the entire Worker and gRPC server. No client preparation is
             # replayed, and the old wheel upload is no longer available.
-            config, options = worker.config, worker.options
+            config, options = worker.config, dataclasses.replace(worker.options, python="")
             old_boot = worker.fence.worker_boot_id
             worker.request_stop()
             worker.host.stop()
@@ -846,20 +885,30 @@ app.job(helper)
             )
             assert client.GetMachineExecution(query, timeout=5).worker_boot_id != old_boot
             query.request_id = "paused"
-            resumed = client.ControlMachineExecution(
-                pb.MachineExecutionControl(
-                    execution=query,
-                    command_id="resume-after-worker-replacement",
-                    expected_generation=2,
-                    action=pb.MACHINE_EXECUTION_ACTION_RESUME,
-                ),
-                timeout=30,
+            resume = pb.MachineExecutionControl(
+                execution=query,
+                command_id="resume-after-worker-replacement",
+                expected_generation=2,
+                action=pb.MACHINE_EXECUTION_ACTION_RESUME,
             )
+            stale = pb.MachineExecutionControl()
+            stale.CopyFrom(resume)
+            stale.command_id = "stale-resume"
+            stale.expected_generation = 1
+            with pytest.raises(grpc.RpcError) as conflict:
+                client.ControlMachineExecution(stale, timeout=5)
+            assert conflict.value.code() == grpc.StatusCode.ABORTED
+            assert (
+                dict(conflict.value.trailing_metadata())["cozy-error-code"]
+                == "execution_generation_stale"
+            )
+            resumed = client.ControlMachineExecution(resume, timeout=30)
             assert resumed.attempt_ordinal == 2
             while client.GetMachineExecution(query, timeout=5).state not in ("succeeded", "failed"):
                 assert time.monotonic() < until
                 time.sleep(0.02)
             assert client.GetMachineExecution(query, timeout=5).state == "succeeded"
+            assert client.ControlMachineExecution(resume, timeout=5) == resumed
             assert worker.local_revisions and worker.engine.jobs
             assert not worker.connected.is_set() and not worker.fence.dispatch_open
             channel.close()

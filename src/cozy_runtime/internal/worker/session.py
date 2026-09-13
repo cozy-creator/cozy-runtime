@@ -2084,7 +2084,6 @@ class Worker:
                 preparation=preparation,
                 worker_id=self.options.worker_id,
             )
-            self.drive_executions()
             self.publish_activity(strict=True)
             return receipt
 
@@ -2118,7 +2117,7 @@ class Worker:
                 action,
                 worker_boot=self.fence.worker_boot_id,
             )
-            self.drive_executions()
+            self.publish_activity(strict=True)
             return state
 
     def drive_executions(self) -> None:
@@ -2134,6 +2133,10 @@ class Worker:
                 if state.state in workspace_executions.TERMINAL:
                     if held is None or held.state == "closed":
                         self.executions.abandon(owner, request)
+                    continue
+                if not self.executions.assigned_here(
+                    owner, request, state.attempt_ordinal, self.fence.worker_boot_id
+                ):
                     continue
                 if state.state in ("pausing", "canceling"):
                     if held is None:
@@ -2154,14 +2157,30 @@ class Worker:
                     continue
                 if state.state != "queued" or held is not None:
                     continue
-                preparation = self.executions.preparation(owner, request)
-                if preparation and not self._prepare_execution(preparation):
+                if any(
+                    attempt.request_id == request
+                    and attempt.attempt < state.attempt_ordinal
+                    and attempt.state != "closed"
+                    for attempt in self.engine.history.values()
+                ):
                     continue
                 offered = self.executions.offer(owner, request)
                 spec = documents.read(offered.invocation_spec_canonical_bytes, pb.InvocationSpec)
                 deadline = int(spec.get("deadline_unix_ms", 0))
                 if deadline and self.executions.clock_ms() >= deadline:
                     self.executions.stop_queued(owner, request, deadline=True)
+                    continue
+                preparation = self.executions.preparation(owner, request)
+                try:
+                    if preparation and not self._prepare_execution(preparation):
+                        continue
+                except Exception as exc:
+                    self.refuse(
+                        offered,
+                        "execution_preparation_unavailable",
+                        f"Retained preparation is unavailable ({type(exc).__name__}): {exc}",
+                        pb.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
+                    )
                     continue
                 # Validation precedes waiting for capacity, so malformed work does not
                 # occupy a durable queue forever. The engine still authors its refusal.

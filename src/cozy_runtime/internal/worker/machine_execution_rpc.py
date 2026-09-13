@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -15,6 +16,7 @@ from cozy_runtime.internal.package_environment import EnvironmentRefusal
 from cozy_runtime.internal.worker import machine_capture
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace_executions import StaleExecutionGeneration
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -34,6 +36,9 @@ class MachineExecutionRPC:
                 raise WorkspaceRefusal("machine execution workspace is unavailable")
             self.worker.authorize_workspace(claim)
             return operation()
+        except StaleExecutionGeneration as exc:
+            context.set_trailing_metadata((("cozy-error-code", exc.code),))
+            return context.abort(grpc.StatusCode.ABORTED, str(exc))
         except (
             ValueError,
             OSError,
@@ -121,7 +126,23 @@ class MachineExecutionRPC:
                 execution_workspace_id=self.worker.executions.workspace_id,
             )
 
-        return self._call(request.claim, context, submit)
+        def checked_submit() -> pb.MachineExecutionReceipt:
+            try:
+                return submit()
+            except Exception:
+                # A lost reply after commit stays ambiguous. Only an actual
+                # journal read proving absence permits the client to stop replay.
+                with contextlib.suppress(Exception):
+                    executions = self.worker.executions
+                    if executions is not None and not executions.owns(
+                        request.claim.record_owner_id, request.offer.request_id
+                    ):
+                        context.set_trailing_metadata(
+                            (("cozy-error-code", "execution_submission_refused"),)
+                        )
+                raise
+
+        return self._call(request.claim, context, checked_submit)
 
     def GetMachineExecution(self, request: pb.MachineExecutionQuery, context: Any) -> Any:
         def get() -> pb.MachineExecutionState:
