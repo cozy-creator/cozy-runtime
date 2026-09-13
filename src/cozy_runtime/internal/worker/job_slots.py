@@ -19,4 +19,11 @@ class JobSlot:
 
     def ready(self) -> bool:
         executor = self.supervision.current
-        return bool(executor is not None and not executor.poisoned and executor.alive())
+        return bool(
+            executor is not None
+            and executor.reserved_for_job
+            and executor.launch_python == self.binding.python
+            and executor.environment_content_digest == self.binding.environment_content_digest
+            and not executor.poisoned
+            and executor.alive()
+        )
