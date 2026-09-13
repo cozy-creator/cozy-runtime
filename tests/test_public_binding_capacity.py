@@ -16,6 +16,7 @@ from cozy_runtime.internal.worker.session import (
     Placement,
     Worker,
     WorkerOptions,
+    executor_prepare_command,
     read_placement_set,
 )
 from cozy_runtime.protocol import documents
@@ -111,3 +112,40 @@ def test_public_alternative_entrypoints_preserve_the_joint_call_cost(
 def test_two_simultaneous_slots_still_add_even_for_the_same_checkpoint(tmp_path: Path) -> None:
     selected = independent_slots(tmp_path, slots=2)
     assert selected.group_weight_bytes() == 2 * 51_506_191_840 > ROOM
+
+
+def test_public_h3_single_gpu_admits_staged_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    placement, bindings = public_bindings(tmp_path)
+    room = 80_000_000_000
+    assert all(b.model_weight_bytes > room for b in bindings.values())
+    assert all(b.group_weight_bytes() < room for b in bindings.values())
+    assert all(b.sequence_parallel_degrees() == (2, 4) for b in bindings.values())
+    placement.device_pin = (0,)
+    monkeypatch.setattr(accel, "host_backend_family", lambda: "cuda")
+    monkeypatch.setattr(
+        accel, "device_memory", lambda *_: accel.DeviceMemory("measured", room, room)
+    )
+    worker = Worker(
+        _config(tmp_path / "home"),
+        WorkerOptions(root=tmp_path / "worker", devices="0"),
+        InMemoryControlHost(),
+    )
+    try:
+        assert worker._assign_lane(placement, bindings, worker.supervision)
+        lane = worker.lanes.lane_of(placement.placement_id)
+        assert lane is not None and lane.degree == 1 and not lane.group
+        for binding in bindings.values():
+            command = executor_prepare_command(
+                binding,
+                devices=lane.devices,
+                authorized_device_limit_bytes=room,
+                sequence_parallel_degree=lane.degree,
+            )
+            assert "sequence_parallel_degree" not in command
+            assert command["devices"] == "0"
+            assert len(command["models"]) == 2
+            assert command["authorized_device_limit_bytes"] == room
+    finally:
+        worker.shutdown()
