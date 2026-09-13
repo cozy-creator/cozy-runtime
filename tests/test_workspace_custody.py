@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import subprocess
 import sys
@@ -10,14 +11,14 @@ from pathlib import Path
 
 import pytest
 import tensorfs
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import WeightsPart, WeightsReceipt, WeightsTarget, WeightsTensor
-from cozy_runtime.author._weights import WeightsCommit
+from cozy_runtime.author import WeightsReceipt
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.weights_sink import (
-    WeightsHostBinding,
-    WeightsTransactionHost,
     protocol_receipt,
+    receipt_from_native,
+    weights_transaction_id,
 )
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
@@ -52,7 +53,7 @@ def produced(
     declaration_digest = b""
     epoch = 0
 
-    def bind(slot: str, transaction: str, digest: bytes, declaration: bytes) -> WeightsHostBinding:
+    def bind(slot: str, transaction: str, digest: bytes, declaration: bytes) -> int:
         nonlocal declaration_digest, epoch
         declaration_digest = digest
         row = workspace.begin_weights(
@@ -68,7 +69,7 @@ def produced(
             ),
         )
         epoch = int(row["epoch"])
-        return WeightsHostBinding(transaction, epoch)
+        return epoch
 
     def record(receipt: WeightsReceipt) -> None:
         reference, _, _ = protocol_receipt(
@@ -96,40 +97,28 @@ def produced(
         )
 
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
-    commit = WeightsCommit(
-        output_slot="model",
-        sources={},
-        targets={
-            "model": WeightsTarget(
-                add={
-                    "weight": WeightsTensor(
-                        logical_dtype="f32",
-                        shape=(512,),
-                        encoding=plain,
-                        parts={"value": WeightsPart(dtype="f32", shape=(512,))},
-                    )
-                },
+    definition = Derivation(
+        {},
+        {
+            "model": Target(
+                add={"weight": Tensor("f32", (512,), plain, {"value": Part("f32", (512,))})}
             )
         },
-        configs={},
-        order=(("model", "weight"),),
-        max_new_bytes=2048,
+        {},
+        (("model", "weight"),),
     )
-    producer = WeightsTransactionHost(
-        store=store,
-        owner_scope="owner",
-        request_id=request_id,
-        invocation_spec_digest=documents.spell(spec),
-        work_fingerprint="sha256:" + "42" * 32,
-        writer_session_id=1,
-        allowed_sources={},
-        output_bounds={"model": 2048},
-        bind_intent=bind,
-        record_receipt=record,
+    fingerprint = "sha256:" + "42" * 32
+    transaction = weights_transaction_id("owner", request_id, documents.spell(spec), "model")
+    args = definition.native_arguments(2048)
+    declaration = store.derived_declaration(*args, work_fingerprint=fingerprint)
+    epoch = bind("model", transaction, hashlib.sha256(declaration).digest(), declaration)
+    writer = store.begin_derived(transaction, epoch, *args, work_fingerprint=fingerprint)
+    writer.add_part("model", "weight", "value", io.BytesIO(b"\x31" * 2048))
+    facts = writer.commit()
+    receipt = receipt_from_native(
+        "model", transaction, facts, replayed=False, request_id=request_id
     )
-    writer = producer.open(commit)
-    writer.add_part("model", "weight", "value", b"\x31" * 2048)
-    receipt = writer.commit()
+    record(receipt)
     assert epoch == 1
     return store, workspace, receipt
 

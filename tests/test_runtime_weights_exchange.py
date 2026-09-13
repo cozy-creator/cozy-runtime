@@ -20,15 +20,13 @@ from typing import Any, cast
 import grpc
 import pytest
 import tensorfs
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import WeightsPart, WeightsTarget, WeightsTensor
-from cozy_runtime.author._weights import WeightsCommit
 from cozy_runtime.internal.weights_sink import (
-    WeightsHostBinding,
-    WeightsTransactionHost,
-    protocol_receipt,
+    receipt_from_native,
     weights_transaction_id,
 )
+from cozy_runtime.internal.weights_writer import ExecutionStorage
 from cozy_runtime.internal.worker import weights
 from cozy_runtime.internal.worker.control import (
     GrpcControlHost,
@@ -39,6 +37,7 @@ from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
+from weights_channel import exchange as channel_exchange
 
 OWNER = "owner-scope"
 OUTPUT_SLOT = "model"
@@ -354,64 +353,35 @@ def test_new_attempt_fences_prior_epoch_and_cannot_change_transaction(rig: Rig) 
 def test_native_receipt_is_durable_before_control_observation(rig: Rig) -> None:
     attempt = rig.accept()
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
-    commit = WeightsCommit(
-        OUTPUT_SLOT,
+    from cozy_runtime import canonical_json
+
+    attempt.state = "running"
+    attempt.spool = Path(rig.store.root).parent / "native-commit"
+    attempt.spool.mkdir()
+    attempt.spec = canonical_json.decode(rig.invocation)
+    attempt.weights_work_fingerprint = "sha256:" + "65" * 32
+    maximum = attempt.spec["outputs"][0]["max_bytes"]
+    client = ExecutionStorage(
+        attempt.spool,
+        channel_exchange(lambda frame: rig.exchange.writer_broker.handle(attempt, frame)),
+        {OUTPUT_SLOT: maximum},
+    )
+    definition = Derivation(
         {},
         {
-            "model": WeightsTarget(
-                add={
-                    "weight": WeightsTensor(
-                        "f32", (512,), plain, {"value": WeightsPart("f32", (512,))}
-                    )
-                }
+            "model": Target(
+                add={"weight": Tensor("f32", (512,), plain, {"value": Part("f32", (512,))})}
             )
         },
         {},
         (("model", "weight"),),
-        2048,
     )
-
-    def bind(slot: str, transaction: str, digest: bytes, declaration: bytes) -> WeightsHostBinding:
-        result = rig.exchange.intent(
-            attempt,
-            output_slot=slot,
-            transaction_id=transaction,
-            declaration_digest=digest,
-            declaration=declaration,
-            requested_writer_epoch=0,
-        )
-        return WeightsHostBinding(result["weights_transaction_id"], result["writer_epoch"])
-
-    def record(receipt: Any) -> None:
-        _, raw, digest = protocol_receipt(
-            receipt,
-            owner_scope=OWNER,
-            request_id=attempt.request_id,
-            invocation_spec_digest=documents.spell(attempt.digest),
-        )
-        rig.exchange.receipt(
-            attempt,
-            output_slot=OUTPUT_SLOT,
-            transaction_id=receipt.weights_transaction_id,
-            receipt_digest=digest,
-            canonical_receipt=raw,
-        )
-
-    producer = WeightsTransactionHost(
-        store=rig.store,
-        owner_scope=OWNER,
-        request_id=attempt.request_id,
-        invocation_spec_digest=documents.spell(attempt.digest),
-        work_fingerprint="sha256:" + "65" * 32,
-        writer_session_id=1,
-        allowed_sources={},
-        output_bounds={OUTPUT_SLOT: 2048},
-        bind_intent=bind,
-        record_receipt=record,
+    with client.open_output(OUTPUT_SLOT, definition) as writer:
+        writer.add_part("model", "weight", "value", b"\x31" * 2048)
+        facts = writer.commit()
+    receipt = receipt_from_native(
+        OUTPUT_SLOT, facts["transaction_id"], facts, replayed=False, request_id=attempt.request_id
     )
-    writer = producer.open(commit)
-    writer.add_part("model", "weight", "value", b"\x31" * 2048)
-    receipt = writer.commit()
     assert [f.WhichOneof("msg") for f in rig.control.frames] == [
         "weights_intent",
         "weights_transaction",
@@ -606,7 +576,6 @@ def test_scoped_native_commit_records_workspace_before_return_and_has_no_tensor_
 ) -> None:
     from cozy_runtime import canonical_json
     from cozy_runtime.internal.seam import Channel, DescriptorReply
-    from cozy_runtime.internal.weights_writer import StoreProxy
 
     spec = canonical_json.decode(rig.invocation)
     maximum = spec["outputs"][0]["max_bytes"]
@@ -621,7 +590,6 @@ def test_scoped_native_commit_records_workspace_before_return_and_has_no_tensor_
     attempt.spool.mkdir()
     attempt.spec = spec
     attempt.weights_work_fingerprint = fingerprint
-    rig.intent(attempt)
     control_requests: list[str] = []
 
     def exchange(kind: str, frame: dict[str, Any], *, descriptor: bool = False) -> dict[str, Any]:
@@ -644,10 +612,19 @@ def test_scoped_native_commit_records_workspace_before_return_and_has_no_tensor_
         finally:
             reply.descriptor.close()
 
-    proxy = StoreProxy(rig.store, attempt.spool, exchange)
-    writer = proxy.begin_derived(
-        TRANSACTION, 1, {}, rig.targets, {}, order, maximum, work_fingerprint=fingerprint
+    client = ExecutionStorage(attempt.spool, exchange, {"model": maximum})
+    plain = dict(tensorfs.seed_digests())["plain/1"]
+    definition = Derivation(
+        {},
+        {
+            "model": Target(
+                add={"weight": Tensor("f32", (512,), plain, {"value": Part("f32", (512,))})}
+            )
+        },
+        {},
+        order,
     )
+    writer = client.open_output("model", definition)
     writer.add_part("model", "weight", "value", bytes(2048))
     writer.checkpoint()
     receipt = writer.commit()
@@ -657,7 +634,7 @@ def test_scoped_native_commit_records_workspace_before_return_and_has_no_tensor_
     assert body["tensorfs_receipt_digest"] == (
         "sha256:" + sha256(canonical_json.encode(receipt)).hexdigest()
     )
-    assert control_requests == ["open"], "per-role traffic still crossed Runtime control"
+    assert control_requests == ["output"], "per-role traffic still crossed Runtime control"
     assert not list(attempt.spool.glob("*-input"))
     assert not list(attempt.spool.glob("*-output"))
     assert not list(attempt.spool.glob("*-receipt.canonical"))

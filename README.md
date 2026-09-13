@@ -6,18 +6,14 @@ executor, and the single-package CLI. Design authority: [tracker-v2](https://git
 
 ## Compatibility status
 
-Cozy Runtime is the platform's declared Python author-API channel. Package code has one supported
-production import root, `cozy_runtime.author`; package tests may also use
-`cozy_runtime.author.fakes`. Underscored author modules, `internal`, `cli`, and `protocol` are not
-package APIs. Runtime remains pre-release: `0.0.x` may make a coordinated hardcut rather than carry
-a compatibility alias for an unused or dishonest surface. Published packages declare the supported
-Runtime range and must be requalified when a hardcut removes something they used.
+Package code uses `cozy_runtime.author`, the shared numerical helpers under
+`cozy_runtime.derive`, and TensorFS's scoped `tensorfs.derived` API. Underscored author
+modules, Runtime `internal`/`cli`/`protocol`, and administrative TensorFS Store operations
+are not package APIs. Package ranges must be requalified for coordinated author API cuts.
 
-Runtime release `0.2.5` targets standard CPython 3.12 only. Project
-tooling pins `3.12`; no other Python interpreter or ABI is supported.
-Wire minor 18 allows an authenticated external RecordOwner to make the existing bounded
-WeightsSink reads through pod-supervisor; Runtime still returns the exact range on the pinned
-WorkerControl stream without a second byte-plane listener.
+Runtime targets CPython 3.12. The native derivation cut requires TensorFS 0.3.41;
+accepted executions receive scoped source/output descriptors while the worker owns Store
+access, admission, epochs and the execution journal.
 
 The distribution major is the Python compatibility major: compatible additions remain in the
 current range, breaking author changes require a new major, and candidate base worker images must
@@ -634,18 +630,23 @@ services (`Scratch`, `Checkpoints`, `Budget`), typed input `Tree` fields whose p
 the value, and a RECYCLE process exit distinct from a death. `corpus/job/` is the live
 project: a structural census over the real 6.9 GB cozytensors store, read-only.
 
-Model-producing jobs declare `WeightsOutput` slots and request `WeightsSink`. The sink accepts
-only exact typed `Model` inputs, locks the declaration/output bound, and streams produced values
-directly into TensorFS's real copy/create/derive transaction without a model-sized spool copy.
-Config declarations use TensorFS's closed copy/add/derive grammar. Added and derived config bytes
-are canonicalized by `DerivedWriter.add_config` into the CozyTensors header; their stream length
-is an operational read bound, not published metadata, and configs have no media type.
-An opened transaction may read exact source-part ranges into caller-owned contiguous writable
-buffers (at most one 64 MiB TensorFS grid window); TensorFS validates alias/component/key/role,
-offset and length under the same pinned source lease before any added value commits.
-The job receives only the exact receipt—never a store, path, publisher or destination. The
-worker sends exact declaration intent before TensorFS opens, waits for the host's writer-epoch
-ACK, commits the receipt plus sorted ObjectRef/source-ref inventory, and serves bounded object
-ranges on the same WorkerControl stream. Receipt frames and replay ACKs also carry the produced
-Manifest `Ref`, so downstream jobs never parse TensorFS receipt bytes. Runtime keeps no journal;
-pod-supervisor owns durability.
+Model-producing jobs declare `WeightsOutput` slots and use `Context.tensorfs_source`,
+`Context.output`, and `Context.adopt_model`. TensorFS owns the typed `Derivation`, `Target`,
+`Tensor`, `Part`, and `Config` declarations and the source/output handles. Inspection keeps
+the source header's construction order. Native validation locks exact sources, geometry,
+order and output bounds before accepting values; inherited roles require no payload copy.
+
+Source/config bytes and streamed additions use bounded TensorFS descriptor frames. Runtime
+exchanges only bounded declaration and receipt metadata; it creates no complete-role spool
+copy and the executor opens no Store. Added/derived configs are canonicalized into the
+CozyTensors header. Completed-role inventories and checkpoints come from the native writer.
+
+Runtime's worker assigns the accepted execution's transaction and writer epoch, admits its
+remaining storage needs, and records native checkpoint/receipt facts in its Workspace before
+success reaches the executor. `ctx.adopt_model(native_receipt)` returns the verified
+`ModelArtifact`. Source and writer handles are fenced with the attempt, while retained native
+partial and committed bytes survive process loss for authorized recovery.
+
+Plain PEP 723 producers that declare `[tool.cozy.weights]` use an explicit `ctx: Context`
+parameter. Ordinary client scripts can keep their lightweight `ScriptContext` for composing
+managed calls. The separate scoped `WeightsReader` remains the evaluation/readback API.

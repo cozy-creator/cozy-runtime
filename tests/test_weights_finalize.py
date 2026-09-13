@@ -95,7 +95,7 @@ def _committed(tmp_path: Path) -> tuple[pb.WeightsFinalizeRequest, Path, Any]:
     root = tmp_path / "store"
     request = _request()
     facts = _writer(store, request, manifest, length).commit()
-    receipt = weights_sink.WeightsTransactionHost._wrap(
+    receipt = weights_sink.receipt_from_native(
         "model", _transaction(request), facts, replayed=True, request_id=request.request_id
     )
     _ref, _bytes, digest = weights_sink.protocol_receipt(
@@ -223,7 +223,7 @@ def test_commit_first_abandon_uncommitted_returns_the_released_receipt(tmp_path:
 def test_abandon_drops_upload_lease_and_late_receipt_cannot_reopen_it(tmp_path: Path) -> None:
     request, root, store = _committed(tmp_path)
     facts = store.derived_lookup(_transaction(request))["receipt"]
-    receipt = weights_sink.WeightsTransactionHost._wrap(
+    receipt = weights_sink.receipt_from_native(
         "model", _transaction(request), facts, replayed=True, request_id=request.request_id
     )
     reference, _raw, _digest = weights_sink.protocol_receipt(

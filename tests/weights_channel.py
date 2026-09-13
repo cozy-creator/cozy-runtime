@@ -32,3 +32,47 @@ def exchange(
             answer.descriptor.close()
 
     return call
+
+
+def open_output(
+    broker: Any,
+    attempt: Any,
+    transaction: str,
+    definition: Any,
+    *,
+    output: str = "model",
+    checkpoint: tuple[str, int] | None = None,
+    frames: list[dict[str, Any]] | None = None,
+    maximum: int | None = None,
+) -> Any:
+    """Supply the fixture's execution binding through the real executor output door."""
+    import hashlib
+
+    from cozy_runtime.internal.weights_writer import ExecutionStorage
+
+    def bind(current: Any, slot: str, declaration: bytes) -> tuple[str, int]:
+        broker.authorize(
+            current,
+            transaction,
+            current.attempt,
+            hashlib.sha256(declaration).digest(),
+            slot,
+            checkpoint=checkpoint,
+        )
+        return transaction, current.attempt
+
+    def handle(frame: dict[str, Any]) -> dict[str, Any]:
+        if frames is not None:
+            frames.append(dict(frame))
+        answer = broker.handle(attempt, frame)
+        assert isinstance(answer, dict)
+        return answer
+
+    broker.bind_output = bind
+    limit = next(
+        row.get("max_bytes", 0) for row in attempt.spec["outputs"] if row["output_id"] == output
+    )
+    client = ExecutionStorage(
+        attempt.spool, exchange(handle), {output: limit if maximum is None else maximum}
+    )
+    return client.open_output(output, definition)

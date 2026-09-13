@@ -10,13 +10,14 @@ from typing import Any
 
 import pytest
 import tensorfs
+from tensorfs.derived import Derivation, Part, Source, Target, Tensor
 
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.internal.weights_writer import StoreProxy, WriterBroker
+from cozy_runtime.internal.weights_writer import WriterBroker
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
-from weights_channel import exchange as writer_exchange
+from weights_channel import open_output
 
 
 def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_head(
@@ -26,29 +27,9 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
     spool = tmp_path / "spool"
     spool.mkdir()
     encoding = next(d for a, d in tensorfs.seed_digests() if a == "fp8-rowwise/1")
-    targets = {
-        "model": {
-            "drop": [],
-            "add": {
-                "weight": {
-                    "logical_dtype": "bf16",
-                    "shape": [512, 8192],
-                    "encoding": encoding,
-                    "parts": {
-                        "data": {"dtype": "f8_e4m3fn", "shape": [512, 8192]},
-                        "scale": {"dtype": "f32", "shape": [512]},
-                    },
-                }
-            },
-        }
-    }
     order = [("model", "weight")]
     maximum = (4 << 20) + 2048
     fingerprint = "sha256:" + "71" * 32
-    declaration = store.derived_declaration(
-        {}, targets, {}, order, maximum, work_fingerprint=fingerprint
-    )
-    digest = hashlib.sha256(declaration).digest()
     observed: list[dict[str, Any]] = []
     committed: list[dict[str, Any]] = []
     broker = WriterBroker(
@@ -67,22 +48,36 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
     )
     frames: list[dict[str, Any]] = []
 
-    def handle(frame: dict[str, Any]) -> dict[str, Any]:
-        frames.append(dict(frame))
-        return broker.handle(attempt, frame)
-
-    proxy = StoreProxy(store, spool, writer_exchange(handle))
     transaction = "sha256:" + "72" * 32
-    broker.authorize(attempt, transaction, 1, digest, "model")
-    with pytest.raises(CapabilityError) as changed:
-        proxy.begin_derived(
-            transaction, 1, {}, targets, {}, order, maximum, work_fingerprint="sha256:" + "73" * 32
-        )
-    assert changed.value.code == "weights_writer_declaration"
-    assert store.derived_lookup(transaction)["state"] == "absent"
-    writer = proxy.begin_derived(
-        transaction, 1, {}, targets, {}, order, maximum, work_fingerprint=fingerprint
+    definition = Derivation(
+        {},
+        {
+            "model": Target(
+                add={
+                    "weight": Tensor(
+                        "bf16",
+                        (512, 8192),
+                        encoding,
+                        {"data": Part("f8_e4m3fn", (512, 8192)), "scale": Part("f32", (512,))},
+                    )
+                }
+            )
+        },
+        {},
+        order,
     )
+    retired = broker.handle(
+        attempt,
+        {
+            "operation": "open",
+            "weights_transaction_id": transaction,
+            "writer_epoch": 91,
+            "work_fingerprint": "sha256:" + "73" * 32,
+        },
+    )
+    assert retired["code"] == "weights_writer_ungranted"
+    assert store.derived_lookup(transaction)["state"] == "absent"
+    writer = open_output(broker, attempt, transaction, definition, frames=frames)
     assert writer.completed_parts() == []
     data = b"\x31" * (4 << 20)
     writer.add_part("model", "weight", "data", io.BytesIO(data))
@@ -97,22 +92,8 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
 
     attempt.attempt = 2
     restored_head = (head["head"], head["head_length"])
-    broker.authorize(attempt, transaction, 2, digest, "model", checkpoint=restored_head)
-    with pytest.raises(CapabilityError) as wrong_head:
-        proxy.begin_derived(
-            transaction, 2, {}, targets, {}, order, maximum, work_fingerprint=fingerprint
-        )
-    assert wrong_head.value.code == "weights_writer_declaration"
-    writer = proxy.begin_derived(
-        transaction,
-        2,
-        {},
-        targets,
-        {},
-        order,
-        maximum,
-        work_fingerprint=fingerprint,
-        checkpoint=restored_head,
+    writer = open_output(
+        broker, attempt, transaction, definition, checkpoint=restored_head, frames=frames
     )
     assert writer.completed_parts() == [("model", "weight", "data")]
     assert writer.completed_configs() == []
@@ -123,26 +104,10 @@ def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_hea
     assert len(receipt["added_objects"]) == 2
     broker.close_attempt(attempt)
     assert broker.writers == {} and broker.bindings == {}
-    assert {frame["operation"] for frame in frames} == {"open"}
+    assert {frame["operation"] for frame in frames} == {"output"}
     assert not list(spool.glob("*-input")) and not list(spool.glob("*-output"))
     # No payload or model-sized role inventory crosses the durable control request.
-    assert all(
-        set(frame)
-        <= {
-            "operation",
-            "weights_transaction_id",
-            "writer_epoch",
-            "length",
-            "target_operation",
-            "component",
-            "key",
-            "role",
-            "operation_id",
-            "slot",
-            "previous",
-        }
-        for frame in frames
-    )
+    assert all(set(frame) <= {"operation", "output_slot", "length"} for frame in frames)
 
 
 def test_parent_broker_spends_zero_protobuf_output_grant_on_native_graft(tmp_path: Path) -> None:
@@ -214,15 +179,16 @@ def test_parent_broker_spends_zero_protobuf_output_grant_on_native_graft(tmp_pat
     )
     transaction = "sha256:" + "84" * 32
     broker.authorize(attempt, transaction, 1, hashlib.sha256(declaration).digest(), "model")
-    proxy = StoreProxy(store, spool, writer_exchange(lambda frame: broker.handle(attempt, frame)))
-    with pytest.raises(CapabilityError) as excess:
-        proxy.begin_derived(
-            transaction, 1, sources, targets, {}, order, 1, work_fingerprint=fingerprint
-        )
-    assert excess.value.code == "weights_writer_ungranted"
-    writer = proxy.begin_derived(
-        transaction, 1, sources, targets, {}, order, 0, work_fingerprint=fingerprint
+    definition = Derivation(
+        {"source": Source(*source)},
+        {"model": Target(source="source", source_component="model")},
+        {},
+        order,
     )
+    with pytest.raises(CapabilityError) as excess:
+        open_output(broker, attempt, transaction, definition, maximum=1)
+    assert excess.value.code == "weights_writer_ungranted"
+    writer = open_output(broker, attempt, transaction, definition)
     receipt = writer.commit()
     assert recorded == [receipt]
     assert receipt["added_objects"] == []

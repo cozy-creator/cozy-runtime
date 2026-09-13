@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import json
+import io
 import socket
 import struct
 from pathlib import Path
@@ -11,11 +11,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+from tensorfs.derived import Config as NativeConfig
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import Model, uses_components
 from cozy_runtime.internal.executor import Executor, _capture_seal
 from cozy_runtime.internal.parallel.cp import in_gated_call
 from cozy_runtime.internal.seam import Channel
+from cozy_runtime.internal.weights_sink import weights_transaction_id
 
 
 class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in the base checking env
@@ -95,42 +98,30 @@ def fill_residency(root: Path, model: ModelCalls) -> None:
     """Materialize three real native TensorFS components, then park the two used by DiT."""
     import tensorfs
 
-    from cozy_runtime.author import WeightsConfig, WeightsPart, WeightsTarget, WeightsTensor
     from cozy_runtime.author._loader import census
-    from cozy_runtime.author._weights import WeightsCommit
     from cozy_runtime.internal.encoding import SPEC_PLAIN
     from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, _Holder
     from cozy_runtime.internal.residency import ComponentResidency
-    from cozy_runtime.internal.weights_sink import WeightsTransactionHost
 
     root.mkdir(parents=True, exist_ok=True)
     store = tensorfs.Store.ensure(str(root / "store"))
     values = {"block": 2.0, "overlay": 1.0, "spare": 5.0}
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="parallel-test",
-        request_id="create",
-        invocation_spec_digest="sha256:" + "1" * 64,
-        work_fingerprint="sha256:" + "2" * 64,
-        writer_session_id=1,
-        allowed_sources={},
-        output_bounds={"model": 4096},
-    )
-    target = WeightsTensor("f32", (1,), SPEC_PLAIN, {"value": WeightsPart("f32", (1,))})
-    writer = host.open(
-        WeightsCommit(
-            output_slot="model",
+    target = Tensor("f32", (1,), SPEC_PLAIN, {"value": Part("f32", (1,))})
+    writer = store.begin_derived(
+        weights_transaction_id("parallel-test", "create", "sha256:" + "1" * 64, "model"),
+        1,
+        *Derivation(
             sources={},
-            targets={name: WeightsTarget(add={"weight": target}) for name in values},
-            configs={"model": WeightsConfig(data=b"{}")},
+            targets={name: Target(add={"weight": target}) for name in values},
+            configs={"model": NativeConfig("add")},
             order=tuple((name, "weight") for name in values),
-            max_new_bytes=4096,
-        )
+        ).native_arguments(4096),
+        work_fingerprint="sha256:" + "2" * 64,
     )
     for name, value in values.items():
-        writer.add_part(name, "weight", "value", struct.pack("<f", value))
-    writer.add_config("model", b"{}", 2)
-    receipt = json.loads(writer.commit().tensorfs_receipt)
+        writer.add_part(name, "weight", "value", io.BytesIO(struct.pack("<f", value)))
+    writer.add_config("model", io.BytesIO(b"{}"))
+    receipt = writer.commit()
     manifest = "sha256:" + receipt["manifest"]["sha256"]
     checkpoint = Checkpoint(root / "store", manifest)
     backend = StreamingFillBackend.for_script(
