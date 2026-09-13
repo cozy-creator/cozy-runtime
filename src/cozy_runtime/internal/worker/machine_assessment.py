@@ -197,7 +197,7 @@ def verify(
                         (owner, request, execution["ordinal"], matched[0]["output_id"]),
                     ).fetchone()
                     _check(output is not None)
-                    byte_outputs.append(dict(output))
+                    byte_outputs.append((dict(output), matched[0]))
                 expected_capture = {
                     "components": plan.get("capture", []),
                     "steps": plan.get("capture_steps", []),
@@ -215,10 +215,10 @@ def verify(
                         (owner, request, execution["ordinal"]),
                     ).fetchone()
                     _check(output is not None)
-                    byte_outputs.append(dict(output))
+                    byte_outputs.append((dict(output), None))
                 else:
                     _check(not intent.get("capture") and not observation.get("capture"))
-            for output in byte_outputs:
+            for output, claimed in byte_outputs:
                 source = workspace_byte_outputs.reference(output)
                 retained = machine_models.retain_bytes(
                     workspace, owner, recipient, f"render.{request}.{output['slot']}", source
@@ -229,6 +229,20 @@ def verify(
                     pb.NativeByteRetentionRequest(
                         source=source, retention_id=retained.retention_id
                     ),
-                ):
-                    pass
+                ) as (_, _, members):
+                    if claimed is not None:
+                        _check(
+                            members
+                            == [
+                                {
+                                    "kind": "file",
+                                    "path": "payload",
+                                    "blob": {
+                                        "sha256": claimed["digest"][7:],
+                                        "length": claimed["length"],
+                                    },
+                                }
+                            ]
+                            and source.content_bytes == claimed["length"]
+                        )
     return str(facts["verdict"])
