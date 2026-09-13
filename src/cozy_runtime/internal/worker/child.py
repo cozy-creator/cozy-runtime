@@ -326,6 +326,14 @@ class ExecutorSupervision:
             raise ExecutorGone(
                 f"worker root {self.root} is already supervised by another live worker"
             ) from exc
+        # Rank 0 writes warm-call tensors before any request has an attempt spool.
+        # Provision that subtree before dropping privileges; the worker root remains
+        # traverse-only for the executor and cannot be created beneath by that UID.
+        warm = self.root / "warm"
+        warm.mkdir(mode=0o700, exist_ok=True)
+        if self.isolated:
+            os.chown(warm, self.executor_uid, self.executor_gid)
+        warm.chmod(0o700)
         # The epoch starts at 1 (02 §0): a worker that has not spawned yet already
         # carries a valid fence rather than a zero.
         self.epoch = 1
