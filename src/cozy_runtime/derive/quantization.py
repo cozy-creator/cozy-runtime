@@ -1,8 +1,8 @@
 """Carrier-free FP8 and MXFP8 model derivation jobs.
 
 The worker receives one exact TensorFS Manifest capability and returns another through
-``WeightsSink``. It never receives a filesystem path, store path, border binary, or
-publication credential. Publication belongs to Tensorhub's production transaction.
+TensorFS scoped derivation handles. It receives no Store or filesystem access.
+Publication belongs to Tensorhub's production transaction.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterator, Mapping
 from importlib.resources import files
-from typing import Any, NamedTuple, Protocol, cast
+from typing import Any, NamedTuple
 
 import msgspec
 import numpy as np
@@ -21,8 +21,6 @@ from cozy_runtime.author import (
     Model,
     Telemetry,
     UnsupportedInput,
-    WeightsSink,
-    WeightsTransaction,
 )
 
 from . import safetensors_io as st
@@ -56,17 +54,8 @@ _ENCODINGS: dict[str, _Encoding] = {
 BF16_ROUND_TRIP_BOUND = 2.0**-8
 
 
-class EncodingConformance(msgspec.Struct):
-    """What these kinds PROVE: byte layout, decoder agreement, reproducibility (#549.6).
-    Necessary for any publication; sufficient only for an explicitly quality-unapproved
-    one."""
-
-    passed: bool
-    basis: list[str]
-
-
 class QuantizationSource(Model[object]):
-    """Exact TensorFS Manifest input. The job reads it only through WeightsSink."""
+    """Exact TensorFS Manifest input. The job reads it only through its scoped TensorFS handle."""
 
     def load(self, loader: Any) -> None:
         del loader
@@ -95,20 +84,6 @@ class ArtifactQuantizationRequest(msgspec.Struct, forbid_unknown_fields=True):
     max_relative_frobenius: float | None = None
 
 
-class ArtifactQuantizationResult(msgspec.Struct):
-    artifact_transaction_id: str
-    tensorfs_receipt_digest: str
-    replayed: bool
-    encoded_keys: int
-    reused_keys: int
-    inherited_keys: int
-    source_bytes_read_this_run: int
-    new_bytes_written_this_run: int
-    saturated_elements_this_run: int
-    worst_relative_frobenius: float | None
-    conformance: EncodingConformance
-
-
 class QuantizationStats(msgspec.Struct):
     encoded_keys: int
     reused_keys: int
@@ -116,46 +91,6 @@ class QuantizationStats(msgspec.Struct):
     new_bytes_written: int
     saturated_elements: int
     worst_relative_frobenius: float | None
-
-
-class SourcePart(Protocol):
-    @property
-    def name(self) -> str: ...
-
-    @property
-    def dtype(self) -> str: ...
-
-    @property
-    def shape(self) -> tuple[int, ...]: ...
-
-
-class SourceTensor(Protocol):
-    @property
-    def component(self) -> str: ...
-
-    @property
-    def key(self) -> str: ...
-
-    @property
-    def logical_dtype(self) -> str: ...
-
-    @property
-    def shape(self) -> tuple[int, ...]: ...
-
-    @property
-    def parts(self) -> tuple[SourcePart, ...]: ...
-
-
-class SourceStructure(Protocol):
-    @property
-    def configs(self) -> tuple[str, ...]: ...
-
-    @property
-    def tensors(self) -> tuple[SourceTensor, ...]: ...
-
-
-class StructureWeights(Protocol):
-    def structure(self, source: Model[object]) -> SourceStructure: ...
 
 
 class Bf16Tensor(msgspec.Struct):
@@ -202,94 +137,27 @@ def h3_quantization_plan() -> bytes:
     return files(__package__).joinpath("h3-dit-quantization-plan.json").read_bytes()
 
 
-def derive_mxfp8(
-    ctx: Context,
-    payload: ArtifactQuantizationRequest,
-    source: QuantizationSource,
-    artifacts: WeightsSink,
-    tel: Telemetry,
-    *,
-    plan_bytes: bytes | None = None,
-) -> ArtifactQuantizationResult:
-    """Derive MXFP8 directly from the exact source Manifest."""
-    return _artifact_quantize(
-        "mxfp8/1",
-        _plan_or_source(plan_bytes, source, artifacts),
-        ctx,
-        payload,
-        source,
-        artifacts,
-        tel,
-    )
-
-
-def derive_fp8(
-    ctx: Context,
-    payload: ArtifactQuantizationRequest,
-    source: QuantizationSource,
-    artifacts: WeightsSink,
-    tel: Telemetry,
-    *,
-    plan_bytes: bytes | None = None,
-) -> ArtifactQuantizationResult:
-    """Derive row-wise FP8 directly from the source, never from the MXFP8 sibling."""
-    return _artifact_quantize(
-        "fp8-rowwise/1",
-        _plan_or_source(plan_bytes, source, artifacts),
-        ctx,
-        payload,
-        source,
-        artifacts,
-        tel,
-    )
-
-
-def _plan_or_source(
-    plan_bytes: bytes | None,
-    source: QuantizationSource,
-    weights: WeightsSink,
-) -> ArtifactQuantizationPlan:
-    if plan_bytes is not None:
-        return prepare_quantization(plan_bytes)
-    structure = cast(StructureWeights, weights).structure(source)
-    return prepare_source_quantization(
-        structure,
-        components=tuple(dict.fromkeys(tensor.component for tensor in structure.tensors)),
-    )
-
-
 def prepare_quantization(plan_bytes: bytes) -> ArtifactQuantizationPlan:
     """Validate one closed structural plan for caller-owned transactions."""
     return _artifact_plan(plan_bytes)
 
 
-def source_rows(structure: SourceStructure | SourceInspection) -> Iterator[tuple[str, str, Any]]:
-    """Traverse native metadata; keep the existing published structural callers usable."""
-    if isinstance(structure, SourceInspection):
-        for component, tensors in structure.components.items():
-            for key, tensor in tensors.items():
-                yield component, key, tensor
-    else:
-        for legacy_tensor in structure.tensors:
-            yield legacy_tensor.component, legacy_tensor.key, legacy_tensor
+def source_rows(structure: SourceInspection) -> Iterator[tuple[str, str, Tensor]]:
+    """Traverse the native header's construction order."""
+    for component, tensors in structure.components.items():
+        for key, tensor in tensors.items():
+            yield component, key, tensor
 
 
-def source_parts(tensor: Any) -> Mapping[str, Any]:
-    parts = tensor.parts
-    return parts if isinstance(parts, Mapping) else {part.name: part for part in parts}
+def source_parts(tensor: Tensor) -> Mapping[str, Part]:
+    return tensor.parts
 
 
-def completed_parts(
-    transaction: WeightsTransaction | DerivedTransaction,
-) -> set[tuple[str, str, str]]:
-    # The old property remains for active released consumers during cr174's cut.
-    value = transaction.completed_parts
-    return set(value() if callable(value) else value)
+def completed_parts(transaction: DerivedTransaction) -> set[tuple[str, str, str]]:
+    return set(transaction.completed_parts())
 
 
-def prepare_bf16(
-    structure: SourceStructure | SourceInspection, *, keep: tuple[str, ...] = ()
-) -> Bf16Plan:
+def prepare_bf16(structure: SourceInspection, *, keep: tuple[str, ...] = ()) -> Bf16Plan:
     """Plan only plain f32 normalization; preserve other precision and encodings."""
     keep_set = set(keep)
     if len(keep_set) != len(keep):
@@ -323,7 +191,7 @@ def prepare_bf16(
 
 
 def prepare_source_quantization(
-    structure: SourceStructure | SourceInspection, *, components: tuple[str, ...]
+    structure: SourceInspection, *, components: tuple[str, ...]
 ) -> ArtifactQuantizationPlan:
     """Select plain rank-2 weights that both row-wise encodings can represent."""
     rows = list(source_rows(structure))
@@ -389,7 +257,7 @@ def bf16_targets(
 
 
 def write_bf16(
-    transaction: WeightsTransaction | DerivedTransaction,
+    transaction: DerivedTransaction,
     ctx: Context,
     tel: Telemetry,
     *,
@@ -489,7 +357,7 @@ def quantization_additions(
 
 
 def quantize_component_into(
-    transaction: WeightsTransaction | DerivedTransaction,
+    transaction: DerivedTransaction,
     ctx: Context,
     payload: ArtifactQuantizationRequest,
     tel: Telemetry,
@@ -661,7 +529,7 @@ def _artifact_tensor(
 
 
 def _source_values(
-    transaction: WeightsTransaction | DerivedTransaction,
+    transaction: DerivedTransaction,
     tensor: QuantizationTensor,
     *,
     source: str,
@@ -679,7 +547,7 @@ def _source_values(
 
 
 def _read_values(
-    transaction: WeightsTransaction | DerivedTransaction,
+    transaction: DerivedTransaction,
     *,
     source: str,
     component: str,
@@ -730,104 +598,3 @@ def _validate_request(payload: ArtifactQuantizationRequest) -> None:
         not math.isfinite(payload.max_relative_frobenius) or payload.max_relative_frobenius < 0
     ):
         raise UnsupportedInput("max_relative_frobenius must be one finite nonnegative value")
-
-
-def _artifact_quantize(
-    encoding: str,
-    plan: ArtifactQuantizationPlan,
-    ctx: Context,
-    payload: ArtifactQuantizationRequest,
-    source: QuantizationSource,
-    artifacts: WeightsSink,
-    tel: Telemetry,
-) -> ArtifactQuantizationResult:
-    _validate_request(payload)
-    selected: dict[str, dict[str, QuantizationTensor]] = {
-        component: {} for component in plan.components
-    }
-    for tensor in plan.tensors:
-        selected[tensor.component][tensor.key] = tensor
-    targets = {
-        component: Target(
-            source="source",
-            source_component=component,
-            drop=tuple(sorted(selected[component])),
-            add=quantization_additions(encoding, plan, component),
-        )
-        for component in plan.components
-    }
-    configs = {name: Config("copy", source="source", source_config=name) for name in plan.configs}
-    with cast(Any, artifacts).open(
-        "model",
-        sources={"source": source},
-        targets=targets,
-        configs=configs,
-        order=plan.order,
-    ) as transaction:
-        if transaction.replayed:
-            receipt = transaction.receipt
-            assert receipt is not None
-            return ArtifactQuantizationResult(
-                artifact_transaction_id=receipt.weights_transaction_id,
-                tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
-                replayed=True,
-                encoded_keys=0,
-                reused_keys=len(plan.tensors),
-                inherited_keys=len(plan.order) - len(plan.tensors),
-                source_bytes_read_this_run=0,
-                new_bytes_written_this_run=0,
-                saturated_elements_this_run=0,
-                worst_relative_frobenius=None,
-                conformance=EncodingConformance(
-                    True,
-                    ["TensorFS replayed the previously committed exact transaction"],
-                ),
-            )
-
-        stats = [
-            quantize_component_into(
-                transaction,
-                ctx,
-                payload,
-                tel,
-                encoding=encoding,
-                plan=plan,
-                component=component,
-                source="source",
-                source_component=component,
-                target_component=component,
-            )
-            for component in plan.components
-        ]
-        receipt = transaction.commit()
-    source_bytes = sum(stat.source_bytes_read for stat in stats)
-    new_bytes = sum(stat.new_bytes_written for stat in stats)
-    saturated = sum(stat.saturated_elements for stat in stats)
-    measured = [stat.worst_relative_frobenius for stat in stats]
-    worst = (
-        None
-        if any(value is None for value in measured)
-        else max((value for value in measured if value is not None), default=0.0)
-    )
-    tel.metric("quantization.source_bytes", float(source_bytes), unit="bytes")
-    tel.metric("quantization.new_bytes", float(new_bytes), unit="bytes")
-    return ArtifactQuantizationResult(
-        artifact_transaction_id=receipt.weights_transaction_id,
-        tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
-        replayed=False,
-        encoded_keys=sum(stat.encoded_keys for stat in stats),
-        reused_keys=sum(stat.reused_keys for stat in stats),
-        inherited_keys=len(plan.order) - len(plan.tensors),
-        source_bytes_read_this_run=source_bytes,
-        new_bytes_written_this_run=new_bytes,
-        saturated_elements_this_run=saturated,
-        worst_relative_frobenius=worst,
-        conformance=EncodingConformance(
-            True,
-            [
-                "each selected source role was read through the exact granted Manifest",
-                "per-tensor round-trip stayed inside the encoding bound",
-                "TensorFS committed the declared derived Manifest transaction",
-            ],
-        ),
-    )
