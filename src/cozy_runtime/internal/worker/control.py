@@ -426,6 +426,7 @@ class _PreparationServicer(WorkspaceRPC):
         return pb.ProtocolInfoResult(
             wire_minor=WIRE_MINOR,
             minimum_wire_minor=MIN_COMPATIBLE_WIRE_MINOR,
+            supports_model_materialization_recovery=True,
         )
 
     def NumericalEnvironment(self, _request: pb.NumericalEnvironmentRequest, context: Any) -> Any:

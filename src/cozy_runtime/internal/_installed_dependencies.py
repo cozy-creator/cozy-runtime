@@ -13,10 +13,14 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.package_environment import (
@@ -34,6 +38,93 @@ from cozy_runtime.internal.package_environment import (
 
 MANIFEST_NAME = "installed-dependencies.json"
 MAX_DEPENDENCY_MANIFEST_BYTES = 64 << 20
+
+
+def required_distributions(
+    source_python: Path,
+    provided: Mapping[str, tuple[str, Sequence[Requirement]]],
+    environment: dict[str, str],
+    *,
+    allow_absent: frozenset[str] = frozenset(),
+) -> set[str]:
+    """Read the declared dependency graph without importing a mutable source venv.
+
+    Exact captured wheels supply their own metadata. The installed SDK may contain
+    unrelated packages, including heavyweight optional accelerator dependencies.
+    Extras propagate along dependency edges and cycles terminate by visited extras.
+    """
+    sites = list(source_python.parent.parent.glob("lib/python*/site-packages"))
+    if len(sites) != 1 or sites[0].resolve() != sites[0]:
+        raise EnvironmentRefusal(
+            "package_environment_dependency_source_invalid", str(source_python)
+        )
+    installed: dict[str, tuple[str, Sequence[Requirement]]] = {}
+    requires_python: dict[str, str] = {}
+    for info in sorted(sites[0].glob("*.dist-info")):
+        metadata = info / "METADATA"
+        if (
+            info.is_symlink()
+            or not metadata.is_file()
+            or metadata.is_symlink()
+            or metadata.stat().st_size > MAX_METADATA_BYTES
+        ):
+            raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(info))
+        headers = BytesParser().parsebytes(metadata.read_bytes(), headersonly=True)
+        name, version = _name(str(headers.get("Name", ""))), str(headers.get("Version", ""))
+        if name in provided:
+            continue
+        if not normalized_distribution(name) or not valid_wheel_version(version):
+            raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(info))
+        if name in installed:
+            raise EnvironmentRefusal("package_environment_dependency_distribution_collision", name)
+        try:
+            installed[name] = (
+                version,
+                tuple(Requirement(row) for row in headers.get_all("Requires-Dist", [])),
+            )
+        except InvalidRequirement as exc:
+            raise EnvironmentRefusal(
+                "package_environment_dependency_record_invalid", str(info)
+            ) from exc
+        requires_python[name] = str(headers.get("Requires-Python", ""))
+    available = {**installed, **provided}
+    pending = [Requirement(name) for name in {*provided, "cozy-runtime"}]
+    visited: dict[str, set[str]] = {}
+    while pending:
+        requirement = pending.pop()
+        name = _name(requirement.name)
+        if name not in available:
+            if name in allow_absent:
+                continue
+            raise EnvironmentRefusal("package_environment_dependency_missing", str(requirement))
+        version, dependencies = available[name]
+        try:
+            if requirement.specifier and not requirement.specifier.contains(
+                Version(version), prereleases=True
+            ):
+                raise EnvironmentRefusal(
+                    "package_environment_dependency_base_conflict",
+                    f"{requirement}: installed {version}",
+                )
+            python = requires_python.get(name, "")
+            if python and not SpecifierSet(python).contains(
+                environment["python_full_version"], prereleases=True
+            ):
+                raise EnvironmentRefusal(
+                    "package_environment_python_incompatible", f"{name}: {python}"
+                )
+        except (InvalidVersion, InvalidSpecifier) as exc:
+            raise EnvironmentRefusal("package_environment_dependency_record_invalid", name) from exc
+        extras = {"", *requirement.extras} - visited.get(name, set())
+        if not extras:
+            continue
+        visited.setdefault(name, set()).update(extras)
+        for dependency in dependencies:
+            if dependency.marker is None or any(
+                dependency.marker.evaluate({**environment, "extra": extra}) for extra in extras
+            ):
+                pending.append(dependency)
+    return set(visited) - provided.keys()
 
 
 def _dependency_record(info: Path) -> list[tuple[str, str, str]]:
