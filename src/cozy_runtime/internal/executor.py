@@ -2641,6 +2641,9 @@ class Executor:
         weights_open = None
         weights_source_structure = None
         weights_source_config = None
+        tensorfs_source = None
+        tensorfs_output = None
+        tensorfs_adopt = None
         if surface.weights_outputs:
             from cozy_runtime.internal import weights_sink
 
@@ -2735,6 +2738,9 @@ class Executor:
             weights_open = weights_host.open
             weights_source_structure = weights_host.structure
             weights_source_config = weights_store.config
+            tensorfs_source = weights_host.source
+            tensorfs_output = weights_host.open_output
+            tensorfs_adopt = weights_host.adopt_model
 
         from cozy_runtime.author._services import (
             BudgetFacts,
@@ -2802,6 +2808,9 @@ class Executor:
                 weights_reader=weights_reader,
                 weights_source_structure=weights_source_structure,
                 weights_source_config=weights_source_config,
+                tensorfs_source=tensorfs_source,
+                tensorfs_output=tensorfs_output,
+                tensorfs_adopt=tensorfs_adopt,
                 budget=BudgetFacts(
                     gpu_rate_usd_per_hour=int(budget.get("gpu_rate_micro_usd_per_hour", 0)) / 1e6,
                     gpu_count=int(budget.get("gpu_count", 0)),

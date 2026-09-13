@@ -15,11 +15,11 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import tensorfs
 
@@ -37,12 +37,19 @@ from cozy_runtime.author._weights import (
     WeightsSource,
     WeightsSourcePart,
     WeightsSourceTensor,
-    WeightsTarget,
 )
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
+    from tensorfs.derived import (
+        Derivation,
+        DerivedTransaction,
+        SourceCapability,
+        SourceInspection,
+        Target,
+    )
+
     from cozy_runtime.internal.base_observation import Observation
     from cozy_runtime.internal.hostfacts import HostFacts
 
@@ -256,6 +263,18 @@ def source_config(store: Any, manifest: str, length: int, name: str) -> bytes:
         ) from exc
 
 
+@dataclass(slots=True)
+class _OpenedOutput:
+    output_slot: str
+    transaction_id: str
+    declaration: object
+    declaration_digest: str
+    writer: Any
+    receipt: WeightsReceipt | None
+    writer_epoch: int
+    checkpoint: tuple[str, int] | None
+
+
 class WeightsTransactionHost:
     """One immutable invocation's real TensorFS weights authority."""
 
@@ -295,34 +314,133 @@ class WeightsTransactionHost:
         self.bind_intent = bind_intent
         self.record_receipt = record_receipt
         self.record_checkpoint = record_checkpoint
+        self._opened_outputs: dict[str, _OpenedOutput] = {}
 
     def open(self, request: WeightsCommit) -> WeightsHostTransaction:
-        """Lock one tfs-019 declaration before exposing any source reader or writer."""
-        maximum = self.output_bounds.get(request.output_slot)
-        if maximum is None or maximum != request.max_new_bytes:
+        """Compatibility for active author consumers, over the same native binding."""
+        from tensorfs.derived import Config, Derivation, Source
+
+        if self.output_bounds.get(request.output_slot) != request.max_new_bytes:
             raise CapabilityError(
-                f"weights output {request.output_slot!r} is not in the immutable grant",
-                code="weights_output_ungranted",
+                "weights output differs from its immutable grant", code="weights_output_ungranted"
             )
-        sources: dict[str, tuple[str, int]] = {}
-        for alias, manifest in request.sources.items():
-            length = self.allowed_sources.get(manifest)
-            if length is None:
-                raise CapabilityError(
-                    f"weights source {alias!r} ({manifest}) is not in the immutable grant",
-                    code="weights_source_ungranted",
-                )
-            sources[alias] = (manifest, length)
-        transaction_id = self.transaction_id(request.output_slot)
-        targets = {name: self._target(target) for name, target in request.targets.items()}
-        configs = {name: self._config(config) for name, config in request.configs.items()}
+        definition = Derivation(
+            sources={
+                alias: Source(manifest, self.allowed_sources.get(manifest, 0))
+                for alias, manifest in request.sources.items()
+            },
+            # Legacy declarations expose the same structural fields. TensorFS
+            # marshals them once; the compatibility path adds no geometry codec.
+            targets=cast("Mapping[str, Target]", request.targets),
+            configs={
+                name: Config(**self._config(config)) for name, config in request.configs.items()
+            },
+            order=request.order,
+        )
+        opened = self._begin(request.output_slot, definition)
+        return OpenedWeightsTransaction(
+            host=self,
+            request=request,
+            transaction_id=opened.transaction_id,
+            declaration=opened.declaration,
+            declaration_digest=opened.declaration_digest,
+            writer=opened.writer,
+            receipt=opened.receipt,
+            writer_epoch=opened.writer_epoch,
+            checkpoint=opened.checkpoint,
+        )
+
+    def open_output(self, output_slot: str, definition: Derivation) -> DerivedTransaction:
+        """Bind one declared output and return TensorFS's actual scoped handle."""
+        from tensorfs.derived import DerivedTransaction
+
+        opened = self._begin(output_slot, definition)
+        self._opened_outputs[opened.transaction_id] = opened
+        if opened.receipt is not None:
+            return DerivedTransaction.replay(canonical_json.decode(opened.receipt.tensorfs_receipt))
+        if not isinstance(opened.writer, DerivedTransaction):
+            opened.writer.fence()
+            raise CapabilityError(
+                "execution owner did not provide a scoped TensorFS handle",
+                code="weights_host_unavailable",
+            )
+        return opened.writer
+
+    def adopt_model(self, facts: Mapping[str, Any]) -> ModelArtifact:
+        """Project an exact committed native output; a caller cannot mint a receipt."""
+        transaction = str(facts.get("transaction_id", ""))
+        opened = self._opened_outputs.get(transaction)
+        if opened is None:
+            raise CapabilityError(
+                "model receipt was not produced by this output capability",
+                code="weights_receipt_mismatch",
+            )
+        existing = self.store.derived_lookup(transaction)
+        if existing.get("state") != "committed" or existing.get("receipt") != facts:
+            raise CapabilityError(
+                "model receipt differs from native committed custody",
+                code="weights_receipt_mismatch",
+            )
+        self._receipt(dict(facts), transaction, opened.declaration)
+        wrapped = self._wrap(
+            opened.output_slot,
+            transaction,
+            dict(facts),
+            replayed=opened.receipt is not None,
+            request_id=self.request_id,
+        )
+        self.acknowledge(wrapped)
+        return wrapped.artifact
+
+    def inspect_source(
+        self, manifest: str, components: Sequence[str], configs: Sequence[str]
+    ) -> SourceInspection:
+        """Inspect the admitted root through native parsing, without rebuilding geometry."""
+        from tensorfs.derived import SourceInspection
+
+        length = self.allowed_sources.get(manifest)
+        if length is None:
+            raise CapabilityError(
+                "source is outside this invocation", code="weights_source_ungranted"
+            )
+        if not components or not configs:
+            header = tensorfs.parse_header(bytes(self.store.manifest(manifest)["header"]))
+            components = components or tuple(header["components"])
+            configs = configs or tuple(header.get("configs", {}))
+        return SourceInspection.from_native(
+            self.store.inspect_derived_source(manifest, length, components, configs)
+        )
+
+    def source(self, manifest: str) -> SourceCapability:
+        from tensorfs.derived import SourceCapability
+
+        length = self.allowed_sources.get(manifest)
+        if length is None:
+            raise CapabilityError(
+                "source is outside this invocation", code="weights_source_ungranted"
+            )
+        return SourceCapability(
+            manifest,
+            length,
+            lambda components, configs: self.inspect_source(manifest, components, configs),
+        )
+
+    def _begin(self, output_slot: str, definition: Derivation) -> _OpenedOutput:
+        maximum = self.output_bounds.get(output_slot)
+        if maximum is None:
+            raise CapabilityError("weights output is not declared", code="weights_output_ungranted")
+        if any(
+            self.allowed_sources.get(source.manifest) != source.length
+            for source in definition.sources.values()
+        ):
+            raise CapabilityError(
+                "derivation source is outside this invocation", code="weights_source_ungranted"
+            )
+        transaction_id = self.transaction_id(output_slot)
+        arguments = definition.native_arguments(maximum)
         try:
             declaration = self.store.derived_declaration(
-                sources,
-                targets,
-                configs,
-                list(request.order),
-                request.max_new_bytes,
+                *arguments,
                 work_fingerprint=self.work_fingerprint,
             )
             if not isinstance(declaration, bytes) or not declaration:
@@ -335,7 +453,7 @@ class WeightsTransactionHost:
             ) from exc
         declaration_digest = hashlib.sha256(declaration).digest()
         binding = (
-            self.bind_intent(request.output_slot, transaction_id, declaration_digest, declaration)
+            self.bind_intent(output_slot, transaction_id, declaration_digest, declaration)
             if self.bind_intent is not None
             else WeightsHostBinding(transaction_id, self.writer_session_id)
         )
@@ -364,8 +482,8 @@ class WeightsTransactionHost:
                 self.store.inspect_derived_source(
                     "sha256:" + manifest["sha256"],
                     manifest["length"],
-                    list(request.targets),
-                    list(request.configs),
+                    list(definition.targets),
+                    list(definition.configs),
                 )
             except Exception as exc:
                 raise CapabilityError(
@@ -373,7 +491,7 @@ class WeightsTransactionHost:
                     code="weights_receipt_unavailable",
                 ) from exc
             receipt = self._wrap(
-                request.output_slot,
+                output_slot,
                 transaction_id,
                 facts,
                 replayed=True,
@@ -394,9 +512,8 @@ class WeightsTransactionHost:
             elif self.record_receipt is not None:
                 # TensorFS committed before the host receipt ACK. Close that crash gap now.
                 self.record_receipt(receipt)
-            return OpenedWeightsTransaction(
-                host=self,
-                request=request,
+            return _OpenedOutput(
+                output_slot=output_slot,
                 transaction_id=transaction_id,
                 declaration=expected_declaration,
                 declaration_digest=documents.spell(declaration_digest),
@@ -419,11 +536,7 @@ class WeightsTransactionHost:
             writer = self.store.begin_derived(
                 transaction_id,
                 binding.writer_epoch,
-                sources,
-                targets,
-                configs,
-                list(request.order),
-                request.max_new_bytes,
+                *arguments,
                 work_fingerprint=self.work_fingerprint,
                 checkpoint=binding.checkpoint,
             )
@@ -432,9 +545,8 @@ class WeightsTransactionHost:
                 f"TensorFS weights declaration refused: {type(exc).__name__}: {exc}",
                 code="weights_tensorfs_refused",
             ) from exc
-        return OpenedWeightsTransaction(
-            host=self,
-            request=request,
+        return _OpenedOutput(
+            output_slot=output_slot,
             transaction_id=transaction_id,
             declaration=expected_declaration,
             declaration_digest=documents.spell(declaration_digest),
@@ -519,43 +631,6 @@ class WeightsTransactionHost:
         return self._wrap(
             output_slot, transaction_id, facts, replayed=True, request_id=self.request_id
         )
-
-    @staticmethod
-    def _target(target: WeightsTarget) -> dict[str, Any]:
-        value: dict[str, Any] = {
-            "drop": sorted(target.drop),
-            "add": {
-                key: {
-                    "logical_dtype": tensor.logical_dtype,
-                    "shape": list(tensor.shape),
-                    "encoding": tensor.encoding,
-                    "parts": {
-                        role: {
-                            "dtype": part.dtype,
-                            "shape": list(part.shape),
-                            **(
-                                {
-                                    "source": {
-                                        "source": part.source.source,
-                                        "component": part.source.component,
-                                        "tensor": part.source.tensor,
-                                        "role": part.source.role,
-                                    }
-                                }
-                                if part.source is not None
-                                else {}
-                            ),
-                        }
-                        for role, part in sorted(tensor.parts.items())
-                    },
-                }
-                for key, tensor in sorted(target.add.items())
-            },
-        }
-        if target.source:
-            value["source"] = target.source
-            value["source_component"] = target.source_component
-        return value
 
     @staticmethod
     def _config(config: WeightsConfig) -> dict[str, Any]:

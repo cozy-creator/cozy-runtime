@@ -27,7 +27,7 @@ import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, get_args, get_type_hints
+from typing import TYPE_CHECKING, Any, get_args, get_type_hints
 
 import msgspec
 
@@ -52,6 +52,7 @@ from cozy_runtime.author._describe import check
 from cozy_runtime.author._errors import (
     SUCCEEDED,
     AuthorError,
+    CapabilityError,
     ConformanceError,
     InvalidRequest,
     Outcome,
@@ -89,6 +90,9 @@ from cozy_runtime.author._weights import (
     WeightsSink,
     WeightsSource,
 )
+
+if TYPE_CHECKING:
+    from tensorfs.derived import Derivation, DerivedTransaction, SourceCapability
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +142,9 @@ class Invocation:
     weights_source_config: Callable[[str, str], bytes] | None = None
     weights_source_structure: Callable[[str], WeightsSource] | None = None
     """Bounded structure reader for exact Manifest inputs already granted to this attempt."""
+    tensorfs_source: Callable[[str], SourceCapability] | None = None
+    tensorfs_output: Callable[[str, Derivation], DerivedTransaction] | None = None
+    tensorfs_adopt: Callable[[Mapping[str, Any]], ModelArtifact] | None = None
     max_output_bytes: int = MAX_OUTPUT_BYTES
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
@@ -228,6 +235,64 @@ def prepare(
     )
 
 
+def _bind_tensorfs(ctx: Context, record: Attempt, inv: Invocation, surface: Surface) -> None:
+    """Bind execution authority; TensorFS implements the source and output handles."""
+    if inv.tensorfs_source is None and inv.tensorfs_output is None:
+        return
+    from tensorfs.derived import OutputCapability, SourceCapability
+
+    source_reader = inv.tensorfs_source
+    output_opener = inv.tensorfs_output
+    receipt_adopter = inv.tensorfs_adopt
+    outputs: dict[str, OutputCapability] = {}
+    declared = {output.name for output in surface.weights_outputs}
+
+    def current() -> None:
+        record.check_open("Context TensorFS capability")
+        ctx.raise_if_cancelled()
+
+    def source(model: Model[object]) -> SourceCapability:
+        current()
+        if source_reader is None or not any(
+            model is candidate for candidate in inv.models.values()
+        ):
+            raise CapabilityError(
+                "source is not an admitted model input", code="weights_source_ungranted"
+            )
+        capability = source_reader(model.checkpoint_ref)
+
+        def inspect(components: Sequence[str], configs: Sequence[str]) -> Any:
+            current()
+            return capability.inspect(components=components, configs=configs)
+
+        return SourceCapability(capability.manifest, capability.length, inspect)
+
+    def output(slot: str) -> OutputCapability:
+        current()
+        if output_opener is None or slot not in declared:
+            raise CapabilityError(
+                "output slot is not interface-declared", code="weights_output_ungranted"
+            )
+        if slot not in outputs:
+
+            def opened(definition: Derivation) -> DerivedTransaction:
+                current()
+                return output_opener(slot, definition)
+
+            outputs[slot] = OutputCapability(opened)
+        return outputs[slot]
+
+    def adopt(receipt: Mapping[str, Any]) -> ModelArtifact:
+        current()
+        if receipt_adopter is None:
+            raise CapabilityError(
+                "native receipt adoption is unavailable", code="weights_receipt_mismatch"
+            )
+        return receipt_adopter(receipt)
+
+    ctx._tensorfs_source, ctx._tensorfs_output, ctx._tensorfs_adopt = source, output, adopt
+
+
 def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> InvocationResult:
     """Execute one PREPARED attempt end to end and return its envelope.
 
@@ -245,6 +310,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt = record
     attempt.rows.extend(overlay.rows)
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
+    _bind_tensorfs(ctx, record, inv, surface)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)
 
     attempt.entered = True

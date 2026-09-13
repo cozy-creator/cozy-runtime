@@ -35,8 +35,6 @@ _CHUNK = 1 << 20
 def _path(spool: Path, transaction: str, kind: str) -> Path:
     if _TRANSACTION.fullmatch(transaction) is None or kind not in {
         "request",
-        "input",
-        "output",
         "source-config",
     }:
         raise CapabilityError("invalid writer exchange identity", code="weights_writer_identity")
@@ -424,36 +422,38 @@ class WriterBroker:
         arguments: tuple[Any, ...],
         fingerprint: str,
     ) -> Iterator[None]:
-        if not storage_admission.pressure_enabled():
-            with storage_admission.admit(storage_admission.native_write(self.store_root)):
-                yield
-            return
-        store = self.store()
-        estimate = store.derived_write_estimate(
-            transaction,
-            binding.epoch,
-            *arguments,
-            work_fingerprint=fingerprint,
-            checkpoint=binding.checkpoint,
-        )
-        payload, parts = int(estimate["payload_bytes"]), int(estimate["parts"])
-        with self.lock:
-            existing = tuple(self.writers.items())
-        for key, live in existing:
-            if key[:2] != (attempt.request_id, attempt.attempt):
-                continue
-            pending = store.derived_write_estimate(
-                key[2],
-                live.binding.epoch,
-                *live.arguments,
-                work_fingerprint=live.fingerprint,
+        payload, parts = 0, 1
+        if storage_admission.pressure_enabled():
+            store = self.store()
+            estimate = store.derived_write_estimate(
+                transaction,
+                binding.epoch,
+                *arguments,
+                work_fingerprint=fingerprint,
+                checkpoint=binding.checkpoint,
             )
-            payload += int(pending["payload_bytes"])
-            parts += int(pending["parts"])
-        with storage_admission.admit(
+            payload, parts = int(estimate["payload_bytes"]), int(estimate["parts"])
+            with self.lock:
+                existing = tuple(self.writers.items())
+            for key, live in existing:
+                if key[:2] != (attempt.request_id, attempt.attempt):
+                    continue
+                pending = store.derived_write_estimate(
+                    key[2],
+                    live.binding.epoch,
+                    *live.arguments,
+                    work_fingerprint=live.fingerprint,
+                )
+                payload += int(pending["payload_bytes"])
+                parts += int(pending["parts"])
+        lease = storage_admission.acquire(
             storage_admission.native_write(self.store_root, payload, parts)
-        ):
-            yield
+        )
+        try:
+            with lease.scope():
+                yield
+        finally:
+            lease.close()
 
     def close_attempt(self, attempt: Any) -> None:
         with self.lock:
