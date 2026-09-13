@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
+from cozy_runtime.internal import source_interfaces
 from cozy_runtime.internal.worker import machine_child_target, workspace_memo
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
@@ -43,6 +44,8 @@ class Calls:
             raise WorkspaceRefusal("local call changed its accepted intent")
         executions = self.worker.executions
         assert executions is not None
+        if request.module == source_interfaces.MODULE and action == "cancel":
+            self.worker.machine_sources.cancel(owner, request)
         if executions.owns(owner, call.child_request):
             state = executions.status(owner, call.child_request)
             previous_attempt = canonical_json.decode(call.prepared)["parent_attempt"]
@@ -90,6 +93,8 @@ class Calls:
             child_request_id=call.child_request,
             state=pb.CHILD_CALL_STATE_PENDING,
         )
+        if request.module == source_interfaces.MODULE:
+            return self.worker.machine_sources.result(owner, call, request, result)
         if call.result:
             assert self.worker.workspace is not None
             workspace_memo.release_lookup(self.worker.workspace, owner, call.child_request)
@@ -152,6 +157,9 @@ class Calls:
                 self._finish(owner, call)
                 continue
             try:
+                if request.module == source_interfaces.MODULE:
+                    self.worker.machine_sources.drive(owner, call, request)
+                    continue
                 if request.HasField("capture"):
                     raise WorkspaceRefusal("activation capture requires a serving child")
                 target = machine_child_target.resolve(self.worker, parent, call)

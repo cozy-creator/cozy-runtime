@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
@@ -125,8 +127,50 @@ async def nested(ctx: Context, payload: Request) -> Result:
 """
 
 
+def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread]:
+    fixture = Path(__file__).parent / "testdata/native_source"
+    body = (fixture / "first.safetensors").read_bytes()
+    digest = hashlib.sha256(body).hexdigest()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/api/models/"):
+                data = json.dumps(
+                    [
+                        {
+                            "type": "file",
+                            "path": "provider/first.safetensors",
+                            "size": len(body),
+                            "lfs": {"oid": digest, "size": len(body)},
+                        }
+                    ]
+                ).encode()
+                self.send_response(200)
+            else:
+                start, end = map(int, self.headers["Range"].removeprefix("bytes=").split("-"))
+                data = body[start : end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(body)}")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    assert worker.source_calls is not None
+    worker.source_calls.endpoints = {"huggingface": f"http://127.0.0.1:{server.server_port}"}
+    worker.source_calls.native_registry = (fixture / "registry.json").read_bytes()
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    return server, thread
+
+
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-@pytest.mark.parametrize("case", ["normal", "pause", "loss", "cycle", "capacity", "model"])
+@pytest.mark.parametrize(
+    "case", ["normal", "pause", "loss", "cycle", "capacity", "model", "source"]
+)
 def test_nested_capture_and_leaf_memoization_without_control_stream(
     monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
@@ -135,7 +179,24 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
 
     with tempfile.TemporaryDirectory(prefix="cz-child.") as directory:
         root = Path(directory)
-        source = MODEL_SOURCE if case == "model" else SOURCE
+        source = MODEL_SOURCE if case in ("model", "source") else SOURCE
+        if case == "source":
+            source = source.replace(
+                'return Result(len(view.components["body"]))',
+                "return Result(sum(len(v) for v in view.components.values()))",
+            )
+            source = source.replace(
+                "    return await compose(n=3)",
+                "    from cozy_runtime.author.sources import (\n"
+                "        download_huggingface, source_files, convert_cozytensors)\n"
+                "    source = await download_huggingface('example/model', revision='"
+                + "a"
+                * 40
+                + "', carriers=('provider/first.safetensors',))\n"
+                "    await source_files(source)\n"
+                "    model = await convert_cozytensors(source, profile='fixture/first/1')\n"
+                "    return await consume(model=model)",
+            )
         if case in ("pause", "loss"):
             source = source.replace(
                 "    return Result(n * 2)",
@@ -181,6 +242,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             GrpcControlHost("127.0.0.1:0", root / "address"),
         )
         thread = threading.Thread(target=worker.run, daemon=True)
+        origin = native_origin(worker) if case == "source" else None
         try:
             fixture.measure(worker, preparation)
             prepared = worker.prepare_local_package(preparation)
@@ -219,7 +281,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                         )
                         for export in (
                             ("compose", "consume", "leaf")
-                            if case == "model"
+                            if case in ("model", "source")
                             else ("compose", "leaf")
                         )
                     ],
@@ -349,24 +411,30 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             import base64
 
             assert canonical_json.decode(base64.b64decode(body["result"]["inline_result"])) == {
-                "value": 2 if case == "model" else 12
+                "value": 1 if case == "source" else 2 if case == "model" else 12
             }
             assert not worker.connected.is_set()
             assert worker.workspace is not None
             with worker.workspace.locked() as db:
                 assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == (
-                    4 if case == "model" else 3
+                    2 if case == "source" else 4 if case == "model" else 3
                 )
                 assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == (
-                    4 if case == "model" else 3
+                    4 if case in ("model", "source") else 3
                 )
-                assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 1
+                assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == (
+                    2 if case == "source" else 1
+                )
         finally:
             worker.request_stop()
             worker.host.stop()
             if thread.ident is not None:
                 thread.join(30)
             assert not thread.is_alive()
+            if origin is not None:
+                origin[0].shutdown()
+                origin[0].server_close()
+                origin[1].join()
 
 
 def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:

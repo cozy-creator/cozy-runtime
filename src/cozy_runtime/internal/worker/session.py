@@ -1247,6 +1247,9 @@ class Worker:
         from .machine_calls import Calls as MachineCalls
 
         self.machine_calls = MachineCalls(self) if self.workspace is not None else None
+        from .machine_sources import Sources as MachineSources
+
+        self.machine_sources = MachineSources(self)
         self.engine.calls = self.calls
         from cozy_runtime.internal.worker.source_calls import SourceCalls
 
@@ -2459,6 +2462,8 @@ class Worker:
             and bool(subject_id)
             and self.executions.owns(self.fence.record_owner_id, subject_id)
         )
+        if machine_message and frame.HasField("native_source_status"):
+            self.machine_sources.observe(frame.native_source_status)
         if machine_message and frame.HasField("child_call_request"):
             request = frame.child_call_request
             self.calls.absorb(

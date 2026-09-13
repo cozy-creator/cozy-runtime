@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 from typing import Any
 
 import msgspec
 
+from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.internal.worker import grants
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
@@ -33,6 +35,19 @@ def retain(
     from .machine_artifacts import model_retention
 
     request = model_retention(workspace, owner, recipient, path, artifact)
+    register(workspace, owner, recipient, path, request)
+    return request, workspace.retain(owner, request)
+
+
+def register(
+    workspace: Workspace,
+    owner: str,
+    recipient: str,
+    path: str,
+    request: pb.DerivedRetentionRequest,
+    *,
+    kind: str = "derived",
+) -> None:
     raw = request.SerializeToString(deterministic=True)
     with workspace.locked() as db:
         db.execute(
@@ -46,20 +61,52 @@ def retain(
         ).fetchone()
         if row["retention"] != raw:
             raise WorkspaceRefusal("execution Model hold changed its exact subject")
-    return request, workspace.retain(owner, request)
+        workspace.reserve_hold(db, owner, request, release=False, kind=kind)
+
+
+def retain_bytes(
+    workspace: Workspace, owner: str, recipient: str, path: str, source: pb.NativeByteTreeRef
+) -> pb.ChildByteResultGrant:
+    from . import workspace_byte_outputs
+
+    identity = documents.spell(
+        hashlib.sha256(
+            canonical_json.encode(
+                ["cozy.machine-byte-hold/1", owner, recipient, path, documents.body(source)]
+            )
+        ).digest()
+    )
+    request = pb.DerivedRetentionRequest(
+        weights_transaction_id=source.producer_root_id,
+        tensorfs_receipt_digest=source.receipt_digest,
+        retention_id=identity,
+    )
+    register(workspace, owner, recipient, path, request, kind="tree")
+    workspace_byte_outputs.change_hold(
+        workspace,
+        owner,
+        pb.NativeByteRetentionRequest(source=source, retention_id=identity),
+        release=False,
+    )
+    return pb.ChildByteResultGrant(source=source, retention_id=identity)
 
 
 def release(workspace: Workspace, owner: str, recipient: str) -> None:
     """Collection or explicit abandonment releases this recipient's own native holds."""
     with workspace.locked() as db:
         rows = db.execute(
-            "SELECT path,retention FROM execution_model_holds WHERE owner=? AND recipient=?",
+            "SELECT retention FROM execution_model_holds WHERE owner=? AND recipient=?",
             (owner, recipient),
         ).fetchall()
     for row in rows:
-        workspace.retain(
-            owner, pb.DerivedRetentionRequest.FromString(row["retention"]), release=True
-        )
+        request = pb.DerivedRetentionRequest.FromString(row["retention"])
+        with workspace.locked() as db:
+            held = db.execute(
+                "SELECT kind FROM holds WHERE id=?", (request.retention_id,)
+            ).fetchone()
+            workspace._change_hold(
+                db, owner, request, release=True, kind=held["kind"] if held else "derived"
+            )
     # Keep the tiny ownership record for idempotent release after a lost reply.
 
 
