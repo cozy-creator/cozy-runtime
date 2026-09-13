@@ -426,11 +426,12 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
         assert all(path.read_bytes() == raw for path, raw in first_plans.items())
 
 
-@pytest.mark.parametrize("bind_model", [False, True], ids=["code-only", "native-model"])
+@pytest.mark.parametrize("model_source", ["none", "native", "downloaded", "mixed"])
 def test_real_modeled_package_prepare_can_be_acquired_before_model_selection(
-    tmp_path: Path, bind_model: bool
+    tmp_path: Path, model_source: str
 ) -> None:
     """The real producer/consumer handoff, before any model or handler may execute."""
+    bind_model = model_source != "none"
     project = tmp_path / "project"
     _write_pure_project(project, "code-only", "1.0.0", "code_only_package")
     metadata = project / "pyproject.toml"
@@ -464,6 +465,8 @@ app = App()
 def generate(ctx: Context, payload: Request, model: Weights) -> Result:
     raise AssertionError("code preparation cannot execute a handler")
 """
+    if model_source == "mixed":
+        source = source.replace("model: Weights)", "model: Weights, adapter: Weights)")
     (project / "src/code_only_package/__init__.py").write_text(source)
     captured = package_interface.canonical_bytes(static_interface.build(project))
     artifacts, environment = tmp_path / "artifacts", tmp_path / "environment"
@@ -583,27 +586,73 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
         store_root, manifest, length, _store = _snapshot(
             native_root, include_asset=True, checkpoint_only=True
         )
-        modeled = prepare_unpublished_placement(
-            pb.PreparePrivatePlacementRequest(
-                operation_id="code-only-proof-model",
-                local_revision_digest=revision,
-                native_models=[
-                    pb.NativeModelBinding(
-                        slot="generate.models.model",
-                        model="proof/native",
-                        manifest=pb.Ref(digest=documents.raw(manifest), length=length),
-                    )
-                ],
-            ),
-            prepared=entry,
-            installed=installed[0],
-            artifact_cache=artifacts,
-            tensorfs_root=store_root,
-            verified=lambda _digest, _length, _path: None,
+        selection = pb.PreparePrivatePlacementRequest(
+            operation_id="code-only-proof-model", local_revision_digest=revision
         )
+        if model_source in {"native", "mixed"}:
+            selection.native_models.append(
+                pb.NativeModelBinding(
+                    slot="generate.models.model",
+                    model="proof/native",
+                    manifest=pb.Ref(digest=documents.raw(manifest), length=length),
+                )
+            )
+        if model_source in {"downloaded", "mixed"}:
+            # The second source is a real released root, not a native label pretending
+            # to be downloadable. The same tiny bytes deliberately test native dedup.
+            operation = _store.begin_operation("mixed-input-release", "proof", "base")
+            operation.hold_manifest(manifest, length)
+            operation.commit_release(None, "1.0.0", "bf16", manifest, length)
+            selection.download_delegation, _ = documents.identity(
+                pb.DownloadDelegation(
+                    models=[
+                        pb.DownloadModelRef(
+                            package="local/code-only",
+                            slot="generate.models.adapter"
+                            if model_source == "mixed"
+                            else "generate.models.model",
+                            model="proof/base",
+                            release="1.0.0",
+                            lane="bf16",
+                            manifest=manifest,
+                        )
+                    ]
+                )
+            )
+
+        def prepare_selection(
+            selected: pb.PreparePrivatePlacementRequest,
+        ) -> pb.PreparePackageSetResult:
+            return prepare_unpublished_placement(
+                selected,
+                prepared=entry,
+                installed=installed[0],
+                artifact_cache=artifacts,
+                tensorfs_root=store_root,
+                verified=lambda _digest, _length, _path: None,
+            )
+
+        modeled = prepare_selection(selection)
+        if model_source == "mixed":
+            duplicate = pb.PreparePrivatePlacementRequest()
+            duplicate.CopyFrom(selection)
+            duplicate.native_models[0].slot = "generate.models.adapter"
+            with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
+                prepare_selection(duplicate)
+            wrong = pb.PreparePrivatePlacementRequest()
+            wrong.CopyFrom(selection)
+            wrong.native_models[0].manifest.digest = bytes(32)
+            with pytest.raises(PreparationRefusal):
+                prepare_selection(wrong)
+            undeclared = pb.PreparePrivatePlacementRequest()
+            undeclared.CopyFrom(selection)
+            undeclared.native_models[0].slot = "generate.models.undeclared"
+            with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
+                prepare_selection(undeclared)
         (joined,) = read_placement_set(modeled.placement_set)
         assert [row["name"] for row in joined["entrypoints"]] == ["generate"]
-        assert len(joined["models"]) == 1
+        assert len(joined["models"]) == (2 if model_source == "mixed" else 1)
+        assert {row["manifest"]["digest"] for row in joined["models"]} == {manifest}
         bound = Placement(
             placement_id=joined["placement_id"],
             placement_set_digest=modeled.placement_set.placement_set_digest,
