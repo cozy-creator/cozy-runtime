@@ -15,6 +15,8 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
 
 from cozy_runtime.internal import _installed_dependencies as dependencies
 from cozy_runtime.internal import canonical, package_environment
@@ -35,11 +37,19 @@ def _venv(path: Path, *, executable: Path | None = None) -> Path:
 
 
 def _distribution(
-    site: Path, name: str, members: dict[str, bytes], *, editable: bool = False
+    site: Path,
+    name: str,
+    members: dict[str, bytes],
+    *,
+    editable: bool = False,
+    requirements: tuple[str, ...] = (),
 ) -> Path:
     info = site / f"{name}-1.0.dist-info"
     content = {
-        f"{info.name}/METADATA": f"Metadata-Version: 2.3\nName: {name}\nVersion: 1.0\n".encode(),
+        f"{info.name}/METADATA": (
+            f"Metadata-Version: 2.3\nName: {name}\nVersion: 1.0\n"
+            + "".join(f"Requires-Dist: {row}\n" for row in requirements)
+        ).encode(),
         **members,
     }
     if editable:
@@ -176,16 +186,81 @@ def test_failed_final_observation_publishes_no_receipt(tmp_path: Path) -> None:
         (package_environment.BlobGrant(wheel.digest, wheel.length, path, verified),),
     )
     install_root = tmp_path / "environments"
-    # This thin source deliberately lacks Runtime. The actual final observation must fail
-    # before a receipt could admit it, even though its recorded dependency copied correctly.
-    with pytest.raises(package_environment.EnvironmentRefusal, match="base_invalid"):
+    # This thin source deliberately lacks Runtime. Reject its incomplete dependency
+    # graph before spending I/O on any installed bytes or publishing a receipt.
+    with pytest.raises(package_environment.EnvironmentRefusal, match="dependency_missing"):
         package_environment.materialize(
             material, install_root, base=base, dependency_python=source / "bin/python"
         )
-    assert not list((install_root / "receipts").iterdir())
-    assert not list((install_root / "contents").iterdir())
+    assert not (install_root / "receipts").exists()
+    assert not (install_root / "contents").exists()
     assert not list(install_root.glob(".environment-staging-*"))
     assert not (source / "bin/executed").exists()
+
+
+def test_required_closure_tracks_extras_markers_cycles_and_captured_wheels(tmp_path: Path) -> None:
+    source, target = tmp_path / "source", tmp_path / "target"
+    site = _venv(source)
+    target_site = _venv(target)
+    _distribution(site, "cozy-runtime", {"cozy_runtime/__init__.py": b""})
+    _distribution(
+        site,
+        "model",
+        {"model.pth": b"mutable"},
+        editable=True,
+        requirements=("unrelated-sdk-package",),
+    )
+    _distribution(
+        site,
+        "codec",
+        {"codec.py": b"codec = 1"},
+        requirements=(
+            'pixels>=1; extra == "images"',
+            'sound>=1; extra == "audio"',
+            "cycle",
+            'windows-only; sys_platform == "win32"',
+        ),
+    )
+    _distribution(site, "cycle", {"cycle.py": b""}, requirements=("codec[audio]",))
+    _distribution(site, "pixels", {"pixels.py": b""})
+    _distribution(site, "sound", {"sound.py": b""})
+    unrelated = _distribution(site, "unrelated-sdk-package", {"huge.bin": b"unused"})
+    # An unrelated package's bytes/RECORD must never be read, copied, or verified.
+    (unrelated / "RECORD").unlink()
+    provided = {"model": ("2.0", (Requirement("codec[images]>=1"),))}
+    included = dependencies.required_distributions(
+        source / "bin/python", provided, default_environment()
+    )
+    assert included == {"cozy-runtime", "codec", "cycle", "pixels", "sound"}
+    manifest = dependencies.snapshot(
+        source / "bin/python", target, set(provided), included=included
+    )
+    dependencies.verify_files(target, manifest)
+    assert (target_site / "sound.py").exists() and (target_site / "pixels.py").exists()
+    assert not (target_site / "huge.bin").exists() and not (target_site / "model.pth").exists()
+    assert not (source / "bin/executed").exists()
+
+
+@pytest.mark.parametrize(
+    "requirement,code",
+    [
+        ("missing", "dependency_missing"),
+        ("codec>=2", "dependency_base_conflict"),
+        ("codec[images]", "dependency_missing"),
+    ],
+)
+def test_required_closure_refuses_incomplete_or_incompatible_graph(
+    tmp_path: Path, requirement: str, code: str
+) -> None:
+    site = _venv(tmp_path / "source")
+    _distribution(site, "cozy-runtime", {"cozy_runtime/__init__.py": b""})
+    _distribution(site, "codec", {"codec.py": b""}, requirements=('pixels; extra == "images"',))
+    with pytest.raises(package_environment.EnvironmentRefusal, match=code):
+        dependencies.required_distributions(
+            tmp_path / "source/bin/python",
+            {"project": ("1.0", (Requirement(requirement),))},
+            default_environment(),
+        )
 
 
 def test_dependency_copy_accepts_concurrent_uv_hardlink_churn(tmp_path: Path) -> None:
