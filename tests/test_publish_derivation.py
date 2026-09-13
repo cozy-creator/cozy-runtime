@@ -26,7 +26,7 @@ from pathlib import Path
 import msgspec
 import pytest
 
-from cozy_runtime.author import App, ConformanceError, Model, WeightsOutput, WeightsSink
+from cozy_runtime.author import App, ConformanceError, Context, Model, WeightsOutput
 from cozy_runtime.author._describe import describe
 from cozy_runtime.author._loader import Loader
 from cozy_runtime.internal import canonical, package_environment, package_interface
@@ -121,7 +121,7 @@ def test_lane_words_are_not_selection_leaks() -> None:
         app = App()
 
         @app.job(weights=(WeightsOutput(output_id, max_new_bytes=1 << 20),))
-        def produce(payload: Request, denoiser: Denoiser, weights: WeightsSink) -> Reply:
+        def produce(payload: Request, denoiser: Denoiser, ctx: Context) -> Reply:
             return Reply(text="ok")
 
         found = Discovered(

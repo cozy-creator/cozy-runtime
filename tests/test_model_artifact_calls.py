@@ -11,6 +11,7 @@ import grpc
 import msgspec
 import pytest
 import tensorfs
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import (
     App,
@@ -21,10 +22,6 @@ from cozy_runtime.author import (
     ModelArtifact,
     ObjectRef,
     WeightsOutput,
-    WeightsPart,
-    WeightsSink,
-    WeightsTarget,
-    WeightsTensor,
     attempt,
     describe,
     invocable,
@@ -39,6 +36,7 @@ from cozy_runtime.internal.worker.control import _PreparationServicer
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
+from native_weights import NativeExecution
 from test_weights_resume_native import _committed
 
 
@@ -63,48 +61,40 @@ async def echo(ctx: Context, *, value: ModelArtifact) -> ModelArtifact:
 
 
 @invocable(memoize=True)
-async def produce(ctx: Context, *, weights: WeightsSink) -> ModelArtifact:
+async def produce(ctx: Context) -> ModelArtifact:
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
-    with weights.open(
-        "result",
-        sources={},
-        targets={
-            "model": WeightsTarget(
-                add={
-                    "weight": WeightsTensor(
-                        "f32", (512,), plain, {"value": WeightsPart("f32", (512,))}
-                    )
-                }
-            )
-        },
-        configs={},
-        order=(("model", "weight"),),
+    with ctx.output("result").open(
+        Derivation(
+            sources={},
+            targets={
+                "model": Target(
+                    add={"weight": Tensor("f32", (512,), plain, {"value": Part("f32", (512,))})}
+                )
+            },
+            configs={},
+            order=(("model", "weight"),),
+        )
     ) as writer:
         writer.add_part("model", "weight", "value", b"\x31" * 2048)
-        return writer.commit().artifact
+        return ctx.adopt_model(writer.commit())
 
 
 def test_author_native_creation_call_returns_its_model_artifact(tmp_path: Path) -> None:
-    from cozy_runtime.internal.weights_sink import WeightsTransactionHost
-
     store = tensorfs.Store.init(tmp_path / "store")
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="owner",
-        request_id="request",
-        invocation_spec_digest="sha256:" + "11" * 32,
-        work_fingerprint="sha256:" + "12" * 32,
-        writer_session_id=1,
-        allowed_sources={},
-        output_bounds={"result": 2048},
-    )
+    host = NativeExecution(store, tmp_path, "request", {}, {"result": 2048})
     app = App()
     app.job(produce, weights=(WeightsOutput("result", 2048),))
     describe(app)
     result, outcome, _ = attempt(
         app.get("produce"),
         {},
-        Invocation("request", tmp_path / "spool", time.monotonic() + 5, weights=host.open),
+        Invocation(
+            "request",
+            tmp_path / "spool",
+            time.monotonic() + 30,
+            tensorfs_output=host.client.open_output,
+            tensorfs_adopt=host.client.adopt_model,
+        ),
     )
     assert outcome.terminal == "succeeded", outcome
     assert result is not None and isinstance(result.result, ModelArtifact)

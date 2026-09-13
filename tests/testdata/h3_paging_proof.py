@@ -9,6 +9,7 @@ import argparse
 import copy
 import gc
 import importlib
+import io
 import json
 import resource
 import sys
@@ -16,6 +17,11 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+from tensorfs.derived import Config as NativeConfig
+from tensorfs.derived import Derivation, Part, Target, Tensor
+
+from cozy_runtime.internal.weights_sink import weights_transaction_id
 
 
 def main() -> None:
@@ -39,15 +45,12 @@ def main() -> None:
     dual_full_config = config_module.dual_full_config
     parse_production_config = config_module.parse_production_config
 
-    from cozy_runtime.author import WeightsConfig, WeightsPart, WeightsTarget, WeightsTensor
     from cozy_runtime.author._loader import census
-    from cozy_runtime.author._weights import WeightsCommit
     from cozy_runtime.internal.derive import Observations, serving_substrate
     from cozy_runtime.internal.encoding import SPEC_PLAIN
     from cozy_runtime.internal.fill import Checkpoint, StreamingFillBackend, _Holder
     from cozy_runtime.internal.paging import partition
     from cozy_runtime.internal.residency import ComponentResidency, ResidencyRefusal
-    from cozy_runtime.internal.weights_sink import WeightsTransactionHost
 
     sections = parse_production_config(
         (
@@ -172,42 +175,36 @@ def main() -> None:
         state = reference.state_dict()
         for key, tensor in state.items():
             kind = dtype[str(tensor.dtype)]
-            targets[key] = WeightsTensor(
+            targets[key] = Tensor(
                 logical_dtype=kind,
                 shape=tuple(tensor.shape),
                 encoding=SPEC_PLAIN,
-                parts={"value": WeightsPart(dtype=kind, shape=tuple(tensor.shape))},
+                parts={"value": Part(dtype=kind, shape=tuple(tensor.shape))},
             )
         total = sum(t.numel() * t.element_size() for t in state.values())
-        host = WeightsTransactionHost(
-            store=store,
-            owner_scope="paging-proof",
-            request_id="paging-proof",
-            invocation_spec_digest="sha256:" + "1" * 64,
-            work_fingerprint="sha256:" + "b" * 64,
-            writer_session_id=1,
-            allowed_sources={},
-            output_bounds={"model": total + 4096},
-        )
-        transaction = host.open(
-            WeightsCommit(
-                output_slot="model",
+        transaction = store.begin_derived(
+            weights_transaction_id("paging-proof", "paging-proof", "sha256:" + "1" * 64, "model"),
+            1,
+            *Derivation(
                 sources={},
-                targets={component: WeightsTarget(add=targets)},
-                configs={"model": WeightsConfig(data=b'{"proof":"paging"}')},
+                targets={component: Target(add=targets)},
+                configs={"model": NativeConfig("add")},
                 order=tuple((component, key) for key in state),
-                max_new_bytes=total + 4096,
-            )
+            ).native_arguments(total + 4096),
+            work_fingerprint="sha256:" + "b" * 64,
         )
         for key, tensor in state.items():
             transaction.add_part(
-                component, key, "value", tensor.contiguous().view(torch.uint8).numpy().tobytes()
+                component,
+                key,
+                "value",
+                io.BytesIO(tensor.contiguous().view(torch.uint8).numpy().tobytes()),
             )
-        transaction.add_config("model", b'{"proof":"paging"}', len(b'{"proof":"paging"}'))
+        transaction.add_config("model", io.BytesIO(b'{"proof":"paging"}'))
         receipt = transaction.commit()
-        manifest = "sha256:" + json.loads(receipt.tensorfs_receipt)["manifest"]["sha256"]
+        manifest = "sha256:" + receipt["manifest"]["sha256"]
         print(json.dumps({"phase": "native_commit", "bytes": total}), flush=True)
-        del state, transaction, host
+        del state, transaction
         reference.to("cuda")
         with torch.no_grad():
             expected = outputs(invoke(reference))

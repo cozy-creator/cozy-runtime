@@ -9,52 +9,38 @@ from pathlib import Path
 
 import pytest
 import tensorfs
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import WeightsPart, WeightsReceipt, WeightsTarget, WeightsTensor
+from cozy_runtime.author import WeightsReceipt
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.author._weights import WeightsCommit
 from cozy_runtime.internal.base_observation import Observation
 from cozy_runtime.internal.hostfacts import HostFacts
-from cozy_runtime.internal.weights_sink import WeightsTransactionHost, work_fingerprint
+from cozy_runtime.internal.weights_sink import receipt_from_native, work_fingerprint
+from native_weights import NativeExecution
 
 
 def _committed(
     tmp_path: Path,
-) -> tuple[tensorfs.Store, WeightsTransactionHost, WeightsCommit, WeightsReceipt]:
+) -> tuple[tensorfs.Store, NativeExecution, Derivation, WeightsReceipt]:
     store = tensorfs.Store.init(tmp_path / "store")
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
-    request = WeightsCommit(
-        output_slot="result",
-        sources={},
-        targets={
-            "model": WeightsTarget(
-                add={
-                    "weight": WeightsTensor(
-                        logical_dtype="f32",
-                        shape=(512,),
-                        encoding=plain,
-                        parts={"value": WeightsPart(dtype="f32", shape=(512,))},
-                    )
-                }
+    request = Derivation(
+        {},
+        {
+            "model": Target(
+                add={"weight": Tensor("f32", (512,), plain, {"value": Part("f32", (512,))})}
             )
         },
-        configs={},
-        order=(("model", "weight"),),
-        max_new_bytes=2048,
+        {},
+        (("model", "weight"),),
     )
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="resume-proof",
-        request_id="request",
-        invocation_spec_digest="sha256:" + "41" * 32,
-        work_fingerprint="sha256:" + "42" * 32,
-        writer_session_id=1,
-        allowed_sources={},
-        output_bounds={"result": 2048},
+    host = NativeExecution(store, tmp_path, "request", {}, {"result": 2048})
+    with host.client.open_output("result", request) as writer:
+        writer.add_part("model", "weight", "value", b"\x31" * 2048)
+        facts = writer.commit()
+    receipt = receipt_from_native(
+        "result", facts["transaction_id"], facts, replayed=False, request_id="request"
     )
-    writer = host.open(request)
-    writer.add_part("model", "weight", "value", b"\x31" * 2048)
-    receipt = writer.commit()
     return store, host, request, receipt
 
 
@@ -63,9 +49,9 @@ def test_pending_and_adopted_results_replay_but_disposed_metadata_refuses(tmp_pa
     for disposition in ("pending", "adopted"):
         if disposition == "adopted":
             store.derived_adopt(receipt.weights_transaction_id, "owned-output")
-        replay = host.open(request)
-        assert replay.replayed
-        assert replay.commit().tensorfs_receipt == receipt.tensorfs_receipt
+        replay = host.client.open_output("result", request)
+        assert replay.receipt is not None
+        assert replay.commit() == json.loads(receipt.tensorfs_receipt)
         observed = store.derived_lookup(receipt.weights_transaction_id)
         assert observed["disposition"]["kind"] == disposition
 
@@ -74,8 +60,8 @@ def test_pending_and_adopted_results_replay_but_disposed_metadata_refuses(tmp_pa
     assert retained_metadata["state"] == "committed"
     assert retained_metadata["receipt"] == json.loads(receipt.tensorfs_receipt)
     with pytest.raises(CapabilityError) as error:
-        host.open(request)
-    assert error.value.code == "weights_transaction_closed"
+        host.client.open_output("result", request)
+    assert error.value.code == "weights_transaction_abandoned"
 
 
 def test_pending_receipt_without_native_root_is_not_reusable(tmp_path: Path) -> None:
@@ -90,7 +76,7 @@ def test_pending_receipt_without_native_root_is_not_reusable(tmp_path: Path) -> 
     root.unlink()
     assert store.derived_lookup(receipt.weights_transaction_id)["state"] == "committed"
     with pytest.raises(CapabilityError) as error:
-        host.open(request)
+        host.client.open_output("result", request)
     assert error.value.code == "weights_receipt_unavailable"
 
 

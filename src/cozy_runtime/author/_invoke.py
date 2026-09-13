@@ -84,12 +84,6 @@ from cozy_runtime.author._services import (
 )
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
-from cozy_runtime.author._weights import (
-    WeightsCommit,
-    WeightsHostTransaction,
-    WeightsSink,
-    WeightsSource,
-)
 
 if TYPE_CHECKING:
     from tensorfs.derived import Derivation, DerivedTransaction, SourceCapability
@@ -136,12 +130,7 @@ class Invocation:
     see `Checkpoints` (#553a)."""
     budget: BudgetFacts | None = None
     """Cost-governor facts from the typed config channel. Never read from environment."""
-    weights: Callable[[WeightsCommit], WeightsHostTransaction] | None = None
-    """The Runtime/host weights transaction. Author code receives only WeightsSink."""
     weights_reader: Callable[[str], ModelViewHost] | None = None
-    weights_source_config: Callable[[str, str], bytes] | None = None
-    weights_source_structure: Callable[[str], WeightsSource] | None = None
-    """Bounded structure reader for exact Manifest inputs already granted to this attempt."""
     tensorfs_source: Callable[[str], SourceCapability] | None = None
     tensorfs_output: Callable[[str, Derivation], DerivedTransaction] | None = None
     tensorfs_adopt: Callable[[Mapping[str, Any]], ModelArtifact] | None = None
@@ -891,16 +880,6 @@ def _service(
             return Budget(attempt, inv.budget)
         case "weights_read":
             return WeightsReader(attempt, inv.models, inv.weights_reader, inv.cancel)
-        case "weights":
-            return WeightsSink(
-                attempt=attempt,
-                models=inv.models,
-                outputs={output.name: output.max_new_bytes for output in surface.weights_outputs},
-                open_transaction=inv.weights,
-                source_structure=inv.weights_source_structure,
-                source_config=inv.weights_source_config,
-                cancel=inv.cancel,
-            )
     raise ConformanceError(f"no injector for capability {param.capability!r}")
 
 

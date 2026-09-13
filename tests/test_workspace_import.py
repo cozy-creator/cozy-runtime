@@ -14,14 +14,13 @@ from typing import Any
 import pytest
 import tensorfs
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author import WeightsPart, WeightsReceipt, WeightsTarget, WeightsTensor
-from cozy_runtime.author._weights import WeightsCommit
+from cozy_runtime.author import WeightsReceipt
 from cozy_runtime.internal.weights_sink import (
-    WeightsHostBinding,
-    WeightsTransactionHost,
     protocol_receipt,
+    receipt_from_native,
     weights_transaction_id,
 )
 from cozy_runtime.internal.worker.downloads import verify_claim_proof
@@ -650,7 +649,7 @@ def test_native_commit_before_old_receipt_is_replayed_without_new_writer(tmp_pat
     )
     assigned = {}
 
-    def bind(slot: str, transaction: str, digest: bytes, declaration: bytes) -> WeightsHostBinding:
+    def bind(slot: str, transaction: str, digest: bytes, declaration: bytes) -> int:
         row = workspace.begin_weights(
             "owner",
             pb.WeightsIntentFrame(
@@ -664,7 +663,7 @@ def test_native_commit_before_old_receipt_is_replayed_without_new_writer(tmp_pat
             ),
         )
         assigned.update(row)
-        return WeightsHostBinding(transaction, int(row["epoch"]))
+        return int(row["epoch"])
 
     def record(receipt: WeightsReceipt) -> None:
         reference, _, _ = protocol_receipt(
@@ -692,40 +691,27 @@ def test_native_commit_before_old_receipt_is_replayed_without_new_writer(tmp_pat
         )
 
     plain = next(value for alias, value in tensorfs.seed_digests() if alias == "plain/1")
-    producer = WeightsTransactionHost(
-        store=store,
-        owner_scope="owner",
-        request_id="producer",
-        invocation_spec_digest=documents.spell(spec),
-        work_fingerprint="sha256:" + "42" * 32,
-        writer_session_id=2,
-        allowed_sources={},
-        output_bounds={"model": 2048},
-        bind_intent=bind,
-        record_receipt=record,
+    definition = Derivation(
+        {},
+        {
+            "model": Target(
+                add={"weight": Tensor("f32", (512,), plain, {"value": Part("f32", (512,))})}
+            )
+        },
+        {},
+        (("model", "weight"),),
     )
-    opened = producer.open(
-        WeightsCommit(
-            output_slot="model",
-            sources={},
-            configs={},
-            targets={
-                "model": WeightsTarget(
-                    add={
-                        "weight": WeightsTensor(
-                            logical_dtype="f32",
-                            shape=(512,),
-                            encoding=plain,
-                            parts={"value": WeightsPart(dtype="f32", shape=(512,))},
-                        )
-                    }
-                )
-            },
-            order=(("model", "weight"),),
-            max_new_bytes=2048,
+    args = definition.native_arguments(2048)
+    declaration = store.derived_declaration(*args, work_fingerprint="sha256:" + "42" * 32)
+    bind("model", weights["transaction_id"], hashlib.sha256(declaration).digest(), declaration)
+    # The imported native commit is replayed into the new journal without opening a writer.
+    facts = store.derived_lookup(weights["transaction_id"])["receipt"]
+    with store.acquire_cozytensors("sha256:" + facts["manifest"]["sha256"]):
+        record(
+            receipt_from_native(
+                "model", weights["transaction_id"], facts, replayed=True, request_id="producer"
+            )
         )
-    )
-    assert opened.replayed and opened.completed_parts == frozenset({("model", "weight", "value")})
     assert store.derived_lookup(weights["transaction_id"]) == before
     with workspace.locked() as db:
         row = db.execute("SELECT * FROM weights").fetchone()

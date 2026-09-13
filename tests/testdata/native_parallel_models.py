@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
 import math
 import os
@@ -21,9 +22,9 @@ from typing import Any, cast
 import numpy as np
 import tensorfs
 import torch
+from tensorfs.derived import Config as NativeConfig
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import WeightsConfig, WeightsPart, WeightsTarget, WeightsTensor
-from cozy_runtime.author._weights import WeightsCommit
 from cozy_runtime.derive.microscale import encode_fp8_rowwise
 from cozy_runtime.internal import accel, canonical, package_interface, spawn
 from cozy_runtime.internal.discovery import discover
@@ -33,7 +34,7 @@ from cozy_runtime.internal.executor import main as executor_main
 from cozy_runtime.internal.local import development_source_digest, stage_development_placement
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
-from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+from cozy_runtime.internal.weights_sink import weights_transaction_id
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import PlanChooser, PreparedModel, PreparedRequest
 from cozy_runtime.internal.worker.session import executor_prepare_command
@@ -179,39 +180,30 @@ def native_model(
         with torch.no_grad():
             components["dit"].get_parameter("proj_out.weight").copy_(data.float() * scale[:, None])
     max_bytes = sum(t.numel() * t.element_size() for t in rows.values()) + 1_000_000
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="native-cp-test",
-        request_id=name,
-        invocation_spec_digest="sha256:" + "1" * 64,
-        work_fingerprint="sha256:" + "2" * 64,
-        writer_session_id=1,
-        allowed_sources={},
-        output_bounds={"model": max_bytes},
-    )
     raw_config = canonical.write(config)
-    transaction = host.open(
-        WeightsCommit(
-            output_slot="model",
+    transaction = store.begin_derived(
+        weights_transaction_id("native-cp-test", name, "sha256:" + "1" * 64, "model"),
+        1,
+        *Derivation(
             sources={},
             targets={
-                component: WeightsTarget(
+                component: Target(
                     add={
-                        key: WeightsTensor(
+                        key: Tensor(
                             "f32",
                             tuple(value.shape),
                             SPEC_ROWWISE,
                             {
-                                "data": WeightsPart("f8_e4m3fn", tuple(value.shape)),
-                                "scale": WeightsPart("f32", (value.shape[0],)),
+                                "data": Part("f8_e4m3fn", tuple(value.shape)),
+                                "scale": Part("f32", (value.shape[0],)),
                             },
                         )
                         if (owner, key) in encoded_parts
-                        else WeightsTensor(
+                        else Tensor(
                             "f32",
                             tuple(value.shape),
                             SPEC_PLAIN,
-                            {"value": WeightsPart("f32", tuple(value.shape))},
+                            {"value": Part("f32", tuple(value.shape))},
                         )
                         for (owner, key), value in rows.items()
                         if owner == component
@@ -219,20 +211,20 @@ def native_model(
                 )
                 for component in components
             },
-            configs={"model": WeightsConfig(data=raw_config)},
+            configs={"model": NativeConfig("add")},
             order=tuple(rows),
-            max_new_bytes=max_bytes,
-        )
+        ).native_arguments(max_bytes),
+        work_fingerprint="sha256:" + "2" * 64,
     )
     for (component, key), value in rows.items():
         if (component, key) in encoded_parts:
             packed = encoded_parts[component, key]
-            transaction.add_part(component, key, "data", packed.payload)
-            transaction.add_part(component, key, "scale", packed.companions[0].raw)
+            transaction.add_part(component, key, "data", io.BytesIO(packed.payload))
+            transaction.add_part(component, key, "scale", io.BytesIO(packed.companions[0].raw))
         else:
-            transaction.add_part(component, key, "value", value.numpy().tobytes())
-    transaction.add_config("model", raw_config, len(raw_config))
-    receipt = json.loads(transaction.commit().tensorfs_receipt)
+            transaction.add_part(component, key, "value", io.BytesIO(value.numpy().tobytes()))
+    transaction.add_config("model", io.BytesIO(raw_config))
+    receipt = transaction.commit()
     manifest = "sha256:" + receipt["manifest"]["sha256"]
     length = int(receipt["manifest"]["length"])
     operation = store.begin_operation("publish-" + name, "test", name)

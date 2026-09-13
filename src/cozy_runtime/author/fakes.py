@@ -50,7 +50,6 @@ from cozy_runtime.author._services import (
     Outputs,
     Telemetry,
 )
-from cozy_runtime.author._weights import WeightsCommit, WeightsHostTransaction, WeightsSource
 
 
 def _spool(name: str) -> Path:
@@ -241,8 +240,6 @@ def invoke_with_fakes(
     seconds: float = 300.0,
     cancelled: bool = False,
     egress_broker: Callable[..., Any] | None = None,
-    weights: Callable[[WeightsCommit], WeightsHostTransaction] | None = None,
-    weights_source_structure: Callable[[str], WeightsSource] | None = None,
     assets: Mapping[str, GrantedInput] | None = None,
     max_output_bytes: int = MAX_OUTPUT_BYTES,
 ) -> InvocationResult:
@@ -270,8 +267,6 @@ def invoke_with_fakes(
             secrets=secrets,
             adapters=adapters,
             egress_broker=egress_broker,
-            weights=weights,
-            weights_source_structure=weights_source_structure,
             assets=assets or {},
             max_output_bytes=max_output_bytes,
         ),
