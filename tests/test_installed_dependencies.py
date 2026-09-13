@@ -186,14 +186,14 @@ def test_failed_final_observation_publishes_no_receipt(tmp_path: Path) -> None:
         (package_environment.BlobGrant(wheel.digest, wheel.length, path, verified),),
     )
     install_root = tmp_path / "environments"
-    # This thin source deliberately lacks Runtime. Reject its incomplete dependency
-    # graph before spending I/O on any installed bytes or publishing a receipt.
-    with pytest.raises(package_environment.EnvironmentRefusal, match="dependency_missing"):
+    # This thin source deliberately lacks Runtime. The actual final observation must fail
+    # before a receipt could admit it, even though its recorded dependency copied correctly.
+    with pytest.raises(package_environment.EnvironmentRefusal, match="base_invalid"):
         package_environment.materialize(
             material, install_root, base=base, dependency_python=source / "bin/python"
         )
-    assert not (install_root / "receipts").exists()
-    assert not (install_root / "contents").exists()
+    assert not list((install_root / "receipts").iterdir())
+    assert not list((install_root / "contents").iterdir())
     assert not list(install_root.glob(".environment-staging-*"))
     assert not (source / "bin/executed").exists()
 
