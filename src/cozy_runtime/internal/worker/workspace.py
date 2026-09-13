@@ -33,6 +33,10 @@ class WorkspaceRefusal(ValueError):
     """A stable workspace identity or custody invariant refused the operation."""
 
 
+class WorkspaceInactive(WorkspaceRefusal):
+    """The journal is fenced while existing Host custody transfers to Runtime."""
+
+
 class WorkspaceBusy(WorkspaceRefusal):
     """A foreground custody transition takes precedence over optional collection."""
 
@@ -215,7 +219,7 @@ class Workspace:
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
                 != "active"
             ):
-                raise WorkspaceRefusal("workspace authority transfer is not active")
+                raise WorkspaceInactive("workspace authority transfer is not active")
             yield db
         finally:
             if db is not None:

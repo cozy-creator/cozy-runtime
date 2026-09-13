@@ -2155,6 +2155,15 @@ class Worker:
             return state
 
     def drive_executions(self) -> None:
+        """A custody handoff fences dispatch without killing the lifecycle watchdog."""
+        from .workspace import WorkspaceInactive
+
+        try:
+            self._drive_executions()
+        except WorkspaceInactive:
+            return
+
+    def _drive_executions(self) -> None:
         """Admit retained roots through the existing lanes, independently of observers."""
         if self.executions is None or not self.fence.record_owner_recorded:
             return

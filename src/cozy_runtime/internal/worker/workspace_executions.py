@@ -397,6 +397,13 @@ class Executions:
                 worker_boot,
             )
 
+    def retry_policy(self, owner: str, request: str) -> tuple[int, int]:
+        """Local descendants inherit the root's accepted automatic retry limits."""
+        root = self.capture_root(owner, request)
+        with self.workspace.locked() as db:
+            row = self._row(db, owner, root)
+            return row["max_attempts"], row["retry_delay_ms"]
+
     def capture(self, owner: str, request: str) -> dict[str, Any]:
         root = self.capture_root(owner, request)
         with self.workspace.locked() as db:
@@ -582,13 +589,21 @@ class Executions:
 
     def _retryable(self, row: Row, body: dict[str, Any]) -> bool:
         cause = body.get("cause", {})
+        executor_loss = (
+            body.get("status") == pb.OUTCOME_STATUS_ABANDONED
+            and cause.get("code") == pb.CAUSE_CODE_EXECUTOR_INVALIDATED
+            and cause.get("origin") == pb.CAUSE_ORIGIN_EXECUTOR
+        )
         if (
             row["desired"] != "run"
             or row["ordinal"] >= row["max_attempts"]
             or body.get("status") not in (pb.OUTCOME_STATUS_FAILED, pb.OUTCOME_STATUS_ABANDONED)
             or cause.get("code")
             not in (pb.CAUSE_CODE_EXECUTOR_FAULT, pb.CAUSE_CODE_EXECUTOR_INVALIDATED)
-            or cause.get("origin") not in (pb.CAUSE_ORIGIN_WORKER, pb.CAUSE_ORIGIN_RUNTIME)
+            or (
+                not executor_loss
+                and cause.get("origin") not in (pb.CAUSE_ORIGIN_WORKER, pb.CAUSE_ORIGIN_RUNTIME)
+            )
         ):
             return False
         spec = documents.read(
@@ -874,7 +889,12 @@ class Executions:
 
     def retention_required(self, owner: str) -> bool:
         Workspace.owner(owner)
-        with self.workspace.locked() as db:
+        with self.workspace.locked(allow_frozen=True) as db:
+            if (
+                db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
+                != "active"
+            ):
+                return True
             return (
                 db.execute(
                     "SELECT 1 FROM executions WHERE owner=? AND "

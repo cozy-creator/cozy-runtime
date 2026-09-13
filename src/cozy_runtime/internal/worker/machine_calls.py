@@ -254,6 +254,7 @@ class Calls:
                     }
                 )
                 capture = canonical_json.encode(executions.capture(owner, parent.request_id))
+                max_attempts, retry_delay_ms = executions.retry_policy(owner, parent.request_id)
                 executions.submit(
                     owner,
                     call.child_request,
@@ -264,6 +265,8 @@ class Calls:
                     memoize=memoized,
                     preparation=preparation,
                     worker_id=self.worker.options.worker_id,
+                    max_attempts=max_attempts,
+                    retry_delay_ms=retry_delay_ms,
                 )
             except Exception as exc:
                 # Admission refusal has no accepted child attempt to duplicate. Keep its
