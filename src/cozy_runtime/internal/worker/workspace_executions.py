@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import re
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ class Receipt:
     accepted_at_ms: int
     worker_id: str
     worker_boot_id: str
+    publication_authorization_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -182,6 +184,7 @@ class Executions:
             row["accepted_ms"],
             row["worker_id"],
             row["accepted_boot"],
+            row["publication_authorization_id"],
         )
 
     def _event(self, db: Journal, row: Row, kind: str, body: bytes) -> None:
@@ -232,10 +235,19 @@ class Executions:
         capture_document: bytes = b"",
         preparation: bytes = b"",
         worker_id: str = "",
+        publication_authorization_id: str = "",
     ) -> Receipt:
         """Atomically accept a verified capture/root and its first existing attempt."""
         Workspace.owner(owner)
         _id(submission_id)
+        if publication_authorization_id:
+            try:
+                identity = uuid.UUID(publication_authorization_id)
+                valid = identity.int != 0 and str(identity) == publication_authorization_id
+            except ValueError:
+                valid = False
+            if not valid:
+                raise WorkspaceRefusal("publication authorization must be a canonical nonzero UUID")
         if not 1 <= max_attempts <= 100 or not 0 <= retry_delay_ms <= 86_400_000:
             raise WorkspaceRefusal("execution retry policy exceeds its bound")
         self.workspace.validate_offer(offer)
@@ -259,6 +271,7 @@ class Executions:
                     row["retry_delay_ms"],
                     row["capture_document"],
                     row["preparation"],
+                    row["publication_authorization_id"],
                 ) != (
                     submission_id,
                     offer.request_id,
@@ -268,6 +281,7 @@ class Executions:
                     retry_delay_ms,
                     capture_document,
                     preparation,
+                    publication_authorization_id,
                 ):
                     raise WorkspaceRefusal("execution submission identity changed")
                 return self._receipt(row)
@@ -286,8 +300,9 @@ class Executions:
             db.execute(
                 "INSERT INTO executions(owner,request,submission,capture,offer,accepted_ms,"
                 "ordinal,generation,state,max_attempts,retry_delay_ms,"
-                "capture_document,preparation,worker_id,accepted_boot) "
-                "VALUES(?,?,?,?,?,?,1,1,'queued',?,?,?,?,?,?)",
+                "capture_document,preparation,worker_id,accepted_boot,"
+                "publication_authorization_id) "
+                "VALUES(?,?,?,?,?,?,1,1,'queued',?,?,?,?,?,?,?)",
                 (
                     owner,
                     offer.request_id,
@@ -301,11 +316,32 @@ class Executions:
                     preparation,
                     worker_id,
                     worker_boot,
+                    publication_authorization_id,
                 ),
             )
             row = self._row(db, owner, offer.request_id)
             self._event(db, row, "accepted", canonical_json.encode({"generation": 1}))
             return self._receipt(row)
+
+    def publication_authorization(self, owner: str, request: str) -> str:
+        with self.workspace.locked() as db:
+            seen: set[str] = set()
+            claimed: set[str] = set()
+            while request not in seen and len(seen) <= 32:
+                seen.add(request)
+                grant = str(self._row(db, owner, request)["publication_authorization_id"])
+                if grant:
+                    claimed.add(grant)
+                parent = db.execute(
+                    "SELECT parent_request FROM execution_calls WHERE owner=? AND child_request=?",
+                    (owner, request),
+                ).fetchone()
+                if parent is None:
+                    if claimed and claimed != {grant}:
+                        raise WorkspaceRefusal("child publication authority differs from its root")
+                    return grant
+                request = parent[0]
+        raise WorkspaceRefusal("publication authority has no bounded root ancestry")
 
     def owns(self, owner: str, request: str) -> bool:
         with self.workspace.locked() as db:

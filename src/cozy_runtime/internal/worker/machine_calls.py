@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
-from cozy_runtime.internal import source_interfaces
+from cozy_runtime.internal import effect_interfaces, source_interfaces
 from cozy_runtime.internal.worker import machine_child_target, workspace_memo
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
@@ -159,6 +159,10 @@ class Calls:
             try:
                 if request.module == source_interfaces.MODULE:
                     self.worker.machine_sources.drive(owner, call, request)
+                    continue
+                if request.module == effect_interfaces.MODULE:
+                    assert self.worker.machine_effects is not None
+                    self.worker.machine_effects.schedule(owner, call)
                     continue
                 if request.HasField("capture"):
                     raise WorkspaceRefusal("activation capture requires a serving child")

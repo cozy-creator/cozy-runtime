@@ -596,7 +596,7 @@ class MachineCallableBinding(_message.Message):
     def __init__(self, caller_revision_digest: _Optional[bytes] = ..., interface_digest: _Optional[bytes] = ..., module: _Optional[str] = ..., export: _Optional[str] = ..., callee_revision_digest: _Optional[bytes] = ..., entrypoint: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionSubmit(_message.Message):
-    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "max_attempts", "retry_delay_ms", "prepared_state", "payload_canonical_bytes")
+    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "max_attempts", "retry_delay_ms", "prepared_state", "payload_canonical_bytes", "publication_authorization_id")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -606,6 +606,7 @@ class MachineExecutionSubmit(_message.Message):
     RETRY_DELAY_MS_FIELD_NUMBER: _ClassVar[int]
     PREPARED_STATE_FIELD_NUMBER: _ClassVar[int]
     PAYLOAD_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PUBLICATION_AUTHORIZATION_ID_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     submission_id: str
     capture_digest: bytes
@@ -615,10 +616,11 @@ class MachineExecutionSubmit(_message.Message):
     retry_delay_ms: int
     prepared_state: DesiredWorkerState
     payload_canonical_bytes: bytes
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+    publication_authorization_id: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionReceipt(_message.Message):
-    __slots__ = ("request_id", "submission_id", "capture_digest", "invocation_spec_digest", "accepted_at_ms", "worker_id", "worker_boot_id", "execution_workspace_id")
+    __slots__ = ("request_id", "submission_id", "capture_digest", "invocation_spec_digest", "accepted_at_ms", "worker_id", "worker_boot_id", "execution_workspace_id", "publication_authorization_id")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -627,6 +629,7 @@ class MachineExecutionReceipt(_message.Message):
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    PUBLICATION_AUTHORIZATION_ID_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     submission_id: str
     capture_digest: bytes
@@ -635,7 +638,8 @@ class MachineExecutionReceipt(_message.Message):
     worker_id: str
     worker_boot_id: str
     execution_workspace_id: str
-    def __init__(self, request_id: _Optional[str] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., invocation_spec_digest: _Optional[bytes] = ..., accepted_at_ms: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ...) -> None: ...
+    publication_authorization_id: str
+    def __init__(self, request_id: _Optional[str] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., invocation_spec_digest: _Optional[bytes] = ..., accepted_at_ms: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., publication_authorization_id: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionQuery(_message.Message):
     __slots__ = ("claim", "request_id", "expected_execution_workspace_id")
