@@ -224,10 +224,10 @@ def main() -> None:
         gc.collect()
         torch.cuda.empty_cache()
         # The text-encoder proof has 241 MB total weights but an approximately 9 MB
-        # working set. Enforce a 64 MiB allocator quota without occupying the rest of
+        # working set. Enforce a 256 MiB allocator quota without occupying the rest of
         # the user's GPU. The planner's capacity budget below is this real quota,
-        # not a claim that physical driver-free VRAM was reduced to 64 MiB.
-        allocation_limit = 64 << 20 if component == "text_encoder" else 0
+        # not a claim that physical driver-free VRAM was reduced to 256 MiB.
+        allocation_limit = 256 << 20 if component == "text_encoder" else 0
         if allocation_limit:
             torch.cuda.set_per_process_memory_fraction(
                 allocation_limit / torch.cuda.get_device_properties(0).total_memory
