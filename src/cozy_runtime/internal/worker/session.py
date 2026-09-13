@@ -2257,7 +2257,12 @@ class Worker:
         if same:
             return True
         if any(
-            attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD
+            (attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD)
+            and not (
+                desired.WhichOneof("mode") == "job"
+                and not desired.job.orchestration
+                and attempt.lane_id.startswith("cpu-")
+            )
             for attempt in self.engine.history.values()
         ):
             # on_offer journals the queue before a lane begins accepting it. That queue
@@ -5966,8 +5971,13 @@ class Worker:
                 descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
                 # Execution attaches attempt.job later. The prepared engine binding
                 # is available on both local and placement-hosted paths at offer time.
-                binding = self.engine.jobs.get(descriptor)
-                if binding is None:
+                from . import machine_slots
+
+                selected = self.job_slots.get(machine_slots.key(attempt.request_id))
+                binding = (
+                    selected.binding if selected is not None else self.engine.jobs.get(descriptor)
+                )
+                if binding is None or binding.build_id != attempt.spec["job"]["build_id"]:
                     self.refuse(
                         offered,
                         "job_binding_unavailable",

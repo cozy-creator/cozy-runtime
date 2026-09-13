@@ -51,8 +51,81 @@ async def nested(ctx: Context, payload: Request) -> Result:
 """
 
 
+MODEL_SOURCE = """import struct
+import tensorfs
+from tensorfs.derived import Config, Derivation, Part, Target, Tensor
+from cozy_runtime.author import App, Context, Model, ModelArtifact, WeightsOutput, invocable
+
+def assert_no_store():
+    import os
+    from pathlib import Path
+    assert not any(
+        "tensorfs.sqlite" in os.readlink(fd)
+        for fd in Path("/proc/self/fd").iterdir() if fd.exists()
+    )
+
+
+app = App()
+PLAIN = dict(tensorfs.seed_digests())["plain/1"]
+
+class Source(Model[object], encoded_leaves="accept"):
+    def load(self, loader):
+        del loader
+
+@invocable(memoize=True)
+async def leaf(ctx: Context, *, n: int) -> ModelArtifact:
+    assert_no_store()
+    definition = Derivation(
+        sources={},
+        targets={"body": Target(add={
+            "layer.weight": Tensor("f16", (16,32), PLAIN, {"value": Part("f16", (16,32))}),
+            "layer.bias": Tensor("f16", (16,), PLAIN, {"value": Part("f16", (16,))}),
+        })},
+        configs={"pipeline": Config("add")},
+        order=(("body", "layer.weight"), ("body", "layer.bias")),
+    )
+    with tensorfs.derive(ctx.output("model"), definition) as output:
+        if output.receipt is None:
+            output.add_part(
+                "body", "layer.weight", "value", struct.pack("<512e", *(i/257-1 for i in range(512)))
+            )
+            output.add_part("body", "layer.bias", "value", struct.pack("<16e", *range(16)))
+            output.add_config("pipeline", b"{}")
+        receipt = output.receipt or output.commit()
+    return ctx.adopt_model(receipt)
+
+app.job(leaf, weights=(WeightsOutput("model", max_new_bytes=65536),))
+import msgspec
+class Request(msgspec.Struct):
+    pass
+class Result(msgspec.Struct):
+    value: int
+
+@invocable
+async def consume(ctx: Context, *, model: Source) -> Result:
+    assert_no_store()
+    source = ctx.tensorfs_source(model)
+    view = source.inspect()
+    assert_no_store()
+    return Result(len(view.components["body"]))
+app.job(consume)
+
+@invocable
+async def compose(ctx: Context, *, n: int) -> Result:
+    first = await leaf(n=n)
+    second = await leaf(n=n)
+    assert first.manifest == second.manifest
+    return await consume(model=first)
+app.job(compose)
+
+@app.job
+async def nested(ctx: Context, payload: Request) -> Result:
+    return await compose(n=3)
+"""
+
+
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-@pytest.mark.parametrize("case", ["normal", "pause", "cycle", "capacity"])
+@pytest.mark.parametrize("case", ["normal", "pause", "cycle", "capacity", "model"])
 def test_nested_capture_and_leaf_memoization_without_control_stream(
     monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
@@ -61,7 +134,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
 
     with tempfile.TemporaryDirectory(prefix="cz-child.") as directory:
         root = Path(directory)
-        source = SOURCE
+        source = MODEL_SOURCE if case == "model" else SOURCE
         if case == "pause":
             source = source.replace(
                 "    return Result(n * 2)",
@@ -143,7 +216,11 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                             export=export,
                             entrypoint=export,
                         )
-                        for export in ("compose", "leaf")
+                        for export in (
+                            ("compose", "consume", "leaf")
+                            if case == "model"
+                            else ("compose", "leaf")
+                        )
                     ],
                 )
             )
@@ -241,13 +318,17 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             import base64
 
             assert canonical_json.decode(base64.b64decode(body["result"]["inline_result"])) == {
-                "value": 12
+                "value": 2 if case == "model" else 12
             }
             assert not worker.connected.is_set()
             assert worker.workspace is not None
             with worker.workspace.locked() as db:
-                assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 3
-                assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == 3
+                assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == (
+                    4 if case == "model" else 3
+                )
+                assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == (
+                    4 if case == "model" else 3
+                )
                 assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 1
         finally:
             worker.request_stop()

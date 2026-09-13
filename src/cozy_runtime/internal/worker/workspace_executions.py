@@ -361,6 +361,13 @@ class Executions:
                 worker_boot,
             )
 
+    def retry_policy(self, owner: str, request: str) -> tuple[int, int]:
+        """Local descendants inherit the root's accepted automatic retry limits."""
+        root = self.capture_root(owner, request)
+        with self.workspace.locked() as db:
+            row = self._row(db, owner, root)
+            return row["max_attempts"], row["retry_delay_ms"]
+
     def capture(self, owner: str, request: str) -> dict[str, Any]:
         root = self.capture_root(owner, request)
         with self.workspace.locked() as db:
@@ -386,7 +393,7 @@ class Executions:
 
     def abandon(self, owner: str, request: str) -> bool:
         """Relinquish this stopped root through existing native release operations."""
-        from . import workspace_finalize
+        from . import machine_models, workspace_finalize
         from .workspace_calls import Calls
 
         with self.workspace.locked() as db:
@@ -407,6 +414,7 @@ class Executions:
                 "SELECT * FROM weights WHERE owner=? AND request=? AND state<>'released'",
                 (owner, request),
             ).fetchall()
+        machine_models.release(self.workspace, owner, request)
         for weight in weights:
             if weight["native_digest"]:
                 self.workspace.release_result(
@@ -772,16 +780,27 @@ class Executions:
             outcome = self.workspace._outcome_frame(row)
             verify = not execution["collected"] and not execution["retention_waived"]
         if verify:
-            self._verify_outputs(outcome)
+            self._verify_outputs(owner, outcome, row["result_schema"])
         return outcome
 
-    def _verify_outputs(self, outcome: pb.AttemptOutcome) -> None:
+    def _verify_outputs(self, owner: str, outcome: pb.AttemptOutcome, schema: bytes) -> None:
         """A journal alone cannot prove an uncollected native result remains present."""
         from cozy_runtime.internal import fill
 
         body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
         if body["status"] != pb.OUTCOME_STATUS_SUCCEEDED:
             return
+        if schema and (raw := body.get("result", {}).get("inline_result")):
+            from . import machine_models
+
+            machine_models.retain_result(
+                self.workspace,
+                owner,
+                outcome.request_id,
+                "result",
+                canonical_json.decode(base64.b64decode(raw, validate=True)),
+                canonical_json.decode(schema),
+            )
         manifests = set()
         for reference in body.get("weights_receipts", []):
             receipt = documents.read(
@@ -833,8 +852,15 @@ class Executions:
                 self._event(
                     db, row, "collected", canonical_json.encode({"outcome_id": ack.outcome_id})
                 )
-            # Collection is not native deletion. Explicit existing release APIs govern custody.
-            return self._state(self._row(db, owner, ack.request_id))
+            state = self._state(self._row(db, owner, ack.request_id))
+        if ack.attempt_ordinal == state.attempt_ordinal and state.state in (
+            "succeeded",
+            "canceled",
+        ):
+            from . import machine_models
+
+            machine_models.release(self.workspace, owner, ack.request_id)
+        return state
 
     def retention_required(self, owner: str) -> bool:
         Workspace.owner(owner)
