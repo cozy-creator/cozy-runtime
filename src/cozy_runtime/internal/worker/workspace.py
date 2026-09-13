@@ -38,6 +38,7 @@ class WorkspaceBusy(WorkspaceRefusal):
 
 
 _authority: ContextVar[Callable[[], None]] = ContextVar("workspace_authority", default=lambda: None)
+Row = sqlite3.Row
 
 
 class Journal(sqlite3.Connection):
@@ -202,7 +203,7 @@ class Workspace:
 
                 migrate6(db)
             if version <= 6:
-                from .machine_execution import SCHEMA7
+                from .workspace_executions import SCHEMA7
 
                 db.executescript("BEGIN IMMEDIATE;" + SCHEMA7 + "PRAGMA user_version=7; COMMIT;")
             if (
@@ -597,10 +598,15 @@ class Workspace:
             ):
                 raise WorkspaceRefusal("outcome acknowledgment changed or revoked its subject")
             execution = db.execute(
-                "SELECT collected FROM executions WHERE owner=? AND request=?",
+                "SELECT collected,desired FROM executions WHERE owner=? AND request=?",
                 (row["owner"], ack.request_id),
             ).fetchone()
-            if execution is not None and not execution["collected"] and not ack.retain_work:
+            if (
+                execution is not None
+                and not execution["collected"]
+                and execution["desired"] != "cancel"
+                and not ack.retain_work
+            ):
                 raise WorkspaceRefusal("uncollected execution outcome must remain retained")
             db.execute(
                 "UPDATE attempts SET state=?,retain=? WHERE owner=? AND request=? AND ordinal=?",

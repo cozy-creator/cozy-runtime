@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,12 +16,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+import grpc
 import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal.worker.machine_execution import Executions
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
@@ -213,7 +215,7 @@ def test_progress_compaction_reports_gaps_but_preserves_logs_and_days_of_retenti
 CHILD = """
 import base64,sys
 from pathlib import Path
-from cozy_runtime.internal.worker.machine_execution import Executions
+from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import worker_pb2 as pb
 e=Executions(Workspace(Path(sys.argv[1])))
@@ -261,7 +263,10 @@ def test_actual_process_death_recovers_without_duplicate_execution(tmp_path: Pat
         child.communicate(timeout=10)
 
 
-def test_native_result_has_separate_collection_and_consumer_custody(tmp_path: Path) -> None:
+@pytest.mark.parametrize("abandon", [False, True])
+def test_native_result_has_separate_collection_and_consumer_custody(
+    tmp_path: Path, abandon: bool
+) -> None:
     from cozy_runtime.internal import canonical
     from cozy_runtime.internal.weights_sink import protocol_receipt
     from test_workspace_custody import produced, retention
@@ -311,17 +316,32 @@ def test_native_result_has_separate_collection_and_consumer_custody(tmp_path: Pa
     )
     workspace.outcome("owner", terminal)
     assert e.collect("owner", "producer") == terminal
+    replacement = Workspace(tmp_path / "replacement-store")
+    shutil.copyfile(
+        workspace.directory / "journal.sqlite3", replacement.directory / "journal.sqlite3"
+    )
+    copied = Executions(replacement)
+    assert copied.workspace_id == e.workspace_id
+    with pytest.raises(Exception) as lost:
+        copied.collect("owner", "producer")
+    assert getattr(lost.value, "code", None) in {"ROOT_ABSENT", "OBJECT_ABSENT"}
     tensorfs.gc(str(store.root))
     assert store.manifest(documents.spell(independent.manifest.digest))["manifest"]
-    e.acknowledge_collection("owner", ack(terminal))
-    workspace.release_result(
-        "owner",
-        pb.DerivedResultReleaseRequest(
-            weights_transaction_id=receipt.weights_transaction_id,
-            tensorfs_receipt_digest=documents.raw(receipt.tensorfs_receipt_digest),
-        ),
-    )
-    workspace.acknowledge("owner", ack(terminal))
+    if abandon:
+        e.control("owner", "producer", "abandon", 1, "cancel")
+        assert e.abandon("owner", "producer")
+        assert not e.status("owner", "producer").collected
+        assert not e.retention_required("owner")
+    else:
+        e.acknowledge_collection("owner", ack(terminal))
+        workspace.release_result(
+            "owner",
+            pb.DerivedResultReleaseRequest(
+                weights_transaction_id=receipt.weights_transaction_id,
+                tensorfs_receipt_digest=documents.raw(receipt.tensorfs_receipt_digest),
+            ),
+        )
+        workspace.acknowledge("owner", ack(terminal))
     tensorfs.gc(str(store.root))
     assert store.manifest(documents.spell(independent.manifest.digest))["manifest"]
     assert Executions(Workspace(tmp_path / "store")).collect("owner", "producer") == terminal
@@ -340,7 +360,11 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
             credentials=Credentials(),
             bootstrap_credential="test-bootstrap",
         ),
-        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
+        WorkerOptions(
+            root=tmp_path / "worker",
+            tensorfs_root=tmp_path / "store",
+            activity_path=tmp_path / "activity",
+        ),
         InMemoryControlHost(),
     )
     frames: list[pb.WorkerFrame] = []
@@ -356,6 +380,7 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
         submitted = offer("refused", job=False)
         receipt = worker.submit_execution(claim, "refused", b"c" * 32, submitted)
         assert receipt.request_id == "refused"
+        assert json.loads((tmp_path / "activity").read_bytes())["execution_retention_required"]
         assert worker.execution_status(claim, "refused").state == "failed"
         refused = worker.collect_execution(claim, "refused")
         assert documents.read(refused.outcome_canonical_bytes, pb.AttemptOutcomeBody)[
@@ -401,6 +426,11 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
         assert worker.fence.record_owner_id == "owner"
         with pytest.raises(WorkspaceRefusal, match="authenticated owner"):
             worker.execution_status(foreign, "scalar")
+        worker.control_execution(claim, "refused", "abandon-refused", 1, "cancel")
+        assert not worker.execution_status(claim, "refused").collected
+        assert not worker.executions.retention_required("owner")
+        worker.publish_activity()
+        assert not json.loads((tmp_path / "activity").read_bytes())["execution_retention_required"]
     finally:
         worker.shutdown()
 
@@ -411,10 +441,14 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     with workspace.locked() as db:
         for table in ("execution_commands", "execution_events", "executions"):
             db.execute("DROP TABLE " + table)
+        db.execute("ALTER TABLE workspace_state DROP COLUMN execution_workspace_id")
         db.execute("PRAGMA user_version=6")
     workspace = Workspace(tmp_path / "store")
     assert workspace.contains("owner", "legacy", 1)
     e = Executions(workspace)
+    assert len(e.workspace_id) == 32
+    assert Executions(Workspace(tmp_path / "store")).workspace_id == e.workspace_id
+    assert Executions(Workspace(tmp_path / "other-store")).workspace_id != e.workspace_id
     e.submit("owner", "new", b"c" * 32, offer("new"))
     with workspace.locked() as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 7
@@ -485,11 +519,13 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
     from cozy_runtime.internal.worker.plan import JobBinding
     from cozy_runtime.internal.worker.session import Worker, WorkerOptions
     from cozy_runtime.protocol import WIRE_MINOR
+    from cozy_runtime.protocol import worker_pb2_grpc as rpc
     from test_job_preparation_isolation import measure, package
 
     with tempfile.TemporaryDirectory(prefix="cz-machine.") as raw:
         root = Path(raw)
         environment, preparation = package(root, "offline")
+        _, second_preparation = package(root, "different")
         (root / "artifacts").mkdir()
         worker = Worker(
             RuntimeConfig(
@@ -519,8 +555,35 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
         )
         thread = threading.Thread(target=worker.run, daemon=True)
         try:
-            measure(worker, preparation)
-            worker.prepare_local_package(preparation)
+            captures = {}
+            for current_preparation in (preparation, second_preparation):
+                measure(worker, current_preparation)
+                prepared = worker.prepare_local_package(current_preparation)
+                placement_body = documents.read(
+                    prepared.placement_set.placement_set_canonical_bytes, pb.PlacementSet
+                )["placements"][0]
+                revision = pb.LocalPackageRevision(
+                    package=current_preparation.package.package,
+                    release=current_preparation.package.release,
+                    source_digest=current_preparation.package.source_digest,
+                    package_interface=pb.Ref(
+                        digest=documents.raw(placement_body["package_interface"]["digest"]),
+                        length=placement_body["package_interface"]["length"],
+                    ),
+                    files=[
+                        pb.LocalPackageFileRef(
+                            filename=w.filename, digest=w.digest, length=w.length
+                        )
+                        for w in current_preparation.wheels
+                    ],
+                )
+                capture, capture_digest = documents.identity(
+                    pb.MachineExecutionCapture(
+                        root_revision_digest=current_preparation.package.local_revision_digest,
+                        revisions=[revision],
+                    )
+                )
+                captures[current_preparation.operation_id] = (capture, capture_digest)
             if worker.supervision.current is not None:
                 worker.supervision.retire_current(
                     worker.supervision.current, "begin worker lifecycle"
@@ -529,6 +592,9 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
                 json.loads(path.read_bytes()) for path in (root / "home/job-plans").glob("*/*.json")
             ]
             binding = JobBinding.read(next(row for row in plans if row.get("job") == "offline"))
+            second_binding = JobBinding.read(
+                next(row for row in plans if row.get("job") == "different")
+            )
             thread.start()
             until = time.monotonic() + 90
             while not (root / "control.addr").exists():
@@ -542,6 +608,8 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
             )
             # End a real stream immediately. Neither a SnapshotAck nor a sender survives it.
             worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda frame: None)
+            channel = grpc.insecure_channel((root / "control.addr").read_text().strip())
+            client = rpc.WorkerControlStub(channel)
             assert not worker.connected.is_set() and not worker.fence.dispatch_open
             request = LocalRequest(
                 entrypoint="offline",
@@ -559,28 +627,56 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
             while not worker.job_ready:
                 assert time.monotonic() < until, worker.latched
                 time.sleep(0.02)
-            for identifier in ("first", "second", "canceled"):
+            for identifier in ("first", "second", "canceled", "paused"):
+                selected = second_binding if identifier == "second" else binding
+                capture, capture_digest = captures[
+                    "different" if identifier == "second" else "offline"
+                ]
                 generator = LocalRecordOwner(
                     dataclasses.replace(
                         request,
                         request_id=identifier,
+                        entrypoint=selected.job,
+                        job_descriptor_id=selected.job_descriptor_id,
                         payload=request.payload if identifier == "first" else {},
                     ),
                     {},
                     root / ("grants-" + identifier),
-                    package_code_digest=binding.build_id,
+                    package_code_digest=selected.build_id,
                 )
                 generator.host.inbound.get_nowait()  # helper's Claim is not transmitted
                 generator._dispatch()
                 message = generator.host.inbound.get_nowait()
                 assert message is not None
-                worker.submit_execution(claim, identifier, b"c" * 32, message.attempt_offer)
+                submission = pb.MachineExecutionSubmit(
+                    claim=claim,
+                    submission_id=identifier,
+                    capture_digest=capture_digest,
+                    capture_canonical_bytes=capture,
+                    offer=message.attempt_offer,
+                    prepared_state=generator._desired_state(),
+                    payload_canonical_bytes=canonical_json.encode(generator.request.payload),
+                )
+                # Remove the old transport payload before intake: only the inline captured
+                # arguments are available when the queued executor eventually starts.
+                for path in generator.grant_dir.glob("*.json"):
+                    path.unlink()
+                receipt = client.SubmitMachineExecution(submission, timeout=30)
+                assert client.SubmitMachineExecution(submission, timeout=30) == receipt
+            query = pb.MachineExecutionQuery(
+                claim=claim,
+                request_id="second",
+                expected_execution_workspace_id=receipt.execution_workspace_id,
+            )
+            assert client.GetMachineExecution(query, timeout=5).state == "queued"
             while not (root / "entered").exists():
                 assert time.monotonic() < until
                 time.sleep(0.02)
             assert worker.execution_status(claim, "second").state == "queued"
             worker.control_execution(claim, "canceled", "cancel", 1, "cancel")
             assert worker.execution_status(claim, "canceled").state == "canceled"
+            worker.control_execution(claim, "paused", "pause", 1, "pause")
+            assert worker.execution_status(claim, "paused").state == "paused"
             (root / "gate").touch()
             for identifier in ("first", "second"):
                 while worker.execution_status(claim, identifier).state not in (
@@ -592,10 +688,82 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
                 outcome = worker.collect_execution(claim, identifier)
                 body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
                 assert body["status"] == pb.OUTCOME_STATUS_SUCCEEDED, body
-                assert worker.engine.history[(identifier, 1)].state == "closed"
+                while worker.engine.history[(identifier, 1)].state != "closed":
+                    assert time.monotonic() < until
+                    time.sleep(0.02)
                 assert worker.execution_status(claim, identifier).state == "succeeded"
+                query.request_id = identifier
+                assert (
+                    client.CollectMachineExecution(
+                        pb.MachineExecutionCollect(execution=query), timeout=5
+                    )
+                    == outcome
+                )
+                assert (
+                    client.ListMachineExecutionEvents(
+                        pb.MachineExecutionEventsQuery(execution=query), timeout=5
+                    ).head_sequence
+                    > 0
+                )
+                assert client.AcknowledgeMachineExecutionCollection(
+                    pb.MachineExecutionCollectionAck(execution=query, outcome=ack(outcome)),
+                    timeout=5,
+                ).collected
             assert not worker.connected.is_set() and not worker.fence.dispatch_open
             assert thread.is_alive()  # completed results still await collection
+            query.expected_execution_workspace_id = "replaced-workspace"
+            with pytest.raises(grpc.RpcError) as mismatched:
+                client.GetMachineExecution(query, timeout=5)
+            assert mismatched.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+            channel.close()
+            # Replace the entire Worker and gRPC server. No client preparation is
+            # replayed, and the old wheel upload is no longer available.
+            config, options = worker.config, worker.options
+            old_boot = worker.fence.worker_boot_id
+            worker.request_stop()
+            worker.host.stop()
+            thread.join(30)
+            assert not thread.is_alive()
+            for path in (environment / ".stage").rglob("*.whl"):
+                path.unlink()
+            (root / "control.addr").unlink()
+            worker = Worker(config, options, GrpcControlHost("127.0.0.1:0", root / "control.addr"))
+            assert not worker.local_revisions and not worker.engine.jobs
+            thread = threading.Thread(target=worker.run, daemon=True)
+            thread.start()
+            while not (root / "control.addr").exists():
+                assert thread.is_alive() and time.monotonic() < until
+                time.sleep(0.02)
+            worker.serve_stream(iter([pb.RecordOwnerFrame(claim=claim)]), lambda frame: None)
+            channel = grpc.insecure_channel((root / "control.addr").read_text().strip())
+            client = rpc.WorkerControlStub(channel)
+            query.expected_execution_workspace_id = receipt.execution_workspace_id
+            query.request_id = "second"
+            assert (
+                client.CollectMachineExecution(
+                    pb.MachineExecutionCollect(execution=query), timeout=5
+                )
+                == outcome
+            )
+            assert client.GetMachineExecution(query, timeout=5).worker_boot_id != old_boot
+            query.request_id = "paused"
+            resumed = client.ControlMachineExecution(
+                pb.MachineExecutionControl(
+                    execution=query,
+                    command_id="resume-after-worker-replacement",
+                    expected_generation=2,
+                    action=pb.MACHINE_EXECUTION_ACTION_RESUME,
+                ),
+                timeout=30,
+            )
+            assert resumed.attempt_ordinal == 2
+            while client.GetMachineExecution(query, timeout=5).state not in ("succeeded", "failed"):
+                assert time.monotonic() < until
+                time.sleep(0.02)
+            assert client.GetMachineExecution(query, timeout=5).state == "succeeded"
+            assert worker.local_revisions and worker.engine.jobs
+            assert not worker.connected.is_set() and not worker.fence.dispatch_open
+            channel.close()
         finally:
             worker.request_stop()
             worker.host.stop()

@@ -70,13 +70,13 @@ from cozy_runtime.internal.worker import (
     downloads,
     grants,
     lane_wire,
-    machine_execution,
     model_source_prepare,
     observe,
     page_warm,
     store_gc,
     triage,
     weights,
+    workspace_executions,
 )
 from cozy_runtime.internal.worker.attempts import (
     CAUSE,
@@ -1183,7 +1183,9 @@ class Worker:
         self.workspace = (
             Workspace(options.tensorfs_root) if options.tensorfs_root is not None else None
         )
-        self.executions = machine_execution.Executions(self.workspace) if self.workspace else None
+        self.executions = (
+            workspace_executions.Executions(self.workspace) if self.workspace else None
+        )
         self._pressure_registration = None
         if self.workspace is not None:
             from cozy_runtime.internal import storage_admission
@@ -2027,7 +2029,7 @@ class Worker:
                 raise WorkspaceRefusal("workspace bootstrap proof was refused")
             return self.fence.record_owner_id
 
-    def _execution_service(self, claim: pb.Claim) -> tuple[machine_execution.Executions, str]:
+    def _execution_service(self, claim: pb.Claim) -> tuple[workspace_executions.Executions, str]:
         owner = self.authorize_workspace(claim)
         if self.executions is None:
             raise ValueError("worker has no execution workspace")
@@ -2042,7 +2044,9 @@ class Worker:
         *,
         max_attempts: int = 1,
         retry_delay_ms: int = 0,
-    ) -> machine_execution.Receipt:
+        capture_document: bytes = b"",
+        preparation: bytes = b"",
+    ) -> workspace_executions.Receipt:
         """Authenticated root intake; accepted execution never depends on the caller's stream."""
         with self.control_lock:
             executions, owner = self._execution_service(claim)
@@ -2052,7 +2056,17 @@ class Worker:
                 descriptor = spec["job"]["job_descriptor_id"]
                 binding = self.engine.jobs.get(descriptor)
                 if binding is None:
-                    raise ValueError("execution job is not prepared")
+                    from cozy_runtime.internal import job_plan
+
+                    binding = JobBinding.read(
+                        json.loads(
+                            job_plan.path(
+                                self.config.cozy_home / "job-plans",
+                                spec["job"]["build_id"],
+                                descriptor,
+                            ).read_bytes()
+                        )
+                    )
                 declaration = self.engine._job_declaration(binding, descriptor)
                 result_schema = canonical.write(declaration["result"])
                 memoize = declaration.get("invocable", {}).get("memoize", False) is True
@@ -2066,17 +2080,21 @@ class Worker:
                 memoize=memoize,
                 max_attempts=max_attempts,
                 retry_delay_ms=retry_delay_ms,
+                capture_document=capture_document,
+                preparation=preparation,
+                worker_id=self.options.worker_id,
             )
             self.drive_executions()
+            self.publish_activity(strict=True)
             return receipt
 
-    def execution_status(self, claim: pb.Claim, request_id: str) -> machine_execution.State:
+    def execution_status(self, claim: pb.Claim, request_id: str) -> workspace_executions.State:
         executions, owner = self._execution_service(claim)
         return executions.status(owner, request_id)
 
     def execution_events(
         self, claim: pb.Claim, request_id: str, after: int = 0, limit: int = 256
-    ) -> machine_execution.EventPage:
+    ) -> workspace_executions.EventPage:
         executions, owner = self._execution_service(claim)
         return executions.events(owner, request_id, after, limit)
 
@@ -2087,7 +2105,7 @@ class Worker:
         command_id: str,
         generation: int,
         action: Literal["pause", "resume", "cancel"],
-    ) -> machine_execution.State:
+    ) -> workspace_executions.State:
         if action not in ("pause", "resume", "cancel"):
             raise ValueError("unknown execution control")
         with self.control_lock:
@@ -2113,6 +2131,10 @@ class Worker:
             for request in self.executions.pending(owner):
                 state = self.executions.status(owner, request)
                 held = self.engine.history.get((request, state.attempt_ordinal))
+                if state.state in workspace_executions.TERMINAL:
+                    if held is None or held.state == "closed":
+                        self.executions.abandon(owner, request)
+                    continue
                 if state.state in ("pausing", "canceling"):
                     if held is None:
                         self.executions.stop_queued(owner, request)
@@ -2131,6 +2153,9 @@ class Worker:
                             )
                     continue
                 if state.state != "queued" or held is not None:
+                    continue
+                preparation = self.executions.preparation(owner, request)
+                if preparation and not self._prepare_execution(preparation):
                     continue
                 offered = self.executions.offer(owner, request)
                 spec = documents.read(offered.invocation_spec_canonical_bytes, pb.InvocationSpec)
@@ -2152,6 +2177,24 @@ class Worker:
                 offered.admission_epoch = self.admission_epoch
                 self.on_offer(offered, machine_owned=True)
 
+    def _prepare_execution(self, preparation: dict[str, Any]) -> bool:
+        """Reuse the existing preparation/convergence engine without replacing live work."""
+        from . import machine_capture
+
+        desired = pb.DesiredWorkerState.FromString(
+            base64.b64decode(preparation["state"], validate=True)
+        )
+        desired.revision = self.accepted.accepted_desired_state_revision
+        same = desired_state_body(desired) == self.accepted.desired_state_body
+        if same:
+            return True
+        if any(attempt.state in self.engine.HELD for attempt in self.engine.history.values()):
+            return False
+        desired = machine_capture.restore(self, preparation)
+        desired.revision = self.accepted.accepted_desired_state_revision + 1
+        self._apply_desired_state(desired)
+        return self.dispatchable()
+
     def collect_execution(
         self, claim: pb.Claim, request_id: str, ordinal: int | None = None
     ) -> pb.AttemptOutcome:
@@ -2160,7 +2203,7 @@ class Worker:
 
     def acknowledge_execution_collection(
         self, claim: pb.Claim, ack: pb.AttemptOutcomeAck
-    ) -> machine_execution.State:
+    ) -> workspace_executions.State:
         executions, owner = self._execution_service(claim)
         return executions.acknowledge_collection(owner, ack)
 
@@ -2323,10 +2366,17 @@ class Worker:
         )
         if managed and self.executions is not None:
             self.executions.observe(self.fence.record_owner_id, frame)
+        detached_execution = (
+            not self.connected.is_set()
+            and self.executions is not None
+            and bool(getattr(inner, "request_id", ""))
+            and self.executions.owns(self.fence.record_owner_id, inner.request_id)
+        )
         with self.claim_lock:
             if frame.WhichOneof("msg") != "weights_transaction":
                 self.stamp(inner)
-            self.outbound.put(frame)
+            if not detached_execution:
+                self.outbound.put(frame)
         if managed and frame.HasField("attempt_outcome"):
             terminal = frame.attempt_outcome
             # Runtime has committed exact result custody. Free the lane without
@@ -6421,7 +6471,7 @@ class Worker:
             if self.connected.is_set():
                 self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
-    def publish_activity(self) -> None:
+    def publish_activity(self, *, strict: bool = False) -> None:
         """Tell the pod supervisor what this worker is doing (`worker/activity.py`).
 
         It rides the reporter for one reason: a tick that does not happen is the evidence
@@ -6434,9 +6484,16 @@ class Worker:
             self.activity_file.publish(
                 owner_attached=bool(self.attached_streams),
                 attempts_in_flight=self.engine.in_flight(),
+                execution_retention_required=(
+                    self.executions is not None
+                    and self.fence.record_owner_recorded
+                    and self.executions.retention_required(self.fence.record_owner_id)
+                ),
                 meter=activity.meter(self),
             )
         except OSError as exc:
+            if strict:
+                raise
             self.note("activity", f"the supervisor's activity file was not written: {exc}")
 
     def observed_state(self) -> pb.ObservedWorkerState:

@@ -69,7 +69,14 @@ class ActivityFile:
         self.owner = owner
         self.sequence = 0
 
-    def publish(self, *, owner_attached: bool, attempts_in_flight: int, meter: str | None) -> None:
+    def publish(
+        self,
+        *,
+        owner_attached: bool,
+        attempts_in_flight: int,
+        meter: str | None,
+        execution_retention_required: bool = False,
+    ) -> None:
         self.sequence += 1
         document: dict[str, Any] = {
             "version": VERSION,
@@ -80,6 +87,7 @@ class ActivityFile:
             "sequence": self.sequence,
             "owner_attached": owner_attached,
             "attempts_in_flight": attempts_in_flight,
+            "execution_retention_required": execution_retention_required,
             "meter": meter,
             "still_factor": liveness.STILL_FACTOR,
             "still_floor_seconds": liveness.STILL_FACTOR * liveness.noise_floor(),

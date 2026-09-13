@@ -6,8 +6,8 @@ This module stores neither another outcome copy nor native byte/catalog state.
 
 from __future__ import annotations
 
+import base64
 import re
-import sqlite3
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -15,11 +15,13 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import Journal, Row, Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 SCHEMA7 = """
+ALTER TABLE workspace_state ADD COLUMN execution_workspace_id TEXT NOT NULL DEFAULT '';
+UPDATE workspace_state SET execution_workspace_id=lower(hex(randomblob(16)));
 CREATE TABLE executions (
  owner TEXT NOT NULL, request TEXT NOT NULL, submission TEXT NOT NULL,
  capture BLOB NOT NULL, offer BLOB NOT NULL, accepted_ms INTEGER NOT NULL,
@@ -29,6 +31,9 @@ CREATE TABLE executions (
  compacted_through INTEGER NOT NULL DEFAULT 0,
  max_attempts INTEGER NOT NULL DEFAULT 1, retry_delay_ms INTEGER NOT NULL DEFAULT 0,
  finished_ms INTEGER NOT NULL DEFAULT 0,
+ capture_document BLOB NOT NULL DEFAULT x'', preparation BLOB NOT NULL DEFAULT x'',
+ worker_id TEXT NOT NULL DEFAULT '', accepted_boot TEXT NOT NULL DEFAULT '',
+ retention_waived INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(owner,request), UNIQUE(owner,submission)
 ) STRICT;
 CREATE TABLE execution_events (
@@ -58,6 +63,8 @@ class Receipt:
     capture_digest: bytes
     invocation_spec_digest: bytes
     accepted_at_ms: int
+    worker_id: str
+    worker_boot_id: str
 
 
 @dataclass(frozen=True)
@@ -127,8 +134,17 @@ class Executions:
         self.workspace = workspace
         self.clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
 
+    @property
+    def workspace_id(self) -> str:
+        with self.workspace.locked() as db:
+            return str(
+                db.execute(
+                    "SELECT execution_workspace_id FROM workspace_state WHERE singleton=1"
+                ).fetchone()[0]
+            )
+
     @staticmethod
-    def _row(db: Journal, owner: str, request: str) -> sqlite3.Row:
+    def _row(db: Journal, owner: str, request: str) -> Row:
         Workspace.owner(owner)
         _id(request)
         row = db.execute(
@@ -136,10 +152,10 @@ class Executions:
         ).fetchone()
         if row is None:
             raise WorkspaceRefusal("execution is not held by this owner")
-        return cast(sqlite3.Row, row)
+        return cast(Row, row)
 
     @staticmethod
-    def _state(row: sqlite3.Row) -> State:
+    def _state(row: Row) -> State:
         return State(
             row["request"],
             row["ordinal"],
@@ -150,7 +166,7 @@ class Executions:
         )
 
     @staticmethod
-    def _receipt(row: sqlite3.Row) -> Receipt:
+    def _receipt(row: Row) -> Receipt:
         offer = pb.AttemptOffer.FromString(row["offer"])
         return Receipt(
             row["request"],
@@ -158,9 +174,11 @@ class Executions:
             row["capture"],
             offer.invocation_spec_digest,
             row["accepted_ms"],
+            row["worker_id"],
+            row["accepted_boot"],
         )
 
-    def _event(self, db: Journal, row: sqlite3.Row, kind: str, body: bytes) -> None:
+    def _event(self, db: Journal, row: Row, kind: str, body: bytes) -> None:
         if len(body) > MAX_EVENT_BYTES:
             raise WorkspaceRefusal("execution event exceeds its metadata bound")
         canonical_json.decode(body)
@@ -205,6 +223,9 @@ class Executions:
         memoize: bool = False,
         max_attempts: int = 1,
         retry_delay_ms: int = 0,
+        capture_document: bytes = b"",
+        preparation: bytes = b"",
+        worker_id: str = "",
     ) -> Receipt:
         """Atomically accept a verified capture/root and its first existing attempt."""
         Workspace.owner(owner)
@@ -230,6 +251,8 @@ class Executions:
                     row["offer"],
                     row["max_attempts"],
                     row["retry_delay_ms"],
+                    row["capture_document"],
+                    row["preparation"],
                 ) != (
                     submission_id,
                     offer.request_id,
@@ -237,6 +260,8 @@ class Executions:
                     raw,
                     max_attempts,
                     retry_delay_ms,
+                    capture_document,
+                    preparation,
                 ):
                     raise WorkspaceRefusal("execution submission identity changed")
                 return self._receipt(row)
@@ -254,8 +279,9 @@ class Executions:
             )
             db.execute(
                 "INSERT INTO executions(owner,request,submission,capture,offer,accepted_ms,"
-                "ordinal,generation,state,max_attempts,retry_delay_ms) "
-                "VALUES(?,?,?,?,?,?,1,1,'queued',?,?)",
+                "ordinal,generation,state,max_attempts,retry_delay_ms,"
+                "capture_document,preparation,worker_id,accepted_boot) "
+                "VALUES(?,?,?,?,?,?,1,1,'queued',?,?,?,?,?,?)",
                 (
                     owner,
                     offer.request_id,
@@ -265,6 +291,10 @@ class Executions:
                     self.clock_ms(),
                     max_attempts,
                     retry_delay_ms,
+                    capture_document,
+                    preparation,
+                    worker_id,
+                    worker_boot,
                 ),
             )
             row = self._row(db, owner, offer.request_id)
@@ -288,11 +318,95 @@ class Executions:
                 row[0]
                 for row in db.execute(
                     "SELECT request FROM executions WHERE owner=? "
-                    "AND state IN ('queued','running','pausing','canceling') "
+                    "AND (state IN ('queued','running','pausing','canceling') "
+                    "OR (desired='cancel' AND retention_waived=0)) "
                     "ORDER BY accepted_ms,request",
                     (owner,),
                 )
             )
+
+    def preparation(self, owner: str, request: str) -> dict[str, Any]:
+        with self.workspace.locked() as db:
+            raw = self._row(db, owner, request)["preparation"]
+            return cast(dict[str, Any], canonical_json.decode(raw)) if raw else {}
+
+    def capture(self, owner: str, request: str) -> dict[str, Any]:
+        with self.workspace.locked() as db:
+            raw = self._row(db, owner, request)["capture_document"]
+            return documents.read(raw, pb.MachineExecutionCapture)
+
+    def abandon(self, owner: str, request: str) -> bool:
+        """Relinquish this stopped root through existing native release operations."""
+        from . import workspace_finalize
+
+        with self.workspace.locked() as db:
+            row = self._row(db, owner, request)
+            if (
+                row["desired"] != "cancel"
+                or row["state"] not in TERMINAL
+                or row["retention_waived"]
+            ):
+                return False
+            attempts = db.execute(
+                "SELECT * FROM attempts WHERE owner=? AND request=?", (owner, request)
+            ).fetchall()
+            if any(not attempt["outcome"] for attempt in attempts):
+                return False
+            weights = db.execute(
+                "SELECT * FROM weights WHERE owner=? AND request=? AND state<>'released'",
+                (owner, request),
+            ).fetchall()
+        for weight in weights:
+            if weight["native_digest"]:
+                self.workspace.release_result(
+                    owner,
+                    pb.DerivedResultReleaseRequest(
+                        weights_transaction_id=weight["id"],
+                        tensorfs_receipt_digest=weight["native_digest"],
+                    ),
+                )
+            else:
+                attempt = next(
+                    attempt for attempt in attempts if attempt["ordinal"] == weight["ordinal"]
+                )
+                workspace_finalize.finalize(
+                    self.workspace,
+                    owner,
+                    pb.WeightsFinalizeRequest(
+                        owner_authority_scope=owner,
+                        request_id=request,
+                        invocation_spec_digest=weight["spec"],
+                        invocation_spec_canonical_bytes=attempt["invocation"],
+                        output_slot=weight["slot"],
+                        disposition=pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED,
+                    ),
+                )
+        for attempt in attempts:
+            self.workspace.acknowledge(
+                owner,
+                pb.AttemptOutcomeAck(
+                    request_id=request,
+                    attempt_ordinal=attempt["ordinal"],
+                    invocation_spec_digest=attempt["spec"],
+                    outcome_id=attempt["outcome_id"],
+                    outcome_digest=attempt["outcome_digest"],
+                    retain_work=False,
+                ),
+            )
+        with self.workspace.locked() as db, transaction(db):
+            row = self._row(db, owner, request)
+            if not row["retention_waived"]:
+                db.execute(
+                    "UPDATE executions SET retention_waived=1 WHERE owner=? AND request=?",
+                    (owner, request),
+                )
+                self._event(
+                    db,
+                    row,
+                    "retention_released",
+                    canonical_json.encode({"collected": bool(row["collected"])}),
+                )
+        return True
 
     def stop_queued(self, owner: str, request: str, *, deadline: bool = False) -> None:
         """Stop work that has no live executor, through the same durable outcome codec."""
@@ -511,7 +625,7 @@ class Executions:
             if row["generation"] != expected_generation:
                 raise WorkspaceRefusal("execution command generation is stale")
             state, ordinal, desired = row["state"], row["ordinal"], row["desired"]
-            if action != "resume" and state in ("succeeded", "canceled"):
+            if action == "pause" and state in ("succeeded", "canceled"):
                 result = self._state(row)
                 db.execute(
                     "INSERT INTO execution_commands VALUES(?,?,?,?,?)",
@@ -547,13 +661,14 @@ class Executions:
                 state, desired = (
                     ("pausing", "pause") if action == "pause" else ("canceling", "cancel")
                 )
-            elif action == "cancel" and state in ("paused", "failed"):
-                state, desired = "canceled", "cancel"
+            elif action == "cancel":
+                state, desired = "succeeded" if state == "succeeded" else "canceled", "cancel"
             generation = row["generation"] + 1
             db.execute(
-                "UPDATE executions SET state=?,desired=?,ordinal=?,generation=?,collected=0 "
+                "UPDATE executions SET state=?,desired=?,ordinal=?,generation=?,"
+                "collected=CASE WHEN ? THEN 0 ELSE collected END "
                 "WHERE owner=? AND request=?",
-                (state, desired, ordinal, generation, owner, request),
+                (state, desired, ordinal, generation, action == "resume", owner, request),
             )
             self._event(db, self._row(db, owner, request), "control", intent)
             result = self._state(self._row(db, owner, request))
@@ -568,14 +683,52 @@ class Executions:
         state = self.status(owner, request)
         selected = state.attempt_ordinal if ordinal is None else ordinal
         with self.workspace.locked() as db:
-            self._row(db, owner, request)
+            execution = self._row(db, owner, request)
             row = db.execute(
                 "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
                 (owner, request, selected),
             ).fetchone()
             if row is None or not row["outcome"]:
                 raise WorkspaceRefusal("execution has no durable terminal to collect")
-            return self.workspace._outcome_frame(row)
+            outcome = self.workspace._outcome_frame(row)
+            verify = not execution["collected"] and not execution["retention_waived"]
+        if verify:
+            self._verify_outputs(outcome)
+        return outcome
+
+    def _verify_outputs(self, outcome: pb.AttemptOutcome) -> None:
+        """A journal alone cannot prove an uncollected native result remains present."""
+        from cozy_runtime.internal import fill
+
+        body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        if body["status"] != pb.OUTCOME_STATUS_SUCCEEDED:
+            return
+        manifests = set()
+        for reference in body.get("weights_receipts", []):
+            receipt = documents.read(
+                base64.b64decode(reference["weights_receipt_canonical_bytes"], validate=True),
+                pb.WeightsReceipt,
+            )
+            native = canonical_json.decode(
+                base64.b64decode(receipt["tensorfs_receipt_canonical_bytes"], validate=True)
+            )
+            manifests.add("sha256:" + native["manifest"]["sha256"])
+        outputs = list(body.get("output_manifest", {}).get("outputs", []))
+        if blob := body.get("result", {}).get("result_blob"):
+            outputs.append(blob)
+        for output in outputs:
+            if native_tree := output.get("native_tree"):
+                manifests.add(native_tree["manifest"]["digest"])
+        if not manifests:
+            return
+        store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+        leases = []
+        try:
+            for manifest in sorted(manifests):
+                leases.append(store.acquire_manifest(manifest))
+        finally:
+            for lease in leases:
+                lease.release()
 
     def acknowledge_collection(self, owner: str, ack: pb.AttemptOutcomeAck) -> State:
         self.status(owner, ack.request_id)
@@ -610,6 +763,7 @@ class Executions:
             return (
                 db.execute(
                     "SELECT 1 FROM executions WHERE owner=? AND "
+                    "retention_waived=0 AND "
                     "(state NOT IN ('succeeded','failed','canceled') OR collected=0) LIMIT 1",
                     (owner,),
                 ).fetchone()

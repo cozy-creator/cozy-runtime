@@ -7,6 +7,13 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
+class MachineExecutionAction(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    MACHINE_EXECUTION_ACTION_UNSPECIFIED: _ClassVar[MachineExecutionAction]
+    MACHINE_EXECUTION_ACTION_PAUSE: _ClassVar[MachineExecutionAction]
+    MACHINE_EXECUTION_ACTION_RESUME: _ClassVar[MachineExecutionAction]
+    MACHINE_EXECUTION_ACTION_CANCEL: _ClassVar[MachineExecutionAction]
+
 class ChildCallState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     CHILD_CALL_STATE_UNSPECIFIED: _ClassVar[ChildCallState]
@@ -330,6 +337,10 @@ class WeightsFinalizeOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     WEIGHTS_FINALIZE_OUTCOME_UNSPECIFIED: _ClassVar[WeightsFinalizeOutcome]
     WEIGHTS_FINALIZE_OUTCOME_ADOPTED: _ClassVar[WeightsFinalizeOutcome]
     WEIGHTS_FINALIZE_OUTCOME_ABANDONED: _ClassVar[WeightsFinalizeOutcome]
+MACHINE_EXECUTION_ACTION_UNSPECIFIED: MachineExecutionAction
+MACHINE_EXECUTION_ACTION_PAUSE: MachineExecutionAction
+MACHINE_EXECUTION_ACTION_RESUME: MachineExecutionAction
+MACHINE_EXECUTION_ACTION_CANCEL: MachineExecutionAction
 CHILD_CALL_STATE_UNSPECIFIED: ChildCallState
 CHILD_CALL_STATE_PENDING: ChildCallState
 CHILD_CALL_STATE_SUCCEEDED: ChildCallState
@@ -558,6 +569,170 @@ class ProtocolInfoRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
 
+class MachineExecutionCapture(_message.Message):
+    __slots__ = ("root_revision_digest", "revisions", "bindings")
+    ROOT_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    REVISIONS_FIELD_NUMBER: _ClassVar[int]
+    BINDINGS_FIELD_NUMBER: _ClassVar[int]
+    root_revision_digest: bytes
+    revisions: _containers.RepeatedCompositeFieldContainer[LocalPackageRevision]
+    bindings: _containers.RepeatedCompositeFieldContainer[MachineCallableBinding]
+    def __init__(self, root_revision_digest: _Optional[bytes] = ..., revisions: _Optional[_Iterable[_Union[LocalPackageRevision, _Mapping]]] = ..., bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ...) -> None: ...
+
+class MachineCallableBinding(_message.Message):
+    __slots__ = ("caller_revision_digest", "interface_digest", "module", "export", "callee_revision_digest", "entrypoint")
+    CALLER_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    INTERFACE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    EXPORT_FIELD_NUMBER: _ClassVar[int]
+    CALLEE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    ENTRYPOINT_FIELD_NUMBER: _ClassVar[int]
+    caller_revision_digest: bytes
+    interface_digest: bytes
+    module: str
+    export: str
+    callee_revision_digest: bytes
+    entrypoint: str
+    def __init__(self, caller_revision_digest: _Optional[bytes] = ..., interface_digest: _Optional[bytes] = ..., module: _Optional[str] = ..., export: _Optional[str] = ..., callee_revision_digest: _Optional[bytes] = ..., entrypoint: _Optional[str] = ...) -> None: ...
+
+class MachineExecutionSubmit(_message.Message):
+    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "max_attempts", "retry_delay_ms", "prepared_state", "payload_canonical_bytes")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
+    CAPTURE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CAPTURE_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    OFFER_FIELD_NUMBER: _ClassVar[int]
+    MAX_ATTEMPTS_FIELD_NUMBER: _ClassVar[int]
+    RETRY_DELAY_MS_FIELD_NUMBER: _ClassVar[int]
+    PREPARED_STATE_FIELD_NUMBER: _ClassVar[int]
+    PAYLOAD_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    submission_id: str
+    capture_digest: bytes
+    capture_canonical_bytes: bytes
+    offer: AttemptOffer
+    max_attempts: int
+    retry_delay_ms: int
+    prepared_state: DesiredWorkerState
+    payload_canonical_bytes: bytes
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+
+class MachineExecutionReceipt(_message.Message):
+    __slots__ = ("request_id", "submission_id", "capture_digest", "invocation_spec_digest", "accepted_at_ms", "worker_id", "worker_boot_id", "execution_workspace_id")
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
+    CAPTURE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    ACCEPTED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    request_id: str
+    submission_id: str
+    capture_digest: bytes
+    invocation_spec_digest: bytes
+    accepted_at_ms: int
+    worker_id: str
+    worker_boot_id: str
+    execution_workspace_id: str
+    def __init__(self, request_id: _Optional[str] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., invocation_spec_digest: _Optional[bytes] = ..., accepted_at_ms: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ...) -> None: ...
+
+class MachineExecutionQuery(_message.Message):
+    __slots__ = ("claim", "request_id", "expected_execution_workspace_id")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request_id: str
+    expected_execution_workspace_id: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ...) -> None: ...
+
+class MachineExecutionState(_message.Message):
+    __slots__ = ("request_id", "attempt_ordinal", "generation", "state", "collected", "sequence", "worker_id", "worker_boot_id", "execution_workspace_id")
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    GENERATION_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    COLLECTED_FIELD_NUMBER: _ClassVar[int]
+    SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    request_id: str
+    attempt_ordinal: int
+    generation: int
+    state: str
+    collected: bool
+    sequence: int
+    worker_id: str
+    worker_boot_id: str
+    execution_workspace_id: str
+    def __init__(self, request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., generation: _Optional[int] = ..., state: _Optional[str] = ..., collected: bool = ..., sequence: _Optional[int] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ...) -> None: ...
+
+class MachineExecutionEventsQuery(_message.Message):
+    __slots__ = ("execution", "after", "limit")
+    EXECUTION_FIELD_NUMBER: _ClassVar[int]
+    AFTER_FIELD_NUMBER: _ClassVar[int]
+    LIMIT_FIELD_NUMBER: _ClassVar[int]
+    execution: MachineExecutionQuery
+    after: int
+    limit: int
+    def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., after: _Optional[int] = ..., limit: _Optional[int] = ...) -> None: ...
+
+class MachineExecutionEvent(_message.Message):
+    __slots__ = ("sequence", "attempt_ordinal", "at_ms", "kind", "body_canonical_bytes")
+    SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    AT_MS_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    BODY_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    sequence: int
+    attempt_ordinal: int
+    at_ms: int
+    kind: str
+    body_canonical_bytes: bytes
+    def __init__(self, sequence: _Optional[int] = ..., attempt_ordinal: _Optional[int] = ..., at_ms: _Optional[int] = ..., kind: _Optional[str] = ..., body_canonical_bytes: _Optional[bytes] = ...) -> None: ...
+
+class MachineExecutionEventPage(_message.Message):
+    __slots__ = ("events", "next_after", "head_sequence", "compacted_through")
+    EVENTS_FIELD_NUMBER: _ClassVar[int]
+    NEXT_AFTER_FIELD_NUMBER: _ClassVar[int]
+    HEAD_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    COMPACTED_THROUGH_FIELD_NUMBER: _ClassVar[int]
+    events: _containers.RepeatedCompositeFieldContainer[MachineExecutionEvent]
+    next_after: int
+    head_sequence: int
+    compacted_through: int
+    def __init__(self, events: _Optional[_Iterable[_Union[MachineExecutionEvent, _Mapping]]] = ..., next_after: _Optional[int] = ..., head_sequence: _Optional[int] = ..., compacted_through: _Optional[int] = ...) -> None: ...
+
+class MachineExecutionControl(_message.Message):
+    __slots__ = ("execution", "command_id", "expected_generation", "action")
+    EXECUTION_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    ACTION_FIELD_NUMBER: _ClassVar[int]
+    execution: MachineExecutionQuery
+    command_id: str
+    expected_generation: int
+    action: MachineExecutionAction
+    def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., command_id: _Optional[str] = ..., expected_generation: _Optional[int] = ..., action: _Optional[_Union[MachineExecutionAction, str]] = ...) -> None: ...
+
+class MachineExecutionCollect(_message.Message):
+    __slots__ = ("execution", "attempt_ordinal")
+    EXECUTION_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    execution: MachineExecutionQuery
+    attempt_ordinal: int
+    def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., attempt_ordinal: _Optional[int] = ...) -> None: ...
+
+class MachineExecutionCollectionAck(_message.Message):
+    __slots__ = ("execution", "outcome")
+    EXECUTION_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
+    execution: MachineExecutionQuery
+    outcome: AttemptOutcomeAck
+    def __init__(self, execution: _Optional[_Union[MachineExecutionQuery, _Mapping]] = ..., outcome: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ...) -> None: ...
+
 class WorkspaceImportBegin(_message.Message):
     __slots__ = ("claim", "migration_id", "record_count", "source_schema")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
@@ -631,12 +806,14 @@ class WorkspaceActivationCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ...) -> None: ...
 
 class ProtocolInfoResult(_message.Message):
-    __slots__ = ("wire_minor", "minimum_wire_minor")
+    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs")
     WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     MINIMUM_WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_MIXED_MODEL_INPUTS_FIELD_NUMBER: _ClassVar[int]
     wire_minor: int
     minimum_wire_minor: int
-    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ...) -> None: ...
+    supports_mixed_model_inputs: bool
+    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
     __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements")
