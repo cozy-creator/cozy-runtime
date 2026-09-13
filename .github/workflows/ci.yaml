@@ -50,6 +50,14 @@ jobs:
       - run: uv python install 3.12
       - run: uv sync
       - run: uv run pytest
+      - name: Prove primary handoff with real supervised processes
+        run: |
+          sudo systemd-run --wait --pipe --collect \
+            --unit="cozy-runtime-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --property=Delegate=yes --working-directory="$PWD" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            .venv/bin/python -c 'import sys; sys.path.insert(0, "tests"); from test_end_to_end import NO_EXECUTOR; assert not NO_EXECUTOR, NO_EXECUTOR; import pytest; raise SystemExit(pytest.main(["tests/test_primary_handoff.py", "-q", "-rs"]))'
 
   # Real CPU rank execution, separate from the torch-free base checks. The native
   # staging case names its CUDA requirement and skips on this runner.
