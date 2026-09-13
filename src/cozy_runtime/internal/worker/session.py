@@ -207,9 +207,13 @@ def _delivery_observation(delivery: Mapping[str, Any]) -> str:
         if isinstance(speedup, int | float) and speedup >= 0.0
         else ""
     )
+    selection = (
+        "per-model delivery"
+        if delivery.get("models")
+        else f"on rung {delivery.get('rung', 'unreported')}"
+    )
     return (
-        f"{delivery.get('variant', '')!r} / {delivery.get('label', 'unlabelled')} on rung "
-        f"{delivery.get('rung', 'unreported')} "
+        f"{delivery.get('variant', '')!r} / {delivery.get('label', 'unlabelled')} {selection} "
         f"({delivery.get('delivery', 'unreported')}/{materialization}; "
         f"routes {census('routes')}; kernels {census('kernels')}{leaf}; {calibrated}) chosen "
         f"on the {delivery.get('objective', 'unreported')} axis"
@@ -4965,13 +4969,7 @@ class Worker:
                 self.note("recovery", f"prepare refusal reclaim failed: {exc}")
             return "prepare refused: every binding", False
         delivery = reply.get("delivery") or {}
-        resolved = PreparedModel(
-            constructed_model_digest=str(reply["constructed_model_digest"]),
-            delivery_rung=str(delivery.get("rung", "")),
-            delivery_variant=str(delivery.get("variant", "")),
-            weight_bytes=int(reply["facts"]["filled_bytes"]),
-            attention=dict(reply["facts"].get("attention") or {}),
-        )
+        resolved = PreparedModel.from_reply(reply)
         executor.construction_key = construction_key
         executor.parameters = parameters
         executor.prepared_model = resolved

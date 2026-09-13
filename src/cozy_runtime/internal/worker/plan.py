@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cozy_runtime.internal import canonical
-from cozy_runtime.internal.delivery import RUNGS_BY_NAME
+from cozy_runtime.internal.delivery import RUNGS_BY_NAME, DeliveryRefusal, cost_class
 from cozy_runtime.internal.resolution import ROUTE_KERNEL
 from cozy_runtime.internal.worker.ledger import Ledger
 
@@ -128,6 +128,8 @@ class AttemptPlan:
     """WHICH stored bytes served (cr-008c). Inside the document because `plan_digest` is an
     identity a RecordOwner holds, and two plans that read different artifacts of one model
     are not the same plan however identical their placement."""
+    model_deliveries: tuple[tuple[str, dict[str, Any]], ...] = ()
+    """Each model's resolved delivery and its cost under this attempt's placement."""
     scope_headroom_bytes: tuple[tuple[str, int], ...] = ()
     """Measured activation scratch by component-use method. The scalar headroom is its max;
     staged admission uses each method's own value so unrelated weight/scratch maxima never add."""
@@ -158,6 +160,28 @@ class AttemptPlan:
             "shape_cell": self.shape_cell,
             "model_weight_bytes": self.model_weight_bytes,
             "resident_bytes": self.resident_bytes,
+            **(
+                {
+                    "model_deliveries": {
+                        name: {
+                            key: row[key]
+                            for key in (
+                                "plan_digest",
+                                "routes",
+                                "kernels",
+                                "delivery",
+                                "materialization",
+                                "cost_class",
+                                "route_costs",
+                            )
+                            if key in row
+                        }
+                        for name, row in self.model_deliveries
+                    }
+                }
+                if self.model_deliveries
+                else {}
+            ),
         }
 
     def digest(self) -> str:
@@ -266,6 +290,8 @@ class PreparedModel:
     `verbatim`."""
     delivery_variant: str = ""
     """Which offered variant this generation actually read."""
+    model_deliveries: tuple[tuple[str, dict[str, Any]], ...] = ()
+    """Named child delivery documents when this prepare constructed several models."""
     weight_bytes: int = 0
     """What the fill COMMITTED, measured. Distinct from the deployment's declared
     `model_weight_bytes` and from the ledger's live resident map — three different facts
@@ -274,6 +300,21 @@ class PreparedModel:
     """WHAT THE RUNTIME PINNED on this generation's attention sites (cr-124): kernel per
     component, and what this device and image offered. A construction fact, read once at
     boot — the choice cannot vary between attempts of one generation."""
+
+    @classmethod
+    def from_reply(cls, reply: Mapping[str, Any]) -> PreparedModel:
+        """Read exactly the executor's prepared generation, including each model's routes."""
+        delivery, facts = reply.get("delivery") or {}, reply["facts"]
+        return cls(
+            constructed_model_digest=str(reply["constructed_model_digest"]),
+            delivery_rung=str(delivery.get("rung", "")),
+            delivery_variant=str(delivery.get("variant", "")),
+            model_deliveries=tuple(
+                (name, dict(row)) for name, row in sorted((delivery.get("models") or {}).items())
+            ),
+            weight_bytes=int(facts["filled_bytes"]),
+            attention=dict(facts.get("attention") or {}),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -915,8 +956,8 @@ class PlanChooser:
             confession = ""
         rung = self._delivery(prepared_model, chosen, walk)
         return AttemptPlan(
-            delivery=rung.delivery,
-            materialization=rung.materialization,
+            delivery=rung["delivery"],
+            materialization=rung["materialization"],
             compute_dtype="float16",
             placement=chosen,
             # THREE DIFFERENT FACTS, three names (codex audit, adopted 2026-08-25). The
@@ -947,10 +988,11 @@ class PlanChooser:
             overlay_digest=prepared.overlay_digest,
             shape_cell=prepared.cell(),
             delivery_variant=prepared_model.delivery_variant,
+            model_deliveries=tuple(sorted((rung.get("models") or {}).items())),
             decision_explanation=(
-                f"{rung.delivery}/{rung.materialization or 'verbatim'} on variant "
+                f"{rung['delivery']}/{rung['materialization'] or 'verbatim'} on variant "
                 f"{prepared_model.delivery_variant or declared.variant or 'default'!r} "
-                f"({rung.cost_class} decode, {ROUTE_KERNEL[rung.route]} kernel) x "
+                f"({rung['cost_class']} decode, {rung['kernel']} kernel) x "
                 f"{chosen}: {len(resident) + len(absent) or 1} component(s) totalling "
                 f"{weights} B of which {absent_bytes} B is not resident, with "
                 f"{allocatable} B allocatable and {activations.value} B of activations "
@@ -961,7 +1003,9 @@ class PlanChooser:
             ),
         )
 
-    def _delivery(self, prepared_model: PreparedModel, placement: str, walk: dict[str, Any]) -> Any:
+    def _delivery(
+        self, prepared_model: PreparedModel, placement: str, walk: dict[str, Any]
+    ) -> dict[str, Any]:
         """THE CROSS (cr-008c): the resolved delivery rung, crossed with the placement one.
 
         Delivery was chosen ONCE, at prepare, against measured envelopes — this function
@@ -979,6 +1023,59 @@ class PlanChooser:
         rather than restated, so a delivery switch arriving as a placement side effect is a
         refusal instead of a silent reinterpretation of the request.
         """
+        if prepared_model.model_deliveries:
+            models = {}
+            for parameter, delivery in prepared_model.model_deliveries:
+                child = PreparedModel(
+                    delivery_rung=str(delivery.get("rung", "")),
+                    delivery_variant=str(delivery.get("variant", "")),
+                )
+                child_crossed = self._delivery(child, placement, {})
+                try:
+                    route_costs = {
+                        route: cost_class(route, placement)
+                        for route, count in (delivery.get("routes") or {}).items()
+                        if count
+                    }
+                except DeliveryRefusal as exc:
+                    raise PlanRefusal(exc.code, f"model {parameter!r}: {exc.detail}") from exc
+                # Keep the actual route/kernel census beside its placement-dependent cost.
+                models[parameter] = {
+                    **delivery,
+                    **child_crossed,
+                    "route_costs": route_costs,
+                    "kernel": "+".join(
+                        sorted(delivery.get("kernels") or {child_crossed["kernel"]: 1})
+                    ),
+                }
+            materializations = {row["materialization"] for row in models.values()}
+            summary = {
+                "variant": prepared_model.delivery_variant,
+                "delivery": "float"
+                if any(row["delivery"] == "float" for row in models.values())
+                else "native",
+                "materialization": (
+                    "staged_decode"
+                    if "staged_decode" in materializations
+                    else "aot_decode"
+                    if "aot_decode" in materializations
+                    else ""
+                ),
+                "cost_class": "+".join(sorted({row["cost_class"] for row in models.values()})),
+                "kernel": "+".join(
+                    sorted(
+                        {
+                            kernel
+                            for row in models.values()
+                            for kernel in (row.get("kernels") or {row["kernel"]: 1})
+                        }
+                    )
+                ),
+                "chosen_at": "prepare",
+                "models": models,
+            }
+            walk["delivery"] = summary
+            return summary
         name = prepared_model.delivery_rung or "verbatim"
         rung = RUNGS_BY_NAME.get(name)
         if rung is None:
@@ -1008,7 +1105,7 @@ class PlanChooser:
                     "evidence_class": "structural",
                 },
             )
-        walk["delivery"] = {
+        result = {
             "variant": prepared_model.delivery_variant,
             "rung": crossed.name,
             "delivery": crossed.delivery,
@@ -1017,7 +1114,8 @@ class PlanChooser:
             "kernel": ROUTE_KERNEL[crossed.route],
             "chosen_at": "prepare",
         }
-        return crossed
+        walk["delivery"] = result
+        return result
 
     def _deepen(
         self,
