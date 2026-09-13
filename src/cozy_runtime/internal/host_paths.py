@@ -29,7 +29,9 @@ READINESS_ENVELOPE: Final = Path("/run/cozy/bootstrap/readiness-envelope.json")
 WORKER_ACTIVITY: Final = Path("/run/cozy/bootstrap/worker-activity")
 TLS_CERTIFICATE: Final = Path("/run/cozy/bootstrap/tls.crt")
 TLS_PRIVATE_KEY: Final = Path("/run/cozy/bootstrap/tls.key")
-MACHINE_PUBLICATION_AUTHORITY: Final = Path("/run/cozy/bootstrap/machine-publication-authority.json")
+MACHINE_PUBLICATION_AUTHORITY: Final = Path(
+    "/run/cozy/bootstrap/machine-publication-authority.json"
+)
 WORKER_CONTROL_ADDRESS: Final = Path("/run/cozy/worker/control.addr")
 WORKER_STATE: Final = Path("/run/cozy/worker")
 
