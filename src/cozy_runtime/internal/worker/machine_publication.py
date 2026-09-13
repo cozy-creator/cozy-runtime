@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import http.client
 import json
 import re
 import ssl
@@ -16,12 +15,15 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author.publication import CheckpointRef, ReleaseReceipt
+from cozy_runtime.internal import egress
 from cozy_runtime.internal.config import parse_tensorhub_origin
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -38,6 +40,21 @@ class PublicationRefusal(Exception):
 
 class PublicationClient(Protocol):
     def request(self, method: str, path: str, body: bytes | None = None) -> bytes: ...
+
+
+@dataclass(frozen=True)
+class PublicationTLS:
+    origin: str
+    certificate: Path
+    private_key: Path
+    ca_der: bytes = b""
+
+    def client(self, authorization_id: str) -> MachinePublicationClient:
+        context = ssl.create_default_context()
+        if self.ca_der:
+            context.load_verify_locations(cadata=self.ca_der)
+        context.load_cert_chain(self.certificate, self.private_key)
+        return MachinePublicationClient(self.origin, authorization_id, context)
 
 
 def _object(raw: bytes) -> dict[str, Any]:
@@ -90,7 +107,7 @@ class MachinePublicationClient:
             context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED,
             "publication.tls_verification_required",
         )
-        self.host, self.port = parsed.host, parsed.port
+        self.origin = parsed
         self.authorization_id, self.context, self.clock = authorization_id, context, clock
         self._token, self._expires = "", 0.0
         self._lock = threading.Lock()
@@ -106,20 +123,14 @@ class MachinePublicationClient:
             headers["Content-Type"] = "application/json"
         if method != "GET":
             headers["X-Tensorhub-Reason"] = "explicit private script publication"
-        connection = http.client.HTTPSConnection(
-            self.host, self.port, context=self.context, timeout=30
-        )
         try:
-            connection.request(method, path, body=body, headers=headers)
-            response = connection.getresponse()
-            raw = response.read(_MAX_METADATA + 1)
-            _require(len(raw) <= _MAX_METADATA, "publication.response_bound")
-            return response.status, raw
-        except (OSError, http.client.HTTPException) as exc:
+            return egress.request_control_metadata(
+                self.origin, self.context, method, path, body, headers, limit=_MAX_METADATA
+            )
+        except egress.EgressRefusal as exc:
             # URLs, signed headers and token strings never enter a retained error.
-            raise PublicationRefusal("publication.transport_unavailable", status=503) from exc
-        finally:
-            connection.close()
+            status = 503 if exc.code == "control_transport_unavailable" else 409
+            raise PublicationRefusal("publication." + exc.code, status=status) from exc
 
     def _renew(self) -> None:
         status, raw = self._exchange(
@@ -361,6 +372,9 @@ def upload_checkpoint(
             client.request("POST", path + "/grants", canonical_json.encode({"object_ids": [key]}))
         )
         grants, held = granted.get("grants"), granted.get("held")
+        # Go's empty slices may be JSON null; they still represent zero rows.
+        grants = [] if grants is None else grants
+        held = [] if held is None else held
         if not isinstance(grants, list) or not isinstance(held, list):
             raise PublicationRefusal("publication.response_invalid")
         _require(len(grants) + len(held) == 1)
