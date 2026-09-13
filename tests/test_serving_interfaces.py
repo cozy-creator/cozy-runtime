@@ -215,6 +215,7 @@ async def run():
     repeat = client.generate(prompt="same", model=model)
     assert (await repeat).value == 7
     assert first.request_id != repeat.request_id
+    assert (await client.generate(prompt="select default")).value == 7
     for _ in range(62):
         assert (await client.generate(prompt="same", model=model)).value == 7
         assert not broker.calls and not broker.activated
@@ -223,8 +224,8 @@ try:
     broker.finish()
 finally:
     _current.reset(token)
-assert len(sent) == 64
-assert [frame["call_index"] for frame in sent] == list(range(64))
+assert len(sent) == 65
+assert [frame["call_index"] for frame in sent] == list(range(65))
 body = json.loads(sent[0]["payload"])
 assert set(body) == {"payload", "models"}
 assert body["payload"] == {"prompt":"same", "mode":"one", "tags":{}, "wire_count":3}
@@ -232,6 +233,7 @@ assert body["models"]["model"]["producer_request_id"] == "producer"
 assert "capture" not in body
 assert sent[0]["capture"]["components"] == ["unet"]
 assert "capture" not in sent[1]
+assert json.loads(sent[2]["payload"])["models"] == {"model":None}
 """
     completed = subprocess.run(
         [sys.executable, "-I", "-c", check, str(output)],
@@ -246,6 +248,8 @@ assert "capture" not in sent[1]
         "from cozy_runtime.author import ModelArtifact, PendingCall\n"
         "def run(model: ModelArtifact) -> PendingCall[Result]:\n"
         "    return generate(prompt='hello', model=model)\n"
+        "def default() -> PendingCall[Result]:\n"
+        "    return generate(prompt='hello')\n"
     )
     typed = subprocess.run(
         [sys.executable, "-m", "mypy", "--strict", str(caller)],

@@ -109,7 +109,7 @@ def test_snapshot_excludes_editables_and_hooks_and_survives_source_removal(tmp_p
     )
 
 
-@pytest.mark.parametrize("failure", ["hash", "editable", "symlink", "collision"])
+@pytest.mark.parametrize("failure", ["hash", "editable", "symlink", "collision", "overlap"])
 def test_snapshot_refuses_unverifiable_dependency_files(tmp_path: Path, failure: str) -> None:
     source, staging = tmp_path / "source", tmp_path / "staging"
     source_site = _venv(source)
@@ -124,6 +124,8 @@ def test_snapshot_refuses_unverifiable_dependency_files(tmp_path: Path, failure:
         (source_site / "dependency.py").symlink_to(__file__)
     elif failure == "collision":
         (target_site / "dependency.py").write_bytes(b"different distribution\n")
+    elif failure == "overlap":
+        _distribution(source_site, "other", {"dependency.py": b"value=1\n"})
     with pytest.raises(package_environment.EnvironmentRefusal) as caught:
         dependencies.snapshot(source / "bin/python", staging, set())
     assert (
@@ -133,21 +135,32 @@ def test_snapshot_refuses_unverifiable_dependency_files(tmp_path: Path, failure:
             "editable": "package_environment_dependency_editable",
             "symlink": "package_environment_dependency_member_unsupported",
             "collision": "package_environment_dependency_member_collision",
+            "overlap": "package_environment_dependency_member_collision",
         }[failure]
     )
     assert not (source / "bin/executed").exists()
 
 
-def test_manifest_binds_bytes_and_detects_wheel_overwrite(tmp_path: Path) -> None:
+@pytest.mark.parametrize("changed", ["dependency.py", "../../../bin/dependency-command"])
+def test_manifest_binds_bytes_and_detects_wheel_overwrite(tmp_path: Path, changed: str) -> None:
     source, staging = tmp_path / "source", tmp_path / "staging"
     source_site = _venv(source)
     target_site = _venv(staging)
-    _distribution(source_site, "dependency", {"dependency.py": b"value=1\n"})
+    _distribution(
+        source_site,
+        "dependency",
+        {
+            "dependency.py": b"value=1\n",
+            "dependency-1.0.dist-info/entry_points.txt": (
+                b"[console_scripts]\ndependency-command = sys:exit\n"
+            ),
+        },
+    )
     manifest = dependencies.snapshot(source / "bin/python", staging, set())
     (staging / dependencies.MANIFEST_NAME).write_bytes(manifest)
     ref = {"digest": "sha256:" + hashlib.sha256(manifest).hexdigest(), "length": len(manifest)}
     assert dependencies.read_manifest(staging, ref) == canonical.parse_canonical(manifest)
-    (target_site / "dependency.py").write_bytes(b"value=2\n")
+    (target_site / changed).write_bytes(b"value=2\n")
     with pytest.raises(package_environment.EnvironmentRefusal, match="member_collision"):
         dependencies.verify_files(staging, manifest)
     (staging / dependencies.MANIFEST_NAME).write_bytes(manifest.replace(b"1.0", b"2.0"))
@@ -186,14 +199,14 @@ def test_failed_final_observation_publishes_no_receipt(tmp_path: Path) -> None:
         (package_environment.BlobGrant(wheel.digest, wheel.length, path, verified),),
     )
     install_root = tmp_path / "environments"
-    # This thin source deliberately lacks Runtime. Reject its incomplete dependency
-    # graph before spending I/O on any installed bytes or publishing a receipt.
-    with pytest.raises(package_environment.EnvironmentRefusal, match="dependency_missing"):
+    # This thin source deliberately lacks Runtime. The actual final observation must fail
+    # before a receipt could admit it, even though its recorded dependency copied correctly.
+    with pytest.raises(package_environment.EnvironmentRefusal, match="base_invalid"):
         package_environment.materialize(
             material, install_root, base=base, dependency_python=source / "bin/python"
         )
-    assert not (install_root / "receipts").exists()
-    assert not (install_root / "contents").exists()
+    assert not list((install_root / "receipts").iterdir())
+    assert not list((install_root / "contents").iterdir())
     assert not list(install_root.glob(".environment-staging-*"))
     assert not (source / "bin/executed").exists()
 
@@ -315,3 +328,19 @@ def test_dependency_copy_refuses_changed_bytes_even_with_restored_mtime(tmp_path
     assert source.stat().st_mtime_ns == before.st_mtime_ns
     with pytest.raises(package_environment.EnvironmentRefusal, match="member_changed"):
         dependencies._copy_dependency_file(source, target, expected, str(len(original)))
+
+
+@pytest.mark.parametrize("algorithm", ["sha256", "sha384", "sha512", ""])
+def test_dependency_record_verification_also_returns_canonical_content_digest(
+    tmp_path: Path, algorithm: str
+) -> None:
+    source, target = tmp_path / "source", tmp_path / "copied"
+    body = b"installed bytes with an independently recorded hash\n" * 1024
+    source.write_bytes(body)
+    expected = ""
+    if algorithm:
+        encoded = base64.urlsafe_b64encode(hashlib.new(algorithm, body).digest()).rstrip(b"=")
+        expected = algorithm + "=" + encoded.decode()
+    actual = dependencies._copy_dependency_file(source, target, expected, str(len(body)))
+    assert actual == ("sha256:" + hashlib.sha256(body).hexdigest(), len(body))
+    assert source.stat().st_ino != target.stat().st_ino

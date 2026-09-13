@@ -278,10 +278,13 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                     "serving request fields collide with model slots or capture options",
                     code="interface_name_conflict",
                 )
-            parameters += [f"{name}: ModelArtifact" for name in model_names]
+            # Model arguments override injected slots. None leaves selection to the
+            # host, which knows both owner bindings and the callee's authored defaults.
+            model_overrides = [f"{name}: ModelArtifact | None = None" for name in model_names]
+            parameters += model_overrides
             parameters.append("capture: ActivationCapture | None = None")
             models_name, call_name = f"__cozy_{export}Models", f"__cozy_{export}Call"
-            model_fields = [f"    {name}: ModelArtifact" for name in model_names]
+            model_fields = [f"    {field}" for field in model_overrides]
             _declare(
                 declarations,
                 models_name,

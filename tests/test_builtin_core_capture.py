@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,42 @@ assert broker is not None and 'numpy' not in sys.modules
     )
     capsule = carrier(tmp_path / "carrier", version=version)
     site = next(core.glob("lib/python*/site-packages"))
+    # Creator can select a root package extra during uv sync, but the local
+    # preparation message currently carries wheels, not that extra selection.
+    # A real authored capture must retain the installed optional dependency.
+    _distribution(site, "snapshotextra", {"snapshotextra.py": b"value = 47\n"})
+    extra_root = tmp_path / "extra-wheel"
+    _distribution(
+        extra_root,
+        "snapshotproject",
+        {
+            "snapshotproject.py": b"from snapshotextra import value\n",
+            "snapshotproject-1.0.dist-info/WHEEL": (
+                b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+            ),
+        },
+        requirements=('snapshotextra; extra == "cuda"',),
+    )
+    extra_wheel = tmp_path / "snapshotproject-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(extra_wheel, "w") as archive:
+        for member in sorted(extra_root.rglob("*")):
+            if member.is_file():
+                archive.write(member, str(member.relative_to(extra_root)))
+    authored_python = python(
+        str(core / "bin/python"),
+        "from pathlib import Path; import sys; "
+        "from cozy_runtime.internal import package_environment as p; "
+        f"path = Path({str(extra_wheel)!r}); base = p.observe_base(); "
+        "wheel, verified = p.measure_wheel(path, 'project', base); "
+        "source = p.Input('sha256:' + 'a'*64, wheel.digest, (wheel,), "
+        "(p.BlobGrant(wheel.digest, wheel.length, path, verified),)); "
+        f"result = p.materialize(source, Path({str(tmp_path / 'authored')!r}), "
+        "base=base, dependency_python=Path(sys.executable)); print(result.python)",
+    )
+    (site / "snapshotextra.py").write_text("raise AssertionError('original extra used')\n")
+    python(authored_python, "from snapshotproject import value; assert value == 47")
+    # Restore its recorded bytes; the following builtin should omit it entirely.
+    (site / "snapshotextra.py").write_text("value = 47\n")
     unrelated = _distribution(site, "unrelated-sdk-tool", {"unused.dat": b"not needed"})
     # Deliberately absent bytes prove capture never tries copying an unrelated
     # installed dependency; the real Runtime closure still gets captured below.
@@ -90,6 +127,7 @@ assert broker is not None and 'numpy' not in sys.modules
         str(core / "bin/python"), "builtin-capture", tmp_path / "captured", offline=True
     )
     assert "unrelated-sdk-tool" not in captured["closure"]
+    assert "snapshotextra" not in captured["closure"]
     assert not (
         Path(captured["environment_python"]).parent.parent / unrelated.relative_to(core)
     ).exists()

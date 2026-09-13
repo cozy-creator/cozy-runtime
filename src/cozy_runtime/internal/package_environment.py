@@ -2407,12 +2407,18 @@ def _materialize_dependency_snapshot(
     provided = {
         item.wheel.distribution: (item.wheel.version, item.requirements) for item in inspected
     }
-    included = _installed_dependencies.required_distributions(
-        dependency_python,
-        provided,
-        _marker_environment(observed),
-        allow_absent=frozenset({"numpy"}) if builtin_capture is not None else frozenset(),
-    )
+    # The fixed carrier has no root extras. Authored local packages can have a
+    # selected CUDA extra, but PrepareLocalPackage does not carry that selection.
+    # Preserve their installed closure until that exact selection is supplied;
+    # inferring it from Requires-Dist alone would silently drop optional inputs.
+    included = None
+    if builtin_capture is not None:
+        included = _installed_dependencies.required_distributions(
+            dependency_python,
+            provided,
+            _marker_environment(observed),
+            allow_absent=frozenset({"numpy"}),
+        )
     uv = _uv_binary()
     if _observed_uv_version(uv) != observed.uv_version:
         raise EnvironmentRefusal("package_environment_uv_changed", observed.uv_version)
@@ -2436,10 +2442,10 @@ def _materialize_dependency_snapshot(
         _install_with_uv(
             uv, python, staging, inspected, supplements, dependencies=copy_dependencies
         )
-        _installed_dependencies.verify_files(staging, manifest)
         if supplements:
             # Only newly resolved optional numerical files join the existing immutable
-            # snapshot. Verify original SDK bytes first; the resolver cannot replace them.
+            # snapshot. The final verification below covers both the original SDK bytes
+            # and the supplement; the resolver cannot replace a captured dependency.
             additional = _installed_dependencies.snapshot(
                 staging / "bin/python", staging, set(), included={"numpy"}, inventory_only=True
             )
@@ -2469,12 +2475,13 @@ def _materialize_dependency_snapshot(
         _installed_dependencies.verify_files(staging, manifest)
         # Re-read the copied metadata after wheel installation: a source edit during
         # capture cannot silently leave an incomplete transitive closure.
-        _installed_dependencies.required_distributions(
-            staging / "bin/python",
-            provided,
-            _marker_environment(observed),
-            allow_absent=frozenset({"numpy"}) if builtin_capture else frozenset(),
-        )
+        if builtin_capture is not None:
+            _installed_dependencies.required_distributions(
+                staging / "bin/python",
+                provided,
+                _marker_environment(observed),
+                allow_absent=frozenset({"numpy"}) if builtin_capture else frozenset(),
+            )
         actual = observe_base(staging / "bin" / "python")
         if actual.interpreter_identity != observed.interpreter_identity:
             raise EnvironmentRefusal(
