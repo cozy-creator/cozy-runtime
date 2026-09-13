@@ -361,14 +361,40 @@ class Executions:
                 worker_boot,
             )
 
-    def capture(self, owner: str, request: str) -> dict[str, Any]:
+    def retry_policy(self, owner: str, request: str) -> tuple[int, int]:
+        """Local descendants inherit the root's accepted automatic retry limits."""
+        root = self.capture_root(owner, request)
         with self.workspace.locked() as db:
-            raw = self._row(db, owner, request)["capture_document"]
+            row = self._row(db, owner, root)
+            return row["max_attempts"], row["retry_delay_ms"]
+
+    def capture(self, owner: str, request: str) -> dict[str, Any]:
+        root = self.capture_root(owner, request)
+        with self.workspace.locked() as db:
+            raw = self._row(db, owner, root)["capture_document"]
             return documents.read(raw, pb.MachineExecutionCapture)
+
+    def capture_root(self, owner: str, request: str) -> str:
+        """Children reference their original capture instead of copying its package inventory."""
+        with self.workspace.locked() as db:
+            seen: set[str] = set()
+            while request not in seen and len(seen) <= 32:
+                seen.add(request)
+                if self._row(db, owner, request)["capture_document"]:
+                    return request
+                parent = db.execute(
+                    "SELECT parent_request FROM execution_calls WHERE owner=? AND child_request=?",
+                    (owner, request),
+                ).fetchone()
+                if parent is None:
+                    break
+                request = parent[0]
+        raise WorkspaceRefusal("execution has no bounded original capture ancestry")
 
     def abandon(self, owner: str, request: str) -> bool:
         """Relinquish this stopped root through existing native release operations."""
         from . import workspace_finalize
+        from .workspace_calls import Calls
 
         with self.workspace.locked() as db:
             row = self._row(db, owner, request)
@@ -376,6 +402,7 @@ class Executions:
                 row["desired"] != "cancel"
                 or row["state"] not in TERMINAL
                 or row["retention_waived"]
+                or Calls.unsettled_effects_in(db, owner, request)
             ):
                 return False
             attempts = db.execute(
@@ -526,13 +553,21 @@ class Executions:
 
     def _retryable(self, row: Row, body: dict[str, Any]) -> bool:
         cause = body.get("cause", {})
+        executor_loss = (
+            body.get("status") == pb.OUTCOME_STATUS_ABANDONED
+            and cause.get("code") == pb.CAUSE_CODE_EXECUTOR_INVALIDATED
+            and cause.get("origin") == pb.CAUSE_ORIGIN_EXECUTOR
+        )
         if (
             row["desired"] != "run"
             or row["ordinal"] >= row["max_attempts"]
             or body.get("status") not in (pb.OUTCOME_STATUS_FAILED, pb.OUTCOME_STATUS_ABANDONED)
             or cause.get("code")
             not in (pb.CAUSE_CODE_EXECUTOR_FAULT, pb.CAUSE_CODE_EXECUTOR_INVALIDATED)
-            or cause.get("origin") not in (pb.CAUSE_ORIGIN_WORKER, pb.CAUSE_ORIGIN_RUNTIME)
+            or (
+                not executor_loss
+                and cause.get("origin") not in (pb.CAUSE_ORIGIN_WORKER, pb.CAUSE_ORIGIN_RUNTIME)
+            )
         ):
             return False
         spec = documents.read(
@@ -818,7 +853,12 @@ class Executions:
 
     def retention_required(self, owner: str) -> bool:
         Workspace.owner(owner)
-        with self.workspace.locked() as db:
+        with self.workspace.locked(allow_frozen=True) as db:
+            if (
+                db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
+                != "active"
+            ):
+                return True
             return (
                 db.execute(
                     "SELECT 1 FROM executions WHERE owner=? AND "

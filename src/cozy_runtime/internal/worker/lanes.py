@@ -325,6 +325,7 @@ class LaneSet:
     orchestration: DeviceLane
     worker_pid: int
     by_id: dict[str, DeviceLane] = field(default_factory=dict)
+    composition: dict[str, DeviceLane] = field(default_factory=dict)
     #: moves on every fuse and split: the seat set changed meaning (`admission_epoch`)
     revision: int = 0
 
@@ -350,7 +351,7 @@ class LaneSet:
         )
 
     def __iter__(self) -> Iterator[DeviceLane]:
-        return iter((*self.lanes, self.envelope, self.orchestration))
+        return iter((*self.lanes, self.envelope, self.orchestration, *self.composition.values()))
 
     def __len__(self) -> int:
         return len(self.lanes)
