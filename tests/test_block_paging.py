@@ -9,7 +9,8 @@ from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import DeclaredBinding, PlanChooser
 
 
-def test_h3_encoder_block_floor_reaches_the_attempt_planner() -> None:
+@pytest.mark.parametrize("degree", [1, 2, 4])
+def test_h3_encoder_block_floor_reaches_the_attempt_planner(degree: int) -> None:
     # Exact full-H3 meta census, including its non-persistent buffers. These are
     # shape facts, not a claimed activation peak or a full-video fit certificate.
     nominal, working = 51_506_192_132, 2_898_621_988
@@ -38,7 +39,7 @@ def test_h3_encoder_block_floor_reaches_the_attempt_planner() -> None:
         release="fixture@1",
         model_weight_bytes=nominal,
     )
-    chooser = PlanChooser(ledger)
+    chooser = PlanChooser(ledger, degree=degree)
     _, rows, chosen, _ = chooser._walk(binding, "fixture")
     assert chosen == "component_staged", rows
     assert rows[0]["verdict"] == "construction_parked"

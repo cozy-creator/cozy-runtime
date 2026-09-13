@@ -148,22 +148,20 @@ def test_a_group_pin_refuses_typed_then_fuses() -> None:
     assert "declares no sequence-parallel degree" in undeclared.detail
     wrong = refused((0, 2), degrees=(4,))
     assert wrong.code == "device_group_unsupported" and "[4]" in wrong.detail
-    # 3. per-device fit: every rank holds the full weights, so EVERY card must hold them
+    # 3. readable capacity: every rank must receive a measured prepare ceiling
     unreadable = refused((0, 2))
     assert unreadable.code == "device_group_infeasible"
     assert "ordinal 2 ('2') free bytes unreadable" in unreadable.detail
     lanes_.release("t")
-    short = refused((0, 1), declared=5 * GiB)
-    assert short.code == "device_group_infeasible"
-    assert "ordinal 1 ('1') has 4294967296 B measured headroom" in short.detail
-    assert "ordinal 0" not in short.detail, "device 0 fits; only the short card is named"
     # a weightless placement shards nothing
     with pytest.raises(lanes.LaneRefusal) as weightless:
         lanes_.assign("w", model_bearing=False, declared_bytes=0, measured={}, pin=(0, 1))
     assert weightless.value.code == "device_group_unsupported"
-    # then the fuse: one lane, both devices, one row per device when measured
+    # Estimated weights exceed both cards: bounded construction, not assignment,
+    # discovers paging and decides the executable working set.
+    # Then the fuse: one lane, both devices, one row per device when measured
     group = lanes_.assign(
-        "g", model_bearing=True, declared_bytes=GiB, measured=MEASURED, pin=(0, 1), degrees=(2,)
+        "g", model_bearing=True, declared_bytes=50 * GiB, measured=MEASURED, pin=(0, 1), degrees=(2,)
     )
     assert group.lane_id == "lane-0+1" and group.placements == {"g"} and lanes_.revision == 1
     assert lanes_.lane_of("g") is group
