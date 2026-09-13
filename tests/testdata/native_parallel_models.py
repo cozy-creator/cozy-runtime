@@ -31,6 +31,8 @@ from cozy_runtime.internal.local import development_source_digest, stage_develop
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+from cozy_runtime.internal.worker.ledger import Ledger
+from cozy_runtime.internal.worker.plan import PlanChooser, PreparedModel, PreparedRequest
 from cozy_runtime.internal.worker.session import executor_prepare_command
 
 PACKAGE = Path(__file__).parent / "dual_model_package"
@@ -111,6 +113,7 @@ def install_cpu_transport() -> None:
     setattr(torch.cuda, "stream", lambda _stream: contextlib.nullcontext())  # noqa: B010
     setattr(torch.cuda, "Event", lambda *args, **kwargs: _CpuEvent())  # noqa: B010
     setattr(torch.cuda, "current_stream", lambda *args, **kwargs: _CpuEvent())  # noqa: B010
+    setattr(torch.cuda, "default_stream", lambda *args, **kwargs: _CpuEvent())  # noqa: B010
 
 
 def cpu_accounting() -> None:
@@ -298,6 +301,45 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         assert len(executor.model_executors) == 2
         assert set(executor.models) == {"base", "overlay"}
         assert all(child.facts["filled_bytes"] > 0 for child in executor.model_executors)
+        # Cross the real admission boundary before calling either model directly.
+        # The former fixture skipped the chooser and could not expose the invented
+        # aggregate delivery rung that refused real turbo serving requests.
+        resolved = PreparedModel.from_reply(reply)
+        ledger = Ledger()
+        ledger.observe_construction(reply["facts"])
+        chooser = PlanChooser(ledger, degree=degree)
+        request_id = "native-multi-model-invocation"
+        request = executor.prepare_request(
+            {"request_id": request_id, "entrypoint": "generate", "payload": {"value": 9}}
+        )
+        assert request["ok"], request
+        prepared = PreparedRequest(
+            request_id=request_id,
+            entrypoint="generate",
+            features=request["features"],
+            features_digest=request["features_digest"],
+            overlay_digest=request["overlay_digest"],
+            facts_digest=request["facts_digest"],
+        )
+        attempt_plan = chooser.choose(binding, resolved, prepared)
+        deliveries = attempt_plan.document()["model_deliveries"]
+        assert set(deliveries) == {"base", "overlay"}, deliveries
+        assert {name: row["routes"] for name, row in deliveries.items()} == {
+            name: row["delivery"]["routes"] for name, row in reply["facts"]["models"].items()
+        }
+        served = executor.invoke(
+            {
+                "request_id": request_id,
+                "entrypoint": "generate",
+                "deadline_s": None,
+                "spool": str(root / "invocation"),
+                "placement": attempt_plan.placement,
+                "headroom_bytes": attempt_plan.headroom_bytes,
+                "scope_headroom_bytes": dict(attempt_plan.scope_headroom_bytes),
+            }
+        )
+        assert served["ok"] and served["outcome"]["terminal"] == "succeeded", served
+        assert not executor.poisoned
         executor._attempt_spool = root / "attempt"
         scope_headrooms = {"base.sample": 11, "overlay.sample": 17}
         executor.residency.open_attempt("all_resident", 0, scope_headrooms)

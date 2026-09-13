@@ -1941,18 +1941,33 @@ class Executor:
                 routes[str(name)] = routes.get(str(name), 0) + int(count)
             for name, count in (delivery.get("kernels") or {}).items():
                 kernels[str(name)] = kernels.get(str(name), 0) + int(count)
+        deliveries = {parameter: reply["delivery"] for parameter, _, reply in children}
+        materializations = {row.get("materialization", "") for row in deliveries.values()}
         delivery = {
-            "variant": "joint",
-            "label": "joint",
-            "rung": "joint",
-            "delivery": "mixed",
-            "materialization": "joint",
+            "variant": ", ".join(
+                f"{parameter}={row.get('variant', '')}" for parameter, row in deliveries.items()
+            ),
+            "label": ", ".join(
+                f"{parameter}: {row.get('label', '')}" for parameter, row in deliveries.items()
+            ),
+            # This is a summary over independently resolved models, never a new rung.
+            "models": deliveries,
+            "delivery": "float" if routes.get("decoded_float") else "native",
+            "materialization": (
+                "staged_decode"
+                if "staged_decode" in materializations
+                else "aot_decode"
+                if "aot_decode" in materializations
+                else ""
+            ),
             "routes": routes,
             "kernels": kernels,
             "calibrated": all(
                 bool(reply.get("delivery", {}).get("calibrated")) for _, _, reply in children
             ),
-            "objective": "joint",
+            "objective": ", ".join(
+                sorted({str(row.get("objective", "")) for row in deliveries.values()})
+            ),
         }
         self.facts = {
             "cuda_init_ms": sum(float(facts.get("cuda_init_ms", 0)) for _, facts in facts_rows),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, cast
 
 import msgspec
@@ -128,9 +129,15 @@ class Input(msgspec.Struct):
 
 class Output(msgspec.Struct):
     value: int
+    checksum: float
 
 
 @app.entrypoint
 def generate(payload: Input, base: Base, overlay: Overlay) -> Output:
-    del base, overlay
-    return Output(payload.value)
+    device = next(base.pipe.components["dit"].parameters()).device
+    values = {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in batch().items()
+    }
+    result = base.sample(overlay, SimpleNamespace(values=values), lambda: None)
+    return Output(payload.value, sum(float(value.sum()) for value in result))
