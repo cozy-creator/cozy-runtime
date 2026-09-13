@@ -87,7 +87,7 @@ class Effects:
     def _run(self, owner: str, original: Call) -> None:
         call = self.journal.get(owner, original.parent_request, original.call_index)
         try:
-            if call.result or call.safe_code:
+            if call.result or (call.safe_code and not call.sent):
                 return
             with self.workspace.locked() as db:
                 pure = db.execute(
@@ -154,6 +154,8 @@ class Effects:
                 )
                 self.journal.refuse(owner, latest, code, "publication was refused before any write")
                 return
+            if latest.sent and isinstance(exc, PublicationRefusal) and not transient:
+                self.journal.unresolved(owner, latest, exc.code)
             # An interrupted/revoked authority does not establish whether a prior
             # send committed. Keep the obligation and exact baseline for readback.
             self.executions.progress(
@@ -240,8 +242,7 @@ class Effects:
         for row in rows:
             if not (
                 row["result"]
-                or row["safe_code"]
-                or (not row["sent"] and row["desired"] == "cancel")
+                or (not row["sent"] and (row["safe_code"] or row["desired"] == "cancel"))
             ):
                 continue
             with self.workspace.locked() as db:

@@ -32,3 +32,22 @@ def test_ungranted_effect_is_durably_refused_without_external_send(tmp_path: Pat
         assert not calls.pending_effects("another-owner")
     finally:
         effects.close()
+
+
+def test_failed_effect_remains_reconcilable_after_parent_stops(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    calls = Calls(workspace)
+    call = calls.accept("owner", request(running(executions), module=effect_interfaces.MODULE))
+    calls.before_write("owner", call)
+    calls.unresolved("owner", call, "publication.outcome_unknown")
+    executions.control("owner", "parent", "cancel", 1, "cancel")
+    failed = calls.get("owner", "parent", 0)
+    assert failed.safe_code == "publication.outcome_unknown"
+    assert calls.has_unsettled_effects("owner", "parent")
+    assert calls.pending_effects("owner") == [failed]
+    calls.complete("owner", call, b'{"revision":1}')
+    observed = calls.get("owner", "parent", 0)
+    assert observed.result and not observed.safe_code
+    assert not calls.has_unsettled_effects("owner", "parent")
