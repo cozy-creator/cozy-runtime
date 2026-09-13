@@ -864,7 +864,12 @@ class Executions:
 
     def retention_required(self, owner: str) -> bool:
         Workspace.owner(owner)
-        with self.workspace.locked() as db:
+        with self.workspace.locked(allow_frozen=True) as db:
+            if (
+                db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
+                != "active"
+            ):
+                return True
             return (
                 db.execute(
                     "SELECT 1 FROM executions WHERE owner=? AND "
