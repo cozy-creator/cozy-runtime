@@ -8,23 +8,20 @@ publication credential. Publication belongs to Tensorhub's production transactio
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from importlib.resources import files
 from typing import Any, NamedTuple, Protocol, cast
 
 import msgspec
 import numpy as np
+from tensorfs.derived import Config, DerivedTransaction, Part, SourceInspection, Target, Tensor
 
 from cozy_runtime.author import (
     Context,
     Model,
     Telemetry,
     UnsupportedInput,
-    WeightsConfig,
-    WeightsPart,
     WeightsSink,
-    WeightsTarget,
-    WeightsTensor,
     WeightsTransaction,
 )
 
@@ -184,12 +181,12 @@ class Bf16Stats(msgspec.Struct):
     converted_keys: int
     source_bytes_read: int
     new_bytes_written: int
-    worst_relative_frobenius: float
+    worst_relative_frobenius: float | None
 
 
 _ARTIFACT_SPECS = {
     # TensorFS 0.3's exact, vector-backed platform specs. Aliases are display;
-    # WeightsTensor always carries the immutable spec identity.
+    # Tensor always carries the immutable spec identity.
     "fp8-rowwise/1": "sha256:c4be0120fb4548306b134f6ee07eb2545a363bc140a005af1ef6543c790cf890",
     "mxfp8/1": "sha256:7e9b1ad8f2e5ddd236a4d4303042d632a96eadef4f25d44eb0fb63124cec7cfd",
 }
@@ -266,43 +263,58 @@ def prepare_quantization(plan_bytes: bytes) -> ArtifactQuantizationPlan:
     return _artifact_plan(plan_bytes)
 
 
-def prepare_bf16(structure: SourceStructure, *, keep: tuple[str, ...] = ()) -> Bf16Plan:
-    """Plan the fp32→bf16 ingest normalization from granted structure facts (#695).
+def source_rows(structure: SourceStructure | SourceInspection) -> Iterator[tuple[str, str, Any]]:
+    """Traverse native metadata; keep the existing published structural callers usable."""
+    if isinstance(structure, SourceInspection):
+        for component, tensors in structure.components.items():
+            for key, tensor in tensors.items():
+                yield component, key, tensor
+    else:
+        for legacy_tensor in structure.tensors:
+            yield legacy_tensor.component, legacy_tensor.key, legacy_tensor
 
-    Only plain f32 tensors convert: fp16 carries the same bytes and would lose three
-    mantissa bits for nothing, so fp16/bf16 and every already-encoded tensor inherit
-    untouched. A component named in ``keep`` is precision-sensitive by the ingest
-    config's own declaration — its f32 tensors inherit at source precision and are
-    recorded in ``kept``.
-    """
+
+def source_parts(tensor: Any) -> Mapping[str, Any]:
+    parts = tensor.parts
+    return parts if isinstance(parts, Mapping) else {part.name: part for part in parts}
+
+
+def completed_parts(
+    transaction: WeightsTransaction | DerivedTransaction,
+) -> set[tuple[str, str, str]]:
+    # The old property remains for active released consumers during cr174's cut.
+    value = transaction.completed_parts
+    return set(value() if callable(value) else value)
+
+
+def prepare_bf16(
+    structure: SourceStructure | SourceInspection, *, keep: tuple[str, ...] = ()
+) -> Bf16Plan:
+    """Plan only plain f32 normalization; preserve other precision and encodings."""
     keep_set = set(keep)
     if len(keep_set) != len(keep):
         raise UnsupportedInput("keep list repeats a component")
-    available = {tensor.component for tensor in structure.tensors}
-    missing = sorted(keep_set - available)
+    rows = list(source_rows(structure))
+    components = list(dict.fromkeys(component for component, _, _ in rows))
+    missing = sorted(keep_set - set(components))
     if missing:
         raise UnsupportedInput(f"keep list names absent components {missing}")
-    components: list[str] = []
     tensors: list[Bf16Tensor] = []
     kept: list[tuple[str, str]] = []
-    order: list[tuple[str, str]] = []
-    for tensor in structure.tensors:
-        if tensor.component not in components:
-            components.append(tensor.component)
-        order.append((tensor.component, tensor.key))
+    order = [(component, key) for component, key, _ in rows]
+    for component, key, tensor in rows:
         if tensor.logical_dtype != "f32":
             continue
-        if tensor.component in keep_set:
-            kept.append((tensor.component, tensor.key))
+        if component in keep_set:
+            kept.append((component, key))
             continue
-        role = _plain_source_role(tensor)
         tensors.append(
             Bf16Tensor(
-                tensor.component,
-                tensor.key,
+                component,
+                key,
                 tensor.logical_dtype,
-                tensor.shape,
-                role,
+                tuple(tensor.shape),
+                _plain_source_role(tensor),
             )
         )
     if not components or not order:
@@ -311,20 +323,18 @@ def prepare_bf16(structure: SourceStructure, *, keep: tuple[str, ...] = ()) -> B
 
 
 def prepare_source_quantization(
-    structure: SourceStructure,
-    *,
-    components: tuple[str, ...],
+    structure: SourceStructure | SourceInspection, *, components: tuple[str, ...]
 ) -> ArtifactQuantizationPlan:
     """Select plain rank-2 weights that both row-wise encodings can represent."""
-    available = {tensor.component for tensor in structure.tensors}
-    missing = sorted(set(components) - available)
+    rows = list(source_rows(structure))
+    missing = sorted(set(components) - {component for component, _, _ in rows})
     if missing:
         raise UnsupportedInput(f"weights source has no components {missing}")
     selected: list[QuantizationTensor] = []
-    for tensor in structure.tensors:
+    for component, key, tensor in rows:
         if (
-            tensor.component not in components
-            or not tensor.key.endswith(".weight")
+            component not in components
+            or not key.endswith(".weight")
             or tensor.logical_dtype not in {"f16", "bf16", "f32"}
             or len(tensor.shape) != 2
             or tensor.shape[1] % 32
@@ -332,8 +342,8 @@ def prepare_source_quantization(
             continue
         selected.append(
             QuantizationTensor(
-                component=tensor.component,
-                key=tensor.key,
+                component=component,
+                key=key,
                 logical_dtype=tensor.logical_dtype,
                 shape=(tensor.shape[0], tensor.shape[1]),
                 source_role=_plain_source_role(tensor),
@@ -342,10 +352,10 @@ def prepare_source_quantization(
     if not selected:
         raise UnsupportedInput("weights source has no block-aligned rank-2 float weights")
     return ArtifactQuantizationPlan(
-        components=list(components),
-        configs=list(structure.configs),
-        order=[(tensor.component, tensor.key) for tensor in structure.tensors],
-        tensors=selected,
+        list(components),
+        list(structure.configs),
+        [(component, key) for component, key, _ in rows],
+        selected,
     )
 
 
@@ -354,22 +364,22 @@ def bf16_targets(
     *,
     source: str,
     excluded: set[tuple[str, str]] | None = None,
-) -> dict[str, WeightsTarget]:
+) -> dict[str, Target]:
     """Declare BF16 replacements for the plan's f32 cut; everything else inherits."""
     omitted = excluded or set()
-    targets: dict[str, WeightsTarget] = {}
+    targets: dict[str, Target] = {}
     for component in plan.components:
         additions = {
-            tensor.key: WeightsTensor(
+            tensor.key: Tensor(
                 logical_dtype="bf16",
                 shape=tensor.shape,
                 encoding=PLAIN_SPEC,
-                parts={"value": WeightsPart("bf16", tensor.shape)},
+                parts={"value": Part("bf16", tensor.shape)},
             )
             for tensor in plan.tensors
             if tensor.component == component and (tensor.component, tensor.key) not in omitted
         }
-        targets[component] = WeightsTarget(
+        targets[component] = Target(
             source=source,
             source_component=component,
             drop=tuple(sorted(additions)),
@@ -379,7 +389,7 @@ def bf16_targets(
 
 
 def write_bf16(
-    transaction: WeightsTransaction,
+    transaction: WeightsTransaction | DerivedTransaction,
     ctx: Context,
     tel: Telemetry,
     *,
@@ -398,9 +408,14 @@ def write_bf16(
     selected = [tensor for tensor in plan.tensors if (tensor.component, tensor.key) not in omitted]
     read = 0
     written = 0
-    worst = 0.0
+    worst: float | None = 0.0
+    completed = completed_parts(transaction)
     for done, tensor in enumerate(selected, 1):
         ctx.raise_if_cancelled()
+        if (tensor.component, tensor.key, "value") in completed:
+            worst = None
+            tel.progress(done / len(selected), stage="bf16")
+            continue
         values, length = _read_values(
             transaction,
             source=source,
@@ -421,8 +436,9 @@ def write_bf16(
             )
         norm = float(np.linalg.norm(values))
         relative = float(np.linalg.norm(error)) / norm if norm else 0.0
-        worst = max(worst, relative)
+        worst = max(worst, relative) if worst is not None else None
         transaction.add_part(tensor.component, tensor.key, "value", raw)
+        transaction.checkpoint()
         read += length
         written += len(raw)
         tel.log(
@@ -445,8 +461,8 @@ def write_bf16(
     )
 
 
-def inherited_configs(plan: Bf16Plan, *, source: str) -> dict[str, WeightsConfig]:
-    return {name: WeightsConfig(source=source, source_config=name) for name in plan.configs}
+def inherited_configs(plan: Bf16Plan, *, source: str) -> dict[str, Config]:
+    return {name: Config("copy", source=source, source_config=name) for name in plan.configs}
 
 
 def quantization_additions(
@@ -455,7 +471,7 @@ def quantization_additions(
     component: str,
     *,
     target_logical_dtype: str | None = None,
-) -> dict[str, WeightsTensor]:
+) -> dict[str, Tensor]:
     """Declare the encoded tensor replacements for one plan component."""
     if encoding not in _ENCODINGS:
         raise UnsupportedInput(f"unsupported quantization encoding {encoding!r}")
@@ -473,7 +489,7 @@ def quantization_additions(
 
 
 def quantize_component_into(
-    transaction: WeightsTransaction,
+    transaction: WeightsTransaction | DerivedTransaction,
     ctx: Context,
     payload: ArtifactQuantizationRequest,
     tel: Telemetry,
@@ -499,7 +515,7 @@ def quantize_component_into(
     saturated = 0
     worst = 0.0
     total = len(tensors)
-    completed = transaction.completed_parts
+    completed = completed_parts(transaction)
     reused = 0
     for done, tensor in enumerate(tensors, 1):
         ctx.raise_if_cancelled()
@@ -620,7 +636,7 @@ def _artifact_tensor(
     tensor: QuantizationTensor,
     *,
     target_logical_dtype: str | None = None,
-) -> WeightsTensor:
+) -> Tensor:
     rows, cols = tensor.shape
     if encoding == "mxfp8/1":
         if cols % 32:
@@ -628,15 +644,15 @@ def _artifact_tensor(
                 f"{tensor.component}.{tensor.key} has {cols} columns, not an MXFP8 block multiple"
             )
         parts = {
-            "data": WeightsPart("f8_e4m3fn", (rows, cols)),
-            "scale": WeightsPart("u8", (rows, cols // 32)),
+            "data": Part("f8_e4m3fn", (rows, cols)),
+            "scale": Part("u8", (rows, cols // 32)),
         }
     else:
         parts = {
-            "data": WeightsPart("f8_e4m3fn", (rows, cols)),
-            "scale": WeightsPart("f32", (rows,)),
+            "data": Part("f8_e4m3fn", (rows, cols)),
+            "scale": Part("f32", (rows,)),
         }
-    return WeightsTensor(
+    return Tensor(
         logical_dtype=target_logical_dtype or tensor.logical_dtype,
         shape=tensor.shape,
         encoding=_ARTIFACT_SPECS[encoding],
@@ -645,7 +661,7 @@ def _artifact_tensor(
 
 
 def _source_values(
-    transaction: WeightsTransaction,
+    transaction: WeightsTransaction | DerivedTransaction,
     tensor: QuantizationTensor,
     *,
     source: str,
@@ -663,7 +679,7 @@ def _source_values(
 
 
 def _read_values(
-    transaction: WeightsTransaction,
+    transaction: WeightsTransaction | DerivedTransaction,
     *,
     source: str,
     component: str,
@@ -696,16 +712,16 @@ def _read_values(
     return values, length
 
 
-def _plain_source_role(tensor: SourceTensor) -> str:
+def _plain_source_role(tensor: Any) -> str:
+    parts = source_parts(tensor)
+    value = parts.get("value")
     if (
-        len(tensor.parts) != 1
-        or tensor.parts[0].name != "value"
-        or tensor.parts[0].dtype != tensor.logical_dtype
-        or tensor.parts[0].shape != tensor.shape
+        len(parts) != 1
+        or value is None
+        or value.dtype != tensor.logical_dtype
+        or tuple(value.shape) != tuple(tensor.shape)
     ):
-        raise UnsupportedInput(
-            f"source {tensor.component}.{tensor.key} is not one plain value role"
-        )
+        raise UnsupportedInput("source tensor is not one plain value role")
     return "value"
 
 
@@ -732,7 +748,7 @@ def _artifact_quantize(
     for tensor in plan.tensors:
         selected[tensor.component][tensor.key] = tensor
     targets = {
-        component: WeightsTarget(
+        component: Target(
             source="source",
             source_component=component,
             drop=tuple(sorted(selected[component])),
@@ -740,8 +756,8 @@ def _artifact_quantize(
         )
         for component in plan.components
     }
-    configs = {name: WeightsConfig(source="source", source_config=name) for name in plan.configs}
-    with artifacts.open(
+    configs = {name: Config("copy", source="source", source_config=name) for name in plan.configs}
+    with cast(Any, artifacts).open(
         "model",
         sources={"source": source},
         targets=targets,

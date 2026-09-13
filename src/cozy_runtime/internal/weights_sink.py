@@ -333,7 +333,8 @@ class WeightsTransactionHost:
             # marshals them once; the compatibility path adds no geometry codec.
             targets=cast("Mapping[str, Target]", request.targets),
             configs={
-                name: Config(**self._config(config)) for name, config in request.configs.items()
+                name: config if isinstance(config, Config) else Config(**self._config(config))
+                for name, config in cast(Mapping[str, Any], request.configs).items()
             },
             order=request.order,
         )
