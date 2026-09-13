@@ -33,6 +33,10 @@ class WorkspaceRefusal(ValueError):
     """A stable workspace identity or custody invariant refused the operation."""
 
 
+class WorkspaceBusy(WorkspaceRefusal):
+    """A foreground custody transition takes precedence over optional collection."""
+
+
 _authority: ContextVar[Callable[[], None]] = ContextVar("workspace_authority", default=lambda: None)
 
 
@@ -150,11 +154,14 @@ class Workspace:
                 os.close(fd)
 
     @contextmanager
-    def locked(self, *, allow_frozen: bool = False) -> Iterator[Journal]:
+    def locked(self, *, allow_frozen: bool = False, blocking: bool = True) -> Iterator[Journal]:
         lock = os.open(self.directory / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         db: Journal | None = None
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError as exc:
+                raise WorkspaceBusy("foreground workspace transition is active") from exc
             guard = _authority.get()
             guard()
             path = self.directory / "journal.sqlite3"

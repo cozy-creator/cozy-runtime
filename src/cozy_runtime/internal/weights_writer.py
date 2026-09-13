@@ -438,7 +438,11 @@ class WriterBroker:
                         ),
                     )
             with self.lock, lease.scope():
-                result = self._handle(attempt, frame)
+                result = self._handle(
+                    attempt,
+                    frame,
+                    estimate_only=operation == "open" and storage_admission.pressure_enabled(),
+                )
                 if operation in {"part", "config", "fence"} or not result.get("ok"):
                     self.pending.pop(key, None)
                     if borrowed is not None:
@@ -448,30 +452,45 @@ class WriterBroker:
         finally:
             if lease is not None and lease is not borrowed:
                 lease.close()
-        if operation == "open" and result.get("ok"):
+        if operation == "open" and result.get("ok") and "estimate" in result:
             try:
-                self._preflight_writers(attempt)
+                lease = self._preflight_writers(attempt, result["estimate"])
+                try:
+                    # Native inspection has dropped its read holds. Reclaim/admit
+                    # before opening, and revalidate the exact request under the
+                    # broker lock before any writer becomes visible to the author.
+                    with lease.scope(), self.lock:
+                        result = self._handle(attempt, frame)
+                finally:
+                    lease.close()
             except Exception as exc:
-                # The native writer retains completed parts, but no package may
-                # start expensive work with an already-insufficient disk budget.
-                with self.lock:
-                    held = self.writers.pop(key, None)
-                    if held is not None:
-                        held[0].fence()
                 return self._refused(exc)
         return result
 
-    def _preflight_writers(self, attempt: Any) -> None:
-        """Check remaining declared additions before handing writers to the package.
+    def _preflight_writers(
+        self, attempt: Any, estimate: Mapping[str, Any]
+    ) -> storage_admission.Lease:
+        """Admit exact remaining additions before acquiring a new native writer.
 
-        This is a preflight, not a long-held reservation: the per-part write/read
-        leases still arbitrate concurrent I/O. Native completion owns resume state;
-        inherited roles and completed roles consume no new-payload budget here.
+        This hold ends after begin: per-part leases still arbitrate later I/O.
+        Native inspection owns resume accounting; inherited/grafted and verified
+        completed roles consume no new-payload budget here.
         """
-        if not storage_admission.enabled():
-            return
+        payload, largest, parts = (
+            estimate.get("payload_bytes"),
+            estimate.get("largest_part_bytes"),
+            estimate.get("parts"),
+        )
+        if (
+            type(payload) is not int
+            or payload < 0
+            or type(largest) is not int
+            or largest < 0
+            or type(parts) is not int
+            or parts < 0
+        ):
+            raise storage_admission.StorageRefusal("native writer estimate is not bounded")
         dtypes = fill.tensorfs_module().dtypes()
-        payload = largest = parts = 0
         with self.lock:
             for key, (writer, declaration) in self.writers.items():
                 if key[:2] != (attempt.request_id, attempt.attempt):
@@ -488,13 +507,14 @@ class WriterBroker:
                             parts += 1
         # Configs and commit metadata use the existing native document allowance.
         # One added role and its source-read window can coexist in the spool.
-        with storage_admission.admit(
+        return storage_admission.acquire(
             storage_admission.native_write(self.store_root, payload, parts),
             storage_admission.Write(attempt.spool, largest + MAX_WEIGHTS_SOURCE_READ, 3),
-        ):
-            pass
+        )
 
-    def _handle(self, attempt: Any, frame: Mapping[str, Any]) -> dict[str, Any]:
+    def _handle(
+        self, attempt: Any, frame: Mapping[str, Any], *, estimate_only: bool = False
+    ) -> dict[str, Any]:
         import io
 
         transaction = str(frame.get("weights_transaction_id", ""))
@@ -569,6 +589,17 @@ class WriterBroker:
                     raise CapabilityError(
                         "writer declaration changed after intent", code="weights_writer_declaration"
                     )
+                if estimate_only:
+                    return {
+                        "ok": True,
+                        "estimate": store.derived_write_estimate(
+                            transaction,
+                            binding.epoch,
+                            *args,
+                            work_fingerprint=fingerprint,
+                            checkpoint=binding.checkpoint,
+                        ),
+                    }
                 writer = store.begin_derived(
                     transaction,
                     binding.epoch,

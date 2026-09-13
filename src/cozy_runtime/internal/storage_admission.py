@@ -13,11 +13,12 @@ import json
 import os
 import socket
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from cozy_runtime.internal import fill
 
@@ -44,10 +45,36 @@ class Write:
 
 _channel: socket.socket | None = None
 _held: ContextVar[bool] = ContextVar("storage_admission_held", default=False)
+_reclaimers: WeakValueDictionary[int, Registration] = WeakValueDictionary()
+_reclaiming: ContextVar[bool] = ContextVar("storage_reclaiming", default=False)
 
 
 def enabled() -> bool:
     return _channel is not None
+
+
+def pressure_enabled() -> bool:
+    return enabled() or bool(_reclaimers)
+
+
+@dataclass(eq=False)
+class Registration:
+    """A worker lifetime reference, not another durable storage owner."""
+
+    root: Path
+    reclaim: Callable[[int], object]
+
+    def close(self) -> None:
+        _reclaimers.pop(id(self), None)
+
+
+def register_workspace(root: Path, reclaim: Callable[[int], object]) -> Registration:
+    """Only a worker's already-open native workspace supplies deletion authority."""
+    if not root.is_absolute() or not (root / ".cozy-workspace").is_dir():
+        raise StorageRefusal("pressure recovery requires an existing Runtime workspace")
+    registration = Registration(root, reclaim)
+    _reclaimers[id(registration)] = registration
+    return registration
 
 
 def native_write(path: Path | None, payload: int = 0, objects: int = 1) -> Write:
@@ -57,7 +84,7 @@ def native_write(path: Path | None, payload: int = 0, objects: int = 1) -> Write
     per MiB (well above native's 64 MiB pack grid), plus per-file fanout. These
     are transient write estimates, never TensorFS reachability or quota policy.
     """
-    if _channel is None:
+    if not pressure_enabled():
         return Write(path or Path("/"), 0, 0)
     if path is None:
         raise StorageRefusal("native writer has no configured Store root")
@@ -112,7 +139,7 @@ class Lease:
 
 
 def acquire(*writes: Write) -> Lease:
-    if _channel is None:
+    if not pressure_enabled():
         return Lease()
     if _held.get():
         raise StorageRefusal("nested storage admission would deadlock; combine write destinations")
@@ -129,15 +156,67 @@ def acquire(*writes: Write) -> Lease:
         [{"path": str(row.path), "bytes": row.bytes, "inodes": row.inodes} for row in writes],
         separators=(",", ":"),
     ).encode()
-    context = _exchange(body, tuple(row.path for row in writes))
-    context.__enter__()
+
+    def admission() -> AbstractContextManager[dict[str, object]]:
+        if _channel is not None:
+            return _exchange(body, tuple(row.path for row in writes))
+        from . import local_storage_admission
+
+        registrations = tuple(_reclaimers.values())
+        if not registrations:
+            raise StorageRefusal("local write has no live workspace admission owner")
+        return local_storage_admission.acquire(registrations[0].root, writes)
+
+    context = admission()
+    try:
+        context.__enter__()
+    except StorageRefusal as exc:
+        # The failed exchange/exclusion is closed before native recovery. A single
+        # retry re-observes real capacity; a busy collector cannot fabricate space.
+        if not _recover(writes, exc.facts):
+            raise
+        context = admission()
+        context.__enter__()
     return Lease(context)
+
+
+def _recover(writes: tuple[Write, ...], facts: dict[str, int]) -> bool:
+    if _reclaiming.get() or not facts or not _reclaimers:
+        return False
+    required = facts.get("required")
+    available = facts.get("available")
+    reserve = facts.get("reserve", 0) + facts.get("reserved", 0)
+    if type(required) is not int or type(available) is not int or min(required, available) < 0:
+        return False
+    target = max(1, required + reserve - available)
+    if facts.get("required_inodes", 0) > facts.get("available_inodes", 0) - facts.get(
+        "reserve_inodes", 0
+    ) - facts.get("reserved_inodes", 0):
+        target = (1 << 63) - 1
+    from . import local_storage_admission
+
+    token = _reclaiming.set(True)
+    try:
+        devices = {local_storage_admission.device(row.path) for row in writes}
+        matched = False
+        seen: set[Path] = set()
+        for registration in tuple(_reclaimers.values()):
+            root = registration.root
+            if root not in seen and local_storage_admission.device(root) in devices:
+                registration.reclaim(target)
+                seen.add(root)
+                matched = True
+        return matched
+    except OSError as exc:
+        raise StorageRefusal("reclamation filesystem identity is unavailable") from exc
+    finally:
+        _reclaiming.reset(token)
 
 
 @contextmanager
 def admit(*writes: Write) -> Iterator[None]:
     """Hold admission through the actual write/child exit, never just its launch."""
-    if _channel is None:
+    if not pressure_enabled():
         yield
         return
     lease = acquire(*writes)

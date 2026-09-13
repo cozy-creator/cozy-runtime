@@ -10,8 +10,9 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
+from cozy_runtime.internal.local_storage_admission import POLICY
 from cozy_runtime.internal.worker import store_gc
-from cozy_runtime.internal.worker.workspace import _ID, Journal, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import _ID, Journal, WorkspaceBusy, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -809,48 +810,61 @@ def _found(
     return answer
 
 
+def _mark_unused(db: Journal, owner: str, limit: int, cache_id: str | None = None) -> int:
+    """Existing custody rules, with age used only to order eligible victims."""
+    rows = db.execute(
+        "SELECT * FROM operation_cache WHERE owner=? ORDER BY sequence,id", (owner,)
+    ).fetchall()
+    cache_holds = {
+        hold["retention_id"] for row in rows for hold in json.loads(row["body"])["holds"]
+    }
+    selected = 0
+    for row in rows:
+        if row["state"] == "disabled" or (cache_id is not None and row["id"] != cache_id):
+            continue
+        if selected >= limit:
+            break
+        payload = json.loads(row["body"])
+        if not payload["holds"]:
+            continue
+        source = payload["source"]
+        if source.get("kind") == "native":
+            active = db.execute(
+                "SELECT 1 FROM attempts WHERE owner=? AND request=? AND state<>'released'",
+                (owner, source["parent_request"]),
+            ).fetchone()
+        else:
+            active = db.execute(
+                "SELECT 1 FROM attempts WHERE owner=? AND request=? "
+                "AND ordinal=? AND state<>'released'",
+                (owner, source["request_id"], source["attempt_ordinal"]),
+            ).fetchone()
+        pending = db.execute(
+            "SELECT 1 FROM operation_lookups WHERE owner=? AND cache_id=? AND state='retaining'",
+            (owner, row["id"]),
+        ).fetchone()
+        if active is not None or pending is not None:
+            continue
+        external = False
+        for hold in payload["holds"]:
+            roots = db.execute(
+                "SELECT id FROM holds WHERE owner=? AND transaction_id=? "
+                "AND native_digest=? AND state IN ('retaining','held')",
+                (owner, hold["transaction_id"], documents.raw(hold["native_receipt_digest"])),
+            ).fetchall()
+            external |= any(root["id"] not in cache_holds for root in roots)
+        if not external:
+            db.execute("UPDATE operation_cache SET state='evicting' WHERE id=?", (row["id"],))
+            selected += 1
+    return selected
+
+
 def prune(workspace: Workspace, owner: str) -> pb.PruneOperationCacheResult:
     """Drop cache-only native roots; retained computations and live readers win."""
     workspace.owner(owner)
     with workspace.locked() as db:
         removed = _drain(workspace, db, owner)
-        rows = db.execute("SELECT * FROM operation_cache WHERE owner=?", (owner,)).fetchall()
-        cache_holds = {
-            hold["retention_id"] for row in rows for hold in json.loads(row["body"])["holds"]
-        }
-        for row in rows:
-            payload = json.loads(row["body"])
-            if not payload["holds"]:
-                continue
-            source = payload["source"]
-            if source.get("kind") == "native":
-                active = db.execute(
-                    "SELECT 1 FROM attempts WHERE owner=? AND request=? AND state<>'released'",
-                    (owner, source["parent_request"]),
-                ).fetchone()
-            else:
-                active = db.execute(
-                    "SELECT 1 FROM attempts WHERE owner=? AND request=? "
-                    "AND ordinal=? AND state<>'released'",
-                    (owner, source["request_id"], source["attempt_ordinal"]),
-                ).fetchone()
-            pending = db.execute(
-                "SELECT 1 FROM operation_lookups WHERE owner=? AND cache_id=? "
-                "AND state='retaining'",
-                (owner, row["id"]),
-            ).fetchone()
-            if active is not None or pending is not None:
-                continue
-            external = False
-            for hold in payload["holds"]:
-                roots = db.execute(
-                    "SELECT id FROM holds WHERE owner=? AND transaction_id=? "
-                    "AND native_digest=? AND state IN ('retaining','held')",
-                    (owner, hold["transaction_id"], documents.raw(hold["native_receipt_digest"])),
-                ).fetchall()
-                external |= any(root["id"] not in cache_holds for root in roots)
-            if not external:
-                db.execute("UPDATE operation_cache SET state='evicting' WHERE id=?", (row["id"],))
+        _mark_unused(db, owner, MAX_ENTRIES)
         removed += _drain(workspace, db, owner)
         collected = db.native(lambda: store_gc.collect(workspace.store_root))
         return pb.PruneOperationCacheResult(
@@ -858,3 +872,52 @@ def prune(workspace: Workspace, owner: str) -> pb.PruneOperationCacheResult:
             reclaimed_bytes=collected.reclaimed_bytes,
             store_busy=collected.store_busy,
         )
+
+
+def reclaim_unused(
+    workspace: Workspace, *, target_bytes: int, max_entries: int = int(POLICY["max_memo_victims"])
+) -> pb.PruneOperationCacheResult:
+    try:
+        return _reclaim_unused(workspace, target_bytes=target_bytes, max_entries=max_entries)
+    except WorkspaceBusy:
+        return pb.PruneOperationCacheResult(store_busy=True)
+
+
+def _reclaim_unused(
+    workspace: Workspace, *, target_bytes: int, max_entries: int
+) -> pb.PruneOperationCacheResult:
+    """One bounded physical workspace cleanup; no caller may name or release a hold.
+
+    The workspace owns all cached results here. Explicit owners, unfinished producers
+    and pending/native recipients retain priority across every native lock crossing.
+    """
+    if target_bytes <= 0 or not 1 <= max_entries <= MAX_ENTRIES:
+        raise ValueError("cache reclamation requires a positive target and bounded batch")
+    result = pb.PruneOperationCacheResult()
+    with workspace.locked(blocking=False) as db:
+        # A previous busy pass may already have dropped its cache mapping. Sweep
+        # now-unreferenced bytes before choosing another victim, including when
+        # no optional memo roots remain. Live native readers/writers win first.
+        collected = db.native(lambda: store_gc.collect(workspace.store_root))
+        result.reclaimed_bytes = collected.reclaimed_bytes
+        result.store_busy = collected.store_busy
+        if result.store_busy or result.reclaimed_bytes >= target_bytes:
+            return result
+        candidates = db.execute(
+            "SELECT owner,id FROM operation_cache WHERE state<>'disabled' "
+            "ORDER BY sequence,id LIMIT ?",
+            (MAX_ENTRIES,),
+        ).fetchall()
+        for row in candidates:
+            if result.removed_entries >= max_entries or result.reclaimed_bytes >= target_bytes:
+                break
+            owner = row["owner"]
+            if not _mark_unused(db, owner, 1, row["id"]):
+                continue
+            result.removed_entries += _drain(workspace, db, owner)
+            collected = db.native(lambda: store_gc.collect(workspace.store_root))
+            result.reclaimed_bytes += collected.reclaimed_bytes
+            if collected.store_busy:
+                result.store_busy = True
+                break
+    return result

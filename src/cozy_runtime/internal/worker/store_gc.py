@@ -43,6 +43,19 @@ def collect_worker(worker: Worker) -> pb.CollectStoreGarbageResult:
     A busy foreground lane wins immediately, without a waiter blocking control progress.
     """
     root = Path(worker.options.tensorfs_root or "")
+    workspace = getattr(worker, "workspace", None)
+    if workspace is not None:
+        from cozy_runtime.internal import local_storage_admission
+
+        from . import workspace_memo
+
+        target = local_storage_admission.pressure_target(root)
+        if target:
+            pruned = workspace_memo.reclaim_unused(workspace, target_bytes=target)
+            if pruned.store_busy or pruned.removed_entries:
+                return pb.CollectStoreGarbageResult(
+                    reclaimed_bytes=pruned.reclaimed_bytes, store_busy=pruned.store_busy
+                )
     if not worker.options.owns_tensorfs_store:
         return collect(root)
     if not worker.preparation_lock.acquire(blocking=False):
