@@ -114,8 +114,10 @@ from cozy_runtime.internal.worker.lanes import (
     fold_memory,
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
+from cozy_runtime.internal.worker.machine_publication import PublicationTLS
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding, PreparedModel
 from cozy_runtime.internal.worker.records import WorkerRecords
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -301,6 +303,8 @@ class WorkerOptions:
     """
     environment_python: Path | None = None
     """An already-complete local package venv; mutually exclusive with materialization root."""
+    publication_tls: PublicationTLS | None = None
+    """Privileged worker mTLS configuration, never an executor or captured-code value."""
     tensorfs_root: Path | None = None
     """The one host-local executable TensorFS Store."""
     artifact_cache: Path | None = None
@@ -2046,10 +2050,13 @@ class Worker:
         retry_delay_ms: int = 0,
         capture_document: bytes = b"",
         preparation: bytes = b"",
+        publication_authorization_id: str = "",
     ) -> workspace_executions.Receipt:
         """Authenticated root intake; accepted execution never depends on the caller's stream."""
         with self.control_lock:
             executions, owner = self._execution_service(claim)
+            if publication_authorization_id and self.options.publication_tls is None:
+                raise WorkspaceRefusal("worker has no independent publication authority configured")
             result_schema, memoize = b"", False
             spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
             if "job" in spec:
@@ -2083,6 +2090,7 @@ class Worker:
                 capture_document=capture_document,
                 preparation=preparation,
                 worker_id=self.options.worker_id,
+                publication_authorization_id=publication_authorization_id,
             )
             self.publish_activity(strict=True)
             return receipt

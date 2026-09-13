@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import grpc
 
+from cozy.worker.v1.wire_version import MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
@@ -73,6 +74,11 @@ class MachineExecutionRPC:
 
     def SubmitMachineExecution(self, request: pb.MachineExecutionSubmit, context: Any) -> Any:
         def submit() -> pb.MachineExecutionReceipt:
+            if (
+                request.publication_authorization_id
+                and request.claim.wire_minor < MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR
+            ):
+                raise WorkspaceRefusal("publication authority requires Runtime wire52")
             payload = request.payload_canonical_bytes
             if not 0 < len(payload) <= canonical.DOC_MAX_BYTES:
                 raise WorkspaceRefusal("execution payload exceeds its inline argument bound")
@@ -107,6 +113,7 @@ class MachineExecutionRPC:
                     retry_delay_ms=request.retry_delay_ms,
                     capture_document=request.capture_canonical_bytes,
                     preparation=canonical.write(prepared),
+                    publication_authorization_id=request.publication_authorization_id,
                 )
             else:
                 preparation = machine_capture.verify(self.worker, request)
@@ -119,6 +126,7 @@ class MachineExecutionRPC:
                     retry_delay_ms=request.retry_delay_ms,
                     capture_document=request.capture_canonical_bytes,
                     preparation=preparation,
+                    publication_authorization_id=request.publication_authorization_id,
                 )
             assert self.worker.executions is not None
             return pb.MachineExecutionReceipt(

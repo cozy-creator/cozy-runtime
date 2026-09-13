@@ -153,3 +153,28 @@ def test_root_cancel_fences_descendant_writes_and_retains_uncertain_effect(tmp_p
     calls.complete("owner", effect, b'{"revision":1}')
     assert not calls.has_unsettled_effects("owner", "parent")
     assert executions.abandon("owner", "parent")
+
+
+def test_accepted_publication_authority_is_immutable_and_survives_reopen(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    grant = "019aaaab-0000-7000-8000-000000000003"
+    accepted = executions.submit(
+        "owner", "parent", b"c" * 32, offer("parent"), publication_authorization_id=grant
+    )
+    assert accepted.publication_authorization_id == grant
+    reopened = Executions(Workspace(tmp_path / "store"))
+    assert reopened.publication_authorization("owner", "parent") == grant
+    assert (
+        reopened.submit(
+            "owner", "parent", b"c" * 32, offer("parent"), publication_authorization_id=grant
+        )
+        == accepted
+    )
+    for changed in ("", "019aaaab-0000-7000-8000-000000000004"):
+        with pytest.raises(WorkspaceRefusal, match="identity changed"):
+            reopened.submit(
+                "owner", "parent", b"c" * 32, offer("parent"), publication_authorization_id=changed
+            )
+    with pytest.raises(WorkspaceRefusal, match="not held"):
+        reopened.publication_authorization("another-owner", "parent")

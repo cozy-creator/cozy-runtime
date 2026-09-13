@@ -14,6 +14,7 @@ from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 SCHEMA8 = """
+ALTER TABLE executions ADD COLUMN publication_authorization_id TEXT NOT NULL DEFAULT '';
 CREATE TABLE execution_calls (
  owner TEXT NOT NULL, parent_request TEXT NOT NULL, call_index INTEGER NOT NULL,
  parent_ordinal INTEGER NOT NULL, parent_generation INTEGER NOT NULL,

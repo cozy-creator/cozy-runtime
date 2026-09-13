@@ -757,6 +757,20 @@ app.job(helper)
                         dict(denied.value.trailing_metadata())["cozy-error-code"]
                         == "execution_submission_refused"
                     )
+                    for minor, detail in ((51, "wire52"), (52, "no independent publication")):
+                        assert worker.executions is not None
+                        invalid.CopyFrom(submission)
+                        invalid.offer.request_id = f"rejected-authority-{minor}"
+                        invalid.submission_id = invalid.offer.request_id
+                        invalid.claim.wire_minor = minor
+                        invalid.publication_authorization_id = (
+                            "019aaaab-0000-7000-8000-000000000003"
+                        )
+                        with pytest.raises(grpc.RpcError) as ungranted:
+                            client.SubmitMachineExecution(invalid, timeout=30)
+                        assert ungranted.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                        assert detail in ungranted.value.details()
+                        assert not worker.executions.owns("owner", invalid.offer.request_id)
                 receipt = client.SubmitMachineExecution(submission, timeout=30)
                 assert client.SubmitMachineExecution(submission, timeout=30) == receipt
                 if identifier == "first":
