@@ -69,11 +69,29 @@ def offer(
         frame = owner.host.inbound.get_nowait()
         assert frame is not None
         if frame.HasField("attempt_offer"):
+            # The one-shot owner routes to plc-local; this fixture owns two
+            # named placements and must route to the one it actually selected.
+            frame.attempt_offer.placement_id = placement.placement_id
             attempt = worker.engine.offer(frame.attempt_offer)
             worker._bind_attempt_slot(attempt)
             worker.engine.hold(attempt)
             worker.engine.prepare_and_accept(attempt)
             return attempt
+
+
+def acknowledge(worker: Worker, outcome: pb.AttemptOutcome) -> None:
+    worker.on_outcome_ack(
+        pb.AttemptOutcomeAck(
+            worker_boot_id=worker.fence.worker_boot_id,
+            record_owner_epoch=worker.fence.record_owner_epoch,
+            control_stream_epoch=worker.fence.control_stream_epoch,
+            request_id=outcome.request_id,
+            attempt_ordinal=outcome.attempt_ordinal,
+            invocation_spec_digest=outcome.invocation_spec_digest,
+            outcome_id=outcome.outcome_id,
+            outcome_digest=outcome.outcome_digest,
+        )
+    )
 
 
 @needs_executor
@@ -176,6 +194,7 @@ def test_replacement_waits_for_work_then_retires_before_assignment() -> None:
                     outcomes.append(
                         worker.engine.finish(result) if isinstance(result, Released) else result
                     )
+                    acknowledge(worker, outcomes[-1])
                 except BaseException as exc:
                     failures.append(exc)
 
@@ -228,6 +247,7 @@ def test_replacement_waits_for_work_then_retires_before_assignment() -> None:
                 documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)["status"]
                 == pb.OUTCOME_STATUS_SUCCEEDED
             )
+            acknowledge(worker, terminal)
         finally:
             (root / "release").touch()
             for thread in threads:
