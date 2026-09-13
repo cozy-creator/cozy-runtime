@@ -3494,7 +3494,7 @@ class Worker:
         self.calls.close(acked.request_id, acked.attempt_ordinal)
         from . import machine_slots
 
-        machine_slots.release(self, acked.request_id)
+        machine_slots.release(self, acked.request_id, ordinal=acked.attempt_ordinal)
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
         # An acknowledged stopped attempt can leave retained work for another

@@ -74,7 +74,7 @@ class Calls:
                 executions.control(
                     owner,
                     call.child_request,
-                    f"parent-pause.{parent.attempt}",
+                    f"parent-pause.{parent.attempt}.{state.generation}",
                     state.generation,
                     "pause",
                 )
@@ -301,7 +301,7 @@ class Calls:
             executions.control(
                 owner,
                 row["child_request"],
-                f"ancestor-{action}.{row['parent']}.{row['generation']}",
+                f"ancestor-{action}.{row['parent']}.{row['generation']}.{state.generation}",
                 state.generation,
                 action,
             )
