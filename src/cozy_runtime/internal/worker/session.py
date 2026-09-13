@@ -1451,7 +1451,9 @@ class Worker:
         when a co-tenant needs the card (cr-022).
         """
         model_bearing = any(not binding.weightless for binding in bindings.values())
-        declared = sum(binding.model_weight_bytes for binding in bindings.values())
+        # A placement executes one entrypoint at a time. Each binding already sums
+        # its independent model slots; other entrypoints are alternative calls.
+        declared = max((binding.model_weight_bytes for binding in bindings.values()), default=0)
         measured: dict[int, accel.DeviceMemory] = {}
         if model_bearing:
             kind = accel.host_backend_family()
@@ -1461,7 +1463,9 @@ class Worker:
         # validated here and never chosen here. The declared degrees are the package's.
         pin = placement.device_pin
         if pin is not None and len(pin) > 1:
-            declared = sum(binding.group_weight_bytes() for binding in bindings.values())
+            declared = max(
+                (binding.group_weight_bytes() for binding in bindings.values()), default=0
+            )
         degrees: set[int] | None = None
         for binding in bindings.values():
             if binding.weightless:
