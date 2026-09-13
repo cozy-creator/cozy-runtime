@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cozy_runtime.internal import canonical
-from cozy_runtime.internal.delivery import RUNGS_BY_NAME, cost_class
+from cozy_runtime.internal.delivery import RUNGS_BY_NAME, DeliveryRefusal, cost_class
 from cozy_runtime.internal.resolution import ROUTE_KERNEL
 from cozy_runtime.internal.worker.ledger import Ledger
 
@@ -1031,15 +1031,22 @@ class PlanChooser:
                     delivery_variant=str(delivery.get("variant", "")),
                 )
                 child_crossed = self._delivery(child, placement, {})
+                try:
+                    route_costs = {
+                        route: cost_class(route, placement)
+                        for route, count in (delivery.get("routes") or {}).items()
+                        if count
+                    }
+                except DeliveryRefusal as exc:
+                    raise PlanRefusal(exc.code, f"model {parameter!r}: {exc.detail}") from exc
                 # Keep the actual route/kernel census beside its placement-dependent cost.
                 models[parameter] = {
                     **delivery,
                     **child_crossed,
-                    "route_costs": {
-                        route: cost_class(route, placement)
-                        for route, count in (delivery.get("routes") or {}).items()
-                        if count
-                    },
+                    "route_costs": route_costs,
+                    "kernel": "+".join(
+                        sorted(delivery.get("kernels") or {child_crossed["kernel"]: 1})
+                    ),
                 }
             materializations = {row["materialization"] for row in models.values()}
             summary = {

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import socket
 import sys
@@ -17,19 +18,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import tensorfs
 import torch
 
 from cozy_runtime.author import WeightsConfig, WeightsPart, WeightsTarget, WeightsTensor
 from cozy_runtime.author._weights import WeightsCommit
+from cozy_runtime.derive.microscale import encode_fp8_rowwise
 from cozy_runtime.internal import accel, canonical, package_interface, spawn
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.encoding import SPEC_PLAIN
+from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE
 from cozy_runtime.internal.executor import Executor, _capture_seal
 from cozy_runtime.internal.executor import main as executor_main
 from cozy_runtime.internal.local import development_source_digest, stage_development_placement
 from cozy_runtime.internal.parallel.group import RankGroup
-from cozy_runtime.internal.seam import Channel
+from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
 from cozy_runtime.internal.weights_sink import WeightsTransactionHost
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import PlanChooser, PreparedModel, PreparedRequest
@@ -148,13 +151,33 @@ def cpu_accounting() -> None:
     accel.device_identity = cast(Any, identity)
 
 
-def native_model(root: Path, name: str, components: dict[str, Any], config: dict[str, Any]) -> None:
+def native_model(
+    root: Path,
+    name: str,
+    components: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    encoded: bool = False,
+) -> None:
     store = tensorfs.Store.ensure(str(root))
     rows = {
         (component, key): tensor.detach().cpu().contiguous()
         for component, module in components.items()
         for key, tensor in module.state_dict().items()
     }
+    encoded_parts = {}
+    if encoded:
+        # One real FP8 stored matrix makes the base a mixed-route artifact while
+        # the independent overlay remains plain. CPU uses the honest decode path.
+        value = rows["dit", "proj_out.weight"]
+        packed = encode_fp8_rowwise("proj_out.weight", value.numpy())
+        encoded_parts["dit", "proj_out.weight"] = packed
+        data = torch.frombuffer(bytearray(packed.payload), dtype=torch.float8_e4m3fn).reshape(
+            value.shape
+        )
+        scale = torch.from_numpy(np.frombuffer(packed.companions[0].raw, dtype=np.float32).copy())
+        with torch.no_grad():
+            components["dit"].get_parameter("proj_out.weight").copy_(data.float() * scale[:, None])
     max_bytes = sum(t.numel() * t.element_size() for t in rows.values()) + 1_000_000
     host = WeightsTransactionHost(
         store=store,
@@ -177,6 +200,16 @@ def native_model(root: Path, name: str, components: dict[str, Any], config: dict
                         key: WeightsTensor(
                             "f32",
                             tuple(value.shape),
+                            SPEC_ROWWISE,
+                            {
+                                "data": WeightsPart("f8_e4m3fn", tuple(value.shape)),
+                                "scale": WeightsPart("f32", (value.shape[0],)),
+                            },
+                        )
+                        if (owner, key) in encoded_parts
+                        else WeightsTensor(
+                            "f32",
+                            tuple(value.shape),
                             SPEC_PLAIN,
                             {"value": WeightsPart("f32", tuple(value.shape))},
                         )
@@ -192,7 +225,12 @@ def native_model(root: Path, name: str, components: dict[str, Any], config: dict
         )
     )
     for (component, key), value in rows.items():
-        transaction.add_part(component, key, "value", value.numpy().tobytes())
+        if (component, key) in encoded_parts:
+            packed = encoded_parts[component, key]
+            transaction.add_part(component, key, "data", packed.payload)
+            transaction.add_part(component, key, "scale", packed.companions[0].raw)
+        else:
+            transaction.add_part(component, key, "value", value.numpy().tobytes())
     transaction.add_config("model", raw_config, len(raw_config))
     receipt = json.loads(transaction.commit().tensorfs_receipt)
     manifest = "sha256:" + receipt["manifest"]["sha256"]
@@ -231,12 +269,13 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
     overlay = OverlayPipe(Config({}))
     with torch.no_grad():
         overlay.components["projection"].weight.copy_(torch.tensor([[1.0, 0.25], [-0.5, 1.25]]))
+    native_model(store, "base", base.components, {"dit": CONFIG}, encoded=True)
+    native_model(store, "overlay", overlay.components, {})
+    with torch.no_grad():
         expected = base.components["dit"](
             **batch(), attention_kwargs={"projection": overlay.components["projection"]}
         )
         expected_plain = base.components["dit"](**batch())
-    native_model(store, "base", base.components, {"dit": CONFIG})
-    native_model(store, "overlay", overlay.components, {})
     found = discover(PACKAGE)
     interface = package_interface.build(found)
     staged = stage_development_placement(
@@ -324,6 +363,8 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         attempt_plan = chooser.choose(binding, resolved, prepared)
         deliveries = attempt_plan.document()["model_deliveries"]
         assert set(deliveries) == {"base", "overlay"}, deliveries
+        assert deliveries["base"]["routes"].get("decoded_float") == 1, deliveries
+        assert set(deliveries["overlay"]["routes"]) == {"verbatim"}, deliveries
         assert {name: row["routes"] for name, row in deliveries.items()} == {
             name: row["delivery"]["routes"] for name, row in reply["facts"]["models"].items()
         }
@@ -340,6 +381,14 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         )
         assert served["ok"] and served["outcome"]["terminal"] == "succeeded", served
         assert not executor.poisoned
+        result = json.loads((root / "invocation" / RESULT_DOCUMENT).read_bytes())
+        assert result["value"] == 9
+        assert math.isclose(
+            result["checksum"],
+            sum(float(value.sum()) for value in expected),
+            rel_tol=2e-5,
+            abs_tol=2e-6,
+        ), result
         executor._attempt_spool = root / "attempt"
         scope_headrooms = {"base.sample": 11, "overlay.sample": 17}
         executor.residency.open_attempt("all_resident", 0, scope_headrooms)

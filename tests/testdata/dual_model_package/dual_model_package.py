@@ -76,7 +76,7 @@ class OverlayPipe:
 
 
 @sequence_parallel(degrees=(2, 4))
-class Base(Model[BasePipe]):
+class Base(Model[BasePipe], encoded_leaves="accept"):
     pipe: BasePipe
 
     def load(self, loader: Loader) -> None:
