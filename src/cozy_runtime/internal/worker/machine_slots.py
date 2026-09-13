@@ -103,7 +103,8 @@ def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: Jo
         executor.reserved_for_job = True
         worker.jobs[binding.job_descriptor_id] = binding
         worker.engine.jobs = worker.jobs
-        worker.accepted.mode = "job"
+        if worker.accepted.mode != "serving":
+            worker.accepted.mode = "job"
         worker.set_job_ready(True)
         lane.settled.set()
         worker._sync_lane_consumers()
