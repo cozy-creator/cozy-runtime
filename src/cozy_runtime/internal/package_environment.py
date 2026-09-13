@@ -2428,7 +2428,7 @@ def _materialize_dependency_snapshot(
             dependency_python,
             provided,
             _marker_environment(observed),
-            allow_absent=frozenset({"numpy"}) if builtin_capture is not None else frozenset(),
+            allow_absent=frozenset({"numpy"}),
         )
     uv = _uv_binary()
     if _observed_uv_version(uv) != observed.uv_version:

@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -443,3 +444,18 @@ def test_cached_capture_refuses_mutable_cache_and_staged_collisions(tmp_path: Pa
     cached.chmod(0o644)
     with pytest.raises(package_environment.EnvironmentRefusal, match="cache_invalid"):
         dependencies.snapshot(source / "bin/python", target, set(), cache=cache)
+
+
+def test_cross_filesystem_cache_uses_independent_copies(tmp_path: Path) -> None:
+    memory = Path("/dev/shm")
+    if not memory.is_dir() or memory.stat().st_dev == tmp_path.stat().st_dev:
+        pytest.skip("requires two actual filesystems for the hardlink fallback")
+    source, target = tmp_path / "source", tmp_path / "target"
+    site, destination = _venv(source), _venv(target)
+    _distribution(site, "dependency", {"payload.bin": b"independent copied bytes"})
+    with tempfile.TemporaryDirectory(prefix="cozy-dependency-cache-", dir=memory) as root:
+        cache = Path(root)
+        manifest = dependencies.snapshot(source / "bin/python", target, set(), cache=cache)
+        dependencies.verify_files(target, manifest)
+        assert not list(cache.iterdir())
+    assert not (site / "payload.bin").samefile(destination / "payload.bin")
