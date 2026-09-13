@@ -21,7 +21,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 MAX_RECORD = 64 << 20
 MAX_CHUNK = 48 << 10
 KINDS = ("attempt", "weights", "hold", "cache", "lookup")
-TABLES = ("attempts", "weights", "holds", "operation_cache", "operation_lookups")
+TABLES = ("attempts", "weights", "holds", "operation_cache", "operation_lookups", "executions")
 Authorize = Callable[[pb.Claim], str]
 _OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")

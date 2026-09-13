@@ -38,6 +38,7 @@ class WorkspaceBusy(WorkspaceRefusal):
 
 
 _authority: ContextVar[Callable[[], None]] = ContextVar("workspace_authority", default=lambda: None)
+Row = sqlite3.Row
 
 
 class Journal(sqlite3.Connection):
@@ -187,7 +188,7 @@ class Workspace:
                     + _MIGRATION_3
                     + "PRAGMA user_version=3; COMMIT;"
                 )
-            elif version not in (3, 4, 5, 6):
+            elif version not in (3, 4, 5, 6, 7):
                 raise WorkspaceRefusal("workspace journal schema is not supported")
             if version <= 3:
                 from .workspace_sources import SCHEMA4
@@ -201,6 +202,10 @@ class Workspace:
                 from .workspace_byte_outputs import migrate6
 
                 migrate6(db)
+            if version <= 6:
+                from .workspace_executions import SCHEMA7
+
+                db.executescript("BEGIN IMMEDIATE;" + SCHEMA7 + "PRAGMA user_version=7; COMMIT;")
             if (
                 not allow_frozen
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
@@ -238,9 +243,19 @@ class Workspace:
     ) -> pb.AttemptOutcome | None:
         self.owner(owner)
         self.recover(owner)
-        from .workspace_recovery import process_identity
+        self.validate_offer(offer)
+        with self.locked() as db:
+            return self.accept_in(
+                db,
+                owner,
+                offer,
+                result_schema=result_schema,
+                worker_boot=worker_boot,
+                memoize=memoize,
+            )
 
-        process_owner = process_identity()
+    @staticmethod
+    def validate_offer(offer: pb.AttemptOffer) -> None:
         if (
             _ID.fullmatch(offer.request_id) is None
             or not 0 < offer.attempt_ordinal < 1 << 63
@@ -250,36 +265,49 @@ class Workspace:
         ):
             raise WorkspaceRefusal("workspace attempt does not bind its exact invocation")
         documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
-        with self.locked() as db:
-            row = db.execute(
-                "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
-                (owner, offer.request_id, offer.attempt_ordinal),
-            ).fetchone()
-            if row is not None:
-                if (
-                    row["spec"] != offer.invocation_spec_digest
-                    or row["invocation"] != offer.invocation_spec_canonical_bytes
-                ):
-                    raise WorkspaceRefusal("workspace attempt was changed or released")
-                if row["state"] in ("outcome", "released"):
-                    return self._outcome_frame(row)
-                return None
-            db.execute(
-                "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state,"
-                "worker_boot,result_schema,process_owner,memoize) "
-                "VALUES(?,?,?,?,?,'accepted',?,?,?,?)",
-                (
-                    owner,
-                    offer.request_id,
-                    offer.attempt_ordinal,
-                    offer.invocation_spec_digest,
-                    offer.invocation_spec_canonical_bytes,
-                    worker_boot,
-                    result_schema,
-                    process_owner,
-                    int(memoize),
-                ),
-            )
+
+    @staticmethod
+    def accept_in(
+        db: Journal,
+        owner: str,
+        offer: pb.AttemptOffer,
+        *,
+        result_schema: bytes = b"",
+        worker_boot: str = "",
+        memoize: bool = False,
+    ) -> pb.AttemptOutcome | None:
+        """Insert the existing attempt row within a caller's admission transaction."""
+        from .workspace_recovery import process_identity
+
+        row = db.execute(
+            "SELECT * FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+            (owner, offer.request_id, offer.attempt_ordinal),
+        ).fetchone()
+        if row is not None:
+            if (
+                row["spec"] != offer.invocation_spec_digest
+                or row["invocation"] != offer.invocation_spec_canonical_bytes
+            ):
+                raise WorkspaceRefusal("workspace attempt was changed or released")
+            if row["state"] in ("outcome", "released"):
+                return Workspace._outcome_frame(row)
+            return None
+        db.execute(
+            "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state,"
+            "worker_boot,result_schema,process_owner,memoize) "
+            "VALUES(?,?,?,?,?,'accepted',?,?,?,?)",
+            (
+                owner,
+                offer.request_id,
+                offer.attempt_ordinal,
+                offer.invocation_spec_digest,
+                offer.invocation_spec_canonical_bytes,
+                worker_boot,
+                result_schema,
+                process_identity(),
+                int(memoize),
+            ),
+        )
 
         return None
 
@@ -569,6 +597,17 @@ class Workspace:
                 or (row["state"] == "released" and ack.retain_work)
             ):
                 raise WorkspaceRefusal("outcome acknowledgment changed or revoked its subject")
+            execution = db.execute(
+                "SELECT collected,desired FROM executions WHERE owner=? AND request=?",
+                (row["owner"], ack.request_id),
+            ).fetchone()
+            if (
+                execution is not None
+                and not execution["collected"]
+                and execution["desired"] != "cancel"
+                and not ack.retain_work
+            ):
+                raise WorkspaceRefusal("uncollected execution outcome must remain retained")
             db.execute(
                 "UPDATE attempts SET state=?,retain=? WHERE owner=? AND request=? AND ordinal=?",
                 (
@@ -600,7 +639,13 @@ class Workspace:
                     "owner=? AND request=? AND ordinal=? AND state<>'released' LIMIT 1",
                     (row["owner"], ack.request_id, ack.attempt_ordinal) * 2,
                 ).fetchone()
-                if active is None:
+                execution = db.execute(
+                    "SELECT 1 FROM executions WHERE owner=? AND request=?",
+                    (row["owner"], ack.request_id),
+                ).fetchone()
+                if execution is not None:
+                    pass  # Native release does not delete machine execution history.
+                elif active is None:
                     db.execute(
                         "DELETE FROM attempts WHERE owner=? AND request=? AND ordinal=?",
                         (row["owner"], ack.request_id, ack.attempt_ordinal),
