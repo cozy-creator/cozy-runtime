@@ -137,6 +137,12 @@ def test_captured_model_source_and_pth_are_never_executed(tmp_path: Path) -> Non
         "from cozy_runtime.author import Model\ndef main(*, model: Model[factory()]): pass\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=1\n# ///\ndef main(): pass\n",
         "from cozy_runtime.author import WeightsSink\ndef main(*, weights: WeightsSink): pass\n",
+        "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# ///\n"
+        "from cozy_runtime.author import WeightsSink, WeightsReader\n"
+        "def main(*, weights: WeightsSink, source: WeightsReader): pass\n",
+        "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# ///\n"
+        "from cozy_runtime.author import WeightsSink, Outputs\n"
+        "def main(*, weights: WeightsSink, out: Outputs): pass\n",
     ],
 )
 def test_static_script_refuses_unresolvable_or_mismatched_contract(
