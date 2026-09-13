@@ -205,9 +205,7 @@ class DeviceLane:
         held = self.rows.get(slot)
         if held is None:
             ledger = Ledger(worker_pid=self.worker_pid)
-            held = self.rows[slot] = LaneRow(
-                ledger=ledger, chooser=PlanChooser(ledger, degree=self.degree)
-            )
+            held = self.rows[slot] = LaneRow(ledger=ledger, chooser=PlanChooser(ledger))
         return held
 
     def forget(self, slot: str) -> None:

@@ -28,6 +28,7 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
     ) -> Any:
         assert in_gated_call()
         assert not torch.is_grad_enabled()
+        torch.testing.assert_close(self.weight.cpu(), torch.tensor([2.0]))
         if check:
             torch.testing.assert_close(value.cpu(), torch.tensor([3.0, 5.0, 9.0]))
             return value
