@@ -161,7 +161,12 @@ def test_a_group_pin_refuses_typed_then_fuses() -> None:
     # discovers paging and decides the executable working set.
     # Then the fuse: one lane, both devices, one row per device when measured
     group = lanes_.assign(
-        "g", model_bearing=True, declared_bytes=50 * GiB, measured=MEASURED, pin=(0, 1), degrees=(2,)
+        "g",
+        model_bearing=True,
+        declared_bytes=50 * GiB,
+        measured=MEASURED,
+        pin=(0, 1),
+        degrees=(2,),
     )
     assert group.lane_id == "lane-0+1" and group.placements == {"g"} and lanes_.revision == 1
     assert lanes_.lane_of("g") is group
