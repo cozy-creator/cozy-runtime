@@ -97,6 +97,10 @@ class Calls:
             return self.worker.machine_sources.result(owner, call, request, result)
         if call.result:
             assert self.worker.workspace is not None
+            if self.worker.executions is not None and self.worker.executions.owns(
+                owner, call.child_request
+            ):
+                self._finish(owner, call)
             workspace_memo.release_lookup(self.worker.workspace, owner, call.child_request)
             result.state, result.result_canonical_bytes = pb.CHILD_CALL_STATE_SUCCEEDED, call.result
             result.byte_result_grants.extend(
@@ -169,6 +173,8 @@ class Calls:
                 continue
             call = self.journal.get(owner, parent.request_id, request.call_index)
             if call.result or call.safe_code:
+                if call.result and executions.owns(owner, call.child_request):
+                    self._finish(owner, call)
                 with self.lock:
                     self.pending.pop((parent.request_id, request.call_index), None)
                 continue
@@ -355,7 +361,8 @@ class Calls:
                 "ON p.owner=c.owner AND p.request=c.parent_request "
                 "JOIN executions e ON e.owner=c.owner AND e.request=c.child_request "
                 "WHERE c.owner=? AND (p.desired<>'run' OR p.state IN ('failed','canceled')) "
-                "AND e.state IN ('queued','running','retrying','pausing')",
+                "AND (e.state IN ('queued','running','retrying','pausing') "
+                "OR (p.desired='cancel' AND e.desired<>'cancel'))",
                 (owner,),
             ).fetchall()
         for row in rows:
@@ -375,14 +382,24 @@ class Calls:
         executions = self.worker.executions
         assert executions is not None
         state = executions.status(owner, call.child_request)
-        if state.state != "succeeded" or state.collected:
+        if state.state != "succeeded":
             return
+        if state.collected:
+            with executions.workspace.locked() as db:
+                pending = db.execute(
+                    "SELECT 1 FROM attempts WHERE owner=? AND request=? AND ordinal=? "
+                    "AND state<>'released' UNION ALL SELECT 1 FROM weights "
+                    "WHERE owner=? AND request=? AND state<>'released' LIMIT 1",
+                    (owner, call.child_request, state.attempt_ordinal, owner, call.child_request),
+                ).fetchone()
+            if pending is None:
+                return
         held = self.worker.engine.history.get((call.child_request, state.attempt_ordinal))
         if held is not None and held.state != "closed":
             return
         terminal = executions.collect(owner, call.child_request)
         plan = canonical_json.decode(call.prepared)
-        if key := plan.get("computation"):
+        if not call.result and (key := plan.get("computation")):
             workspace_memo.record(
                 executions.workspace,
                 owner,
@@ -397,17 +414,18 @@ class Calls:
             )
         body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
         raw_result = base64.b64decode(body["result"]["inline_result"], validate=True)
-        self._retain_result(owner, call, raw_result, plan.get("result_schema", {}))
-        machine_byte_results.retain(
-            executions.workspace,
-            owner,
-            call.parent_request,
-            call.call_index,
-            canonical_json.decode(raw_result),
-            plan.get("result_schema", {}),
-            body.get("output_manifest", {}).get("outputs", []),
-        )
-        self.journal.observe_result(owner, call, raw_result)
+        if not call.result:
+            self._retain_result(owner, call, raw_result, plan.get("result_schema", {}))
+            machine_byte_results.retain(
+                executions.workspace,
+                owner,
+                call.parent_request,
+                call.call_index,
+                canonical_json.decode(raw_result),
+                plan.get("result_schema", {}),
+                body.get("output_manifest", {}).get("outputs", []),
+            )
+            self.journal.observe_result(owner, call, raw_result)
         ack = pb.AttemptOutcomeAck(
             request_id=call.child_request,
             attempt_ordinal=terminal.attempt_ordinal,
@@ -416,6 +434,18 @@ class Calls:
             outcome_digest=terminal.outcome_digest,
         )
         executions.acknowledge_collection(owner, ack)
+        for reference in body.get("weights_receipts", []):
+            receipt = documents.read(
+                base64.b64decode(reference["weights_receipt_canonical_bytes"], validate=True),
+                pb.WeightsReceipt,
+            )
+            executions.workspace.release_result(
+                owner,
+                pb.DerivedResultReleaseRequest(
+                    weights_transaction_id=receipt["weights_transaction_id"],
+                    tensorfs_receipt_digest=documents.raw(receipt["tensorfs_receipt_digest"]),
+                ),
+            )
         executions.workspace.acknowledge(owner, ack)
 
     def _retain_result(self, owner: str, call: Call, raw: bytes, schema: Any) -> None:

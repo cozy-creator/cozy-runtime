@@ -497,3 +497,30 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
         dispatcher._check_ancestors(
             "owner", cast(AttemptRecord, SimpleNamespace(request_id=parents[-1])), target, b"{}"
         )
+
+
+def test_canceling_root_also_abandons_failed_descendants(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from cozy_runtime.internal.worker.machine_calls import Calls as Dispatcher
+    from cozy_runtime.internal.worker.workspace import Workspace
+    from cozy_runtime.internal.worker.workspace_calls import Calls
+    from cozy_runtime.internal.worker.workspace_executions import Executions
+    from test_machine_calls import request, running
+    from test_machine_execution import complete, offer
+
+    workspace = Workspace(tmp_path / "store")
+    executions, calls = Executions(workspace), Calls(workspace)
+    executions.submit("owner", "root", b"c" * 32, offer())
+    call = calls.accept("owner", request(running(executions, "root")))
+    executions.submit("owner", "child", b"c" * 32, offer(call.child_request))
+    complete(executions, call.child_request, status=pb.OUTCOME_STATUS_FAILED)
+    complete(executions, "root", status=pb.OUTCOME_STATUS_FAILED)
+    executions.control("owner", "root", "cancel-root", 1, "cancel")
+    dispatcher = Dispatcher(
+        cast(Worker, SimpleNamespace(workspace=workspace, executions=executions))
+    )
+    dispatcher._stop_descendants("owner")
+    assert executions.abandon("owner", "root")
+    assert executions.abandon("owner", call.child_request)
+    assert not executions.retention_required("owner")
