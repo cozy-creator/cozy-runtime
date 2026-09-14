@@ -2124,39 +2124,42 @@ class Worker:
                 declaration = self.engine._job_declaration(binding, descriptor)
                 result_schema = canonical.write(declaration["result"])
                 memoize = declaration.get("invocable", {}).get("memoize", False) is True
-            if "job" in spec:
-                from . import machine_model_inputs
+            from . import machine_checkpoint_inputs
 
-                assert binding is not None
-                declared = set(self.engine._job_model_declarations(binding, descriptor))
-                if declared and claim.wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
-                    raise WorkspaceRefusal("durable root Model inputs require Runtime wire55")
-                machine_model_inputs.retain(executions.workspace, owner, offer, declared)
-                from . import machine_byte_inputs
+            with machine_checkpoint_inputs.admission(executions.workspace, owner, offer.request_id):
+                if "job" in spec:
+                    from . import machine_model_inputs
 
-                machine_byte_inputs.retain_root(
-                    executions.workspace,
+                    assert binding is not None
+                    declared = set(self.engine._job_model_declarations(binding, descriptor))
+                    if declared and claim.wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
+                        raise WorkspaceRefusal("durable root Model inputs require Runtime wire55")
+                    machine_model_inputs.retain(executions.workspace, owner, offer, declared)
+                    from . import machine_byte_inputs
+
+                    machine_byte_inputs.retain_root(
+                        executions.workspace,
+                        owner,
+                        offer,
+                        declaration["request"],
+                        arguments or {},
+                        wire_minor=claim.wire_minor,
+                    )
+                receipt = executions.submit(
                     owner,
+                    submission_id,
+                    capture_digest,
                     offer,
-                    declaration["request"],
-                    arguments or {},
-                    wire_minor=claim.wire_minor,
+                    result_schema=result_schema,
+                    worker_boot=self.fence.worker_boot_id,
+                    memoize=memoize,
+                    max_attempts=max_attempts,
+                    retry_delay_ms=retry_delay_ms,
+                    capture_document=capture_document,
+                    preparation=preparation,
+                    worker_id=self.options.worker_id,
+                    publication_authorization_id=publication_authorization_id,
                 )
-            receipt = executions.submit(
-                owner,
-                submission_id,
-                capture_digest,
-                offer,
-                result_schema=result_schema,
-                worker_boot=self.fence.worker_boot_id,
-                memoize=memoize,
-                max_attempts=max_attempts,
-                retry_delay_ms=retry_delay_ms,
-                capture_document=capture_document,
-                preparation=preparation,
-                worker_id=self.options.worker_id,
-                publication_authorization_id=publication_authorization_id,
-            )
             self.publish_activity(strict=True)
             return receipt
 

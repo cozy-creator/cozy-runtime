@@ -192,7 +192,7 @@ class Workspace:
                     + _MIGRATION_3
                     + "PRAGMA user_version=3; COMMIT;"
                 )
-            elif version not in (3, 4, 5, 6, 7, 8, 9, 10):
+            elif version not in (3, 4, 5, 6, 7, 8, 9, 10, 11):
                 raise WorkspaceRefusal("workspace journal schema is not supported")
             if version <= 3:
                 from .workspace_sources import SCHEMA4
@@ -222,6 +222,10 @@ class Workspace:
                 from .workspace_input_trees import SCHEMA10
 
                 db.executescript("BEGIN IMMEDIATE;" + SCHEMA10 + "PRAGMA user_version=10; COMMIT;")
+            if version <= 10:
+                from .machine_checkpoint_inputs import SCHEMA11
+
+                db.executescript("BEGIN IMMEDIATE;" + SCHEMA11 + "PRAGMA user_version=11; COMMIT;")
             if (
                 not allow_frozen
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]

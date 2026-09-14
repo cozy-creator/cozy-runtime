@@ -180,6 +180,11 @@
       "sha256": "939304d6336f6a7926d5e5b8f7bb917c1c310cd754b59da912eb71bcd9c61a8e",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
+    "catalog_model_input_access": {
+      "bytes": 108,
+      "sha256": "648be2b031906bab9a2dd51f9791115c073ed3bc10a54072be78356485746659",
+      "type": "cozy.worker.v1.InputAccess"
+    },
     "checkpoint_ack": {
       "bytes": 84,
       "sha256": "d5888893dc4af7bf4653b2d42e29867e1d6e77fccee22191eecebd83739726fe",

@@ -1,4 +1,4 @@
-"""Retain exact, already-owned derived Model inputs before accepting a root."""
+"""Retain exact root Model inputs through independent derived or catalog custody."""
 
 from __future__ import annotations
 
@@ -10,24 +10,37 @@ from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from . import grants, machine_models
+from . import grants, machine_checkpoint_inputs, machine_models
 from .workspace import Workspace, WorkspaceRefusal
 
 
 def retain(workspace: Workspace, owner: str, offer: pb.AttemptOffer, declared: set[str]) -> None:
     spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
-    if not declared and not any(
-        item["input_id"].startswith(grants.MODEL_PREFIX) for item in spec.get("inputs", [])
+    if (
+        not declared
+        and not any(entry.HasField("catalog_model") for entry in offer.grant.inputs)
+        and not any(
+            item["input_id"].startswith(grants.MODEL_PREFIX) for item in spec.get("inputs", [])
+        )
     ):
         return
     selected = grants.model_inputs(grants.bind(spec, offer.grant, offer.invocation_spec_digest))
     if set(selected) != declared:
         raise WorkspaceRefusal("root Model inputs differ from the captured job declaration")
+    if machine_checkpoint_inputs.already_accepted(workspace, owner, offer):
+        return
+    catalog = {
+        parameter: entry for parameter, entry in selected.items() if entry.catalog_repository
+    }
     # Reject incomplete multi-model declarations before minting any recipient hold.
     sources = [
         (parameter, _owned(workspace, owner, documents.spell(entry.digest), entry.length))
         for parameter, entry in sorted(selected.items())
+        if not entry.catalog_repository
     ]
+    machine_checkpoint_inputs.preflight(workspace, owner, offer, catalog)
+    for entry in catalog.values():
+        machine_checkpoint_inputs.retain(workspace, owner, offer, entry)
     for parameter, artifact in sources:
         request, held = machine_models.retain(
             workspace, owner, offer.request_id, "input/" + parameter, artifact

@@ -3543,15 +3543,23 @@ class DeliveryGrant(_message.Message):
     outputs: _containers.RepeatedCompositeFieldContainer[OutputAccess]
     def __init__(self, invocation_spec_digest: _Optional[bytes] = ..., credential: _Optional[_Union[DeliveryAccessCredential, _Mapping]] = ..., file_base_url: _Optional[str] = ..., expires_at_unix: _Optional[int] = ..., inputs: _Optional[_Iterable[_Union[InputAccess, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[OutputAccess, _Mapping]]] = ...) -> None: ...
 
+class CatalogModelSource(_message.Message):
+    __slots__ = ("repository",)
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
+    repository: str
+    def __init__(self, repository: _Optional[str] = ...) -> None: ...
+
 class InputAccess(_message.Message):
-    __slots__ = ("input_id", "url", "native_tree")
+    __slots__ = ("input_id", "url", "native_tree", "catalog_model")
     INPUT_ID_FIELD_NUMBER: _ClassVar[int]
     URL_FIELD_NUMBER: _ClassVar[int]
     NATIVE_TREE_FIELD_NUMBER: _ClassVar[int]
+    CATALOG_MODEL_FIELD_NUMBER: _ClassVar[int]
     input_id: str
     url: str
     native_tree: NativeByteRetentionRequest
-    def __init__(self, input_id: _Optional[str] = ..., url: _Optional[str] = ..., native_tree: _Optional[_Union[NativeByteRetentionRequest, _Mapping]] = ...) -> None: ...
+    catalog_model: CatalogModelSource
+    def __init__(self, input_id: _Optional[str] = ..., url: _Optional[str] = ..., native_tree: _Optional[_Union[NativeByteRetentionRequest, _Mapping]] = ..., catalog_model: _Optional[_Union[CatalogModelSource, _Mapping]] = ...) -> None: ...
 
 class OutputAccess(_message.Message):
     __slots__ = ("output_id", "url")

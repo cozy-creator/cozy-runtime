@@ -111,6 +111,9 @@ def release(workspace: Workspace, owner: str, recipient: str) -> None:
             workspace._change_hold(
                 db, owner, request, release=True, kind=held["kind"] if held else "derived"
             )
+    from . import machine_checkpoint_inputs
+
+    machine_checkpoint_inputs.release(workspace, owner, recipient)
     # Keep the tiny ownership record for idempotent release after a lost reply.
 
 
