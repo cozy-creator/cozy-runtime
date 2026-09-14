@@ -151,9 +151,6 @@ from cozy_runtime.author._weights import (
     MAX_WEIGHTS_NEW_BYTES,
     WeightsOutput,
     WeightsReceipt,
-    WeightsSource,
-    WeightsSourcePart,
-    WeightsSourceTensor,
 )
 from cozy_runtime.author.publication import (
     AssessmentRef,
@@ -281,9 +278,6 @@ __all__ = [
     "WeightsOutput",
     "WeightsReader",
     "WeightsReceipt",
-    "WeightsSource",
-    "WeightsSourcePart",
-    "WeightsSourceTensor",
     "WeightsView",
     "assert_declaration_shape",
     "attach_assessment",

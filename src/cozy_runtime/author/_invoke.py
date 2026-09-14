@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, get_args, get_type_hints
@@ -62,7 +63,7 @@ from cozy_runtime.author._errors import (
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
-from cozy_runtime.author._model_reader import ModelViewHost, WeightsReader
+from cozy_runtime.author._model_reader import ReadValues, WeightsReader
 from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
@@ -130,7 +131,7 @@ class Invocation:
     see `Checkpoints` (#553a)."""
     budget: BudgetFacts | None = None
     """Cost-governor facts from the typed config channel. Never read from environment."""
-    weights_reader: Callable[[str], ModelViewHost] | None = None
+    weights_values: ReadValues | None = None
     tensorfs_source: Callable[[str], SourceCapability] | None = None
     tensorfs_output: Callable[[str, Derivation], DerivedTransaction] | None = None
     tensorfs_adopt: Callable[[Mapping[str, Any]], ModelArtifact] | None = None
@@ -224,7 +225,9 @@ def prepare(
     )
 
 
-def _bind_tensorfs(ctx: Context, record: Attempt, inv: Invocation, surface: Surface) -> None:
+def _bind_tensorfs(
+    ctx: Context, record: Attempt, inv: Invocation, surface: Surface, handles: ExitStack
+) -> None:
     """Bind execution authority; TensorFS implements the source and output handles."""
     if inv.tensorfs_source is None and inv.tensorfs_output is None:
         return
@@ -249,12 +252,29 @@ def _bind_tensorfs(ctx: Context, record: Attempt, inv: Invocation, surface: Surf
                 "source is not an admitted model input", code="weights_source_ungranted"
             )
         capability = source_reader(model.checkpoint_ref)
+        handles.callback(capability.close)
 
         def inspect(components: Sequence[str], configs: Sequence[str]) -> Any:
             current()
             return capability.inspect(components=components, configs=configs)
 
-        return SourceCapability(capability.manifest, capability.length, inspect, capability.close)
+        def read_part(component: str, key: str, role: str, offset: int, into: object) -> None:
+            current()
+            try:
+                capability.read_part_into(component, key, role, offset, into)
+            finally:
+                current()
+
+        def check() -> None:
+            current()
+            try:
+                capability.check()
+            finally:
+                current()
+
+        return SourceCapability(
+            capability.manifest, capability.length, inspect, capability.close, read_part, check
+        )
 
     def output(slot: str) -> OutputCapability:
         current()
@@ -266,7 +286,9 @@ def _bind_tensorfs(ctx: Context, record: Attempt, inv: Invocation, surface: Surf
 
             def opened(definition: Derivation) -> DerivedTransaction:
                 current()
-                return output_opener(slot, definition)
+                transaction = output_opener(slot, definition)
+                handles.callback(transaction.close)
+                return transaction
 
             outputs[slot] = OutputCapability(opened)
         return outputs[slot]
@@ -299,7 +321,8 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt = record
     attempt.rows.extend(overlay.rows)
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
-    _bind_tensorfs(ctx, record, inv, surface)
+    handles = ExitStack()
+    _bind_tensorfs(ctx, record, inv, surface, handles)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)
 
     attempt.entered = True
@@ -314,6 +337,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
         if inv.calls is not None:
             inv.calls.closed = True
         _current.reset(token)
+        handles.close()
 
     _validate_result(
         surface, result, attempt, grant_token=inv.calls.grant_token if inv.calls else None
@@ -879,7 +903,9 @@ def _service(
         case "budget":
             return Budget(attempt, inv.budget)
         case "weights_read":
-            return WeightsReader(attempt, inv.models, inv.weights_reader, inv.cancel)
+            return WeightsReader(
+                attempt, inv.models, ctx.tensorfs_source, inv.cancel, inv.weights_values
+            )
     raise ConformanceError(f"no injector for capability {param.capability!r}")
 
 

@@ -2267,6 +2267,10 @@ class Executor:
                         # handler that dials one anyway is refused rather than merely unexpected.
                         # That fence is Python-level (cr-042) — it bounds a buggy package, not a
                         # hostile one, and there is no netns or seccomp under it.
+                        trees={
+                            ref: (Path(root), digest)
+                            for ref, (root, digest) in (command.get("trees") or {}).items()
+                        },
                         assets=_granted_inputs(command),
                         max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
                     ),
@@ -2588,12 +2592,11 @@ class Executor:
         except CapabilityError as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:1024]}
 
-        weights_reader = None
+        weights_values = None
         if "weights_read" in surface.capabilities:
-            from cozy_runtime.internal.model_reader import ModelReaderProxy
+            from cozy_runtime.internal.model_values import read_values_into
 
-            def weights_reader(manifest: str) -> ModelReaderProxy:
-                return ModelReaderProxy.open(spool, self._durable, manifest)
+            weights_values = read_values_into
 
         from cozy_runtime.internal.weights_writer import ExecutionStorage
 
@@ -2668,7 +2671,7 @@ class Executor:
                 max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
                 scratch=scratch,
                 checkpoints=durable_checkpoint,
-                weights_reader=weights_reader,
+                weights_values=weights_values,
                 tensorfs_source=tensorfs_source,
                 tensorfs_output=tensorfs_output,
                 tensorfs_adopt=tensorfs_adopt,

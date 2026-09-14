@@ -378,6 +378,21 @@ class Calls:
                 raise
             raise ValueError("native child artifact bytes are unavailable") from exc
 
+    def received_inputs(
+        self, attempt: AttemptRecord
+    ) -> list[tuple[dict[str, Any], pb.NativeByteRetentionRequest]]:
+        """Snapshot only native byte capabilities actually delivered to this attempt."""
+        with self.lock:
+            return [
+                (
+                    dict(value.metadata),
+                    pb.NativeByteRetentionRequest.FromString(
+                        value.source.SerializeToString(deterministic=True)
+                    ),
+                )
+                for value in self.received.get((attempt.request_id, attempt.attempt), {}).values()
+            ]
+
     def received_output(
         self, attempt: AttemptRecord, row: Mapping[str, Any]
     ) -> tuple[Path, pb.NativeByteRetentionRequest] | None:

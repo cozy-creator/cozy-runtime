@@ -19,7 +19,7 @@ from cozy_runtime.internal import package_environment
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from . import machine_byte_results, machine_models, package_prepare
+from . import machine_byte_inputs, machine_byte_results, machine_models, package_prepare
 from .machine_child_target import Target
 from .workspace import WorkspaceRefusal
 from .workspace_calls import Call
@@ -128,6 +128,19 @@ class Serving:
                 spec.outputs.append(
                     pb.OutputBinding(output_id="runtime.capture", max_bytes=64 << 20)
                 )
+            live_parent = self.worker.engine.live.get(call.parent_request)
+            if live_parent is None or live_parent.attempt != request.parent_attempt_ordinal:
+                raise WorkspaceRefusal("native child input parent is no longer active")
+            byte_bindings, byte_access = machine_byte_inputs.inputs(
+                workspace,
+                owner,
+                live_parent,
+                call.child_request,
+                target.declaration["request"],
+                canonical_json.decode(payload),
+                self.worker.calls,
+            )
+            spec.inputs.extend(byte_bindings)
             raw, identity = documents.identity(spec)
             offer = pb.AttemptOffer(
                 request_id=call.child_request,
@@ -149,6 +162,7 @@ class Serving:
                     ],
                 ),
             )
+            offer.grant.inputs.extend(byte_access)
             placement_bytes = canonical_json.encode(
                 {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement]}
             )

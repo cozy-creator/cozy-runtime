@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING, Any, Literal
 from cozy_runtime import canonical_json
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
 from cozy_runtime.internal import effect_interfaces, source_interfaces
-from cozy_runtime.internal.worker import machine_byte_results, machine_child_target, workspace_memo
+from cozy_runtime.internal.worker import (
+    machine_byte_inputs,
+    machine_byte_results,
+    machine_child_target,
+    workspace_memo,
+)
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_calls import Calls as JournalCalls
@@ -296,6 +301,15 @@ class Calls:
                     target.declaration,
                     arguments,
                 )
+                byte_bindings, byte_access = machine_byte_inputs.inputs(
+                    executions.workspace,
+                    owner,
+                    parent,
+                    call.child_request,
+                    target.declaration["request"],
+                    arguments,
+                    self.worker.calls,
+                )
                 spec = pb.InvocationSpec(
                     environment_digest=target.prepared_revision["placement"]["environment_digest"],
                     payload_digest=documents.spell(hashlib.sha256(payload).digest()),
@@ -317,6 +331,7 @@ class Calls:
                     ),
                 )
                 spec.inputs.extend(model_inputs)
+                spec.inputs.extend(byte_bindings)
                 spec.outputs.extend(
                     pb.OutputBinding(output_id=path, max_bytes=bound)
                     for path, bound in machine_byte_results.paths(target.declaration["result"])
@@ -342,6 +357,7 @@ class Calls:
                     ),
                 )
                 offer.grant.inputs.extend(model_access)
+                offer.grant.inputs.extend(byte_access)
                 desired = pb.DesiredWorkerState(
                     wire_minor=self.worker.fence.wire_minor,
                     posture=pb.POSTURE_ACCEPTING,

@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import tensorfs
 
-from cozy_runtime.author import CapabilityError
+from cozy_runtime.author import Cancelled
 from cozy_runtime.internal import storage_admission as storage
 from test_model_reader import model, plain, reader
 from test_storage_admission import operation
@@ -19,7 +19,7 @@ from test_storage_admission import operation
 
 @pytest.mark.parametrize("phase", ["open", "read"])
 @pytest.mark.parametrize("allowed", [True, False])
-def test_native_reader_spool_admission(
+def test_native_reader_metadata_admission_has_no_spool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, allowed: bool
 ) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
@@ -52,8 +52,7 @@ def test_native_reader_spool_admission(
 
         def execute() -> None:
             if phase == "open":
-                with service.open(models["source"]):
-                    pass
+                service.open(models["source"]).close()
             else:
                 assert view is not None
                 target = bytearray(16)
@@ -64,18 +63,19 @@ def test_native_reader_spool_admission(
         if allowed:
             execute()
         else:
-            with pytest.raises(CapabilityError) as refused:
+            with pytest.raises(tensorfs.errors.Refusal) as refused:
                 execute()
             assert refused.value.code == "insufficient_storage"
         assert released.wait(3)
         server.join(3)
         assert not server.is_alive() and not failures
-    assert not broker.views
-    assert any(row["path"] == str(tmp_path / "spool") and row["bytes"] >= 16 for row in seen)
+    broker.close()
+    assert not broker.sources
+    assert seen and all(row["path"] == str(tmp_path / "store") for row in seen)
     assert not list((tmp_path / "spool").glob("model-reader-*-output"))
 
 
-def test_cancel_can_close_read_lease_while_spool_admission_waits(
+def test_cancel_can_close_source_while_metadata_admission_waits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
@@ -118,12 +118,31 @@ def test_cancel_can_close_read_lease_while_spool_admission_waits(
         closer.start()
         try:
             assert closed.wait(1), "read broker held its mutex while waiting for disk admission"
-            assert not broker.views
+            assert not broker.sources
         finally:
             allow.set()
         worker.join(3)
         server.join(3)
         closer.join(3)
         assert not worker.is_alive() and not server.is_alive() and not closer.is_alive()
-    assert len(errors) == 1 and isinstance(errors[0], CapabilityError)
+    assert len(errors) == 1 and isinstance(errors[0], Cancelled)
     assert not list((tmp_path / "spool").glob("model-reader-*-output"))
+
+
+def test_payload_reads_on_an_existing_native_lease_require_no_disk_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tensorfs.Store.init(tmp_path / "store")
+    reference = model(store, "resident-read", {"weight": plain(np.arange(16, dtype=np.float32))})
+    service, models, broker, _, _, _ = reader(tmp_path, store, {"source": reference})
+    with service.open(models["source"]) as view:
+
+        def refuse(*args: Any) -> Any:
+            raise AssertionError("resident read requested a disk write grant")
+
+        monkeypatch.setattr(storage, "acquire", refuse)
+        output = bytearray(64)
+        view.read_part_into("model", "weight", "value", 0, output)
+        assert output == np.arange(16, dtype=np.float32).tobytes()
+    broker.close()
+    assert list((tmp_path / "spool").iterdir()) == []
