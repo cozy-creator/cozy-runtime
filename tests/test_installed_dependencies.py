@@ -487,7 +487,7 @@ def test_explicit_current_system_sdk_relocates_dist_packages_and_recorded_resour
             "../../../share/sdk/data": b"recorded data resource",
         },
     )
-    environment = default_environment()
+    environment = dict(default_environment())
     monkeypatch.setattr(sys, "prefix", str(source))
     monkeypatch.setattr(sys, "base_prefix", str(source))
     monkeypatch.setattr(sys, "executable", str(python))
