@@ -29,9 +29,11 @@ def catalog(tmp_path: Path) -> tuple[tensorfs.Store, Workspace, pb.AttemptOffer]
     return store, Workspace(root), offer
 
 
-def input_row(workspace: Workspace) -> dict[str, object]:
+def input_row(workspace: Workspace, recipient: str = "root") -> dict[str, object]:
     with workspace.locked() as db:
-        row = db.execute("SELECT * FROM execution_checkpoint_inputs").fetchone()
+        row = db.execute(
+            "SELECT * FROM execution_checkpoint_inputs WHERE recipient=?", (recipient,)
+        ).fetchone()
         assert row is not None
         return dict(row)
 
@@ -134,6 +136,10 @@ def test_all_catalog_inputs_preflight_before_creating_any_recipient(tmp_path: Pa
 
 def test_failed_unaccepted_intake_releases_only_its_pin_and_can_retry(tmp_path: Path) -> None:
     store, workspace, offer = catalog(tmp_path)
+    other = pb.AttemptOffer.FromString(offer.SerializeToString())
+    other.request_id = "other"
+    machine_model_inputs.retain(workspace, "owner", other, {"source"})
+    other_pin = input_row(workspace, "other")
     with (
         pytest.raises(WorkspaceRefusal, match="later input"),
         machine_checkpoint_inputs.admission(workspace, "owner", offer.request_id),
@@ -142,6 +148,9 @@ def test_failed_unaccepted_intake_releases_only_its_pin_and_can_retry(tmp_path: 
         raise WorkspaceRefusal("later input refused before submission")
     previous = input_row(workspace)
     assert previous["state"] == "released"
+    assert input_row(workspace, "other") == other_pin
+    native_other = store.checkpoint_root(str(other_pin["native_owner"]))
+    assert native_other is not None and not native_other["released"]
     machine_model_inputs.retain(workspace, "owner", offer, {"source"})
     current = input_row(workspace)
     assert current["state"] == "held" and current["generation"] == 2
