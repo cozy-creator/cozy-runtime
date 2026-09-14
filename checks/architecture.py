@@ -64,6 +64,7 @@ PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
 SCOPED_TENSORFS_FILES = frozenset(
     {
         "author/_context.py",
+        "author/_model_reader.py",
         "author/_invoke.py",
         "derive/facade.py",
         "derive/operations.py",

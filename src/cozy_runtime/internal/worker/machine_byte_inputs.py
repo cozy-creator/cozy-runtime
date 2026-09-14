@@ -1,0 +1,156 @@
+"""Project typed child byte inputs from the parent's existing native capabilities."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any
+
+from cozy_runtime.author._media import admits, normalize
+from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
+
+from . import byte_inputs, machine_models, workspace_byte_outputs
+from .workspace import Workspace, WorkspaceRefusal
+
+if TYPE_CHECKING:
+    from .attempts import AttemptRecord
+    from .calls import Calls
+
+
+def _leaves(
+    value: Any,
+    schema: Any,
+    path: tuple[str | int, ...] = (),
+    order: int = 0,
+    bound: dict[str, Any] | None = None,
+) -> Iterator[tuple[str, int, str, str, dict[str, Any]]]:
+    if not isinstance(schema, dict):
+        return
+    if schema.get("asset") or schema.get("input") == "tree":
+        if not path or any(isinstance(p, str) and (not p or "." in p) for p in path):
+            raise WorkspaceRefusal("native child input has an ambiguous field path")
+        name = ".".join(map(str, path))
+        if name == "payload" or name.startswith(("tree:", "model:")):
+            raise WorkspaceRefusal("native child input collides with a reserved binding")
+        if not isinstance(value, str):
+            raise WorkspaceRefusal("native child input must carry an exact digest reference")
+        documents.raw(value)
+        yield name, order, str(schema.get("asset") or "tree"), value, bound or {}
+    elif "fields" in schema and isinstance(value, dict):
+        for field in schema["fields"]:
+            if field["name"] in value:
+                yield from _leaves(
+                    value[field["name"]],
+                    field["type"],
+                    (*path, field["name"]),
+                    order,
+                    field.get("asset_bound", bound),
+                )
+    elif "list" in schema and isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _leaves(item, schema["list"], (*path, index), index, bound)
+    elif "tuple" in schema and isinstance(value, list):
+        for index, (item, member) in enumerate(zip(value, schema["tuple"], strict=True)):
+            yield from _leaves(item, member, (*path, index), index, bound)
+    elif "map" in schema and isinstance(value, dict):
+        for key, item in value.items():
+            yield from _leaves(item, schema["map"]["value"], (*path, key), order, bound)
+    elif "union" in schema:
+        branches = schema["union"]
+        if value is None and "null" in branches:
+            return
+        selected = [branch for branch in branches if branch != "null"]
+        if tag := schema.get("tag_field"):
+            selected = [
+                branch
+                for branch in selected
+                if isinstance(branch, dict)
+                and isinstance(value, dict)
+                and branch.get("tag") == value.get(tag)
+            ]
+        if len(selected) == 1:
+            yield from _leaves(value, selected[0], path, order, bound)
+        elif any(list(_leaves(value, branch, path, order, bound)) for branch in selected):
+            raise WorkspaceRefusal("ambiguous input union cannot grant native bytes")
+
+
+def inputs(
+    workspace: Workspace,
+    owner: str,
+    parent: AttemptRecord,
+    recipient: str,
+    schema: Any,
+    arguments: dict[str, Any],
+    calls: Calls,
+) -> tuple[list[pb.InputBinding], list[pb.InputAccess]]:
+    """Acquire recipient custody before dispatch; existing grant loaders own byte access."""
+    selected = list(_leaves(arguments, schema))
+    if not selected:
+        return [], []
+    candidates = calls.received_inputs(parent)
+    if parent.grant is not None:
+        for entry in parent.grant.inputs.values():
+            if entry.native_tree is not None:
+                candidates.append(
+                    (
+                        {
+                            "kind": "tree"
+                            if entry.kind_mime == byte_inputs.TREE_MIME
+                            or entry.input_id.startswith("tree:")
+                            else "file",
+                            "digest": documents.spell(entry.digest),
+                            "length": entry.length,
+                            "content_bytes": entry.native_tree.source.content_bytes,
+                            "media_type": (
+                                parent.inputs[entry.input_id].media_type
+                                if entry.input_id in parent.inputs
+                                else normalize(entry.kind_mime)
+                            ),
+                        },
+                        entry.native_tree,
+                    )
+                )
+    bindings, access = [], []
+    for name, order, kind, digest, bound in selected:
+        matches = [
+            (metadata, source)
+            for metadata, source in candidates
+            if metadata["digest"] == digest
+            and (metadata["kind"] == "tree") == (kind == "tree")
+            and (kind == "tree" or admits(kind, metadata["media_type"]))
+            and (not bound.get("media_types") or metadata["media_type"] in bound["media_types"])
+        ]
+        if not matches:
+            raise WorkspaceRefusal("native child input has no exact parent capability")
+        metadata, source = matches[0]
+        size = source.source.content_bytes
+        if size > min(bound.get("max_bytes") or byte_inputs.MAX_BYTES, byte_inputs.MAX_BYTES):
+            raise WorkspaceRefusal("native child input exceeds its declared byte bound")
+        media = metadata["media_type"]
+        with workspace_byte_outputs.leased(workspace, owner, source) as (_, _, members):
+            if kind == "tree":
+                if digest != documents.spell(source.source.manifest.digest):
+                    raise WorkspaceRefusal("native child tree differs from its source manifest")
+                length, media = source.source.manifest.length, byte_inputs.TREE_MIME
+            else:
+                blob = byte_inputs.file_member(source, members)
+                if (digest, metadata["length"]) != ("sha256:" + blob["sha256"], blob["length"]):
+                    raise WorkspaceRefusal("native child file differs from its source payload")
+                length = blob["length"]
+            retained = machine_models.retain_bytes(
+                workspace, owner, recipient, "input/" + name, source.source
+            )
+        bindings.append(
+            pb.InputBinding(
+                input_id=name, digest=digest, length=length, kind_mime=media, order=order
+            )
+        )
+        access.append(
+            pb.InputAccess(
+                input_id=name,
+                native_tree=pb.NativeByteRetentionRequest(
+                    source=retained.source, retention_id=retained.retention_id
+                ),
+            )
+        )
+    return bindings, access

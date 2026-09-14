@@ -2,7 +2,7 @@
 
 TensorFS owns source and writer APIs. Runtime binds native facts to the accepted
 execution and converts retained native receipts into its existing protocol documents.
-The source metadata projection serves the separate scoped model reader.
+The native source API supplies all reader metadata and bytes.
 """
 
 from __future__ import annotations
@@ -19,9 +19,6 @@ from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._weights import (
     WeightsReceipt,
-    WeightsSource,
-    WeightsSourcePart,
-    WeightsSourceTensor,
 )
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -108,46 +105,6 @@ def write_exchange_file(spool: Path, output_slot: str, kind: str, data: bytes) -
                 code="weights_receipt_mismatch" if kind == "receipt" else "weights_intent_conflict",
             ) from None
     return target
-
-
-def source_structure(header: Mapping[str, Any]) -> WeightsSource:
-    """Author-safe geometry from one native-validated header, shared by readers/writers."""
-    configs = header.get("configs") or {}
-    components = header.get("components")
-    if not isinstance(configs, Mapping) or not isinstance(components, Mapping):
-        raise ValueError("header configs/components are not mappings")
-    tensors: list[WeightsSourceTensor] = []
-    for component, table in components.items():
-        if not isinstance(table, Mapping):
-            raise ValueError(f"component {component!r} is not a tensor mapping")
-        for key, entry in table.items():
-            if not isinstance(entry, Mapping):
-                raise ValueError(f"tensor {component}/{key} is not a mapping")
-            logical = entry.get("logical")
-            parts = entry.get("parts")
-            if not isinstance(logical, Mapping) or not isinstance(parts, Mapping):
-                raise ValueError(f"tensor {component}/{key} has no logical/parts maps")
-            tensors.append(
-                WeightsSourceTensor(
-                    component=str(component),
-                    key=str(key),
-                    logical_dtype=str(logical["logical_dtype"]),
-                    encoding=str(entry["encoding"]),
-                    shape=tuple(int(value) for value in logical["shape"]),
-                    parts=tuple(
-                        WeightsSourcePart(
-                            name=str(role),
-                            dtype=str(part["dtype"]),
-                            shape=tuple(int(value) for value in part["shape"]),
-                        )
-                        for role, part in parts.items()
-                    ),
-                )
-            )
-    return WeightsSource(
-        configs=tuple(str(name) for name in configs),
-        tensors=tuple(tensors),
-    )
 
 
 def receipt_from_native(
