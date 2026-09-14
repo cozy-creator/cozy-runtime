@@ -49,6 +49,13 @@ def test_real_module_hooks_restore_site_after_failure() -> None:
     assert attention_sol._SITE.get() is None
     with pytest.raises(ValueError, match="another Sol site"):
         attention_sol.install_site(module, "dit", "blocks.3.attn")
+    with pytest.raises(ValueError, match="another Sol site"):
+        attention_sol.remove_site(module, "dit", "blocks.3.attn")
+    assert len(module._forward_pre_hooks) == len(module._forward_hooks) == 1
+    attention_sol.remove_site(module, "dit", "blocks.2.attn")
+    assert len(module._forward_pre_hooks) == len(module._forward_hooks) == 0
+    assert not hasattr(module, "_cozy_sol_site")
+    attention_sol.remove_site(module, "dit", "blocks.2.attn")
 
 
 def _dense_reference(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
