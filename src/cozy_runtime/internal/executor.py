@@ -55,12 +55,13 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
-from cozy_runtime.author._model import _derive_model
+from cozy_runtime.author._model import Model, _derive_model
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.internal import (
     accel,
     attention,
+    attention_sol,
     canonical,
     child_env,
     model_config,
@@ -471,6 +472,7 @@ class Executor:
         #: What the runtime pinned on this generation's attention sites (cr-124). One BOOT
         #: line, not a per-attempt record: the choice is a function of device and image.
         self.attention: attention.Applied | None = None
+        self.attention_defaults = attention.Snapshot(())
         #: Device facts for this prepared generation, reused for per-request pin checks.
         self.device_facts: Any = None
         self.facts: dict[str, Any] = {}
@@ -844,7 +846,9 @@ class Executor:
             return f"{type(exc).__name__}: {exc}"[:200]
         return ""
 
-    def prepare(self, command: dict[str, Any]) -> dict[str, Any]:
+    def prepare(
+        self, command: dict[str, Any], *, optional_attention_scope: bool = False
+    ) -> dict[str, Any]:
         """Consume this epoch's one construction attempt.
 
         The latch moves before the first operation deliberately. A preparation that raises
@@ -864,7 +868,7 @@ class Executor:
             }
         self._prepare_consumed = True
         try:
-            reply = self._prepare_first(command)
+            reply = self._prepare_first(command, optional_attention_scope=optional_attention_scope)
         except Exception as exc:
             self.poisoned = self.poisoned or f"prepare raised: {type(exc).__name__}"
             raise
@@ -898,7 +902,7 @@ class Executor:
         child.discovered = self.discovered
         child.surface_names = dict(self.surface_names)
         self.model_executors.append(child)
-        reply = child.prepare(command)
+        reply = child.prepare(command, optional_attention_scope=True)
         if not reply.get("ok"):
             self.poisoned = child.poisoned
             return reply
@@ -916,7 +920,9 @@ class Executor:
         self.ready = True  # prepared roots can receive their leader's warm calls
         return reply
 
-    def _prepare_first(self, command: dict[str, Any]) -> dict[str, Any]:
+    def _prepare_first(
+        self, command: dict[str, Any], *, optional_attention_scope: bool = False
+    ) -> dict[str, Any]:
         """Construct and fill the epoch's one binding."""
         if self.poisoned:
             return {
@@ -1484,8 +1490,25 @@ class Executor:
             # either is a field nobody reads, which is why this is a construction fact and
             # not a per-attempt one. The degree rides in because a sharded site admits only
             # a kernel `cp.py` can shard, and the fp8 rank is not one (cr-138).
+            roots = {**backend.components, **backend.parked}
+            scope, _ = attention._pin_parts(pin)
+            if (
+                optional_attention_scope
+                and scope
+                and not any(
+                    attention._matches(component, scope)
+                    for component, _, _ in attention._sites(roots)
+                )
+            ):
+                pin = ""
             applied = attention.select(
-                device_facts, {**backend.components, **backend.parked}, pin, degree=self.world
+                device_facts,
+                roots,
+                pin,
+                degree=self.world,
+                choose=model.choose_attention
+                if type(model).choose_attention is not Model.choose_attention
+                else None,
             )
             self.device_facts = device_facts
             stage("attention_pin")
@@ -1682,6 +1705,15 @@ class Executor:
                     "envelope": envelope,
                 }
         stage("warm")
+        if "sol-attn" in applied.totals():
+            frozen = attention._baked_in({**backend.components, **backend.parked})
+            if frozen:
+                return {
+                    "ok": False,
+                    "code": "attention_kernel_frozen",
+                    "detail": f"Sol requires eager execution: {frozen}",
+                }
+        self.attention_defaults = attention.snapshot({**backend.components, **backend.parked})
         group_facts = dict(self.facts)
         memory = accel.allocation(torch, self.device_kind)
         self.ready = True
@@ -1819,6 +1851,18 @@ class Executor:
                 "detail": "the prepare carries no authorized_device_limit_bytes; the worker "
                 "assigns the residence ceiling and this executor derives none",
             }
+        aggregate_pin = str(command.get("attention_pin", ""))
+        try:
+            scope, _ = attention._pin_parts(aggregate_pin)
+        except attention.AttentionRefusal as exc:
+            return {"ok": False, "code": exc.code, "detail": str(exc)}
+        if "/" in scope and scope.split("/", 1)[0] not in parameters:
+            return {
+                "ok": False,
+                "code": "attention_kernel_unsupported",
+                "detail": f"{aggregate_pin} matches no model in {parameters}",
+            }
+
         # ONE authorization for the PROCESS: each construction fits under what the previous
         # ones left of it, measured by this process's own allocator after their fills.
         authorized = int(command["authorized_device_limit_bytes"])
@@ -1850,10 +1894,9 @@ class Executor:
                     ),
                     "devices": command.get("devices", ""),
                     "authorized_device_limit_bytes": max(authorized - held, 0),
-                    # One construction, one execution path: every model of a set takes the
-                    # same pin (cr-125), exactly as they share one device authorization.
-                    "attention_pin": command.get("attention_pin", ""),
-                }
+                    "attention_pin": attention.for_model(aggregate_pin, [parameter]),
+                },
+                optional_attention_scope=True,
             )
             if reply.get("ok"):
                 self._device_ready = child._device_ready
@@ -1869,6 +1912,15 @@ class Executor:
 
         if self.world > 1 and not self.group_sharded:
             return self._group_refusal(GroupRefusal("the model set contains no sharded component"))
+        if aggregate_pin and not any(
+            child.attention and child.attention.pin for _, child, _ in children
+        ):
+            self.poisoned = "attention override matches no component"
+            return {
+                "ok": False,
+                "code": "attention_kernel_unsupported",
+                "detail": f"{aggregate_pin} matches no attention component",
+            }
         self.model_executors = [child for _, child, _ in children]
         self.torch = children[-1][1].torch
         self.models = {}
@@ -2200,19 +2252,10 @@ class Executor:
             }
         pin = str(command.get("attention_kernel", ""))
         try:
-            if pin:
-                self._attention_plan(pin).apply()
-            elif self.device_facts is not None and self.backend is not None:
-                # A previous pinned request must never affect the next ordinary request.
-                # Re-run the automatic selection at the attempt boundary so the mutable
-                # processor field is restored before author code enters.
-                attention.select(
-                    self.device_facts,
-                    {**self.backend.components, **self.backend.parked},
-                    "",
-                    degree=self.world,
-                )
+            swap = self._attention_plan(pin) if pin else None
+            self._restore_attention()
         except attention.AttentionRefusal as exc:
+            self._restore_attention()
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "origin": "request"}
         spool = Path(command["spool"])
         deadline = _deadline(command["deadline_s"])
@@ -2245,44 +2288,65 @@ class Executor:
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
+        served_attention: attention.Applied | None = None
+        sol_counts: dict[str, int] = {}
         capture = None
         capture_result: dict[str, Any] | None = None
         record: AuthorAttempt | None = None
         try:
-            capture = self._capture_session(command, surface)
-            with capture if capture is not None else contextlib.nullcontext():
-                envelope, outcome, record = run_prepared(
-                    prepared,
-                    Invocation(
-                        request_id=command["request_id"],
-                        spool=spool,
-                        deadline=deadline,
-                        device=self._device(),
-                        cancel=lambda: _cancelled(self.root, command["request_id"]),
-                        models=self.models,
-                        progress=progress,
-                        # cr-012: the inputs the WORKER already fetched, verified and spooled.
-                        # Every value is a path inside this attempt's own spool: this process is
-                        # never HANDED an address, and `main` installs `sandbox.refuse_network` so a
-                        # handler that dials one anyway is refused rather than merely unexpected.
-                        # That fence is Python-level (cr-042) — it bounds a buggy package, not a
-                        # hostile one, and there is no netns or seccomp under it.
-                        trees={
-                            ref: (Path(root), digest)
-                            for ref, (root, digest) in (command.get("trees") or {}).items()
-                        },
-                        assets=_granted_inputs(command),
-                        max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
-                        max_output_bytes=int(command.get("max_output_bytes", MAX_OUTPUT_BYTES)),
-                    ),
-                )
-            if capture is not None and outcome.terminal == "succeeded":
-                capture_result = capture.write(spool)
+            with (
+                attention.override(
+                    self._attention_snapshot(), self._attention_roots(), swap, pin
+                ) as served_attention,
+                attention_sol.observing() as sol_counts,
+            ):
+                capture = self._capture_session(command, surface)
+                with capture if capture is not None else contextlib.nullcontext():
+                    envelope, outcome, record = run_prepared(
+                        prepared,
+                        Invocation(
+                            request_id=command["request_id"],
+                            spool=spool,
+                            deadline=deadline,
+                            device=self._device(),
+                            cancel=lambda: _cancelled(self.root, command["request_id"]),
+                            models=self.models,
+                            progress=progress,
+                            # cr-012: the inputs the WORKER already fetched, verified and spooled.
+                            # Every value is a path inside this attempt's own spool: this process is
+                            # `sandbox.refuse_network` rejects ungranted network access.
+                            # Input bytes arrive only through the worker grant.
+                            # That fence is Python-level (cr-042) — it bounds a buggy package, not a
+                            # hostile one, and there is no netns or seccomp under it.
+                            trees={
+                                ref: (Path(root), digest)
+                                for ref, (root, digest) in (command.get("trees") or {}).items()
+                            },
+                            assets=_granted_inputs(command),
+                            max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
+                            max_output_bytes=int(command.get("max_output_bytes", MAX_OUTPUT_BYTES)),
+                        ),
+                    )
+                if capture is not None and outcome.terminal == "succeeded":
+                    capture_result = capture.write(spool)
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             if record is None:
                 record = AuthorAttempt(command["request_id"], spool, 0, sink=progress)
         assert record is not None
+        if served_attention is not None:
+            self._emit_attention(record, served_attention, "attention.selected")
+            if "sol-attn" in served_attention.totals():
+                record.emit(
+                    "confession",
+                    "attention.sol.calls",
+                    "sol-attn",
+                    dense_reference=attention_sol.dense_identity(),
+                    **sol_counts,
+                )
+        self._emit_attention(
+            record, attention.observed(self._attention_roots()), "attention.restored"
+        )
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
         self._attempt_spool = None
         if self.group is not None and self.group.broken and not self.poisoned:
@@ -2339,7 +2403,7 @@ class Executor:
             "attribution": record.attribution.document(),
             "position": record.position,
             "outcome": terminal,
-            "execution_observation": self._execution_observation(),
+            "execution_observation": self._execution_observation(served_attention),
             "capture": capture_result,
             "quiescent": quiescent,
             **_env_document(),
@@ -2379,6 +2443,18 @@ class Executor:
 
     # ------------------------------------------------------- the per-request attention pin
 
+    def _attention_snapshot(self) -> attention.Snapshot:
+        return attention.Snapshot(
+            tuple(
+                choice
+                for executor in (self.model_executors or [self])
+                for choice in executor.attention_defaults.choices
+            )
+        )
+
+    def _restore_attention(self) -> None:
+        self._attention_snapshot().restore()
+
     def _attention_roots(self) -> dict[str, Any]:
         roots: dict[str, Any] = {}
         executors = self.model_executors or [self]
@@ -2402,7 +2478,11 @@ class Executor:
         return device
 
     def _attention_frozen(self) -> str:
-        return "a context-parallel group is installed" if self.group is not None else ""
+        return (
+            "a context-parallel group is installed"
+            if self.group is not None or self.world > 1
+            else ""
+        )
 
     def _attention_check(self, pin: str) -> None:
         attention.check(
@@ -2449,7 +2529,21 @@ class Executor:
                 roots[name] = root
         return CaptureSession(options, roots)
 
-    def _execution_observation(self) -> dict[str, Any]:
+    @staticmethod
+    def _emit_attention(record: AuthorAttempt, choices: attention.Applied, name: str) -> None:
+        for component, kernels in choices.hosts.items():
+            for kernel, sites in kernels.items():
+                record.emit(
+                    "confession",
+                    name,
+                    kernel,
+                    component=component,
+                    sites=sites,
+                    pin=choices.pin,
+                    dense_reference=attention_sol.dense_identity() if kernel == "sol-attn" else "",
+                )
+
+    def _execution_observation(self, choices: attention.Applied | None = None) -> dict[str, Any]:
         from cozy_runtime import __version__
 
         # Observed generation facts; image and boot identity are added by the worker.
@@ -2461,7 +2555,7 @@ class Executor:
             "driver": str(self.facts.get("device_driver") or ""),
             "execution_lane": "",  # no generic eager/compiled observation exists yet
             "execution_contract_digest": "",
-            "kernel_symbol": "",
+            "kernel_symbol": ",".join(sorted(choices.totals())) if choices is not None else "",
         }
 
     # ------------------------------------------------------------------ job

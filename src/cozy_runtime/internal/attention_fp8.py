@@ -58,29 +58,19 @@ def member() -> Any:
     a member that dispatches before `bind` raises `Unbound` rather than computing nothing.
     """
     from diffusers.models.attention_dispatch import (
-        AttentionBackendName,
-        _AttentionBackendRegistry,
         _check_device,
         _check_qkv_dtype_bf16_or_fp16,
         _check_shape,
     )
 
-    found = AttentionBackendName._value2member_map_.get(BACKEND)
-    if found is not None:
-        return found
-    synthesised = str.__new__(AttentionBackendName, BACKEND)
-    synthesised._name_ = MEMBER_NAME
-    synthesised._value_ = BACKEND
-    AttentionBackendName._value2member_map_[BACKEND] = synthesised
-    _AttentionBackendRegistry.register(
-        synthesised,
+    from cozy_runtime.internal.attention_registry import register
+
+    return register(
+        BACKEND,
+        _flash_attention_3_hub_fp8,
         constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
-        # NOT context-parallel: `cp.py` refuses a backend outside diffusers' own CP set by
-        # name before anything is armed, which is the right answer for a kernel whose
-        # per-call quantisation has no ring/ulysses form here.
         supports_context_parallel=False,
-    )(_flash_attention_3_hub_fp8)
-    return synthesised
+    )
 
 
 def bind(kernel: Any) -> Any:
