@@ -3,23 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any, Protocol
+from typing import Any
+
+from tensorfs.derived import SourceCapability, SourceInspection, Tensor
 
 from cozy_runtime.author._errors import Cancelled, CapabilityError
 from cozy_runtime.author._model import Model
-from cozy_runtime.author._weights import MAX_WEIGHTS_SOURCE_READ, WeightsSource, WeightsSourceTensor
+from cozy_runtime.author._weights import MAX_WEIGHTS_SOURCE_READ
 
-
-class ModelViewHost(Protocol):
-    structure: WeightsSource
-    identities: Mapping[tuple[str, str], str]
-
-    def check(self) -> None: ...
-    def close(self) -> None: ...
-    def read_part_into(
-        self, component: str, key: str, role: str, offset: int, into: memoryview
-    ) -> None: ...
-    def read_values_into(self, component: str, key: str, offset: int, into: memoryview) -> None: ...
+ReadValues = Callable[[SourceCapability, SourceInspection, str, str, int, memoryview], None]
 
 
 class WeightsView:
@@ -30,15 +22,19 @@ class WeightsView:
     Quantizer-time statistics, including saturation counts, are not inferred here.
     """
 
-    def __init__(self, reader: WeightsReader, host: ModelViewHost) -> None:
+    def __init__(self, reader: WeightsReader, host: SourceCapability) -> None:
         self._reader, self._host, self._closed = reader, host, False
-        self._tensors = {(row.component, row.key): row for row in host.structure.tensors}
+        self._structure = host.inspect()
 
     def _check(self) -> None:
         self._reader._check()
         if self._closed:
             raise CapabilityError("model view is closed", code="weights_reader_closed")
-        self._host.check()
+        try:
+            self._host.check()
+        except BaseException:
+            self._reader._check()
+            raise
 
     def __enter__(self) -> WeightsView:
         self._check()
@@ -54,32 +50,30 @@ class WeightsView:
 
     def components(self) -> tuple[str, ...]:
         self._check()
-        return tuple(dict.fromkeys(row.component for row in self._host.structure.tensors))
+        return tuple(self._structure.components)
 
     def keys(self, component: str) -> tuple[str, ...]:
         self._check()
-        rows = tuple(key for name, key in self._tensors if name == component)
+        rows = tuple(self._structure.components.get(component, {}))
         if not rows:
             raise CapabilityError("model component is absent", code="weights_reader_tensor")
         return rows
 
-    def tensor(self, component: str, key: str) -> WeightsSourceTensor:
+    def tensor(self, component: str, key: str) -> Tensor:
         self._check()
         try:
-            return self._tensors[component, key]
+            return self._structure.components[component][key]
         except KeyError:
             raise CapabilityError("model tensor is absent", code="weights_reader_tensor") from None
 
     def identity(self, component: str, key: str) -> str:
         self.tensor(component, key)
-        return self._host.identities[component, key]
+        return self._structure.identities[component, key]
 
     def read_part_into(self, component: str, key: str, role: str, offset: int, into: Any) -> None:
         """Read an encoded role's byte range, at most MAX_WEIGHTS_SOURCE_READ bytes."""
         self._check()
-        target = _buffer(into, logical=False)
-        _offset(offset)
-        self._host.read_part_into(component, key, role, offset, target)
+        self._host.read_part_into(component, key, role, offset, into)
         self._check()
 
     def read_values_into(self, component: str, key: str, offset: int, into: Any) -> None:
@@ -91,7 +85,11 @@ class WeightsView:
         self._check()
         target = _buffer(into, logical=True)
         _offset(offset)
-        self._host.read_values_into(component, key, offset, target)
+        if self._reader._values is None:
+            raise CapabilityError(
+                "logical model decoder is unavailable", code="weights_reader_decoder_unavailable"
+            )
+        self._reader._values(self._host, self._structure, component, key, offset, target)
         self._check()
 
 
@@ -127,11 +125,12 @@ class WeightsReader:
         self,
         attempt: Any,
         models: Mapping[str, Model[object]],
-        open_view: Callable[[str], ModelViewHost] | None,
+        open_view: Callable[[Model[object]], SourceCapability] | None,
         cancel: Callable[[], bool] = lambda: False,
+        read_values: ReadValues | None = None,
     ) -> None:
         self._attempt, self._models = attempt, dict(models)
-        self._open, self._cancel = open_view, cancel
+        self._open, self._cancel, self._values = open_view, cancel, read_values
 
     def _check(self) -> None:
         self._attempt.check_open("WeightsReader")
@@ -149,7 +148,7 @@ class WeightsReader:
             raise CapabilityError("model input is not granted", code="weights_source_ungranted")
         if self._open is None:
             raise CapabilityError("model reader is unavailable", code="weights_reader_unavailable")
-        host = self._open(source.checkpoint_ref)
+        host = self._open(source)
         try:
             self._check()
             return WeightsView(self, host)

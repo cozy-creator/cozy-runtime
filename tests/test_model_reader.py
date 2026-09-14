@@ -24,9 +24,11 @@ from cozy_runtime.internal.encoding.formats import (
     SPEC_ROWWISE,
     SPEC_ROWWISE_KEEPDIM,
 )
-from cozy_runtime.internal.model_reader import ModelReaderBroker, ModelReaderProxy
+from cozy_runtime.internal.model_values import read_values_into
+from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterBroker
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.grants import MODEL_PREFIX
+from weights_channel import exchange as channel_exchange
 
 
 def model(
@@ -102,7 +104,7 @@ def reader(
 ) -> tuple[
     WeightsReader,
     dict[str, QuantizationSource],
-    ModelReaderBroker,
+    WriterBroker,
     AttemptRecord,
     Attempt,
     list[tuple[str, dict[str, Any]]],
@@ -123,21 +125,22 @@ def reader(
         spool=spool,
         kind="job",
     )
-    broker = ModelReaderBroker(lambda: store)
+    broker = WriterBroker(lambda: store, store_root=Path(store.root))
     frames = []
 
-    def exchange(kind: str, fields: dict[str, Any]) -> dict[str, Any]:
-        frames.append((kind, dict(fields)))
-        assert kind == "model_reader", "a read-only call requested writer authority"
+    def handle(fields: dict[str, Any]) -> dict[str, Any]:
+        frames.append(("weights_writer", dict(fields)))
         return broker.handle(record, fields)
 
+    client = ExecutionStorage(spool, channel_exchange(handle), {})
     models = {name: _derive_model(QuantizationSource, ref[0]) for name, ref in references.items()}
     attempt = Attempt(record.request_id, spool)
     service = WeightsReader(
         attempt,
         models,
-        lambda manifest: ModelReaderProxy.open(spool, exchange, manifest),
+        lambda source: client.source(source.checkpoint_ref),
         lambda: bool(record.canceling),
+        read_values_into,
     )
     return service, models, broker, record, attempt, frames
 
@@ -190,7 +193,8 @@ def test_inherited_identity_and_changed_scale_use_native_read_custody(
             cand.read_values_into("model", "changed", 0, right)
             np.testing.assert_array_equal(left.view(np.uint32), expected.view(np.uint32))
             np.testing.assert_array_equal(right, changed_expected)
-    assert not broker.views
+    broker.close()
+    assert not broker.sources
     with pytest.raises(CapabilityError):
         ref.identity("model", "inherited")
     with pytest.raises(CapabilityError):
@@ -259,26 +263,26 @@ def test_foreign_stale_canceled_and_released_views_refuse(tmp_path: Path) -> Non
     reference = model(store, "scope", {"weight": plain(np.arange(16, dtype=np.float32))})
     service, models, broker, record, _, _ = reader(tmp_path, store, {"source": reference})
     view = service.open(models["source"])
-    token = next(iter(broker.views))[-1]
-    foreign = AttemptRecord(
-        "foreign", 1, record.digest, record.spec, state="running", spool=record.spool
-    )
-    assert not broker.handle(foreign, {"operation": "check", "view_id": token})["ok"]
-    assert len(broker.views) == 1
-    assert not broker.handle(record, {"operation": "open", "manifest": "sha256:" + "ff" * 32})["ok"]
-    assert len(broker.views) == 1
+    assert len(broker.sources) == 1
+    retired = broker.handle(record, {"operation": "check", "view_id": "foreign"})
+    assert not retired["ok"] and retired["code"] == "weights_writer_ungranted"
+    assert len(broker.sources) == 1
+    assert not broker.handle(record, {"operation": "source", "manifest": "sha256:" + "ff" * 32})[
+        "ok"
+    ]
     record.spec["inputs"][0]["length"] += 1
-    assert not broker.handle(record, {"operation": "open", "manifest": reference[0]})["ok"]
+    with pytest.raises(tensorfs.errors.Refusal):
+        service.open(models["source"])
     record.spec["inputs"][0]["length"] -= 1
     record.canceling = "requested"
-    assert not broker.handle(record, {"operation": "check", "view_id": token})["ok"]
-    assert not broker.views
+    broker.close_attempt(record)
+    assert not broker.sources
     with pytest.raises(Cancelled):
         view.identity("model", "weight")
     record.canceling = ""
     view = service.open(models["source"])
     broker.close_attempt(record)
-    with pytest.raises(CapabilityError):
+    with pytest.raises((EOFError, OSError, tensorfs.errors.Refusal)):
         view.read_part_into("model", "weight", "value", 0, bytearray(4))
 
 
@@ -318,10 +322,12 @@ def test_missing_or_corrupt_native_header_cannot_open_a_view(tmp_path: Path) -> 
     path = files[0]
     path.chmod(0o600)
     path.write_bytes(header[:-1] + bytes([header[-1] ^ 1]))
-    with pytest.raises(CapabilityError):
+    with pytest.raises(tensorfs.errors.Refusal):
         service.open(models["source"])
-    assert not broker.views
+    broker.close()
+    assert not broker.sources
     assert not path.exists(), "native verification must quarantine the corrupt header"
-    with pytest.raises(CapabilityError):
+    with pytest.raises(tensorfs.errors.Refusal):
         service.open(models["source"])
-    assert not broker.views
+    broker.close()
+    assert not broker.sources

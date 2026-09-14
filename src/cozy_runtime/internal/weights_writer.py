@@ -257,9 +257,15 @@ class WriterBroker:
                 "source is outside the invocation", code="weights_source_ungranted"
             )
         key = attempt.request_id, attempt.attempt
+        accepted_digest = getattr(attempt, "digest", None)
         client, server = socket.socketpair()
         stop = server.dup()
         with self.lock:
+            if len(self.sources.get(key, ())) >= 16:
+                client.close()
+                server.close()
+                stop.close()
+                raise CapabilityError("too many open source handles", code="weights_reader_bounds")
             self.sources.setdefault(key, set()).add(stop)
 
         def current() -> None:
@@ -267,6 +273,8 @@ class WriterBroker:
                 if (
                     attempt.canceling
                     or attempt.state != "running"
+                    or (attempt.request_id, attempt.attempt) != key
+                    or getattr(attempt, "digest", None) != accepted_digest
                     or stop not in self.sources.get(key, ())
                 ):
                     raise CapabilityError(

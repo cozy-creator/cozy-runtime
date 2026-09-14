@@ -1402,7 +1402,7 @@ class AttemptEngine:
         either side ever copies the checkpoint. `Checkpoints.save()` used to report success
         on this answer; it now refuses `checkpoint_sink_unbuilt`, and `Checkpoints.declare()`
         is what reaches here. The row keeps landing because it is TRUE — an attempt declared
-        a checkpoint with this digest and this length — and it is what the WeightsSink will
+        a checkpoint with this digest and this length — the native writer will
         attach real object references to when #552's transaction lands.
 
         Three answers and no fourth:
@@ -1461,7 +1461,7 @@ class AttemptEngine:
         self.receipts[key] = record
         # The RecordOwner's copy rides the DURABLE control lane, after the worker's own
         # record, at-least-once like every other control message. `artifact` stays
-        # UNSET, and that is the honest state of this frame: no WeightsSink exists to fill
+        # UNSET: this checkpoint declaration does not have a native writer to fill
         # it, so the RecordOwner is being told an attempt DECLARED a checkpoint and nothing
         # more (#552/#553a).
         # The envelope is stamped centrally by the worker's `send` (#454: three fields, one
@@ -1504,24 +1504,9 @@ class AttemptEngine:
             return {
                 "ok": False,
                 "code": "weights_host_unavailable",
-                "detail": "this worker has no WeightsSink host",
+                "detail": "this worker has no native TensorFS writer host",
             }
         try:
-            if kind == "model_reader":
-                if attempt.job is None:
-                    raise ValueError("a model read requires the current job")
-                if frame.get("operation") in {
-                    "open",
-                    "read",
-                } and self.weights.writer_broker.payload_pending(attempt):
-                    return {
-                        "ok": False,
-                        "code": "weights_reader_writer_pending",
-                        "detail": "read before reserving a payload, or use writer source_read_into",
-                    }
-                # Exact Model inputs already grant read access. The broker verifies
-                # those immutable input refs; it grants no output or write authority.
-                return self.weights.reader_broker.handle(attempt, frame)
             output_slot = str(frame.get("output_slot", ""))
             if kind == "weights_intent" or (
                 kind == "weights_writer" and frame.get("operation") == "output"
@@ -1693,7 +1678,6 @@ class AttemptEngine:
         finally:
             if self.weights is not None:
                 self.weights.writer_broker.close_attempt(attempt)
-                self.weights.reader_broker.close_attempt(attempt)
         return self.release(attempt, reply, spool, key)
 
     @staticmethod

@@ -13,7 +13,7 @@ The existing workspace remains the sole execution/custody journal.
 The implementation replaces Runtime's `WeightsSink`/`WeightsTransaction`, duplicate
 declaration/source classes, `StoreProxy`/`WriterProxy` and complete-role spool
 transport. Keep only interface output declarations and execution receipt/admission
-bindings. The separate evaluation reader metadata contract remains unchanged. The author entry points are `ctx.tensorfs_source(model)`,
+bindings. Model evaluation uses the same native source metadata/transport, with only float32 reconstruction in Runtime. The author entry points are `ctx.tensorfs_source(model)`,
 `ctx.output(slot)` and `ctx.adopt_model(native_receipt)`; algorithms use TensorFS
 declarations, source inspection and writer handles directly.
 
@@ -51,3 +51,12 @@ capacity and Workspace controls run against real scoped descriptors. The ordinar
 CLI producer/inheritance/shared-FP8 proof with nonlexical components is recorded under
 `outputs/cr174-tensorfs-execution-adapter/order-cli-*` in the Cozy v2 workspace. The new
 private/disconnected/default-home CLI qualification remains a joint integration gate.
+
+
+The reader follow-up removes `ModelReaderProxy`/`ModelReaderBroker`, per-view metadata/part
+spool files and `WeightsSource*` geometry classes. TensorFS PR170 supplies source checks,
+bounded native part reads and opaque encoded tensor identities. Metadata-only inspection
+leaves no persistent read lease; checking/reading pins the source until close. Resident
+part reads require no disk-write grant. Runtime keeps only the logical float32 decoder,
+invocation binding and resource cleanup. Eval's actual native measurement and instrument
+normalization drivers qualify the new types and transport without claiming model quality.
