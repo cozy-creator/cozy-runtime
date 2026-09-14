@@ -55,9 +55,7 @@ def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, Any]]:
             if value.get(name) is not None:
                 base, _ = read_binding(value[name])
                 payload[name] = msgspec.to_builtins(base)
-        return canonical_json.encode(payload), {
-            name: value[name] for name in names if value.get(name) is not None
-        }
+        return canonical_json.encode(payload), value
     if (
         set(value) != {"payload", "models"}
         or not isinstance(value["payload"], dict)

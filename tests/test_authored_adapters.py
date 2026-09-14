@@ -23,9 +23,9 @@ from cozy_runtime.internal.lora import AdapterRefusal
 from cozy_runtime.internal.worker import machine_models
 from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.machine_serving import (
-    _call_arguments,
     _matches_bindings,
     _retain_models,
+    arguments,
 )
 from cozy_runtime.internal.worker.package_prepare import (
     NativeAdapterSelection,
@@ -161,10 +161,10 @@ def test_generated_serving_proxy_accepts_adapters_only_on_model_slots(
         digest="",
         entrypoint="generate",
         declaration=next(row for row in declaration["entrypoints"] if row["name"] == "generate"),
+        serving_envelope=True,
     )
-    payload, models = _call_arguments(
-        target, pb.ChildCallRequest(request_canonical_bytes=call.payload)
-    )
+    payload_bytes, models = arguments(target, call.payload)
+    payload = canonical_json.decode(payload_bytes)
     assert payload["prompt"] == "same" and "models" not in payload
     assert read_binding(models["model"])[1][0].scale == "0.3"
     assert (
@@ -312,3 +312,82 @@ def test_adapter_wrapper_inside_typed_user_payload_is_not_an_override() -> None:
     wrapped = with_adapters(base, [LoRA(artifact("2"), "dit", 0)])
     with pytest.raises(ConformanceError, match="adapter_slot"):
         reserve(base, base, UserData(wrapped))
+
+
+def test_native_self_call_unwraps_only_declared_model_payload() -> None:
+    bound = canonical_json.decode(
+        reserve(with_adapters(artifact("1"), [LoRA(artifact("2"), "dit", 0)]), artifact("3"))
+    )
+    target = Target(
+        "revision",
+        "generate",
+        "interface",
+        {"models": [{"path": "generate.models.first"}, {"path": "generate.models.second"}]},
+        {},
+        None,
+        "digest",
+        serving_envelope=False,
+    )
+    raw = canonical_json.encode(bound)
+    payload, models = arguments(target, raw)
+    assert canonical_json.decode(payload)["first"] == msgspec.to_builtins(artifact("1"))
+    assert models == bound
+    assert read_binding(models["first"])[1][0].scale == "0"
+    assert canonical_json.decode(raw)["first"]["format"] == "cozy.model-binding/1"
+
+
+def test_prepared_cache_matches_default_and_adapted_slots_together() -> None:
+    base, adapter, default = artifact("1"), artifact("2"), artifact("3")
+    native = [
+        pb.NativeModelBinding(
+            slot="generate.models.base",
+            manifest=pb.Ref(
+                digest=documents.raw(base.manifest.digest), length=base.manifest.length
+            ),
+        )
+    ]
+    stack = {
+        "generate.models.base": (
+            NativeAdapterSelection(
+                "dit", adapter.manifest.digest, adapter.manifest.length, "adapter", "0.3"
+            ),
+        )
+    }
+    defaults = [{"parameter": "text", "manifest": msgspec.to_builtins(default.manifest)}]
+    selected = {
+        "component": "dit",
+        "model_id": "adapter",
+        "source_component": "adapter",
+        "scale": "0.3",
+    }
+    candidate = {
+        "models": [
+            {"id": name, "manifest": msgspec.to_builtins(value.manifest)}
+            for name, value in [("base", base), ("adapter", adapter), ("text", default)]
+        ],
+        "entrypoints": [
+            {
+                "name": "generate",
+                "slots": [
+                    {
+                        "slot": "base",
+                        "reference_model_id": "base",
+                        "components": [{"component": "dit", "model_id": "base"}],
+                        "adapters": [selected],
+                    },
+                    {
+                        "slot": "text",
+                        "reference_model_id": "text",
+                        "components": [{"component": "encoder", "model_id": "text"}],
+                    },
+                ],
+            }
+        ],
+    }
+    assert _matches_bindings(candidate, "generate", native, stack, defaults)
+    assert not _matches_bindings(candidate, "generate", native, {}, defaults)
+    assert not _matches_bindings(candidate, "generate", native, stack)
+    wrong_default = [{**defaults[0], "manifest": msgspec.to_builtins(base.manifest)}]
+    assert not _matches_bindings(candidate, "generate", native, stack, wrong_default)
+    candidate["entrypoints"][0]["slots"][1]["adapters"] = [selected]
+    assert not _matches_bindings(candidate, "generate", native, stack, defaults)

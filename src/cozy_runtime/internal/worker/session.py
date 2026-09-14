@@ -3767,7 +3767,7 @@ class Worker:
                 ):
                     raise documents.DocumentError(
                         "model_adapters_unsupported",
-                        "adapted model bindings require wire55 on both peers",
+                        "adapted model bindings require wire57 on both peers",
                     )
             except documents.DocumentError as exc:
                 kind = (
