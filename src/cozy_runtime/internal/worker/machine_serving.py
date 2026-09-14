@@ -48,9 +48,10 @@ def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, Any]]:
     value = canonical_json.decode(raw)
     if not isinstance(value, dict):
         raise WorkspaceRefusal("captured serving arguments must be an object")
-    if not target.serving_envelope:
-        return raw, value
     names = {model["path"].rpartition(".")[2] for model in target.declaration.get("models", [])}
+    if not target.serving_envelope:
+        payload = {key: item for key, item in value.items() if key not in names}
+        return canonical_json.encode(payload), value
     if (
         set(value) != {"payload", "models"}
         or not isinstance(value["payload"], dict)
