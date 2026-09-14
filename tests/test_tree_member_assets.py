@@ -190,6 +190,7 @@ def test_member_projects_without_spool_copy_and_child_survives_parent_gc(
         "released",
         "foreign",
         "cancelled",
+        "missing_file",
     ],
 )
 def test_member_refuses_before_minting_custody(tmp_path: Path, mutation: str) -> None:
@@ -205,6 +206,9 @@ def test_member_refuses_before_minting_custody(tmp_path: Path, mutation: str) ->
     elif mutation == "changed":
         (local / "frame.png").chmod(0o644)
         (local / "frame.png").write_bytes(b"changed")
+    elif mutation == "missing_file":
+        local.chmod(0o755)
+        (local / "frame.png").unlink()
     elif mutation == "symlink":
         local.chmod(0o755)
         (local / "frame.png").unlink()

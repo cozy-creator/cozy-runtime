@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._assets import file_state
+from cozy_runtime.author._errors import RuntimeFailure
 from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, admits, sniff
 from cozy_runtime.internal.worker import byte_inputs, machine_models, workspace_byte_outputs
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
@@ -41,6 +42,7 @@ def project(calls: Calls, attempt: AttemptRecord, frame: Mapping[str, Any]) -> d
                 or PurePosixPath(path).is_absolute()
                 or str(PurePosixPath(path)) != path
                 or any(part in (".", "..") for part in PurePosixPath(path).parts)
+                or not isinstance(kind, str)
                 or kind not in KIND_MEDIA
                 or type(limit) is not int
                 or not 0 < limit <= byte_inputs.MAX_BYTES
@@ -150,5 +152,5 @@ def project(calls: Calls, attempt: AttemptRecord, frame: Mapping[str, Any]) -> d
                     "local": str(local),
                     "file_state": list(state),
                 }
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeFailure) as exc:
         return {"ok": False, "code": "tree_member_refused", "detail": str(exc)[:1024]}

@@ -372,6 +372,8 @@ def asset_kinds(annotation: object) -> frozenset[str]:
     base, _ = strip(annotation)
     base, _ = unwrap_optional(base)
     if isinstance(base, type):
+        if base is Tree:
+            return frozenset({"tree"})
         if issubclass(base, Asset):
             return frozenset({base.kind})
         return frozenset()

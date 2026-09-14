@@ -56,8 +56,8 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._model import _derive_model
+from cozy_runtime.author._services import MAX_OUTPUT_BYTES, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
-from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.internal import (
     accel,
     attention,
@@ -2273,6 +2273,7 @@ class Executor:
                         },
                         assets=_granted_inputs(command),
                         max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
+                        max_output_bytes=int(command.get("max_output_bytes", MAX_OUTPUT_BYTES)),
                     ),
                 )
             if capture is not None and outcome.terminal == "succeeded":
@@ -2669,6 +2670,7 @@ class Executor:
                 },
                 assets=_granted_inputs(command),
                 max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
+                max_output_bytes=int(command.get("max_output_bytes", MAX_OUTPUT_BYTES)),
                 scratch=scratch,
                 checkpoints=durable_checkpoint,
                 weights_values=weights_values,
