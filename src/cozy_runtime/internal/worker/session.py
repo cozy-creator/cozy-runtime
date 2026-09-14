@@ -6687,7 +6687,9 @@ class Worker:
             for subject in list(self.monitor.cursors):
                 self.monitor.sample(subject)
             self.publish_activity()
-            if self.connected.is_set():
+            # Observation follows authentication, independently of the dispatch
+            # barrier. Only the current stream is eligible, after its snapshot.
+            if self.fence.control_stream_epoch in self.attached_streams:
                 self.send(pb.WorkerFrame(observed_state=self.observed_state()))
 
     def publish_activity(self, *, strict: bool = False) -> None:
