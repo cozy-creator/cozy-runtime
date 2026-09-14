@@ -17,6 +17,8 @@ from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import PUBLISHED_MACHINE_CAPTURE_WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+from . import machine_model_defaults
+
 if TYPE_CHECKING:
     from .session import Worker
 
@@ -40,7 +42,7 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
     if published and request.claim.wire_minor < PUBLISHED_MACHINE_CAPTURE_WIRE_MINOR:
         raise WorkspaceRefusal("published execution capture requires wire54")
     if (
-        set(capture) - {"published_revisions"}
+        set(capture) - {"published_revisions", "model_defaults"}
         != {"format", "root_revision_digest", "revisions", "bindings"}
         or not isinstance(capture["revisions"], list)
         or not isinstance(published, list)
@@ -192,6 +194,7 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             bound[caller].add(target)
     if len(keys) > 4096 or keys != sorted(set(keys)) or bound != exports:
         raise WorkspaceRefusal("execution callable inventory is incomplete or ambiguous")
+    machine_model_defaults.verify(worker, request, capture, interfaces)
     spec = documents.read(request.offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
     root = capture["root_revision_digest"]
     state = request.prepared_state

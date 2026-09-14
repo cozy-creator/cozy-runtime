@@ -19,7 +19,7 @@ from cozy_runtime.internal import canonical, schema
 
 
 def metadata(surface: Surface) -> dict[str, Any]:
-    if surface.kind == "entrypoint":
+    if surface.kind == "entrypoint" and not surface.invocable:
         return serving_metadata(
             surface.payload_type,
             surface.result_type,
@@ -163,6 +163,37 @@ def from_types(
 
 def _identifier(value: object) -> bool:
     return isinstance(value, str) and value.isidentifier() and not keyword.iskeyword(value)
+
+
+def project_serving_models(document: dict[str, Any]) -> None:
+    """Expose injected Model parameters once, in the serving Model plane.
+
+    Only the trusted builders of registered @invocable entrypoints call this.
+    The source proxy retains its original typed flat request for self calls.
+    Ordinary request structs with colliding field names still fail generation.
+    """
+    parameters = {model["path"].rpartition(".")[2] for model in document.get("models", [])}
+    if not parameters:
+        return
+    fields = document["request"]["fields"]
+    for parameter in parameters:
+        field = next((field for field in fields if field["name"] == parameter), None)
+        if field is None or field["type"] != {"union": ["null", {"input": "model"}]}:
+            raise ConformanceError(
+                "serving Model parameter lost its typed declaration", code="invocable_interface"
+            )
+    document["request"]["fields"] = [field for field in fields if field["name"] not in parameters]
+    metadata = document["invocable"]
+    metadata["parameters"] = [name for name in metadata["parameters"] if name not in parameters]
+    for field in ("defaults", "type_names", "enum_members"):
+        metadata[field] = {
+            path: value
+            for path, value in metadata[field].items()
+            if not any(
+                path == "request/" + parameter or path.startswith("request/" + parameter + "/")
+                for parameter in parameters
+            )
+        }
 
 
 def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> dict[str, Any]:

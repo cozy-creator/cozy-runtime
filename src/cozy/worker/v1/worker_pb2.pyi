@@ -570,16 +570,44 @@ class ProtocolInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class MachineExecutionCapture(_message.Message):
-    __slots__ = ("root_revision_digest", "revisions", "bindings", "published_revisions")
+    __slots__ = ("root_revision_digest", "revisions", "bindings", "published_revisions", "model_defaults")
     ROOT_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     REVISIONS_FIELD_NUMBER: _ClassVar[int]
     BINDINGS_FIELD_NUMBER: _ClassVar[int]
     PUBLISHED_REVISIONS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_DEFAULTS_FIELD_NUMBER: _ClassVar[int]
     root_revision_digest: bytes
     revisions: _containers.RepeatedCompositeFieldContainer[LocalPackageRevision]
     bindings: _containers.RepeatedCompositeFieldContainer[MachineCallableBinding]
     published_revisions: _containers.RepeatedCompositeFieldContainer[PublishedPackageRevision]
-    def __init__(self, root_revision_digest: _Optional[bytes] = ..., revisions: _Optional[_Iterable[_Union[LocalPackageRevision, _Mapping]]] = ..., bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ..., published_revisions: _Optional[_Iterable[_Union[PublishedPackageRevision, _Mapping]]] = ...) -> None: ...
+    model_defaults: _containers.RepeatedCompositeFieldContainer[MachineModelDefault]
+    def __init__(self, root_revision_digest: _Optional[bytes] = ..., revisions: _Optional[_Iterable[_Union[LocalPackageRevision, _Mapping]]] = ..., bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ..., published_revisions: _Optional[_Iterable[_Union[PublishedPackageRevision, _Mapping]]] = ..., model_defaults: _Optional[_Iterable[_Union[MachineModelDefault, _Mapping]]] = ...) -> None: ...
+
+class MachineModelDefault(_message.Message):
+    __slots__ = ("callee_revision_digest", "entrypoint", "parameter", "public_origin", "rungs", "unavailable_code")
+    CALLEE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    ENTRYPOINT_FIELD_NUMBER: _ClassVar[int]
+    PARAMETER_FIELD_NUMBER: _ClassVar[int]
+    PUBLIC_ORIGIN_FIELD_NUMBER: _ClassVar[int]
+    RUNGS_FIELD_NUMBER: _ClassVar[int]
+    UNAVAILABLE_CODE_FIELD_NUMBER: _ClassVar[int]
+    callee_revision_digest: bytes
+    entrypoint: str
+    parameter: str
+    public_origin: str
+    rungs: _containers.RepeatedCompositeFieldContainer[MachineModelDefaultRung]
+    unavailable_code: str
+    def __init__(self, callee_revision_digest: _Optional[bytes] = ..., entrypoint: _Optional[str] = ..., parameter: _Optional[str] = ..., public_origin: _Optional[str] = ..., rungs: _Optional[_Iterable[_Union[MachineModelDefaultRung, _Mapping]]] = ..., unavailable_code: _Optional[str] = ...) -> None: ...
+
+class MachineModelDefaultRung(_message.Message):
+    __slots__ = ("gpu", "repository", "manifest")
+    GPU_FIELD_NUMBER: _ClassVar[int]
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    gpu: str
+    repository: str
+    manifest: Ref
+    def __init__(self, gpu: _Optional[str] = ..., repository: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
 class PublishedPackageRevision(_message.Message):
     __slots__ = ("package", "environment", "package_interface")
