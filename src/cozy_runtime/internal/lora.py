@@ -257,15 +257,22 @@ class LinearAdapters:
             # FP16/BF16 -> FP32 is lossless. The ordered FP32 accumulator rounds back
             # to the base output only once, after every adapter, like an FP32 PEFT stack.
             with torch.autocast(device_type=x.device.type, enabled=False):
-                for start in range(0, inputs.shape[0], TILE_ROWS):
-                    attempt.check_cancelled()
-                    stop = min(start + TILE_ROWS, inputs.shape[0])
-                    tile = torch.zeros(
+                if inputs.shape[0]:
+                    tile = torch.empty(
                         (TILE_ROWS, in_features), dtype=torch.float32, device=x.device
                     )
-                    accumulator = torch.zeros(
+                    accumulator = torch.empty(
                         (TILE_ROWS, out_features), dtype=torch.float32, device=x.device
                     )
+                for start in range(0, inputs.shape[0], TILE_ROWS):
+                    assert tile is not None and accumulator is not None
+                    attempt.check_cancelled()
+                    stop = min(start + TILE_ROWS, inputs.shape[0])
+                    # Every valid row is overwritten below. Only padding needs a
+                    # defined zero; keep the same GEMM geometry and rounding path.
+                    if stop - start < TILE_ROWS:
+                        tile[stop - start :].zero_()
+                        accumulator[stop - start :].zero_()
                     tile[: stop - start].copy_(inputs[start:stop])
                     accumulator[: stop - start].copy_(result[start:stop])
                     for term in terms:
@@ -275,7 +282,6 @@ class LinearAdapters:
                         accumulator.add_(delta)
                         hidden = delta = None
                     result[start:stop].copy_(accumulator[: stop - start])
-                    tile = accumulator = None
         finally:
             tile = accumulator = hidden = delta = None
         attempt.calls += 1

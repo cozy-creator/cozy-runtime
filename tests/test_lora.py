@@ -448,3 +448,40 @@ def test_fp32_stack_rounds_back_to_bf16_only_after_all_adapters() -> None:
     expected = torch.tensor([[1.0 + 0.003 + 0.003]], dtype=torch.bfloat16)
     assert torch.equal(actual, expected)
     assert actual.item() == 1.0078125
+
+
+@pytest.mark.parametrize("rows", [1, TILE_ROWS, TILE_ROWS + 17, 2 * TILE_ROWS + 17])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_reused_scratch_matches_old_tiles_with_poisoned_empty_storage(
+    rows: int, dtype: Any, monkeypatch: Any
+) -> None:
+    model, binding, source, _ = _fixture(dtype)
+    x = torch.randn(rows, 4, dtype=dtype)
+    expected = model(x).clone()
+    linear = torch.nn.functional.linear
+    a, b = source.tensors["0.lora_A.weight"], source.tensors["0.lora_B.weight"]
+    # Freeze the previous zero-initialized per-tile arithmetic as the parity oracle.
+    for start in range(0, rows, TILE_ROWS):
+        count = min(TILE_ROWS, rows - start)
+        tile = torch.zeros(TILE_ROWS, 4)
+        accumulator = torch.zeros(TILE_ROWS, 3)
+        tile[:count].copy_(x[start : start + count])
+        accumulator[:count].copy_(expected[start : start + count])
+        for coefficient in (0.75, -0.375):
+            delta = linear(linear(tile, a), b)
+            delta.mul_(coefficient)
+            accumulator.add_(delta)
+        expected[start : start + count].copy_(accumulator[:count])
+    original_empty = torch.empty
+
+    def poisoned(*args: Any, **kwargs: Any) -> Any:
+        tensor = original_empty(*args, **kwargs)
+        if tensor.dtype == torch.float32:
+            tensor.fill_(float("nan"))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", poisoned)
+    with _request(binding, source, replace(source, scale=-0.25)):
+        actual = model(x)
+    assert torch.equal(actual, expected)
+    assert bool(torch.isfinite(actual).all())
