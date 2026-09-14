@@ -35,7 +35,7 @@ def test_invalid_layout_refuses(fields: tuple[Any, Any, Any]) -> None:
 def test_real_module_hooks_restore_site_after_failure() -> None:
     torch = pytest.importorskip("torch")
 
-    class Failing(torch.nn.Module):
+    class Failing(torch.nn.Module):  # type: ignore[name-defined, misc]
         def forward(self, value: Any) -> Any:
             assert attention_sol._SITE.get() == attention_sol.Site("dit", "blocks.2.attn")
             raise RuntimeError("forward failure")
