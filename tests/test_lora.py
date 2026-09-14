@@ -330,7 +330,12 @@ def test_each_stacked_term_budgets_above_current_live_outputs() -> None:
                 total += tensor.untyped_storage().nbytes()
         return total
 
-    class Track(TorchDispatchMode):  # type: ignore[no-untyped-call]
+    dispatch_base: Any = TorchDispatchMode
+
+    class Track(dispatch_base):  # type: ignore[misc]
+        def __init__(self) -> None:
+            super().__init__()
+
         def __torch_dispatch__(
             self, func: Any, types: Any, args: Any = (), kwargs: Any = None
         ) -> Any:
@@ -362,7 +367,7 @@ def test_each_stacked_term_budgets_above_current_live_outputs() -> None:
                     (term.a.untyped_storage().data_ptr(), term.b.untyped_storage().data_ptr())
                 )
         measuring = True
-        with Track():  # type: ignore[no-untyped-call]
+        with Track():
             result = model(x)
         assert result.shape == (2, 5, 3)
     output_bytes = 2 * 5 * 3 * 4

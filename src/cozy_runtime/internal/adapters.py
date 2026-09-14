@@ -218,7 +218,9 @@ def load(
                     check_cancelled()
                     if row.encoded.encoding != SPEC_PLAIN or row.encoded.roles != {"value"}:
                         raise AdapterRefusal("adapter_tensor", f"{row.key}: encoded adapter factor")
-                    tensor = torch.empty(row.shape, dtype=getattr(torch, TORCH_DTYPES[row.dtype]))
+                    tensor = torch.empty(
+                        row.shape, dtype=getattr(torch, TORCH_DTYPES[row.dtype]), device="cpu"
+                    )
                     lease.read_part_into(
                         checkpoint.header_bytes,
                         selection.source_component,
