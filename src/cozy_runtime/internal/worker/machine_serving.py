@@ -227,6 +227,45 @@ class Serving:
                         retention=retention,
                     )
                 )
+            # The existing immutable preparation registry already owns this work.
+            # Reusing its exact checkpoint bindings does not reuse an inference result.
+            expected = {
+                model.slot.removeprefix(target.entrypoint + ".models."): documents.body(
+                    model.manifest
+                )
+                for model in native
+            }
+            with worker.control_lock:
+                candidates = [dict(value.document) for value in worker.local_revisions.values()]
+            for candidate in candidates:
+                if (
+                    candidate.get("development", {}).get("local_revision_digest") != target.revision
+                    or candidate.get("environment_digest") != prepared["environment_digest"]
+                    or candidate.get("package_interface") != prepared["package_interface"]
+                ):
+                    continue
+                entry = next(
+                    (
+                        row
+                        for row in candidate.get("entrypoints", [])
+                        if row["name"] == target.entrypoint
+                    ),
+                    None,
+                )
+                models = {row["id"]: row["manifest"] for row in candidate.get("models", [])}
+                if entry is None:
+                    continue
+                used = {slot["reference_model_id"] for slot in entry["slots"]}
+                if used != models.keys() or any(
+                    component["model_id"] != slot["reference_model_id"]
+                    for slot in entry["slots"]
+                    for component in slot.get("components", [])
+                ):
+                    continue
+                if {
+                    slot["slot"]: models[slot["reference_model_id"]] for slot in entry["slots"]
+                } == expected:
+                    return candidate
             installed = package_environment.open_generation(
                 Path(worker.options.install_root or ""),
                 receipt_digest=target.prepared_revision["receipt_digest"],
