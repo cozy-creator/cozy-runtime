@@ -99,7 +99,7 @@ def install_site(module: Any, component: str, path: str) -> None:
         self_name += "_"
 
     @wraps(call, updated=())
-    def scoped_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+    def scoped_forward(self: Any, /, *args: Any, **kwargs: Any) -> Any:
         # Read the copied module's record rather than closing over a bound method
         # on the original module. deepcopy must execute the copied weights.
         installed = self._cozy_sol_site

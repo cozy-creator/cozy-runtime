@@ -199,3 +199,20 @@ def test_deepcopy_restores_an_existing_instance_bound_method() -> None:
     attention_sol.remove_site(module, "dit", "attn")
     assert module.forward.__self__ is module
     assert module.forward.__func__ is original
+
+
+def test_instance_callable_keeps_self_and_wrapper_name_keywords() -> None:
+    torch = pytest.importorskip("torch")
+    module = torch.nn.Module()
+
+    def original(*, self: Any, _cozy_module: Any) -> Any:
+        return self + _cozy_module
+
+    module.forward = original
+    attention_sol.install_site(module, "dit", "attn")
+    assert inspect.signature(module.forward) == inspect.signature(original)
+    assert torch.equal(
+        module(self=torch.ones(1), _cozy_module=torch.ones(1)), torch.full((1,), 2.0)
+    )
+    attention_sol.remove_site(module, "dit", "attn")
+    assert module.forward is original
