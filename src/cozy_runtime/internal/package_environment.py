@@ -2485,6 +2485,7 @@ def _materialize_dependency_snapshot(
             provided,
             _marker_environment(observed),
             allow_absent=frozenset({"numpy"}),
+            current_system_sdk=True,
         )
     uv = _uv_binary()
     if _observed_uv_version(uv) != observed.uv_version:
