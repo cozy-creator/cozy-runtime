@@ -91,6 +91,18 @@ def install_site(module: Any, component: str, path: str) -> None:
     module._cozy_sol_site = site, first, second
 
 
+def remove_site(module: Any, component: str, path: str) -> None:
+    """Remove only the expected site's paired hooks after a request override."""
+    existing = getattr(module, "_cozy_sol_site", None)
+    if existing is None:
+        return
+    if existing[0] != Site(component, path):
+        raise ValueError("attention module is assigned another Sol site")
+    existing[1].remove()
+    existing[2].remove()
+    del module._cozy_sol_site
+
+
 def _dense(query: Any, key: Any, value: Any, scale: float | None) -> Any:
     if _DENSE is None:
         raise RuntimeError("Sol dense reference was not resolved before execution")
