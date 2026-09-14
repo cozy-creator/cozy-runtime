@@ -225,6 +225,15 @@ def _registry() -> Any:
             f"the reviewed attention backends are diffusers=={DIFFUSERS_VERSION}; this "
             f"environment installs {installed}",
         )
+    loaded = import_module("diffusers")
+    actual = getattr(loaded, "__version__", "unknown")
+    if actual != DIFFUSERS_VERSION:
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"diffusers metadata is {installed}, but the imported module is {actual} "
+            f"at {getattr(loaded, '__file__', 'unknown')}; Runtime requires "
+            f"diffusers=={DIFFUSERS_VERSION}",
+        )
     from diffusers.models.attention_dispatch import _AttentionBackendRegistry
 
     return _AttentionBackendRegistry
