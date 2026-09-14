@@ -66,11 +66,9 @@ RANKED = ["flash-attn3", "sdpa"]
 
 
 def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
-    """cr-127. A kernel is admitted only if it AGREES with exact fp32 attention, so every entry
-    has to say how far it is allowed to drift. The two classes are visible in the numbers: an
-    exact kernel is held near bf16's own 2.3e-3 floor, and a numerics-changing one is allowed
-    its quantisation (h3a-013 measured 3.7-4.0e-2) and nothing like the 311 a dead kernel
-    returned."""
+    """Every kernel declares its arithmetic budget. Sol's full-key control is dense;
+    its production sparse-policy approximation is measured separately (h3a-069).
+    """
     for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
         assert candidate.rel_l2_max > 0, candidate.name
         assert candidate.rel_l2_max < 1, candidate.name
