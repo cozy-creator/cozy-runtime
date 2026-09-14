@@ -331,3 +331,36 @@ def test_missing_or_corrupt_native_header_cannot_open_a_view(tmp_path: Path) -> 
         service.open(models["source"])
     broker.close()
     assert not broker.sources
+
+
+def test_source_descriptor_is_bound_to_the_accepted_digest(tmp_path: Path) -> None:
+    store = tensorfs.Store.init(tmp_path / "store")
+    reference = model(store, "digest-bound", {"weight": plain(np.arange(16, dtype=np.float32))})
+    service, models, broker, record, _, _ = reader(tmp_path, store, {"source": reference})
+    view = service.open(models["source"])
+    view.identity("model", "weight")
+    record.digest = b"\x32" * 32
+    try:
+        with pytest.raises(tensorfs.errors.Refusal) as refused:
+            view.read_part_into("model", "weight", "value", 0, bytearray(4))
+        assert refused.value.code == "weights_writer_closed"
+    finally:
+        view.close()
+        broker.close()
+
+
+def test_source_handle_limit_refuses_before_exhausting_worker_descriptors(tmp_path: Path) -> None:
+    store = tensorfs.Store.init(tmp_path / "store")
+    reference = model(store, "bounded-handles", {"weight": plain(np.arange(16, dtype=np.float32))})
+    service, models, broker, _, _, _ = reader(tmp_path, store, {"source": reference})
+    views = [service.open(models["source"]) for _ in range(16)]
+    try:
+        with pytest.raises(CapabilityError) as refused:
+            service.open(models["source"])
+        assert refused.value.code == "weights_reader_bounds"
+        assert sum(len(sources) for sources in broker.sources.values()) == 16
+    finally:
+        for view in views:
+            view.close()
+        broker.close()
+    assert not broker.sources
