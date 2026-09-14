@@ -338,6 +338,7 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
         "cycle",
         "capacity",
         "model",
+        "model_sequence",
         "model_result",
         "model_admission",
         "source",
@@ -373,9 +374,21 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
         root = Path(directory)
         source = (
             MODEL_SOURCE
-            if case in ("model", "model_result", "model_admission", "source")
+            if case in ("model", "model_sequence", "model_result", "model_admission", "source")
             else SOURCE
         )
+        if case == "model_sequence":
+            source = source.replace(
+                "    return await consume(model=first)",
+                "    first_result = await consume(model=first)\n"
+                "    from pathlib import Path\n    import asyncio\n"
+                + f"    Path({str(root / 'between-children')!r}).touch()\n"
+                + f"    while not Path({str(root / 'prepared-other')!r}).exists():\n"
+                + "        ctx.raise_if_cancelled()\n        await asyncio.sleep(0.02)\n"
+                + "    second_result = await consume(model=first)\n"
+                + "    assert first_result == second_result\n"
+                + "    return second_result",
+            )
         if case == "model_admission":
             source = source.replace(
                 "async def consume(ctx: Context, *, model: Source) -> Result:",
@@ -548,6 +561,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                             if case
                             in (
                                 "model",
+                                "model_sequence",
                                 "model_result",
                                 "model_admission",
                                 "source",
@@ -612,6 +626,14 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     max_attempts=2 if case == "loss" else 1,
                 )
             )
+            if case == "model_sequence":
+                while not (root / "between-children").exists():
+                    assert thread.is_alive() and time.monotonic() < deadline
+                    time.sleep(0.02)
+                _, other = fixture.package(root, "unrelated")
+                fixture.measure(worker, other)
+                worker.prepare_local_package(other)
+                (root / "prepared-other").touch()
             if case == "pause":
                 while not (root / "entered").exists():
                     assert thread.is_alive() and time.monotonic() < deadline
@@ -774,7 +796,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 else 1
                 if case == "source"
                 else 2
-                if case == "model"
+                if case in ("model", "model_sequence")
                 else 12
             }
             assert not worker.connected.is_set()
@@ -783,13 +805,17 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == (
                     2
                     if case == "source"
+                    else 5
+                    if case == "model_sequence"
                     else 4
                     if case
                     in ("model", "serving", "serving_model", "byte_inputs", "byte_inputs_serving")
                     else 3
                 )
                 assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == (
-                    4
+                    5
+                    if case == "model_sequence"
+                    else 4
                     if case
                     in ("model", "source", "serving_model", "byte_inputs", "byte_inputs_serving")
                     else 3
