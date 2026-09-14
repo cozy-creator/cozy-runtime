@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
 from typing import Any
 
@@ -23,17 +23,20 @@ def scale_string(value: float) -> str:
     """Finite shortest decimal, shared with Go's FormatFloat(g, -1, 64)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError("adapter strength must be a finite number")
-    number = Decimal(repr(float(value))).normalize()
+    # Decimal construction/as_tuple do not use the caller's decimal context.
+    number = Decimal(repr(float(value)))
     sign, digits, exponent = number.as_tuple()
     assert isinstance(exponent, int)
     text = "".join(str(n) for n in digits)
     if not number:
         return "0"
     power = len(text) + exponent - 1
+    text = text.rstrip("0")
     if power < -4 or power >= 6:
         fraction = "." + text[1:] if len(text) > 1 else ""
         return f"{'-' if sign else ''}{text[0]}{fraction}e{power:+03d}"
-    return format(number, "f")
+    fixed = format(number, "f")
+    return fixed.rstrip("0").rstrip(".") if "." in fixed else fixed
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +131,8 @@ def lower_bindings(
     selected: dict[tuple[str, ...], dict[str, Any]] = {}
 
     def walk(value: Any, path: tuple[str, ...] = ()) -> Any:
+        if len(path) > 32:
+            raise ConformanceError("package call nesting exceeds its bound", code="child_arguments")
         if isinstance(value, AdaptedModel):
             if path not in paths:
                 raise ConformanceError(
@@ -149,6 +154,12 @@ def lower_bindings(
             return {key: walk(item, (*path, key)) for key, item in value.items()}
         if isinstance(value, (tuple, list)):
             return [walk(item, (*path, str(index))) for index, item in enumerate(value)]
+        if isinstance(value, msgspec.Struct):
+            for field in msgspec.structs.fields(type(value)):
+                walk(getattr(value, field.name), (*path, field.encode_name))
+        elif is_dataclass(value) and not isinstance(value, type):
+            for item in fields(value):
+                walk(getattr(value, item.name), (*path, item.name))
         return value
 
     return walk(dict(arguments)), selected

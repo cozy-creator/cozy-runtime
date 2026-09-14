@@ -7,7 +7,6 @@ import sys
 import types
 from contextlib import ExitStack
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import msgspec
@@ -15,18 +14,25 @@ import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author import LoRA, ModelArtifact, ObjectRef, with_adapters
+from cozy_runtime.author import ConformanceError, LoRA, ModelArtifact, ObjectRef, with_adapters
 from cozy_runtime.author._calls import _Broker, _CallType
 from cozy_runtime.author._model_bindings import read_binding
 from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.internal import interface_wheel, package_interface, static_interface
+from cozy_runtime.internal.lora import AdapterRefusal
 from cozy_runtime.internal.worker import machine_models
+from cozy_runtime.internal.worker.machine_child_target import Target
 from cozy_runtime.internal.worker.machine_serving import (
     _call_arguments,
     _matches_bindings,
     _retain_models,
 )
-from cozy_runtime.internal.worker.package_prepare import NativeAdapterSelection, _slot_adapters
+from cozy_runtime.internal.worker.package_prepare import (
+    NativeAdapterSelection,
+    PreparationRefusal,
+    _slot_adapters,
+)
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_serving_interfaces import project
@@ -97,9 +103,9 @@ def test_order_zero_negative_and_independent_model_slots_join_payload_identity()
 def test_adapter_wrapper_cannot_enter_a_job_or_arbitrary_payload_field() -> None:
     base = artifact("1")
     selected = with_adapters(base, [LoRA(artifact("2"), "dit")])
-    with pytest.raises(Exception, match="adapter_slot"):
+    with pytest.raises(ConformanceError, match="adapter_slot"):
         reserve(selected, base, model_paths=())
-    with pytest.raises(Exception, match="adapter_slot"):
+    with pytest.raises(ConformanceError, match="adapter_slot"):
         reserve(base, base, {"user": [selected]})
 
 
@@ -147,7 +153,12 @@ def test_generated_serving_proxy_accepts_adapters_only_on_model_slots(
             "models": {"model": with_adapters(artifact("1"), [LoRA(artifact("2"), "dit", 0.3)])},
         },
     )
-    target = SimpleNamespace(
+    target = Target(
+        revision="",
+        interface_digest="",
+        prepared_revision={},
+        binding=None,
+        digest="",
         entrypoint="generate",
         declaration=next(row for row in declaration["entrypoints"] if row["name"] == "generate"),
     )
@@ -190,7 +201,7 @@ def test_native_adapter_custody_outlives_prepare_and_original_result(tmp_path: P
             "WHERE owner='owner' AND recipient='child' ORDER BY path"
         ).fetchall()
         assert [row["path"] for row in rows] == ["input/model", "input/model/adapters/0"]
-    with ExitStack() as access, pytest.raises(Exception, match="provenance"):
+    with ExitStack() as access, pytest.raises(WorkspaceRefusal, match="provenance"):
         _retain_models(
             workspace,
             "foreign",
@@ -215,11 +226,11 @@ def test_native_preparation_checks_real_adapter_geometry_and_exact_length(tmp_pa
     assert slots[0].scale == "-0.25" and models[0].manifest.length == length
     from dataclasses import replace
 
-    with pytest.raises(Exception, match="length"):
+    with pytest.raises(PreparationRefusal, match="length"):
         _slot_adapters(
             {"manifest": base}, ["dit"], root, 1, native=[replace(row, manifest_length=length + 1)]
         )
-    with pytest.raises(Exception, match="adapter_component"):
+    with pytest.raises(AdapterRefusal, match="adapter_component"):
         _slot_adapters(
             {"manifest": base}, ["dit"], root, 1, native=[replace(row, component="other")]
         )
@@ -275,3 +286,25 @@ def test_prepared_cache_requires_full_stack_and_rejects_zero_vs_omitted() -> Non
         replace(selected, manifest=base.manifest.digest),
     ):
         assert not _matches_bindings(candidate, "generate", native, {native[0].slot: (changed,)})
+
+
+def test_canonical_strength_ignores_authored_decimal_context() -> None:
+    from decimal import localcontext
+
+    from cozy_runtime.author._model_bindings import scale_string
+
+    with localcontext() as context:
+        context.prec = 3
+        assert scale_string(1.234567891234567) == "1.234567891234567"
+        assert scale_string(1000000.0) == "1e+06"
+        assert scale_string(-0.0) == "0"
+
+
+def test_adapter_wrapper_inside_typed_user_payload_is_not_an_override() -> None:
+    class UserData(msgspec.Struct):
+        arbitrary: Any
+
+    base = artifact("1")
+    wrapped = with_adapters(base, [LoRA(artifact("2"), "dit", 0)])
+    with pytest.raises(ConformanceError, match="adapter_slot"):
+        reserve(base, base, UserData(wrapped))

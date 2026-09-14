@@ -7,10 +7,13 @@ and manifest identities remain unchanged.
 ```python
 from cozy_runtime.author import LoRA, with_adapters
 
-styled = with_adapters(base, [
-    LoRA(spatial, component="fl2va_dit", scale=0.3),
-    LoRA(action, component="fl2va_dit", scale=-0.1),
-])
+styled = with_adapters(
+    base,
+    [
+        LoRA(spatial, component="fl2va_dit", scale=0.3),
+        LoRA(action, component="fl2va_dit", scale=-0.1),
+    ],
+)
 result = await generate(prompt="A dancer turns", model=styled)
 ```
 
