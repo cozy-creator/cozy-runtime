@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import import_module, metadata
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import attention_fp8
+from cozy_runtime.author._attention import AttentionContext
+from cozy_runtime.internal import attention_fp8, attention_upstream
 from cozy_runtime.internal.anima_optimization import DIFFUSERS_VERSION
 from cozy_runtime.internal.encoding import DeviceFacts
 
@@ -38,7 +39,7 @@ IMAGE_KERNELS_DIR = Path("/opt/cozy/kernels")
 
 
 class AttentionRefusal(RuntimeError):
-    """A typed refusal on the attention axis. Only a PIN can raise one; auto never does."""
+    """An unsupported explicit selection or unavailable attention implementation."""
 
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)
@@ -60,6 +61,9 @@ class Candidate:
     jit: bool = False  # Source kernels use the declared device range, not binary metadata.
     rel_l2_max: float = 0.0  # Numerical smoke-test threshold, not an output-quality guarantee.
     why: str = ""
+    sms: frozenset[int] = frozenset()
+    head_dims: frozenset[int] = frozenset()
+    import_name: str = ""
 
 
 CANDIDATES: tuple[Candidate, ...] = (
@@ -71,7 +75,13 @@ CANDIDATES: tuple[Candidate, ...] = (
         max_head_dim=256,
         baked="flash-attn3",
         rel_l2_max=2e-2,
-        why="H100 SXM attention: 22.84 s versus cuDNN 28.45 s per DiT forward; h3a-012.",
+        why=(
+            "Quality-preserving default. H100 H3 N109104: FA3 BF16 about 506 ms, "
+            "FA4 about 501 ms, cuDNN about 616 ms; no consistent FA4 gain. "
+            "Retained: tracker/h3-acceleration/ATTENTION-UPSTREAM-2026-09-14.md; "
+            "outputs/h3-attention-oracle-20260914/ATTENTION-RESULTS.md. "
+            "This is a curated H100 ranking, not a universal hardware winner."
+        ),
     ),
     Candidate(
         name="sdpa",
@@ -136,6 +146,32 @@ PINNABLE: tuple[Candidate, ...] = (
             "Inexact and slower than the FP8 FA3 benchmark."
         ),
     ),
+    Candidate(
+        name="kitchen-int8",
+        backend=attention_upstream.KITCHEN_BACKEND,
+        min_sm=90,
+        max_sm=103,
+        sms=frozenset({90, 100, 103}),
+        dtypes=frozenset({"bfloat16", "float16"}),
+        max_head_dim=256,
+        distribution="comfy-kitchen",
+        rel_l2_max=2e-1,
+        why="Explicit dense INT8 experiment; H3 quality/timing qualification pending (h3a-060).",
+    ),
+    Candidate(
+        name="flashinfer-bf16-fp8",
+        backend=attention_upstream.FLASHINFER_BACKEND,
+        min_sm=100,
+        max_sm=103,
+        sms=frozenset({100, 103}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        distribution="flashinfer-python",
+        import_name="flashinfer",
+        rel_l2_max=2e-1,
+        why="Explicit BF16 Q/K + FP8 P/V experiment; H3 qualification pending (h3a-060).",
+    ),
 )
 
 BY_NAME: dict[str, Candidate] = {c.name: c for c in (*CANDIDATES, *PINNABLE)}
@@ -178,6 +214,14 @@ def _member(backend: str) -> Any:
     if backend == attention_fp8.BACKEND:
         # OURS, not diffusers': registered into its registry on first use (cr-136).
         return attention_fp8.member()
+    upstream = {
+        attention_upstream.KITCHEN_BACKEND: attention_upstream.kitchen_int8_attention,
+        attention_upstream.FLASHINFER_BACKEND: attention_upstream.flashinfer_mixed_attention,
+    }
+    if backend in upstream:
+        from cozy_runtime.internal.attention_registry import register
+
+        return register(backend, upstream[backend])
     from diffusers.models.attention_dispatch import AttentionBackendName
 
     return AttentionBackendName(backend)
@@ -357,13 +401,12 @@ def _computes(entry: Ready, device: DeviceFacts) -> None:
         for _ in range(3)
     )
     with torch.no_grad():
-        got = dispatch_attention_fn(query, key, value, backend=entry.member)
+        got: Any = dispatch_attention_fn(query, key, value, backend=entry.member)
     if isinstance(got, tuple):
         got = got[0]
 
-    exact = torch.nn.functional.scaled_dot_product_attention(
-        *(tensor.transpose(1, 2).float() for tensor in (query, key, value))
-    ).transpose(1, 2)
+    q_ref, k_ref, v_ref = (tensor.transpose(1, 2).float() for tensor in (query, key, value))
+    exact = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref).transpose(1, 2)
     if tuple(got.shape) != tuple(exact.shape):
         raise AttentionRefusal(
             "attention_kernel_wrong",
@@ -414,7 +457,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
                 "this image does not install",
             ) from exc
         try:
-            import_module(candidate.distribution.replace("-", "_"))
+            import_module(candidate.import_name or candidate.distribution.replace("-", "_"))
         except Exception as exc:
             raise AttentionRefusal(
                 "attention_kernel_absent",
@@ -428,6 +471,8 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
 
 def _device_admits(candidate: Candidate, device: DeviceFacts) -> str:
     """Empty when this DEVICE is inside the candidate's DECLARED range, else why it is not."""
+    if candidate.sms and device.sm not in candidate.sms:
+        return f"{candidate.name} serves SM {sorted(candidate.sms)}, not sm{device.sm}"
     if candidate.min_sm and (device.kind != "cuda" or device.sm < candidate.min_sm):
         return (
             f"{candidate.name} needs sm{candidate.min_sm} or better; this executor holds "
@@ -536,47 +581,26 @@ def _trees(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any]]:
                     queue.append((name, item, depth + 1))
 
 
-def _sites(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any]]:
-    """(component, attention module, its processor) for every diffusers attention site.
-
-    The walk follows public attributes and mapping values three levels deep and stops at torch
-    module trees, where `modules()` finds the attention classes diffusers' own
-    `set_attention_backend` looks for. A component's label is the name the fill plane gave it.
-    """
+def _site_records(roots: Mapping[str, Any]) -> Iterator[tuple[str, str, Any, Any]]:
+    """Stable component/module paths with their actual Diffusers processor objects."""
     try:
         from diffusers.models.attention import AttentionModuleMixin
         from diffusers.models.attention_processor import Attention, MochiAttention
     except ImportError:
-        # No diffusers, no diffusers attention site. Nothing to pin, and not a refusal.
         return
-
     classes = (Attention, MochiAttention, AttentionModuleMixin)
     seen: set[int] = set()
-    queue: deque[tuple[str, Any, int]] = deque(
-        (name, root, 0) for name, root in sorted(roots.items())
-    )
-    while queue:
-        label, value, depth = queue.popleft()
-        if id(value) in seen:
-            continue
-        seen.add(id(value))
-        if callable(getattr(value, "modules", None)) and callable(
-            getattr(value, "parameters", None)
-        ):
-            for module in value.modules():
-                processor = getattr(module, "processor", None)
-                if isinstance(module, classes) and processor is not None:
-                    yield label, module, processor
-            continue
-        if depth >= 3:
-            continue
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                queue.append((str(key), item, depth + 1))
-        elif hasattr(value, "__dict__"):
-            for name, item in vars(value).items():
-                if not name.startswith("_"):
-                    queue.append((name, item, depth + 1))
+    for component, tree in _trees(roots):
+        for path, module in tree.named_modules():
+            processor = getattr(module, "processor", None)
+            if id(module) not in seen and isinstance(module, classes) and processor is not None:
+                seen.add(id(module))
+                yield component, path, module, processor
+
+
+def _sites(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any]]:
+    for component, _path, module, processor in _site_records(roots):
+        yield component, module, processor
 
 
 def _head_dim(module: Any) -> int:
@@ -605,6 +629,8 @@ def _dtype(module: Any) -> str:
 
 
 def _admits(candidate: Candidate, dtype: str, head_dim: int) -> bool:
+    if candidate.head_dims and head_dim not in candidate.head_dims:
+        return False
     if candidate.dtypes and dtype not in candidate.dtypes:
         return False
     return not (candidate.max_head_dim and (head_dim == 0 or head_dim > candidate.max_head_dim))
@@ -705,41 +731,151 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
     }
 
 
+def _pin_parts(pin: str) -> tuple[str, str]:
+    if "=" not in pin:
+        return "", pin
+    component, name = pin.split("=", 1)
+    if not component or not name or "=" in name or any(ch.isspace() for ch in pin):
+        raise AttentionRefusal(
+            "attention_kernel_unknown", f"invalid attention override {pin!r}; use component=backend"
+        )
+    return component, name
+
+
+def for_model(pin: str, parameters: Sequence[str]) -> str:
+    """Translate an aggregate model/component pin to one construction's local scope."""
+    scope, backend = _pin_parts(pin)
+    if "/" not in scope:
+        return pin
+    model, component = scope.split("/", 1)
+    return f"{component}={backend}" if model in parameters else ""
+
+
+def _matches(component: str, scope: str) -> bool:
+    return (
+        not scope
+        or component == scope
+        or ("/" not in scope and component.rsplit("/", 1)[-1] == scope)
+    )
+
+
+def _eligible(
+    candidate: Candidate, device: DeviceFacts, dtype: str, head_dim: int, degree: int
+) -> bool:
+    if _device_admits(candidate, device) or not _admits(candidate, dtype, head_dim):
+        return False
+    try:
+        _admit_arch(candidate, _baked_archs(candidate), device)
+        if candidate.distribution:
+            metadata.version(candidate.distribution)
+        member = _member(candidate.backend)
+        return member in _registry()._backends and (degree == 1 or _context_parallel(member))
+    except Exception:
+        return False
+
+
 def install(
-    ready: list[Ready], roots: Mapping[str, Any], pin: str = "", degree: int = 1
+    ready: list[Ready],
+    roots: Mapping[str, Any],
+    pin: str = "",
+    degree: int = 1,
+    *,
+    device: DeviceFacts | None = None,
+    choose: Callable[[AttentionContext], str | None] | None = None,
 ) -> Applied:
-    """Pin the fastest admitted kernel on every attention site of the constructed components."""
+    """Validate a complete per-site selection before changing any processor."""
+    scope, name = _pin_parts(pin)
     hosts: dict[str, dict[str, int]] = {}
     locations: dict[str, str] = {}
-    for component, module, processor in _sites(roots):
+    assignments: list[tuple[Any, Ready]] = []
+    resolved = {entry.name: entry for entry in ready}
+    matched = False
+    eligible_sites: dict[tuple[str, int], tuple[str, ...]] = {}
+    for component, path, module, processor in _site_records(roots):
         dtype, head_dim = _dtype(module), _head_dim(module)
-        for entry in ready:
-            if not _admits(entry.candidate, dtype, head_dim):
-                continue
-            if degree > 1 and not _context_parallel(entry.member):
-                continue
-            processor._attention_backend = entry.member
-            hosts.setdefault(component, {})
-            hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
-            if entry.location:
-                locations[entry.name] = entry.location
-            break
-        else:
-            raise AttentionRefusal(
-                "attention_kernel_unsupported",
-                f"{ready[0].name if ready else 'no attention kernel'} does not serve "
-                f"{component}'s attention: "
-                f"{dtype or 'unknown'} activations at head dimension "
-                f"{head_dim or 'unknown'}"
-                + (
-                    f", sharded at sequence-parallel degree {degree} (a kernel that does not "
-                    "serve context parallelism cannot take a sharded site)"
-                    if degree > 1
-                    else ""
-                )
-                + ". A pinned kernel is never quietly replaced",
+        forced = bool(name and _matches(component, scope))
+        matched |= forced
+        offered = [
+            entry
+            for entry in ready
+            if (entry.name == name if forced else not pin or entry.candidate in CANDIDATES)
+            and _admits(entry.candidate, dtype, head_dim)
+            and (degree == 1 or _context_parallel(entry.member))
+        ]
+        if not offered:
+            detail = _site_refusal(
+                name if forced else "no available attention kernel", component, dtype, head_dim
             )
-    return Applied(hosts, locations, tuple(entry.name for entry in ready), pin)
+            if degree > 1:
+                detail = AttentionRefusal(
+                    detail.code,
+                    f"{detail}; sequence-parallel degree {degree} requires context parallelism",
+                )
+            raise detail
+        entry = offered[0]
+        if choose is not None and not forced:
+            assert device is not None
+            key = (dtype, head_dim)
+            if key not in eligible_sites:
+                eligible_sites[key] = tuple(
+                    c.name
+                    for c in BY_NAME.values()
+                    if _eligible(c, device, dtype, head_dim, degree)
+                )
+            eligible = eligible_sites[key]
+            context = AttentionContext(
+                component,
+                path,
+                device.kind,
+                device.name,
+                device.sm,
+                dtype,
+                head_dim,
+                degree,
+                eligible,
+                entry.name,
+                entry.candidate.why,
+            )
+            selection = choose(context)
+            if selection is not None:
+                if not isinstance(selection, str) or selection not in eligible:
+                    raise AttentionRefusal(
+                        "attention_kernel_unsupported",
+                        f"model chose {selection!r} for {component}/{path}; "
+                        f"eligible choices are {eligible}",
+                    )
+                if selection not in resolved:
+                    resolved[selection] = pinned(selection, device)[0]
+                entry = resolved[selection]
+        assignments.append((processor, entry))
+        hosts.setdefault(component, {})
+        hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
+        if entry.location:
+            locations[entry.name] = entry.location
+    if name and not matched:
+        raise AttentionRefusal(
+            "attention_kernel_unsupported", f"{pin!r} matches no attention component"
+        )
+    for processor, entry in assignments:
+        processor._attention_backend = entry.member
+    return Applied(hosts, locations, tuple(resolved), pin)
+
+
+@dataclass(frozen=True, slots=True)
+class Snapshot:
+    """Prepared processor choices, restored without resolution or policy re-execution."""
+
+    choices: tuple[tuple[Any, Any], ...]
+
+    def restore(self) -> None:
+        for processor, member in self.choices:
+            processor._attention_backend = member
+
+
+def snapshot(roots: Mapping[str, Any]) -> Snapshot:
+    return Snapshot(
+        tuple((processor, processor._attention_backend) for _, _, processor in _sites(roots))
+    )
 
 
 def _site_refusal(name: str, component: str, dtype: str, head_dim: int) -> AttentionRefusal:
@@ -766,6 +902,7 @@ class Swap:
 
     entry: Ready
     sites: tuple[tuple[str, Any], ...]
+    pin: str = ""
 
     def apply(self) -> Applied:
         hosts: dict[str, dict[str, int]] = {}
@@ -774,51 +911,68 @@ class Swap:
             hosts.setdefault(component, {})
             hosts[component][self.entry.name] = hosts[component].get(self.entry.name, 0) + 1
         locations = {self.entry.name: self.entry.location} if self.entry.location else {}
-        return Applied(hosts, locations, (self.entry.name,), self.entry.name)
+        return Applied(hosts, locations, (self.entry.name,), self.pin or self.entry.name)
 
 
 def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Candidate:
-    candidate = BY_NAME.get(name)
+    scope, backend = _pin_parts(name)
+    candidate = BY_NAME.get(backend)
     if candidate is None:
         raise AttentionRefusal(
             "attention_kernel_unknown",
-            f"{name!r} is not an attention kernel this runtime knows; it knows {sorted(BY_NAME)}",
+            f"unknown attention kernel {backend!r}; this runtime knows {sorted(BY_NAME)}",
         )
-    blocked = frozen or _baked_in(roots)
+    selected = {component: root for component, root in roots.items() if _matches(component, scope)}
+    blocked = frozen or _baked_in(selected)
     if blocked:
         raise AttentionRefusal(
-            "attention_kernel_frozen",
-            f"{name} cannot be pinned per request: {blocked}",
+            "attention_kernel_frozen", f"{name} cannot be pinned per request: {blocked}"
         )
     unsupported = _device_admits(candidate, device)
     if unsupported:
         raise AttentionRefusal("attention_kernel_unsupported", unsupported)
     sites = 0
-    for component, module, _ in _sites(roots):
+    for component, module, _ in _sites(selected):
         dtype, head_dim = _dtype(module), _head_dim(module)
         if not _admits(candidate, dtype, head_dim):
             raise _site_refusal(candidate.name, component, dtype, head_dim)
         sites += 1
     if not sites:
         raise AttentionRefusal(
-            "attention_kernel_unsupported",
-            f"{name} was pinned on a construction that holds no diffusers attention site",
+            "attention_kernel_unsupported", f"{name} matches no diffusers attention site"
         )
     return candidate
 
 
 def plan(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Swap:
-    check(device, roots, name, frozen)
-    entry = pinned(name, device)[0]
-    return Swap(entry, tuple((component, processor) for component, _, processor in _sites(roots)))
+    candidate = check(device, roots, name, frozen)
+    scope, _ = _pin_parts(name)
+    entry = pinned(candidate.name, device)[0]
+    return Swap(
+        entry,
+        tuple(
+            (component, processor)
+            for component, _, processor in _sites(roots)
+            if _matches(component, scope)
+        ),
+        name,
+    )
 
 
 def select(
-    device: DeviceFacts, roots: Mapping[str, Any], pin: str = "", degree: int = 1
+    device: DeviceFacts,
+    roots: Mapping[str, Any],
+    pin: str = "",
+    degree: int = 1,
+    *,
+    choose: Callable[[AttentionContext], str | None] | None = None,
 ) -> Applied:
-    """The whole decision, in one call: what this device and image offer, pinned on the sites
-    of a placement sharded at `degree` (1 = unsharded)."""
-    return install(pinned(pin, device) if pin else available(device), roots, pin, degree)
+    """Select once at preparation; optional model policy and request pins are validated."""
+    scope, name = _pin_parts(pin)
+    ready = pinned(name, device) if name and not scope else available(device)
+    if scope:
+        ready = [entry for entry in ready if entry.name != name] + pinned(name, device)
+    return install(ready, roots, pin, degree, device=device, choose=choose)
 
 
 def image_kernels(device: DeviceFacts) -> str:

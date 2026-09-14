@@ -32,6 +32,7 @@ from typing import (
     final,
 )
 
+from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._context import Context, Device, RequestView, derive_seed
 from cozy_runtime.author._errors import (
     CapabilityError,
@@ -438,6 +439,16 @@ class Model[PipelineT]:
             "loader.construct(T, factory=…) — the one construction primitive (§1.1)",
             code="no_load",
         )
+
+    def choose_attention(self, context: AttentionContext) -> str | None:
+        """Select an eligible backend before warm-up, or retain Runtime's recommendation.
+
+        This hook chooses a name, not a kernel implementation or device operation.
+        Explicit choices are validated and never silently replaced. Approximate
+        attention remains the model author's quality decision, independent of FP8
+        checkpoint storage. Developer request overrides take precedence temporarily.
+        """
+        return None
 
     def warm(self, ctx: Context) -> None:
         """Optional post-fill, pre-serving work — the ONE place for it (cr-110, #708).

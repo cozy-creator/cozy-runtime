@@ -28,6 +28,7 @@ from cozy_runtime.author._assets import (
     Tree,
     VideoAsset,
 )
+from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._calls import ChildCallError, PendingCall, invocable
 from cozy_runtime.author._capture import (
     ActivationCapture,
@@ -180,6 +181,7 @@ __all__ = [
     "AssetInfo",
     "AssetLimits",
     "Assets",
+    "AttentionContext",
     "AudioAsset",
     "AuthorError",
     "Backend",
