@@ -202,7 +202,6 @@ def main() -> None:
                 "run",
                 f"paul/minimax-h3/{task}",
                 f"model.{parameter}={BASE}",
-                "--attention-kernel=flash-attn3",
             ]
             if task.endswith("_turbo"):
                 argv.append(f"model.turbo_lora={PDD}")
@@ -246,6 +245,12 @@ def main() -> None:
                 if completed.returncode:
                     raise RuntimeError(f"cozy failed; retained logs: {root}")
             report = verify(stdout, stderr, args.degree, bool(CASES[case] and case != "zero"))
+            report["attention_verification"] = (
+                "Retain this placement's Runtime boot attention line or triage plan.attention "
+                "map; compare actual per-component kernels across every parity run. "
+                "There is no global kernel pin: H3 audio_vae uses FP32/D256 attention, "
+                "which BF16 FA3 cannot serve. This script does not prove the kernel map."
+            )
             reports[label] = report
             write(root / "verification.json", report)
             print(f"Verified {label}: {report['execution']}", flush=True)
