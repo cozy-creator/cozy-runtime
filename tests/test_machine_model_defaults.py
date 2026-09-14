@@ -126,6 +126,11 @@ def test_unused_or_overridden_defaults_do_not_touch_catalog_or_storage(
     assert (
         len(selected) == 1 and selected[0]["parameter"] == "adapter" and selected[0]["gpu"] == "*"
     )
+
+    def no_hardware_probe(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("unavailable default reached hardware selection")
+
+    monkeypatch.setattr(defaults.hostfacts, "measure", no_hardware_probe)
     with pytest.raises(WorkspaceRefusal, match="unavailable for model"):
         defaults.select(worker, "owner", call, target(), {"adapter": {}})
     assert defaults.matches("H100", "NVIDIA H100 80GB HBM3")
