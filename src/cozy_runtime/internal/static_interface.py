@@ -159,6 +159,7 @@ _TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.models")
 def _trusted_module(name: str) -> bool:
     return any(name == root or name.startswith(root + ".") for root in _TRUSTED_ROOTS)
 
+
 #: The entry-point group `discovery.py` reads. A distribution that declares one IS a cozy
 #: package; every other distribution beside it — torch included — is not, and is never read.
 _APPLICATION_GROUP = "[cozy.application]"

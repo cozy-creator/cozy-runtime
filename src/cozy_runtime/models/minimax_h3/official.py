@@ -1193,14 +1193,17 @@ class OfficialH3Pipeline:
             "text_indices": range(rows, 2 * rows),
             "audio_indices": range(2 * rows, packed),
         }
-        with torch.no_grad(), attention_scope(
-            AttentionLayout(
-                live_tokens=packed,
-                protected_prefix=0,
-                step=0,
-                dense_until_step=10,
-                dense_paths=_DENSE_ATTENTION_PATHS,
-            )
+        with (
+            torch.no_grad(),
+            attention_scope(
+                AttentionLayout(
+                    live_tokens=packed,
+                    protected_prefix=0,
+                    step=0,
+                    dense_until_step=10,
+                    dense_paths=_DENSE_ATTENTION_PATHS,
+                )
+            ),
         ):
             dit(
                 hidden_states=anchor.new_zeros(
