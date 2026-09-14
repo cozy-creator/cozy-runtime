@@ -49,6 +49,59 @@ def _check(condition: bool) -> None:
         raise PublicationRefusal("assessment.execution_binding_mismatch")
 
 
+def render_arguments(
+    spec: dict[str, Any],
+    intent: dict[str, Any],
+    preparation: bytes,
+    call_prepared: bytes,
+    checkpoint: str,
+) -> dict[str, Any]:
+    """Separate the observed checkpoint binding from the workload's ordinary inputs."""
+    arguments = dict(intent["request"])
+    if "job" in spec:
+        models = [
+            row
+            for row in spec.get("inputs", [])
+            if row["kind_mime"] == "application/vnd.cozy.model-manifest"
+        ]
+        _check(len(models) == 1 and models[0]["digest"] == checkpoint)
+        arguments.pop(models[0]["input_id"].removeprefix("model:"), None)
+        return arguments
+
+    # Serving binds Model parameters through the admitted placement rather than
+    # through job InputBindings. Read the exact retained preparation, never a
+    # checkpoint claim supplied by the assessment script.
+    prepared = canonical_json.decode(call_prepared)
+    _check(prepared.get("kind") == "serving")
+    revisions = canonical_json.decode(preparation)["revisions"]
+    _check(prepared["revision"] in revisions)
+    placement = revisions[prepared["revision"]]["placement"]
+    serving = spec["serving"]
+    _check(
+        serving["bindings_digest"] == placement["bindings_digest"]
+        and placement["package_interface"]["digest"] == intent["interface_digest"]
+    )
+    entries = [
+        entry
+        for entry in placement["entrypoints"]
+        if entry["entrypoint_binding_digest"] == serving["entrypoint_binding_digest"]
+        and entry["name"] == prepared["entrypoint"]
+    ]
+    _check(len(entries) == 1 and bool(entries[0]["slots"]))
+    bound = {model["id"]: model["manifest"] for model in placement["models"]}
+    for slot in entries[0]["slots"]:
+        selected = {slot["reference_model_id"]} | {
+            component["model_id"] for component in slot["components"]
+        }
+        _check(all(name in bound and bound[name]["digest"] == checkpoint for name in selected))
+        argument = arguments.pop(slot["slot"], None)
+        _check(
+            isinstance(argument, dict)
+            and argument.get("manifest") == bound[slot["reference_model_id"]]
+        )
+    return arguments
+
+
 def verify(
     workspace: Workspace,
     owner: str,
@@ -145,14 +198,9 @@ def verify(
                     and terminal["status"] == pb.OUTCOME_STATUS_SUCCEEDED
                     and terminal.get("execution_started") is True
                 )
-                arguments = dict(intent["request"])
-                model_inputs = [
-                    row
-                    for row in spec.get("inputs", [])
-                    if row["kind_mime"] == "application/vnd.cozy.model-manifest"
-                ]
-                _check(len(model_inputs) == 1 and model_inputs[0]["digest"] == model)
-                arguments.pop(model_inputs[0]["input_id"].removeprefix("model:"), None)
+                arguments = render_arguments(
+                    spec, intent, execution["preparation"], call["prepared"], model
+                )
                 _check(canonical_json.encode(arguments) == canonical_json.encode(payload))
                 observation = terminal.get("observation", {})
                 observed = observation.get("environment", {})
