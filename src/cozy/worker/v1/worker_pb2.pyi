@@ -3873,6 +3873,46 @@ class ChildByteResultGrant(_message.Message):
     retention_id: str
     def __init__(self, output_id: _Optional[str] = ..., source: _Optional[_Union[NativeByteTreeRef, _Mapping]] = ..., retention_id: _Optional[str] = ...) -> None: ...
 
+class InputTreeImportHeader(_message.Message):
+    __slots__ = ("claim", "request_id", "input_id", "manifest", "manifest_canonical_bytes", "content_bytes")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    INPUT_ID_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_BYTES_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request_id: str
+    input_id: str
+    manifest: Ref
+    manifest_canonical_bytes: bytes
+    content_bytes: int
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request_id: _Optional[str] = ..., input_id: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., manifest_canonical_bytes: _Optional[bytes] = ..., content_bytes: _Optional[int] = ...) -> None: ...
+
+class InputTreeImportBlob(_message.Message):
+    __slots__ = ("object", "offset", "data")
+    OBJECT_FIELD_NUMBER: _ClassVar[int]
+    OFFSET_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    object: Ref
+    offset: int
+    data: bytes
+    def __init__(self, object: _Optional[_Union[Ref, _Mapping]] = ..., offset: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
+
+class InputTreeImportCommit(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class InputTreeImportFrame(_message.Message):
+    __slots__ = ("header", "blob", "commit")
+    HEADER_FIELD_NUMBER: _ClassVar[int]
+    BLOB_FIELD_NUMBER: _ClassVar[int]
+    COMMIT_FIELD_NUMBER: _ClassVar[int]
+    header: InputTreeImportHeader
+    blob: InputTreeImportBlob
+    commit: InputTreeImportCommit
+    def __init__(self, header: _Optional[_Union[InputTreeImportHeader, _Mapping]] = ..., blob: _Optional[_Union[InputTreeImportBlob, _Mapping]] = ..., commit: _Optional[_Union[InputTreeImportCommit, _Mapping]] = ...) -> None: ...
+
 class NativeByteReadCall(_message.Message):
     __slots__ = ("claim", "source", "object", "offset")
     CLAIM_FIELD_NUMBER: _ClassVar[int]

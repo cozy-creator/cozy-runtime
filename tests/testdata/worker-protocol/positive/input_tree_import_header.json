@@ -1,0 +1,20 @@
+{
+  "header": {
+    "claim": {
+      "proof": "vmk8UxWZPLMWKYRxYpNpUTXPtw4XnOimNzOdIGtzEp1Q52hCl8/nvnLMA76sQZ54/j2eCPIgsOVi8OgtANovXg==",
+      "record_owner_epoch": "41",
+      "record_owner_id": "rec-owner-local-1",
+      "wire_minor": 55,
+      "worker_boot_id": "boot-9f21",
+      "worker_id": "wrk-4070"
+    },
+    "content_bytes": "10",
+    "input_id": "files",
+    "manifest": {
+      "digest": "3I3cHa1WrBhBF6jijvSoxILfDHDvKqFI7l//tCG97TM=",
+      "length": "143"
+    },
+    "manifest_canonical_bytes": "eyJlbnRyaWVzIjpbeyJibG9iIjp7Imxlbmd0aCI6MTAsInNoYTI1NiI6IjBmNmM0NjBmNTYzYmIwZTQ4N2Y3YWM5YjM4NzNkYjViMTc3MDA1N2M1MGNiMTQwNmY3MGQyNDNjN2JmZjJjNmYifSwia2luZCI6ImZpbGUiLCJwYXRoIjoicGF5bG9hZCJ9XX0=",
+    "request_id": "root-input"
+  }
+}

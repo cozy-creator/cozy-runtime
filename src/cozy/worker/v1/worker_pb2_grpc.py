@@ -484,6 +484,11 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.FromString,
                 _registered_method=True)
+        self.ImportInputTree = channel.stream_unary(
+                '/cozy.worker.v1.RuntimePreparation/ImportInputTree',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
+                _registered_method=True)
         self.WorkspaceWeightsIntentReady = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WeightsIntentReadyCall.SerializeToString,
@@ -645,6 +650,13 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ImportInputTree(self, request_iterator, context):
+        """MINOR55. Authenticated root input intake; native bytes commit before a receipt.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def WorkspaceWeightsIntentReady(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -800,6 +812,11 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.WorkspaceReadByteTreeObject,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.SerializeToString,
+            ),
+            'ImportInputTree': grpc.stream_unary_rpc_method_handler(
+                    servicer.ImportInputTree,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.SerializeToString,
             ),
             'WorkspaceWeightsIntentReady': grpc.unary_unary_rpc_method_handler(
                     servicer.WorkspaceWeightsIntentReady,
@@ -1186,6 +1203,33 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/WorkspaceReadByteTreeObject',
             cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ImportInputTree(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/ImportInputTree',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1899,6 +1943,11 @@ class PodHostStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.FromString,
                 _registered_method=True)
+        self.ImportInputTree = channel.stream_unary(
+                '/cozy.worker.v1.PodHost/ImportInputTree',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
+                _registered_method=True)
         self.RecordOperationResult = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/RecordOperationResult',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.RecordOperationResultCall.SerializeToString,
@@ -2113,6 +2162,13 @@ class PodHostServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ImportInputTree(self, request_iterator, context):
+        """MINOR55. Proxies the bounded stream to Runtime without owning its byte custody.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def RecordOperationResult(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -2286,6 +2342,11 @@ def add_PodHostServicer_to_server(servicer, server):
                     servicer.ReadByteTreeObject,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.SerializeToString,
+            ),
+            'ImportInputTree': grpc.stream_unary_rpc_method_handler(
+                    servicer.ImportInputTree,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.SerializeToString,
             ),
             'RecordOperationResult': grpc.unary_unary_rpc_method_handler(
                     servicer.RecordOperationResult,
@@ -2935,6 +2996,33 @@ class PodHost(object):
             '/cozy.worker.v1.PodHost/ReadByteTreeObject',
             cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteReadChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ImportInputTree(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/cozy.worker.v1.PodHost/ImportInputTree',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.InputTreeImportFrame.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.NativeByteRetentionResult.FromString,
             options,
             channel_credentials,
             insecure,

@@ -118,7 +118,7 @@ from cozy_runtime.internal.worker.machine_publication import PublicationTLS
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding, PreparedModel
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
+from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
@@ -2128,6 +2128,8 @@ class Worker:
 
                 assert binding is not None
                 declared = set(self.engine._job_model_declarations(binding, descriptor))
+                if declared and claim.wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
+                    raise WorkspaceRefusal("durable root Model inputs require Runtime wire55")
                 machine_model_inputs.retain(executions.workspace, owner, offer, declared)
             receipt = executions.submit(
                 owner,
