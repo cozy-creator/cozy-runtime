@@ -116,7 +116,7 @@ def _receipt(
 ) -> pb.WeightsReceiptRef:
     if not isinstance(facts, dict) or facts.get("transaction_id") != transaction_id:
         raise FinalizationRefusal("TensorFS finalization returned another transaction receipt")
-    receipt = weights_sink.WeightsTransactionHost._wrap(
+    receipt = weights_sink.receipt_from_native(
         request.output_slot, transaction_id, facts, replayed=True, request_id=request.request_id
     )
     ref, _raw, digest = weights_sink.protocol_receipt(

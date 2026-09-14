@@ -145,9 +145,62 @@ class WeightsExchange:
         self._held: dict[str, _Held] = {}
         self._abandoned: set[str] = set()
         self.writer_broker = WriterBroker(
-            self._store, checkpoint=self.record_checkpoint, store_root=store_root
+            self._store,
+            checkpoint=self.record_checkpoint,
+            receipt=self.record_native_receipt,
+            store_root=store_root,
+            bind_output=self.bind_output,
         )
         self.reader_broker = ModelReaderBroker(self._store, store_root=store_root)
+
+    def bind_output(self, attempt: Any, output_slot: str, declaration: bytes) -> tuple[str, int]:
+        """Assign the execution identity after TensorFS canonicalizes the declaration."""
+        from cozy_runtime.internal.weights_sink import weights_transaction_id
+
+        transaction = weights_transaction_id(
+            self.owner_scope(), attempt.request_id, documents.spell(attempt.digest), output_slot
+        )
+        result = self.intent(
+            attempt,
+            output_slot=output_slot,
+            transaction_id=transaction,
+            declaration_digest=hashlib.sha256(declaration).digest(),
+            declaration=declaration,
+            requested_writer_epoch=0,
+        )
+        return transaction, int(result["writer_epoch"])
+
+    def record_native_receipt(
+        self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]
+    ) -> None:
+        """Record the native winner before acknowledging the scoped TensorFS commit."""
+        from cozy_runtime import canonical_json
+        from cozy_runtime.internal.weights_sink import protocol_receipt, receipt_from_native
+
+        if (
+            facts.get("transaction_id") != transaction
+            or hashlib.sha256(canonical_json.encode(facts.get("declaration"))).digest()
+            != binding.declaration_digest
+        ):
+            raise WeightsExchangeError(
+                "weights_receipt_identity_mismatch", "native commit differs from intent"
+            )
+        wrapped = receipt_from_native(
+            binding.slot, transaction, facts, replayed=False, request_id=attempt.request_id
+        )
+        _, canonical_receipt, digest = protocol_receipt(
+            wrapped,
+            owner_scope=self.owner_scope(),
+            request_id=attempt.request_id,
+            invocation_spec_digest=documents.spell(attempt.digest),
+        )
+        self.receipt(
+            attempt,
+            output_slot=binding.slot,
+            transaction_id=transaction,
+            receipt_digest=digest,
+            canonical_receipt=canonical_receipt,
+        )
 
     def record_checkpoint(
         self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]
@@ -327,6 +380,13 @@ class WeightsExchange:
                     "OBJECT_ABSENT",
                 }:
                     raise
+                from cozy_runtime.internal.worker.workspace_executions import Executions
+
+                if Executions(self.workspace).owns(self.owner_scope(), attempt.request_id):
+                    raise WeightsExchangeError(
+                        "weights_checkpoint_unavailable",
+                        "accepted execution checkpoint is unavailable",
+                    ) from exc
                 self.send(pb.WorkerFrame(weights_transaction=self.workspace.status(row)))
                 # An owner may restore an acknowledged remote checkpoint. Its
                 # Ready RPC commits to the same journal; no network wait owns a lock.

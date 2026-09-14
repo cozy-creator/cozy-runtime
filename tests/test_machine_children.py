@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
@@ -51,17 +53,344 @@ async def nested(ctx: Context, payload: Request) -> Result:
 """
 
 
+MODEL_SOURCE = """import struct
+import tensorfs
+from tensorfs.derived import Config, Derivation, Part, Target, Tensor
+from cozy_runtime.author import App, Context, Model, ModelArtifact, WeightsOutput, invocable
+
+def assert_no_store():
+    import os
+    from pathlib import Path
+    assert not any(
+        "tensorfs.sqlite" in os.readlink(fd)
+        for fd in Path("/proc/self/fd").iterdir() if fd.exists()
+    )
+
+
+app = App()
+PLAIN = dict(tensorfs.seed_digests())["plain/1"]
+
+class Source(Model[object], encoded_leaves="accept"):
+    def load(self, loader):
+        del loader
+
+@invocable(memoize=True)
+async def leaf(ctx: Context, *, n: int) -> ModelArtifact:
+    assert_no_store()
+    definition = Derivation(
+        sources={},
+        targets={"body": Target(add={
+            "layer.weight": Tensor("f16", (16,32), PLAIN, {"value": Part("f16", (16,32))}),
+            "layer.bias": Tensor("f16", (16,), PLAIN, {"value": Part("f16", (16,))}),
+        })},
+        configs={"pipeline": Config("add")},
+        order=(("body", "layer.weight"), ("body", "layer.bias")),
+    )
+    with tensorfs.derive(ctx.output("model"), definition) as output:
+        if output.receipt is None:
+            output.add_part(
+                "body", "layer.weight", "value",
+                struct.pack("<512e", *(i/257-1 for i in range(512)))
+            )
+            output.add_part("body", "layer.bias", "value", struct.pack("<16e", *range(16)))
+            output.add_config("pipeline", b"{}")
+        receipt = output.receipt or output.commit()
+    return ctx.adopt_model(receipt)
+
+app.job(leaf, weights=(WeightsOutput("model", max_new_bytes=65536),))
+import msgspec
+class Request(msgspec.Struct):
+    pass
+class Result(msgspec.Struct):
+    value: int
+
+@invocable
+async def consume(ctx: Context, *, model: Source) -> Result:
+    assert_no_store()
+    source = ctx.tensorfs_source(model)
+    view = source.inspect()
+    assert_no_store()
+    return Result(len(view.components["body"]))
+app.job(consume)
+
+@invocable
+async def compose(ctx: Context, *, n: int) -> Result:
+    first = await leaf(n=n)
+    second = await leaf(n=n)
+    assert first.manifest == second.manifest
+    return await consume(model=first)
+app.job(compose)
+
+@app.job
+async def nested(ctx: Context, payload: Request) -> Result:
+    return await compose(n=3)
+"""
+
+
+FILE_SOURCE = """import msgspec
+from cozy_runtime.author import App, Context, FileAsset, Outputs, invocable
+app = App()
+class Request(msgspec.Struct):
+    pass
+class Result(msgspec.Struct):
+    value: int
+class Report(msgspec.Struct):
+    report: FileAsset
+@invocable(memoize=True)
+async def leaf(ctx: Context, out: Outputs, *, n: int) -> Report:
+    path = out.temporary_file('.json')
+    path.write_bytes(b'{"observed":7}')
+    return Report(out.save_file(path, media_type='application/json'))
+app.job(leaf)
+@invocable
+async def compose(ctx: Context, *, n: int) -> Result:
+    first = await leaf(n=n)
+    second = await leaf(n=n)
+    assert first.report.read_bytes() == second.report.read_bytes() == b'{"observed":7}'
+    return Result(12)
+app.job(compose)
+@app.job
+async def nested(ctx: Context, payload: Request) -> Result:
+    return await compose(n=3)
+"""
+
+
+MODELED_SERVING_SOURCE = (
+    "from cozy_runtime.author import ActivationCapture, Config, Telemetry, uses_components\n"
+    + MODEL_SOURCE.replace(
+        "        del loader",
+        "        self.pipe = loader.construct(Pipeline, factory=build_pipeline)\n"
+        "    @uses_components('body')\n"
+        "    def infer(self, n, tel):\n"
+        "        import torch\n"
+        "        body = self.pipe.components['body']\n"
+        "        on_step = tel.step_callback(1, stage='denoise')\n"
+        "        with torch.inference_mode():\n"
+        "            value = body(torch.ones((1,32), dtype=torch.float16,\n"
+        "                                    device=body.layer.weight.device))\n"
+        "            assert bool(torch.isfinite(value).all())\n"
+        "        on_step(0)\n"
+        "        return int(value.shape[1])",
+    ).replace(
+        "    return await consume(model=first)",
+        "    call = generate(model=first, n=n, capture=ActivationCapture(('body',), (0,)))\n"
+        "    result = await call\n"
+        "    assert call.observation.environment.worker_boot_id\n"
+        "    assert call.observation.capture.tree is not None\n"
+        "    return result",
+    )
+    + """
+class Pipeline:
+    def __init__(self):
+        import torch
+        class Body(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = torch.nn.Linear(32, 16, dtype=torch.float16)
+            def forward(self, value):
+                return self.layer(value)
+        self.components = {'body': Body()}
+def build_pipeline(config: Config) -> Pipeline:
+    return Pipeline()
+@invocable
+async def generate(ctx: Context, tel: Telemetry, *, model: Source, n: int) -> Result:
+    return Result(model.infer(n, tel))
+app.entrypoint(generate)
+"""
+)
+
+
+MODELED_MEDIA_SOURCE = (
+    "from cozy_runtime.author import ImageAsset, Outputs, Tree\n"
+    + MODELED_SERVING_SOURCE.replace(
+        "class Result(msgspec.Struct):\n    value: int",
+        "class Result(msgspec.Struct):\n    value: int\n"
+        "class Render(msgspec.Struct):\n    value: int\n    image: ImageAsset\n"
+        "class Media(msgspec.Struct):\n    value: int\n    image: ImageAsset\n    capture: Tree",
+    )
+    .replace("        return int(value.shape[1])", "        return value")
+    .replace(
+        "async def compose(ctx: Context, *, n: int) -> Result:",
+        "async def compose(ctx: Context, *, n: int) -> Media:",
+    )
+    .replace(
+        "async def nested(ctx: Context, payload: Request) -> Result:",
+        "async def nested(ctx: Context, payload: Request) -> Media:",
+    )
+    .replace(
+        "async def generate(ctx: Context, tel: Telemetry, *, model: Source, n: int) -> Result:",
+        "async def generate(ctx: Context, tel: Telemetry, out: Outputs,\n"
+        "                   *, model: Source, n: int) -> Render:",
+    )
+    .replace(
+        "    return Result(model.infer(n, tel))",
+        "    from PIL import Image\n"
+        "    value = model.infer(n, tel)\n"
+        "    pixels = (value.reshape(4,4).float().sigmoid().cpu().numpy()*255).astype('uint8')\n"
+        "    return Render(16, out.save_image(Image.fromarray(pixels).convert('RGB')))",
+    )
+    .replace(
+        "    call = generate(model=first, n=n, capture=ActivationCapture(('body',), (0,)))\n"
+        "    result = await call\n"
+        "    assert call.observation.environment.worker_boot_id\n"
+        "    assert call.observation.capture.tree is not None\n"
+        "    return result",
+        "    for render_n in (1,2,3,4,5,6,7,8) * 3:\n"
+        "        call = generate(model=first, n=render_n,\n"
+        "                        capture=ActivationCapture(('body',), (0,)))\n"
+        "        result = await call\n"
+        "        assert call.observation.environment.worker_boot_id\n"
+        "        assert call.observation.capture.tree is not None\n"
+        "    return Media(result.value, result.image, call.observation.capture.tree)",
+    )
+)
+
+
+def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread]:
+    fixture = Path(__file__).parent / "testdata/native_source"
+    body = (fixture / "first.safetensors").read_bytes()
+    digest = hashlib.sha256(body).hexdigest()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/api/models/"):
+                data = json.dumps(
+                    [
+                        {
+                            "type": "file",
+                            "path": "provider/first.safetensors",
+                            "size": len(body),
+                            "lfs": {"oid": digest, "size": len(body)},
+                        }
+                    ]
+                ).encode()
+                self.send_response(200)
+            else:
+                start, end = map(int, self.headers["Range"].removeprefix("bytes=").split("-"))
+                data = body[start : end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(body)}")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    assert worker.source_calls is not None
+    worker.source_calls.endpoints = {"huggingface": f"http://127.0.0.1:{server.server_port}"}
+    worker.source_calls.native_registry = (fixture / "registry.json").read_bytes()
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    return server, thread
+
+
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-@pytest.mark.parametrize("case", ["normal", "pause", "loss", "cycle", "capacity"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "normal",
+        "pause",
+        "loss",
+        "cycle",
+        "capacity",
+        "model",
+        "model_result",
+        "model_admission",
+        "source",
+        "file",
+        "serving",
+        "serving_model",
+        "serving_media",
+    ],
+)
 def test_nested_capture_and_leaf_memoization_without_control_stream(
-    monkeypatch: pytest.MonkeyPatch, case: str
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    proof_gate: Path | None = None,
+    proof_info: Path | None = None,
 ) -> None:
     import test_job_preparation_isolation as fixture
     from conftest import image_python
 
+    if case in ("serving_model", "serving_media"):
+        import importlib.util
+
+        if importlib.util.find_spec("torch") is None:
+            pytest.skip("modeled serving requires the Torch image qualification environment")
+        import torch
+
+        if torch.version.cuda is None or not torch.cuda.is_available():
+            pytest.skip("modeled serving requires a CUDA-capable qualification environment")
+
     with tempfile.TemporaryDirectory(prefix="cz-child.") as directory:
         root = Path(directory)
-        source = SOURCE
+        source = (
+            MODEL_SOURCE
+            if case in ("model", "model_result", "model_admission", "source")
+            else SOURCE
+        )
+        if case == "model_admission":
+            source = source.replace(
+                "async def consume(ctx: Context, *, model: Source) -> Result:",
+                "async def consume(ctx: Context, *, model: Source, z_other: Source) -> Result:",
+            ).replace(
+                "    return await consume(model=first)",
+                "    bad = ModelArtifact(\n"
+                "        'unowned', first.output_slot, first.manifest,\n"
+                "        first.tensorfs_receipt_digest)\n"
+                "    return await consume(model=first, z_other=bad)",
+            )
+        if case == "model_result":
+            source = source.replace(
+                "async def nested(ctx: Context, payload: Request) -> Result:",
+                "async def nested(ctx: Context, payload: Request) -> ModelArtifact:",
+            ).replace("    return await compose(n=3)", "    return await leaf(n=3)")
+        if case == "file":
+            source = FILE_SOURCE
+        if case == "serving":
+            source = (
+                SOURCE.replace("@invocable(memoize=True)", "@invocable")
+                .replace("app.job(leaf)", "app.entrypoint(leaf)")
+                .replace(
+                    "    first = await leaf(n=n)",
+                    "    call = leaf(n=n)\n"
+                    "    first = await call\n"
+                    "    assert call.observation.environment.worker_boot_id\n",
+                )
+            )
+        if case == "serving_model":
+            source = MODELED_SERVING_SOURCE
+        if case == "serving_media":
+            source = MODELED_MEDIA_SOURCE
+            if proof_gate is not None:
+                source = source.replace(
+                    "    return Media(result.value, result.image, call.observation.capture.tree)",
+                    "    from pathlib import Path\n    import asyncio\n"
+                    + f"    ready = Path({str(proof_gate.with_suffix('.ready'))!r})\n"
+                    + "    ready.write_text(ctx.request_id)\n"
+                    + f"    while not Path({str(proof_gate)!r}).exists():\n"
+                    + "        ctx.raise_if_cancelled()\n        await asyncio.sleep(0.05)\n"
+                    + "    return Media(result.value, result.image, call.observation.capture.tree)",
+                )
+        if case == "source":
+            source = source.replace(
+                'return Result(len(view.components["body"]))',
+                "return Result(sum(len(v) for v in view.components.values()))",
+            )
+            source = source.replace(
+                "    return await compose(n=3)",
+                "    from cozy_runtime.author.sources import (\n"
+                "        download_huggingface, source_files, convert_cozytensors)\n"
+                "    source = await download_huggingface('example/model', revision='"
+                + "a"
+                * 40
+                + "', carriers=('provider/first.safetensors',))\n"
+                "    await source_files(source)\n"
+                "    model = await convert_cozytensors(source, profile='fixture/first/1')\n"
+                "    return await consume(model=model)",
+            )
         if case in ("pause", "loss"):
             source = source.replace(
                 "    return Result(n * 2)",
@@ -107,6 +436,20 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             GrpcControlHost("127.0.0.1:0", root / "address"),
         )
         thread = threading.Thread(target=worker.run, daemon=True)
+        if proof_info is not None:
+            proof_info.write_text(
+                json.dumps(
+                    {
+                        "root": str(root),
+                        "store": str(root / "store"),
+                        "artifacts": str(root / "artifacts"),
+                        "owner": "owner",
+                        "gate": str(proof_gate),
+                        "ready": str(proof_gate.with_suffix(".ready")) if proof_gate else "",
+                    }
+                )
+            )
+        origin = native_origin(worker) if case == "source" else None
         try:
             fixture.measure(worker, preparation)
             prepared = worker.prepare_local_package(preparation)
@@ -143,7 +486,13 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                             export=export,
                             entrypoint=export,
                         )
-                        for export in ("compose", "leaf")
+                        for export in (
+                            ("compose", "consume", "generate", "leaf")
+                            if case in ("serving_model", "serving_media")
+                            else ("compose", "consume", "leaf")
+                            if case in ("model", "model_result", "model_admission", "source")
+                            else ("compose", "leaf")
+                        )
                     ],
                 )
             )
@@ -154,7 +503,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             ]
             binding = JobBinding.read(next(row for row in plans if row.get("job") == "nested"))
             thread.start()
-            deadline = time.monotonic() + 60
+            deadline = time.monotonic() + (960 if case == "serving_media" or proof_gate else 60)
             while not (root / "address").exists():
                 assert thread.is_alive() and time.monotonic() < deadline
                 time.sleep(0.02)
@@ -169,11 +518,11 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 LocalRequest(
                     entrypoint="nested",
                     payload={},
-                    outputs=(),
+                    outputs=("image", "capture") if case == "serving_media" else (),
                     kind="job",
                     request_id="root",
                     job_descriptor_id=binding.job_descriptor_id,
-                    timeout_ms=45_000,
+                    timeout_ms=900_000 if case == "serving_media" or proof_gate else 45_000,
                 ),
                 {},
                 root / "grants",
@@ -250,7 +599,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 time.sleep(0.02)
             outcome = worker.collect_execution(claim, "root")
             body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
-            if case in ("cycle", "capacity"):
+            if case in ("cycle", "capacity", "model_admission"):
                 assert body["status"] == pb.OUTCOME_STATUS_FAILED, body
                 assert worker.workspace is not None
                 with worker.workspace.locked() as db:
@@ -261,6 +610,23 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                             "SELECT 1 FROM execution_calls WHERE safe_detail "
                             "LIKE '%active ancestor%'"
                         ).fetchone()
+                    if case == "model_admission":
+                        refused = db.execute(
+                            "SELECT child_request FROM execution_calls "
+                            "WHERE safe_detail LIKE '%provenance%'"
+                        ).fetchone()
+                        assert refused is not None
+                        (row,) = db.execute(
+                            "SELECT retention FROM execution_model_holds WHERE recipient=?",
+                            (refused[0],),
+                        ).fetchall()
+                        hold = pb.DerivedRetentionRequest.FromString(row[0])
+                        assert (
+                            db.execute(
+                                "SELECT state FROM holds WHERE id=?", (hold.retention_id,)
+                            ).fetchone()[0]
+                            == "released"
+                        )
                 while worker.lanes.composition:
                     assert thread.is_alive() and time.monotonic() < deadline
                     time.sleep(0.02)
@@ -270,21 +636,90 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             assert not worker.stop.is_set()
             import base64
 
+            if case == "serving_media":
+                value = canonical_json.decode(base64.b64decode(body["result"]["inline_result"]))
+                assert (
+                    value["value"] == 16
+                    and value["image"]["kind"] == "image"
+                    and value["capture"]["kind"] == "tree"
+                )
+                assert {output["output_id"] for output in body["output_manifest"]["outputs"]} == {
+                    "image",
+                    "capture",
+                }
+                assert worker.workspace is not None
+                with worker.workspace.locked() as db:
+                    assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 27
+                    assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 1
+                return
+            if case == "model_result":
+                import tensorfs
+
+                from test_machine_execution import ack
+
+                value = canonical_json.decode(base64.b64decode(body["result"]["inline_result"]))
+                assert not body.get("weights_receipts")
+                (retained,) = body["result"]["retained_models"]
+                assert retained.get("result_pointer", "") == ""
+                assert (
+                    canonical_json.decode(
+                        base64.b64decode(retained["model_artifact_canonical_bytes"])
+                    )
+                    == value
+                )
+                assert worker.workspace is not None
+                received = worker.workspace.retain(
+                    "owner",
+                    pb.DerivedRetentionRequest(
+                        weights_transaction_id=retained["retention"]["weights_transaction_id"],
+                        tensorfs_receipt_digest=documents.raw(
+                            retained["retention"]["tensorfs_receipt_digest"]
+                        ),
+                        retention_id="sha256:" + "e7" * 32,
+                    ),
+                )
+                worker.acknowledge_execution_collection(claim, ack(outcome))
+                tensorfs.gc(str(worker.workspace.store_root))
+                assert documents.body(received.manifest) == value["manifest"]
+                assert tensorfs.Store.open(str(worker.workspace.store_root)).manifest(
+                    value["manifest"]["digest"]
+                )
+                return
             assert canonical_json.decode(base64.b64decode(body["result"]["inline_result"])) == {
-                "value": 12
+                "value": 16
+                if case == "serving_model"
+                else 1
+                if case == "source"
+                else 2
+                if case == "model"
+                else 12
             }
             assert not worker.connected.is_set()
             assert worker.workspace is not None
             with worker.workspace.locked() as db:
-                assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 3
-                assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == 3
-                assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 1
+                assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == (
+                    2
+                    if case == "source"
+                    else 4
+                    if case in ("model", "serving", "serving_model")
+                    else 3
+                )
+                assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == (
+                    4 if case in ("model", "source", "serving_model") else 3
+                )
+                assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == (
+                    2 if case == "source" else 0 if case == "serving" else 1
+                )
         finally:
             worker.request_stop()
             worker.host.stop()
             if thread.ident is not None:
                 thread.join(30)
             assert not thread.is_alive()
+            if origin is not None:
+                origin[0].shutdown()
+                origin[0].server_close()
+                origin[1].join()
 
 
 def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
@@ -309,7 +744,14 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
         parents.append(selected)
         selected = calls.accept("owner", request(parent)).child_request
     dispatcher = Dispatcher(cast(Worker, SimpleNamespace(workspace=workspace)))
-    target = cast(Target, SimpleNamespace(revision="different", binding=None))
+    target = cast(
+        Target,
+        SimpleNamespace(
+            revision="different",
+            binding=SimpleNamespace(job_descriptor_id="different"),
+            declaration={},
+        ),
+    )
     dispatcher._check_ancestors(
         "owner", cast(AttemptRecord, SimpleNamespace(request_id=parents[-2])), target, b"{}"
     )
@@ -317,3 +759,30 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
         dispatcher._check_ancestors(
             "owner", cast(AttemptRecord, SimpleNamespace(request_id=parents[-1])), target, b"{}"
         )
+
+
+def test_canceling_root_also_abandons_failed_descendants(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from cozy_runtime.internal.worker.machine_calls import Calls as Dispatcher
+    from cozy_runtime.internal.worker.workspace import Workspace
+    from cozy_runtime.internal.worker.workspace_calls import Calls
+    from cozy_runtime.internal.worker.workspace_executions import Executions
+    from test_machine_calls import request, running
+    from test_machine_execution import complete, offer
+
+    workspace = Workspace(tmp_path / "store")
+    executions, calls = Executions(workspace), Calls(workspace)
+    executions.submit("owner", "root", b"c" * 32, offer())
+    call = calls.accept("owner", request(running(executions, "root")))
+    executions.submit("owner", "child", b"c" * 32, offer(call.child_request))
+    complete(executions, call.child_request, status=pb.OUTCOME_STATUS_FAILED)
+    complete(executions, "root", status=pb.OUTCOME_STATUS_FAILED)
+    executions.control("owner", "root", "cancel-root", 1, "cancel")
+    dispatcher = Dispatcher(
+        cast(Worker, SimpleNamespace(workspace=workspace, executions=executions))
+    )
+    dispatcher._stop_descendants("owner")
+    assert executions.abandon("owner", "root")
+    assert executions.abandon("owner", call.child_request)
+    assert not executions.retention_required("owner")

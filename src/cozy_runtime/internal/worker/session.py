@@ -114,8 +114,10 @@ from cozy_runtime.internal.worker.lanes import (
     fold_memory,
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
+from cozy_runtime.internal.worker.machine_publication import PublicationTLS
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding, PreparedModel
 from cozy_runtime.internal.worker.records import WorkerRecords
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -301,6 +303,8 @@ class WorkerOptions:
     """
     environment_python: Path | None = None
     """An already-complete local package venv; mutually exclusive with materialization root."""
+    publication_tls: PublicationTLS | None = None
+    """Privileged worker mTLS configuration, never an executor or captured-code value."""
     tensorfs_root: Path | None = None
     """The one host-local executable TensorFS Store."""
     artifact_cache: Path | None = None
@@ -1245,8 +1249,17 @@ class Worker:
             local=self._machine_call,
         )
         from .machine_calls import Calls as MachineCalls
+        from .machine_effects import Effects
 
         self.machine_calls = MachineCalls(self) if self.workspace is not None else None
+        from .machine_sources import Sources as MachineSources
+
+        self.machine_sources = MachineSources(self)
+        self.machine_effects = (
+            Effects(self.workspace, self.executions, options.publication_tls)
+            if self.workspace is not None and self.executions is not None
+            else None
+        )
         self.engine.calls = self.calls
         from cozy_runtime.internal.worker.source_calls import SourceCalls
 
@@ -1650,6 +1663,8 @@ class Worker:
 
     def _lane_dispatchable(self, lane: DeviceLane) -> bool:
         """Whether THIS lane has a placement that takes offers (job mode: the envelope)."""
+        if lane.lane_id.startswith("cpu-") and (slot := self.job_slots.get(lane.lane_id)):
+            return slot.ready()
         if self.accepted.mode == "job":
             slot = self.job_slots.get(lane.lane_id)
             return (
@@ -2067,10 +2082,13 @@ class Worker:
         retry_delay_ms: int = 0,
         capture_document: bytes = b"",
         preparation: bytes = b"",
+        publication_authorization_id: str = "",
     ) -> workspace_executions.Receipt:
         """Authenticated root intake; accepted execution never depends on the caller's stream."""
         with self.control_lock:
             executions, owner = self._execution_service(claim)
+            if publication_authorization_id and self.options.publication_tls is None:
+                raise WorkspaceRefusal("worker has no independent publication authority configured")
             result_schema, memoize = b"", False
             spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
             if "job" in spec:
@@ -2104,6 +2122,7 @@ class Worker:
                 capture_document=capture_document,
                 preparation=preparation,
                 worker_id=self.options.worker_id,
+                publication_authorization_id=publication_authorization_id,
             )
             self.publish_activity(strict=True)
             return receipt
@@ -2156,6 +2175,8 @@ class Worker:
             return
         with self.control_lock:
             owner = self.fence.record_owner_id
+            if self.machine_effects is not None:
+                self.machine_effects.drive(owner)
             if self.machine_calls is not None:
                 self.machine_calls.drive()
             self.executions.retry_due(owner, worker_boot=self.fence.worker_boot_id)
@@ -2267,7 +2288,15 @@ class Worker:
         if same:
             return True
         if any(
-            attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD
+            (attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD)
+            and not (
+                (
+                    desired.WhichOneof("mode") == "placement_set"
+                    or (desired.WhichOneof("mode") == "job" and not desired.job.orchestration)
+                )
+                and attempt.lane_id.startswith("cpu-")
+                and attempt.state != "queued"
+            )
             for attempt in self.engine.history.values()
         ):
             # on_offer journals the queue before a lane begins accepting it. That queue
@@ -2455,6 +2484,8 @@ class Worker:
             and bool(subject_id)
             and self.executions.owns(self.fence.record_owner_id, subject_id)
         )
+        if machine_message and frame.HasField("native_source_status"):
+            self.machine_sources.observe(frame.native_source_status)
         if machine_message and frame.HasField("child_call_request"):
             request = frame.child_call_request
             self.calls.absorb(
@@ -2611,6 +2642,8 @@ class Worker:
         """Can this worker take an offer AT ALL right now? Serving asks the placement's
         axis; job mode asks whether its one build is ready. Neither answer is a SLOT count —
         `available_attempt_slots` is the other half, and #486c keeps them apart on purpose."""
+        if any(slot.ready() for name, slot in self.job_slots.items() if name.startswith("cpu-")):
+            return True
         if self.accepted.mode == "job":
             return self.job_ready
         return bool(
@@ -2806,11 +2839,14 @@ class Worker:
         nothing about whether this worker is getting anywhere. Every other thread burns
         only when it works, which is what makes the worker's own burn, less these, an
         honest progress meter for an outside observer."""
-        return {
+        clocks = {
             tid
             for name, tid in self.lane_threads.items()
             if name in ("report", "watchdog", "control-send")
         }
+        if self.machine_effects is not None:
+            clocks.update(self.machine_effects.pollers)
+        return clocks
 
     def applied_posture(self) -> dict[str, Any]:
         """The state the worker was in when something happened (§3.6). `readiness_epoch` is
@@ -3621,8 +3657,15 @@ class Worker:
             and self.job_slots
             and any(
                 self._job_lane_busy(slot.lane)
-                for slot in self.job_slots.values()
+                for name, slot in self.job_slots.items()
                 if slot is not retained_parent
+                and (
+                    not name.startswith("cpu-")
+                    or any(
+                        attempt.lane_id == slot.lane.lane_id and attempt.state == "queued"
+                        for attempt in self.engine.history.values()
+                    )
+                )
             )
         ):
             self.engine.fault(
@@ -3707,9 +3750,11 @@ class Worker:
             if cpu is not None and cpu is not retained_parent:
                 cpu.supervision.close()
                 self.lanes.orchestration.forget("")
-            self.job_slots = (
-                {"orchestration": retained_parent} if retained_parent is not None else {}
-            )
+            self.job_slots = {
+                name: slot for name, slot in self.job_slots.items() if name.startswith("cpu-")
+            }
+            if retained_parent is not None:
+                self.job_slots["orchestration"] = retained_parent
             self.jobs = {
                 slot.binding.job_descriptor_id: slot.binding for slot in self.job_slots.values()
             }
@@ -5916,7 +5961,13 @@ class Worker:
                 CAUSE.CAUSE_CODE_ADMISSION_EPOCH_STALE,
             )
             return
-        if self.accepted.mode == "serving":
+        try:
+            job_offer = machine_owned and "job" in documents.read(
+                offered.invocation_spec_canonical_bytes, pb.InvocationSpec
+            )
+        except documents.DocumentError:
+            job_offer = False  # The ordinary AttemptEngine records the malformed offer refusal.
+        if self.accepted.mode == "serving" and not job_offer:
             selected = self._placement_by_id(offered.placement_id)
             if selected is None:
                 hosted_ids = sorted(self.hosted)
@@ -5976,8 +6027,15 @@ class Worker:
                 descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
                 # Execution attaches attempt.job later. The prepared engine binding
                 # is available on both local and placement-hosted paths at offer time.
-                binding = self.engine.jobs.get(descriptor)
-                if binding is None:
+                from . import machine_slots
+
+                child_slot = self.job_slots.get(machine_slots.key(attempt.request_id))
+                binding = (
+                    child_slot.binding
+                    if child_slot is not None
+                    else self.engine.jobs.get(descriptor)
+                )
+                if binding is None or binding.build_id != attempt.spec["job"]["build_id"]:
                     self.refuse(
                         offered,
                         "job_binding_unavailable",
@@ -6073,7 +6131,7 @@ class Worker:
         """The lane an offer draws its seat from: the placement's, or the envelope for a job.
         Called after the placement is known to be hosted, so an unassigned placement here
         is one that is not dispatchable, and its lane is whichever its slot would take."""
-        if self.accepted.mode == "job":
+        if self.accepted.mode == "job" or (attempt is not None and "job" in attempt.spec):
             if attempt is not None:
                 from . import machine_slots
 
@@ -6276,7 +6334,7 @@ class Worker:
                     CAUSE.CAUSE_CODE_ADMISSION_EPOCH_STALE,
                 )
                 return False
-            if self.accepted.mode == "serving":
+            if self.accepted.mode == "serving" and "job" not in attempt.spec:
                 selected = self._placement_by_id(attempt.placement_id)
                 if selected is None:
                     self.note(
@@ -6895,6 +6953,10 @@ class Worker:
             if supervision.current is not None
         ]
         self.request_stop()
+        if self.machine_calls is not None:
+            self.machine_calls.close()
+        if self.machine_effects is not None:
+            self.machine_effects.close()
         self.weights.close()
         if self.artifact_transfers is not None:
             self.artifact_transfers.close()

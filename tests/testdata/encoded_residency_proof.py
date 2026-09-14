@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 from pathlib import Path
@@ -10,15 +11,15 @@ from typing import Any
 import numpy as np
 import tensorfs
 import torch
+from tensorfs.derived import Config as NativeConfig
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import WeightsConfig, WeightsPart, WeightsTarget, WeightsTensor
 from cozy_runtime.author._loader import census
-from cozy_runtime.author._weights import WeightsCommit
 from cozy_runtime.derive.microscale import encode_fp8_rowwise
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE
 from cozy_runtime.internal.fill import Checkpoint, FillRefusal, StreamingFillBackend, _Holder
 from cozy_runtime.internal.residency import ComponentResidency, ResidencyRefusal
-from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+from cozy_runtime.internal.weights_sink import weights_transaction_id
 
 
 def main(root: Path) -> None:
@@ -33,46 +34,35 @@ def main(root: Path) -> None:
     encoded = encode_fp8_rowwise("generated", values)
     bias = np.random.default_rng(92).normal(0, 0.1, 1024).astype(np.float32)
     targets = {
-        "linear.weight": WeightsTensor(
+        "linear.weight": Tensor(
             "bf16",
             (1024, 1024),
             SPEC_ROWWISE,
             {
-                "data": WeightsPart("f8_e4m3fn", (1024, 1024)),
-                "scale": WeightsPart("f32", (1024,)),
+                "data": Part("f8_e4m3fn", (1024, 1024)),
+                "scale": Part("f32", (1024,)),
             },
         ),
-        "linear.bias": WeightsTensor(
-            "f32", (1024,), SPEC_PLAIN, {"value": WeightsPart("f32", (1024,))}
-        ),
+        "linear.bias": Tensor("f32", (1024,), SPEC_PLAIN, {"value": Part("f32", (1024,))}),
     }
     bound = 2 * (len(encoded.payload) + len(encoded.companions[0].raw) + bias.nbytes) + 4096
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="encoded-proof",
-        request_id="proof",
-        invocation_spec_digest="sha256:" + "1" * 64,
-        work_fingerprint="sha256:" + "2" * 64,
-        writer_session_id=1,
-        allowed_sources={},
-        output_bounds={"model": bound},
-    )
-    transaction = host.open(
-        WeightsCommit(
-            output_slot="model",
+    transaction = store.begin_derived(
+        weights_transaction_id("encoded-proof", "proof", "sha256:" + "1" * 64, "model"),
+        1,
+        *Derivation(
             sources={},
-            targets={name: WeightsTarget(add=targets) for name in ("a", "b")},
-            configs={"model": WeightsConfig(data=b"{}")},
+            targets={name: Target(add=targets) for name in ("a", "b")},
+            configs={"model": NativeConfig("add")},
             order=tuple((name, key) for name in ("a", "b") for key in targets),
-            max_new_bytes=bound,
-        )
+        ).native_arguments(bound),
+        work_fingerprint="sha256:" + "2" * 64,
     )
     for name in ("a", "b"):
-        transaction.add_part(name, "linear.weight", "data", encoded.payload)
-        transaction.add_part(name, "linear.weight", "scale", encoded.companions[0].raw)
-        transaction.add_part(name, "linear.bias", "value", bias.tobytes())
-    transaction.add_config("model", b"{}", 2)
-    receipt = json.loads(transaction.commit().tensorfs_receipt)
+        transaction.add_part(name, "linear.weight", "data", io.BytesIO(encoded.payload))
+        transaction.add_part(name, "linear.weight", "scale", io.BytesIO(encoded.companions[0].raw))
+        transaction.add_part(name, "linear.bias", "value", io.BytesIO(bias.tobytes()))
+    transaction.add_config("model", io.BytesIO(b"{}"))
+    receipt = transaction.commit()
     manifest = "sha256:" + receipt["manifest"]["sha256"]
     checkpoint = Checkpoint(root / "store", manifest)
     rows = [row for name in ("a", "b") for row in checkpoint.rows(name)]

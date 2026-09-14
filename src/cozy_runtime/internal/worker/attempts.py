@@ -1524,10 +1524,10 @@ class AttemptEngine:
                 # Exact Model inputs already grant read access. The broker verifies
                 # those immutable input refs; it grants no output or write authority.
                 return self.weights.reader_broker.handle(attempt, frame)
-            if kind == "weights_writer":
-                return self.weights.writer_broker.handle(attempt, frame)
             output_slot = str(frame.get("output_slot", ""))
-            if kind == "weights_intent":
+            if kind == "weights_intent" or (
+                kind == "weights_writer" and frame.get("operation") == "output"
+            ):
                 if attempt.job is None:
                     raise ValueError("a weights intent requires the current job")
                 declared = self._job_declaration(attempt.job, attempt.job.job_descriptor_id)
@@ -1546,6 +1546,9 @@ class AttemptEngine:
                     raise ValueError(
                         "weights intent is outside the package and invocation output contract"
                     )
+            if kind == "weights_writer":
+                return self.weights.writer_broker.handle(attempt, frame)
+            if kind == "weights_intent":
                 length = int(frame.get("tensorfs_declaration_length", 0))
                 raw = weights_exchange_bytes(attempt.spool, output_slot, "declaration", length)
                 return self.weights.intent(
@@ -2262,7 +2265,8 @@ class AttemptEngine:
                     and str(row["asset_ref"]).startswith("sha256:")
                     else None
                 )
-                if row.get("kind") == "tree":
+                tree = row.get("kind") == "tree"
+                if tree or (native and not attempt.grant.outputs[output_id].url):
                     if not native:
                         raise grants.GrantRefusal(
                             "native_tree_unsupported", "tree outputs require wire43 native custody"
@@ -2272,7 +2276,11 @@ class AttemptEngine:
                     from .workspace_byte_outputs import TREE_MIME
 
                     root = (
-                        received[0] if received else self._blob_path(spool, str(row["asset_ref"]))
+                        received[0]
+                        if received
+                        else self._blob_path(spool, str(row["asset_ref"]))
+                        if tree
+                        else self._blob(spool, str(row["asset_ref"]))
                     )
                     if root is None or self.tensorfs_root is None:
                         raise grants.GrantRefusal(
@@ -2280,7 +2288,9 @@ class AttemptEngine:
                         )
                     destination = attempt.grant.outputs[output_id]
                     media_type = grants._output_media_type(
-                        output_id, destination.mime_type, TREE_MIME
+                        output_id,
+                        destination.mime_type,
+                        TREE_MIME if tree else str(row.get("media_type") or ""),
                     )
                     if received:
                         entry = byte_outputs.reexport(
@@ -2291,7 +2301,7 @@ class AttemptEngine:
                             attempt.digest,
                             output_id,
                             received[1],
-                            tree=True,
+                            tree=tree,
                             max_bytes=destination.max_bytes or (256 << 20),
                             media_type=media_type,
                         )
@@ -2304,7 +2314,7 @@ class AttemptEngine:
                             attempt.digest,
                             output_id,
                             root,
-                            tree=True,
+                            tree=tree,
                             max_bytes=destination.max_bytes or (256 << 20),
                             media_type=media_type,
                         )
@@ -2601,6 +2611,62 @@ class AttemptEngine:
             body.metrics.CopyFrom(self.attest(attempt, metrics, manifest))
         if result is not None:
             body.result.CopyFrom(self._envelope(result))
+            if (
+                status == pb.OUTCOME_STATUS_SUCCEEDED
+                and attempt.job is not None
+                and self.tensorfs_root is not None
+            ):
+                from cozy_runtime.internal.worker import machine_models
+                from cozy_runtime.internal.worker.workspace import Workspace
+                from cozy_runtime.protocol import RETAINED_MODEL_RESULTS_WIRE_MINOR
+
+                workspace = Workspace(self.tensorfs_root)
+                owner = self.owner_scope()
+                with workspace.locked() as db:
+                    managed = (
+                        db.execute(
+                            "SELECT 1 FROM executions WHERE owner=? AND request=?",
+                            (owner, attempt.request_id),
+                        ).fetchone()
+                        is not None
+                    )
+                if managed:
+                    try:
+                        schema = self._job_declaration(attempt.job, attempt.job.job_descriptor_id)[
+                            "result"
+                        ]
+                        records = machine_models.result_records(
+                            workspace,
+                            owner,
+                            attempt.request_id,
+                            canonical.parse_canonical(result.canonical),
+                            schema,
+                        )
+                        if records and (
+                            self.calls is None
+                            or self.calls.minor() < RETAINED_MODEL_RESULTS_WIRE_MINOR
+                        ):
+                            raise ValueError("native Model collection requires wire53")
+                        for pointer, artifact, retention in records:
+                            body.result.retained_models.append(
+                                pb.RetainedModelResult(
+                                    result_pointer=pointer,
+                                    model_artifact_canonical_bytes=artifact,
+                                    retention=retention,
+                                )
+                            )
+                    except Exception as exc:
+                        status, cause, origin = (
+                            pb.OUTCOME_STATUS_FAILED,
+                            pb.CAUSE_CODE_LOCAL_SAFETY,
+                            pb.CAUSE_ORIGIN_WORKER,
+                        )
+                        detail = "result_custody_unavailable: " + safe(str(exc), 1024)
+                        body.status, body.safe_message = status, detail
+                        body.cause.CopyFrom(
+                            pb.OutcomeCause(code=cause, origin=origin, detail=detail)
+                        )
+                        body.ClearField("result")
         for output_slot in sorted(attempt.weights_receipts):
             body.weights_receipts.append(attempt.weights_receipts[output_slot])
         receipt = self.commit_bundle(attempt, status, cause, origin, detail)

@@ -18,14 +18,14 @@ from cozy_runtime.author import (
     Telemetry,
     UnsupportedInput,
     WeightsOutput,
-    WeightsSink,
-    WeightsSource,
     invocable,
 )
 
 from . import facade
 
 if TYPE_CHECKING:
+    from tensorfs.derived import SourceInspection
+
     from .quantization import ArtifactQuantizationPlan
 
 
@@ -52,12 +52,14 @@ MAX_QUANTIZED_BYTES = MAX_WEIGHTS_NEW_BYTES
 app = App()
 
 
-def _selection(structure: WeightsSource, plan: QuantizationPlan) -> ArtifactQuantizationPlan:
+def _selection(structure: SourceInspection, plan: QuantizationPlan) -> ArtifactQuantizationPlan:
     from .quantization import (
         PLAIN_SPEC,
         ArtifactQuantizationPlan,
         QuantizationTensor,
         prepare_source_quantization,
+        source_parts,
+        source_rows,
     )
 
     if (
@@ -80,12 +82,13 @@ def _selection(structure: WeightsSource, plan: QuantizationPlan) -> ArtifactQuan
         raise UnsupportedInput(
             "quantization plan requires canonical digests", code="quantization_plan"
         )
-    by_key = {(row.component, row.key): row for row in structure.tensors}
-    if len(by_key) != len(structure.tensors):
+    rows = list(source_rows(structure))
+    by_key = {(component, key): tensor for component, key, tensor in rows}
+    if len(by_key) != len(rows):
         raise UnsupportedInput("quantization source repeats a tensor", code="quantization_source")
     if (
         plan.source_order_digests
-        and canonical_json.digest([[row.component, row.key] for row in structure.tensors])
+        and canonical_json.digest([[component, key] for component, key, _ in rows])
         not in plan.source_order_digests
     ):
         raise UnsupportedInput(
@@ -122,24 +125,26 @@ def _selection(structure: WeightsSource, plan: QuantizationPlan) -> ArtifactQuan
     schema = []
     for item in selection.tensors:
         tensor = by_key[item.component, item.key]
+        parts = source_parts(tensor)
+        plain = parts.get("value")
         if (
             tensor.encoding != PLAIN_SPEC
-            or len(tensor.parts) != 1
-            or tensor.parts[0].name != "value"
-            or tensor.parts[0].dtype != tensor.logical_dtype
-            or tensor.parts[0].shape != tensor.shape
+            or len(parts) != 1
+            or plain is None
+            or plain.dtype != tensor.logical_dtype
+            or tuple(plain.shape) != tuple(tensor.shape)
         ):
             raise UnsupportedInput(
-                f"quantization source {tensor.component}.{tensor.key} is not plain",
+                f"quantization source {item.component}.{item.key} is not plain",
                 code="quantization_source",
             )
         schema.append(
             [
-                tensor.component,
-                tensor.key,
+                item.component,
+                item.key,
                 tensor.logical_dtype,
                 list(tensor.shape),
-                [[part.name, part.dtype, list(part.shape)] for part in tensor.parts],
+                [[role, part.dtype, list(part.shape)] for role, part in parts.items()],
             ]
         )
     if (
@@ -159,22 +164,22 @@ async def quantize(
     source: QuantizationSource,
     plan: QuantizationPlan,
     encoding: str,
-    weights: WeightsSink,
     tel: Telemetry,
     max_relative_frobenius: float | None = None,
 ) -> ModelArtifact:
     """Quantize one granted source under a closed caller-authored selection plan."""
     ctx.raise_if_cancelled()
     intent = facade.plan(plan.components, encoding, max_relative_frobenius=max_relative_frobenius)
-    selected = _selection(weights.structure(source), plan)
+    structure = ctx.tensorfs_source(source).inspect()
+    selected = _selection(structure, plan)
     result, receipt = facade._quantize(
         source,
         intent,
-        sink=weights,
         ctx=ctx,
         tel=tel,
         output="model",
         selection=selected,
+        source_view=structure,
         preserve_precision=plan.output_precision == "preserve",
     )
     return facade._artifact_result(result, receipt, tel, "model")

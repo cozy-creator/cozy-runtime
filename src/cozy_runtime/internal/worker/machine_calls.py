@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
-from cozy_runtime.internal.worker import machine_child_target, workspace_memo
+from cozy_runtime.internal import effect_interfaces, source_interfaces
+from cozy_runtime.internal.worker import machine_byte_results, machine_child_target, workspace_memo
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_calls import Calls as JournalCalls
@@ -27,7 +28,14 @@ class Calls:
         self.worker = worker
         self.journal = JournalCalls(worker.workspace)
         self.lock = threading.Lock()
+        self.finishing_lock = threading.RLock()
         self.pending: dict[tuple[str, int], pb.ChildCallRequest] = {}
+        from .machine_serving import Serving
+
+        self.serving = Serving(worker)
+
+    def close(self) -> None:
+        self.serving.close()
 
     def handle(
         self, parent: AttemptRecord, request: pb.ChildCallRequest, action: str
@@ -43,6 +51,8 @@ class Calls:
             raise WorkspaceRefusal("local call changed its accepted intent")
         executions = self.worker.executions
         assert executions is not None
+        if request.module == source_interfaces.MODULE and action == "cancel":
+            self.worker.machine_sources.cancel(owner, request)
         if executions.owns(owner, call.child_request):
             state = executions.status(owner, call.child_request)
             previous_attempt = canonical_json.decode(call.prepared)["parent_attempt"]
@@ -90,8 +100,27 @@ class Calls:
             child_request_id=call.child_request,
             state=pb.CHILD_CALL_STATE_PENDING,
         )
+        if request.module == source_interfaces.MODULE:
+            return self.worker.machine_sources.result(owner, call, request, result)
         if call.result:
+            assert self.worker.workspace is not None
+            if self.worker.executions is not None and self.worker.executions.owns(
+                owner, call.child_request
+            ):
+                self._finish(owner, call)
+            workspace_memo.release_lookup(self.worker.workspace, owner, call.child_request)
             result.state, result.result_canonical_bytes = pb.CHILD_CALL_STATE_SUCCEEDED, call.result
+            capture = self._observation(owner, call, result)
+            result.byte_result_grants.extend(
+                machine_byte_results.grants(
+                    self.worker.workspace,
+                    owner,
+                    call.parent_request,
+                    call.call_index,
+                    canonical_json.decode(call.prepared).get("result_schema", {}),
+                    capture=capture,
+                )
+            )
             return result
         if call.safe_code:
             result.state, result.safe_code, result.safe_detail = (
@@ -107,9 +136,9 @@ class Calls:
         state = executions.status(owner, call.child_request)
         if state.state not in ("succeeded", "failed", "canceled", "paused"):
             return result
-        terminal = executions.collect(owner, call.child_request)
-        body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
         if state.state != "succeeded":
+            terminal = executions.collect(owner, call.child_request)
+            body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
             result.state = pb.CHILD_CALL_STATE_FAILED
             result.safe_code = "child_failed"
             result.safe_detail = str(body.get("safe_message", "child operation stopped"))[:1024]
@@ -118,15 +147,54 @@ class Calls:
         if held is not None and held.state != "closed":
             return result
         self._finish(owner, call)
+        terminal = executions.collect(owner, call.child_request)
+        body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        assert self.worker.workspace is not None
+        capture = self._observation(owner, call, result)
+        result.byte_result_grants.extend(
+            machine_byte_results.grants(
+                self.worker.workspace,
+                owner,
+                call.parent_request,
+                call.call_index,
+                canonical_json.decode(call.prepared).get("result_schema", {}),
+                capture=capture,
+            )
+        )
         result.result_canonical_bytes = base64.b64decode(
             body["result"]["inline_result"], validate=True
         )
         result.state = pb.CHILD_CALL_STATE_SUCCEEDED
         return result
 
+    def _observation(self, owner: str, call: Call, result: pb.ChildCallResult) -> bool:
+        from cozy_runtime.internal.capture_observation import environment
+
+        executions = self.worker.executions
+        assert executions is not None
+        if not executions.owns(owner, call.child_request):
+            return False
+        terminal = executions.collect(owner, call.child_request)
+        body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        observation = body.get("observation", {})
+        if env := observation.get("environment"):
+            result.observation.environment.CopyFrom(
+                environment(env, boot_id=env.get("worker_boot_id", ""))
+            )
+        if capture := observation.get("capture"):
+            result.observation.capture.CopyFrom(
+                pb.ActivationCaptureResult(
+                    output_id=capture["output_id"],
+                    content_digest=documents.raw(capture["content_digest"]),
+                )
+            )
+            return True
+        return False
+
     def drive(self) -> None:
         owner, executions = self.worker.fence.record_owner_id, self.worker.executions
         assert executions is not None
+        self.serving.sweep(owner)
         self._stop_descendants(owner)
         with self.lock:
             requests = list(self.pending.values())
@@ -143,6 +211,8 @@ class Calls:
                 continue
             call = self.journal.get(owner, parent.request_id, request.call_index)
             if call.result or call.safe_code:
+                if call.result and executions.owns(owner, call.child_request):
+                    self._finish(owner, call)
                 with self.lock:
                     self.pending.pop((parent.request_id, request.call_index), None)
                 continue
@@ -150,13 +220,20 @@ class Calls:
                 self._finish(owner, call)
                 continue
             try:
+                if request.module == source_interfaces.MODULE:
+                    self.worker.machine_sources.drive(owner, call, request)
+                    continue
+                if request.module == effect_interfaces.MODULE:
+                    assert self.worker.machine_effects is not None
+                    self.worker.machine_effects.schedule(owner, call)
+                    continue
+                target = machine_child_target.resolve(self.worker, parent, call)
+                if target.binding is None:
+                    self._check_ancestors(owner, parent, target, request.request_canonical_bytes)
+                    self.serving.drive(owner, call, target, request)
+                    continue
                 if request.HasField("capture"):
                     raise WorkspaceRefusal("activation capture requires a serving child")
-                target = machine_child_target.resolve(self.worker, parent, call)
-                if target.declaration.get("models") or target.declaration.get("weights_outputs"):
-                    raise WorkspaceRefusal(
-                        "model child requires native input and output delegation"
-                    )
                 payload = request.request_canonical_bytes
                 arguments = canonical_json.decode(payload)
                 memoized = bool(target.declaration.get("invocable", {}).get("memoize"))
@@ -173,6 +250,7 @@ class Calls:
                     "entrypoint": target.entrypoint,
                     "parent_attempt": parent.attempt,
                     "computation": key.hex(),
+                    "result_schema": target.declaration["result"],
                 }
                 self.journal.freeze(owner, call, canonical_json.encode(plan))
                 call = self.journal.get(owner, parent.request_id, request.call_index)
@@ -188,14 +266,36 @@ class Calls:
                         body = documents.read(
                             found.source.outcome_canonical_bytes, pb.AttemptOutcomeBody
                         )
-                        self.journal.observe_result(
-                            owner,
-                            call,
-                            base64.b64decode(body["result"]["inline_result"], validate=True),
+                        raw_result = base64.b64decode(
+                            body["result"]["inline_result"], validate=True
                         )
+                        self._retain_result(owner, call, raw_result, target.declaration["result"])
+                        machine_byte_results.retain(
+                            executions.workspace,
+                            owner,
+                            call.parent_request,
+                            call.call_index,
+                            canonical_json.decode(raw_result),
+                            target.declaration["result"],
+                            body.get("output_manifest", {}).get("outputs", []),
+                        )
+                        self.journal.observe_result(owner, call, raw_result)
                         workspace_memo.delivered(executions.workspace, owner, call.child_request)
+                        workspace_memo.release_lookup(
+                            executions.workspace, owner, call.child_request
+                        )
                         continue
                 self._check_ancestors(owner, parent, target, payload)
+                from . import machine_models
+
+                model_inputs, model_access = machine_models.inputs(
+                    executions.workspace,
+                    owner,
+                    call.child_request,
+                    target.entrypoint,
+                    target.declaration,
+                    arguments,
+                )
                 spec = pb.InvocationSpec(
                     environment_digest=target.prepared_revision["placement"]["environment_digest"],
                     payload_digest=documents.spell(hashlib.sha256(payload).digest()),
@@ -207,10 +307,19 @@ class Calls:
                             kind_mime="application/json",
                         )
                     ],
+                    outputs=[
+                        pb.OutputBinding(**output)
+                        for output in target.declaration.get("weights_outputs", [])
+                    ],
                     deadline_unix_ms=int(parent.spec.get("deadline_unix_ms", 0)),
                     job=pb.JobInvocationSpec(
                         build_id=target.revision, job_descriptor_id=target.binding.job_descriptor_id
                     ),
+                )
+                spec.inputs.extend(model_inputs)
+                spec.outputs.extend(
+                    pb.OutputBinding(output_id=path, max_bytes=bound)
+                    for path, bound in machine_byte_results.paths(target.declaration["result"])
                 )
                 raw, digest = documents.identity(spec)
                 offer = pb.AttemptOffer(
@@ -227,15 +336,22 @@ class Calls:
                                 + base64.b64encode(payload).decode(),
                             )
                         ],
+                        outputs=[
+                            pb.OutputAccess(output_id=output.output_id) for output in spec.outputs
+                        ],
                     ),
                 )
+                offer.grant.inputs.extend(model_access)
                 desired = pb.DesiredWorkerState(
                     wire_minor=self.worker.fence.wire_minor,
                     posture=pb.POSTURE_ACCEPTING,
                     job=pb.JobDirective(
                         build_id=target.revision,
                         job_descriptor_id=target.binding.job_descriptor_id,
-                        orchestration=True,
+                        orchestration=not bool(
+                            target.declaration.get("models")
+                            or target.declaration.get("weights_outputs")
+                        ),
                         reclaim_on_terminal=True,
                     ),
                 )
@@ -266,6 +382,10 @@ class Calls:
             except Exception as exc:
                 # Admission refusal has no accepted child attempt to duplicate. Keep its
                 # exact failure beside the frozen call so a polling parent receives it.
+                if not executions.owns(owner, call.child_request):
+                    from . import machine_models
+
+                    machine_models.release(executions.workspace, owner, call.child_request)
                 with executions.workspace.locked() as db:
                     db.execute(
                         "UPDATE execution_calls SET safe_code=?,safe_detail=? "
@@ -290,7 +410,8 @@ class Calls:
                 "ON p.owner=c.owner AND p.request=c.parent_request "
                 "JOIN executions e ON e.owner=c.owner AND e.request=c.child_request "
                 "WHERE c.owner=? AND (p.desired<>'run' OR p.state IN ('failed','canceled')) "
-                "AND e.state IN ('queued','running','retrying','pausing')",
+                "AND (e.state IN ('queued','running','retrying','pausing') "
+                "OR (p.desired='cancel' AND e.desired<>'cancel'))",
                 (owner,),
             ).fetchall()
         for row in rows:
@@ -307,17 +428,35 @@ class Calls:
             )
 
     def _finish(self, owner: str, call: Call) -> None:
+        # Polling executors and the watchdog can reach the same terminal together.
+        # One finalizer owns custody transfer, result persistence and native ACK.
+        with self.finishing_lock:
+            self._finish_locked(
+                owner, self.journal.get(owner, call.parent_request, call.call_index)
+            )
+
+    def _finish_locked(self, owner: str, call: Call) -> None:
         executions = self.worker.executions
         assert executions is not None
         state = executions.status(owner, call.child_request)
-        if state.state != "succeeded" or state.collected:
+        if state.state != "succeeded":
             return
+        if state.collected:
+            with executions.workspace.locked() as db:
+                pending = db.execute(
+                    "SELECT 1 FROM attempts WHERE owner=? AND request=? AND ordinal=? "
+                    "AND state<>'released' UNION ALL SELECT 1 FROM weights "
+                    "WHERE owner=? AND request=? AND state<>'released' LIMIT 1",
+                    (owner, call.child_request, state.attempt_ordinal, owner, call.child_request),
+                ).fetchone()
+            if pending is None:
+                return
         held = self.worker.engine.history.get((call.child_request, state.attempt_ordinal))
         if held is not None and held.state != "closed":
             return
         terminal = executions.collect(owner, call.child_request)
         plan = canonical_json.decode(call.prepared)
-        if key := plan.get("computation"):
+        if not call.result and (key := plan.get("computation")):
             workspace_memo.record(
                 executions.workspace,
                 owner,
@@ -330,6 +469,21 @@ class Calls:
                     outcome_digest=terminal.outcome_digest,
                 ),
             )
+        body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        raw_result = base64.b64decode(body["result"]["inline_result"], validate=True)
+        if not call.result:
+            self._retain_result(owner, call, raw_result, plan.get("result_schema", {}))
+            machine_byte_results.retain(
+                executions.workspace,
+                owner,
+                call.parent_request,
+                call.call_index,
+                canonical_json.decode(raw_result),
+                plan.get("result_schema", {}),
+                body.get("output_manifest", {}).get("outputs", []),
+                capture="capture" in body.get("observation", {}),
+            )
+            self.journal.observe_result(owner, call, raw_result)
         ack = pb.AttemptOutcomeAck(
             request_id=call.child_request,
             attempt_ordinal=terminal.attempt_ordinal,
@@ -338,7 +492,32 @@ class Calls:
             outcome_digest=terminal.outcome_digest,
         )
         executions.acknowledge_collection(owner, ack)
+        for reference in body.get("weights_receipts", []):
+            receipt = documents.read(
+                base64.b64decode(reference["weights_receipt_canonical_bytes"], validate=True),
+                pb.WeightsReceipt,
+            )
+            executions.workspace.release_result(
+                owner,
+                pb.DerivedResultReleaseRequest(
+                    weights_transaction_id=receipt["weights_transaction_id"],
+                    tensorfs_receipt_digest=documents.raw(receipt["tensorfs_receipt_digest"]),
+                ),
+            )
         executions.workspace.acknowledge(owner, ack)
+
+    def _retain_result(self, owner: str, call: Call, raw: bytes, schema: Any) -> None:
+        from . import machine_models
+
+        assert self.worker.workspace is not None
+        machine_models.retain_result(
+            self.worker.workspace,
+            owner,
+            call.parent_request,
+            f"call.{call.call_index}.result",
+            canonical_json.decode(raw),
+            schema,
+        )
 
     def _check_ancestors(
         self, owner: str, parent: AttemptRecord, target: machine_child_target.Target, payload: bytes
@@ -349,6 +528,16 @@ class Calls:
         with self.worker.workspace.locked() as db:
             while request not in seen and len(seen) < MAX_ACTIVE_CALLS - 1:
                 seen.add(request)
+                if (
+                    target.binding is None
+                    or target.declaration.get("models")
+                    or target.declaration.get("weights_outputs")
+                ):
+                    held = self.worker.engine.live.get(request)
+                    if held is not None and not held.lane_id.startswith("cpu-"):
+                        raise WorkspaceRefusal(
+                            "managed child cannot coexist with an ancestor on the device lane"
+                        )
                 row = db.execute(
                     "SELECT a.invocation FROM attempts a JOIN executions e "
                     "ON a.owner=e.owner AND a.request=e.request AND a.ordinal=e.ordinal "
@@ -358,7 +547,8 @@ class Calls:
                 if row is not None:
                     spec = documents.read(row["invocation"], pb.InvocationSpec)
                     if (
-                        spec.get("job", {}).get("build_id") == target.revision
+                        target.binding is not None
+                        and spec.get("job", {}).get("build_id") == target.revision
                         and spec.get("job", {}).get("job_descriptor_id")
                         == target.binding.job_descriptor_id
                         and spec.get("payload_digest")

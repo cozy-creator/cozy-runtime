@@ -31,6 +31,7 @@ from cozy_runtime.internal.placement_materialization import prepare_boot
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.control import GrpcControlHost
 from cozy_runtime.internal.worker.downloads import tls_certificate_digest
+from cozy_runtime.internal.worker.machine_publication import PublicationTLS
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 
 POD_EXECUTOR_UID = 65533
@@ -210,6 +211,14 @@ def _worker_options(
         install_root=host_paths.INSTALL_ROOT,
         artifact_cache=host_paths.PREPARE_CACHE,
         tensorfs_root=tensorfs_root,
+        publication_tls=PublicationTLS(
+            config.tensorhub_origin,
+            host_paths.TLS_CERTIFICATE,
+            host_paths.TLS_PRIVATE_KEY,
+            config.tensorhub_ca_der,
+        )
+        if config.tensorhub_origin
+        else None,
         worker_tls_certificate_digest=tls_certificate_digest(certificate_der),
         claim_ready=False,
         executor_uid=POD_EXECUTOR_UID,

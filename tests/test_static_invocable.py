@@ -16,7 +16,7 @@ OPERATIONS = """
 from typing import Literal
 import msgspec
 from cozy_runtime.author import (
-    Context, ModelArtifact, Model, Telemetry, WeightsSink, invocable, uses_components,
+    Context, ModelArtifact, Model, Telemetry, invocable, uses_components,
 )
 
 raise AssertionError("the static reader must never execute this module")
@@ -36,7 +36,7 @@ class Result(msgspec.Struct, frozen=True):
 
 @invocable(memoize=True)
 async def quantize(ctx: Context, *, source: Source, encoding: Literal["fp8", "mxfp8"],
-    threshold: float | None = None, weights: WeightsSink, tel: Telemetry) -> Result:
+    threshold: float | None = None, tel: Telemetry) -> Result:
     raise AssertionError("implementation must never execute")
 
 @invocable(memoize=True)
@@ -130,6 +130,16 @@ def test_invocable_defaults_are_part_of_the_static_interface_identity(tmp_path: 
     source.write_text(source.read_text().replace('note: str = "original"', 'note: str = "changed"'))
     after = package_interface.package_interface_digest(static_interface.build(original))
     assert before != after
+
+
+def test_declared_tensorfs_output_is_a_capability_without_a_weights_sink_parameter(
+    tmp_path: Path,
+) -> None:
+    source = OPERATIONS
+    document = static_interface.build(project(tmp_path, source))
+    jobs = {row["name"]: row for row in cast(list[dict[str, Any]], document["jobs"])}
+    assert jobs["quantize-artifact"]["invocable"]["capabilities"] == ["telemetry", "weights"]
+    assert jobs["quantize-artifact"]["weights_outputs"][0]["output_id"] == "model"
 
 
 @pytest.mark.parametrize(

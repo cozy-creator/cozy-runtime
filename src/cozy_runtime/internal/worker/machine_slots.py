@@ -103,7 +103,8 @@ def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: Jo
         executor.reserved_for_job = True
         worker.jobs[binding.job_descriptor_id] = binding
         worker.engine.jobs = worker.jobs
-        worker.accepted.mode = "job"
+        if worker.accepted.mode != "serving":
+            worker.accepted.mode = "job"
         worker.set_job_ready(True)
         lane.settled.set()
         worker._sync_lane_consumers()
@@ -121,7 +122,7 @@ def release(worker: Worker, request: str, *, ordinal: int | None = None) -> None
             and attempt.state != "closed"
             for attempt in worker.engine.history.values()
         ):
-            # A delayed old acknowledgement cannot retire the new retry's slot.
+            # Native finalization of an older attempt may finish after its retry was admitted.
             return
         slot_key = key(request)
         slot = worker.job_slots.get(slot_key)

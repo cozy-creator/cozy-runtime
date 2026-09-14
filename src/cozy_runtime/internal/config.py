@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from cozy_runtime.internal import child_env
+from cozy_runtime.internal import child_env, host_paths
 from cozy_runtime.internal.exits import Exit
 
 COZY_HOME_DEFAULT = "~/.cozy"
@@ -120,6 +120,9 @@ class WorkerHostConfig:
     media_token_sha256: tuple[str, ...]
     child_base_env: tuple[tuple[str, str], ...]
     storage_admission_fd: int | None = None
+    tensorhub_origin: str = ""
+    tensorhub_ca_der: bytes = b""
+    """Operator-owned mTLS edge metadata; never inherited by a job executor."""
     lease_expiry_unix: int = 0
     """What the supervisor SAID the lease expires at, or 0 for no lease. Carried, never
     decided on (xs-007 row 18): tensorhub deleted the rental cap, the supervisor still
@@ -309,7 +312,11 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
     )
 
 
-def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerHostConfig:
+def read_worker_host_config(
+    environ: Mapping[str, str] | None = None,
+    *,
+    publication_authority_path: Path = host_paths.MACHINE_PUBLICATION_AUTHORITY,
+) -> WorkerHostConfig:
     """Read the fixed product-host handoff once; admit no extra product env name."""
 
     global _worker_host_read
@@ -427,7 +434,10 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         raise ConfigError(
             "worker_host_config", "storage admission must use inherited fd 4", "fix host launch"
         )
+    hub_origin, ca_der = _machine_publication_authority(publication_authority_path)
     parsed = WorkerHostConfig(
+        tensorhub_origin=hub_origin,
+        tensorhub_ca_der=ca_der,
         storage_admission_fd=4 if storage_fd == "4" else None,
         worker_id=bounded("COZY_WORKER_ID"),
         worker_internal_port=worker_port,
@@ -446,6 +456,38 @@ def read_worker_host_config(environ: Mapping[str, str] | None = None) -> WorkerH
         os.environ.pop("COZY_STORAGE_ADMISSION_FD", None)
     _worker_host_read = True
     return parsed
+
+
+def _machine_publication_authority(path: Path) -> tuple[str, bytes]:
+    """Read the fixed boot document once, alongside the worker's other config."""
+    try:
+        with path.open("rb") as source:
+            raw = source.read((32 << 10) + 1)
+    except FileNotFoundError:
+        return "", b""  # Older Hosts confer no independent publication authority.
+    try:
+        if len(raw) > 32 << 10:
+            raise ValueError("authority metadata exceeds its bound")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or set(value) != {"version", "origin", "ca_der_base64url"}:
+            raise ValueError("authority metadata is not closed")
+        origin, ca = value["origin"], value["ca_der_base64url"]
+        if (
+            type(value["version"]) is not int
+            or value["version"] != 1
+            or not isinstance(origin, str)
+            or not isinstance(ca, str)
+        ):
+            raise ValueError("invalid authority metadata")
+        parse_tensorhub_origin(origin)
+        der = base64.b64decode(ca + "=" * (-len(ca) % 4), altchars=b"-_", validate=True)
+        if len(der) > 16 << 10 or base64.urlsafe_b64encode(der).decode("ascii").rstrip("=") != ca:
+            raise ValueError("invalid authority CA")
+        return origin, der
+    except (ValueError, binascii.Error) as exc:
+        raise ConfigError(
+            "worker_host_config", "Hub authority handoff is invalid", "fix host launch"
+        ) from exc
 
 
 def runtime_config_from_host(host: WorkerHostConfig) -> RuntimeConfig:

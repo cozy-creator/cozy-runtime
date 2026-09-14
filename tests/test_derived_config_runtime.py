@@ -10,18 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import tensorfs
+from tensorfs.derived import Config, Derivation, Part, Source, Target, Tensor
 
-from cozy_runtime.author._services import Attempt
-from cozy_runtime.author._weights import (
-    WeightsCommit,
-    WeightsConfig,
-    WeightsPart,
-    WeightsTarget,
-    WeightsTensor,
-    WeightsTransaction,
-)
+from cozy_runtime.author import ModelArtifact, ObjectRef
 from cozy_runtime.internal.encoding import SPEC_PLAIN
-from cozy_runtime.internal.weights_sink import WeightsTransactionHost
+from native_weights import NativeExecution
 from test_model_runtime_closure import _CONFIG, _snapshot
 
 _ADDED_INPUT = b'{ "value": 1, "kind": "added" }'
@@ -58,67 +51,38 @@ def test_add_and_derive_configs_land_as_inline_jcs(tmp_path: Path) -> None:
     store, manifest, manifest_length = _released_source(tmp_path)
     derived_stream = BytesIO(_DERIVED_INPUT)
     configs = {
-        "added": WeightsConfig(data=_ADDED_INPUT),
-        "copied": WeightsConfig(source="source", source_config="unet"),
-        "derived": WeightsConfig(
-            source="source",
-            source_config="unet",
-            data=derived_stream,
-            length=len(_DERIVED_INPUT),
-        ),
+        "added": Config("add"),
+        "copied": Config("copy", "source", "unet"),
+        "derived": Config("derive", "source", "unet"),
     }
-    targets = {
-        "unet": WeightsTarget(
-            source="source",
-            source_component="unet",
-            add={
-                "bias": WeightsTensor(
-                    logical_dtype="f32",
-                    shape=(2,),
-                    encoding=SPEC_PLAIN,
-                    parts={"value": WeightsPart(dtype="f32", shape=(2,))},
-                )
-            },
-        )
-    }
-    request = WeightsCommit(
-        output_slot="result",
-        sources={"source": manifest},
-        targets=targets,
-        configs=configs,
-        order=(("unet", "weight"), ("unet", "bias")),
-        max_new_bytes=1 << 20,
+    definition = Derivation(
+        {"source": Source(manifest, manifest_length)},
+        {
+            "unet": Target(
+                source="source",
+                source_component="unet",
+                add={"bias": Tensor("f32", (2,), SPEC_PLAIN, {"value": Part("f32", (2,))})},
+            )
+        },
+        configs,
+        (("unet", "weight"), ("unet", "bias")),
     )
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="derived-config-test",
-        request_id="request-1",
-        invocation_spec_digest="sha256:" + "11" * 32,
-        work_fingerprint="sha256:" + "22" * 32,
-        writer_session_id=1,
-        allowed_sources={manifest: manifest_length},
-        output_bounds={"result": 1 << 20},
+    source = ModelArtifact(
+        "source", "model", ObjectRef(manifest, manifest_length), "sha256:" + "11" * 32
     )
-    structure = host.structure(manifest)
-    assert [(tensor.key, tensor.logical_dtype) for tensor in structure.tensors] == [
-        ("weight", "f32")
-    ]
-    transaction = WeightsTransaction(
-        attempt=Attempt("request-1", tmp_path / "spool"),
-        cancel=lambda: False,
-        output="result",
-        sources=request.sources,
-        targets=targets,
-        configs=configs,
-        host=host.open(request),
-    )
-
-    transaction.add_config("added", _ADDED_INPUT)
-    transaction.add_config("derived", derived_stream)
-    transaction.add_part("unet", "bias", "value", struct.pack("<2f", 1.0, 2.0))
-    receipt = transaction.commit()
-
-    facts = json.loads(receipt.tensorfs_receipt)
+    with NativeExecution(
+        store, tmp_path, "request-1", {"source": source}, {"result": 1 << 20}
+    ) as owner:
+        with owner.client.source(manifest) as capability:
+            structure = capability.inspect()
+        assert [
+            (key, tensor.logical_dtype) for key, tensor in structure.components["unet"].items()
+        ] == [("weight", "f32")]
+        with owner.client.open_output("result", definition) as transaction:
+            transaction.add_config("added", _ADDED_INPUT)
+            transaction.add_config("derived", derived_stream)
+            transaction.add_part("unet", "bias", "value", struct.pack("<2f", 1.0, 2.0))
+            facts = transaction.commit()
     assert facts["declaration"]["configs"] == {
         "added": {"kind": "add"},
         "copied": {"kind": "copy", "source": "source", "source_config": "unet"},

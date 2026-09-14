@@ -454,7 +454,13 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     workspace.accept("owner", offer("legacy"))
     with workspace.locked() as db:
-        for table in ("execution_calls", "execution_commands", "execution_events", "executions"):
+        for table in (
+            "execution_model_holds",
+            "execution_calls",
+            "execution_commands",
+            "execution_events",
+            "executions",
+        ):
             db.execute("DROP TABLE " + table)
         db.execute("ALTER TABLE workspace_state DROP COLUMN execution_workspace_id")
         db.execute("PRAGMA user_version=6")
@@ -466,7 +472,7 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     assert Executions(Workspace(tmp_path / "other-store")).workspace_id != e.workspace_id
     e.submit("owner", "new", b"c" * 32, offer("new"))
     with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
         assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 2
 
 
@@ -757,6 +763,20 @@ app.job(helper)
                         dict(denied.value.trailing_metadata())["cozy-error-code"]
                         == "execution_submission_refused"
                     )
+                    for minor, detail in ((51, "wire52"), (52, "no independent publication")):
+                        assert worker.executions is not None
+                        invalid.CopyFrom(submission)
+                        invalid.offer.request_id = f"rejected-authority-{minor}"
+                        invalid.submission_id = invalid.offer.request_id
+                        invalid.claim.wire_minor = minor
+                        invalid.publication_authorization_id = (
+                            "019aaaab-0000-7000-8000-000000000003"
+                        )
+                        with pytest.raises(grpc.RpcError) as ungranted:
+                            client.SubmitMachineExecution(invalid, timeout=30)
+                        assert ungranted.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                        assert detail in ungranted.value.details()
+                        assert not worker.executions.owns("owner", invalid.offer.request_id)
                 receipt = client.SubmitMachineExecution(submission, timeout=30)
                 assert client.SubmitMachineExecution(submission, timeout=30) == receipt
                 if identifier == "first":
@@ -933,7 +953,7 @@ def test_queued_offer_prevents_preparation_switch_before_lane_accepts() -> None:
     worker = SimpleNamespace(
         accepted=SimpleNamespace(accepted_desired_state_revision=1, desired_state_body=b"first"),
         engine=SimpleNamespace(
-            history={("first", 1): SimpleNamespace(state="queued")},
+            history={("first", 1): SimpleNamespace(state="queued", lane_id="")},
             ON_DEVICE=AttemptEngine.ON_DEVICE,
             HELD=AttemptEngine.HELD,
         ),

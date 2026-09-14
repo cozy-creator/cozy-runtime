@@ -3,23 +3,17 @@
 from __future__ import annotations
 
 import hashlib
-import json
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import pytest
 import tensorfs
+from tensorfs.derived import Config as NativeConfig
+from tensorfs.derived import Derivation, Source, Target
 
 from cozy_runtime.author import Config, ConformanceError
-from cozy_runtime.author._services import Attempt
-from cozy_runtime.author._weights import (
-    WeightsCommit,
-    WeightsConfig,
-    WeightsTarget,
-    WeightsTransaction,
-)
 from cozy_runtime.internal import canonical, model_config
-from cozy_runtime.internal.weights_sink import WeightsTransactionHost
 from cozy_runtime.internal.worker.package_prepare import _compatibility_models
 from cozy_runtime.internal.worker.session import _placement_profile
 from cozy_runtime.protocol import documents
@@ -167,50 +161,35 @@ RETIRED = {
 
 
 def _lane_checkpoint(
-    tmp_path: Path, construction: WeightsConfig, contract: bytes
+    tmp_path: Path, construction: bytes | None, contract: bytes
 ) -> tuple[Any, str]:
     """One real lane checkpoint, produced the way se-037's `attention-lane` job produces one:
     the source checkpoint's components and configs by reference, plus the inline `execution`
     config, over the real weights sink and a real TensorFS store."""
 
     store, source, source_length = _released_source(tmp_path)
-    configs = {
-        "unet": construction,
-        "execution": WeightsConfig(data=contract, length=len(contract)),
-    }
-    targets = {"unet": WeightsTarget(source="source", source_component="unet")}
-    request = WeightsCommit(
-        output_slot="lane",
-        sources={"source": source},
-        targets=targets,
-        configs=configs,
-        order=(("unet", "weight"),),
-        max_new_bytes=1 << 20,
+    definition = Derivation(
+        {"source": Source(source, source_length)},
+        {"unet": Target(source="source", source_component="unet")},
+        {
+            "unet": NativeConfig("copy", "source", "unet")
+            if construction is None
+            else NativeConfig("add"),
+            "execution": NativeConfig("add"),
+        },
+        (("unet", "weight"),),
     )
-    host = WeightsTransactionHost(
-        store=store,
-        owner_scope="retired-contract-lane",
-        request_id="request-1",
-        invocation_spec_digest="sha256:" + "11" * 32,
-        work_fingerprint="sha256:" + "22" * 32,
-        writer_session_id=1,
-        allowed_sources={source: source_length},
-        output_bounds={"lane": 1 << 20},
+    transaction = store.begin_derived(
+        tensorfs.object_id(b"inline-config-proof"),
+        1,
+        *definition.native_arguments(1 << 20),
+        work_fingerprint=tensorfs.object_id(b"inline-config-proof"),
     )
-    transaction = WeightsTransaction(
-        attempt=Attempt("request-1", tmp_path / "spool"),
-        cancel=lambda: False,
-        output="lane",
-        sources=request.sources,
-        targets=targets,
-        configs=configs,
-        host=host.open(request),
-    )
-    if isinstance(construction.data, bytes):
-        transaction.add_config("unet", construction.data)
-    transaction.add_config("execution", contract)
+    if construction is not None:
+        transaction.add_config("unet", BytesIO(construction))
+    transaction.add_config("execution", BytesIO(contract))
     receipt = transaction.commit()
-    return store, "sha256:" + json.loads(receipt.tensorfs_receipt)["manifest"]["sha256"]
+    return store, "sha256:" + receipt["manifest"]["sha256"]
 
 
 def _prepared_config(store: Any, manifest: str) -> bytes:
@@ -239,9 +218,7 @@ def test_the_retired_contracts_leave_the_constructor_document_untouched() -> Non
 
 def test_a_lane_checkpoint_prepares_and_constructs(tmp_path: Path) -> None:
     contract = canonical.write(FA3_CONFIG)
-    store, lane = _lane_checkpoint(
-        tmp_path, WeightsConfig(source="source", source_config="unet"), contract
-    )
+    store, lane = _lane_checkpoint(tmp_path, None, contract)
     header = tensorfs.parse_header(bytes(store.manifest(lane)["header"]))
     assert {name: bytes(raw) for name, raw in header["configs"].items()} == {
         "unet": _CONFIG,
@@ -262,9 +239,7 @@ def test_a_construction_config_naming_a_source_carrier_still_refuses(tmp_path: P
     construction config. A genuine one carrying a path refuses on the same prepare path."""
 
     carrier = canonical.write({"weights": "/mnt/h3/model.safetensors"})
-    store, lane = _lane_checkpoint(
-        tmp_path, WeightsConfig(data=carrier, length=len(carrier)), canonical.write(FA3_CONFIG)
-    )
+    store, lane = _lane_checkpoint(tmp_path, carrier, canonical.write(FA3_CONFIG))
 
     config = _prepared_config(store, lane)
 
