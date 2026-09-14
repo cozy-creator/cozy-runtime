@@ -2123,6 +2123,12 @@ class Worker:
                 declaration = self.engine._job_declaration(binding, descriptor)
                 result_schema = canonical.write(declaration["result"])
                 memoize = declaration.get("invocable", {}).get("memoize", False) is True
+            if "job" in spec:
+                from . import machine_model_inputs
+
+                assert binding is not None
+                declared = set(self.engine._job_model_declarations(binding, descriptor))
+                machine_model_inputs.retain(executions.workspace, owner, offer, declared)
             receipt = executions.submit(
                 owner,
                 submission_id,
