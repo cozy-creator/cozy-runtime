@@ -366,7 +366,8 @@ def _refuse(context: Any, exc: BaseException) -> Any:
     return context.abort(grpc.StatusCode.INTERNAL, f"{type(exc).__name__}: {exc}"[:1024])
 
 
-class _PreparationServicer(WorkspaceRPC, pb_grpc.RuntimePreparationServicer):
+class _PreparationServicer(WorkspaceRPC, pb_grpc.RuntimePreparationServicer):  # type: ignore[misc]
+    # Generated gRPC defaults keep additive unimplemented methods bindable.
     def __init__(
         self,
         compatibility_handler: (
