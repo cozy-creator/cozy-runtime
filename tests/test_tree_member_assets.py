@@ -27,6 +27,7 @@ from cozy_runtime.internal.worker import (
 )
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.calls import Calls, _Received
+from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -223,3 +224,137 @@ def test_member_refuses_before_minting_custody(tmp_path: Path, mutation: str) ->
     assert not reply["ok"], reply
     with workspace.locked() as db:
         assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 1
+
+
+def terminal_bundle(
+    workspace: Any, parent: Any, hold: Any, extra: pb.OutputEntry | None = None
+) -> None:
+    raw, digest = documents.identity(
+        pb.AttemptOutcomeBody(
+            request_id=parent.request_id,
+            attempt_ordinal=parent.attempt,
+            invocation_spec_digest=documents.spell(parent.digest),
+            status=pb.OUTCOME_STATUS_SUCCEEDED,
+            execution_started=True,
+            output_manifest=pb.OutputManifest(
+                outputs=[pb.OutputEntry(output_id="bundle", native_tree=hold.source)]
+                + ([extra] if extra is not None else [])
+            ),
+        )
+    )
+    workspace.outcome(
+        "owner",
+        pb.AttemptOutcome(
+            request_id=parent.request_id,
+            attempt_ordinal=parent.attempt,
+            invocation_spec_digest=parent.digest,
+            outcome_id="finished",
+            outcome_digest=digest,
+            outcome_canonical_bytes=raw,
+        ),
+    )
+
+
+@pytest.mark.parametrize("root_input", [False, True])
+def test_projected_members_are_not_required_terminal_outputs(
+    tmp_path: Path,
+    root_input: bool,
+) -> None:
+    workspace, parent, calls, hold, _, frame = prepared(tmp_path, root_input=root_input)
+    assert tree_members.project(calls, parent, frame)["ok"]
+    terminal_bundle(Workspace(workspace.store_root), parent, hold)
+    with workspace.locked() as db:
+        assert db.execute("SELECT state FROM attempts").fetchone()[0] == "outcome"
+        assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("mutation", ["missing_binding", "unfinished_hold", "wrong_slot"])
+def test_projection_exclusion_requires_the_exact_completed_hold(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    workspace, parent, calls, hold, _, frame = prepared(tmp_path)
+    assert tree_members.project(calls, parent, frame)["ok"]
+    with workspace.locked() as db:
+        if mutation == "missing_binding":
+            db.execute("DELETE FROM execution_model_holds WHERE path LIKE 'runtime.tree_member.%'")
+        elif mutation == "unfinished_hold":
+            db.execute("UPDATE holds SET state='retaining'")
+        else:
+            db.execute(
+                "UPDATE byte_outputs SET slot='runtime.tree_member.changed' "
+                "WHERE slot LIKE 'runtime.tree_member.%'"
+            )
+    with pytest.raises(WorkspaceRefusal):
+        terminal_bundle(workspace, parent, hold)
+
+
+@pytest.mark.parametrize("hash_shaped", [False, True])
+def test_ordinary_output_can_use_a_projection_like_name(tmp_path: Path, hash_shaped: bool) -> None:
+    workspace, parent, _, hold, local, _ = prepared(tmp_path)
+    manifest, files = byte_outputs.roster(local / "frame.png", tree=False, max_bytes=1000)
+    slot = "runtime.tree_member." + (
+        hashlib.sha256(manifest).hexdigest() if hash_shaped else "frame"
+    )
+    native = workspace_byte_outputs.commit(
+        workspace, "owner", "producer", 1, parent.digest, slot, manifest, files, 1000
+    )
+    terminal_bundle(workspace, parent, hold, pb.OutputEntry(output_id=slot, native_tree=native))
+
+
+def test_projection_terminal_replays_after_retained_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def producing_execution(path: Path) -> tuple[Any, ...]:
+        workspace = Workspace(path / "store")
+        executions = Executions(workspace)
+        raw, spec = documents.identity(pb.InvocationSpec(job=pb.JobInvocationSpec()))
+        executions.submit(
+            "owner",
+            "submission",
+            b"c" * 32,
+            pb.AttemptOffer(
+                request_id="producer",
+                attempt_ordinal=1,
+                invocation_spec_digest=spec,
+                invocation_spec_canonical_bytes=raw,
+            ),
+        )
+        workspace.mark_running(
+            "owner",
+            pb.AttemptAccepted(
+                request_id="producer",
+                attempt_ordinal=1,
+                invocation_spec_digest=spec,
+            ),
+        )
+        return workspace, spec, b"", path / "unused"
+
+    monkeypatch.setattr("test_tree_member_assets.producing", producing_execution)
+    workspace, parent, calls, hold, _, frame = prepared(tmp_path)
+    assert tree_members.project(calls, parent, frame)["ok"]
+    terminal_bundle(workspace, parent, hold)
+    executions = Executions(workspace)
+    terminal = executions.collect("owner", "producer")
+    workspace.outcome("owner", terminal)
+    ack = pb.AttemptOutcomeAck(
+        request_id=terminal.request_id,
+        attempt_ordinal=terminal.attempt_ordinal,
+        invocation_spec_digest=terminal.invocation_spec_digest,
+        outcome_id=terminal.outcome_id,
+        outcome_digest=terminal.outcome_digest,
+        retain_work=True,
+    )
+    assert executions.acknowledge_collection("owner", ack).collected
+    workspace.acknowledge("owner", ack)
+    with workspace.locked() as db:
+        assert db.execute("SELECT state FROM attempts").fetchone()[0] == "outcome"
+        assert {row[0] for row in db.execute("SELECT state FROM holds")} == {"released"}
+    reopened = Workspace(workspace.store_root)
+    assert Executions(reopened).collect("owner", "producer") == terminal
+    reopened.outcome("owner", terminal)
+    changed = pb.AttemptOutcome()
+    changed.CopyFrom(terminal)
+    changed.outcome_id = "different-terminal"
+    with pytest.raises(WorkspaceRefusal):
+        reopened.outcome("owner", changed)

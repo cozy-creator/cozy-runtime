@@ -545,8 +545,9 @@ class Workspace:
                 or row["outcome_digest"] not in (b"", outcome.outcome_digest)
             ):
                 raise WorkspaceRefusal("outcome has no unchanged accepted execution")
-            if row["state"] == "released":
+            if row["state"] == "released" or row["outcome"] == raw:
                 return
+            from .tree_members import PROJECTION_PREFIX, recorded_projection
             from .workspace_byte_outputs import recorded_native, reference
 
             output_rows = db.execute(
@@ -555,8 +556,19 @@ class Workspace:
             ).fetchall()
             body = documents.read(raw, pb.AttemptOutcomeBody)
             if body["status"] == pb.OUTCOME_STATUS_SUCCEEDED:
+                native = {
+                    item["output_id"]: item["native_tree"]
+                    for item in body.get("output_manifest", {}).get("outputs", [])
+                    if "native_tree" in item
+                }
                 returned_rows = []
                 for output in output_rows:
+                    if (
+                        output["slot"] not in native
+                        and output["slot"].startswith(PROJECTION_PREFIX)
+                        and recorded_projection(db, output)
+                    ):
+                        continue
                     if output["native_service_id"]:
                         if not recorded_native(db, output, complete=True):
                             raise WorkspaceRefusal(
@@ -564,11 +576,6 @@ class Workspace:
                             )
                     else:
                         returned_rows.append(output)
-                native = {
-                    item["output_id"]: item["native_tree"]
-                    for item in body.get("output_manifest", {}).get("outputs", [])
-                    if "native_tree" in item
-                }
                 if set(native) != {output["slot"] for output in returned_rows}:
                     raise WorkspaceRefusal(
                         "terminal native byte outputs do not match completed intents"
