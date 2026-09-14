@@ -5,8 +5,9 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from tensorfs.derived import SourceCapability, SourceInspection
+
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.derive.safetensors_io import to_f32
 from cozy_runtime.internal.encoding.formats import (
     MX_BLOCK,
     SPEC_MXFP8,
@@ -26,10 +27,19 @@ def _part(source: Any, component: str, key: str, role: str, offset: int, length:
     return data
 
 
-def read_values_into(source: Any, component: str, key: str, offset: int, into: memoryview) -> None:
+def read_values_into(
+    source: SourceCapability,
+    structure: SourceInspection,
+    component: str,
+    key: str,
+    offset: int,
+    into: memoryview,
+) -> None:
     import numpy as np
 
-    tensor = source.tensors.get((component, key))
+    from cozy_runtime.derive.safetensors_io import to_f32
+
+    tensor = structure.components.get(component, {}).get(key)
     count = into.nbytes // 4
     if tensor is None:
         raise CapabilityError("model tensor is absent", code="weights_reader_tensor")
@@ -42,7 +52,7 @@ def read_values_into(source: Any, component: str, key: str, offset: int, into: m
             raise CapabilityError(
                 "logical dtype is not a supported float", code="weights_reader_encoding"
             )
-        if len(tensor.parts) != 1 or tensor.parts[0].name != "value":
+        if set(tensor.parts) != {"value"}:
             raise CapabilityError("plain tensor roles differ", code="weights_reader_encoding")
         for start in range(0, count, _ELEMENTS):
             length = min(_ELEMENTS, count - start)
@@ -55,7 +65,7 @@ def read_values_into(source: Any, component: str, key: str, offset: int, into: m
         raise CapabilityError(
             "encoding has no reviewed model reader", code="weights_reader_encoding"
         )
-    if len(tensor.shape) != 2 or {part.name for part in tensor.parts} != {"data", "scale"}:
+    if len(tensor.shape) != 2 or set(tensor.parts) != {"data", "scale"}:
         raise CapabilityError("encoded tensor geometry differs", code="weights_reader_encoding")
     try:
         import torch
@@ -69,7 +79,7 @@ def read_values_into(source: Any, component: str, key: str, offset: int, into: m
         if tensor.encoding == SPEC_MXFP8
         else RowwiseDequant(tensor.encoding)
     )
-    if tensor.encoding not in provider.reviewed_specs or provider.supports(tensor.shape):
+    if tensor.encoding not in provider.reviewed_specs or provider.supports(tuple(tensor.shape)):
         raise CapabilityError("encoding geometry is not reviewed", code="weights_reader_encoding")
     target = torch.from_numpy(destination)
     columns = tensor.shape[1]

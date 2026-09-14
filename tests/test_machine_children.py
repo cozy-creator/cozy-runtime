@@ -155,6 +155,48 @@ async def nested(ctx: Context, payload: Request) -> Result:
 """
 
 
+BYTE_INPUT_SOURCE = """import msgspec
+from typing import Annotated
+from cozy_runtime.author import App, AssetBound, Context, FileAsset, Outputs, Tree, invocable
+app = App()
+ReportFile = Annotated[FileAsset, AssetBound(max_bytes=200000, media_types=('application/json',))]
+class Request(msgspec.Struct):
+    pass
+class Result(msgspec.Struct):
+    value: int
+class Report(msgspec.Struct):
+    report: ReportFile
+    bundle: Tree
+@invocable(memoize=True)
+async def leaf(ctx: Context, out: Outputs, *, n: int) -> Report:
+    data = msgspec.json.encode({'observed': n, 'padding': 'verified' * 12000})
+    root = out.temporary_file()
+    root.mkdir()
+    (root / 'report.json').write_bytes(data)
+    (root / 'extra.txt').write_text('verified')
+    return Report(out.save_bytes(data, media_type='application/json'), out.save_tree(root))
+app.job(leaf)
+@invocable
+async def consume(ctx: Context, *, report: ReportFile, bundle: Tree) -> Result:
+    raw = report.read_bytes()
+    assert len(raw) > 48 * 1024
+    assert raw == (bundle.path / 'report.json').read_bytes()
+    assert (bundle.path / 'extra.txt').read_text() == 'verified'
+    return Result(12)
+app.job(consume)
+@invocable
+async def compose(ctx: Context, *, n: int) -> Result:
+    first = await leaf(n=n)
+    second = await leaf(n=n)
+    assert first.report.read_bytes() == second.report.read_bytes()
+    return await consume(report=first.report, bundle=first.bundle)
+app.job(compose)
+@app.job
+async def nested(ctx: Context, payload: Request) -> Result:
+    return await compose(n=3)
+"""
+
+
 MODELED_SERVING_SOURCE = (
     "from cozy_runtime.author import ActivationCapture, Config, Telemetry, uses_components\n"
     + MODEL_SOURCE.replace(
@@ -300,6 +342,9 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
         "model_admission",
         "source",
         "file",
+        "byte_inputs",
+        "byte_inputs_serving",
+        "byte_input_admission",
         "serving",
         "serving_model",
         "serving_media",
@@ -349,6 +394,16 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             ).replace("    return await compose(n=3)", "    return await leaf(n=3)")
         if case == "file":
             source = FILE_SOURCE
+        if case in ("byte_inputs", "byte_inputs_serving", "byte_input_admission"):
+            source = BYTE_INPUT_SOURCE
+        if case == "byte_inputs_serving":
+            source = source.replace("app.job(consume)", "app.entrypoint(consume)")
+        if case == "byte_input_admission":
+            source = source.replace(
+                "bundle: Tree) -> Result:",
+                "bundle: Tree, z_rejected: Annotated[FileAsset, "
+                "AssetBound(max_bytes=1)]) -> Result:",
+            ).replace("bundle=first.bundle)", "bundle=first.bundle, z_rejected=first.report)")
         if case == "serving":
             source = (
                 SOURCE.replace("@invocable(memoize=True)", "@invocable")
@@ -490,7 +545,16 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                             ("compose", "consume", "generate", "leaf")
                             if case in ("serving_model", "serving_media")
                             else ("compose", "consume", "leaf")
-                            if case in ("model", "model_result", "model_admission", "source")
+                            if case
+                            in (
+                                "model",
+                                "model_result",
+                                "model_admission",
+                                "source",
+                                "byte_inputs",
+                                "byte_inputs_serving",
+                                "byte_input_admission",
+                            )
                             else ("compose", "leaf")
                         )
                     ],
@@ -599,7 +663,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 time.sleep(0.02)
             outcome = worker.collect_execution(claim, "root")
             body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
-            if case in ("cycle", "capacity", "model_admission"):
+            if case in ("cycle", "capacity", "model_admission", "byte_input_admission"):
                 assert body["status"] == pb.OUTCOME_STATUS_FAILED, body
                 assert worker.workspace is not None
                 with worker.workspace.locked() as db:
@@ -610,6 +674,25 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                             "SELECT 1 FROM execution_calls WHERE safe_detail "
                             "LIKE '%active ancestor%'"
                         ).fetchone()
+                    if case == "byte_input_admission":
+                        refused = db.execute(
+                            "SELECT child_request FROM execution_calls WHERE safe_detail "
+                            "LIKE '%declared byte bound%'"
+                        ).fetchone()
+                        assert refused is not None
+                        records = db.execute(
+                            "SELECT retention FROM execution_model_holds WHERE recipient=?",
+                            (refused[0],),
+                        ).fetchall()
+                        assert records
+                        for record in records:
+                            hold = pb.DerivedRetentionRequest.FromString(record[0])
+                            assert (
+                                db.execute(
+                                    "SELECT state FROM holds WHERE id=?", (hold.retention_id,)
+                                ).fetchone()[0]
+                                == "released"
+                            )
                     if case == "model_admission":
                         refused = db.execute(
                             "SELECT child_request FROM execution_calls "
@@ -701,11 +784,15 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     2
                     if case == "source"
                     else 4
-                    if case in ("model", "serving", "serving_model")
+                    if case
+                    in ("model", "serving", "serving_model", "byte_inputs", "byte_inputs_serving")
                     else 3
                 )
                 assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == (
-                    4 if case in ("model", "source", "serving_model") else 3
+                    4
+                    if case
+                    in ("model", "source", "serving_model", "byte_inputs", "byte_inputs_serving")
+                    else 3
                 )
                 assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == (
                     2 if case == "source" else 0 if case == "serving" else 1
