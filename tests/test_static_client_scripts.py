@@ -39,6 +39,10 @@ def project(root: Path, code: str) -> Path:
         "def main(ctx: Context, *, source: Model[object],\n"
         "         tel: Telemetry) -> ModelArtifact:\n"
         "    raise RuntimeError('body')\n",
+        "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# ///\n"
+        "from cozy_runtime.author import Context, ModelArtifact\n"
+        "def main(ctx: Context) -> ModelArtifact:\n"
+        "    raise RuntimeError('body')\n",
     ],
 )
 def test_static_main_equals_execution_adapter(tmp_path: Path, body: str) -> None:
@@ -133,6 +137,12 @@ def test_captured_model_source_and_pth_are_never_executed(tmp_path: Path) -> Non
         "from cozy_runtime.author import Model\ndef main(*, model: Model[factory()]): pass\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=1\n# ///\ndef main(): pass\n",
         "from cozy_runtime.author import WeightsSink\ndef main(*, weights: WeightsSink): pass\n",
+        "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# ///\n"
+        "from cozy_runtime.author import Context, WeightsReader\n"
+        "def main(ctx: Context, *, source: WeightsReader): pass\n",
+        "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# ///\n"
+        "from cozy_runtime.author import Context, Outputs\n"
+        "def main(ctx: Context, *, out: Outputs): pass\n",
     ],
 )
 def test_static_script_refuses_unresolvable_or_mismatched_contract(

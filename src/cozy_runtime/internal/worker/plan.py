@@ -610,13 +610,8 @@ class PlanChooser:
     PRECOMPUTED ordered set.
     """
 
-    def __init__(self, ledger: Ledger, *, degree: int = 1) -> None:
+    def __init__(self, ledger: Ledger) -> None:
         self.ledger = ledger
-        #: the lane's sequence-parallel degree (cr-068). Above 1 the ladder is REFUSED, not
-        #: deepened: K ranks run ONE plan priced against the tightest card (the ledger's
-        #: `device_free` is the MIN over the lane's devices), and a rung one rank would
-        #: need to deepen is a rung the group cannot run.
-        self.degree = int(degree)
         self.choices = 0
         #: every choice's ladder walk, for the envelope and the triage bundle
         self.walks: list[dict[str, Any]] = []
@@ -760,15 +755,15 @@ class PlanChooser:
         # bytes the tenant already holds, and everything where a rung would have to ACQUIRE
         # bytes: declining to move gigabytes on a guess is conservative, while spending
         # residency that is already paid for on the same guess is not.
-        enforceable_headroom = 0 if activations.provenance == "bound" else activations.value
+        planning_headroom = 0 if activations.provenance == "bound" else activations.value
         measured_scopes = self.ledger.activation_scopes_for(cell)
-        scope_headrooms = {
-            method: measured_scopes.get(method, enforceable_headroom)
+        planning_scope_headrooms = {
+            method: measured_scopes.get(method, planning_headroom)
             for method in self.ledger.declared_scopes
         }
         scope_demands = {
             method: sum(sizes.get(name, 0) for name in dict.fromkeys(names))
-            + scope_headrooms[method]
+            + planning_scope_headrooms[method]
             for method, names in self.ledger.declared_scopes.items()
         }
         # THE SHALLOW RUNG'S HEADROOM, and the two direct observations that may overrule
@@ -779,7 +774,7 @@ class PlanChooser:
         #   * a SUFFICIENCY — this cell already COMPLETED, with its resident set standing
         #     still, on a card with no more room than this one. That is the outcome the
         #     rung is trying to predict, already observed, so it outranks an envelope.
-        resident_headroom = enforceable_headroom if absent_bytes == 0 else activations.value
+        resident_headroom = planning_headroom if absent_bytes == 0 else activations.value
         headroom_basis = activations.provenance if resident_headroom else "already_resident"
         sufficiency = self.ledger.resident_sufficiency(cell)
         if absent_bytes == 0 and sufficiency and free >= 0 and sufficiency <= free:
@@ -834,7 +829,7 @@ class PlanChooser:
                 capacity = allocatable
                 denied = shortfall
             else:
-                headroom = max(scope_demands.values(), default=enforceable_headroom + largest)
+                headroom = max(scope_demands.values(), default=planning_headroom + largest)
                 capacity = allocatable + sum(resident.values())
             fits = (allocatable < 0 or capacity >= headroom) and not denied
             row = {
@@ -856,6 +851,14 @@ class PlanChooser:
                 chosen = placement
                 row["verdict"] = "chosen"
 
+        # Estimates can select a conservative strategy without becoming a required
+        # allocation. In particular, the uncalibrated 1 GiB reserve must not refuse
+        # a small staged model. Actual component/block checks still run in the executor.
+        admitted_headroom = activations.value if activations.enforceable else 0
+        scope_headrooms = {
+            method: measured_scopes.get(method, admitted_headroom)
+            for method in self.ledger.declared_scopes
+        }
         walk = {
             "coefficients": [c.document() for c in terms.values()],
             "allocatable_bytes": allocatable,
@@ -873,7 +876,7 @@ class PlanChooser:
             # with. They are the same number whenever the envelope may be enforced, and
             # they part company exactly when it may not — which is the fact a reader needs
             # in front of them rather than one they have to reconstruct.
-            "enforceable_headroom_bytes": enforceable_headroom,
+            "enforceable_headroom_bytes": admitted_headroom,
             "resident_headroom_bytes": resident_headroom,
             "headroom_basis": headroom_basis,
             "device_free_bytes": free,
@@ -951,7 +954,7 @@ class PlanChooser:
                         "evidence_class": "measured",
                     },
                 )
-            chosen, confession = self._deepen(declared, activations, allocatable, walk)
+            chosen, confession = self._deepen(activations, allocatable, walk)
         else:
             confession = ""
         rung = self._delivery(prepared_model, chosen, walk)
@@ -1119,41 +1122,18 @@ class PlanChooser:
 
     def _deepen(
         self,
-        declared: DeclaredBinding,
         activations: Coefficient,
         allocatable: int,
         walk: dict[str, Any],
     ) -> tuple[str, str]:
-        """Nothing on the ladder fits. What happens next depends on TENANCY (§3.2).
+        """Use the deepest supported residency plan before judging an active working set.
 
-        LOCAL single-tenant: capacity NEVER refuses above the physical floor. The ladder
-        deepens to the deepest authorized rung with a quantified confession, because the
-        person in front of it wants their image, not a lecture about their card.
-
-        SHARED cloud: a shortfall is a RESCHEDULE-shaped fact for the RecordOwner, never a
-        structural-incompatibility claim — a different worker may fit it exactly.
-
-        A GROUP (cr-068, cr-018): never deepened. Every rank runs the same plan, so a
-        per-rank downgrade is unrepresentable; the refusal is `CONSTRAINT_INFEASIBLE`,
-        priced against the MIN over the K devices' headroom, and the RecordOwner reads it
-        as a placement that does not fit this group.
+        A group already has one ledger priced against its tightest rank. Its leader
+        broadcasts this same plan and scope headroom to every follower; rank-local
+        fallback is neither required nor allowed. The executor still enforces the
+        actual component/block working set before allocation. A plan that was already
+        falsified on this generation is rejected by `choose`, not retried here.
         """
-        if self.degree > 1:
-            walk["refused_under_group"] = self.degree
-            raise PlanRefusal(
-                "group_constraint_infeasible",
-                f"no proven placement rung fits this {self.degree}-device group: needed "
-                f"{activations.value} B of headroom ({activations.provenance}) against "
-                f"{max(allocatable, 0)} B allocatable on the tightest device; the ladder is "
-                "not deepened under a group because every rank runs one plan",
-                {
-                    "resource": "vram",
-                    "scope": "group",
-                    "needed_bytes": activations.value,
-                    "available_bytes": max(allocatable, 0),
-                    "evidence_class": "measured" if activations.enforceable else "bound",
-                },
-            )
         if not activations.enforceable:
             # A NON-MEASURED coefficient MAY NOT REFUSE. It may deepen the ladder, because
             # a placement rung changes weight placement only — never the kernel, never the
@@ -1188,6 +1168,6 @@ class PlanChooser:
         return deepest, (
             f" | DEGRADED: needed {activations.value} B of headroom, had "
             f"{max(allocatable, 0)} B, short by {max(activations.value - allocatable, 0)} B; "
-            f"the ladder deepened to {deepest} rather than refusing a single-tenant request "
-            "above its physical floor"
+            f"the ladder deepened to {deepest}; every executing rank retains its "
+            "measured component and block admission checks"
         )
