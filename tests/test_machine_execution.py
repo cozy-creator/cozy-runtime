@@ -573,6 +573,11 @@ def serve(payload: Request) -> Result:
     return Result(count)
 """
         )
+        source.write_text(
+            source.read_text()
+            .replace("def offline(", "async def offline(")
+            .replace("return Result(7)", "return await helper(n=7)")
+        )
         uv = shutil.which("uv")
         assert uv is not None
         wheels = environment / ".stage/offline/wheels"
@@ -1049,7 +1054,7 @@ def serve(payload: Request) -> Result:
             channel.close()
             # Replace the entire Worker and gRPC server. No client preparation is
             # replayed, and the old wheel upload is no longer available.
-            config, options = worker.config, dataclasses.replace(worker.options, python="")
+            config, options = worker.config, worker.options
             old_boot = worker.fence.worker_boot_id
             worker.request_stop()
             worker.host.stop()
@@ -1105,7 +1110,16 @@ def serve(payload: Request) -> Result:
             while client.GetMachineExecution(query, timeout=5).state not in ("succeeded", "failed"):
                 assert time.monotonic() < until
                 time.sleep(0.02)
-            assert client.GetMachineExecution(query, timeout=5).state == "succeeded"
+            assert worker.workspace is not None
+            with worker.workspace.locked() as db:
+                child_failures = [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT safe_code,safe_detail FROM execution_calls "
+                        "WHERE parent_request='paused'"
+                    )
+                ]
+            assert client.GetMachineExecution(query, timeout=5).state == "succeeded", child_failures
             assert client.ControlMachineExecution(resume, timeout=5) == resumed
             assert worker.prepared_revisions and worker.engine.jobs
             assert not worker.connected.is_set() and not worker.fence.dispatch_open
