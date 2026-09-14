@@ -59,12 +59,15 @@ def _dense_reference(*, query: Any, key: Any, value: Any, scale: float | None) -
     ).transpose(1, 2)
 
 
-def test_dense_warmup_excludes_padding_using_real_attention() -> None:
+@pytest.mark.parametrize("dense_path", [False, True])
+def test_dense_warmup_excludes_padding_using_real_attention(dense_path: bool) -> None:
     torch = pytest.importorskip("torch")
     attention_sol.bind_dense(_dense_reference, "test-native-dense")
     generator = torch.Generator().manual_seed(72)
     q, k, v = (torch.randn(1, 16, 2, 128, generator=generator) for _ in range(3))
-    layout = AttentionLayout(11, 3, 0, dense_until_step=2)
+    layout = AttentionLayout(
+        11, 3, 0, dense_until_step=2, dense_paths=("blocks.2",) if dense_path else ()
+    )
     site = attention_sol.Site("dit", "blocks.2.attn")
     expected = _dense_reference(query=q[:, :11], key=k[:, :11], value=v[:, :11], scale=None)
     out = attention_sol._execute(q, k, v, None, layout, site)
@@ -75,6 +78,27 @@ def test_dense_warmup_excludes_padding_using_real_attention() -> None:
     v[:, 11:] = -100
     again = attention_sol._execute(q, k, v, None, layout, site)
     assert torch.equal(out.view(torch.uint8), again.view(torch.uint8))
+
+
+def test_observations_are_request_local_and_restore_after_failure() -> None:
+    torch = pytest.importorskip("torch")
+    attention_sol.bind_dense(_dense_reference, "test-native-dense")
+    q = torch.ones(1, 4, 2, 128)
+    site = attention_sol.Site("dit", "blocks.2.attn")
+    with attention_sol.observing() as outer:
+        attention_sol._execute(q, q, q, None, AttentionLayout(4, 0, 0, 10), site)
+        with pytest.raises(RuntimeError), attention_sol.observing() as inner:
+            attention_sol._execute(
+                q, q, q, None, AttentionLayout(4, 0, 0, dense_paths=("blocks.2",)), site
+            )
+            raise RuntimeError("request failed")
+        assert inner == dict(sparse=0, dense_step=0, dense_path=1, dense_prefix=0)
+        assert outer == dict(sparse=0, dense_step=1, dense_path=0, dense_prefix=0)
+        attention_sol._execute(q, q, q, None, AttentionLayout(4, 0, 1, 10), site)
+    assert outer == dict(sparse=0, dense_step=2, dense_path=0, dense_prefix=0)
+    assert attention_sol._COUNTS.get() is None
+    with attention_sol.observing() as following:
+        assert sum(following.values()) == 0
 
 
 def test_dense_refiner_uses_its_own_short_document() -> None:
@@ -121,7 +145,7 @@ def test_native_sol_preserves_protected_queries_and_input_bytes() -> None:
     original = [t.clone() for t in (q, k, v)]
     token = attention_sol._SITE.set(attention_sol.Site("dit", "blocks.2.attn"))
     try:
-        with attention_scope(AttentionLayout(501, 33, 10)):
+        with attention_sol.observing() as counts, attention_scope(AttentionLayout(501, 33, 10)):
             output = attention_sol.sol_attention(q, k, v)
     finally:
         attention_sol._SITE.reset(token)
@@ -129,5 +153,6 @@ def test_native_sol_preserves_protected_queries_and_input_bytes() -> None:
     torch.testing.assert_close(output[:, :33], expected, rtol=0, atol=0)
     assert torch.count_nonzero(output[:, 501:]) == 0
     assert torch.isfinite(output).all()
+    assert counts == dict(sparse=1, dense_step=0, dense_path=0, dense_prefix=1)
     for tensor, before in zip((q, k, v), original, strict=True):
         assert torch.equal(tensor.view(torch.uint8), before.view(torch.uint8))

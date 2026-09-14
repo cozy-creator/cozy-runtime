@@ -7,7 +7,8 @@ model supplies its live layout, step policy and dense module paths explicitly.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from importlib import import_module
@@ -25,6 +26,24 @@ class Site:
 _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
 _DENSE: Callable[..., Any] | None = None
 _DENSE_IDENTITY = ""
+_COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
+
+
+@contextmanager
+def observing() -> Iterator[dict[str, int]]:
+    """Count successful calls in this request, restoring any outer observation."""
+    counts = dict.fromkeys(("sparse", "dense_step", "dense_path", "dense_prefix"), 0)
+    token = _COUNTS.set(counts)
+    try:
+        yield counts
+    finally:
+        _COUNTS.reset(token)
+
+
+def _count(kind: str) -> None:
+    counts = _COUNTS.get()
+    if counts is not None:
+        counts[kind] += 1
 
 
 def bind_dense(call: Callable[..., Any], identity: str) -> None:
@@ -151,14 +170,17 @@ def _execute(
     import torch
 
     dense_path = any(site.path == p or site.path.startswith(p + ".") for p in layout.dense_paths)
-    if dense_path:
+    if dense_path and query.shape[1] < layout.live_tokens:
         # A refiner has its own shorter document; its explicit dense policy wins.
-        return _dense(query, key, value, scale)
+        output = _dense(query, key, value, scale)
+        _count("dense_path")
+        return output
     if layout.live_tokens > query.shape[1]:
         raise ValueError("attention layout exceeds Q/K/V sequence length")
     q, k, v = (t[:, : layout.live_tokens] for t in (query, key, value))
-    if layout.step < layout.dense_until_step:
+    if dense_path or layout.step < layout.dense_until_step:
         live_output = _dense(q, k, v, scale)
+        _count("dense_path" if dense_path else "dense_step")
     else:
         sol_attn = import_module("sol_attn").sol_attn
 
@@ -179,10 +201,12 @@ def _execute(
             for t in (query, key, value)
         ):
             raise ValueError("Sol returned output sharing input storage")
+        _count("sparse")
         if layout.protected_prefix:
             live_output[:, : layout.protected_prefix] = _dense(
                 q[:, : layout.protected_prefix], k, v, scale
             )
+            _count("dense_prefix")
     _validate_result(live_output, q)
     if layout.live_tokens == query.shape[1]:
         return live_output
