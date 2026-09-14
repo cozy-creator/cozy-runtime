@@ -8,9 +8,8 @@ from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from cozy.worker.v1.wire_version import CAPTURED_MODEL_DEFAULTS_WIRE_MINOR
 from cozy_runtime.internal import fill, hostfacts
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import CAPTURED_MODEL_DEFAULTS_WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import grants

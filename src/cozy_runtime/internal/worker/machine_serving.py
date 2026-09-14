@@ -289,11 +289,9 @@ class Serving:
                 path = model["path"]
                 if not path.startswith(prefix) or not path.removeprefix(prefix).isidentifier():
                     raise WorkspaceRefusal("captured serving Model has no exact parameter")
-                if model_arguments.get(path.removeprefix(prefix)) is None:
-                    continue
                 supplied = model_arguments.get(path.removeprefix(prefix))
                 if supplied is None:
-                    raise WorkspaceRefusal("captured serving Model default has not been retained")
+                    continue
                 artifact = msgspec.convert(supplied, type=ModelArtifact, strict=True)
                 retention, held = machine_models.retain(
                     workspace,
