@@ -794,6 +794,8 @@ def materialize_locked(
     environment_digest: str,
     python: Path = Path(sys.executable),
     base: base_observation.Observation | None = None,
+    dependency_python: Path | None = None,
+    dependency_cache: Path | None = None,
 ) -> InstalledEnvironment:
     """Materialize one venv from the release's exact hash-pinned export (xs-017).
 
@@ -806,7 +808,8 @@ def materialize_locked(
     The joined venv (image site-packages included) is proven by the derivation that follows —
     a real import of the installed application in the venv's own interpreter — so an
     image-owned distribution outside a declared range is a typed refusal there, never a
-    boot-install.
+    boot-install. A local SDK instead copies its dependency RECORD closure into the
+    generation; that snapshot joins content identity and is checked by open_generation.
     """
 
     _require_digest(environment_digest, "environment_digest")
@@ -835,7 +838,7 @@ def materialize_locked(
     receipts = root / "receipts"
     final = contents / content_digest.removeprefix("sha256:")
     receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
-    if receipt_path.exists():
+    if dependency_python is None and receipt_path.exists():
         installed = open_generation(
             root,
             receipt_digest=receipt_digest,
@@ -845,7 +848,7 @@ def materialize_locked(
         )
         _release_locked_wheels(install_rows)
         return installed
-    reused = final.exists()
+    reused = dependency_python is None and final.exists()
     with storage_admission.admit(storage_admission.Write(root, 1 << 20, 128)):
         _require_owned_root(root)
         _remove_dead_staging(root)
@@ -857,7 +860,51 @@ def materialize_locked(
         staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
         cache = root / f".uv-cache-{os.getpid()}-{uuid.uuid4().hex}"
         try:
-            _install_locked(uv, python, staging, cache, locked.indexes, install_rows)
+            manifest = b""
+
+            def copy_dependencies(target: Path) -> None:
+                nonlocal manifest
+                from cozy_runtime.internal import _installed_dependencies
+
+                assert dependency_python is not None
+                manifest = _installed_dependencies.snapshot(
+                    dependency_python,
+                    target,
+                    {row.name for row in install_rows},
+                    cache=dependency_cache,
+                )
+
+            _install_locked(
+                uv,
+                python,
+                staging,
+                cache,
+                locked.indexes,
+                install_rows,
+                dependencies=copy_dependencies if dependency_python is not None else None,
+            )
+            if dependency_python is not None:
+                from cozy_runtime.internal import _installed_dependencies
+
+                _installed_dependencies.verify_files(staging, manifest)
+                identity = _locked_content_identity(
+                    locked.digest, observed.interpreter_identity, observed.uv_version
+                )
+                identity["dependency_snapshot"] = {
+                    "digest": _sha(manifest),
+                    "length": len(manifest),
+                }
+                content_bytes = canonical.write(identity)
+                content_digest = _sha(content_bytes)
+                receipt_bytes = canonical.write(
+                    _locked_receipt(
+                        environment_digest, content_digest, locked.digest, locked.length
+                    )
+                )
+                receipt_digest = _sha(receipt_bytes)
+                final = contents / content_digest.removeprefix("sha256:")
+                receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
+                _write_once(staging / _installed_dependencies.MANIFEST_NAME, manifest)
             # Validates the staged venv's shape; the typed refusal is the point here.
             _installed_at(
                 staging,
@@ -907,9 +954,11 @@ def _install_locked(
     cache: Path,
     indexes: Sequence[str],
     install_rows: Sequence[LockedRow],
+    *,
+    dependencies: Callable[[Path], None] | None = None,
 ) -> None:
     if storage_admission.enabled():
-        _install_locked_bounded(uv, python, staging, install_rows)
+        _install_locked_bounded(uv, python, staging, install_rows, dependencies=dependencies)
         return
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     requirements = cache / "locked-requirements.txt"
@@ -952,7 +1001,9 @@ def _install_locked(
             str(requirements),
         ],
     ]
-    for command in commands:
+    for index, command in enumerate(commands):
+        if index == 1 and dependencies is not None:
+            dependencies(staging)
         result = subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
@@ -978,7 +1029,12 @@ def _release_locked_wheels(rows: Sequence[LockedRow]) -> None:
 
 
 def _install_locked_bounded(
-    uv: Path, python: Path, staging: Path, rows: Sequence[LockedRow]
+    uv: Path,
+    python: Path,
+    staging: Path,
+    rows: Sequence[LockedRow],
+    *,
+    dependencies: Callable[[Path], None] | None = None,
 ) -> None:
     observed = observe_base(python)
     inspected: list[_Inspected] = []
@@ -1011,7 +1067,7 @@ def _install_locked_bounded(
             )
         inspected.append(item)
     with storage_admission.admit(_wheel_write_bound(staging.parent, inspected)):
-        _install_with_uv(uv, python, staging, inspected)
+        _install_with_uv(uv, python, staging, inspected, dependencies=dependencies)
 
 
 def _locked_content_identity(
@@ -2212,7 +2268,7 @@ def _content_matches_receipt(identity: object, receipt: Mapping[str, Any]) -> bo
         ref = receipt.get("locked_requirements")
         return (
             isinstance(identity, dict)
-            and set(identity)
+            and set(identity) - {"dependency_snapshot"}
             == {"format", "interpreter", "locked_requirements_digest", "uv_version"}
             and identity.get("format") == LOCKED_CONTENT_FORMAT
             and isinstance(identity.get("interpreter"), dict)
