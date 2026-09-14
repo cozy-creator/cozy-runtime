@@ -155,14 +155,15 @@ _DENSE_ATTENTION_PATHS = ("token_refiner", "transformer_blocks.0", "transformer_
 
 def _attention_layout(state: Any, step: int) -> AttentionLayout:
     fields = state.denoiser_input_fields
-    # Diffusers packs text, then every reference's video/audio rows, then target
-    # audio/video. Shape/count metadata is host-resident; do not read GPU values.
+    # NVIDIA's H3 policy protects every row before target video, including target
+    # audio. Diffusers packs text, reference media, target audio, then target video.
+    # Shape/count metadata is host-resident; do not read GPU values.
     return AttentionLayout(
         live_tokens=fields["token_tags"].numel(),
         protected_prefix=(
             fields["text_indices"].numel()
             + state.num_condition_video_rows
-            + state.num_condition_audio_rows
+            + fields["audio_indices"].numel()
         ),
         step=step,
         dense_until_step=10,
