@@ -7,8 +7,8 @@ import hashlib
 import importlib.metadata
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 
 def main() -> None:
@@ -25,6 +25,7 @@ def main() -> None:
     import torch
     from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
     from peft.tuners.lora.layer import Linear
+
     from cozy_runtime.internal.encoding.leaves import (
         PreQuantized,
         RowwiseNativeLeaf,
@@ -91,7 +92,9 @@ def main() -> None:
         }
 
     result = {
-        "scope": "CPU: real full-size adapter factors; generated base and activations; no GPU/video claim",
+        "scope": (
+            "CPU: real full-size adapter factors; generated base and activations; no GPU/video claim"
+        ),
         "versions": {
             name: importlib.metadata.version(name)
             for name in ("torch", "peft", "diffusers", "transformers", "accelerate")
