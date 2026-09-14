@@ -346,7 +346,7 @@ def test_prepared_cache_matches_default_and_adapted_slots_together() -> None:
             ),
         )
     ]
-    stack = {
+    stack: dict[str, tuple[NativeAdapterSelection, ...]] = {
         "generate.models.base": (
             NativeAdapterSelection(
                 "dit", adapter.manifest.digest, adapter.manifest.length, "adapter", "0.3"

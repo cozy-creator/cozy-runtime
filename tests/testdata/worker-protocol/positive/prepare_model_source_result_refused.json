@@ -1,5 +1,0 @@
-{
-  "outcome": "MODEL_SOURCE_PREPARE_OUTCOME_REFUSED",
-  "safe_code": "model_source_profile_refused",
-  "safe_detail": "downloaded headers match no reviewed source profile"
-}
