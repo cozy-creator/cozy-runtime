@@ -2022,16 +2022,18 @@ class DesiredPrivatePlacementSet(_message.Message):
     def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ...) -> None: ...
 
 class NativeModelBinding(_message.Message):
-    __slots__ = ("slot", "model", "manifest", "retention")
+    __slots__ = ("slot", "model", "manifest", "retention", "adapters")
     SLOT_FIELD_NUMBER: _ClassVar[int]
     MODEL_FIELD_NUMBER: _ClassVar[int]
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
     RETENTION_FIELD_NUMBER: _ClassVar[int]
+    ADAPTERS_FIELD_NUMBER: _ClassVar[int]
     slot: str
     model: str
     manifest: Ref
     retention: DerivedRetentionRequest
-    def __init__(self, slot: _Optional[str] = ..., model: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., retention: _Optional[_Union[DerivedRetentionRequest, _Mapping]] = ...) -> None: ...
+    adapters: _containers.RepeatedCompositeFieldContainer[DownloadAdapterRef]
+    def __init__(self, slot: _Optional[str] = ..., model: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., retention: _Optional[_Union[DerivedRetentionRequest, _Mapping]] = ..., adapters: _Optional[_Iterable[_Union[DownloadAdapterRef, _Mapping]]] = ...) -> None: ...
 
 class LocalPackageFileRef(_message.Message):
     __slots__ = ("digest", "filename", "length")

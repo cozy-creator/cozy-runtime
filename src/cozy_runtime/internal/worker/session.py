@@ -1006,7 +1006,10 @@ def executor_prepare_command(
                     "model": model.model,
                     **(
                         {
-                            "adapter_compatibility": list(model.adapter_compatibility),
+                            "adapter_selections": [a.document() for a in model.adapters],
+                            "adapter_compatibility_digest": canonical.digest(
+                                list(model.adapter_compatibility)
+                            ),
                             "adapter_implementation": implementation_digest(),
                         }
                         if model.adapters

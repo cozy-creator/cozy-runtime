@@ -856,6 +856,11 @@ def prepare_model_placement(
             "model": row.model,
             "manifest": documents.spell(row.manifest.digest),
             "manifest_length": row.manifest.length,
+            **(
+                {"adapters": [documents.body(adapter) for adapter in row.adapters]}
+                if row.adapters
+                else {}
+            ),
         }
         for row in native_models
     )

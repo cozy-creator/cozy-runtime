@@ -85,9 +85,12 @@ def test_zero_scale_is_exact_and_validates_bad_factors() -> None:
 def test_compute_dtype_and_factor_source_do_not_alias() -> None:
     model, binding, source, x = _fixture(torch.bfloat16)
     base = model(x)
-    a = source.tensors["0.lora_A.weight"].to(torch.bfloat16)
-    b = source.tensors["0.lora_B.weight"].to(torch.bfloat16)
-    expected = base + torch.nn.functional.linear(torch.nn.functional.linear(x, a), b) * 0.75
+    a = source.tensors["0.lora_A.weight"].clone()
+    b = source.tensors["0.lora_B.weight"].clone()
+    expected = (
+        base.float()
+        + torch.nn.functional.linear(torch.nn.functional.linear(x.float(), a), b) * 0.75
+    ).to(base.dtype)
     with _request(binding, source):
         source.tensors["0.lora_A.weight"].zero_()
         assert torch.equal(model(x), expected)
@@ -206,7 +209,7 @@ def test_alias_targets_refuse_and_active_context_cannot_be_bypassed() -> None:
     assert not leaf._forward_hooks
 
 
-def test_defaults_alpha_keyword_input_and_fp16_overflow() -> None:
+def test_defaults_alpha_keyword_input_and_preserved_fp32_factor_range() -> None:
     model, binding, source, x = _fixture()
     without_alpha = replace(
         source, tensors={k: v for k, v in source.tensors.items() if not k.endswith(".alpha")}
@@ -223,9 +226,12 @@ def test_defaults_alpha_keyword_input_and_fp16_overflow() -> None:
     model, binding, source, x = _fixture(torch.float16)
     values = dict(source.tensors)
     values["0.lora_A.weight"] = torch.full((2, 4), 1e10)
-    with pytest.raises(AdapterRefusal) as error, _request(binding, replace(source, tensors=values)):
-        pytest.fail("finite FP32 values overflowed compute dtype")
-    assert error.value.code == "adapter_cast_nonfinite"
+    with _request(binding, replace(source, tensors=values)):
+        attempt = binding._active.get()
+        assert attempt is not None
+        factor = attempt.terms[("dit", "0")][0].a
+        assert factor.dtype == torch.float32
+        assert torch.equal(factor, values["0.lora_A.weight"])
 
 
 def test_encoded_leaf_keeps_payload_and_disables_prequantized_carrier() -> None:
@@ -371,8 +377,8 @@ def test_each_stacked_term_budgets_above_current_live_outputs() -> None:
             result = model(x)
         assert result.shape == (2, 5, 3)
     output_bytes = 2 * 5 * 3 * 4
-    static_scratch = TILE_ROWS * (4 + 2 + 3) * 4
-    assert samples == [(output_bytes, static_scratch), (output_bytes, static_scratch)]
+    static_scratch = TILE_ROWS * (4 + 2 + 2 * 3) * 4
+    assert samples == [(output_bytes, static_scratch)]
     assert peak <= max(live + additional for live, additional in samples)
 
 
@@ -419,3 +425,26 @@ def test_float32_partition_error_is_bounded_without_claiming_bit_identity() -> N
     # CPU BLAS may change reduction details with a row's position inside a tile.
     # This is mathematical agreement only; CUDA/Ulysses needs its own byte proof.
     torch.testing.assert_close(whole, split, rtol=5e-6, atol=5e-7)
+
+
+def test_fp32_stack_rounds_back_to_bf16_only_after_all_adapters() -> None:
+    model = torch.nn.Sequential(torch.nn.Linear(1, 1, dtype=torch.bfloat16))
+    with torch.no_grad():
+        model[0].weight.zero_()
+        model[0].bias.fill_(1.0)
+    binding = LinearAdapters({"dit": model}, {"dit": "base"}, {"dit": ["0"]})
+    source = AdapterInput(
+        "style",
+        "dit",
+        "base",
+        {
+            "0.lora_A.weight": torch.ones(1, 1),
+            "0.lora_B.weight": torch.full((1, 1), 0.003),
+        },
+    )
+    x = torch.ones(1, 1, dtype=torch.bfloat16)
+    with _request(binding, source, source):
+        actual = model(x)
+    expected = torch.tensor([[1.0 + 0.003 + 0.003]], dtype=torch.bfloat16)
+    assert torch.equal(actual, expected)
+    assert actual.item() == 1.0078125

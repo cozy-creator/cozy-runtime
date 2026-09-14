@@ -92,6 +92,7 @@ class AdapterGeometry:
     source_bytes: int
     device_bytes: int
     scratch_bytes: int
+    host_scratch_bytes: int
 
 
 def inspect(
@@ -107,7 +108,7 @@ def inspect(
     bases: dict[str, dict[str, PlanRow]] = {}
     targets: dict[str, set[str]] = {}
     compatible: dict[tuple[str, str], dict[str, Any]] = {}
-    source_bytes = device_bytes = scratch_bytes = 0
+    source_bytes = device_bytes = scratch_bytes = host_scratch_bytes = 0
     for selection in selections:
         parse_scale(selection.scale)
         component = selection.component
@@ -138,6 +139,7 @@ def inspect(
                     "adapter_tensor", f"{row.key}: factors must be plain floating tensors"
                 )
             source_bytes += row.stored_nbytes
+            host_scratch_bytes = max(host_scratch_bytes, 3 * math.prod(row.shape) * 4)
             for suffix, role in _SUFFIXES:
                 if row.name.endswith(suffix):
                     pairs.setdefault(row.name[: -len(suffix)], {})[role] = row
@@ -178,10 +180,10 @@ def inspect(
             }
             if parse_scale(selection.scale) != 0:
                 elements = math.prod(a.shape) + math.prod(b.shape)
-                width = 4 if base_row.dtype == "f32" else 2
+                width = 4
                 device_bytes += elements * width
                 scratch_bytes = max(
-                    scratch_bytes, TILE_ROWS * (a.shape[1] + a.shape[0] + b.shape[0]) * width
+                    scratch_bytes, TILE_ROWS * (a.shape[1] + a.shape[0] + 2 * b.shape[0]) * width
                 )
     return AdapterGeometry(
         tuple(selections),
@@ -190,6 +192,7 @@ def inspect(
         source_bytes,
         device_bytes,
         scratch_bytes,
+        host_scratch_bytes,
     )
 
 

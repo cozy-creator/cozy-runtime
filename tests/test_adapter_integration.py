@@ -274,3 +274,84 @@ def test_placement_reserves_factors_and_static_tile_scratch(tmp_path: Path) -> N
     assert adapted.headroom_bytes == geometry.scratch_bytes
     assert dict(adapted.scope_headroom_bytes)["forward"] == geometry.scratch_bytes
     assert declared.group_weight_bytes() == 4096 + geometry.device_bytes + geometry.scratch_bytes
+
+
+def test_zero_strength_source_is_charged_before_any_host_allocation(tmp_path: Path) -> None:
+    root, base, ref, model, _, _ = _fixture(tmp_path)
+    selection = adapters.AdapterSelection("dit", ref, "adapter", "0")
+    geometry = adapters.inspect(root, [selection], {"dit": base})
+    assert geometry.device_bytes == geometry.scratch_bytes == 0
+    controller = AdapterModel({"dit": model}, {"dit": base}, geometry.compatibility, str(root))
+    with pytest.raises(AdapterRefusal) as error:
+        AdapterAttempt(
+            {"model": controller},
+            {"model": [selection.document()]},
+            device="cpu",
+            check_cancelled=lambda: None,
+            check_capacity=lambda _: None,
+            host_available=lambda: 0,
+        )
+    assert error.value.code == "adapter_host_shortfall"
+    assert controller.linear._active.get() is None
+
+
+def test_group_host_preflight_prices_every_rank_before_any_copy(tmp_path: Path) -> None:
+    from cozy_runtime.internal.executor_adapters import check_host_capacity
+
+    root, base, ref, _, _, _ = _fixture(tmp_path)
+    selection = adapters.AdapterSelection("dit", ref, "adapter", "0")
+    geometry = replace(
+        adapters.inspect(root, [selection], {"dit": base}),
+        source_bytes=8 << 30,
+        host_scratch_bytes=0,
+    )
+    assert (
+        check_host_capacity([geometry], device="cuda", copies=2, available=lambda: 20 << 30)
+        == 16 << 30
+    )
+    with pytest.raises(AdapterRefusal) as error:
+        check_host_capacity([geometry], device="cuda", copies=4, available=lambda: 20 << 30)
+    assert error.value.code == "adapter_host_shortfall"
+
+
+def test_prepare_frame_carries_refs_and_digest_instead_of_target_table(tmp_path: Path) -> None:
+    from cozy_runtime.internal import canonical
+    from cozy_runtime.internal.seam import MAX_FRAME
+    from cozy_runtime.internal.worker.plan import DeclaredBinding
+    from cozy_runtime.internal.worker.session import executor_prepare_command
+
+    root, base, ref, _, _, _ = _fixture(tmp_path)
+    selection = adapters.AdapterSelection("dit", ref, "adapter", "1")
+    geometry = adapters.inspect(root, [selection], {"dit": base})
+    targets = tuple(
+        {**geometry.compatibility[0], "target": f"blocks.{index}.projection"}
+        for index in range(1000)
+    )
+    member = ModelBinding(
+        "Model",
+        "serve.models.model",
+        "model",
+        str(root),
+        "",
+        base,
+        ("dit",),
+        {"dit": base},
+        adapters=(selection,),
+        adapter_compatibility=targets,
+    )
+    binding = DeclaredBinding(
+        "sha256:" + "a" * 64,
+        "serve",
+        "Model",
+        "serve.models.model",
+        "model",
+        "release",
+        models=(member,),
+    )
+    command = executor_prepare_command(binding, devices="0", authorized_device_limit_bytes=1 << 30)
+    assert len(canonical.write(command)) < MAX_FRAME
+    assert len(canonical.write(list(targets))) > MAX_FRAME
+    selected = command["binding"]
+    assert "adapter_compatibility" not in selected
+    assert selected["adapter_compatibility_digest"] == canonical.digest(list(targets))
+    assert selected["adapter_selections"] == [selection.document()]

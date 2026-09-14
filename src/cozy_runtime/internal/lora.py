@@ -20,7 +20,7 @@ from typing import Any
 from cozy_runtime.author._context import AdapterRef
 from cozy_runtime.author._errors import InvalidRequest
 
-TILE_ROWS = 16384
+TILE_ROWS = 4096
 
 
 class AdapterRefusal(InvalidRequest):
@@ -57,6 +57,7 @@ class _Attempt:
     check_cancelled: Callable[[], None]
     check_capacity: Callable[[int], None] | None = None
     closed: bool = False
+    calls: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,31 +241,44 @@ class LinearAdapters:
         inputs = x.view(-1, in_features)
         result = output.view(-1, out_features)
         linear = torch.nn.functional.linear
-        tile = hidden = delta = None
+        if x.device.type == "cuda" and torch.get_float32_matmul_precision() != "highest":
+            raise AdapterRefusal(
+                "adapter_precision", "FP32 LoRA requires IEEE float32 matmul precision"
+            )
+        for term in terms:
+            if term.a.device != x.device:
+                raise AdapterRefusal("adapter_device", f"{site}: factors on another device")
+        rank = max(term.a.shape[0] for term in terms)
+        scratch = TILE_ROWS * (in_features + rank + 2 * out_features) * 4
+        if attempt.check_capacity is not None:
+            attempt.check_capacity(scratch)
+        tile = accumulator = hidden = delta = None
         try:
-            for term in terms:
-                if term.a.device != x.device:
-                    raise AdapterRefusal("adapter_device", f"{site}: factors on another device")
-                scratch = (
-                    TILE_ROWS * (in_features + term.a.shape[0] + out_features) * x.element_size()
-                )
-                if attempt.check_capacity is not None:
-                    attempt.check_capacity(scratch)
+            # FP16/BF16 -> FP32 is lossless. The ordered FP32 accumulator rounds back
+            # to the base output only once, after every adapter, like an FP32 PEFT stack.
+            with torch.autocast(device_type=x.device.type, enabled=False):
                 for start in range(0, inputs.shape[0], TILE_ROWS):
+                    attempt.check_cancelled()
                     stop = min(start + TILE_ROWS, inputs.shape[0])
-                    if stop - start == TILE_ROWS:
-                        tile = inputs[start:stop]
-                    else:
-                        tile = torch.zeros((TILE_ROWS, in_features), dtype=x.dtype, device=x.device)
-                        tile[: stop - start].copy_(inputs[start:stop])
-                    hidden = linear(tile, term.a)
-                    delta = linear(hidden, term.b)
-                    # Keep the separate compute-dtype multiply and add roundings.
-                    delta.mul_(term.scale)
-                    result[start:stop].add_(delta[: stop - start])
-                    tile = hidden = delta = None
+                    tile = torch.zeros(
+                        (TILE_ROWS, in_features), dtype=torch.float32, device=x.device
+                    )
+                    accumulator = torch.zeros(
+                        (TILE_ROWS, out_features), dtype=torch.float32, device=x.device
+                    )
+                    tile[: stop - start].copy_(inputs[start:stop])
+                    accumulator[: stop - start].copy_(result[start:stop])
+                    for term in terms:
+                        hidden = linear(tile, term.a)
+                        delta = linear(hidden, term.b)
+                        delta.mul_(term.scale)
+                        accumulator.add_(delta)
+                        hidden = delta = None
+                    result[start:stop].copy_(accumulator[: stop - start])
+                    tile = accumulator = None
         finally:
-            tile = hidden = delta = None
+            tile = accumulator = hidden = delta = None
+        attempt.calls += 1
         return output
 
     def _validate(
@@ -320,7 +334,7 @@ class LinearAdapters:
                     raise AdapterRefusal(
                         "adapter_tensor", f"{site}: expected dense floating CPU tensors"
                     )
-                in_features, out_features, dtype = self._sites[site]
+                in_features, out_features, _dtype = self._sites[site]
                 if (
                     a.ndim != 2
                     or b.ndim != 2
@@ -335,11 +349,11 @@ class LinearAdapters:
                 alpha = pair.get("alpha")
                 if alpha is not None and alpha.ndim != 0:
                     raise AdapterRefusal("adapter_alpha", f"{site}: alpha must be a scalar")
-                scale = adapter.scale * (a.shape[0] if alpha is None else float(alpha)) / a.shape[0]
+                scale = adapter.scale * (1.0 if alpha is None else float(alpha) / a.shape[0])
                 if not math.isfinite(scale):
                     raise AdapterRefusal("adapter_scale", f"{site}: effective scale is not finite")
                 if scale != 0:
-                    nbytes += (a.numel() + b.numel()) * (4 if dtype == torch.float32 else 2)
+                    nbytes += (a.numel() + b.numel()) * 4
                     if nbytes > max_device_bytes:
                         raise AdapterRefusal(
                             "adapter_budget", f"adapter factors need {nbytes} device bytes"
@@ -383,16 +397,14 @@ class LinearAdapters:
                 check_capacity(nbytes)
             for site, a, b, scale in rows:
                 check_cancelled()
-                dtype = self._sites[site][2]
+                dtype = self._torch.float32
                 allocated = True
                 # copy=True is essential even on CPU: source storage must never alias an
                 # attempt, and the attempt must not retain an uploader-owned tensor.
                 ca = a.to(device=device, dtype=dtype, copy=True)
                 cb = b.to(device=device, dtype=dtype, copy=True)
-                if not bool(self._torch.isfinite(ca).all() & self._torch.isfinite(cb).all()):
-                    raise AdapterRefusal(
-                        "adapter_cast_nonfinite", f"{site}: compute-dtype overflow"
-                    )
+                # Source values were checked on CPU. All supported source dtypes
+                # convert losslessly to FP32, so no full-factor GPU finite mask is needed.
                 terms[site] = (*terms.get(site, ()), _Term(ca, cb, scale))
             attempt.terms = MappingProxyType(terms)
             token = self._active.set(attempt)
@@ -417,6 +429,10 @@ class LinearAdapters:
                 terms.clear()
                 ca = cb = None
                 self._lock.release()
+
+    def observed_calls(self) -> int:
+        attempt = self._active.get()
+        return attempt.calls if attempt is not None else 0
 
     def check_ready(self) -> None:
         if self._closed or self._poisoned:

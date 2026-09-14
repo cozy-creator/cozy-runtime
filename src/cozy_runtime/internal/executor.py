@@ -67,12 +67,23 @@ from cozy_runtime.internal import (
     package_interface,
     sandbox,
 )
-from cozy_runtime.internal.adapters import implementation_digest
+from cozy_runtime.internal.adapters import (
+    AdapterSelection,
+    implementation_digest,
+)
+from cozy_runtime.internal.adapters import (
+    inspect as inspect_adapters,
+)
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
-from cozy_runtime.internal.executor_adapters import AdapterAttempt, AdapterModel, validate_slots
+from cozy_runtime.internal.executor_adapters import (
+    AdapterAttempt,
+    AdapterModel,
+    check_host_capacity,
+    validate_slots,
+)
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.lora import AdapterRefusal
+from cozy_runtime.internal.lora import TILE_ROWS, AdapterRefusal
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup, RankSpec, join_rank
 from cozy_runtime.internal.parallel.mirror import mirror_component
@@ -1167,6 +1178,20 @@ class Executor:
         # partial read of a whole-pipeline snapshot has no representation (tfs-007).
         names: list[str] = list(binding.get("components") or [binding["component"]])
         per_component: dict[str, str] = dict(binding.get("snapshots") or {})
+        adapter_compatibility: tuple[Mapping[str, Any], ...] = ()
+        if binding.get("adapter_selections"):
+            adapter_geometry = inspect_adapters(
+                binding["store"],
+                tuple(AdapterSelection.read(row) for row in binding["adapter_selections"]),
+                {name: per_component.get(name, binding["snapshot"]) for name in names},
+            )
+            adapter_compatibility = adapter_geometry.compatibility
+            if canonical.digest(list(adapter_compatibility)) != binding.get(
+                "adapter_compatibility_digest"
+            ):
+                raise AdapterRefusal(
+                    "adapter_target_mismatch", "worker and executor target compatibility differ"
+                )
 
         # --------------------------------------------------------- PLAN RESOLUTION (#549.1)
         #
@@ -1476,7 +1501,7 @@ class Executor:
             stage("lease_acquire")
             model = registry.acquire(binding["model_binding_path"], model_cls, artifact)
             stage("construct_and_fill")
-            compatibility = binding.get("adapter_compatibility", [])
+            compatibility = adapter_compatibility
             if compatibility:
                 if binding.get("adapter_implementation") != implementation_digest():
                     raise AdapterRefusal(
@@ -2349,6 +2374,25 @@ class Executor:
                         max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
                     ),
                 )
+                if torch is not None:
+                    held = self._adapter_attempt
+                    controllers = self._adapter_models(command["entrypoint"])
+                    calls = sum(
+                        controllers[name].linear.observed_calls() for name in selected_adapters
+                    )
+                    record.emit(
+                        "log",
+                        "runtime model execution",
+                        outcome.terminal,
+                        degree=self.world,
+                        matmul_precision=torch.get_float32_matmul_precision(),
+                        lora_dtype="float32" if held else "none",
+                        lora_tile_rows=TILE_ROWS if held else 0,
+                        lora_calls=calls,
+                        lora_digest=held.digest if held else "",
+                        lora_source_bytes=held.source_bytes if held else 0,
+                        lora_factor_budget_bytes=held.device_bytes if held else 0,
+                    )
             if capture is not None and outcome.terminal == "succeeded":
                 capture_result = capture.write(spool)
         except Exception as exc:
@@ -2594,6 +2638,15 @@ class Executor:
             "cancel_root": str(self.root),
             "model_adapters": command["model_adapters"],
         }
+        selected = command["model_adapters"]
+        models = self._adapter_models(command["entrypoint"])
+        # All followers share this host. Check the aggregate before any rank starts
+        # copying sources, then each rank independently rechecks its remaining budget.
+        check_host_capacity(
+            (models[name].inspect(rows) for name, rows in selected.items()),
+            device=self._rank_device(self.torch),
+            copies=self.world,
+        )
         group_started = False
         try:
             if self.group is not None:
