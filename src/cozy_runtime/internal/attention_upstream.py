@@ -110,7 +110,8 @@ def _quantize_value(value: Any) -> tuple[Any, float]:
     if not math.isfinite(maximum):
         raise ValueError("FlashInfer V contains non-finite values")
     descale = max(maximum / 448.0, 1e-12)
-    quantized = (value.float() / descale).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+    scaled = value.to(dtype=torch.float32, copy=True)
+    quantized = scaled.div_(descale).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
     return quantized.contiguous(), descale
 
 

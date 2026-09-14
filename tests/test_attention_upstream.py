@@ -51,8 +51,9 @@ def test_mixed_backend_does_not_cast_qk_or_discard_padding() -> None:
         upstream.flashinfer_mixed_attention(q, q, q, attn_mask=torch.ones((2, 2)))
 
 
-def test_current_value_scale_preserves_inputs_and_zero_values() -> None:
-    value = torch.tensor([-100, -1, 0, 1, 100], dtype=torch.bfloat16)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_current_value_scale_preserves_inputs_and_zero_values(dtype: Any) -> None:
+    value = torch.tensor([-100, -1, 0, 1, 100], dtype=dtype)
     original = value.clone()
     quantized, scale = upstream._quantize_value(value)
     assert torch.equal(value, original)
