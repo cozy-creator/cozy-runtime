@@ -2097,6 +2097,7 @@ class Worker:
         capture_document: bytes = b"",
         preparation: bytes = b"",
         publication_authorization_id: str = "",
+        arguments: dict[str, Any] | None = None,
     ) -> workspace_executions.Receipt:
         """Authenticated root intake; accepted execution never depends on the caller's stream."""
         with self.control_lock:
@@ -2131,6 +2132,16 @@ class Worker:
                 if declared and claim.wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
                     raise WorkspaceRefusal("durable root Model inputs require Runtime wire55")
                 machine_model_inputs.retain(executions.workspace, owner, offer, declared)
+                from . import machine_byte_inputs
+
+                machine_byte_inputs.retain_root(
+                    executions.workspace,
+                    owner,
+                    offer,
+                    declaration["request"],
+                    arguments or {},
+                    wire_minor=claim.wire_minor,
+                )
             receipt = executions.submit(
                 owner,
                 submission_id,
@@ -2240,6 +2251,9 @@ class Worker:
                 ):
                     continue
                 offered = self.executions.offer(owner, request)
+                from . import machine_byte_inputs
+
+                machine_byte_inputs.bind_root_grant(owner, offered)
                 spec = documents.read(offered.invocation_spec_canonical_bytes, pb.InvocationSpec)
                 deadline = int(spec.get("deadline_unix_ms", 0))
                 if deadline and self.executions.clock_ms() >= deadline:

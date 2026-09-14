@@ -227,6 +227,7 @@ def test_schema_two_migrates_conservatively_and_future_schema_refuses(tmp_path: 
     workspace = Workspace(tmp_path / "store")
     with workspace.locked() as db:
         for table in (
+            "input_tree_intakes",
             "execution_model_holds",
             "execution_calls",
             "execution_commands",
