@@ -149,7 +149,8 @@ def select(
         == (target.revision, target.entrypoint)
     }
     for parameter in sorted(missing):
-        if parameter not in defaults or defaults[parameter].get("unavailable_code"):
+        row = defaults.get(parameter)
+        if row is None or row.get("unavailable_code"):
             raise WorkspaceRefusal("captured Model default is unavailable for " + parameter)
     facts = hostfacts.measure(worker.options.accelerator_backend)
     if "gpu_name" in facts.unreadable:

@@ -46,8 +46,7 @@ from typing import Any, cast
 from cozy_runtime.author import _codec
 from cozy_runtime.author._errors import DEVICE_OOM, OutputError
 from cozy_runtime.author._observations import EventRing, Observation
-from cozy_runtime.author._services import MAX_OUTPUT_BYTES
-from cozy_runtime.internal import canonical, fill, package_interface, seam
+from cozy_runtime.internal import canonical, fill, output_budget, package_interface, seam
 from cozy_runtime.internal import weights_sink as weights_bridge
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import grants, observe, refusal, triage
@@ -1489,6 +1488,10 @@ class AttemptEngine:
     def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Dispatch the existing executor control request lane by typed operation."""
         kind = str(frame.get("kind", ""))
+        if kind == "tree_member" and self.calls is not None:
+            from cozy_runtime.internal.worker.tree_members import project
+
+            return project(self.calls, attempt, frame)
         if kind in ("child_call", "child_poll", "child_cancel", "child_forget"):
             if self.calls is None:
                 return {
@@ -1725,6 +1728,7 @@ class AttemptEngine:
                     for parameter, model in sorted(attempt.job_models.items())
                 },
                 "max_input_bytes": 64 << 20,
+                "max_output_bytes": output_budget.intermediate(attempt.spec),
                 "tensorfs_root": str(self.tensorfs_root) if self.tensorfs_root else "",
                 "weights_owner_scope": self.owner_scope(),
                 "weights_request_id": attempt.request_id,
@@ -1761,6 +1765,7 @@ class AttemptEngine:
             "inputs": inputs,
             "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
             "max_input_bytes": attempt.declared.max_input_bytes,
+            "max_output_bytes": output_budget.intermediate(attempt.spec),
         }
 
     def release(
@@ -2409,7 +2414,7 @@ class AttemptEngine:
             if sum(
                 entry.native_tree.content_bytes if entry.HasField("native_tree") else entry.length
                 for entry in entries
-            ) > min(int(reply.get("max_output_bytes") or MAX_OUTPUT_BYTES), MAX_OUTPUT_BYTES):
+            ) > output_budget.effective(attempt.spec, reply):
                 raise grants.GrantRefusal(
                     "output_too_large", "returned bytes exceed the output budget"
                 )
@@ -2458,7 +2463,10 @@ class AttemptEngine:
         frames = list(reply.get("frames") or ())
         if not frames:
             return None
-        budget = int(reply.get("max_output_bytes") or MAX_OUTPUT_BYTES)
+        try:
+            budget = output_budget.effective(attempt.spec, reply)
+        except ValueError as exc:
+            return f"output_budget_invalid: {exc}"
         total = sum(
             int(row.get("size_bytes") or 0)
             for row in reply.get("outputs", ())

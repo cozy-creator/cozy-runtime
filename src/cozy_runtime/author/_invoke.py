@@ -606,6 +606,7 @@ def _materialize_trees(payload: object, inv: Invocation) -> None:
                 code="tree_unmaterialized",
             )
         bind_tree(tree, root=root, digest=digest, attempt=inv.request_id)
+        tree._member_token = inv.calls.grant_token if inv.calls is not None else None
 
 
 @dataclass(frozen=True, slots=True)
