@@ -45,6 +45,8 @@ def test_admitted_slots_preserve_defaults_and_ignore_weights_capacity() -> None:
     assert output_budget.admitted({}) == 256 << 20
     assert output_budget.admitted(spec_for(256 << 20, 256 << 20)) == 512 << 20
     assert output_budget.admitted(spec_for(7, 11)) == 18
+    assert output_budget.intermediate(spec_for(7, 11)) == 256 << 20
+    assert output_budget.intermediate(spec_for(256 << 20, 256 << 20)) == 512 << 20
     assert output_budget.admitted(spec_for(1 << 40)) == 256 << 20
     assert (
         output_budget.admitted(
@@ -67,7 +69,8 @@ def test_admitted_slots_preserve_defaults_and_ignore_weights_capacity() -> None:
         with pytest.raises(ValueError):
             output_budget.admitted({"outputs": [{"max_bytes": bad}]})
     assert output_budget.effective(spec_for(7, 11), {"max_output_bytes": 13}) == 13
-    for bad in (19, -1, True, "18"):
+    assert output_budget.effective(spec_for(7, 11), {"max_output_bytes": 256 << 20}) == 18
+    for bad in ((256 << 20) + 1, -1, True, "18"):
         with pytest.raises(ValueError):
             output_budget.effective(spec_for(7, 11), {"max_output_bytes": bad})
 
@@ -94,12 +97,16 @@ def assemble(payload: Request, media: MediaDecoder) -> Result:
     assert package_interface.canonical_bytes(source) == package_interface.canonical_bytes(imported)
 
 
-def test_native_file_commit_uses_the_recorded_parent_budget(tmp_path: Path) -> None:
+@pytest.mark.parametrize("final_bytes", [140 << 20, 8])
+def test_native_file_commit_uses_the_recorded_parent_budget(
+    tmp_path: Path,
+    final_bytes: int,
+) -> None:
     workspace = Workspace(tmp_path / "store")
     spec = pb.InvocationSpec(
         job=pb.JobInvocationSpec(),
         outputs=[
-            pb.OutputBinding(output_id=name, max_bytes=140 << 20) for name in ("first", "second")
+            pb.OutputBinding(output_id=name, max_bytes=final_bytes) for name in ("first", "second")
         ],
     )
     raw, digest = documents.identity(spec)
@@ -151,7 +158,7 @@ def test_native_file_commit_uses_the_recorded_parent_budget(tmp_path: Path) -> N
             ),
         )
         workspace_sources.accepted(workspace, "owner", command)
-        if index <= 2:
+        if index <= (2 if final_bytes > 8 else 1):
             prepared = commit_files.prepare(workspace, "owner", command, b"c" * 32, tmp_path)
             assert prepared["file_basename"] == f"file-{index:04d}"
         else:
@@ -163,6 +170,28 @@ def test_native_file_commit_uses_the_recorded_parent_budget(tmp_path: Path) -> N
             db.execute("SELECT count(*) FROM byte_outputs WHERE state='complete'").fetchone()[0]
             == 0
         )
+
+
+def test_worker_command_keeps_intermediate_room_for_a_small_final_report(tmp_path: Path) -> None:
+    # The executor receives enough room for intermediate files even when final
+    # output fields are small. The host independently retains final authority.
+    parent = SimpleNamespace(
+        inputs={},
+        job=None,
+        spec=spec_for(7, 11),
+        trees={},
+        declared=SimpleNamespace(entrypoint="report", max_input_bytes=64 << 20),
+        plan=SimpleNamespace(placement="cpu", headroom_bytes=0, scope_headroom_bytes={}),
+    )
+    command = AttemptEngine._command(
+        cast(AttemptEngine, SimpleNamespace()),
+        cast(AttemptRecord, parent),
+        "report#1",
+        tmp_path,
+        30,
+    )
+    assert command["max_output_bytes"] == 256 << 20
+    assert output_budget.effective(parent.spec, command) == 18
 
 
 class Request(msgspec.Struct):

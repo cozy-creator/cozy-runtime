@@ -35,7 +35,7 @@ def prepare(
             "SELECT invocation FROM attempts WHERE owner=? AND request=? AND ordinal=?",
             (owner, call.parent_request_id, call.parent_attempt_ordinal),
         ).fetchone()
-        budget = output_budget.admitted(documents.read(parent["invocation"], pb.InvocationSpec))
+        budget = output_budget.intermediate(documents.read(parent["invocation"], pb.InvocationSpec))
         args = canonical_json.decode(native["accepted"])
         slot = args.get("slot")
         tail = str(slot).removeprefix("file/")

@@ -1723,7 +1723,7 @@ class AttemptEngine:
                     for parameter, model in sorted(attempt.job_models.items())
                 },
                 "max_input_bytes": 64 << 20,
-                "max_output_bytes": output_budget.admitted(attempt.spec),
+                "max_output_bytes": output_budget.intermediate(attempt.spec),
                 "tensorfs_root": str(self.tensorfs_root) if self.tensorfs_root else "",
                 "weights_owner_scope": self.owner_scope(),
                 "weights_request_id": attempt.request_id,
@@ -1755,7 +1755,7 @@ class AttemptEngine:
             "inputs": inputs,
             "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
             "max_input_bytes": attempt.declared.max_input_bytes,
-            "max_output_bytes": output_budget.admitted(attempt.spec),
+            "max_output_bytes": output_budget.intermediate(attempt.spec),
         }
 
     def release(

@@ -25,9 +25,14 @@ def admitted(spec: Mapping[str, Any]) -> int:
 
 
 def effective(spec: Mapping[str, Any], reply: Mapping[str, Any]) -> int:
-    """An executor may use a smaller budget but cannot enlarge admitted capacity."""
+    """The reported working allowance cannot enlarge exact final-output authority."""
     limit = admitted(spec)
     value = reply.get("max_output_bytes", limit)
-    if type(value) is not int or value < 0 or value > limit:
+    if type(value) is not int or value < 0 or value > intermediate(spec):
         raise ValueError("executor output budget exceeds its admitted bound")
-    return value
+    return min(value, limit)
+
+
+def intermediate(spec: Mapping[str, Any]) -> int:
+    """A small final result does not reduce the existing retained-work allowance."""
+    return max(MAX_OUTPUT_BYTES, admitted(spec))
