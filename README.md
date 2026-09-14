@@ -11,7 +11,8 @@ Package code uses `cozy_runtime.author`, the shared numerical helpers under
 modules, Runtime `internal`/`cli`/`protocol`, and administrative TensorFS Store operations
 are not package APIs. Package ranges must be requalified for coordinated author API cuts.
 
-Runtime targets CPython 3.12. The native derivation cut requires TensorFS 0.3.41;
+Runtime targets CPython 3.12. The native writer cut requires TensorFS 0.3.41; model readback additionally requires
+the scoped reader API under TensorFS PR170 (currently qualified with a source-identified dev wheel).
 accepted executions receive scoped source/output descriptors while the worker owns Store
 access, admission, epochs and the execution journal.
 
@@ -649,4 +650,5 @@ partial and committed bytes survive process loss for authorized recovery.
 
 Plain PEP 723 producers that declare `[tool.cozy.weights]` use an explicit `ctx: Context`
 parameter. Ordinary client scripts can keep their lightweight `ScriptContext` for composing
-managed calls. The separate scoped `WeightsReader` remains the evaluation/readback API.
+managed calls. `WeightsReader` provides logical float32 reconstruction over the same TensorFS source handle;
+its geometry, encoded identities, byte reads and lease lifetime are all TensorFS-owned.
