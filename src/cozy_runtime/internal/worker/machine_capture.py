@@ -183,7 +183,11 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             or selected_entry.get("development", {}).get("local_revision_digest") != root
         ):
             raise WorkspaceRefusal("execution inference does not name the captured root")
-    return canonical.write({"revisions": prepared, "state": state_identity(state)})
+    preparation: dict[str, Any] = {"revisions": prepared, "state": state_identity(state)}
+    assert worker.machine_calls is not None
+    if sdk := worker.machine_calls.builtins.capture():
+        preparation["runtime_builtin"] = sdk
+    return canonical.write(preparation)
 
 
 def state_identity(state: pb.DesiredWorkerState) -> str:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
+import io
 import zipfile
 from email.parser import BytesParser
 from functools import lru_cache
@@ -27,6 +29,33 @@ WHEEL = (
 )
 ENTRY_POINTS = ("[cozy.application]\ndefault = " + APPLICATION + "\n").encode()
 MEMBERS = frozenset({"METADATA", "WHEEL", "entry_points.txt", "RECORD"})
+
+
+def carrier(version: str) -> tuple[str, bytes]:
+    """Runtime's inert carrier; the admitted implementation stays in the SDK."""
+    directory = f"cozy_runtime_operations-{version}.dist-info"
+    metadata = (
+        f"Metadata-Version: 2.4\nName: {NAME}\nVersion: {version}\n"
+        f"Requires-Python: >=3.12,<3.13\nRequires-Dist: cozy-runtime>={FLOOR},<1\n"
+        "Requires-Dist: numpy>=1.26\nCozy-Builtin: operations\n"
+        f"Cozy-Builtin-Interface: {digest()}\n"
+    ).encode()
+    validate_metadata(metadata, WHEEL, ENTRY_POINTS, version)
+    files = {"METADATA": metadata, "WHEEL": WHEEL, "entry_points.txt": ENTRY_POINTS}
+    record = io.StringIO(newline="")
+    writer = csv.writer(record, lineterminator="\n")
+    for name, raw in sorted(files.items()):
+        encoded = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
+        writer.writerow((f"{directory}/{name}", "sha256=" + encoded, len(raw)))
+    writer.writerow((f"{directory}/RECORD", "", ""))
+    files["RECORD"] = record.getvalue().encode()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for name, raw in sorted(files.items()):
+            entry = zipfile.ZipInfo(f"{directory}/{name}", (2000, 1, 1, 0, 0, 0))
+            entry.create_system, entry.external_attr = 3, 0o100644 << 16
+            archive.writestr(entry, raw)
+    return f"cozy_runtime_operations-{version}-py3-none-any.whl", output.getvalue()
 
 
 @lru_cache(maxsize=1)

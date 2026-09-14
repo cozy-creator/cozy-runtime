@@ -76,6 +76,18 @@ def test_metadata_only_carrier_passes_ordinary_wheel_admission(tmp_path: Path) -
     builtin_operations.validate_installed(root / "cozy_runtime_operations-0.16.8.dist-info")
 
 
+def test_runtime_mints_only_its_deterministic_metadata_carrier(tmp_path: Path) -> None:
+    filename, raw = builtin_operations.carrier("0.16.8")
+    assert builtin_operations.carrier("0.16.8") == (filename, raw)
+    path = tmp_path / filename
+    path.write_bytes(raw)
+    builtin_operations.validate_carrier(path, "0.16.8")
+    measured, _ = package_environment.measure_wheel(
+        path, "project", package_environment.observe_base()
+    )
+    assert measured.import_roots == () and measured.distribution == builtin_operations.NAME
+
+
 def test_installed_carrier_accepts_only_standard_installer_metadata(tmp_path: Path) -> None:
     path = carrier(tmp_path / "wheel")
     environment = tmp_path / "environment"

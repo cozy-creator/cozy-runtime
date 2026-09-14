@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import job_plan, package_interface
+from cozy_runtime.internal import builtin_operations, job_plan, package_interface
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
@@ -38,6 +38,9 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     root = worker.executions.capture_root(owner, parent.request_id)
     capture = worker.executions.capture(owner, root)
     intent = canonical_json.decode(call.intent)
+    if intent["module"] == builtin_operations.MODULE:
+        assert worker.machine_calls is not None
+        return worker.machine_calls.builtins.resolve(parent, call, intent)
     caller = parent.job.build_id
     selected = next(
         (
