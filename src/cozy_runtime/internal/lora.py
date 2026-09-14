@@ -20,6 +20,8 @@ from typing import Any
 from cozy_runtime.author._context import AdapterRef
 from cozy_runtime.author._errors import InvalidRequest
 
+TILE_ROWS = 16384
+
 
 class AdapterRefusal(InvalidRequest):
     def __init__(self, code: str, detail: str) -> None:
@@ -53,6 +55,7 @@ class _Term:
 class _Attempt:
     terms: Mapping[tuple[str, str], tuple[_Term, ...]]
     check_cancelled: Callable[[], None]
+    check_capacity: Callable[[int], None] | None = None
     closed: bool = False
 
 
@@ -64,7 +67,27 @@ class _Hook:
     def __call__(
         self, module: Any, args: tuple[Any, ...], kwargs: Mapping[str, Any], output: Any
     ) -> Any:
-        return self.binding._apply(self.site, args, kwargs, output)
+        return self.binding._apply(self.site, module, args, kwargs, output)
+
+
+def prequantized_input_allowed(module: Any) -> bool:
+    """Inactive LoRA hooks are exact no-ops and need no floating-point input.
+
+    Other semantic hooks, missing active contexts and nonzero factors retain the
+    original Tensor. This decision is request-local; it mutates no fusion flags.
+    """
+    if module._forward_pre_hooks:
+        return False
+    for hook in module._forward_hooks.values():
+        if not isinstance(hook, _Hook):
+            return False
+        attempt = hook.binding._active.get()
+        if attempt is None:
+            if hook.binding._lock.locked():
+                return False
+        elif attempt.closed or attempt.terms.get(hook.site):
+            return False
+    return True
 
 
 class LinearAdapters:
@@ -84,7 +107,11 @@ class LinearAdapters:
     ) -> None:
         import torch
 
-        from cozy_runtime.internal.encoding.leaves import _leaf_class
+        from cozy_runtime.internal.encoding.leaves import (
+            MicroScaledNativeLeaf,
+            RowwiseNativeLeaf,
+            _leaf_class,
+        )
 
         self._torch = torch
         self._snapshots = dict(snapshots)
@@ -118,6 +145,17 @@ class LinearAdapters:
                     raise AdapterRefusal(
                         "adapter_target_unsupported", f"{site} is not a linear leaf"
                     )
+                if "forward" in module.__dict__ or torch.nn.modules.module._global_forward_hooks:
+                    raise AdapterRefusal(
+                        "adapter_forward_unsupported", f"{site}: wrapped/global-hook forward"
+                    )
+                if type(module) is _leaf_class(torch) and module._cozy_forward not in (
+                    RowwiseNativeLeaf._forward,
+                    MicroScaledNativeLeaf._forward,
+                ):
+                    raise AdapterRefusal(
+                        "adapter_forward_unsupported", f"{site}: unknown encoded forward"
+                    )
                 if dtype not in (torch.float16, torch.bfloat16, torch.float32):
                     raise AdapterRefusal("adapter_compute_dtype", f"{site}: unsupported {dtype}")
                 if id(module) in seen_modules:
@@ -132,15 +170,21 @@ class LinearAdapters:
         try:
             for site, module in modules:
                 self._handles.append(
-                    module.register_forward_hook(_Hook(self, site), with_kwargs=True)
+                    module.register_forward_hook(_Hook(self, site), with_kwargs=True, prepend=True)
                 )
         except BaseException:
             self.close()
             raise
 
     def _apply(
-        self, site: tuple[str, str], args: tuple[Any, ...], kwargs: Mapping[str, Any], output: Any
+        self,
+        site: tuple[str, str],
+        module: Any,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        output: Any,
     ) -> Any:
+        self.check_ready()
         attempt = self._active.get()
         if attempt is None:
             if self._lock.locked():
@@ -168,11 +212,59 @@ class LinearAdapters:
             or x.device != output.device
         ):
             raise AdapterRefusal("adapter_input", f"{site}: input/output geometry or dtype changed")
+        first = next(iter(module._forward_hooks.values()), None)
+        if (
+            not isinstance(first, _Hook)
+            or first.binding is not self
+            or torch.nn.modules.module._global_forward_hooks
+            or "forward" in module.__dict__
+        ):
+            raise AdapterRefusal(
+                "adapter_forward_unsupported",
+                f"{site}: LoRA must observe the fresh linear result first",
+            )
+        if not x.is_contiguous() or not output.is_contiguous():
+            raise AdapterRefusal(
+                "adapter_input_layout", f"{site}: contiguous linear input/output required"
+            )
+        address = output.untyped_storage().data_ptr()
+        if address == x.untyped_storage().data_ptr() or any(
+            address == value.untyped_storage().data_ptr()
+            for value in (*module.parameters(recurse=False), *module.buffers(recurse=False))
+        ):
+            raise AdapterRefusal(
+                "adapter_output_alias", f"{site}: output aliases input or base storage"
+            )
+        # Both supported implementations return fresh output storage. This first local
+        # post-hook may add to it; parameters, buffers and inputs remain immutable.
+        inputs = x.view(-1, in_features)
+        result = output.view(-1, out_features)
         linear = torch.nn.functional.linear
-        for term in terms:
-            if term.a.device != x.device:
-                raise AdapterRefusal("adapter_device", f"{site}: factors on another device")
-            output = output + linear(linear(x, term.a), term.b) * term.scale
+        tile = hidden = delta = None
+        try:
+            for term in terms:
+                if term.a.device != x.device:
+                    raise AdapterRefusal("adapter_device", f"{site}: factors on another device")
+                scratch = (
+                    TILE_ROWS * (in_features + term.a.shape[0] + out_features) * x.element_size()
+                )
+                if attempt.check_capacity is not None:
+                    attempt.check_capacity(scratch)
+                for start in range(0, inputs.shape[0], TILE_ROWS):
+                    stop = min(start + TILE_ROWS, inputs.shape[0])
+                    if stop - start == TILE_ROWS:
+                        tile = inputs[start:stop]
+                    else:
+                        tile = torch.zeros((TILE_ROWS, in_features), dtype=x.dtype, device=x.device)
+                        tile[: stop - start].copy_(inputs[start:stop])
+                    hidden = linear(tile, term.a)
+                    delta = linear(hidden, term.b)
+                    # Keep the separate compute-dtype multiply and add roundings.
+                    delta.mul_(term.scale)
+                    result[start:stop].add_(delta[: stop - start])
+                    tile = hidden = delta = None
+        finally:
+            tile = hidden = delta = None
         return output
 
     def _validate(
@@ -268,6 +360,7 @@ class LinearAdapters:
         device: Any,
         max_device_bytes: int,
         check_cancelled: Callable[[], None],
+        check_capacity: Callable[[int], None] | None = None,
     ) -> Iterator[tuple[AdapterRef, ...]]:
         """Own adapter allocations until completion/cancellation; leave base bytes alone.
 
@@ -278,17 +371,16 @@ class LinearAdapters:
         if not self._lock.acquire(blocking=False):
             raise AdapterRefusal("adapter_concurrent", "this model already has an active attempt")
         terms: dict[tuple[str, str], tuple[_Term, ...]] = {}
-        attempt = _Attempt(terms, check_cancelled)
+        attempt = _Attempt(terms, check_cancelled, check_capacity)
         token = None
         allocated = False
         ca = cb = None
         try:
-            if self._closed or self._poisoned:
-                raise AdapterRefusal(
-                    "adapter_binding_closed", "adapter binding is closed or poisoned"
-                )
+            self.check_ready()
             check_cancelled()
-            rows, _ = self._validate(adapters, max_device_bytes)
+            rows, nbytes = self._validate(adapters, max_device_bytes)
+            if check_capacity is not None:
+                check_capacity(nbytes)
             for site, a, b, scale in rows:
                 check_cancelled()
                 dtype = self._sites[site][2]
@@ -325,6 +417,10 @@ class LinearAdapters:
                 terms.clear()
                 ca = cb = None
                 self._lock.release()
+
+    def check_ready(self) -> None:
+        if self._closed or self._poisoned:
+            raise AdapterRefusal("adapter_binding_closed", "adapter binding is closed or poisoned")
 
     def close(self) -> None:
         """Construction teardown; never change hook registries during an attempt."""

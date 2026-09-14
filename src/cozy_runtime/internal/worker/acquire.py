@@ -19,6 +19,7 @@ from threading import Lock, local
 from typing import Any, Literal
 
 from cozy_runtime.internal import (
+    adapters,
     base_observation,
     fill,
     package_environment,
@@ -694,6 +695,18 @@ class Acquirer:
                     if isinstance(sequence_parallel, dict)
                     else ()
                 )
+                adapter_selections = tuple(
+                    adapters.AdapterSelection(
+                        component=str(row["component"]),
+                        manifest=str(models[str(row["model_id"])]["manifest"]["digest"]),
+                        source_component=str(row["source_component"]),
+                        scale=str(row["scale"]),
+                    )
+                    for row in slot.get("adapters", [])
+                )
+                adapter_geometry = adapters.inspect(
+                    self.tensorfs_root, adapter_selections, snapshots
+                )
                 members.append(
                     ModelBinding(
                         model_class=str(declared.get("class", "")),
@@ -706,6 +719,10 @@ class Acquirer:
                         snapshots=snapshots,
                         model_weight_bytes=model_weight_bytes,
                         sequence_parallel_degrees=degrees,
+                        adapters=adapter_selections,
+                        adapter_compatibility=adapter_geometry.compatibility,
+                        adapter_device_bytes=adapter_geometry.device_bytes,
+                        adapter_scratch_bytes=adapter_geometry.scratch_bytes,
                         # The manifest is identity; lane remains the human repo pointer the
                         # desired download set carried beside it.
                         model=str(reference["repo"])
@@ -766,7 +783,11 @@ class Acquirer:
             store = fill.open_store(fill.tensorfs_module(), self.tensorfs_root)
             for binding in bindings.values():
                 for model in binding.model_bindings():
-                    for digest in {model.reference_snapshot, *model.snapshots.values()}:
+                    for digest in {
+                        model.reference_snapshot,
+                        *model.snapshots.values(),
+                        *(a.manifest for a in model.adapters),
+                    }:
                         store.acquire_cozytensors(digest).release()
         except Exception as exc:
             raise AcquisitionRefusal(

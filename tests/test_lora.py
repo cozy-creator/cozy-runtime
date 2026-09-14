@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal.lora import AdapterInput, AdapterRefusal, LinearAdapters
+from cozy_runtime.internal.lora import TILE_ROWS, AdapterInput, AdapterRefusal, LinearAdapters
 
 torch = pytest.importorskip("torch")
 
@@ -59,7 +59,7 @@ def test_ordered_additive_strengths_alpha_and_request_isolation() -> None:
                 if sources
                 else base
             )
-            assert torch.equal(actual, wanted)
+            torch.testing.assert_close(actual, wanted, rtol=5e-6, atol=5e-7)
         assert torch.equal(model(x), base)
         assert tuple(model[0]._forward_hooks) == hook_ids
         assert all(torch.equal(value, before[key]) for key, value in model.state_dict().items())
@@ -218,7 +218,7 @@ def test_defaults_alpha_keyword_input_and_fp16_overflow() -> None:
     )
     with _request(binding, without_alpha):
         actual = model[0](input=x)
-        assert torch.equal(actual, base + delta * source.scale)
+        torch.testing.assert_close(actual, base + delta * source.scale, rtol=5e-6, atol=5e-7)
         assert not actual.requires_grad
     model, binding, source, x = _fixture(torch.float16)
     values = dict(source.tensors)
@@ -245,9 +245,22 @@ def test_encoded_leaf_keeps_payload_and_disables_prequantized_carrier() -> None:
         for key, value in leaf.roles().items()
     ]
     binding = LinearAdapters({"dit": model}, {"dit": "base"}, {"dit": ["0"]})
-    assert not _rowwise_leaf(leaf)
-    with _request(binding):
+    assert _rowwise_leaf(leaf)
+    source = AdapterInput(
+        "adapter",
+        "dit",
+        "base",
+        {
+            "0.lora_A.weight": torch.ones(2, 4),
+            "0.lora_B.weight": torch.ones(3, 2),
+        },
+    )
+    with _request(binding, source):
         assert not _rowwise_leaf(leaf)
+    with _request(binding, replace(source, scale=0)):
+        assert _rowwise_leaf(leaf)
+    with _request(binding):
+        assert _rowwise_leaf(leaf)
     for key, address, raw in before:
         assert leaf.roles()[key].data_ptr() == address
         assert torch.equal(leaf.roles()[key].view(torch.uint8), raw)
@@ -295,3 +308,109 @@ def test_a_coalesced_leaf_cannot_acquire_two_independent_adapter_owners() -> Non
     assert len(model[0]._forward_hooks) == 1
     with _request(binding, source):
         assert model(x).shape == (2, 5, 3)
+
+
+def test_each_stacked_term_budgets_above_current_live_outputs() -> None:
+    import weakref
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    model, binding, source, x = _fixture()
+    held: dict[int, list[Any]] = {}
+    existing = {value.untyped_storage().data_ptr() for value in [x, *model.parameters()]}
+    samples: list[tuple[int, int]] = []
+    peak = 0
+    measuring = False
+
+    def live_bytes() -> int:
+        total = 0
+        for references in held.values():
+            tensor = next((ref() for ref in references if ref() is not None), None)
+            if tensor is not None:
+                total += tensor.untyped_storage().nbytes()
+        return total
+
+    class Track(TorchDispatchMode):  # type: ignore[no-untyped-call]
+        def __torch_dispatch__(
+            self, func: Any, types: Any, args: Any = (), kwargs: Any = None
+        ) -> Any:
+            nonlocal peak
+            result = func(*args, **(kwargs or {}))
+            if isinstance(result, torch.Tensor):
+                address = result.untyped_storage().data_ptr()
+                if address not in existing:
+                    held.setdefault(address, []).append(weakref.ref(result))
+            peak = max(peak, live_bytes())
+            return result
+
+    def capacity(needed: int) -> None:
+        if measuring:
+            samples.append((live_bytes(), needed))
+
+    with binding.request(
+        [source, replace(source, scale=-0.25)],
+        device="cpu",
+        max_device_bytes=4096,
+        check_cancelled=lambda: None,
+        check_capacity=capacity,
+    ):
+        attempt = binding._active.get()
+        assert attempt is not None
+        for terms in attempt.terms.values():
+            for term in terms:
+                existing.update(
+                    (term.a.untyped_storage().data_ptr(), term.b.untyped_storage().data_ptr())
+                )
+        measuring = True
+        with Track():  # type: ignore[no-untyped-call]
+            result = model(x)
+        assert result.shape == (2, 5, 3)
+    output_bytes = 2 * 5 * 3 * 4
+    static_scratch = TILE_ROWS * (4 + 2 + 3) * 4
+    assert samples == [(output_bytes, static_scratch), (output_bytes, static_scratch)]
+    assert peak <= max(live + additional for live, additional in samples)
+
+
+def test_fixed_tiles_preserve_cpu_residual_bits_across_row_partitions() -> None:
+    model, binding, source, _ = _fixture(torch.bfloat16)
+    with torch.no_grad():
+        model[0].weight.zero_()
+        model[0].bias.zero_()
+    x = torch.randn(TILE_ROWS + 9, 4, dtype=torch.bfloat16)
+    with _request(binding, source):
+        whole = model(x)
+    for count in (2, 4):
+        with _request(binding, source):
+            pieces = torch.cat([model(part) for part in x.tensor_split(count)])
+        assert torch.equal(whole, pieces)
+
+
+def test_unsafe_layout_and_preceding_output_hook_refuse() -> None:
+    model, binding, source, _ = _fixture()
+    x = torch.ones(4, 8).t()  # [8,4], noncontiguous: must not copy a whole sequence
+    with pytest.raises(AdapterRefusal) as error, _request(binding, source):
+        model(x)
+    assert error.value.code == "adapter_input_layout"
+    x = torch.ones(8, 4)
+    hook = model[0].register_forward_hook(lambda *_: torch.ones(8, 3), prepend=True)
+    try:
+        with pytest.raises(AdapterRefusal) as error, _request(binding, source):
+            model(x)
+        assert error.value.code == "adapter_forward_unsupported"
+    finally:
+        hook.remove()
+
+
+def test_float32_partition_error_is_bounded_without_claiming_bit_identity() -> None:
+    model, binding, source, _ = _fixture()
+    with torch.no_grad():
+        model[0].weight.zero_()
+        model[0].bias.zero_()
+    x = torch.randn(TILE_ROWS + 9, 4)
+    with _request(binding, source):
+        whole = model(x)
+    with _request(binding, source):
+        split = torch.cat([model(part) for part in x.tensor_split(4)])
+    # CPU BLAS may change reduction details with a row's position inside a tile.
+    # This is mathematical agreement only; CUDA/Ulysses needs its own byte proof.
+    torch.testing.assert_close(whole, split, rtol=5e-6, atol=5e-7)

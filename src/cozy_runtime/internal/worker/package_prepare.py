@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import (
+    adapters,
     base_observation,
     canonical,
     derive_child,
@@ -1246,8 +1247,13 @@ def _entrypoints(
             constructed = derive(
                 path, model["config_bytes"], model["assets"], model["tensor_dtypes"]
             )
+            adapter_models, adapter_slots = _slot_adapters(
+                model["selection"], constructed, tensorfs_root, len(models)
+            )
+            models.extend(adapter_models)
             slots.append(
                 pb.Slot(
+                    adapters=adapter_slots,
                     slot=path.removeprefix(prefix),
                     reference_model_id=model_id,
                     # WHAT THE DERIVE CONSTRUCTED, in construction order (D9) — never the
@@ -1272,6 +1278,10 @@ def _entrypoints(
         raise PreparationRefusal("package_prepare_interface_invalid", "duplicate entrypoint")
     unbound = sorted(set(selected) - described_slots)
     if unbound:
+        if any(selected[path]["selection"].get("adapters") for path in unbound):
+            raise PreparationRefusal(
+                "adapter_job_unsupported", "LoRA bindings currently require a serving model slot"
+            )
         # A JOB's model slot is legitimately unbound here. A job has no placement and no
         # residency: its Model parameter is an attempt-held, derive-only view of one
         # TensorFS Manifest, so the selection exists to admit those bytes to this pod,
@@ -1284,7 +1294,74 @@ def _entrypoints(
                 f"nothing binds {stranded}: no job declares them, and no entrypoint that "
                 "declares them had its whole slot set selected",
             )
+    models.sort(key=lambda row: row.id)
     return models, out
+
+
+def _slot_adapters(
+    selection: Mapping[str, Any],
+    components: Sequence[str],
+    root: Path | None,
+    first_id: int,
+) -> tuple[list[pb.Model], list[pb.ModelAdapter]]:
+    requested = selection.get("adapters", [])
+    if not isinstance(requested, list):
+        raise PreparationRefusal("adapter_selection", "adapter selections must be an ordered list")
+    if not requested:
+        return [], []
+    if root is None:
+        raise PreparationRefusal("adapter_store_absent", "adapter selection requires TensorFS")
+    store = fill.open_store(fill.tensorfs_module(), root)
+    models: list[pb.Model] = []
+    slots: list[pb.ModelAdapter] = []
+    resolved: list[adapters.AdapterSelection] = []
+    for index, row in enumerate(requested):
+        required = {"component", "model", "manifest", "source_component", "scale"}
+        if (
+            not isinstance(row, dict)
+            or not required <= row.keys()
+            or set(row) - required - {"release", "lane"}
+        ):
+            raise PreparationRefusal("adapter_selection", "adapter selection fields are incomplete")
+        repo, release, lane = row["model"], row.get("release", ""), row.get("lane", "")
+        if len(repo.split("/")) != 2 or not all(repo.split("/")) or bool(release) != bool(lane):
+            raise PreparationRefusal("adapter_selection", "adapter repository/release is invalid")
+        digest = row["manifest"]
+        documents.raw(digest)
+        adapters.parse_scale(row["scale"])
+        raw = bytes(store.manifest(digest)["manifest"])
+        if documents.spell(documents.digest_of(raw)) != digest:
+            raise PreparationRefusal("adapter_manifest_mismatch", digest)
+        if release:
+            _resolved_manifest_length(
+                store.resolve_release(*repo.split("/"), release, lane), digest, len(raw), repo
+            )
+        store.acquire_cozytensors(digest).release()
+        model_id = f"adapter-{first_id + index:04d}"
+        models.append(
+            pb.Model(
+                id=model_id,
+                repo=repo,
+                version=release,
+                lane=lane,
+                manifest=pb.Ref(digest=documents.raw(digest), length=len(raw)),
+            )
+        )
+        slots.append(
+            pb.ModelAdapter(
+                component=row["component"],
+                model_id=model_id,
+                source_component=row["source_component"],
+                scale=row["scale"],
+            )
+        )
+        resolved.append(
+            adapters.AdapterSelection(
+                row["component"], digest, row["source_component"], row["scale"]
+            )
+        )
+    adapters.inspect(root, resolved, {component: selection["manifest"] for component in components})
+    return models, slots
 
 
 def _stage_job_plans(
