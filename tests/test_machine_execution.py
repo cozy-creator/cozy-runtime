@@ -455,6 +455,8 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     workspace.accept("owner", offer("legacy"))
     with workspace.locked() as db:
         for table in (
+            "execution_checkpoint_inputs",
+            "input_tree_intakes",
             "execution_model_holds",
             "execution_calls",
             "execution_commands",

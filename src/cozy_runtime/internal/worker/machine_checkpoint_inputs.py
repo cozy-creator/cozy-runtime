@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill
@@ -37,10 +37,14 @@ def _native[T](db: Journal, operation: Callable[[], T]) -> T:
 
 
 def _row(db: Journal, owner: str, recipient: str, input_id: str) -> Row | None:
-    return db.execute(
-        "SELECT * FROM execution_checkpoint_inputs WHERE owner=? AND recipient=? AND input_id=?",
-        (owner, recipient, input_id),
-    ).fetchone()
+    return cast(
+        Row | None,
+        db.execute(
+            "SELECT * FROM execution_checkpoint_inputs "
+            "WHERE owner=? AND recipient=? AND input_id=?",
+            (owner, recipient, input_id),
+        ).fetchone(),
+    )
 
 
 def already_accepted(workspace: Workspace, owner: str, offer: pb.AttemptOffer) -> bool:

@@ -207,8 +207,10 @@ def retain_root(
                 if (
                     (digest, entry.length) != ("sha256:" + blob["sha256"], blob["length"])
                     or not admits(kind, entry.kind_mime)
-                    or (capacity.get("media_types")
-                    and entry.kind_mime not in capacity["media_types"])
+                    or (
+                        capacity.get("media_types")
+                        and entry.kind_mime not in capacity["media_types"]
+                    )
                 ):
                     raise WorkspaceRefusal("root file differs from its exact native payload")
     for name, _, _, _, _ in selected:
