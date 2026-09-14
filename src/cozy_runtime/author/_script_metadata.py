@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import tomllib
 
+from cozy_runtime.author._assets import Asset, Tree
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._walker import strip
 from cozy_runtime.author._weights import WeightsOutput
 
 
@@ -93,3 +95,8 @@ def declarations(raw: bytes) -> tuple[dict[str, str], tuple[WeightsOutput, ...]]
     return models, tuple(
         WeightsOutput(name, max_new_bytes=limit) for name, limit in weights.items()
     )
+
+
+def byte_parameter(value: object) -> bool:
+    base, _ = strip(value)
+    return isinstance(base, type) and issubclass(base, (Asset, Tree))

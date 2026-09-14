@@ -30,6 +30,11 @@ def project(root: Path, code: str) -> Path:
     "body",
     [
         "def main(): pass\n",
+        "from typing import Annotated\n"
+        "from cozy_runtime.author import AssetBound, FileAsset, Tree\n"
+        "def main(ctx, *, report: Annotated[FileAsset, AssetBound(max_bytes=200000, "
+        "media_types=('application/json',))], files: Tree) -> Tree:\n"
+        "    raise RuntimeError('body must not execute')\n",
         "async def main(ctx): ctx.log('started')\n",
         "from cozy_runtime.author import ImageAsset, Outputs, Telemetry\n"
         "def main(*, out: Outputs, tel: Telemetry) -> ImageAsset: raise RuntimeError('body')\n",
