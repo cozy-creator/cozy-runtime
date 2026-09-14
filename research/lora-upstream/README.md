@@ -134,6 +134,15 @@ The same real CPU probe also establishes adoption gates:
   storage, preserve alias ownership, and test evacuation/restaging; simple dtype
   accounting is incorrect. The module path also becomes `...base_layer` after
   PEFT injection, so authored target names and restaging must use stable bindings.
+- **Adapter lifecycle:** the staged Runtime's `fill.release(component)` frees
+  storages discovered through `named_parameters`/`named_buffers`, then calls
+  `member.to_empty(meta, recurse=True)`. PEFT registers adapter Parameters inside
+  that model tree, whereas the current request-scoped factors live outside it.
+  Wrapper construction alone therefore does not establish factor ownership or
+  reloading after component eviction. `_install_leaf` additionally records
+  physical role paths and shares hook registries. Adoption must preserve these
+  lifecycle contracts explicitly.
+  [Staged Runtime fill](https://github.com/cozy-creator/cozy-runtime/blob/5edf6390/src/cozy_runtime/internal/fill.py).
 - **Recursive dtype conversion:** the current Cozy leaf's comment attributes
   safety to using buffers instead of Parameters. The actual
   `EncodedLinear.to(dtype=torch.bfloat16)` casts both its FP8 payload and FP32
