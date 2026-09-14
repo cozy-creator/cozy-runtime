@@ -174,7 +174,8 @@ def test_generated_serving_proxy_accepts_adapters_only_on_model_slots(
 
 def test_native_adapter_custody_outlives_prepare_and_original_result(tmp_path: Path) -> None:
     store, workspace, base = produced(tmp_path, request_id="base")
-    _, _, adapter = produced(tmp_path, request_id="adapter")
+    _, _, adapter = produced(tmp_path, request_id="adapter", part=b"\x32" * 2048)
+    assert base.artifact.manifest.digest != adapter.artifact.manifest.digest
     bound = canonical_json.decode(
         reserve(with_adapters(base.artifact, [LoRA(adapter.artifact, "dit", 0)]), base.artifact)
     )["first"]
@@ -195,6 +196,9 @@ def test_native_adapter_custody_outlives_prepare_and_original_result(tmp_path: P
     tensorfs.gc(str(store.root))
     assert store.manifest(base.artifact.manifest.digest)
     assert store.manifest(adapter.artifact.manifest.digest)
+    # A manifest alone is metadata; native acquisition walks and leases actual parts.
+    store.acquire_cozytensors(base.artifact.manifest.digest).release()
+    store.acquire_cozytensors(adapter.artifact.manifest.digest).release()
     with workspace.locked() as db:
         rows = db.execute(
             "SELECT path FROM execution_model_holds "
