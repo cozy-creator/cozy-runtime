@@ -25,6 +25,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--store", type=Path, required=True)
+    parser.add_argument(
+        "--scale-policy", choices=("preserve", "grow", "recalibrate"), required=True
+    )
     args = parser.parse_args()
     output = args.evidence / "prepared-merge"
     output.mkdir(exist_ok=True)
@@ -90,7 +93,13 @@ def main() -> None:
         )
     started = time.perf_counter()
     iterator = merge_rowwise_fp8(
-        base, scales, adapters, encoding_spec=SPEC_ROWWISE, tile_rows=2, max_scratch_bytes=8 << 20
+        base,
+        scales,
+        adapters,
+        encoding_spec=SPEC_ROWWISE,
+        scale_policy=args.scale_policy,
+        tile_rows=2,
+        max_scratch_bytes=8 << 20,
     )
     assert iterator is not None
     tiles = list(iterator)
@@ -108,6 +117,13 @@ def main() -> None:
         "scope": (
             "Actual immutable canonical factors on five selected output rows; "
             "generated rowwise base; no H3 execution or full-weight quality claim"
+        ),
+        "scale_policy": args.scale_policy,
+        "original_scale_unique": int(torch.unique(scales).numel()),
+        "original_code_abs_max_per_row": base.float().abs().amax(dim=1).tolist(),
+        "changed_scale_rows": sum(tile.error.changed_scale_rows for tile in tiles),
+        "realized_update_l2": float(
+            torch.linalg.vector_norm(actual - base.double() * scales.double()[:, None])
         ),
         "torch": torch.__version__,
         "threads": torch.get_num_threads(),
@@ -128,7 +144,9 @@ def main() -> None:
         "input_sha256_before": before,
         "input_sha256_after": after,
     }
-    (output / "cpu-real-factors.json").write_text(json.dumps(result, indent=2) + "\n")
+    (output / f"cpu-real-factors-{args.scale_policy}.json").write_text(
+        json.dumps(result, indent=2) + "\n"
+    )
     print(json.dumps(result, indent=2))
 
 

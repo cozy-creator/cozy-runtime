@@ -36,6 +36,7 @@ class MergeError:
     squared_error: float
     squared_reference: float
     max_abs: float
+    changed_scale_rows: int
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ def merge_rowwise_fp8(
     adapters: Sequence[MergeAdapter],
     *,
     encoding_spec: str,
+    scale_policy: str,
     max_scratch_bytes: int = 64 << 20,
     tile_rows: int = 128,
 ) -> Iterator[MergedRows] | None:
@@ -76,6 +78,10 @@ def merge_rowwise_fp8(
     Row scales are always validated. Only explicitly reviewed rowwise encodings
     are accepted: a scalar-scaled source header must not be mislabeled rowwise.
 
+    Scale policy is explicit: preserve retains the original grid and refuses overflow;
+    grow only enlarges scales when required; recalibrate recomputes every row grid.
+    The latter can introduce base quantization error even with a tiny LoRA update.
+
     FP32 rank-ordered multiplication/addition avoids changing process-global
     TF32 settings or relying on GEMM's shape-dependent reduction order. It is a
     correctness control; compare preparation cost with strict-FP32 GEMM before
@@ -87,6 +93,8 @@ def merge_rowwise_fp8(
         raise ValueError("max_scratch_bytes must be an integer of at least 16")
     if type(tile_rows) is not int or tile_rows < 1:
         raise ValueError("tile_rows must be a positive integer")
+    if scale_policy not in ("preserve", "grow", "recalibrate"):
+        raise ValueError("scale_policy must explicitly be preserve, grow or recalibrate")
     if encoding_spec not in (SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM):
         raise ValueError("LoRA merge requires an explicitly reviewed rowwise FP8 encoding")
     if data.ndim != 2 or min(data.shape) < 1 or data.dtype != torch.float8_e4m3fn:
@@ -138,7 +146,7 @@ def merge_rowwise_fp8(
         _finite(torch, adapter.b, check_elements, "LoRA B")
     if not active:
         return None
-    return _merge_tiles(torch, data.detach(), scale.detach(), active, rows)
+    return _merge_tiles(torch, data.detach(), scale.detach(), active, rows, scale_policy)
 
 
 def _sum_squares(value: Any, torch: Any) -> float:
@@ -152,6 +160,7 @@ def _merge_tiles(
     scale: Any,
     active: Sequence[tuple[MergeAdapter, float]],
     rows: int,
+    scale_policy: str,
 ) -> Iterator[MergedRows]:
     for start in range(0, data.shape[0], rows):
         end = min(start + rows, data.shape[0])
@@ -174,14 +183,33 @@ def _merge_tiles(
         if not bool(torch.isfinite(merged).all()):
             raise ValueError("FP32 LoRA merge overflowed or produced nonfinite values")
         peak = merged.abs().amax(dim=1)
-        scales = peak.div(448.0).clamp_min_(torch.finfo(torch.float32).tiny)
-        scales[peak == 0] = 1.0
-        codes = (merged / scales[:, None]).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+        original_scale = scale[start:end].reshape(-1)
+        if scale_policy in ("preserve", "grow") and not bool((original_scale > 0).all()):
+            raise ValueError("preserve/grow requires strictly positive original row scales")
+        if scale_policy == "preserve":
+            scales = original_scale.clone()
+        else:
+            scales = peak.div(448.0)
+            if scale_policy == "grow":
+                scales = torch.maximum(original_scale, scales)
+            else:
+                scales.clamp_min_(torch.finfo(torch.float32).tiny)
+                scales[peak == 0] = 1.0
+        normalized = merged / scales[:, None]
+        if scale_policy == "preserve":
+            overflow_rows = int((normalized.abs() > 448.0).any(dim=1).sum())
+            if overflow_rows:
+                raise ValueError(
+                    f"original FP8 scales overflow in {overflow_rows} rows of tile at {start}"
+                )
+        codes = normalized.clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+        del normalized
         error = codes.to(torch.float32).mul_(scales[:, None]).sub_(merged)
         stats = MergeError(
             squared_error=_sum_squares(error, torch),
             squared_reference=_sum_squares(merged, torch),
             max_abs=float(error.abs().amax()),
+            changed_scale_rows=int((scales != original_scale).sum()),
         )
         if scale.ndim == 2:
             scales = scales.reshape(-1, 1)

@@ -49,6 +49,7 @@ def test_canonical_orientation_alpha_and_fp8_bytes() -> None:
         scale,
         [MergeAdapter(a, b, strength=0.25, alpha=4)],
         encoding_spec=SPEC_ROWWISE,
+        scale_policy="recalibrate",
         tile_rows=2,
     )
     assert tiles is not None
@@ -78,7 +79,14 @@ def test_independent_stack_strengths_and_chunk_invariance() -> None:
     stack = [MergeAdapter(a, b, 0.3, 2.0), MergeAdapter(a, b, -0.125)]
     outputs = []
     for rows in (1, 2, 128):
-        iterator = merge_rowwise_fp8(data, scale, stack, encoding_spec=SPEC_ROWWISE, tile_rows=rows)
+        iterator = merge_rowwise_fp8(
+            data,
+            scale,
+            stack,
+            encoding_spec=SPEC_ROWWISE,
+            scale_policy="recalibrate",
+            tile_rows=rows,
+        )
         assert iterator is not None
         tiles = list(iterator)
         outputs.append((torch.cat([x.data for x in tiles]), torch.cat([x.scale for x in tiles])))
@@ -100,7 +108,11 @@ def test_fp32_factor_precision_and_keepdim_scale() -> None:
     value = 1 + 2.0**-12  # BF16 downcasting loses this real FP32 factor contribution.
     a, b = torch.tensor([[value]]), torch.ones(1, 1)
     iterator = merge_rowwise_fp8(
-        data, scale, [MergeAdapter(a, b)], encoding_spec=SPEC_ROWWISE_KEEPDIM
+        data,
+        scale,
+        [MergeAdapter(a, b)],
+        encoding_spec=SPEC_ROWWISE_KEEPDIM,
+        scale_policy="recalibrate",
     )
     assert iterator is not None
     result = list(iterator)
@@ -111,10 +123,17 @@ def test_fp32_factor_precision_and_keepdim_scale() -> None:
 def test_zero_strength_inherits_but_nonfinite_factors_still_refuse() -> None:
     data, scale = _base()
     adapter = MergeAdapter(torch.ones(1, 4), torch.ones(3, 1), strength=0)
-    assert merge_rowwise_fp8(data, scale, [adapter], encoding_spec=SPEC_ROWWISE) is None
+    assert (
+        merge_rowwise_fp8(
+            data, scale, [adapter], encoding_spec=SPEC_ROWWISE, scale_policy="recalibrate"
+        )
+        is None
+    )
     bad = MergeAdapter(torch.full((1, 4), float("nan")), torch.ones(3, 1), strength=0)
     with pytest.raises(ValueError, match="LoRA A contains nonfinite"):
-        merge_rowwise_fp8(data, scale, [bad], encoding_spec=SPEC_ROWWISE)
+        merge_rowwise_fp8(
+            data, scale, [bad], encoding_spec=SPEC_ROWWISE, scale_policy="recalibrate"
+        )
 
 
 def test_ordered_fp32_sums_are_not_coalesced() -> None:
@@ -125,7 +144,9 @@ def test_ordered_fp32_sums_are_not_coalesced() -> None:
     negative = MergeAdapter(big.a, b, -1)
     values = []
     for stack in ([big, small, negative], [big, negative, small]):
-        iterator = merge_rowwise_fp8(data, scale, stack, encoding_spec=SPEC_ROWWISE)
+        iterator = merge_rowwise_fp8(
+            data, scale, stack, encoding_spec=SPEC_ROWWISE, scale_policy="recalibrate"
+        )
         assert iterator is not None
         tile = next(iterator)
         values.append(float(tile.data.float() * tile.scale[:, None]))
@@ -136,28 +157,107 @@ def test_shape_encoding_budget_and_overflow_refusals() -> None:
     data, scale = _base()
     adapter = MergeAdapter(torch.ones(2, 4), torch.ones(3, 2))
     with pytest.raises(ValueError, match="explicitly reviewed"):
-        merge_rowwise_fp8(data, scale, [adapter], encoding_spec="fp8-rowwise")
+        merge_rowwise_fp8(
+            data, scale, [adapter], encoding_spec="fp8-rowwise", scale_policy="recalibrate"
+        )
     with pytest.raises(ValueError, match="scale shape"):
-        merge_rowwise_fp8(data, scale, [adapter], encoding_spec=SPEC_ROWWISE_KEEPDIM)
+        merge_rowwise_fp8(
+            data, scale, [adapter], encoding_spec=SPEC_ROWWISE_KEEPDIM, scale_policy="recalibrate"
+        )
     with pytest.raises(ValueError, match="orientation"):
         merge_rowwise_fp8(
-            data, scale, [MergeAdapter(adapter.a.t(), adapter.b)], encoding_spec=SPEC_ROWWISE
+            data,
+            scale,
+            [MergeAdapter(adapter.a.t(), adapter.b)],
+            encoding_spec=SPEC_ROWWISE,
+            scale_policy="recalibrate",
         )
     with pytest.raises(ValueError, match="scratch budget"):
         merge_rowwise_fp8(
-            data, scale, [adapter], encoding_spec=SPEC_ROWWISE, max_scratch_bytes=4096
+            data,
+            scale,
+            [adapter],
+            encoding_spec=SPEC_ROWWISE,
+            scale_policy="recalibrate",
+            max_scratch_bytes=4096,
         )
     iterator = merge_rowwise_fp8(
-        data, scale, [adapter], encoding_spec=SPEC_ROWWISE, max_scratch_bytes=4400
+        data,
+        scale,
+        [adapter],
+        encoding_spec=SPEC_ROWWISE,
+        scale_policy="recalibrate",
+        max_scratch_bytes=4400,
     )
     assert iterator is not None
     assert [x.start for x in iterator] == [0, 1, 2]
     huge = MergeAdapter(torch.full((1, 4), 1e30), torch.full((3, 1), 1e30))
-    iterator = merge_rowwise_fp8(data, scale, [huge], encoding_spec=SPEC_ROWWISE)
+    iterator = merge_rowwise_fp8(
+        data, scale, [huge], encoding_spec=SPEC_ROWWISE, scale_policy="recalibrate"
+    )
     assert iterator is not None
     with pytest.raises(ValueError, match="overflowed"):
         list(iterator)
     with pytest.raises(ValueError, match="must be finite"):
         merge_rowwise_fp8(
-            data, scale, [MergeAdapter(adapter.a, adapter.b, math.inf)], encoding_spec=SPEC_ROWWISE
+            data,
+            scale,
+            [MergeAdapter(adapter.a, adapter.b, math.inf)],
+            encoding_spec=SPEC_ROWWISE,
+            scale_policy="recalibrate",
         )
+
+
+def test_original_grid_control_and_growth_refusal() -> None:
+    data = torch.tensor([[1.0, 1.25, 1.5, 2.0]]).to(torch.float8_e4m3fn)
+    scale = torch.tensor([0.01])
+    # Nonzero coefficient with zero factor values exercises only the codec.
+    # Actual zero strength still returns the original-part graft, without this work.
+    zero_update = [MergeAdapter(torch.zeros(1, 4), torch.ones(1, 1))]
+    decoded = {}
+    for policy in ("preserve", "grow", "recalibrate"):
+        iterator = merge_rowwise_fp8(
+            data, scale, zero_update, encoding_spec=SPEC_ROWWISE, scale_policy=policy
+        )
+        assert iterator is not None
+        tile = next(iterator)
+        decoded[policy] = tile.data.float() * tile.scale[:, None]
+        if policy in ("preserve", "grow"):
+            assert torch.equal(tile.data.view(torch.uint8), data.view(torch.uint8))
+            assert torch.equal(tile.scale, scale)
+            assert tile.error.squared_error == 0 and tile.error.changed_scale_rows == 0
+        else:
+            assert tile.error.squared_error > 0 and tile.error.changed_scale_rows == 1
+    assert not torch.equal(decoded["recalibrate"], decoded["preserve"])
+    saturated = torch.tensor([[448.0]]).to(torch.float8_e4m3fn)
+    addition = [MergeAdapter(torch.ones(1, 1), torch.ones(1, 1))]
+    iterator = merge_rowwise_fp8(
+        saturated, torch.ones(1), addition, encoding_spec=SPEC_ROWWISE, scale_policy="preserve"
+    )
+    assert iterator is not None
+    with pytest.raises(ValueError, match="original FP8 scales overflow"):
+        list(iterator)
+    iterator = merge_rowwise_fp8(
+        saturated, torch.ones(1), addition, encoding_spec=SPEC_ROWWISE, scale_policy="grow"
+    )
+    assert iterator is not None
+    tile = next(iterator)
+    assert float(tile.data.float() * tile.scale[:, None]) == pytest.approx(449.0)
+    assert tile.error.changed_scale_rows == 1 and float(tile.scale) > 1
+
+
+def test_grow_preserves_valid_subnormal_grid_without_unnecessary_enlargement() -> None:
+    data = torch.ones(1, 1).to(torch.float8_e4m3fn)
+    scale = torch.tensor([2.0**-130])
+    iterator = merge_rowwise_fp8(
+        data,
+        scale,
+        [MergeAdapter(torch.zeros(1, 1), torch.ones(1, 1))],
+        encoding_spec=SPEC_ROWWISE,
+        scale_policy="grow",
+    )
+    assert iterator is not None
+    tile = next(iterator)
+    assert torch.equal(tile.data.view(torch.uint8), data.view(torch.uint8))
+    assert torch.equal(tile.scale, scale)
+    assert tile.error.changed_scale_rows == 0

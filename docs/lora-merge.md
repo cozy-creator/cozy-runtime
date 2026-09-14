@@ -24,13 +24,30 @@ not a claimed fastest implementation: compare it with highest-mode FP32 GEMM
 on real H100 tensors before production selection. Cross-device byte identity
 is not established by the CPU tests.
 
+## Explicit scale policies
+
+There is no default scale policy. `preserve` keeps the original quantization
+grid and refuses if merged values exceed its E4M3 range; it never silently
+clips overflow. `grow` preserves each positive original scale unless it must
+increase to fit the merged values. `recalibrate` recomputes every row's grid.
+Both preserve and grow require positive original scales. Output statistics
+include how many row scales changed.
+
+To isolate the codec from the LoRA arithmetic, the probe supplies zero-valued
+factors with a nonzero coefficient. This deliberately takes the decode/encode
+path; an actual zero-strength request still returns the original-part graft.
+The independent control shows that recalibration alone can alter base weights,
+while preserving the old grid keeps the tested zero-update codes unchanged.
+A separate overflow control refuses preservation at 449 with original unit
+scale, then proves grow-only expands enough to represent the value.
+
 ## Ownership and memory
 
 The caller owns immutable input parts and a native TensorFS transaction. It
 consumes tiles and commits only after the iterator succeeds. The helper neither
 opens a database nor invents cache aliases. Existing native execution must key
 the prepared result by exact base parts/encoding, ordered factor identities,
-strengths/alpha and computation identity, including `ALGORITHM` and the captured
+strengths/alpha, explicit scale policy and computation identity, including `ALGORITHM` and the captured
 implementation. Mutable release/lane names resolve before that identity is made.
 Keep compact LoRA checkpoints authoritative; cache the completed merged base
 variant, not an expanded full-size delta for every adapter.
@@ -58,7 +75,7 @@ measure error relative to the update and the actual linear outputs.
 
 ## CPU evidence and remaining proof
 
-Six focused cases use independent dense algebra and an enumerated E4M3FN value
+Eight focused cases use independent dense algebra and an enumerated E4M3FN value
 table: orientation/alpha/scales, mixed-factor strengths, FP32 preservation, row
 tails and chunk byte invariance, ordered cancellation, zero/finiteness and
 shape/spec/budget/overflow refusal. Input tensors remain unchanged. They run
@@ -75,8 +92,15 @@ adapter headers and local TensorFS store:
 ```sh
 uv run --extra derive python research/lora-merge/cpu_real_factors.py \
   --evidence /home/fidika/cozy_v2/outputs/h3-general-lora-20260914 \
-  --store /home/fidika/.tensorfs
+  --store /home/fidika/.tensorfs --scale-policy preserve
 ```
+
+On the generated-base fixture, preserving original scales reduces total-weight
+relative L2 from 0.02715 to 0.004646, with error/update norm reducing from 5.50
+to 0.94. Grow-only is identical because this fixture needs no growth. Its
+original code maxima are only 2.0, 1.25, 0.40625, 1.25 and 2.0, so changing the
+grid causes much of the larger error. These fixture results do not establish
+which policy best preserves actual H3 outputs.
 
 The GPU microbenchmark, cached-variant lifecycle and ordinary generated-video
 comparison remain separate acceptance steps under tracker h3a-053. No image
