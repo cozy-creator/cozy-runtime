@@ -199,3 +199,16 @@ def test_serving_default_uses_real_catalog_input_pin_without_derived_provenance(
     result = complete(restored, "serving-child", 17)
     restored.acknowledge_collection("owner", ack(result))
     assert store.checkpoint_root(pin["native_owner"])["released"]
+
+
+def test_unavailable_default_refuses_before_accelerator_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(_: str) -> Any:
+        raise AssertionError("unavailable default must not measure an accelerator")
+
+    monkeypatch.setattr(defaults.hostfacts, "measure", forbidden)
+    call = cast(Call, SimpleNamespace(parent_request="root"))
+    for capture in (captured(), {"model_defaults": []}):
+        with pytest.raises(WorkspaceRefusal, match="captured Model default is unavailable"):
+            defaults.select(peer(capture), "owner", call, target(), {"adapter": {}})
