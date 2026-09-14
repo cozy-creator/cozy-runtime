@@ -8,7 +8,6 @@ from typing import Any
 from tensorfs.derived import SourceCapability, SourceInspection
 
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.derive.safetensors_io import to_f32
 from cozy_runtime.internal.encoding.formats import (
     MX_BLOCK,
     SPEC_MXFP8,
@@ -37,6 +36,8 @@ def read_values_into(
     into: memoryview,
 ) -> None:
     import numpy as np
+
+    from cozy_runtime.derive.safetensors_io import to_f32
 
     tensor = structure.components.get(component, {}).get(key)
     count = into.nbytes // 4
