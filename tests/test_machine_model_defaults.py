@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import tensorfs
 
+from cozy_runtime.internal import fill
 from cozy_runtime.internal.worker import grants, machine_checkpoint_inputs
 from cozy_runtime.internal.worker import machine_model_defaults as defaults
+from cozy_runtime.internal.worker.machine_child_target import Target
+from cozy_runtime.internal.worker.session import Worker
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -21,7 +27,7 @@ REVISION = "sha256:" + "11" * 32
 MANIFEST = {"digest": "sha256:" + "22" * 32, "length": 321}
 
 
-def captured():
+def captured() -> dict[str, Any]:
     return {
         "bindings": [{"callee_revision_digest": REVISION, "entrypoint": "generate"}],
         "model_defaults": [
@@ -45,21 +51,28 @@ def captured():
     }
 
 
-def peer(capture):
-    return SimpleNamespace(
-        config=SimpleNamespace(bootstrap_credential="local-bootstrap"),
-        options=SimpleNamespace(accelerator_backend="none"),
-        executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
+def peer(capture: dict[str, Any]) -> Worker:
+    return cast(
+        Worker,
+        SimpleNamespace(
+            config=SimpleNamespace(bootstrap_credential="local-bootstrap"),
+            options=SimpleNamespace(accelerator_backend="none"),
+            executions=SimpleNamespace(capture_root=lambda *_: "root", capture=lambda *_: capture),
+        ),
     )
 
 
-def target():
-    return SimpleNamespace(
+def target() -> Target:
+    return Target(
         revision=REVISION,
         entrypoint="generate",
+        interface_digest=REVISION,
         declaration={
             "models": [{"path": "generate.models.adapter"}, {"path": "generate.models.model"}]
         },
+        prepared_revision={},
+        binding=None,
+        digest=REVISION,
     )
 
 
@@ -68,7 +81,7 @@ def test_default_capture_requires_complete_exact_inventory_and_capable_peer() ->
     interfaces = {REVISION: {"entrypoints": [{"name": "generate", **target().declaration}]}}
     request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=56))
     defaults.verify(peer(body), request, body, interfaces)
-    for mutate in [
+    mutations: list[Callable[[dict[str, Any]], Any]] = [
         lambda value: value["model_defaults"].pop(),
         lambda value: value["model_defaults"].reverse(),
         lambda value: value["model_defaults"][0].update(parameter="foreign"),
@@ -83,7 +96,8 @@ def test_default_capture_requires_complete_exact_inventory_and_capable_peer() ->
         ),
         lambda value: value["model_defaults"][0]["rungs"][0].update(repository="local/forged"),
         lambda value: value["model_defaults"][0]["rungs"][0].update(gpu="*"),
-    ]:
+    ]
+    for mutate in mutations:
         changed = copy.deepcopy(body)
         mutate(changed)
         with pytest.raises(WorkspaceRefusal):
@@ -96,16 +110,18 @@ def test_default_capture_requires_complete_exact_inventory_and_capable_peer() ->
     assert not defaults.valid_origin("http://169.254.169.254", local=True)
 
 
-def test_unused_or_overridden_defaults_do_not_touch_catalog_or_storage(monkeypatch) -> None:
-    def forbidden():
+def test_unused_or_overridden_defaults_do_not_touch_catalog_or_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden() -> None:
         raise AssertionError("unused default reached TensorFS")
 
-    monkeypatch.setattr(defaults.fill, "tensorfs_module", forbidden)
-    empty_peer = SimpleNamespace()
-    assert defaults.select(empty_peer, "owner", None, target(), {"model": {}, "adapter": {}}) == []
+    monkeypatch.setattr(fill, "tensorfs_module", forbidden)
+    empty_peer = cast(Worker, SimpleNamespace())
+    call = cast(Call, SimpleNamespace(parent_request="root"))
+    assert defaults.select(empty_peer, "owner", call, target(), {"model": {}, "adapter": {}}) == []
     defaults.materialize(empty_peer, [], ExitStack())
     worker = peer(captured())
-    call = SimpleNamespace(parent_request="root")
     selected = defaults.select(worker, "owner", call, target(), {"model": {}, "adapter": None})
     assert (
         len(selected) == 1 and selected[0]["parameter"] == "adapter" and selected[0]["gpu"] == "*"
@@ -118,7 +134,7 @@ def test_unused_or_overridden_defaults_do_not_touch_catalog_or_storage(monkeypat
 
 
 def test_serving_default_uses_real_catalog_input_pin_without_derived_provenance(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root, manifest, length, store = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
     operation = store.begin_operation("default-fixture", "proof", "adapter")
@@ -134,7 +150,7 @@ def test_serving_default_uses_real_catalog_input_pin_without_derived_provenance(
     worker = peer({})
     worker.workspace = workspace
 
-    def no_download(*args, **kwargs):
+    def no_download(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("an already verified exact native checkpoint was downloaded")
 
     monkeypatch.setattr(tensorfs, "pull", no_download)
