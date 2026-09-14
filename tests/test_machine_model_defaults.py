@@ -10,7 +10,7 @@ from typing import Any, cast
 import pytest
 import tensorfs
 
-from cozy_runtime.internal import fill
+from cozy_runtime.internal import fill, hostfacts
 from cozy_runtime.internal.worker import grants, machine_checkpoint_inputs
 from cozy_runtime.internal.worker import machine_model_defaults as defaults
 from cozy_runtime.internal.worker.machine_child_target import Target
@@ -130,7 +130,7 @@ def test_unused_or_overridden_defaults_do_not_touch_catalog_or_storage(
     def no_hardware_probe(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("unavailable default reached hardware selection")
 
-    monkeypatch.setattr(defaults.hostfacts, "measure", no_hardware_probe)
+    monkeypatch.setattr(hostfacts, "measure", no_hardware_probe)
     with pytest.raises(WorkspaceRefusal, match="unavailable for model"):
         defaults.select(worker, "owner", call, target(), {"adapter": {}})
     assert defaults.matches("H100", "NVIDIA H100 80GB HBM3")
