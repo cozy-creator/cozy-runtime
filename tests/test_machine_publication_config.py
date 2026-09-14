@@ -25,6 +25,7 @@ def test_worker_boot_projects_authority_without_inheriting_it(tmp_path: Path) ->
             {"control_public_key_ed25519_b64url": "A" * 43, "media_token_sha256": ["b" * 64]}
         ),
         "PATH": "/usr/bin:/bin",
+        "TENSORHUB_OBJECT_STORAGE_HOSTS": ".objects.example,storage.example",
     }
     authority = {"version": 1, "origin": "https://hub.example.test", "ca_der_base64url": ""}
     path = tmp_path / "authority.json"
@@ -32,14 +33,17 @@ def test_worker_boot_projects_authority_without_inheriting_it(tmp_path: Path) ->
     program = """
 import json,sys
 from pathlib import Path
-from cozy_runtime.internal.config import ConfigError, read_worker_host_config
+from cozy_runtime.internal.config import (
+    ConfigError, read_worker_host_config, runtime_config_from_host,
+)
 try:
     body=json.load(sys.stdin)
     cfg=read_worker_host_config(body['env'], publication_authority_path=Path(body['path']))
 except ConfigError as exc:
     print(exc.name)
     raise SystemExit(2)
-print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env)}))
+print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env),
+                  "hosts":runtime_config_from_host(cfg).object_storage_hosts}))
 """
     result = subprocess.run(
         [sys.executable, "-c", program],
@@ -51,6 +55,7 @@ print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env)
     assert json.loads(result.stdout) == {
         "origin": "https://hub.example.test",
         "child": {"PATH": "/usr/bin:/bin"},
+        "hosts": [".objects.example", "storage.example"],
     }
     for env_change, change in (
         ({"TENSORHUB_TOKEN": "broad-token-must-not-cross"}, {}),
@@ -75,6 +80,30 @@ print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env)
         capture_output=True,
     )
     assert older_host.returncode == 0 and json.loads(older_host.stdout)["origin"] == ""
+
+
+def test_object_storage_hosts_are_an_explicit_bounded_deployment_declaration() -> None:
+    from cozy_runtime.internal.config import ConfigError, parse_object_storage_hosts
+
+    assert parse_object_storage_hosts("") == ()
+    assert parse_object_storage_hosts(".objects.example,storage.example") == (
+        ".objects.example",
+        "storage.example",
+    )
+    for value in (
+        "*",
+        ".",
+        "https://storage.example",
+        "UPPER.example",
+        "b.example,a.example",
+        "a.example,a.example",
+        "a.example,,b.example",
+        "a.example ",
+        "a" * 254,
+        ",".join(f"host{i}.example" for i in range(9)),
+    ):
+        with pytest.raises(ConfigError, match="bounded sorted unique"):
+            parse_object_storage_hosts(value)
 
 
 def test_publication_cannot_disable_tls_or_accept_an_unbound_grant() -> None:

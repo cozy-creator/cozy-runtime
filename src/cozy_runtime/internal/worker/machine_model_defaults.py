@@ -186,6 +186,7 @@ def materialize(worker: Worker, rows: list[dict[str, Any]], access: ExitStack) -
                     store,
                     row["public_origin"],
                     row["repository"] + "@" + manifest["digest"],
+                    allowed_hosts=worker.config.object_storage_hosts,
                     allow_local=bool(worker.config.bootstrap_credential)
                     and local_origin(row["public_origin"]),
                 )
