@@ -103,7 +103,7 @@ implicit_reexport = false
 # and with torch itself untyped. `checks/architecture.py::torch-free-import` is what actually
 # holds the packaging rule; mypy never could.
 [[tool.mypy.overrides]]
-module = ["torch.*", "triton.*", "numpy.*"]
+module = ["torch.*", "triton.*", "numpy.*", "transformers.*"]
 ignore_missing_imports = true
 
 # `av` is the `media` OPTIONAL extra, exactly like torch: the base package is media-free

@@ -4,8 +4,8 @@ INVARIANT (decision #713 — package code is UNTRUSTED): this module never impor
 compiles or evaluates a package module. No `importlib`, no `sys.path`, no `exec`/`eval`/
 `compile`, no annotation evaluation, no module top level. It reads text, parses it with
 `ast`, follows the package's own module-scope import graph (plus cozy-runtime's own source
-for `cozy_runtime.derive.*`), folds constants with its own evaluator over literal and
-arithmetic nodes and the values of the package's own committed JSON data assets
+for `cozy_runtime.derive.*` and `cozy_runtime.models.*`), folds constants with its own
+evaluator over literal and arithmetic nodes and the values of the package's own committed JSON data assets
 (`author.data_values`), and translates every interface-bearing declaration into real types built
 from the CLOSED author vocabulary — `msgspec.defstruct`, `enum.Enum`, `typing.Literal`/
 `Annotated`, cozy-runtime's own asset, marker and service classes. Rendering is then
@@ -76,7 +76,7 @@ class Module:
     tree: ast.Module
     is_package: bool
     trusted: bool
-    """cozy-runtime's own source (`cozy_runtime.derive.*`): followed for types and constants,
+    """cozy-runtime's own derive/model-library source: followed for types and constants,
     never scanned for registrations."""
     bindings: dict[str, ast.stmt] = field(default_factory=dict)
 
@@ -153,7 +153,12 @@ _VOCAB_MODULES = {
     "enum": "enum",
     "cozy_runtime.author": "author",
 }
-_TRUSTED_ROOT = "cozy_runtime.derive"
+_TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.models")
+
+
+def _trusted_module(name: str) -> bool:
+    return any(name == root or name.startswith(root + ".") for root in _TRUSTED_ROOTS)
+
 #: The entry-point group `discovery.py` reads. A distribution that declares one IS a cozy
 #: package; every other distribution beside it — torch included — is not, and is never read.
 _APPLICATION_GROUP = "[cozy.application]"
@@ -269,7 +274,7 @@ class Reader:
     def module(self, name: str, *, where: tuple[Module, ast.AST] | None = None) -> Module:
         if (loaded := self.modules.get(name)) is not None:
             return loaded
-        trusted = name == _TRUSTED_ROOT or name.startswith(_TRUSTED_ROOT + ".")
+        trusted = _trusted_module(name)
         roots = (self.runtime_root,) if trusted else self.roots
         parts = name.split(".")
         for root in roots:
@@ -444,7 +449,7 @@ class Reader:
     def _module_binding(self, module: Module, target: str, stmt: ast.stmt) -> Resolved:
         if target in _VOCAB_MODULES:
             return VocabModule(_VOCAB_MODULES[target])
-        if target.startswith(_TRUSTED_ROOT) or self._tree_tops(target):
+        if _trusted_module(target) or self._tree_tops(target):
             return ModuleRef(self.module(target, where=(module, stmt)))
         return External(target)
 
@@ -455,9 +460,9 @@ class Reader:
             self.refuse(module, stmt, "a relative import above the package", "static_module")
         if base in _VOCAB_MODULES:
             return Vocab(f"{_VOCAB_MODULES[base]}.{name}")
-        if base.startswith("cozy_runtime.") and not base.startswith(_TRUSTED_ROOT):
+        if base.startswith("cozy_runtime.") and not _trusted_module(base):
             return External(f"{base}.{name}")
-        if not (base.startswith(_TRUSTED_ROOT) or self._tree_tops(base)):
+        if not (_trusted_module(base) or self._tree_tops(base)):
             return External(f"{base}.{name}")
         source = self.module(base, where=(module, stmt))
         if source.bindings.get(name) is stmt:
