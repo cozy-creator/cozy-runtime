@@ -12,6 +12,8 @@ class AttentionContext:
     backend still requires Runtime's kernel validation; unavailable choices refuse.
     Activation dtype comes from projection output contracts, with an ordinary floating
     Linear fallback (no external autocast). Unknown/mismatched contracts are empty.
+    Processors without per-site dispatch have empty eligible/recommended values.
+    Return None to leave them unchanged; an explicit choice refuses.
     Weight storage precision is deliberately separate from attention activation dtype.
     """
 
