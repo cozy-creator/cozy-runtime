@@ -9,7 +9,11 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
-from cozy_runtime.internal.encoding.formats import SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM
+from cozy_runtime.internal.encoding.formats import (
+    SPEC_ROWWISE,
+    SPEC_ROWWISE_KEEPDIM,
+    RowwiseDequant,
+)
 from cozy_runtime.internal.lora_merge import MergeAdapter, merge_rowwise_fp8
 
 torch = pytest.importorskip("torch")
@@ -261,3 +265,54 @@ def test_grow_preserves_valid_subnormal_grid_without_unnecessary_enlargement() -
     assert torch.equal(tile.data.view(torch.uint8), data.view(torch.uint8))
     assert torch.equal(tile.scale, scale)
     assert tile.error.changed_scale_rows == 0
+
+
+def test_finite_target_cannot_emit_nonfinite_fp8_reconstruction() -> None:
+    maximum = torch.tensor(torch.finfo(torch.float32).max)
+    scale = torch.nextafter(maximum / 448, torch.tensor(float("inf"))).reshape(1)
+    # Independent arithmetic shows the nearest top grid point exceeds FP32,
+    # although the original zero weight, scale, factor and target are finite.
+    assert float(scale.double() * 448) > float(maximum)
+    data = torch.zeros(1, 1).to(torch.float8_e4m3fn)
+    iterator = merge_rowwise_fp8(
+        data,
+        scale,
+        [MergeAdapter(maximum.reshape(1, 1), torch.ones(1, 1))],
+        encoding_spec=SPEC_ROWWISE,
+        scale_policy="preserve",
+    )
+    assert iterator is not None
+    with pytest.raises(ValueError, match="nonfinite reconstructed"):
+        list(iterator)
+
+
+def test_signed_zero_scale_decode_and_positive_grid_policy_are_distinct() -> None:
+    data = torch.tensor([[1, 2], [3, 4]], dtype=torch.float32).to(torch.float8_e4m3fn)
+    scale = torch.tensor([-0.5, 0.0])
+    reference = torch.empty(2, 2)
+    RowwiseDequant(SPEC_ROWWISE).decode(torch, {"data": data, "scale": scale}, reference)
+    torch.testing.assert_close(reference, torch.tensor([[-0.5, -1.0], [0.0, 0.0]]))
+    zero_values = MergeAdapter(torch.zeros(1, 2), torch.ones(2, 1))
+    iterator = merge_rowwise_fp8(
+        data, scale, [zero_values], encoding_spec=SPEC_ROWWISE, scale_policy="recalibrate"
+    )
+    assert iterator is not None
+    tile = next(iterator)
+    torch.testing.assert_close(tile.data.float() * tile.scale[:, None], reference)
+    for policy in ("preserve", "grow"):
+        iterator = merge_rowwise_fp8(
+            data, scale, [zero_values], encoding_spec=SPEC_ROWWISE, scale_policy=policy
+        )
+        assert iterator is not None
+        with pytest.raises(ValueError, match="strictly positive"):
+            list(iterator)
+        assert (
+            merge_rowwise_fp8(
+                data,
+                scale,
+                [MergeAdapter(zero_values.a, zero_values.b, strength=0)],
+                encoding_spec=SPEC_ROWWISE,
+                scale_policy=policy,
+            )
+            is None
+        )

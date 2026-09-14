@@ -41,6 +41,21 @@ while preserving the old grid keeps the tested zero-update codes unchanged.
 A separate overflow control refuses preservation at 449 with original unit
 scale, then proves grow-only expands enough to represent the value.
 
+The registry's rowwise value law and existing `RowwiseDequant` decoder multiply
+by the FP32 scale without imposing a positive-value restriction. Recalibration
+therefore deliberately accepts finite negative/zero multipliers when their
+decoded base is finite. Preserve/grow are narrower positive-grid operations and
+refuse other scales; that refusal does not label the original encoding invalid.
+A zero-strength graft still checks finite scales and leaves the unchanged base
+under its existing validity responsibility. Tests exercise the actual decoder
+and these distinct policy boundaries.
+
+Before emitting any active-merge tile or statistics, the helper requires finite
+scales and finite reconstructed FP32 values. A finite target and scale alone are
+insufficient: rounding onto a top FP8 grid point can overflow reconstruction.
+An independently constructed FP32-extreme case demonstrated that failure and
+now refuses before the caller can commit the tile.
+
 ## Ownership and memory
 
 The caller owns immutable input parts and a native TensorFS transaction. It
@@ -75,7 +90,7 @@ measure error relative to the update and the actual linear outputs.
 
 ## CPU evidence and remaining proof
 
-Eight focused cases use independent dense algebra and an enumerated E4M3FN value
+Ten focused cases use independent dense algebra and an enumerated E4M3FN value
 table: orientation/alpha/scales, mixed-factor strengths, FP32 preservation, row
 tails and chunk byte invariance, ordered cancellation, zero/finiteness and
 shape/spec/budget/overflow refusal. Input tensors remain unchanged. They run

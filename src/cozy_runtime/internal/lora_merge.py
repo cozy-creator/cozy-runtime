@@ -204,7 +204,10 @@ def _merge_tiles(
                 )
         codes = normalized.clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
         del normalized
-        error = codes.to(torch.float32).mul_(scales[:, None]).sub_(merged)
+        error = codes.to(torch.float32).mul_(scales[:, None])
+        if not bool(torch.isfinite(scales).all()) or not bool(torch.isfinite(error).all()):
+            raise ValueError("FP8 re-encoding produced nonfinite reconstructed weights or scales")
+        error.sub_(merged)
         stats = MergeError(
             squared_error=_sum_squares(error, torch),
             squared_reference=_sum_squares(merged, torch),
