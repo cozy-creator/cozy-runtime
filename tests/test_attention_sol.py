@@ -32,7 +32,7 @@ def test_invalid_layout_refuses(fields: tuple[Any, Any, Any]) -> None:
         AttentionLayout(*fields)
 
 
-def test_real_module_hooks_restore_site_after_failure() -> None:
+def test_real_module_forward_scope_restores_site_after_failure() -> None:
     torch = pytest.importorskip("torch")
 
     class Failing(torch.nn.Module):  # type: ignore[name-defined, misc]
@@ -43,7 +43,7 @@ def test_real_module_hooks_restore_site_after_failure() -> None:
     module = Failing()
     attention_sol.install_site(module, "dit", "blocks.2.attn")
     attention_sol.install_site(module, "dit", "blocks.2.attn")
-    assert len(module._forward_pre_hooks) == len(module._forward_hooks) == 1
+    assert len(module._forward_pre_hooks) == len(module._forward_hooks) == 0
     with pytest.raises(RuntimeError, match="forward failure"):
         module(torch.ones(1))
     assert attention_sol._SITE.get() is None
@@ -51,7 +51,7 @@ def test_real_module_hooks_restore_site_after_failure() -> None:
         attention_sol.install_site(module, "dit", "blocks.3.attn")
     with pytest.raises(ValueError, match="another Sol site"):
         attention_sol.remove_site(module, "dit", "blocks.3.attn")
-    assert len(module._forward_pre_hooks) == len(module._forward_hooks) == 1
+    assert len(module._forward_pre_hooks) == len(module._forward_hooks) == 0
     attention_sol.remove_site(module, "dit", "blocks.2.attn")
     assert len(module._forward_pre_hooks) == len(module._forward_hooks) == 0
     assert not hasattr(module, "_cozy_sol_site")

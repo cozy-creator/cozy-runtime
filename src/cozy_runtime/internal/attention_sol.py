@@ -9,9 +9,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar, Token
+from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import wraps
 from importlib import import_module
+from inspect import Parameter, Signature, signature
+from types import MethodType
 from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
@@ -60,46 +63,87 @@ def dense_identity() -> str:
     return _DENSE_IDENTITY
 
 
+@dataclass(frozen=True, slots=True)
+class _InstalledSite:
+    site: Site
+    forward: Callable[..., Any]
+    original: Callable[..., Any]
+    bind_original: bool
+    had_instance_forward: bool
+    prior_instance_forward: Any
+
+
 def install_site(module: Any, component: str, path: str) -> None:
-    """Attach site metadata without changing a processor or global attention choice."""
+    """Scope the actual forward, after pre-hooks and before post-hooks.
+
+    Paired hooks cannot identify an invocation whose pre-hook never ran: an
+    always-call post-hook can consume an outer recursive call's token. A local
+    try/finally around the real forward has exactly one token per entered call.
+    """
     site = Site(component, path)
     existing = getattr(module, "_cozy_sol_site", None)
     if existing is not None:
-        if existing[0] != site:
+        if existing.site != site:
             raise ValueError("attention module was already assigned another Sol site")
+        if module.forward is not existing.forward:
+            raise ValueError("attention forward was replaced after installing its Sol site")
         return
-    tokens: ContextVar[tuple[Token[Site | None], ...]] = ContextVar(
-        "cozy_sol_site_tokens", default=()
+    original = module.forward
+    bound = isinstance(original, MethodType) and original.__self__ is module
+    call = original.__func__ if bound else original
+    had_forward = "forward" in vars(module)
+    prior = vars(module).get("forward")
+    original_signature = signature(original)
+    self_name = "_cozy_module"
+    while self_name in original_signature.parameters:
+        self_name += "_"
+
+    @wraps(call, updated=())
+    def scoped_forward(self: Any, /, *args: Any, **kwargs: Any) -> Any:
+        # Read the copied module's record rather than closing over a bound method
+        # on the original module. deepcopy must execute the copied weights.
+        installed = self._cozy_sol_site
+        token = _SITE.set(installed.site)
+        try:
+            if installed.bind_original:
+                return installed.original(self, *args, **kwargs)
+            return installed.original(*args, **kwargs)
+        finally:
+            _SITE.reset(token)
+
+    if not bound:
+        # A callable object's metadata must not retain its original mutable state.
+        # Its explicit signature below still preserves the public call contract.
+        del scoped_forward.__wrapped__
+    scoped_forward.__dict__["__signature__"] = Signature(
+        [Parameter(self_name, Parameter.POSITIONAL_ONLY), *original_signature.parameters.values()],
+        return_annotation=original_signature.return_annotation,
     )
-
-    def before(_module: Any, _args: Any) -> None:
-        token = _SITE.set(site)
-        tokens.set((*tokens.get(), token))
-
-    def after(_module: Any, _args: Any, _output: Any) -> None:
-        stack = tokens.get()
-        if stack:
-            tokens.set(stack[:-1])
-            _SITE.reset(stack[-1])
-
-    first = module.register_forward_pre_hook(before)
+    wrapper = MethodType(scoped_forward, module)
+    module.forward = wrapper
     try:
-        second = module.register_forward_hook(after, always_call=True)
+        module._cozy_sol_site = _InstalledSite(site, wrapper, call, bound, had_forward, prior)
     except BaseException:
-        first.remove()
+        if had_forward:
+            module.forward = prior
+        else:
+            del module.forward
         raise
-    module._cozy_sol_site = site, first, second
 
 
 def remove_site(module: Any, component: str, path: str) -> None:
-    """Remove only the expected site's paired hooks after a request override."""
+    """Restore the previous forward only while our exact wrapper still owns it."""
     existing = getattr(module, "_cozy_sol_site", None)
     if existing is None:
         return
-    if existing[0] != Site(component, path):
+    if existing.site != Site(component, path):
         raise ValueError("attention module is assigned another Sol site")
-    existing[1].remove()
-    existing[2].remove()
+    if module.forward is not existing.forward:
+        raise ValueError("attention forward was replaced after installing its Sol site")
+    if existing.had_instance_forward:
+        module.forward = existing.prior_instance_forward
+    else:
+        del module.forward
     del module._cozy_sol_site
 
 
