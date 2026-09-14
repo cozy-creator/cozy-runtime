@@ -58,6 +58,10 @@ def render_arguments(
 ) -> dict[str, Any]:
     """Separate the observed checkpoint binding from the workload's ordinary inputs."""
     arguments = dict(intent["request"])
+    _check(
+        spec.get("payload_digest")
+        == documents.spell(hashlib.sha256(canonical_json.encode(arguments)).digest())
+    )
     if "job" in spec:
         models = [
             row
@@ -79,6 +83,7 @@ def render_arguments(
     serving = spec["serving"]
     _check(
         serving["bindings_digest"] == placement["bindings_digest"]
+        and spec["environment_digest"] == placement["environment_digest"]
         and placement["package_interface"]["digest"] == intent["interface_digest"]
     )
     entries = [

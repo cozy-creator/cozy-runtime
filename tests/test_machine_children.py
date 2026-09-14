@@ -155,6 +155,97 @@ async def nested(ctx: Context, payload: Request) -> Result:
 """
 
 
+MODELED_SERVING_SOURCE = (
+    "from cozy_runtime.author import ActivationCapture, Config, Telemetry, uses_components\n"
+    + MODEL_SOURCE.replace(
+        "        del loader",
+        "        self.pipe = loader.construct(Pipeline, factory=build_pipeline)\n"
+        "    @uses_components('body')\n"
+        "    def infer(self, n, tel):\n"
+        "        import torch\n"
+        "        body = self.pipe.components['body']\n"
+        "        on_step = tel.step_callback(1, stage='denoise')\n"
+        "        with torch.inference_mode():\n"
+        "            value = body(torch.ones((1,32), dtype=torch.float16,\n"
+        "                                    device=body.layer.weight.device))\n"
+        "            assert bool(torch.isfinite(value).all())\n"
+        "        on_step(0)\n"
+        "        return int(value.shape[1])",
+    ).replace(
+        "    return await consume(model=first)",
+        "    call = generate(model=first, n=n, capture=ActivationCapture(('body',), (0,)))\n"
+        "    result = await call\n"
+        "    assert call.observation.environment.worker_boot_id\n"
+        "    assert call.observation.capture.tree is not None\n"
+        "    return result",
+    )
+    + """
+class Pipeline:
+    def __init__(self):
+        import torch
+        class Body(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = torch.nn.Linear(32, 16, dtype=torch.float16)
+            def forward(self, value):
+                return self.layer(value)
+        self.components = {'body': Body()}
+def build_pipeline(config: Config) -> Pipeline:
+    return Pipeline()
+@invocable
+async def generate(ctx: Context, tel: Telemetry, *, model: Source, n: int) -> Result:
+    return Result(model.infer(n, tel))
+app.entrypoint(generate)
+"""
+)
+
+
+MODELED_MEDIA_SOURCE = (
+    "from cozy_runtime.author import ImageAsset, Outputs, Tree\n"
+    + MODELED_SERVING_SOURCE.replace(
+        "class Result(msgspec.Struct):\n    value: int",
+        "class Result(msgspec.Struct):\n    value: int\n"
+        "class Render(msgspec.Struct):\n    value: int\n    image: ImageAsset\n"
+        "class Media(msgspec.Struct):\n    value: int\n    image: ImageAsset\n    capture: Tree",
+    )
+    .replace("        return int(value.shape[1])", "        return value")
+    .replace(
+        "async def compose(ctx: Context, *, n: int) -> Result:",
+        "async def compose(ctx: Context, *, n: int) -> Media:",
+    )
+    .replace(
+        "async def nested(ctx: Context, payload: Request) -> Result:",
+        "async def nested(ctx: Context, payload: Request) -> Media:",
+    )
+    .replace(
+        "async def generate(ctx: Context, tel: Telemetry, *, model: Source, n: int) -> Result:",
+        "async def generate(ctx: Context, tel: Telemetry, out: Outputs,\n"
+        "                   *, model: Source, n: int) -> Render:",
+    )
+    .replace(
+        "    return Result(model.infer(n, tel))",
+        "    from PIL import Image\n"
+        "    value = model.infer(n, tel)\n"
+        "    pixels = (value.reshape(4,4).float().sigmoid().cpu().numpy()*255).astype('uint8')\n"
+        "    return Render(16, out.save_image(Image.fromarray(pixels).convert('RGB')))",
+    )
+    .replace(
+        "    call = generate(model=first, n=n, capture=ActivationCapture(('body',), (0,)))\n"
+        "    result = await call\n"
+        "    assert call.observation.environment.worker_boot_id\n"
+        "    assert call.observation.capture.tree is not None\n"
+        "    return result",
+        "    for render_n in (1,2,3,4,5,6,7,8) * 3:\n"
+        "        call = generate(model=first, n=render_n,\n"
+        "                        capture=ActivationCapture(('body',), (0,)))\n"
+        "        result = await call\n"
+        "        assert call.observation.environment.worker_boot_id\n"
+        "        assert call.observation.capture.tree is not None\n"
+        "    return Media(result.value, result.image, call.observation.capture.tree)",
+    )
+)
+
+
 def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread]:
     fixture = Path(__file__).parent / "testdata/native_source"
     body = (fixture / "first.safetensors").read_bytes()
@@ -210,13 +301,28 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
         "source",
         "file",
         "serving",
+        "serving_model",
+        "serving_media",
     ],
 )
 def test_nested_capture_and_leaf_memoization_without_control_stream(
-    monkeypatch: pytest.MonkeyPatch, case: str
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    proof_gate: Path | None = None,
+    proof_info: Path | None = None,
 ) -> None:
     import test_job_preparation_isolation as fixture
     from conftest import image_python
+
+    if case in ("serving_model", "serving_media"):
+        import importlib.util
+
+        if importlib.util.find_spec("torch") is None:
+            pytest.skip("modeled serving requires the Torch image qualification environment")
+        import torch
+
+        if torch.version.cuda is None or not torch.cuda.is_available():
+            pytest.skip("modeled serving requires a CUDA-capable qualification environment")
 
     with tempfile.TemporaryDirectory(prefix="cz-child.") as directory:
         root = Path(directory)
@@ -244,9 +350,30 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
         if case == "file":
             source = FILE_SOURCE
         if case == "serving":
-            source = SOURCE.replace("@invocable(memoize=True)", "@invocable").replace(
-                "app.job(leaf)", "app.entrypoint(leaf)"
+            source = (
+                SOURCE.replace("@invocable(memoize=True)", "@invocable")
+                .replace("app.job(leaf)", "app.entrypoint(leaf)")
+                .replace(
+                    "    first = await leaf(n=n)",
+                    "    call = leaf(n=n)\n"
+                    "    first = await call\n"
+                    "    assert call.observation.environment.worker_boot_id\n",
+                )
             )
+        if case == "serving_model":
+            source = MODELED_SERVING_SOURCE
+        if case == "serving_media":
+            source = MODELED_MEDIA_SOURCE
+            if proof_gate is not None:
+                source = source.replace(
+                    "    return Media(result.value, result.image, call.observation.capture.tree)",
+                    "    from pathlib import Path\n    import asyncio\n"
+                    + f"    ready = Path({str(proof_gate.with_suffix('.ready'))!r})\n"
+                    + "    ready.write_text(ctx.request_id)\n"
+                    + f"    while not Path({str(proof_gate)!r}).exists():\n"
+                    + "        ctx.raise_if_cancelled()\n        await asyncio.sleep(0.05)\n"
+                    + "    return Media(result.value, result.image, call.observation.capture.tree)",
+                )
         if case == "source":
             source = source.replace(
                 'return Result(len(view.components["body"]))',
@@ -309,6 +436,19 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             GrpcControlHost("127.0.0.1:0", root / "address"),
         )
         thread = threading.Thread(target=worker.run, daemon=True)
+        if proof_info is not None:
+            proof_info.write_text(
+                json.dumps(
+                    {
+                        "root": str(root),
+                        "store": str(root / "store"),
+                        "artifacts": str(root / "artifacts"),
+                        "owner": "owner",
+                        "gate": str(proof_gate),
+                        "ready": str(proof_gate.with_suffix(".ready")) if proof_gate else "",
+                    }
+                )
+            )
         origin = native_origin(worker) if case == "source" else None
         try:
             fixture.measure(worker, preparation)
@@ -347,7 +487,9 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                             entrypoint=export,
                         )
                         for export in (
-                            ("compose", "consume", "leaf")
+                            ("compose", "consume", "generate", "leaf")
+                            if case in ("serving_model", "serving_media")
+                            else ("compose", "consume", "leaf")
                             if case in ("model", "model_result", "model_admission", "source")
                             else ("compose", "leaf")
                         )
@@ -361,7 +503,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             ]
             binding = JobBinding.read(next(row for row in plans if row.get("job") == "nested"))
             thread.start()
-            deadline = time.monotonic() + 60
+            deadline = time.monotonic() + (960 if case == "serving_media" or proof_gate else 60)
             while not (root / "address").exists():
                 assert thread.is_alive() and time.monotonic() < deadline
                 time.sleep(0.02)
@@ -376,11 +518,11 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 LocalRequest(
                     entrypoint="nested",
                     payload={},
-                    outputs=(),
+                    outputs=("image", "capture") if case == "serving_media" else (),
                     kind="job",
                     request_id="root",
                     job_descriptor_id=binding.job_descriptor_id,
-                    timeout_ms=45_000,
+                    timeout_ms=900_000 if case == "serving_media" or proof_gate else 45_000,
                 ),
                 {},
                 root / "grants",
@@ -494,6 +636,22 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             assert not worker.stop.is_set()
             import base64
 
+            if case == "serving_media":
+                value = canonical_json.decode(base64.b64decode(body["result"]["inline_result"]))
+                assert (
+                    value["value"] == 16
+                    and value["image"]["kind"] == "image"
+                    and value["capture"]["kind"] == "tree"
+                )
+                assert {output["output_id"] for output in body["output_manifest"]["outputs"]} == {
+                    "image",
+                    "capture",
+                }
+                assert worker.workspace is not None
+                with worker.workspace.locked() as db:
+                    assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 27
+                    assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == 1
+                return
             if case == "model_result":
                 import tensorfs
 
@@ -528,16 +686,26 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 )
                 return
             assert canonical_json.decode(base64.b64decode(body["result"]["inline_result"])) == {
-                "value": 1 if case == "source" else 2 if case == "model" else 12
+                "value": 16
+                if case == "serving_model"
+                else 1
+                if case == "source"
+                else 2
+                if case == "model"
+                else 12
             }
             assert not worker.connected.is_set()
             assert worker.workspace is not None
             with worker.workspace.locked() as db:
                 assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == (
-                    2 if case == "source" else 4 if case in ("model", "serving") else 3
+                    2
+                    if case == "source"
+                    else 4
+                    if case in ("model", "serving", "serving_model")
+                    else 3
                 )
                 assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == (
-                    4 if case in ("model", "source") else 3
+                    4 if case in ("model", "source", "serving_model") else 3
                 )
                 assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == (
                     2 if case == "source" else 0 if case == "serving" else 1

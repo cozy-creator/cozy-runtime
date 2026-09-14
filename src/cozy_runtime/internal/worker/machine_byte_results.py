@@ -55,16 +55,23 @@ def retain(
     value: Any,
     schema: Any,
     outputs: list[dict[str, Any]],
+    *,
+    capture: bool = False,
 ) -> None:
     by_id = {entry["output_id"]: entry for entry in outputs}
-    for path, _ in paths(schema):
+    fields = list(paths(schema))
+    if capture:
+        fields.append(("runtime.capture", 64 << 20))
+    for path, _ in fields:
         entry = by_id.get(path)
-        node = result_at(value, path)
+        node = result_at(value, path) if path != "runtime.capture" else None
         if (
             entry is None
             or "native_tree" not in entry
-            or not isinstance(node, dict)
-            or node.get("digest") != entry["digest"]
+            or (
+                path != "runtime.capture"
+                and (not isinstance(node, dict) or node.get("digest") != entry["digest"])
+            )
         ):
             raise WorkspaceRefusal("typed child output lacks its exact native result entry")
         native = entry["native_tree"]
@@ -77,17 +84,26 @@ def retain(
             ),
             content_bytes=native["content_bytes"],
         )
-        if node.get("size_bytes") != ref.content_bytes:
+        if node is not None and node.get("size_bytes") != ref.content_bytes:
             raise WorkspaceRefusal("typed child output length differs from native custody")
         machine_models.retain_bytes(workspace, owner, parent, f"call.{index}.output/{path}", ref)
 
 
 def grants(
-    workspace: Workspace, owner: str, parent: str, index: int, schema: Any
+    workspace: Workspace,
+    owner: str,
+    parent: str,
+    index: int,
+    schema: Any,
+    *,
+    capture: bool = False,
 ) -> list[pb.ChildByteResultGrant]:
     result = []
     with workspace.locked() as db:
-        for path, _ in paths(schema):
+        fields = list(paths(schema))
+        if capture:
+            fields.append(("runtime.capture", 64 << 20))
+        for path, _ in fields:
             registered = db.execute(
                 "SELECT retention FROM execution_model_holds "
                 "WHERE owner=? AND recipient=? AND path=?",
