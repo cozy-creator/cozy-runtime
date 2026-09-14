@@ -638,8 +638,8 @@ def _trees(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any]]:
                     queue.append((name, item, depth + 1))
 
 
-def _site_records(roots: Mapping[str, Any]) -> Iterator[tuple[str, str, Any, Any]]:
-    """Stable component/module paths with their actual Diffusers processor objects."""
+def _attention_records(roots: Mapping[str, Any]) -> Iterator[tuple[str, str, Any, Any]]:
+    """All Diffusers attention processors, including those with no backend dispatch."""
     try:
         from diffusers.models.attention import AttentionModuleMixin
         from diffusers.models.attention_processor import Attention, MochiAttention
@@ -653,6 +653,20 @@ def _site_records(roots: Mapping[str, Any]) -> Iterator[tuple[str, str, Any, Any
             if id(module) not in seen and isinstance(module, classes) and processor is not None:
                 seen.add(id(module))
                 yield component, path, module, processor
+
+
+def _site_records(roots: Mapping[str, Any]) -> Iterator[tuple[str, str, Any, Any]]:
+    """Only processors implementing Diffusers' per-site backend selection contract."""
+    for record in _attention_records(roots):
+        if hasattr(record[3], "_attention_backend"):
+            yield record
+
+
+def _unmanaged_reason(component: str, path: str, processor: Any) -> str:
+    return (
+        f"{component}/{path} uses {type(processor).__name__}, which has no per-site "
+        "attention backend selection"
+    )
 
 
 def _sites(roots: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any]]:
@@ -776,7 +790,7 @@ def line(
     """The boot line, from the facts alone — so a GROUP prepare renders the same sentence from
     its merged facts as a single one does from its own `Applied` (cr-124)."""
     if not totals:
-        return "NONE — this construction holds no diffusers attention site"
+        return "NONE — this construction holds no backend-selectable diffusers attention site"
     chosen = ", ".join(f"{name} x{sites}" for name, sites in sorted(totals.items()))
     where = "; ".join(
         f"{component}: {'+'.join(sorted(kernels))}" for component, kernels in sorted(hosts.items())
@@ -876,10 +890,35 @@ def install(
     resolved = {entry.name: entry for entry in ready}
     matched = False
     eligible_sites: dict[tuple[str, int], tuple[str, ...]] = {}
-    for component, path, module, processor in _site_records(roots):
+    for component, path, module, processor in _attention_records(roots):
         dtype, head_dim = _dtype(module), _head_dim(module)
         forced = bool(name and _matches(component, scope))
         matched |= forced
+        if not hasattr(processor, "_attention_backend"):
+            reason = _unmanaged_reason(component, path, processor)
+            if forced:
+                raise AttentionRefusal("attention_kernel_unsupported", reason)
+            if choose is not None:
+                assert device is not None
+                selection = choose(
+                    AttentionContext(
+                        component,
+                        path,
+                        device.kind,
+                        device.name,
+                        device.sm,
+                        dtype,
+                        head_dim,
+                        degree,
+                        (),
+                        "",
+                        reason,
+                    )
+                )
+                if selection is not None:
+                    raise AttentionRefusal("attention_kernel_unsupported", reason)
+            continue
+
         offered = [
             entry
             for entry in ready
@@ -1086,7 +1125,11 @@ def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str 
     if unsupported:
         raise AttentionRefusal("attention_kernel_unsupported", unsupported)
     sites = 0
-    for component, module, _ in _sites(selected):
+    for component, path, module, processor in _attention_records(selected):
+        if not hasattr(processor, "_attention_backend"):
+            raise AttentionRefusal(
+                "attention_kernel_unsupported", _unmanaged_reason(component, path, processor)
+            )
         dtype, head_dim = _dtype(module), _head_dim(module)
         if not _admits(candidate, dtype, head_dim):
             raise _site_refusal(candidate.name, component, dtype, head_dim)

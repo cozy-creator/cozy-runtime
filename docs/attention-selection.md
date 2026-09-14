@@ -71,3 +71,10 @@ dense reference and request-local sparse, dense-step, dense-path and dense-prefi
 call counts. A Turbo request whose policy stays dense is therefore not evidence
 of sparse acceleration. Request-owned Sol hooks are removed even if applying or
 executing an override fails; prepared Sol hooks remain owned by the generation.
+
+Legacy Diffusers processors such as `AttnProcessor2_0` call SDPA directly and have
+no per-site backend selection contract. Runtime leaves them untouched and does not
+report an installed backend for them. Model policies receive an empty `eligible`
+and `recommended` context explaining this limitation. Explicit matching pins or
+policy choices refuse, including components mixing managed and legacy processors;
+Runtime never creates an unused processor attribute to claim partial coverage.

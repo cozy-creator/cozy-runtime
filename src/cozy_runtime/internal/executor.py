@@ -1497,7 +1497,7 @@ class Executor:
                 and scope
                 and not any(
                     attention._matches(component, scope)
-                    for component, _, _ in attention._sites(roots)
+                    for component, _, _, _ in attention._attention_records(roots)
                 )
             ):
                 pin = ""
