@@ -1129,10 +1129,10 @@ class Worker:
             except Exception:
                 self.supervision.close()
                 raise
-        # Exact code/PackageInterface/Environment revisions prepared over the loopback seam.
-        # This is same-process admission state, not a Runtime journal. After worker restart the
-        # RecordOwner replays preparation before a model-bound PlacementSet can join it.
-        self.local_revisions: dict[tuple[str, str], Placement] = {}
+        # Exact code/interface/environment revisions prepared over the existing seam.
+        # Captured machine executions persist their immutable receipt and restore this
+        # same inventory after restart, independent of their code's publication origin.
+        self.prepared_revisions: dict[tuple[str, str], Placement] = {}
         self.local_operations: dict[tuple[str, str], Placement] = {}
         self.claim_ready = threading.Event()
         if options.claim_ready:
@@ -1986,10 +1986,11 @@ class Worker:
                     "prepared Placement changed the declared local revision",
                 )
             self.local_operations[(request.operation_id, revision)] = stored
-            self.local_revisions[(stored.placement_id, revision)] = stored
+            self.prepared_revisions[(stored.placement_id, revision)] = stored
             return result
         assert isinstance(request, pb.PreparePackageSetRequest)
-        return package_prepare.prepare_package_set(
+        published: list[package_environment.InstalledEnvironment] = []
+        result = package_prepare.prepare_package_set(
             request,
             artifact_cache=Path(self.options.artifact_cache or ""),
             tensorfs_root=Path(self.options.tensorfs_root or ""),
@@ -2002,7 +2003,20 @@ class Worker:
             preinstalled_python=Path(self.options.environment_python)
             if self.options.environment_python is not None
             else None,
+            materialized=published.append,
+            dependency_cache=self.config.dependency_cache,
         )
+        entries = read_placement_set(result.placement_set)
+        if len(entries) != 1 or not entries[0].get("package") or len(published) != 1:
+            raise package_prepare.PreparationRefusal(
+                "published_package_result_invalid", "published preparation needs one exact revision"
+            )
+        stored = self._placement_from_entry(entries[0], result.placement_set.placement_set_digest)
+        stored.installed = published[0]
+        self.prepared_revisions[
+            (stored.placement_id, documents.spell(stored.environment_digest))
+        ] = stored
+        return result
 
     def numerical_environment(self) -> bytes:
         from cozy_runtime.internal.numerical_environment import fingerprint
@@ -4401,9 +4415,12 @@ class Worker:
                 terminal=True,
             )
             return None
-        if placement.development:
-            local_revision = str(placement.development.get("local_revision_digest", ""))
-            prepared = self.local_revisions.get((placement.placement_id, local_revision))
+        from .machine_capture import code_identity
+
+        prepared = self.prepared_revisions.get(
+            (placement.placement_id, code_identity(placement.document))
+        )
+        if placement.development or prepared is not None:
             if prepared is None:
                 self._materialization_failed(
                     placement,
@@ -4417,6 +4434,7 @@ class Worker:
                 )
                 return None
             core_fields = (
+                "package",
                 "development",
                 "environment_digest",
                 "environment",

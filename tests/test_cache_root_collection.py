@@ -24,7 +24,7 @@ def worker(tmp_path: Path, *, owns: bool = True) -> Any:
         pending=None,
         hosted={},
         pending_hosted=[],
-        local_revisions={},
+        prepared_revisions={},
         local_operations={},
         accepted=SimpleNamespace(desired_state_body=b"", accepted_desired_state_revision=1),
         held_manifests=SimpleNamespace(rebuild=lambda _: None),
@@ -43,7 +43,7 @@ def test_collection_protects_active_intent_without_treating_prepared_metadata_as
     w.pending = placement("pending")
     w.hosted = {"hosted": SimpleNamespace(placement=placement("hosted"))}
     w.pending_hosted = [placement("incoming").document]
-    w.local_revisions = {"revision": placement("revision")}
+    w.prepared_revisions = {"revision": placement("revision")}
     w.local_operations = {"operation": placement("operation")}
     calls = []
 
