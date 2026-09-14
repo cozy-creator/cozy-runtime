@@ -547,6 +547,7 @@ class Workspace:
                 raise WorkspaceRefusal("outcome has no unchanged accepted execution")
             if row["state"] == "released":
                 return
+            from .tree_members import PROJECTION_PREFIX, recorded_projection
             from .workspace_byte_outputs import recorded_native, reference
 
             output_rows = db.execute(
@@ -557,7 +558,12 @@ class Workspace:
             if body["status"] == pb.OUTCOME_STATUS_SUCCEEDED:
                 returned_rows = []
                 for output in output_rows:
-                    if output["native_service_id"]:
+                    if output["slot"].startswith(PROJECTION_PREFIX):
+                        if not recorded_projection(db, output):
+                            raise WorkspaceRefusal(
+                                "terminal tree view has no exact completed native hold"
+                            )
+                    elif output["native_service_id"]:
                         if not recorded_native(db, output, complete=True):
                             raise WorkspaceRefusal(
                                 "terminal source view has no completed native call"

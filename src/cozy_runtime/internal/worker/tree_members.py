@@ -12,13 +12,55 @@ from cozy_runtime.author._assets import file_state
 from cozy_runtime.author._errors import RuntimeFailure
 from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, admits, sniff
 from cozy_runtime.internal.worker import byte_inputs, machine_models, workspace_byte_outputs
-from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import Journal, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
     from .attempts import AttemptRecord
     from .calls import Calls
+
+
+PROJECTION_PREFIX = "runtime.tree_member."
+
+
+def recorded_projection(db: Journal, row: Mapping[str, Any]) -> bool:
+    """An internal view needs its exact committed root and journaled recipient hold."""
+    body = row["manifest_body"]
+    if (
+        row["slot"] != PROJECTION_PREFIX + hashlib.sha256(body).hexdigest()
+        or row["id"] != workspace_byte_outputs.identity(
+            row["owner"], row["request"], row["ordinal"], row["spec"], row["slot"]
+        )
+        or row["state"] != "complete"
+        or row["native_service_id"]
+    ):
+        return False
+    members = workspace_byte_outputs.manifest_members(body, byte_inputs.MAX_BYTES)
+    if len(members) != 1 or members[0]["path"] != "payload":
+        return False
+    source = workspace_byte_outputs.reference(dict(row))
+    retention = pb.DerivedRetentionRequest(
+        weights_transaction_id=source.producer_root_id,
+        tensorfs_receipt_digest=source.receipt_digest,
+        retention_id=machine_models.byte_retention_id(
+            row["owner"], row["request"], row["slot"], source
+        ),
+    )
+    binding = db.execute(
+        "SELECT retention FROM execution_model_holds WHERE owner=? AND recipient=? AND path=?",
+        (row["owner"], row["request"], row["slot"]),
+    ).fetchone()
+    held = db.execute(
+        "SELECT 1 FROM holds WHERE id=? AND owner=? AND transaction_id=? AND native_digest=? "
+        "AND kind='tree' AND state='held'",
+        (retention.retention_id, row["owner"], source.producer_root_id, source.receipt_digest),
+    ).fetchone()
+    return (
+        binding is not None
+        and binding["retention"] == retention.SerializeToString(deterministic=True)
+        and held is not None
+    )
 
 
 def project(calls: Calls, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
@@ -110,7 +152,7 @@ def project(calls: Calls, attempt: AttemptRecord, frame: Mapping[str, Any]) -> d
                     body = canonical_json.encode(
                         {"entries": [{"path": "payload", "kind": "file", "blob": blob}]}
                     )
-                    slot = "runtime.tree_member." + hashlib.sha256(body).hexdigest()
+                    slot = PROJECTION_PREFIX + hashlib.sha256(body).hexdigest()
                     native = workspace_byte_outputs.commit(
                         workspace,
                         calls.owner(),
