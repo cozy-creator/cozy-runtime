@@ -88,9 +88,12 @@ def test_real_upstream_matches_sdpa_and_preserves_inputs(
         pytest.skip(f"adapter does not serve {capability}")
     generator = torch.Generator(device="cuda").manual_seed(6057)
     kv_heads = 2 if grouped else 4
-    q = torch.randn((2, 137, 4, 128), device="cuda", dtype=torch.bfloat16, generator=generator)
-    k = torch.randn((2, 259, kv_heads, 128), device="cuda", dtype=q.dtype, generator=generator)
-    v = torch.randn(k.shape, device="cuda", dtype=q.dtype, generator=generator)
+    # Packed projections leave gaps between heads/tokens, as actual H3 QKV does.
+    q = torch.randn((2, 137, 4, 3, 128), device="cuda", dtype=torch.bfloat16, generator=generator)[
+        :, :, :, 0, :
+    ]
+    kv = torch.randn((2, 259, kv_heads, 3, 128), device="cuda", dtype=q.dtype, generator=generator)
+    k, v = kv[:, :, :, 1, :], kv[:, :, :, 2, :]
     originals = [tensor.clone() for tensor in (q, k, v)]
     mask = None
     if not mixed:
