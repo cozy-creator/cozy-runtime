@@ -67,6 +67,10 @@ packages = ["src/cozy_runtime", "src/cozy"]
 
 [tool.uv]
 package = true
+# The historical SDXL development corpus is qualified against Transformers 4;
+# MiniMax H3's upstream implementation requires Transformers 5. These are separate
+# test/inference environments, not two compatible dependency sets for one venv.
+conflicts = [[{ extra = "corpus" }, { extra = "minimax-h3" }]]
 
 # Read only on the COZY_RUNTIME_BUILD_KERNELS=1 wheel build; the root CMakeLists.txt is
 # the reviewed kernels build (static cudart, abi3, the upstream fleet arch policy).
