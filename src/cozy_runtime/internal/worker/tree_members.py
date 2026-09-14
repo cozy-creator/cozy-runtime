@@ -29,7 +29,8 @@ def recorded_projection(db: Journal, row: Mapping[str, Any]) -> bool:
     body = row["manifest_body"]
     if (
         row["slot"] != PROJECTION_PREFIX + hashlib.sha256(body).hexdigest()
-        or row["id"] != workspace_byte_outputs.identity(
+        or row["id"]
+        != workspace_byte_outputs.identity(
             row["owner"], row["request"], row["ordinal"], row["spec"], row["slot"]
         )
         or row["state"] != "complete"

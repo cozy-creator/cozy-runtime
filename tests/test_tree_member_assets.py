@@ -234,21 +234,33 @@ def terminal_bundle(workspace: Any, parent: Any, hold: Any) -> None:
             invocation_spec_digest=documents.spell(parent.digest),
             status=pb.OUTCOME_STATUS_SUCCEEDED,
             execution_started=True,
-            output_manifest=pb.OutputManifest(outputs=[pb.OutputEntry(
-                output_id="bundle", native_tree=hold.source,
-            )]),
+            output_manifest=pb.OutputManifest(
+                outputs=[
+                    pb.OutputEntry(
+                        output_id="bundle",
+                        native_tree=hold.source,
+                    )
+                ]
+            ),
         )
     )
-    workspace.outcome("owner", pb.AttemptOutcome(
-        request_id=parent.request_id, attempt_ordinal=parent.attempt,
-        invocation_spec_digest=parent.digest, outcome_id="finished",
-        outcome_digest=digest, outcome_canonical_bytes=raw,
-    ))
+    workspace.outcome(
+        "owner",
+        pb.AttemptOutcome(
+            request_id=parent.request_id,
+            attempt_ordinal=parent.attempt,
+            invocation_spec_digest=parent.digest,
+            outcome_id="finished",
+            outcome_digest=digest,
+            outcome_canonical_bytes=raw,
+        ),
+    )
 
 
 @pytest.mark.parametrize("root_input", [False, True])
 def test_projected_members_are_not_required_terminal_outputs(
-    tmp_path: Path, root_input: bool,
+    tmp_path: Path,
+    root_input: bool,
 ) -> None:
     workspace, parent, calls, hold, _, frame = prepared(tmp_path, root_input=root_input)
     assert tree_members.project(calls, parent, frame)["ok"]
@@ -260,7 +272,8 @@ def test_projected_members_are_not_required_terminal_outputs(
 
 @pytest.mark.parametrize("mutation", ["missing_binding", "unfinished_hold", "wrong_slot"])
 def test_projection_exclusion_requires_the_exact_completed_hold(
-    tmp_path: Path, mutation: str,
+    tmp_path: Path,
+    mutation: str,
 ) -> None:
     workspace, parent, calls, hold, _, frame = prepared(tmp_path)
     assert tree_members.project(calls, parent, frame)["ok"]
@@ -270,7 +283,9 @@ def test_projection_exclusion_requires_the_exact_completed_hold(
         elif mutation == "unfinished_hold":
             db.execute("UPDATE holds SET state='retaining'")
         else:
-            db.execute("UPDATE byte_outputs SET slot='runtime.tree_member.changed' "
-                       "WHERE slot LIKE 'runtime.tree_member.%'")
+            db.execute(
+                "UPDATE byte_outputs SET slot='runtime.tree_member.changed' "
+                "WHERE slot LIKE 'runtime.tree_member.%'"
+            )
     with pytest.raises(WorkspaceRefusal):
         terminal_bundle(workspace, parent, hold)
