@@ -1663,7 +1663,9 @@ def _script_annotation(reader: Reader, module: Module, node: ast.expr) -> ast.ex
         if isinstance(part, ast.Name) and part.id not in {*_BUILTIN_TYPES, *imported}:
             reader.refuse(module, part, "script types must be explicitly imported or builtin")
         if isinstance(part, ast.Call):
-            reader.refuse(module, part, "a call in a script annotation", "static_computed")
+            metadata = reader.resolve(module, part.func)
+            if not isinstance(metadata, Vocab) or metadata.key != "author.AssetBound":
+                reader.refuse(module, part, "a call in a script annotation", "static_computed")
     return node
 
 
