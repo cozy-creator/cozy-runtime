@@ -93,7 +93,8 @@ def main() -> None:
 
     result = {
         "scope": (
-            "CPU: real full-size adapter factors; generated base and activations; no GPU/video claim"
+            "CPU: real full-size adapter factors; generated base and activations; "
+            "no GPU/video claim"
         ),
         "versions": {
             name: importlib.metadata.version(name)
