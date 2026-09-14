@@ -127,7 +127,7 @@ def callable_doc(
     doc: dict[str, Json] = {
         "name": name,
         "request": schema.render(payload_type),
-        "result": schema.render(result_type),
+        "result": schema.render(result_type, decoded_bounds=True),
     }
     if models:
         doc["models"] = list(models)
@@ -752,7 +752,7 @@ _SCALARS = frozenset({"bool", "float", "int", "null", "str"})
 _SCHEMA_FORMS = frozenset(
     {"asset", "fields", "input", "list", "literal", "map", "opaque", "tuple", "union"}
 )
-_ASSET_BOUND_KEYS = {"max_bytes", "media_types"}
+_ASSET_BOUND_KEYS = {"max_bytes", "max_decoded_bytes", "media_types"}
 
 
 def counts(body: Mapping[str, Json]) -> dict[str, int]:

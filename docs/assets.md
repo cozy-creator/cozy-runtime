@@ -86,3 +86,19 @@ Forwarding creates independent child custody over that one file. The handle is
 valid only during this attempt. Use `Outputs` to copy it into a declared output
 when exporting it. A manually constructed Tree or a directory path cannot grant
 this capability.
+
+A function returning media can declare its consumer decode bound on the result:
+
+```python
+class SegmentResult(msgspec.Struct):
+    video: Annotated[
+        VideoAsset,
+        AssetBound(max_bytes=256 << 20, max_decoded_bytes=32 << 20),
+    ]
+```
+
+The parent receives that bound with the verified native video, including through
+a generated imported caller, and can use `MediaDecoder.stream_video` directly.
+Without an explicit decoded-byte bound the returned handle remains readable and
+forwardable, but decoding refuses. Result schema metadata carries this bound;
+existing input schema identities remain unchanged.
