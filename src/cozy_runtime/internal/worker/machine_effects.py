@@ -35,17 +35,31 @@ class Effects:
     def __init__(self, workspace: Workspace, executions: Executions, tls: PublicationTLS | None):
         self.workspace, self.executions, self.tls = workspace, executions, tls
         self.journal = Calls(workspace)
-        self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="publication")
         self.lock = threading.Lock()
+        self.thread_ids: set[int] = set()
+        self.pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="publication", initializer=self._register_poller
+        )
         self.active: dict[tuple[str, str], Future[None]] = {}
         self.retry_after: dict[tuple[str, str], float] = {}
         self.cleanup_after: dict[str, tuple[int, str]] = {}
         self.stopped = False
 
+    def _register_poller(self) -> None:
+        with self.lock:
+            self.thread_ids.add(threading.get_native_id())
+
+    @property
+    def pollers(self) -> set[int]:
+        with self.lock:
+            return set(self.thread_ids)
+
     def close(self) -> None:
         with self.lock:
             self.stopped = True
         self.pool.shutdown(wait=True, cancel_futures=True)
+        with self.lock:
+            self.thread_ids.clear()
 
     def schedule(self, owner: str, call: Call) -> None:
         """Queue metadata work, never perform network IO on the worker control lock."""
@@ -73,6 +87,8 @@ class Effects:
                 return
         for call in self.journal.pending_effects(owner):
             self.schedule(owner, call)
+        if self.tls is None:
+            return
         with self.lock:
             key = owner, "cleanup"
             if not self.stopped and len(self.active) < 2 and key not in self.active:
@@ -141,7 +157,25 @@ class Effects:
                 self.journal.complete(owner, call, raw)
             else:
                 self.journal.observe_result(owner, call, raw)
-        except (PublicationRefusal, WorkspaceRefusal, msgspec.ValidationError, ValueError) as exc:
+        except Exception as exc:
+            if not isinstance(
+                exc, (PublicationRefusal, WorkspaceRefusal, msgspec.ValidationError, ValueError)
+            ):
+                # Native failures and credential IO must not silently retry in a
+                # Future. Preserve only stable identifiers, never exception text
+                # that could contain signed URLs, headers or private arguments.
+                native = getattr(exc, "code", "")
+                if native == "STORE_BUSY":
+                    exc = PublicationRefusal("publication.storage_busy", status=503)
+                else:
+                    code = "publication.adapter_failed." + type(exc).__name__
+                    if (
+                        isinstance(native, str)
+                        and 0 < len(native) <= 80
+                        and all(c.isascii() and (c.isalnum() or c == "_") for c in native)
+                    ):
+                        code += "." + native
+                    exc = PublicationRefusal(code[:128])
             latest = self.journal.get(owner, call.parent_request, call.call_index)
             transient = isinstance(exc, PublicationRefusal) and (
                 exc.status in {408, 425, 429} or exc.status >= 500

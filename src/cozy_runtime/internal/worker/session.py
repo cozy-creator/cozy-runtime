@@ -2853,11 +2853,14 @@ class Worker:
         nothing about whether this worker is getting anywhere. Every other thread burns
         only when it works, which is what makes the worker's own burn, less these, an
         honest progress meter for an outside observer."""
-        return {
+        clocks = {
             tid
             for name, tid in self.lane_threads.items()
             if name in ("report", "watchdog", "control-send")
         }
+        if self.machine_effects is not None:
+            clocks.update(self.machine_effects.pollers)
+        return clocks
 
     def applied_posture(self) -> dict[str, Any]:
         """The state the worker was in when something happened (§3.6). `readiness_epoch` is
