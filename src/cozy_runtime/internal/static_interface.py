@@ -5,7 +5,7 @@ compiles or evaluates a package module. No `importlib`, no `sys.path`, no `exec`
 `compile`, no annotation evaluation, no module top level. It reads text, parses it with
 `ast`, follows the package's own module-scope import graph (plus cozy-runtime's own source
 for `cozy_runtime.derive.*` and `cozy_runtime.models.*`), folds constants with its own
-evaluator over literal and arithmetic nodes and the values of the package's own committed JSON data assets
+evaluator over literal and arithmetic nodes and values of the package's committed JSON assets
 (`author.data_values`), and translates every interface-bearing declaration into real types built
 from the CLOSED author vocabulary — `msgspec.defstruct`, `enum.Enum`, `typing.Literal`/
 `Annotated`, cozy-runtime's own asset, marker and service classes. Rendering is then

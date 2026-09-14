@@ -54,6 +54,7 @@ from transformers import (
 )
 
 from cozy_runtime.author import (
+    AttentionLayout,
     Config,
     ConformanceError,
     DecodedAudio,
@@ -62,6 +63,7 @@ from cozy_runtime.author import (
     InvalidRequest,
     OutputError,
     Telemetry,
+    attention_scope,
     canonical_json,
 )
 
@@ -145,6 +147,27 @@ _ASSETS = Path(__file__).resolve().parent
 #: (timestep, modality) pair the step gathers.
 _WARM_ROWS = 8
 _WARM_VIDEO_TAG, _WARM_TEXT_TAG, _WARM_AUDIO_TAG = 0, 1, 2
+
+# NVIDIA's H3 sparse policy protects conditioning and the initial sensitive work.
+# This supplies semantics only; backend selection still requires explicit policy.
+_DENSE_ATTENTION_PATHS = ("token_refiner", "transformer_blocks.0", "transformer_blocks.1")
+
+
+def _attention_layout(state: Any, step: int) -> AttentionLayout:
+    fields = state.denoiser_input_fields
+    # Diffusers packs text, then every reference's video/audio rows, then target
+    # audio/video. Shape/count metadata is host-resident; do not read GPU values.
+    return AttentionLayout(
+        live_tokens=fields["token_tags"].numel(),
+        protected_prefix=(
+            fields["text_indices"].numel()
+            + state.num_condition_video_rows
+            + state.num_condition_audio_rows
+        ),
+        step=step,
+        dense_until_step=10,
+        dense_paths=_DENSE_ATTENTION_PATHS,
+    )
 
 
 def frames_for(duration_s: int) -> int:
@@ -1170,7 +1193,15 @@ class OfficialH3Pipeline:
             "text_indices": range(rows, 2 * rows),
             "audio_indices": range(2 * rows, packed),
         }
-        with torch.no_grad():
+        with torch.no_grad(), attention_scope(
+            AttentionLayout(
+                live_tokens=packed,
+                protected_prefix=0,
+                step=0,
+                dense_until_step=10,
+                dense_paths=_DENSE_ATTENTION_PATHS,
+            )
+        ):
             dit(
                 hidden_states=anchor.new_zeros(
                     1, rows, dit.config.in_channels * math.prod(dit.config.patch_size)
@@ -1237,7 +1268,8 @@ class OfficialH3Pipeline:
         block_state = loop.get_block_state(state)
         for index, timestep in enumerate(block_state.timesteps):
             cancel()
-            _, block_state = loop.loop_step(scoped, block_state, i=index, t=timestep)
+            with attention_scope(_attention_layout(block_state, index)):
+                _, block_state = loop.loop_step(scoped, block_state, i=index, t=timestep)
             if checks is not None:
                 checks.tensors(
                     f"{_DIT_COMPONENT[_TRUNK[task]]}.updated.{index}",
