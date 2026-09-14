@@ -79,6 +79,8 @@ def check_host_capacity(
     copies: int = 1,
     available: Callable[[], int] = proctree.available_host_bytes,
 ) -> int:
+    if copies < 1:
+        raise AdapterRefusal("adapter_host_shortfall", "rank source-copy count must be positive")
     rows = tuple(geometry)
     required = sum(row.source_bytes for row in rows) + max(
         (row.host_scratch_bytes for row in rows), default=0
@@ -88,8 +90,10 @@ def check_host_capacity(
             (row.scratch_bytes for row in rows), default=0
         )
     required *= copies
+    if required == 0:
+        return 0
     capacity = available()
-    if copies < 1 or capacity < 0 or required > capacity:
+    if capacity < 0 or required > capacity:
         raise AdapterRefusal(
             "adapter_host_shortfall",
             f"{copies} rank source/validation copies need {required} bytes; "

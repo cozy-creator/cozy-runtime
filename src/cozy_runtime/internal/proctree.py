@@ -650,6 +650,12 @@ def create_executor_cgroup(namespace: str) -> CgroupScope:
     path = parent / f"cozy-executor-{namespace}-{secrets.token_hex(8)}"
     try:
         path.mkdir(mode=0o700)
+        # The executor drops to its package UID after joining this root-owned
+        # scope. It must traverse the directory to read live memory constraints;
+        # keeping it 0700 made host admission report unreadable capacity. Search
+        # permission reveals no directory listing and grants no controller write.
+        # Apply explicitly because the supervisor may have a restrictive umask.
+        path.chmod(0o711)
         required = ("cgroup.procs", "cgroup.events", "cgroup.freeze", "cgroup.kill")
         missing = [name for name in required if not (path / name).exists()]
         if missing:
