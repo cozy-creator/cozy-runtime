@@ -10,7 +10,7 @@ from typing import Any, cast
 import pytest
 import tensorfs
 
-from cozy_runtime.internal import fill
+from cozy_runtime.internal import fill, hostfacts
 from cozy_runtime.internal.worker import grants, machine_checkpoint_inputs
 from cozy_runtime.internal.worker import machine_model_defaults as defaults
 from cozy_runtime.internal.worker.machine_child_target import Target
@@ -207,8 +207,9 @@ def test_unavailable_default_refuses_before_accelerator_discovery(
     def forbidden(_: str) -> Any:
         raise AssertionError("unavailable default must not measure an accelerator")
 
-    monkeypatch.setattr(defaults.hostfacts, "measure", forbidden)
+    monkeypatch.setattr(hostfacts, "measure", forbidden)
     call = cast(Call, SimpleNamespace(parent_request="root"))
-    for capture in (captured(), {"model_defaults": []}):
+    captures: list[dict[str, Any]] = [captured(), {"model_defaults": []}]
+    for capture in captures:
         with pytest.raises(WorkspaceRefusal, match="captured Model default is unavailable"):
             defaults.select(peer(capture), "owner", call, target(), {"adapter": {}})
