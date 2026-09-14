@@ -74,10 +74,15 @@ def verify(result_path: Path, events_path: Path, degree: int, active: bool) -> d
     if not {"video", "continuation_frame"} <= saved.keys():
         raise RuntimeError("video and continuation bytes were not retained")
     events = []
-    for line in events_path.read_text().splitlines():
-        # Non-JSON diagnostics remain in the original log.
-        with contextlib.suppress(json.JSONDecodeError):
-            events.append(json.loads(line))
+    logs = [*sorted(events_path.parent.glob("events.partial-*.jsonl")), events_path]
+    for log in logs:
+        for line in log.read_text().splitlines():
+            # Reattachment may only replay the terminal result; previous runtime
+            # observations remain evidence for this same idempotent command.
+            with contextlib.suppress(json.JSONDecodeError):
+                event = json.loads(line)
+                if isinstance(event, dict):
+                    events.append(event)
     facts = [
         row["fields"]
         for event in events
