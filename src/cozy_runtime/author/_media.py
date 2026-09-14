@@ -43,6 +43,7 @@ SIGNATURES: tuple[tuple[int, bytes, str], ...] = (
     (4, b"ftypavif", "image/avif"),
     (4, b"ftypmif1", "image/avif"),
     (4, b"ftypisom", "video/mp4"),
+    (4, b"ftypiso5", "video/mp4"),  # StreamingMP4Encoder's fragmented MP4 brand.
     (4, b"ftypmp42", "video/mp4"),
     (4, b"ftypM4V ", "video/mp4"),
     (4, b"ftypqt  ", "video/quicktime"),

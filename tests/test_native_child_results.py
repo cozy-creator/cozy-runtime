@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from fractions import Fraction
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -47,7 +48,12 @@ class Result(msgspec.Struct):
 
 
 def finish_producer(
-    workspace: Workspace, spec: bytes, source: pb.NativeByteTreeRef, data: bytes
+    workspace: Workspace,
+    spec: bytes,
+    source: pb.NativeByteTreeRef,
+    data: bytes,
+    *,
+    media_type: str = "application/json",
 ) -> None:
     raw, digest = documents.identity(
         pb.AttemptOutcomeBody(
@@ -62,7 +68,7 @@ def finish_producer(
                         output_id="report",
                         digest=hashlib.sha256(data).digest(),
                         length=len(data),
-                        mime_type="application/json",
+                        mime_type=media_type,
                         native_tree=source,
                     )
                 ]
@@ -144,6 +150,76 @@ def retained(tmp_path: Path) -> tuple[Workspace, pb.ChildCallResult, bytes]:
     finish_producer(workspace, spec, source, data)
     tensorfs.gc(str(workspace.store_root))
     return Workspace(workspace.store_root), result, data
+
+
+def test_streaming_mp4_survives_native_child_handoff(tmp_path: Path) -> None:
+    pytest.importorskip("av")
+    from cozy_runtime.author import _codec
+
+    workspace, spec, _, _ = producing(tmp_path)
+    path = tmp_path / "stream.mp4"
+    encoder = _codec.StreamingMP4Encoder(
+        path,
+        width=16,
+        height=16,
+        frame_rate=Fraction(24),
+        pixel_aspect_ratio=Fraction(1),
+        color_primaries=1,
+        color_transfer=1,
+        color_matrix=1,
+        color_range=1,
+        max_bytes=200000,
+    )
+    for pixel in (32, 96, 160):
+        encoder.write_video(bytes([pixel]) * (16 * 16 * 3))
+    assert encoder.finish().frame_count == 3
+    data = path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    manifest = canonical_json.encode(
+        {
+            "entries": [
+                {
+                    "path": "payload",
+                    "kind": "file",
+                    "blob": {"sha256": digest, "length": len(data)},
+                }
+            ]
+        }
+    )
+    source = outputs.commit(
+        workspace, "owner", "producer", 1, spec, "report", manifest, [("payload", path)], 200000
+    )
+    retention = "sha256:" + "a1" * 32
+    outputs.change_hold(
+        workspace,
+        "owner",
+        pb.NativeByteRetentionRequest(source=source, retention_id=retention),
+        release=False,
+    )
+    finish_producer(workspace, spec, source, data, media_type="video/mp4")
+    path.unlink()
+    tensorfs.gc(str(workspace.store_root))
+    value = {
+        "clip": {
+            "asset_ref": "sha256:" + digest,
+            "digest": "sha256:" + digest,
+            "kind": "video",
+            "media_type": "video/mp4",
+            "size_bytes": len(data),
+        }
+    }
+    result = pb.ChildCallResult(
+        state=pb.CHILD_CALL_STATE_SUCCEEDED,
+        call_index=0,
+        result_canonical_bytes=canonical_json.encode(value),
+        byte_result_grants=[
+            pb.ChildByteResultGrant(output_id="clip", source=source, retention_id=retention)
+        ],
+    )
+    rows = child_byte_results.materialize(workspace, "owner", result, tmp_path / "parent")
+    delivered = Path(rows[0]["local"])
+    assert delivered.read_bytes() == data
+    assert _codec.probe_mp4(delivered).frame_count == 3
 
 
 @pytest.mark.parametrize("legacy_prefix", [False, True])
