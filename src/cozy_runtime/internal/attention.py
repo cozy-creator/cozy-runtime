@@ -16,7 +16,7 @@ import json
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import import_module, metadata
 from pathlib import Path
 from typing import Any
@@ -189,7 +189,7 @@ PINNABLE: tuple[Candidate, ...] = (
         max_head_dim=128,
         head_dims=frozenset({128}),
         distribution="sol-attn",
-        rel_l2_max=2e-1,
+        rel_l2_max=2e-2,  # Native all-keys arithmetic control, not sparse approximation error.
         why="Explicit sparse experiment; requires model layout and eager single-GPU execution.",
     ),
 )
@@ -205,6 +205,8 @@ class Ready:
     member: Any
     location: str = ""
     """A baked kernel's variant directory; empty otherwise."""
+    admission: dict[str, Any] | None = None
+    """Retained arithmetic/contract checks; never a model-quality qualification."""
 
     @property
     def name(self) -> str:
@@ -402,23 +404,23 @@ def _lookup(module: Any, dotted: str, name: str) -> Any:
     return entry
 
 
-#: The self-check's shape: (batch, sequence, heads, head dimension). Small enough that the
-#: whole proof costs under a millisecond of a prepare that already takes minutes, and large
-#: enough to cross a real kernel's tiling — 256 rows is two 128-row blocks, and 128 is the head
-#: dimension every entry in both tables serves.
+#: The self-check's shape: (batch, sequence, heads, head dimension). This crosses two
+#: 128-row blocks. Sol adds a ragged row and padding; optional kernels may JIT on first use.
 PROBE: tuple[int, int, int, int] = (1, 256, 4, 128)
 
 
-def _computes(entry: Ready, device: DeviceFacts) -> None:
+def _computes(entry: Ready, device: DeviceFacts) -> dict[str, Any] | None:
     """PROVE the kernel computes attention on THIS device, or refuse it by name."""
     if device.kind != "cuda":
         # There is no device to prove anything on, and the only entry a CPU executor admits is
         # torch's own eager dispatch. Silence here is the honest answer, not a skipped gate.
-        return
+        return None
     import torch
     from diffusers.models.attention_dispatch import dispatch_attention_fn
 
     batch, sequence, heads, dim = PROBE
+    if entry.name == "sol-attn":
+        sequence += 1  # Exercise the sparse kernel's partial final block as well.
     dtype = (
         torch.bfloat16
         if not entry.candidate.dtypes or "bfloat16" in entry.candidate.dtypes
@@ -433,26 +435,109 @@ def _computes(entry: Ready, device: DeviceFacts) -> None:
     )
     with torch.no_grad(), torch.cuda.device(target):
         if entry.name == "sol-attn":
-            from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
-
-            probe: Any = torch.nn.Module()
-            probe.forward = lambda q, k, v: dispatch_attention_fn(q, k, v, backend=entry.member)
-            attention_sol.install_site(probe, "probe", "attention")
-            # Explicit synthetic smoke data, not inferred model conditioning metadata.
-            with attention_scope(AttentionLayout(sequence, 0, 0)):
-                got: Any = probe(query, key, value)
-        else:
-            got = dispatch_attention_fn(query, key, value, backend=entry.member)
+            return _probe_sol(entry, device, query, key, value)
+        got = dispatch_attention_fn(query, key, value, backend=entry.member)
     if isinstance(got, tuple):
         got = got[0]
 
     q_ref, k_ref, v_ref = (tensor.transpose(1, 2).float() for tensor in (query, key, value))
     exact = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref).transpose(1, 2)
     _validate_probe(entry, device, got, query, exact)
+    return None
+
+
+def _probe_sol(
+    entry: Ready, device: DeviceFacts, query: Any, key: Any, value: Any
+) -> dict[str, Any]:
+    """Separate native arithmetic from the wrapper's approximate sparse policy."""
+    import torch
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+    from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
+
+    inputs = (query, key, value)
+    originals = tuple(t.clone() for t in inputs)
+    sequence, prefix, padding = query.shape[1], 33, 15
+    q_ref, k_ref, v_ref = (t.transpose(1, 2).float() for t in inputs)
+    exact = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref).transpose(1, 2)
+    # Public sink semantics keep all KV blocks exact inside the actual native
+    # kernel. No Runtime dense-prefix overwrite can make this control pass.
+    native = attention_sol._native(query, key, value, None, sequence)
+    _validate_probe(entry, device, native, query, exact)
+    if any(
+        not torch.equal(t.view(torch.uint8), old.view(torch.uint8))
+        for t, old in zip(inputs, originals, strict=True)
+    ):
+        raise AttentionRefusal("attention_kernel_wrong", "Sol all-keys control modified its inputs")
+
+    padded = tuple(
+        torch.cat((t, torch.full_like(t[:, :padding], float("nan"))), dim=1) for t in inputs
+    )
+    before = tuple(t.view(torch.uint8).clone() for t in padded)
+    probe: Any = torch.nn.Module()
+    probe.forward = lambda q, k, v: dispatch_attention_fn(q, k, v, backend=entry.member)
+    attention_sol.install_site(probe, "probe", "attention")
+    try:
+        with (
+            attention_scope(AttentionLayout(sequence, prefix, 0)),
+            attention_sol.observing() as counts,
+        ):
+            sparse = probe(*padded)
+            repeated = probe(*padded)
+    finally:
+        attention_sol.remove_site(probe, "probe", "attention")
+    _validate_probe_contract(entry, device, sparse, padded[0], padded[0])
+    expected_prefix = attention_sol._dense(query[:, :prefix], key, value, None)
+    if (
+        not torch.equal(sparse[:, :prefix], expected_prefix)
+        or torch.count_nonzero(sparse[:, sequence:]).item() != 0
+        or not torch.equal(sparse, repeated)
+        or any(
+            not torch.equal(t.view(torch.uint8), old) for t, old in zip(padded, before, strict=True)
+        )
+        or counts != dict(sparse=2, dense_step=0, dense_path=0, dense_prefix=2)
+    ):
+        raise AttentionRefusal(
+            "attention_kernel_wrong",
+            "Sol sparse policy violated protected-prefix, padding, repeat "
+            "or input-ownership contracts",
+        )
+    return {
+        "arithmetic_control": "native_all_keys_selected",
+        "arithmetic_rel_l2_to_fp32": float((native.float() - exact).norm() / exact.norm()),
+        "arithmetic_rel_l2_max": entry.candidate.rel_l2_max,
+        "sparse_policy_rel_l2_to_fp32": float(
+            (sparse[:, :sequence].float() - exact).norm() / exact.norm()
+        ),
+        "sparse_error_meaning": "approximation_only_not_model_quality",
+        "shape": list(query.shape),
+        "protected_prefix": prefix,
+        "padding": padding,
+        "repeat_equal": True,
+        "inputs_unchanged": True,
+        "calls": counts,
+    }
 
 
 def _validate_probe(entry: Ready, device: DeviceFacts, got: Any, query: Any, exact: Any) -> None:
     """Check a real result's contract and small numerical smoke, not model quality."""
+    got = _validate_probe_contract(entry, device, got, query, exact)
+    disagreement = float((got - exact).norm() / exact.norm())
+    if disagreement > entry.candidate.rel_l2_max:
+        raise AttentionRefusal(
+            "attention_kernel_wrong",
+            f"{entry.name} disagrees with exact fp32 attention at rel L2 {disagreement:.4g} on "
+            f"{device.name} (sm{device.sm}), past its declared budget of "
+            f"{entry.candidate.rel_l2_max:.4g}. A kernel that returns its uninitialized output "
+            "buffer raises nothing and has the right shape (h3a-013), so this is the only "
+            "thing that can tell the difference",
+        )
+
+
+def _validate_probe_contract(
+    entry: Ready, device: DeviceFacts, got: Any, query: Any, exact: Any
+) -> Any:
+    """Geometry and finite output are required even when approximation changes the answer."""
     import torch
 
     if not isinstance(got, torch.Tensor) or got.dtype != query.dtype or got.device != query.device:
@@ -474,16 +559,7 @@ def _validate_probe(entry: Ready, device: DeviceFacts, got: Any, query: Any, exa
             f"{entry.name} returned non-finite values on {device.name} (sm{device.sm}); it is "
             "not serving attention and a NaN would pass every ratio test",
         )
-    disagreement = float((got - exact).norm() / exact.norm())
-    if disagreement > entry.candidate.rel_l2_max:
-        raise AttentionRefusal(
-            "attention_kernel_wrong",
-            f"{entry.name} disagrees with exact fp32 attention at rel L2 {disagreement:.4g} on "
-            f"{device.name} (sm{device.sm}), past its declared budget of "
-            f"{entry.candidate.rel_l2_max:.4g}. A kernel that returns its uninitialized output "
-            "buffer raises nothing and has the right shape (h3a-013), so this is the only "
-            "thing that can tell the difference",
-        )
+    return got
 
 
 def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
@@ -499,8 +575,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
     if candidate.baked:
         loaded_member, location = _load_baked(candidate, device)
         ready = Ready(candidate, loaded_member, location)
-        _computes(ready, device)
-        return ready
+        return replace(ready, admission=_computes(ready, device))
     if candidate.distribution:
         try:
             installed = metadata.version(candidate.distribution)
@@ -531,8 +606,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
             registry._backends[dense.member], dense.name + ":" + dense.location
         )
     ready = Ready(candidate, member)
-    _computes(ready, device)
-    return ready
+    return replace(ready, admission=_computes(ready, device))
 
 
 def _device_admits(candidate: Candidate, device: DeviceFacts) -> str:
@@ -765,6 +839,7 @@ class Applied:
     offered: tuple[str, ...]
     #: set when the caller PINNED one through the execution-path override (cr-125).
     pin: str = ""
+    admission: dict[str, dict[str, Any]] | None = None
 
     def totals(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -780,6 +855,7 @@ class Applied:
             "offered": list(self.offered),
             "locations": dict(self.locations),
             "pin": self.pin,
+            **({"admission": self.admission} if self.admission else {}),
             # RENDERED HERE, not by the worker: one renderer for the one line, in the module
             # that knows what it means.
             "line": self.line(),
@@ -815,6 +891,7 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
     offered: list[str] = []
     locations: dict[str, str] = {}
     pins: set[str] = set()
+    admission: dict[str, Any] = {}
     for parameter, row in documents.items():
         for component, chosen in (row.get("hosts") or {}).items():
             hosts[f"{parameter}/{component}"] = dict(chosen)
@@ -826,6 +903,8 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
                 offered.append(name)
         if row.get("pin"):
             pins.add(str(row["pin"]))
+        if row.get("admission"):
+            admission[parameter] = row["admission"]
     if not kernels:
         return None
     pin = "+".join(sorted(pins))
@@ -835,6 +914,7 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
         "offered": offered,
         "locations": locations,
         "pin": pin,
+        **({"admission": admission} if admission else {}),
         "line": line(kernels, hosts, offered, pin),
     }
 
@@ -997,7 +1077,8 @@ def install(
     )
     for _component, _path, _module, processor, entry in assignments:
         processor._attention_backend = entry.member
-    return Applied(hosts, locations, tuple(resolved), pin)
+    proofs = {name: entry.admission for name, entry in resolved.items() if entry.admission}
+    return Applied(hosts, locations, tuple(resolved), pin, proofs or None)
 
 
 def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
@@ -1064,9 +1145,11 @@ def override(
         else []
     )
     try:
+        applied = None
         if swap is not None:
-            swap.apply()
-        yield observed(roots, pin)
+            applied = swap.apply()
+        facts = observed(roots, pin)
+        yield replace(facts, admission=applied.admission) if applied is not None else facts
     finally:
         try:
             for component, path, module in temporary_sites:
@@ -1113,7 +1196,8 @@ class Swap:
             hosts.setdefault(component, {})
             hosts[component][self.entry.name] = hosts[component].get(self.entry.name, 0) + 1
         locations = {self.entry.name: self.entry.location} if self.entry.location else {}
-        return Applied(hosts, locations, (self.entry.name,), self.pin or self.entry.name)
+        proofs = {self.entry.name: self.entry.admission} if self.entry.admission else None
+        return Applied(hosts, locations, (self.entry.name,), self.pin or self.entry.name, proofs)
 
 
 def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Candidate:

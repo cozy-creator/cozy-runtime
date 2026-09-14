@@ -81,6 +81,12 @@ def test_every_kernel_declares_the_numeric_budget_it_is_held_to() -> None:
     exact = {"flash-attn3", "flash-attn4", "sdpa", "cudnn"}
     for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
         budget = candidate.rel_l2_max
+        if candidate.name == "sol-attn":
+            # This threshold applies to Sol's all-keys native arithmetic
+            # control. Sparse-policy disagreement is reported separately.
+            assert budget == 2e-2
+            assert candidate not in attention.CANDIDATES
+            continue
         assert (budget <= 2e-2) is (candidate.name in exact), (candidate.name, budget)
     assert attention.PROBE == (1, 256, 4, 128)
 
