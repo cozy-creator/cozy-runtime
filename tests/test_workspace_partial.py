@@ -227,6 +227,8 @@ def test_schema_two_migrates_conservatively_and_future_schema_refuses(tmp_path: 
     workspace = Workspace(tmp_path / "store")
     with workspace.locked() as db:
         for table in (
+            "execution_checkpoint_inputs",
+            "input_tree_intakes",
             "execution_model_holds",
             "execution_calls",
             "execution_commands",
@@ -244,7 +246,7 @@ def test_schema_two_migrates_conservatively_and_future_schema_refuses(tmp_path: 
             db.execute(f"ALTER TABLE weights DROP COLUMN {column}")
         db.execute("PRAGMA user_version=2")
     with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 11
         assert "memoize" in {row[1] for row in db.execute("PRAGMA table_info(attempts)")}
     with sqlite3.connect(workspace.directory / "journal.sqlite3") as db:
         db.execute("PRAGMA user_version=99")

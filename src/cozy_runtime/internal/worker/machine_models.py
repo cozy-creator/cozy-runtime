@@ -64,18 +64,22 @@ def register(
         workspace.reserve_hold(db, owner, request, release=False, kind=kind)
 
 
-def retain_bytes(
-    workspace: Workspace, owner: str, recipient: str, path: str, source: pb.NativeByteTreeRef
-) -> pb.ChildByteResultGrant:
-    from . import workspace_byte_outputs
-
-    identity = documents.spell(
+def byte_retention_id(owner: str, recipient: str, path: str, source: pb.NativeByteTreeRef) -> str:
+    return documents.spell(
         hashlib.sha256(
             canonical_json.encode(
                 ["cozy.machine-byte-hold/1", owner, recipient, path, documents.body(source)]
             )
         ).digest()
     )
+
+
+def retain_bytes(
+    workspace: Workspace, owner: str, recipient: str, path: str, source: pb.NativeByteTreeRef
+) -> pb.ChildByteResultGrant:
+    from . import workspace_byte_outputs
+
+    identity = byte_retention_id(owner, recipient, path, source)
     request = pb.DerivedRetentionRequest(
         weights_transaction_id=source.producer_root_id,
         tensorfs_receipt_digest=source.receipt_digest,
@@ -107,6 +111,9 @@ def release(workspace: Workspace, owner: str, recipient: str) -> None:
             workspace._change_hold(
                 db, owner, request, release=True, kind=held["kind"] if held else "derived"
             )
+    from . import machine_checkpoint_inputs
+
+    machine_checkpoint_inputs.release(workspace, owner, recipient)
     # Keep the tiny ownership record for idempotent release after a lost reply.
 
 

@@ -192,7 +192,7 @@ class Workspace:
                     + _MIGRATION_3
                     + "PRAGMA user_version=3; COMMIT;"
                 )
-            elif version not in (3, 4, 5, 6, 7, 8, 9):
+            elif version not in (3, 4, 5, 6, 7, 8, 9, 10, 11):
                 raise WorkspaceRefusal("workspace journal schema is not supported")
             if version <= 3:
                 from .workspace_sources import SCHEMA4
@@ -218,6 +218,14 @@ class Workspace:
                 from .machine_models import SCHEMA9
 
                 db.executescript("BEGIN IMMEDIATE;" + SCHEMA9 + "PRAGMA user_version=9; COMMIT;")
+            if version <= 9:
+                from .workspace_input_trees import SCHEMA10
+
+                db.executescript("BEGIN IMMEDIATE;" + SCHEMA10 + "PRAGMA user_version=10; COMMIT;")
+            if version <= 10:
+                from .machine_checkpoint_inputs import SCHEMA11
+
+                db.executescript("BEGIN IMMEDIATE;" + SCHEMA11 + "PRAGMA user_version=11; COMMIT;")
             if (
                 not allow_frozen
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
@@ -1063,6 +1071,12 @@ class Workspace:
                         "AND (state='complete' OR (? AND state IN ('releasing','released')))",
                         (*subject, release),
                     ).fetchone()
+            if original is None and kind == "tree":
+                original = db.execute(
+                    "SELECT 1 FROM input_tree_intakes WHERE owner=? AND id=? AND native_digest=? "
+                    "AND (state='prepared' OR (? AND state IN ('aborting','released')))",
+                    (*subject, release),
+                ).fetchone()
             pending_release = False
             if release and original is None and retained is None:
                 # Durable memo/lookup intent authorizes cancellation of a root
@@ -1131,6 +1145,11 @@ class Workspace:
                 request.retention_id,
             ),
         )
+        if release and kind == "tree":
+            db.execute(
+                "UPDATE input_tree_intakes SET state='released' WHERE intake_hold=? AND owner=?",
+                (request.retention_id, owner),
+            )
         if release:
             from cozy_runtime.internal.worker import workspace_memo
 

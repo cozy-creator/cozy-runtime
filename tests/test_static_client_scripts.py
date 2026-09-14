@@ -30,9 +30,19 @@ def project(root: Path, code: str) -> Path:
     "body",
     [
         "def main(): pass\n",
+        "from typing import Annotated\n"
+        "from cozy_runtime.author import AssetBound, FileAsset, Tree\n"
+        "def main(ctx, *, report: Annotated[FileAsset, AssetBound(max_bytes=200000, "
+        "media_types=('application/json',))], files: Tree) -> Tree:\n"
+        "    raise RuntimeError('body must not execute')\n",
         "async def main(ctx): ctx.log('started')\n",
         "from cozy_runtime.author import ImageAsset, Outputs, Telemetry\n"
         "def main(*, out: Outputs, tel: Telemetry) -> ImageAsset: raise RuntimeError('body')\n",
+        "from typing import Annotated\n"
+        "from cozy_runtime.author import AssetBound, ImageAsset, Outputs\n"
+        "def main(*, out: Outputs) -> Annotated[ImageAsset, "
+        "AssetBound(media_types=('image/png',))]:\n"
+        "    raise RuntimeError('body')\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# [tool.cozy.models]\n"
         "# source='owner/model'\n# ///\n"
         "from cozy_runtime.author import Context, Model, ModelArtifact, Telemetry\n"
@@ -135,6 +145,10 @@ def test_captured_model_source_and_pth_are_never_executed(tmp_path: Path) -> Non
         "from cozy_runtime.author import Model\nclass Local(Model[object]): pass\n"
         "def main(*, model: Local): pass\n",
         "from cozy_runtime.author import Model\ndef main(*, model: Model[factory()]): pass\n",
+        "from typing import Annotated\n"
+        "from cozy_runtime.author import AssetBound, ImageAsset\n"
+        "from external import formats\n"
+        "def main() -> Annotated[ImageAsset, AssetBound(media_types=formats())]: pass\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=1\n# ///\ndef main(): pass\n",
         "from cozy_runtime.author import WeightsSink\ndef main(*, weights: WeightsSink): pass\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# ///\n"

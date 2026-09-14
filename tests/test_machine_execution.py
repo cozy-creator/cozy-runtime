@@ -455,6 +455,8 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     workspace.accept("owner", offer("legacy"))
     with workspace.locked() as db:
         for table in (
+            "execution_checkpoint_inputs",
+            "input_tree_intakes",
             "execution_model_holds",
             "execution_calls",
             "execution_commands",
@@ -472,7 +474,7 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     assert Executions(Workspace(tmp_path / "other-store")).workspace_id != e.workspace_id
     e.submit("owner", "new", b"c" * 32, offer("new"))
     with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 11
         assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 2
 
 

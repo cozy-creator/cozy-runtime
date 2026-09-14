@@ -118,7 +118,7 @@ from cozy_runtime.internal.worker.machine_publication import PublicationTLS
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding, PreparedModel
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
+from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 #: The lossy lane's per-watch depth. Oldest is shed first; a durable frame never enters it.
@@ -2097,6 +2097,7 @@ class Worker:
         capture_document: bytes = b"",
         preparation: bytes = b"",
         publication_authorization_id: str = "",
+        arguments: dict[str, Any] | None = None,
     ) -> workspace_executions.Receipt:
         """Authenticated root intake; accepted execution never depends on the caller's stream."""
         with self.control_lock:
@@ -2123,21 +2124,42 @@ class Worker:
                 declaration = self.engine._job_declaration(binding, descriptor)
                 result_schema = canonical.write(declaration["result"])
                 memoize = declaration.get("invocable", {}).get("memoize", False) is True
-            receipt = executions.submit(
-                owner,
-                submission_id,
-                capture_digest,
-                offer,
-                result_schema=result_schema,
-                worker_boot=self.fence.worker_boot_id,
-                memoize=memoize,
-                max_attempts=max_attempts,
-                retry_delay_ms=retry_delay_ms,
-                capture_document=capture_document,
-                preparation=preparation,
-                worker_id=self.options.worker_id,
-                publication_authorization_id=publication_authorization_id,
-            )
+            from . import machine_checkpoint_inputs
+
+            with machine_checkpoint_inputs.admission(executions.workspace, owner, offer.request_id):
+                if "job" in spec:
+                    from . import machine_model_inputs
+
+                    assert binding is not None
+                    declared = set(self.engine._job_model_declarations(binding, descriptor))
+                    if declared and claim.wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
+                        raise WorkspaceRefusal("durable root Model inputs require Runtime wire55")
+                    machine_model_inputs.retain(executions.workspace, owner, offer, declared)
+                    from . import machine_byte_inputs
+
+                    machine_byte_inputs.retain_root(
+                        executions.workspace,
+                        owner,
+                        offer,
+                        declaration["request"],
+                        arguments or {},
+                        wire_minor=claim.wire_minor,
+                    )
+                receipt = executions.submit(
+                    owner,
+                    submission_id,
+                    capture_digest,
+                    offer,
+                    result_schema=result_schema,
+                    worker_boot=self.fence.worker_boot_id,
+                    memoize=memoize,
+                    max_attempts=max_attempts,
+                    retry_delay_ms=retry_delay_ms,
+                    capture_document=capture_document,
+                    preparation=preparation,
+                    worker_id=self.options.worker_id,
+                    publication_authorization_id=publication_authorization_id,
+                )
             self.publish_activity(strict=True)
             return receipt
 
@@ -2232,6 +2254,9 @@ class Worker:
                 ):
                     continue
                 offered = self.executions.offer(owner, request)
+                from . import machine_byte_inputs
+
+                machine_byte_inputs.bind_root_grant(owner, offered)
                 spec = documents.read(offered.invocation_spec_canonical_bytes, pb.InvocationSpec)
                 deadline = int(spec.get("deadline_unix_ms", 0))
                 if deadline and self.executions.clock_ms() >= deadline:

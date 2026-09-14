@@ -3543,15 +3543,23 @@ class DeliveryGrant(_message.Message):
     outputs: _containers.RepeatedCompositeFieldContainer[OutputAccess]
     def __init__(self, invocation_spec_digest: _Optional[bytes] = ..., credential: _Optional[_Union[DeliveryAccessCredential, _Mapping]] = ..., file_base_url: _Optional[str] = ..., expires_at_unix: _Optional[int] = ..., inputs: _Optional[_Iterable[_Union[InputAccess, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[OutputAccess, _Mapping]]] = ...) -> None: ...
 
+class CatalogModelSource(_message.Message):
+    __slots__ = ("repository",)
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
+    repository: str
+    def __init__(self, repository: _Optional[str] = ...) -> None: ...
+
 class InputAccess(_message.Message):
-    __slots__ = ("input_id", "url", "native_tree")
+    __slots__ = ("input_id", "url", "native_tree", "catalog_model")
     INPUT_ID_FIELD_NUMBER: _ClassVar[int]
     URL_FIELD_NUMBER: _ClassVar[int]
     NATIVE_TREE_FIELD_NUMBER: _ClassVar[int]
+    CATALOG_MODEL_FIELD_NUMBER: _ClassVar[int]
     input_id: str
     url: str
     native_tree: NativeByteRetentionRequest
-    def __init__(self, input_id: _Optional[str] = ..., url: _Optional[str] = ..., native_tree: _Optional[_Union[NativeByteRetentionRequest, _Mapping]] = ...) -> None: ...
+    catalog_model: CatalogModelSource
+    def __init__(self, input_id: _Optional[str] = ..., url: _Optional[str] = ..., native_tree: _Optional[_Union[NativeByteRetentionRequest, _Mapping]] = ..., catalog_model: _Optional[_Union[CatalogModelSource, _Mapping]] = ...) -> None: ...
 
 class OutputAccess(_message.Message):
     __slots__ = ("output_id", "url")
@@ -3872,6 +3880,48 @@ class ChildByteResultGrant(_message.Message):
     source: NativeByteTreeRef
     retention_id: str
     def __init__(self, output_id: _Optional[str] = ..., source: _Optional[_Union[NativeByteTreeRef, _Mapping]] = ..., retention_id: _Optional[str] = ...) -> None: ...
+
+class InputTreeImportHeader(_message.Message):
+    __slots__ = ("claim", "request_id", "input_id", "manifest", "manifest_canonical_bytes", "content_bytes")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    INPUT_ID_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_BYTES_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request_id: str
+    input_id: str
+    manifest: Ref
+    manifest_canonical_bytes: bytes
+    content_bytes: int
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request_id: _Optional[str] = ..., input_id: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., manifest_canonical_bytes: _Optional[bytes] = ..., content_bytes: _Optional[int] = ...) -> None: ...
+
+class InputTreeImportBlob(_message.Message):
+    __slots__ = ("object", "offset", "data")
+    OBJECT_FIELD_NUMBER: _ClassVar[int]
+    OFFSET_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    object: Ref
+    offset: int
+    data: bytes
+    def __init__(self, object: _Optional[_Union[Ref, _Mapping]] = ..., offset: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
+
+class InputTreeImportCommit(_message.Message):
+    __slots__ = ("abort",)
+    ABORT_FIELD_NUMBER: _ClassVar[int]
+    abort: bool
+    def __init__(self, abort: bool = ...) -> None: ...
+
+class InputTreeImportFrame(_message.Message):
+    __slots__ = ("header", "blob", "commit")
+    HEADER_FIELD_NUMBER: _ClassVar[int]
+    BLOB_FIELD_NUMBER: _ClassVar[int]
+    COMMIT_FIELD_NUMBER: _ClassVar[int]
+    header: InputTreeImportHeader
+    blob: InputTreeImportBlob
+    commit: InputTreeImportCommit
+    def __init__(self, header: _Optional[_Union[InputTreeImportHeader, _Mapping]] = ..., blob: _Optional[_Union[InputTreeImportBlob, _Mapping]] = ..., commit: _Optional[_Union[InputTreeImportCommit, _Mapping]] = ...) -> None: ...
 
 class NativeByteReadCall(_message.Message):
     __slots__ = ("claim", "source", "object", "offset")

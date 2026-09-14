@@ -244,6 +244,7 @@ class BoundInput:
     kind_mime: str
     order: int
     native_tree: pb.NativeByteRetentionRequest | None = None
+    catalog_repository: str = ""
 
 
 def _tree_input(entry: BoundInput) -> bool:
@@ -321,6 +322,11 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
     native_inputs = {
         row.input_id: row.native_tree for row in grant.inputs if row.HasField("native_tree")
     }
+    catalog_inputs = {
+        row.input_id: row.catalog_model.repository
+        for row in grant.inputs
+        if row.HasField("catalog_model")
+    }
     for input_id, row in spec_inputs.items():
         spelled = str(row.get("digest", ""))
         try:
@@ -337,6 +343,17 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             native is not None and row.get("kind_mime") == TREE_MIME
         )
         is_model = input_id.startswith(MODEL_PREFIX)
+        catalog_repository = catalog_inputs.get(input_id, "")
+        if input_id in catalog_inputs and (
+            not is_model
+            or native is not None
+            or re.fullmatch(r"[A-Za-z0-9._-]{1,128}/[A-Za-z0-9._-]{1,128}", catalog_repository)
+            is None
+            or any(part in (".", "..") for part in catalog_repository.split("/"))
+        ):
+            raise GrantRefusal(
+                "grant_catalog_access", "catalog source requires one exact Model repository grant"
+            )
         if not is_tree and (
             not spelled.startswith("sha256:")
             or len(spelled) != len("sha256:") + hashlib.sha256().digest_size * 2
@@ -406,6 +423,7 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             input_id=input_id,
             url=grant_inputs[input_id],
             native_tree=native,
+            catalog_repository=catalog_repository,
             digest=digest,
             length=carried_length,
             kind_mime=str(row.get("kind_mime", "")),

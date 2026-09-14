@@ -154,3 +154,75 @@ def inputs(
             )
         )
     return bindings, access
+
+
+def retain_root(
+    workspace: Workspace,
+    owner: str,
+    offer: pb.AttemptOffer,
+    schema: Any,
+    arguments: dict[str, Any],
+    *,
+    wire_minor: int,
+) -> None:
+    """Acquire execution custody before acceptance without changing replay identity."""
+    from cozy_runtime.protocol import weights_limits
+
+    from . import grants
+
+    selected = list(_leaves(arguments, schema))
+    native = {
+        item.input_id: item.native_tree
+        for item in offer.grant.inputs
+        if item.HasField("native_tree")
+    }
+    if not selected and not native:
+        return
+    if wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
+        raise WorkspaceRefusal("durable root byte inputs require Runtime wire55")
+    if set(native) != {item[0] for item in selected}:
+        raise WorkspaceRefusal("root byte inputs differ from the captured job arguments")
+    spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+    bound = grants.bind(spec, offer.grant, offer.invocation_spec_digest)
+    # Validate every declared object before creating any execution recipient.
+    for name, order, kind, digest, capacity in selected:
+        source, entry = native[name], bound.inputs[name]
+        limit = min(capacity.get("max_bytes") or byte_inputs.MAX_BYTES, byte_inputs.MAX_BYTES)
+        if (
+            source.source.content_bytes > limit
+            or documents.spell(entry.digest) != digest
+            or entry.order != order
+        ):
+            raise WorkspaceRefusal("root byte input changed its declared identity or capacity")
+        with workspace_byte_outputs.leased(workspace, owner, source) as (_, _, members):
+            if kind == "tree":
+                if (
+                    entry.kind_mime != byte_inputs.TREE_MIME
+                    or entry.digest != source.source.manifest.digest
+                    or entry.length != source.source.manifest.length
+                ):
+                    raise WorkspaceRefusal("root tree differs from its exact native manifest")
+            else:
+                blob = byte_inputs.file_member(source, members)
+                if (
+                    (digest, entry.length) != ("sha256:" + blob["sha256"], blob["length"])
+                    or not admits(kind, entry.kind_mime)
+                    or (
+                        capacity.get("media_types")
+                        and entry.kind_mime not in capacity["media_types"]
+                    )
+                ):
+                    raise WorkspaceRefusal("root file differs from its exact native payload")
+    for name, _, _, _, _ in selected:
+        machine_models.retain_bytes(
+            workspace, owner, offer.request_id, "input/" + name, native[name].source
+        )
+
+
+def bind_root_grant(owner: str, offer: pb.AttemptOffer) -> None:
+    """Dispatch from the already-owned recipient; keep the submitted offer immutable."""
+    for item in offer.grant.inputs:
+        if item.HasField("native_tree"):
+            item.native_tree.retention_id = machine_models.byte_retention_id(
+                owner, offer.request_id, "input/" + item.input_id, item.native_tree.source
+            )
