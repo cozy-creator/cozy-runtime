@@ -1,0 +1,23 @@
+{
+  "native_source_command": {
+    "control_stream_epoch": "7",
+    "operation": "NATIVE_SOURCE_OPERATION_HUGGINGFACE",
+    "parent_call": {
+      "control_stream_epoch": "7",
+      "export": "download_huggingface",
+      "intent_digest": "ojHYu1Z5R1mFBo9eYKTAgGGRtGyf8jLdxVG8AOI+ox8=",
+      "interface_digest": "nEbHMIfb9+m4H+zfUmsip51qSxXWhZXO9ci7pK9qst4=",
+      "module": "cozy_runtime.author.sources",
+      "parent_attempt_ordinal": "2",
+      "parent_invocation_spec_digest": "qp8l2Dqs8QrnAvvs2/I3ltGNCoaS0/nGFEkUviOp59E=",
+      "parent_request_id": "private-parent",
+      "record_owner_epoch": "41",
+      "request_canonical_bytes": "eyJmaWxlcyI6WyJlbXB0eS5weSJdLCJyZXBvc2l0b3J5IjoiZXhhbXBsZS9tb2RlbCIsInJldmlzaW9uIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSJ9",
+      "worker_boot_id": "boot-9f21"
+    },
+    "phase": "NATIVE_SOURCE_PHASE_RESOLVE",
+    "record_owner_epoch": "41",
+    "service_id": "source-empty-fixture",
+    "worker_boot_id": "boot-9f21"
+  }
+}

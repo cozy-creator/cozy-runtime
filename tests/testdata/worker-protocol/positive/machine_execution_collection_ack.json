@@ -1,0 +1,22 @@
+{
+  "execution": {
+    "claim": {
+      "proof": "vmk8UxWZPLMWKYRxYpNpUTXPtw4XnOimNzOdIGtzEp1Q52hCl8/nvnLMA76sQZ54/j2eCPIgsOVi8OgtANovXg==",
+      "record_owner_epoch": "41",
+      "record_owner_id": "rec-owner-local-1",
+      "wire_minor": 57,
+      "worker_boot_id": "boot-9f21",
+      "worker_id": "wrk-4070"
+    },
+    "expected_execution_workspace_id": "store-fixture-1",
+    "request_id": "job-01HQX"
+  },
+  "outcome": {
+    "attempt_ordinal": "1",
+    "invocation_spec_digest": "JMFcymWeNZXhnboC+F0/ey3llIyHkWOgX19kb54hkA8=",
+    "outcome_digest": "N7t8tDTwqosDDiHT17xxIOkG/5UsZ+OjSEQypyHnj/c=",
+    "outcome_id": "out-machine-1",
+    "request_id": "job-01HQX",
+    "retain_work": true
+  }
+}

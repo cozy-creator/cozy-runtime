@@ -1,0 +1,41 @@
+{
+  "attempt_offer": {
+    "admission_epoch": "11",
+    "attempt_ordinal": "1",
+    "control_stream_epoch": "7",
+    "grant": {
+      "credential": {
+        "credential_epoch": "7",
+        "expires_at_unix": "1786999000",
+        "issuer": "https://hub.cozy.art",
+        "key_id": "k-2026-08",
+        "token": "Up+24I7rQhcGgcuP6Q35uA=="
+      },
+      "expires_at_unix": "1786999000",
+      "file_base_url": "https://files.cozy.art/t/abc",
+      "inputs": [
+        {
+          "input_id": "payload.prompt",
+          "url": "/in/1/prompt.json"
+        },
+        {
+          "input_id": "payload.adapters[0]",
+          "url": "/in/1/lora.cozytensors"
+        }
+      ],
+      "invocation_spec_digest": "qp8l2Dqs8QrnAvvs2/I3ltGNCoaS0/nGFEkUviOp59E=",
+      "outputs": [
+        {
+          "output_id": "video",
+          "url": "/out/1/video.mp4"
+        }
+      ]
+    },
+    "invocation_spec_canonical_bytes": "eyJkZWFkbGluZV91bml4X21zIjoxNzg3MDAwMDAwMDAwLCJlbnZpcm9ubWVudF9kaWdlc3QiOiJzaGEyNTY6YTRlOTM2NjIzNTg4MGNkNzMxN2I0Mjg3MDAxMjk0NTcyYmZjZjdjNWZlN2JjYjgwMmZiMTk4OTQ5MGM0ZWJmNSIsImZvcm1hdCI6ImNvenkud29ya2VyLnYxLkludm9jYXRpb25TcGVjLzEiLCJpbnB1dHMiOlt7ImRpZ2VzdCI6InNoYTI1Njo5YTRlMWJhNWVmMzFiNmZkYmE4NGZmYzg0OGYzNmRlZTA3NjczMmFhOTA5MDA3YTMwYWY4YzYxNWIwYTcyNzIyIiwiaW5wdXRfaWQiOiJwYXlsb2FkLnByb21wdCIsImtpbmRfbWltZSI6ImFwcGxpY2F0aW9uL2pzb24iLCJsZW5ndGgiOjQxMn0seyJkaWdlc3QiOiJzaGEyNTY6NTc0NjM1OTQ0ZWM3MTNiNzNhNGUxZTE4MGFiNGYyODZiNzYyNWJiYzhhYzg0OGJiNzY5ZWFkNmFjNGU0MzVjZiIsImlucHV0X2lkIjoicGF5bG9hZC5hZGFwdGVyc1swXSIsImtpbmRfbWltZSI6ImFwcGxpY2F0aW9uL3gtY296eXRlbnNvcnMiLCJsZW5ndGgiOjEzNDIxNzcyOH1dLCJvdXRwdXRzIjpbeyJtYXhfYnl0ZXMiOjI2ODQzNTQ1NiwibWltZV90eXBlIjoidmlkZW8vbXA0Iiwib3V0cHV0X2lkIjoidmlkZW8ifV0sInBheWxvYWRfZGlnZXN0Ijoic2hhMjU2OjZkMWY5OWM5ZDhhYzM3MGVlYzVhN2Q3NTE4YjdlMjBlYWJjZTE5Y2RhMmQxOWNiMWQ4Yzk2OWZkM2FhZjJkOGQiLCJzZXJ2aW5nIjp7ImF0dGVtcHRfYmluZGluZ19pZCI6InNoYTI1Njo1NzI2YTQ1MDExZmQxZGFkNWJkYjJiNzI2ZDUzNWQyMTRjZjAxMjM5MmUxY2ExYjQ3ZTg1YTM2N2RkY2Y1NTllIiwiYmluZGluZ3NfZGlnZXN0Ijoic2hhMjU2OjdlMTg3ZTY1MGY1NzA4MjI0OWU5YjczOGNhZTFkZTJhMDA0N2RjMDc0NjNhMmEyZTU4ZjA4MzU4MDg5YjcyYjIiLCJlbnRyeXBvaW50X2JpbmRpbmdfZGlnZXN0Ijoic2hhMjU2OjM4M2IyN2NmMWNmOTU1MDc4MTU0NDkyOWRiYTJiMzJkYjdiMTg3NjU4YTc2MGE3YjE4YmFiNmNmMDQyZTJkYWYifX0=",
+    "invocation_spec_digest": "qp8l2Dqs8QrnAvvs2/I3ltGNCoaS0/nGFEkUviOp59E=",
+    "placement_id": "plc-h3-t2v-1",
+    "record_owner_epoch": "41",
+    "request_id": "req-01J8Z",
+    "worker_boot_id": "boot-9f21"
+  }
+}

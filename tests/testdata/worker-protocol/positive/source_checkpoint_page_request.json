@@ -1,0 +1,18 @@
+{
+  "control_stream_epoch": "7",
+  "head": {
+    "digest": "NZ6MhIo5nkD6kuoOR280PAt4ZbwY++0sDktcFjNI/CE=",
+    "length": "2048"
+  },
+  "limit": 128,
+  "plan_digest": "0jCaLD2LJnE5mljVEowFHgLuF9xi2FNSVfUy0qPaB3I=",
+  "record_owner_epoch": "41",
+  "subject": {
+    "source": {
+      "operation_id": "modelpub-minimax-h3-1-0-0",
+      "slot": "dits",
+      "source_selection_digest": "LlYr0gtRJWcsINarClTeW+FWh0NPBYiEOUQQyn/o76M="
+    }
+  },
+  "worker_boot_id": "boot-9f21"
+}

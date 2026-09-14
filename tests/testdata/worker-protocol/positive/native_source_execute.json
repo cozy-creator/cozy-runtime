@@ -1,0 +1,48 @@
+{
+  "native_source_command": {
+    "control_stream_epoch": "7",
+    "credential": "fixture-only-provider-credential",
+    "operation": "NATIVE_SOURCE_OPERATION_HUGGINGFACE",
+    "parent_call": {
+      "control_stream_epoch": "7",
+      "export": "download_huggingface",
+      "intent_digest": "209IrIgmsR8Ksel51foU1SOo3MHFfo7hsqqbr+AndEw=",
+      "interface_digest": "GeUN9o6tPEq1Rn7ZaHf4pump3Rn7XNLnNaDzfrfjRQU=",
+      "module": "cozy_runtime.author.sources",
+      "parent_attempt_ordinal": "2",
+      "parent_invocation_spec_digest": "qp8l2Dqs8QrnAvvs2/I3ltGNCoaS0/nGFEkUviOp59E=",
+      "parent_request_id": "private-parent",
+      "record_owner_epoch": "41",
+      "request_canonical_bytes": "eyJyZXBvc2l0b3J5IjoiZXhhbXBsZS9tb2RlbCIsInJldmlzaW9uIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSJ9",
+      "worker_boot_id": "boot-9f21"
+    },
+    "phase": "NATIVE_SOURCE_PHASE_EXECUTE",
+    "record_owner_epoch": "41",
+    "selection": {
+      "allowed_hosts": [
+        "huggingface.co"
+      ],
+      "canonical": "hf://example/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "content_manifest": {
+        "digest": "ga4yEJuKKChmC1As8a2zTxaWz6/DSiUFjSE4XptNXCo=",
+        "length": "256"
+      },
+      "credential_hosts": [
+        "huggingface.co"
+      ],
+      "members": [
+        {
+          "member": "model.safetensors",
+          "object": {
+            "digest": "2RWSigoN+JxGPbTyC3Yc93PBnwoeQzfjiUn8X0yfSVg=",
+            "length": "4096"
+          },
+          "url": "https://huggingface.co/example/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model.safetensors"
+        }
+      ],
+      "selection_digest": "hhpeg1Ljif+BunxEcNouZKbv7hK33i/0h1tzl8NqDwA="
+    },
+    "service_id": "source-fixture",
+    "worker_boot_id": "boot-9f21"
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "claim": {
+    "proof": "vmk8UxWZPLMWKYRxYpNpUTXPtw4XnOimNzOdIGtzEp1Q52hCl8/nvnLMA76sQZ54/j2eCPIgsOVi8OgtANovXg==",
+    "record_owner_epoch": "41",
+    "record_owner_id": "rec-owner-local-1",
+    "wire_minor": 57,
+    "worker_boot_id": "boot-9f21",
+    "worker_id": "wrk-4070"
+  },
+  "request": {
+    "grant_revision": "1",
+    "head": {
+      "digest": "NZ6MhIo5nkD6kuoOR280PAt4ZbwY++0sDktcFjNI/CE=",
+      "length": "2048"
+    },
+    "object": {
+      "ref": {
+        "digest": "8D2OIwbZdoF3ctoosFAkZkBvGDMKGfihX7dA07/XVxs=",
+        "length": "4096"
+      }
+    },
+    "plan_digest": "0jCaLD2LJnE5mljVEowFHgLuF9xi2FNSVfUy0qPaB3I=",
+    "record_owner_epoch": "41",
+    "subject": {
+      "source": {
+        "operation_id": "modelpub-minimax-h3-1-0-0",
+        "slot": "dits",
+        "source_selection_digest": "LlYr0gtRJWcsINarClTeW+FWh0NPBYiEOUQQyn/o76M="
+      }
+    },
+    "transfer_id": "source-transfer-1",
+    "upload_grant": {
+      "expires_at_unix": "2100000000",
+      "length": "4096",
+      "object_id": "sha256:f03d8e2306d976817772da28b0502466406f18330a19f8a15fb740d3bfd7571b",
+      "required_headers": [
+        {
+          "name": "if-none-match",
+          "value": "*"
+        },
+        {
+          "name": "x-amz-checksum-sha256",
+          "value": "8D2OIwbZdoF3ctoosFAkZkBvGDMKGfihX7dA07/XVxs="
+        }
+      ],
+      "url": "https://objects.example/checkpoint/blob?put=fixture"
+    },
+    "worker_boot_id": "boot-9f21"
+  }
+}

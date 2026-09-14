@@ -1,0 +1,21 @@
+{
+  "outcome": "MODEL_SOURCE_PREPARE_OUTCOME_PREPARED",
+  "sources": [
+    {
+      "manifest": {
+        "digest": "3LPRBwjtFkaJqYwuPJ1CEwbEd3EF4nX2ItV/1kHKN9E=",
+        "length": "16384"
+      },
+      "profile": "hf/minimax-h3/native-dual-bf16/1",
+      "slot": "dits"
+    },
+    {
+      "manifest": {
+        "digest": "Z4kAdwnCcaKcu4YXgVzF00dL3zOqVX2ssFHa4EhyT5w=",
+        "length": "16384"
+      },
+      "profile": "hf/minimax-h3/shared-bf16/1",
+      "slot": "shared"
+    }
+  ]
+}

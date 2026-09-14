@@ -1,0 +1,23 @@
+{
+  "native_source_command": {
+    "control_stream_epoch": "7",
+    "operation": "NATIVE_SOURCE_OPERATION_COMMIT_FILE",
+    "parent_call": {
+      "control_stream_epoch": "7",
+      "export": "commit_file",
+      "intent_digest": "OMyY9ksq/R1ItT6DZbFOFTLB2dIcO0gLhACYLRd4CZI=",
+      "interface_digest": "nEbHMIfb9+m4H+zfUmsip51qSxXWhZXO9ci7pK9qst4=",
+      "module": "cozy_runtime.author.sources",
+      "parent_attempt_ordinal": "2",
+      "parent_invocation_spec_digest": "qp8l2Dqs8QrnAvvs2/I3ltGNCoaS0/nGFEkUviOp59E=",
+      "parent_request_id": "private-parent",
+      "record_owner_epoch": "41",
+      "request_canonical_bytes": "eyJkaWdlc3QiOiJzaGEyNTY6NTYxNmNjMDUyZGJjYjNhYjNlNGRmMWM4NzJlMDdjYzViZWJjNGFmNWEzYzBjZDQ5NTVlMzk1NmNiNTI1ODg2YiIsImhhbmRsZSI6ImF0dGVtcHQ6cmVxdWVzdC1maXh0dXJlIzEvZmlsZS8wMDAxIiwibWVkaWFfdHlwZSI6ImFwcGxpY2F0aW9uL2pzb24iLCJzaXplX2J5dGVzIjo2NTUzNn0=",
+      "worker_boot_id": "boot-9f21"
+    },
+    "phase": "NATIVE_SOURCE_PHASE_EXECUTE",
+    "record_owner_epoch": "41",
+    "service_id": "commit-file-fixture",
+    "worker_boot_id": "boot-9f21"
+  }
+}

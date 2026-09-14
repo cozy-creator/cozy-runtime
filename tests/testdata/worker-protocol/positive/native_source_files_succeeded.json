@@ -1,0 +1,27 @@
+{
+  "native_source_status": {
+    "byte_output": {
+      "content_bytes": "4096",
+      "manifest": {
+        "digest": "ga4yEJuKKChmC1As8a2zTxaWz6/DSiUFjSE4XptNXCo=",
+        "length": "256"
+      },
+      "producer_root_id": "sha256:36b36e9c04cc5c70078aac6fdd84dac44a4c412ab151937e7ad2d66d00e2f621",
+      "receipt_digest": "W2U16ujkqMpeCKJPjXsE0HRsfG7K9YV8ri35y66qXPw="
+    },
+    "byte_output_attempt_ordinal": "1",
+    "byte_output_invocation_spec_digest": "qp8l2Dqs8QrnAvvs2/I3ltGNCoaS0/nGFEkUviOp59E=",
+    "computation_digest": "q1nKDWNuX4ewlsAoErb5lK9P9RGVb+97LhpvW6ptgko=",
+    "control_stream_epoch": "7",
+    "intent_digest": "C2/qEj/ID9h/HYMtjQ9LwyupRStoZ+PT4Pkj1ExuvF8=",
+    "native_receipt_canonical_bytes": "eyJmaXh0dXJlIjoibmF0aXZlIHNvdXJjZSB2aWV3IHJlY2VpcHQifQ==",
+    "parent_attempt_ordinal": "2",
+    "parent_invocation_spec_digest": "qp8l2Dqs8QrnAvvs2/I3ltGNCoaS0/nGFEkUviOp59E=",
+    "parent_request_id": "private-parent",
+    "record_owner_epoch": "41",
+    "result_canonical_bytes": "eyJmaWxlcyI6eyJhc3NldF9yZWYiOiJzaGEyNTY6ODFhZTMyMTA5YjhhMjgyODY2MGI1MDJjZjFhZGIzNGYxNjk2Y2ZhZmMzNGEyNTA1OGQyMTM4NWU5YjRkNWMyYSIsImRpZ2VzdCI6InNoYTI1Njo4MWFlMzIxMDliOGEyODI4NjYwYjUwMmNmMWFkYjM0ZjE2OTZjZmFmYzM0YTI1MDU4ZDIxMzg1ZTliNGQ1YzJhIiwia2luZCI6InRyZWUiLCJzaXplX2J5dGVzIjo0MDk2fX0=",
+    "service_id": "source-files-fixture",
+    "state": "NATIVE_SOURCE_STATE_SUCCEEDED",
+    "worker_boot_id": "boot-9f21"
+  }
+}

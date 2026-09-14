@@ -1,0 +1,20 @@
+{
+  "head": {
+    "digest": "NZ6MhIo5nkD6kuoOR280PAt4ZbwY++0sDktcFjNI/CE=",
+    "length": "2048"
+  },
+  "limit": 128,
+  "plan_digest": "0jCaLD2LJnE5mljVEowFHgLuF9xi2FNSVfUy0qPaB3I=",
+  "record_owner_epoch": "41",
+  "subject": {
+    "weights": {
+      "invocation_spec_digest": "KsHXfr+62asi7rDyRNsqmmd58dGR6zc1symZivYwhBQ=",
+      "output_slot": "model",
+      "request_id": "job-01HQX",
+      "tensorfs_declaration_digest": "+nItxs9UXk1MCYMGxWcFwMVLSOulojV4FTrw4x8pZm0=",
+      "weights_transaction_id": "sha256:e5f8e5571ae52f071dd1b586ad320e82f73afbb03302ac9b65273bccaa7407fb",
+      "writer_epoch": "1"
+    }
+  },
+  "worker_boot_id": "boot-9f21"
+}

@@ -1,0 +1,36 @@
+{
+  "native_source_status": {
+    "control_stream_epoch": "7",
+    "intent_digest": "ojHYu1Z5R1mFBo9eYKTAgGGRtGyf8jLdxVG8AOI+ox8=",
+    "parent_attempt_ordinal": "2",
+    "parent_invocation_spec_digest": "qp8l2Dqs8QrnAvvs2/I3ltGNCoaS0/nGFEkUviOp59E=",
+    "parent_request_id": "private-parent",
+    "record_owner_epoch": "41",
+    "selection": {
+      "allowed_hosts": [
+        "huggingface.co"
+      ],
+      "canonical": "hf://example/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "content_manifest": {
+        "digest": "ga4yEJuKKChmC1As8a2zTxaWz6/DSiUFjSE4XptNXCo=",
+        "length": "256"
+      },
+      "credential_hosts": [
+        "huggingface.co"
+      ],
+      "members": [
+        {
+          "member": "empty.py",
+          "object": {
+            "digest": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+          },
+          "url": "https://huggingface.co/example/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/empty.py"
+        }
+      ],
+      "selection_digest": "hhpeg1Ljif+BunxEcNouZKbv7hK33i/0h1tzl8NqDwA="
+    },
+    "service_id": "source-empty-fixture",
+    "state": "NATIVE_SOURCE_STATE_RESOLVED",
+    "worker_boot_id": "boot-9f21"
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "child_call_result": {
+    "byte_result_grants": [
+      {
+        "output_id": "report",
+        "retention_id": "sha256:055ebce314c0a43c52a73227af27d1c9d56a4962247e95cfb5c02f55f383037c",
+        "source": {
+          "content_bytes": "65537",
+          "manifest": {
+            "digest": "UztfK03HBxPIFj0Tmbo7wqDUm9eR+Yt9gcjWHDX4WZc=",
+            "length": "192"
+          },
+          "producer_root_id": "sha256:a9b5d9a21d5dbf57007b9d0c015db5b077a47918af93b9879c5ad290a82fb212",
+          "receipt_digest": "tH9zYtJkoLicC1VsIkOaxbEvm3lKUX8aux9Rjk8tmP4="
+        }
+      },
+      {
+        "output_id": "runtime.capture",
+        "retention_id": "sha256:0edaa21aff63eb8987f8372e2bdb060787d31e649ef46486b6e7e7c29681ec74",
+        "source": {
+          "content_bytes": "8192",
+          "manifest": {
+            "digest": "dShYNLfLv7zzylSuGvc0Y8dDZ1gdEEiR7EMmIrQ45Rc=",
+            "length": "384"
+          },
+          "producer_root_id": "sha256:033822113bd23048113b269dcdd5ca86a9928eedf9dff40be8aaed06a03ded13",
+          "receipt_digest": "bte3T/pBEYntDpMpcZQmNBTVqbS6UaNUW4Gl8B457MI="
+        }
+      }
+    ],
+    "child_request_id": "private-child",
+    "control_stream_epoch": "7",
+    "intent_digest": "Bl1XJaQGEecTq9OH92grHme+Q3c/J8bFcT/oj4MsR+I=",
+    "observation": {
+      "capture": {
+        "content_digest": "npZ7kanYmDN7egkxBFPMeKypmesdWLybHVw3X/PoHxM=",
+        "output_id": "runtime.capture"
+      },
+      "environment": {
+        "accelerator": "CPU",
+        "execution_lane": "eager",
+        "runtime_version": "0.7.1",
+        "worker_boot_id": "boot-9f21"
+      }
+    },
+    "parent_attempt_ordinal": "2",
+    "parent_invocation_spec_digest": "qp8l2Dqs8QrnAvvs2/I3ltGNCoaS0/nGFEkUviOp59E=",
+    "parent_request_id": "private-parent",
+    "record_owner_epoch": "41",
+    "result_canonical_bytes": "eyJyZXBvcnQiOnsiZGlnZXN0Ijoic2hhMjU2OmVhMjcwNDYzMDM2ZWM1MWE3ZTFkMTdjZTU5M2EwZTI4YThmODgzMTllYmRlZDcwNzg2MDcwMDkwZGE2YTE0ZmIiLCJsZW5ndGgiOjY1NTM3LCJtaW1lX3R5cGUiOiJhcHBsaWNhdGlvbi9qc29uIn19",
+    "state": "CHILD_CALL_STATE_SUCCEEDED",
+    "worker_boot_id": "boot-9f21"
+  }
+}

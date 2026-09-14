@@ -1,0 +1,16 @@
+{
+  "weights_host_ack": {
+    "attempt_ordinal": "1",
+    "control_stream_epoch": "7",
+    "invocation_spec_digest": "KsHXfr+62asi7rDyRNsqmmd58dGR6zc1symZivYwhBQ=",
+    "outcome": "WEIGHTS_HOST_OUTCOME_RECORDED",
+    "output_slot": "model",
+    "record_owner_epoch": "41",
+    "request_id": "job-01HQX",
+    "stage": "WEIGHTS_HOST_STAGE_INTENT",
+    "tensorfs_declaration_digest": "+nItxs9UXk1MCYMGxWcFwMVLSOulojV4FTrw4x8pZm0=",
+    "weights_transaction_id": "sha256:e5f8e5571ae52f071dd1b586ad320e82f73afbb03302ac9b65273bccaa7407fb",
+    "worker_boot_id": "boot-9f21",
+    "writer_epoch": "1"
+  }
+}

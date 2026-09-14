@@ -1,0 +1,19 @@
+{
+  "weights_transfer_status": {
+    "attempt_ordinal": "1",
+    "checksum_sha256": "sha256:bde1922331c714cc7a2cef772423b099169c5f41d11c7c4547d61c19aee65f2d",
+    "control_stream_epoch": "7",
+    "grant_revision": "1",
+    "invocation_spec_digest": "KsHXfr+62asi7rDyRNsqmmd58dGR6zc1symZivYwhBQ=",
+    "length": "16384",
+    "object_id": "sha256:bde1922331c714cc7a2cef772423b099169c5f41d11c7c4547d61c19aee65f2d",
+    "operation_id": "publish-job-01HQX-model-bde1922331c7",
+    "output_slot": "model",
+    "record_owner_epoch": "41",
+    "request_id": "job-01HQX",
+    "state": "WEIGHTS_TRANSFER_STATE_HELD",
+    "update_sequence": "1",
+    "weights_transaction_id": "sha256:e5f8e5571ae52f071dd1b586ad320e82f73afbb03302ac9b65273bccaa7407fb",
+    "worker_boot_id": "boot-9f21"
+  }
+}

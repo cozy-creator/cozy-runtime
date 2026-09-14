@@ -1,0 +1,13 @@
+{
+  "weights_read_request": {
+    "control_stream_epoch": "7",
+    "max_bytes": 22,
+    "object_id": "sha256:834db85608fd190bc37154aaa7cda1a5663f30f5af07a402ed0a15472d72574f",
+    "read_id": "read-0001",
+    "record_owner_epoch": "41",
+    "source_ref": "tensorfs:sha256:834db85608fd190bc37154aaa7cda1a5663f30f5af07a402ed0a15472d72574f",
+    "weights_transaction_id": "sha256:e5f8e5571ae52f071dd1b586ad320e82f73afbb03302ac9b65273bccaa7407fb",
+    "worker_boot_id": "boot-9f21",
+    "writer_epoch": "1"
+  }
+}

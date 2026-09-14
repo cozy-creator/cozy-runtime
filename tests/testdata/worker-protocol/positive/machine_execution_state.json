@@ -1,0 +1,10 @@
+{
+  "attempt_ordinal": "1",
+  "execution_workspace_id": "store-fixture-1",
+  "generation": "1",
+  "request_id": "job-01HQX",
+  "sequence": "3",
+  "state": "succeeded",
+  "worker_boot_id": "boot-after-restart",
+  "worker_id": "wrk-4070"
+}

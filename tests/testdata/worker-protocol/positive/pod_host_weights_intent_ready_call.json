@@ -1,0 +1,32 @@
+{
+  "claim": {
+    "proof": "vmk8UxWZPLMWKYRxYpNpUTXPtw4XnOimNzOdIGtzEp1Q52hCl8/nvnLMA76sQZ54/j2eCPIgsOVi8OgtANovXg==",
+    "record_owner_epoch": "41",
+    "record_owner_id": "rec-owner-local-1",
+    "wire_minor": 57,
+    "worker_boot_id": "boot-9f21",
+    "worker_id": "wrk-4070"
+  },
+  "request": {
+    "attempt_ordinal": "1",
+    "checkpoint": {
+      "bytes": "4294967296",
+      "head": {
+        "digest": "yZP9dyl/HijOLr8z0EpFegKWWd9cYw5Wj8Ujpd+Lz48=",
+        "length": "2048"
+      },
+      "index": "2",
+      "plan_digest": "N5inKKRqhA+eb4+TQIxm7UFMEnb7C5RBllc0asDOObM="
+    },
+    "record_owner_epoch": "41",
+    "weights": {
+      "invocation_spec_digest": "KsHXfr+62asi7rDyRNsqmmd58dGR6zc1symZivYwhBQ=",
+      "output_slot": "model",
+      "request_id": "job-01HQX",
+      "tensorfs_declaration_digest": "+nItxs9UXk1MCYMGxWcFwMVLSOulojV4FTrw4x8pZm0=",
+      "weights_transaction_id": "sha256:e5f8e5571ae52f071dd1b586ad320e82f73afbb03302ac9b65273bccaa7407fb",
+      "writer_epoch": "1"
+    },
+    "worker_boot_id": "boot-9f21"
+  }
+}

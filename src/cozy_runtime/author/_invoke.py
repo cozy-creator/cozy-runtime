@@ -105,6 +105,7 @@ class Invocation:
     settings: object = None
     secrets: object = None
     adapters: tuple[AdapterRef, ...] = ()
+    model_adapters: Mapping[str, tuple[AdapterRef, ...]] = field(default_factory=dict)
     egress_broker: Callable[..., Any] | None = None
     trees: Mapping[str, tuple[Path, str]] = field(default_factory=dict)
     """ref -> (materialized root, digest) for every input tree THIS attempt was granted.
@@ -320,7 +321,10 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
 
     attempt = record
     attempt.rows.extend(overlay.rows)
+    if set(inv.model_adapters) - set(inv.models):
+        raise InvalidRequest("adapter metadata names an unbound model", code="adapter_slot")
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
+    ctx._model_adapters = {id(inv.models[name]): rows for name, rows in inv.model_adapters.items()}
     handles = ExitStack()
     _bind_tensorfs(ctx, record, inv, surface, handles)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)

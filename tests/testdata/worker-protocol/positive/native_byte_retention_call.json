@@ -1,0 +1,22 @@
+{
+  "claim": {
+    "proof": "vmk8UxWZPLMWKYRxYpNpUTXPtw4XnOimNzOdIGtzEp1Q52hCl8/nvnLMA76sQZ54/j2eCPIgsOVi8OgtANovXg==",
+    "record_owner_epoch": "41",
+    "record_owner_id": "rec-owner-local-1",
+    "wire_minor": 57,
+    "worker_boot_id": "boot-9f21",
+    "worker_id": "wrk-4070"
+  },
+  "request": {
+    "retention_id": "sha256:055ebce314c0a43c52a73227af27d1c9d56a4962247e95cfb5c02f55f383037c",
+    "source": {
+      "content_bytes": "65537",
+      "manifest": {
+        "digest": "UztfK03HBxPIFj0Tmbo7wqDUm9eR+Yt9gcjWHDX4WZc=",
+        "length": "192"
+      },
+      "producer_root_id": "sha256:a9b5d9a21d5dbf57007b9d0c015db5b077a47918af93b9879c5ad290a82fb212",
+      "receipt_digest": "tH9zYtJkoLicC1VsIkOaxbEvm3lKUX8aux9Rjk8tmP4="
+    }
+  }
+}

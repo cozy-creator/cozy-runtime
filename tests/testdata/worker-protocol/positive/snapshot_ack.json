@@ -1,0 +1,10 @@
+{
+  "snapshot_ack": {
+    "control_stream_epoch": "7",
+    "host_snapshot_digest": "kAhqPdhoG4wMdfA5guDYScVKvbIgtOhuMsp2S8WaI9M=",
+    "record_owner_epoch": "41",
+    "snapshot_digest": "qh9I5178UaLQKEkzMX0w/whSfSV4pmJ13TiWCIsGMPI=",
+    "snapshot_id": "snap-01",
+    "worker_boot_id": "boot-9f21"
+  }
+}

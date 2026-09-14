@@ -1,0 +1,14 @@
+{
+  "compacted_through": "2",
+  "events": [
+    {
+      "at_ms": "1700000000001",
+      "attempt_ordinal": "1",
+      "body_canonical_bytes": "eyJzdGF0ZSI6InN1Y2NlZWRlZCJ9",
+      "kind": "terminal",
+      "sequence": "3"
+    }
+  ],
+  "head_sequence": "3",
+  "next_after": "3"
+}

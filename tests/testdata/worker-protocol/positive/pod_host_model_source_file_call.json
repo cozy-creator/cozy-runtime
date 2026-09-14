@@ -1,0 +1,23 @@
+{
+  "claim": {
+    "proof": "vmk8UxWZPLMWKYRxYpNpUTXPtw4XnOimNzOdIGtzEp1Q52hCl8/nvnLMA76sQZ54/j2eCPIgsOVi8OgtANovXg==",
+    "record_owner_epoch": "41",
+    "record_owner_id": "rec-owner-local-1",
+    "wire_minor": 57,
+    "worker_boot_id": "boot-9f21",
+    "worker_id": "wrk-4070"
+  },
+  "request": {
+    "capability_revision": "1",
+    "header": "gAAAAAAAAAB7IndlaWdodCI6eyJkYXRhX29mZnNldHMiOlswLDE3MTc5ODY5MDQ4XSwiZHR5cGUiOiJCRjE2Iiwic2hhcGUiOls4NTg5OTM0NTI0XX19ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA==",
+    "length": "17179869184",
+    "member": "transformer/model-00001-of-00002.safetensors",
+    "object_id": "sha256:edcadd60cfac9d3026a093ecc9e5f85241a6c6aaae3fc4e1eca761cf1950482c",
+    "operation_id": "modelpub-minimax-h3-1-0-0",
+    "provider": "MODEL_SOURCE_PROVIDER_HUGGING_FACE",
+    "record_owner_epoch": "41",
+    "source_selection_digest": "LlYr0gtRJWcsINarClTeW+FWh0NPBYiEOUQQyn/o76M=",
+    "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/transformer/model-00001-of-00002.safetensors",
+    "worker_boot_id": "boot-9f21"
+  }
+}

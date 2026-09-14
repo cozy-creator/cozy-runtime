@@ -1,0 +1,7 @@
+{
+  "safe_code": "download_delegation_expired",
+  "safe_detail": "the signed delegation expired before every object landed",
+  "stage": "PREPARE_STAGE_REFUSED",
+  "total_bytes": "4313841664",
+  "transferred_bytes": "18874368"
+}
