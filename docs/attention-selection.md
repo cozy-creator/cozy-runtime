@@ -12,11 +12,12 @@ A model may choose a different eligible implementation before warm-up:
 ```python
 from cozy_runtime.author import AttentionContext, Model
 
+
 class VideoModel(Model[object]):
     def choose_attention(self, context: AttentionContext) -> str | None:
         if context.component == "dit" and "kitchen-int8" in context.eligible:
             return "kitchen-int8"  # This model's separately qualified quality policy.
-        return None               # Keep Runtime's recommendation for other sites.
+        return None  # Keep Runtime's recommendation for other sites.
 ```
 
 The immutable context contains component and module path, device kind/name/SM,
