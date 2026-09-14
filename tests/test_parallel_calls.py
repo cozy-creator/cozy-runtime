@@ -25,6 +25,12 @@ from cozy_runtime.internal.parallel import cp, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.parallel.mirror import mirror_component  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
+from cozy_runtime.internal.worker.lanes import LaneSet  # noqa: E402
+from cozy_runtime.internal.worker.plan import (  # noqa: E402
+    DeclaredBinding,
+    PreparedModel,
+    PreparedRequest,
+)
 from testdata.parallel_calls import collective_model, h3_batch, h3_model  # noqa: E402
 
 
@@ -117,10 +123,10 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         if kind == "h3"
         else collective_model(tmp_path / "rank-0" if kind == "staged" else None)
     )
-    batch = h3_batch() if kind == "h3" else {}
     if kind == "h3":
         with torch.no_grad():
-            expected = model.dit(**batch)
+            batches = [h3_batch(), h3_batch(mixed_lengths=True)]
+            expected = [(batch, model.dit(**batch)) for batch in batches]
     spool = tmp_path / "attempt-a"
     ours, theirs = socket.socketpair()
     leader: Any = Executor(Channel(ours), tmp_path, world=degree)
@@ -161,43 +167,90 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                 group=group,
                 spool=lambda: spool,
             )
+        if kind == "staged":
+            # Exercise the real group chooser, then carry its result through native
+            # CUDA residency and the follower's actual mirrored scope. The tiny
+            # capacity here is a conservative planner input, not a GPU limit claim.
+            lanes = LaneSet.from_envelope(
+                ",".join(str(rank) for rank in range(degree)), worker_pid=os.getpid()
+            )
+            row = lanes.fuse(tuple(range(degree))).row("fixture")
+            backend = model._cozy_residency.backend
+            row.ledger.observe_construction(
+                {
+                    "filled_bytes": 12,
+                    "allocator_bytes": 4,
+                    "reserved_bytes": 4,
+                    "resident": {name: backend.vram_charge[name] for name in backend.components},
+                    "parked": sorted(backend.parked),
+                    "evicted": {
+                        name: backend.component_memory[name].settled for name in backend.parked
+                    },
+                    "declared_scopes": {
+                        "sample": ["block", "overlay"],
+                        "fail_before_collective": ["block", "overlay"],
+                    },
+                    "device_free_bytes": 1,
+                    "device_total_bytes": 1024,
+                }
+            )
+            row.ledger.activations_by_cell["-"] = 37
+            row.ledger.activation_scopes_by_cell["-"] = {"sample": 11, "fail_before_collective": 13}
+            binding = DeclaredBinding(
+                entrypoint_binding_digest="sha256:" + "0" * 64,
+                entrypoint="sample",
+                model_class="ModelCalls",
+                model_binding_path="fixture",
+                model_parameter_name="model",
+                release="fixture/1",
+                model_weight_bytes=12,
+            )
+            assert row.chooser.fits(binding, "-") == ""
+            plan = row.chooser.choose(
+                binding,
+                PreparedModel(delivery_rung="verbatim"),
+                PreparedRequest.unresolved("sample", {}),
+            )
+            assert plan.placement == "component_staged"
+            assert row.chooser.walks[-1]["deepened_to"] == "component_staged"
         for attempt in ("attempt-a", "attempt-b"):
             spool = tmp_path / attempt
             leader._attempt_spool = spool
             if kind == "staged":
                 model._cozy_residency.open_attempt(
-                    "component_staged", 37, {"sample": 11, "fail_before_collective": 13}
+                    plan.placement, plan.headroom_bytes, dict(plan.scope_headroom_bytes)
                 )
             if kind == "h3":
-                # Observe the inputs of real SDPA calls, not just approximately equal
-                # model outputs: replicated text must not become a degree-times-long
-                # attention document before the packed sequence is sharded.
-                with torch.profiler.profile(
-                    activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True
-                ) as profile:
-                    model.compute(batch, expected)
-                attention_shapes = [
-                    event.input_shapes[0]
-                    for event in profile.events()
-                    if event.name == "aten::scaled_dot_product_attention"
-                ]
-                config = model.dit.config
-                local_text = [
-                    1,
-                    config.num_attention_heads,
-                    batch["encoder_hidden_states"].shape[1],
-                    config.attention_head_dim,
-                ]
-                distributed_packed = [
-                    1,
-                    config.num_attention_heads // degree,
-                    batch["position_ids"].shape[0],
-                    config.attention_head_dim,
-                ]
-                assert attention_shapes == (
-                    [local_text] * config.num_refiner_layers
-                    + [distributed_packed] * config.num_layers
-                )
+                for batch, full_output in expected:
+                    # Observe the inputs of real SDPA calls, not just approximately equal
+                    # model outputs: replicated text must not become a degree-times-long
+                    # attention document before the packed sequence is sharded.
+                    with torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True
+                    ) as profile:
+                        model.compute(batch, full_output)
+                    attention_shapes = [
+                        event.input_shapes[0]
+                        for event in profile.events()
+                        if event.name == "aten::scaled_dot_product_attention"
+                    ]
+                    config = model.dit.config
+                    local_text = [
+                        1,
+                        config.num_attention_heads,
+                        batch["encoder_hidden_states"].shape[1],
+                        config.attention_head_dim,
+                    ]
+                    distributed_packed = [
+                        1,
+                        config.num_attention_heads // degree,
+                        batch["position_ids"].shape[0],
+                        config.attention_head_dim,
+                    ]
+                    assert attention_shapes == (
+                        [local_text] * config.num_refiner_layers
+                        + [distributed_packed] * config.num_layers
+                    )
             else:
                 state = SimpleNamespace(
                     value=torch.tensor([2.0, 4.0, 8.0]),

@@ -309,3 +309,48 @@ def test_an_attempt_that_moved_components_proves_nothing_about_full_residency() 
         succeeded=True,
     )
     assert ledger.resident_sufficiency(CELL) == 0
+
+
+def test_uncalibrated_reserve_does_not_become_a_scope_requirement() -> None:
+    ledger = Ledger(worker_pid=1)
+    ledger.begin_generation(1)
+    weights = 4 << 20
+    ledger.observe_construction(
+        {
+            "filled_bytes": weights,
+            "allocator_bytes": 0,
+            "reserved_bytes": 0,
+            "resident": {},
+            "parked": ["model"],
+            "evicted": {"model": weights},
+            "declared_scopes": {"forward": ["model"]},
+            "device_free_bytes": 64 << 20,
+            "device_total_bytes": 128 << 20,
+        }
+    )
+    binding = DeclaredBinding(
+        entrypoint_binding_digest="sha256:small",
+        entrypoint="generate",
+        model_class="SmallModel",
+        model_binding_path="small:Model",
+        model_parameter_name="model",
+        release="fixture/1",
+        model_weight_bytes=weights,
+    )
+    prepared = PreparedRequest.unresolved("generate", {})
+    chooser = PlanChooser(ledger)
+    plan = chooser.choose(binding, PreparedModel(delivery_rung="verbatim"), prepared)
+    assert plan.placement == "component_staged"
+    assert plan.activation_envelope_bytes == UNCALIBRATED_ACTIVATION_BYTES
+    assert plan.headroom_bytes == 0
+    assert dict(plan.scope_headroom_bytes) == {"forward": 0}
+    # The guess still prices conservative placement; it is not lost or called measured.
+    walk = chooser.walks[-1]
+    assert walk["scope_demand_bytes"] == {"forward": weights + UNCALIBRATED_ACTIVATION_BYTES}
+    assert _row(walk, "component_staged")["verdict"] == "short"
+    # Once a scope has been measured on this generation, that observed demand remains.
+    ledger.activations_by_cell["-"] = 2 << 20
+    ledger.activation_scopes_by_cell["-"] = {"forward": 2 << 20}
+    measured = chooser.choose(binding, PreparedModel(delivery_rung="verbatim"), prepared)
+    assert measured.headroom_bytes == 2 << 20
+    assert dict(measured.scope_headroom_bytes) == {"forward": 2 << 20}

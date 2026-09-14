@@ -22,7 +22,8 @@ from typing import Any, Protocol
 from urllib.parse import quote
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author.publication import CheckpointRef, ReleaseReceipt
+from cozy_runtime.author._artifacts import ObjectRef
+from cozy_runtime.author.publication import AssessmentRef, CheckpointRef, ReleaseReceipt
 from cozy_runtime.internal import egress
 from cozy_runtime.internal.config import parse_tensorhub_origin
 
@@ -421,3 +422,53 @@ def upload_checkpoint(
     return CheckpointRef(
         checkpoint.destination, manifest.digest, manifest, operation, "acknowledged"
     )
+
+
+def attach_assessment(
+    client: PublicationClient,
+    checkpoint: CheckpointRef,
+    report: bytes,
+    verdict: str,
+    before_write: Callable[[], None],
+) -> AssessmentRef:
+    """Reconcile the exact report after the machine has verified its associations."""
+    _require(0 < len(report) <= _MAX_METADATA and verdict in {"pass", "fail", "indeterminate"})
+    digest = "sha256:" + hashlib.sha256(report).hexdigest()
+    path = (
+        destination_path(checkpoint.destination)
+        + "/checkpoints/"
+        + checkpoint.checkpoint
+        + "/assessments/"
+        + digest
+    )
+
+    def result(observation: str) -> AssessmentRef:
+        return AssessmentRef(
+            checkpoint.destination,
+            checkpoint.checkpoint,
+            ObjectRef(digest, len(report)),
+            verdict,
+            observation,
+        )
+
+    try:
+        existing = client.request("GET", path)
+    except PublicationRefusal as exc:
+        if exc.status != 404:
+            raise
+    else:
+        _require(existing == report, "assessment.readback_changed")
+        return result("observed_convergence")
+    before_write()
+    acknowledgement = _object(client.request("PUT", path, report))
+    value = acknowledgement.get("assessment", {})
+    _require(
+        value.get("checkpoint_id") == checkpoint.checkpoint
+        and value.get("scope") == "publisher_assessment"
+        and value.get("report") == {"digest": digest, "length": len(report)}
+        and value.get("verdict") == verdict
+        and acknowledgement.get("publisher_reported_verdict") == verdict,
+        "assessment.acknowledgement_changed",
+    )
+    _require(client.request("GET", path) == report, "assessment.readback_changed")
+    return result("acknowledged")

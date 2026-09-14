@@ -33,7 +33,7 @@ A GROUP lane is a lane whose `ordinals` has K > 1 entries (cr-068): ONE executor
 all K devices, one seat, one ledger with one `DeviceFacts` row per device. The RecordOwner
 assigns it by PINNING a placement to K ordinals; `assign` validates the pin against the
 envelope, occupancy (a group never steals a device), the package's declared degrees and
-per-device measured fit, then FUSES K empty device lanes into one. The lane stays a group
+readable device capacity, then FUSES K empty device lanes into one. The lane stays a group
 while its placement holds it and SPLITS back when the placement leaves. `revision` moves on
 every fuse and split, which is the worker's cue to bump `admission_epoch`: the seat count
 changed meaning. The worker never chooses a degree.
@@ -184,7 +184,7 @@ class DeviceLane:
     def memory(self, kind: str) -> DeviceMemory:
         """The lane's ONE reading: the MIN over its devices, UNREADABLE if any is.
 
-        A group holds the full weights on every card, so what the lane can hold is what
+        Every rank follows one residency plan, so what the lane can hold is what
         its tightest card can hold; one card the driver cannot read makes the lane
         unreadable rather than "the others looked fine" (never authorized zero).
         """
@@ -205,9 +205,7 @@ class DeviceLane:
         held = self.rows.get(slot)
         if held is None:
             ledger = Ledger(worker_pid=self.worker_pid)
-            held = self.rows[slot] = LaneRow(
-                ledger=ledger, chooser=PlanChooser(ledger, degree=self.degree)
-            )
+            held = self.rows[slot] = LaneRow(ledger=ledger, chooser=PlanChooser(ledger))
         return held
 
     def forget(self, slot: str) -> None:
@@ -493,11 +491,13 @@ class LaneSet:
            still decide whether the model can run.
 
         A pin of K > 1 ordinals is a GROUP (cr-068): every named lane must be empty, the
-        package must declare degree K, and every device's headroom must cover the declared
-        simultaneous component weight requirement on every rank — then the K lanes FUSE.
+        package must declare degree K, and every device must report readable capacity —
+        then the K lanes FUSE. Like a single-device lane, a group permits bounded
+        preparation when header weight sizes exceed VRAM: construction may discover
+        block paging, and the common plan is priced against the tightest rank.
         Refusals move no other placement: `device_pin_infeasible` (envelope, occupancy),
         `device_group_unsupported` (no construction declared at K), `device_group_infeasible`
-        (a device unreadable or short). A model-bearing placement with NO pin on a WIDE
+        (a device unreadable). A model-bearing placement with NO pin on a WIDE
         envelope refuses `device_group_unsupported`: the RecordOwner chose neither a device
         nor a degree, and the worker will not idle K-1 paid cards silently by picking one
         (ruling 3). The alternative — assign by fit to one device lane and idle the rest —
@@ -515,9 +515,7 @@ class LaneSet:
                 f"got {list(pin)}",
             )
         if pin is not None and len(pin) > 1:
-            return self._assign_group(
-                placement_id, pin, model_bearing, declared_bytes, measured, degrees
-            )
+            return self._assign_group(placement_id, pin, model_bearing, measured, degrees)
         if not model_bearing:
             if pin is None:
                 pool = [lane for lane in self.lanes if not lane.group] or list(self.lanes)
@@ -614,12 +612,15 @@ class LaneSet:
         placement_id: str,
         pin: tuple[int, ...],
         model_bearing: bool,
-        declared_bytes: int,
         measured: Mapping[int, DeviceMemory],
         degrees: tuple[int, ...],
     ) -> DeviceLane:
-        """Validate a K > 1 pin in the design's order — envelope and occupancy, declared
-        degree, per-device fit — then fuse. Nothing moves until every check passed."""
+        """Validate topology and readable capacity before bounded group preparation.
+
+        Header weight bytes cannot describe the working set of Runtime block paging.
+        Preparation assigns one measured ceiling to every rank; construction and the
+        attempt planner remain responsible for the actual simultaneous working set.
+        """
         degree = len(pin)
         if not model_bearing:
             raise LaneRefusal(
@@ -656,18 +657,8 @@ class LaneSet:
         short: list[str] = []
         for ordinal in pin:
             memory = measured.get(ordinal)
-            holder = self.holder_of(ordinal)
-            assert holder is not None
             if memory is None or memory.state != "measured":
                 short.append(f"ordinal {ordinal} ({self.entries[ordinal]!r}) free bytes unreadable")
-                continue
-            room = memory.free_bytes - holder.outstanding_bytes()
-            if room < declared_bytes:
-                short.append(
-                    f"ordinal {ordinal} ({self.entries[ordinal]!r}) has {room} B measured "
-                    f"headroom for {declared_bytes} B of declared simultaneous weights "
-                    "(replicated on every rank)"
-                )
         if short:
             raise LaneRefusal(
                 "device_group_infeasible",

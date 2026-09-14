@@ -10,6 +10,7 @@ from typing import Any
 import msgspec
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author._assets import asset_dec_hook
 from cozy_runtime.author.publication import CheckpointRef
 from cozy_runtime.internal import effect_interfaces, fill
 from cozy_runtime.internal.worker import machine_models
@@ -19,6 +20,7 @@ from cozy_runtime.internal.worker.machine_publication import (
     PublicationRefusal,
     PublicationTLS,
     apply_release,
+    attach_assessment,
     prepare_release,
     upload_checkpoint,
 )
@@ -37,6 +39,7 @@ class Effects:
         self.lock = threading.Lock()
         self.active: dict[tuple[str, str], Future[None]] = {}
         self.retry_after: dict[tuple[str, str], float] = {}
+        self.cleanup_after: dict[str, tuple[int, str]] = {}
         self.stopped = False
 
     def close(self) -> None:
@@ -70,7 +73,10 @@ class Effects:
                 return
         for call in self.journal.pending_effects(owner):
             self.schedule(owner, call)
-        self._cleanup(owner)
+        with self.lock:
+            key = owner, "cleanup"
+            if not self.stopped and len(self.active) < 2 and key not in self.active:
+                self.active[key] = self.pool.submit(self._cleanup, owner)
 
     def _before_write(self, owner: str, call: Call) -> None:
         with self.lock:
@@ -81,7 +87,7 @@ class Effects:
     def _run(self, owner: str, original: Call) -> None:
         call = self.journal.get(owner, original.parent_request, original.call_index)
         try:
-            if call.result or call.safe_code:
+            if call.result or (call.safe_code and not call.sent):
                 return
             with self.workspace.locked() as db:
                 pure = db.execute(
@@ -119,6 +125,14 @@ class Effects:
                     intent["request"], type=effect_interfaces.Upload, strict=True
                 )
                 result = self._upload(owner, call, request_upload, client)
+            elif operation == "attach_assessment":
+                attachment = msgspec.convert(
+                    intent["request"],
+                    type=effect_interfaces.AttachAssessment,
+                    strict=True,
+                    dec_hook=asset_dec_hook,
+                )
+                result = self._assessment(owner, call, attachment, client)
             else:
                 raise PublicationRefusal("publication.operation_unavailable")
             raw = canonical_json.encode(msgspec.to_builtins(result))
@@ -140,6 +154,8 @@ class Effects:
                 )
                 self.journal.refuse(owner, latest, code, "publication was refused before any write")
                 return
+            if latest.sent and isinstance(exc, PublicationRefusal) and not transient:
+                self.journal.unresolved(owner, latest, exc.code)
             # An interrupted/revoked authority does not establish whether a prior
             # send committed. Keep the obligation and exact baseline for readback.
             self.executions.progress(
@@ -213,26 +229,104 @@ class Effects:
             )
 
     def _cleanup(self, owner: str) -> None:
+        after = self.cleanup_after.get(owner, (0, ""))
         with self.workspace.locked() as db:
             rows = db.execute(
-                "SELECT c.prepared FROM execution_calls c JOIN holds h ON "
-                "h.id=json_extract(CASE WHEN json_valid(CAST(c.prepared AS TEXT)) "
-                "THEN CAST(c.prepared AS TEXT) ELSE '{}' END,'$.source.retention_id') "
-                "WHERE c.owner=? AND h.owner=c.owner AND h.state<>'released' "
-                "AND (c.result<>x'' OR c.safe_code<>'' OR (c.sent=0 AND EXISTS "
-                "(SELECT 1 FROM executions e WHERE e.owner=c.owner "
-                "AND e.request=c.parent_request AND e.desired='cancel'))) "
-                "AND json_valid(CAST(c.prepared AS TEXT)) "
-                "AND json_extract(CAST(c.intent AS TEXT),'$.module')=? LIMIT 32",
-                (owner, effect_interfaces.MODULE),
+                "SELECT c.*,e.desired FROM execution_calls c JOIN executions e "
+                "ON e.owner=c.owner AND e.request=c.parent_request "
+                "WHERE c.owner=? AND (c.created_ms,c.child_request)>(?,?) "
+                "AND json_extract(CAST(c.intent AS TEXT),'$.module')=? "
+                "ORDER BY c.created_ms,c.child_request LIMIT 32",
+                (owner, *after, effect_interfaces.MODULE),
             ).fetchall()
         for row in rows:
-            value = canonical_json.decode(row["prepared"])["source"]
-            source = pb.DerivedRetentionRequest(
-                weights_transaction_id=value["weights_transaction_id"],
-                tensorfs_receipt_digest=documents.raw(value["tensorfs_receipt_digest"]),
-                retention_id=value["retention_id"],
+            if not (
+                row["result"]
+                or (not row["sent"] and (row["safe_code"] or row["desired"] == "cancel"))
+            ):
+                continue
+            with self.workspace.locked() as db:
+                registry = db.execute(
+                    "SELECT retention FROM execution_model_holds WHERE owner=? AND recipient=?",
+                    (owner, row["child_request"]),
+                ).fetchall()
+                held = any(
+                    db.execute(
+                        "SELECT 1 FROM holds WHERE owner=? AND id=? AND state<>'released'",
+                        (
+                            owner,
+                            pb.DerivedRetentionRequest.FromString(entry["retention"]).retention_id,
+                        ),
+                    ).fetchone()
+                    for entry in registry
+                )
+            if held:
+                machine_models.release(self.workspace, owner, row["child_request"])
+        # This cursor only bounds background scanning; custody remains native and
+        # release is idempotent. Cycling revisits calls that finish after this page.
+        self.cleanup_after[owner] = (
+            (rows[-1]["created_ms"], rows[-1]["child_request"]) if rows else (0, "")
+        )
+
+    def _assessment(
+        self,
+        owner: str,
+        call: Call,
+        request: effect_interfaces.AttachAssessment,
+        client: PublicationClient,
+    ) -> Any:
+        from . import machine_assessment
+
+        report, producer = machine_assessment.read_file(
+            self.workspace,
+            owner,
+            call.parent_request,
+            call.child_request,
+            "report",
+            request.report.ref,
+        )
+        workloads, workload_producer = machine_assessment.read_file(
+            self.workspace,
+            owner,
+            call.parent_request,
+            call.child_request,
+            "workloads",
+            request.workloads.ref,
+        )
+        if producer != workload_producer:
+            raise WorkspaceRefusal("assessment report and workload have different producers")
+        if not call.prepared:
+            verdict = machine_assessment.verify(
+                self.workspace,
+                owner,
+                producer,
+                call.child_request,
+                request.checkpoint,
+                report,
+                workloads,
             )
-            # The same semantic model registry is used by ordinary child outputs.
-            # Its native releases are exact and idempotent after a lost reply.
-            self.workspace.retain(owner, source, release=True)
+            call = self.journal.freeze(
+                owner,
+                call,
+                canonical_json.encode(
+                    {
+                        "kind": "assessment",
+                        "report": request.report.ref,
+                        "workloads": request.workloads.ref,
+                        "verdict": verdict,
+                        "producer": producer,
+                    }
+                ),
+            )
+        else:
+            frozen = canonical_json.decode(call.prepared)
+            if (
+                frozen.get("report") != request.report.ref
+                or frozen.get("workloads") != request.workloads.ref
+                or frozen.get("producer") != producer
+            ):
+                raise WorkspaceRefusal("assessment changed its frozen source identity")
+            verdict = frozen["verdict"]
+        return attach_assessment(
+            client, request.checkpoint, report, verdict, lambda: self._before_write(owner, call)
+        )

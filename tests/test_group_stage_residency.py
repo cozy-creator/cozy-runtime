@@ -12,7 +12,7 @@ import tensorfs
 
 from cozy_runtime.internal import accel, base_observation, canonical
 from cozy_runtime.internal.worker.acquire import Acquirer
-from cozy_runtime.internal.worker.lanes import DeviceLane, LaneRefusal, LaneSet
+from cozy_runtime.internal.worker.lanes import DeviceLane, LaneSet
 from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.session import Placement, read_placement_set
 from cozy_runtime.protocol import documents
@@ -120,25 +120,24 @@ def test_actual_h3_scopes_fit_each_rank_without_dividing_weights(
     lane = assign(selected, degree)
     assert lane.degree == degree
     assert selected.group_weight_bytes() == TEXT_ENCODER
-    with pytest.raises(LaneRefusal, match="device_group_infeasible"):
-        assign(selected, degree, TEXT_ENCODER - 1)
+    # Header estimates must not reject the text encoder before construction can
+    # discover its smaller no-split block working set.
+    assert assign(selected, degree, TEXT_ENCODER - 1).degree == degree
 
 
 @pytest.mark.parametrize(
     "scope", ["simultaneous", "unknown", "uncovered", "absent", "missing_component"]
 )
-def test_full_or_unknown_scopes_remain_too_large(tmp_path: Path, scope: str) -> None:
+def test_header_scopes_defer_fit_to_bounded_construction(tmp_path: Path, scope: str) -> None:
     selected = binding(tmp_path, scope=scope)
-    with pytest.raises(LaneRefusal, match="device_group_infeasible"):
-        assign(selected)
+    assert assign(selected).degree == 2
 
 
 def test_independent_slots_of_the_same_checkpoint_still_sum(tmp_path: Path) -> None:
     selected = binding(tmp_path, slots=2)
     assert len(selected.model_bindings()) == 2
     assert selected.group_weight_bytes() == 2 * TEXT_ENCODER
-    with pytest.raises(LaneRefusal, match="device_group_infeasible"):
-        assign(selected)
+    assert assign(selected).degree == 2
 
 
 def test_missing_component_still_refuses_native_model_fit(tmp_path: Path) -> None:

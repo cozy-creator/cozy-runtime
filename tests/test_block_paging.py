@@ -5,15 +5,18 @@ from __future__ import annotations
 import pytest
 
 from cozy_runtime.internal.paging import partition
-from cozy_runtime.internal.worker.ledger import Ledger
-from cozy_runtime.internal.worker.plan import DeclaredBinding, PlanChooser
+from cozy_runtime.internal.worker.lanes import LaneSet
+from cozy_runtime.internal.worker.plan import DeclaredBinding
 
 
-def test_h3_encoder_block_floor_reaches_the_attempt_planner() -> None:
+@pytest.mark.parametrize("degree", [1, 2, 4])
+def test_h3_encoder_block_floor_reaches_the_attempt_planner(degree: int) -> None:
     # Exact full-H3 meta census, including its non-persistent buffers. These are
     # shape facts, not a claimed activation peak or a full-video fit certificate.
     nominal, working = 51_506_192_132, 2_898_621_988
-    ledger = Ledger(worker_pid=1)
+    lanes = LaneSet.from_envelope(",".join(str(rank) for rank in range(degree)), worker_pid=1)
+    lane = lanes.fuse(tuple(range(degree))) if degree > 1 else lanes.lanes[0]
+    ledger = lane.row("fixture").ledger
     ledger.begin_generation(1)
     ledger.observe_construction(
         {
@@ -38,7 +41,7 @@ def test_h3_encoder_block_floor_reaches_the_attempt_planner() -> None:
         release="fixture@1",
         model_weight_bytes=nominal,
     )
-    chooser = PlanChooser(ledger)
+    chooser = lane.row("fixture").chooser
     _, rows, chosen, _ = chooser._walk(binding, "fixture")
     assert chosen == "component_staged", rows
     assert rows[0]["verdict"] == "construction_parked"

@@ -107,7 +107,7 @@ class Calls:
                 "SELECT c.child_request FROM execution_calls c JOIN descendants d "
                 "ON c.parent_request=d.request WHERE c.owner=?) "
                 "SELECT 1 FROM execution_calls c JOIN descendants d ON c.parent_request=d.request "
-                "WHERE c.owner=? AND c.sent=1 AND c.result=x'' AND c.safe_code='' "
+                "WHERE c.owner=? AND c.sent=1 AND c.result=x'' "
                 "AND json_extract(CAST(c.intent AS TEXT),'$.module')=? LIMIT 1",
                 (root_request, owner, owner, MODULE),
             ).fetchone()
@@ -241,13 +241,33 @@ class Calls:
                 for row in db.execute(
                     "SELECT c.* FROM execution_calls c JOIN executions e "
                     "ON e.owner=c.owner AND e.request=c.parent_request "
-                    "WHERE c.owner=? AND c.result=x'' AND c.safe_code='' "
+                    "WHERE c.owner=? AND c.result=x'' AND (c.safe_code='' OR c.sent=1) "
                     "AND json_extract(CAST(c.intent AS TEXT),'$.module')=? "
                     "AND (c.sent=1 OR (e.state='running' AND e.desired='run')) "
                     "ORDER BY c.created_ms,c.child_request LIMIT ?",
                     (owner, MODULE, limit),
                 )
             ]
+
+    def unresolved(self, owner: str, call: Call, code: str) -> None:
+        """Expose an effect problem without claiming its prior send did not land."""
+        if not 0 < len(code.encode()) <= 128:
+            raise WorkspaceRefusal("effect failure exceeds its bound")
+        with self.workspace.locked() as db, transaction(db):
+            row = self._row(db, owner, call.parent_request, call.call_index)
+            if row["intent_digest"] != call.intent_digest or not row["sent"] or row["result"]:
+                raise WorkspaceRefusal("effect has no unresolved send")
+            db.execute(
+                "UPDATE execution_calls SET safe_code=?,safe_detail=? "
+                "WHERE owner=? AND parent_request=? AND call_index=?",
+                (
+                    code,
+                    "publication outcome requires reconciliation",
+                    owner,
+                    call.parent_request,
+                    call.call_index,
+                ),
+            )
 
     def freeze(self, owner: str, call: Call, prepared: bytes) -> Call:
         """Bind read-dependent metadata before a write, once for this exact call.
@@ -330,12 +350,11 @@ class Calls:
             if (
                 row["intent_digest"] != call.intent_digest
                 or not row["sent"]
-                or row["safe_code"]
                 or row["result"] not in (b"", result)
             ):
                 raise WorkspaceRefusal("call result changed its authorized write or prior result")
             db.execute(
-                "UPDATE execution_calls SET result=? "
+                "UPDATE execution_calls SET result=?,safe_code='',safe_detail='' "
                 "WHERE owner=? AND parent_request=? AND call_index=?",
                 (result, owner, call.parent_request, call.call_index),
             )
