@@ -139,7 +139,7 @@ class Builtins:
             python=Path(worker.options.python or sys.executable),
         )
         placement.installed = installed
-        worker.local_revisions[(placement.placement_id, revision)] = placement
+        worker.prepared_revisions[(placement.placement_id, revision)] = placement
         interface = package_interface.read_bytes(
             canonical_json.encode(frozen["package_interface"]), "Runtime builtin"
         )
