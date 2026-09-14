@@ -314,7 +314,7 @@ def test_adapter_wrapper_inside_typed_user_payload_is_not_an_override() -> None:
         reserve(base, base, UserData(wrapped))
 
 
-def test_native_self_call_unwraps_only_declared_model_payload() -> None:
+def test_native_self_call_removes_declared_models_from_payload() -> None:
     bound = canonical_json.decode(
         reserve(with_adapters(artifact("1"), [LoRA(artifact("2"), "dit", 0)]), artifact("3"))
     )
@@ -330,7 +330,8 @@ def test_native_self_call_unwraps_only_declared_model_payload() -> None:
     )
     raw = canonical_json.encode(bound)
     payload, models = arguments(target, raw)
-    assert canonical_json.decode(payload)["first"] == msgspec.to_builtins(artifact("1"))
+    assert "first" not in canonical_json.decode(payload)
+    assert "second" not in canonical_json.decode(payload)
     assert models == bound
     assert read_binding(models["first"])[1][0].scale == "0"
     assert canonical_json.decode(raw)["first"]["format"] == "cozy.model-binding/1"

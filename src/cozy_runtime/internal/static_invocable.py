@@ -171,6 +171,10 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
         memoize=registration.memoize,
         capabilities=capabilities,
     )
-    invocable_interface.validate(metadata, doc["request"], doc["result"])
     doc["invocable"] = cast(Json, metadata)
+    if registration.kind == "entrypoint":
+        invocable_interface.project_serving_models(doc)
+    invocable_interface.validate(
+        doc["invocable"], doc["request"], doc["result"], kind=registration.kind
+    )
     return doc

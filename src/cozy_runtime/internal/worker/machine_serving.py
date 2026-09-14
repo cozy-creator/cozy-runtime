@@ -11,8 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import msgspec
-
 from cozy_runtime import canonical_json
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
 from cozy_runtime.author._model_bindings import read_binding
@@ -50,11 +48,7 @@ def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, Any]]:
         raise WorkspaceRefusal("captured serving arguments must be an object")
     names = {model["path"].rpartition(".")[2] for model in target.declaration.get("models", [])}
     if not target.serving_envelope:
-        payload = dict(value)
-        for name in names:
-            if value.get(name) is not None:
-                base, _ = read_binding(value[name])
-                payload[name] = msgspec.to_builtins(base)
+        payload = {key: item for key, item in value.items() if key not in names}
         return canonical_json.encode(payload), value
     if (
         set(value) != {"payload", "models"}

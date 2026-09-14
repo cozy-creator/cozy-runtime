@@ -61,6 +61,108 @@ def project(tmp_path: Path) -> Path:
     return root
 
 
+def test_modeled_invocable_serving_has_one_model_plane_for_self_and_generated_calls(
+    tmp_path: Path,
+) -> None:
+    root = project(tmp_path)
+    source = SOURCE.replace("App, Context, Model", "App, Context, Model, invocable")
+    source = source.replace(
+        "class Request(msgspec.Struct, kw_only=True):",
+        "class Request(msgspec.Struct, kw_only=True, forbid_unknown_fields=True):",
+    )
+    source = source.replace("    tags: dict[str, int] = msgspec.field(default_factory=dict)\n", "")
+    source = source.replace(
+        'count: int = msgspec.field(name="wire_count", default=3)', "count: int = 3"
+    )
+    source = source.replace(
+        "@app.entrypoint\ndef generate(ctx: Context, payload: Request, model: FixtureModel)",
+        '@invocable(memoize=False, defaults={"model":'
+        '[{"gpu":"*","lane":"proof/adapter@1.0.0/base"}]})\n'
+        "async def generate(ctx: Context, *, payload: Request, model: FixtureModel)",
+    ).replace(
+        "\n@app.entrypoint\nasync def echo",
+        "\napp.entrypoint(generate)\n\n@app.entrypoint\nasync def echo",
+    )
+    (root / "serving_fixture.py").write_text(source)
+    static = static_interface.build(root)
+    imported = package_interface.build(discover(root))
+    raw = package_interface.canonical_bytes(static)
+    assert raw == package_interface.canonical_bytes(imported)
+    entry = next(row for row in static["entrypoints"] if row["name"] == "generate")
+    assert [field["name"] for field in entry["request"]["fields"]] == ["payload"]
+    assert entry["invocable"]["parameters"] == ["payload"]
+    output = tmp_path / "caller"
+    for name, data in interface_wheel.generate(raw).items():
+        path = output / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    check = """import asyncio,inspect,json,sys
+sys.path.insert(0,sys.argv[1])
+import serving_fixture as client
+from cozy_runtime.author import PendingCall,describe,ConformanceError
+from cozy_runtime.author._calls import _Broker,_CallType,_current
+from cozy_runtime.author.fakes import fake_context
+if sys.argv[2]=="self":
+    describe(client.app)
+    surface=client.app.get("generate").surface
+    binding=_CallType("sha256:"+"11"*32,"serving_fixture","generate",surface.payload_type,surface.result_type)
+else:
+    binding=client.__cozy_bindings__["generate"]
+    assert list(inspect.signature(client.generate).parameters)==["payload","model","capture"]
+sent=[]
+def exchange(kind,frame):
+    if kind=="child_call":sent.append(frame)
+    return {"ok":True,"state":"succeeded","result":'{"value":7}',"child_request_id":"child"}
+broker=_Broker("root",{(binding.interface_digest,binding.module,binding.export):binding,
+                      ("",binding.module,binding.export):binding},exchange)
+broker.bind(fake_context(request_id="root"))
+token=_current.set(broker)
+async def run():
+    call=client.generate(payload=client.Request(prompt="typed"))
+    assert isinstance(call,PendingCall) and (await call).value==7
+    for invalid in ({"payload":{"prompt":5}},
+                    {"payload":{"prompt":"typed","unknown":1}},
+                    {"payload":client.Request(prompt="typed"),"model":"not an artifact"}):
+        try:await client.generate(**invalid)
+        except (TypeError,ValueError,ConformanceError):pass
+        else:raise AssertionError("invalid request reached inference: "+repr(invalid))
+try:
+    asyncio.run(run());broker.finish()
+finally:_current.reset(token)
+assert len(sent)==1
+print(sent[0]["payload"])
+"""
+    target = Target("revision", "generate", "interface", entry, {}, None, "digest")
+    expected = None
+    from dataclasses import replace
+
+    for mode, module_path in (("self", root), ("imported", output)):
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", check, str(module_path), mode],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        payload, models = arguments(
+            replace(target, serving_envelope=mode == "imported"), result.stdout.strip().encode()
+        )
+        assert models.get("model") is None
+        if expected is None:
+            expected = payload
+        assert payload == expected
+        assert "model" not in canonical_json.decode(payload)
+
+
+def test_ordinary_serving_request_model_name_collision_still_refuses(tmp_path: Path) -> None:
+    root = project(tmp_path)
+    (root / "serving_fixture.py").write_text(
+        SOURCE.replace("    prompt: str", '    prompt: str\n    model: str = "user payload"')
+    )
+    raw = package_interface.canonical_bytes(static_interface.build(root))
+    with pytest.raises(ConformanceError, match="collide"):
+        interface_wheel.generate(raw)
+
+
 def test_serving_metadata_keeps_original_handler_and_cli_schema(tmp_path: Path) -> None:
     root = project(tmp_path)
     source = static_interface.build(root)
