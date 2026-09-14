@@ -6949,6 +6949,8 @@ class Worker:
             if supervision.current is not None
         ]
         self.request_stop()
+        if self.machine_calls is not None:
+            self.machine_calls.close()
         if self.machine_effects is not None:
             self.machine_effects.close()
         self.weights.close()
