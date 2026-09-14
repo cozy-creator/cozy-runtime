@@ -35,6 +35,7 @@ class _Pending:
     byte_grants: list[dict[str, Any]] | None = None
     spool: Path | None = None
     forgotten: bool = False
+    local: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,9 +53,12 @@ class Calls:
         *,
         workspace: Workspace | None = None,
         owner: Callable[[], str] = lambda: "",
+        local: Callable[[AttemptRecord, pb.ChildCallRequest, str], pb.ChildCallResult | None]
+        | None = None,
     ):
         self.send, self.stream, self.minor = send, stream, minor
         self.workspace, self.owner = workspace, owner
+        self.local = local
         self.pending: dict[tuple[str, int, int], _Pending] = {}
         self.materialized: dict[tuple[str, int], tuple[Path, int]] = {}
         self.received: dict[tuple[str, int], dict[str, _Received]] = {}
@@ -74,7 +78,7 @@ class Calls:
         raw = Path(attempt.job.package_interface).read_bytes()
         interface = package_interface.read_bytes(raw)
         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-        for entry in interface["jobs"]:
+        for entry in [*interface["jobs"], *interface["entrypoints"]]:
             declaration = entry.get("invocable")
             if declaration is not None:
                 result.append(
@@ -121,10 +125,23 @@ class Calls:
                         if sum(k[:2] == key[:2] for k in self.pending) >= MAX_ACTIVE_CALLS:
                             raise ValueError("active parent call bound exceeded")
                         pending = self.pending[key] = _Pending(request, self.stream())
-                        self.send(pb.WorkerFrame(child_call_request=request))
+                        local = (
+                            self.local(attempt, request, "call") if self.local is not None else None
+                        )
+                        if local is not None:
+                            pending.local, pending.result = True, local
+                        else:
+                            self.send(pb.WorkerFrame(child_call_request=request))
                 if pending is None:
                     raise ValueError("parent call has not been activated")
+                if pending.local:
+                    assert self.local is not None
+                    pending.result = self.local(
+                        attempt, pending.request, "cancel" if kind == "child_cancel" else "poll"
+                    )
                 if kind == "child_cancel":
+                    if pending.local:
+                        return {"ok": True, "state": "pending"}
                     request = pending.request
                     self.send(
                         pb.WorkerFrame(
@@ -142,7 +159,7 @@ class Calls:
                     raise ValueError("unknown managed call operation")
                 # A new owner stream re-establishes accepted calls by the same
                 # canonical index/intent. No durable cursor lives in Runtime.
-                if pending.stream_epoch != self.stream():
+                if not pending.local and pending.stream_epoch != self.stream():
                     pending.stream_epoch = self.stream()
                     self.send(pb.WorkerFrame(child_call_request=pending.request))
                 result = pending.result

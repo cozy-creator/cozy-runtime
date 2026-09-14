@@ -24,11 +24,18 @@ this repo's CI `drift` job runs.
 from __future__ import annotations
 
 from cozy.worker.v1 import weights_limits, worker_pb2, worker_pb2_grpc
-from cozy.worker.v1.wire_version import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
+from cozy.worker.v1.wire_version import (
+    MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR,
+    MIN_COMPATIBLE_WIRE_MINOR,
+    RETAINED_MODEL_RESULTS_WIRE_MINOR,
+    WIRE_MINOR,
+)
 from cozy_runtime.protocol import documents
 
 __all__ = [
+    "MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR",
     "MIN_COMPATIBLE_WIRE_MINOR",
+    "RETAINED_MODEL_RESULTS_WIRE_MINOR",
     "WIRE_MINOR",
     "documents",
     "weights_limits",

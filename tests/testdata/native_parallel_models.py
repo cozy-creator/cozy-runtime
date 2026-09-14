@@ -338,7 +338,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         resolved = PreparedModel.from_reply(reply)
         ledger = Ledger()
         ledger.observe_construction(reply["facts"])
-        chooser = PlanChooser(ledger, degree=degree)
+        chooser = PlanChooser(ledger)
         request_id = "native-multi-model-invocation"
         request = executor.prepare_request(
             {"request_id": request_id, "entrypoint": "generate", "payload": {"value": 9}}

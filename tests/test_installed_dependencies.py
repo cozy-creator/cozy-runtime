@@ -10,8 +10,10 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -344,3 +346,116 @@ def test_dependency_record_verification_also_returns_canonical_content_digest(
     actual = dependencies._copy_dependency_file(source, target, expected, str(len(body)))
     assert actual == ("sha256:" + hashlib.sha256(body).hexdigest(), len(body))
     assert source.stat().st_ino != target.stat().st_ino
+
+
+def test_cached_payloads_are_immutable_and_independent_of_source_and_cache(tmp_path: Path) -> None:
+    source, first, second, cache = (
+        tmp_path / part for part in ("source", "first", "second", "cache")
+    )
+    site = _venv(source)
+    first_site, second_site = _venv(first), _venv(second)
+    _distribution(
+        site,
+        "dependency",
+        {
+            "dependency.py": b"value = 47\n",
+            "dependency/data.bin": bytes(range(256)) * 4096,
+            "dependency-1.0.dist-info/entry_points.txt": b"[console_scripts]\nproof = sys:exit\n",
+        },
+    )
+    initial = dependencies.snapshot(source / "bin/python", first, set(), cache=cache)
+    dependencies.verify_files(first, initial)
+    repeated = dependencies.snapshot(source / "bin/python", second, set(), cache=cache)
+    assert initial == repeated
+    dependencies.verify_files(second, repeated)
+    payload = "dependency/data.bin"
+    assert (first_site / payload).stat().st_ino == (second_site / payload).stat().st_ino
+    assert (first_site / payload).stat().st_ino != (site / payload).stat().st_ino
+    assert not (first_site / payload).stat().st_mode & 0o222
+    assert (first_site / "dependency-1.0.dist-info/RECORD").stat().st_ino != (
+        second_site / "dependency-1.0.dist-info/RECORD"
+    ).stat().st_ino
+    (site / payload).write_bytes(b"mutated source bytes")
+    shutil.rmtree(source)
+    shutil.rmtree(cache)
+    package_environment._make_read_only(first)
+    package_environment._remove_tree(first)
+    assert not (second_site / payload).stat().st_mode & 0o222
+    dependencies.verify_files(second, repeated)
+
+
+def test_cache_reuse_still_rejects_changed_source_with_unchanged_record(tmp_path: Path) -> None:
+    source, first, second, cache = (
+        tmp_path / part for part in ("source", "first", "second", "cache")
+    )
+    site = _venv(source)
+    _venv(first)
+    _venv(second)
+    _distribution(site, "dependency", {"dependency.py": b"value = 47\n"})
+    initial = dependencies.snapshot(source / "bin/python", first, set(), cache=cache)
+    before = (site / "dependency.py").stat()
+    (site / "dependency.py").write_bytes(b"value = 48\n")
+    os.utime(site / "dependency.py", ns=(before.st_atime_ns, before.st_mtime_ns))
+    with pytest.raises(package_environment.EnvironmentRefusal, match="member_changed"):
+        dependencies.snapshot(source / "bin/python", second, set(), cache=cache)
+    dependencies.verify_files(first, initial)
+
+
+def test_concurrent_captures_publish_only_complete_immutable_objects(tmp_path: Path) -> None:
+    source, cache = tmp_path / "source", tmp_path / "cache"
+    site = _venv(source)
+    _distribution(site, "dependency", {"payload.bin": bytes(range(256)) * (1 << 14)})
+    barrier = threading.Barrier(2)
+
+    def capture(name: str) -> tuple[Path, bytes]:
+        target = tmp_path / name
+        _venv(target)
+        barrier.wait()
+        manifest = dependencies.snapshot(source / "bin/python", target, set(), cache=cache)
+        dependencies.verify_files(target, manifest)
+        return target, manifest
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(capture, ["first", "second"]))
+    assert first[1] == second[1]
+    payload = Path("lib/python3.12/site-packages/payload.bin")
+    assert (first[0] / payload).samefile(second[0] / payload)
+    assert not list(cache.glob(".copy-*"))
+    assert all(not path.stat().st_mode & 0o222 for path in cache.iterdir())
+
+
+def test_cached_capture_refuses_mutable_cache_and_staged_collisions(tmp_path: Path) -> None:
+    source, first, second, cache = (
+        tmp_path / part for part in ("source", "first", "second", "cache")
+    )
+    site = _venv(source)
+    _venv(first)
+    target_site = _venv(second)
+    _distribution(site, "dependency", {"payload.bin": b"retained immutable bytes"})
+    original = dependencies.snapshot(source / "bin/python", first, set(), cache=cache)
+    (target_site / "payload.bin").write_bytes(b"installed package owns this path")
+    with pytest.raises(package_environment.EnvironmentRefusal, match="member_collision"):
+        dependencies.snapshot(source / "bin/python", second, set(), cache=cache)
+    dependencies.verify_files(first, original)
+    # A writable cache inode cannot become a shared captured dependency.
+    target = tmp_path / "third"
+    _venv(target)
+    cached = next(cache.iterdir())
+    cached.chmod(0o644)
+    with pytest.raises(package_environment.EnvironmentRefusal, match="cache_invalid"):
+        dependencies.snapshot(source / "bin/python", target, set(), cache=cache)
+
+
+def test_cross_filesystem_cache_uses_independent_copies(tmp_path: Path) -> None:
+    memory = Path("/dev/shm")
+    if not memory.is_dir() or memory.stat().st_dev == tmp_path.stat().st_dev:
+        pytest.skip("requires two actual filesystems for the hardlink fallback")
+    source, target = tmp_path / "source", tmp_path / "target"
+    site, destination = _venv(source), _venv(target)
+    _distribution(site, "dependency", {"payload.bin": b"independent copied bytes"})
+    with tempfile.TemporaryDirectory(prefix="cozy-dependency-cache-", dir=memory) as root:
+        cache = Path(root)
+        manifest = dependencies.snapshot(source / "bin/python", target, set(), cache=cache)
+        dependencies.verify_files(target, manifest)
+        assert not list(cache.iterdir())
+    assert not (site / "payload.bin").samefile(destination / "payload.bin")

@@ -454,7 +454,13 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     workspace.accept("owner", offer("legacy"))
     with workspace.locked() as db:
-        for table in ("execution_commands", "execution_events", "executions"):
+        for table in (
+            "execution_model_holds",
+            "execution_calls",
+            "execution_commands",
+            "execution_events",
+            "executions",
+        ):
             db.execute("DROP TABLE " + table)
         db.execute("ALTER TABLE workspace_state DROP COLUMN execution_workspace_id")
         db.execute("PRAGMA user_version=6")
@@ -466,7 +472,7 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     assert Executions(Workspace(tmp_path / "other-store")).workspace_id != e.workspace_id
     e.submit("owner", "new", b"c" * 32, offer("new"))
     with workspace.locked() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
         assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 2
 
 
@@ -757,6 +763,20 @@ app.job(helper)
                         dict(denied.value.trailing_metadata())["cozy-error-code"]
                         == "execution_submission_refused"
                     )
+                    for minor, detail in ((51, "wire52"), (52, "no independent publication")):
+                        assert worker.executions is not None
+                        invalid.CopyFrom(submission)
+                        invalid.offer.request_id = f"rejected-authority-{minor}"
+                        invalid.submission_id = invalid.offer.request_id
+                        invalid.claim.wire_minor = minor
+                        invalid.publication_authorization_id = (
+                            "019aaaab-0000-7000-8000-000000000003"
+                        )
+                        with pytest.raises(grpc.RpcError) as ungranted:
+                            client.SubmitMachineExecution(invalid, timeout=30)
+                        assert ungranted.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                        assert detail in ungranted.value.details()
+                        assert not worker.executions.owns("owner", invalid.offer.request_id)
                 receipt = client.SubmitMachineExecution(submission, timeout=30)
                 assert client.SubmitMachineExecution(submission, timeout=30) == receipt
                 if identifier == "first":
@@ -920,3 +940,64 @@ app.job(helper)
             else:
                 worker.shutdown()
             assert not thread.is_alive()
+
+
+def test_queued_offer_prevents_preparation_switch_before_lane_accepts() -> None:
+    from types import SimpleNamespace
+
+    from cozy_runtime.internal.worker.attempts import AttemptEngine
+    from cozy_runtime.internal.worker.session import Worker
+
+    # No lane consumer has accepted this offer yet. A second captured package must
+    # leave the first package's preparation and admission epoch intact during that gap.
+    worker = SimpleNamespace(
+        accepted=SimpleNamespace(accepted_desired_state_revision=1, desired_state_body=b"first"),
+        engine=SimpleNamespace(
+            history={("first", 1): SimpleNamespace(state="queued", lane_id="")},
+            ON_DEVICE=AttemptEngine.ON_DEVICE,
+            HELD=AttemptEngine.HELD,
+        ),
+    )
+    state = pb.DesiredWorkerState(job=pb.JobDirective(build_id="different"))
+    preparation = {"state": base64.b64encode(state.SerializeToString()).decode()}
+    assert Worker._prepare_execution(worker, preparation) is False  # type: ignore[arg-type]
+
+
+def test_workspace_handoff_fences_dispatch_without_stopping_the_watchdog(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from typing import cast
+
+    from cozy_runtime.internal.worker.session import Worker
+    from cozy_runtime.internal.worker.workspace import WorkspaceInactive
+    from cozy_runtime.internal.worker.workspace_import import activate, receive
+    from test_workspace_import import Authority, frames
+
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    worker = cast(Worker, SimpleNamespace(_drive_executions=lambda: executions.pending("owner")))
+    auth = Authority()
+    incoming = frames([], auth)
+
+    def transfer() -> Iterator[pb.WorkspaceImportFrame]:
+        yield incoming[0]
+        with pytest.raises(WorkspaceInactive):
+            executions.submit("owner", "refused", b"c" * 32, offer("refused"))
+        Worker.drive_executions(worker)
+        assert executions.retention_required("owner")
+        yield incoming[-1]
+
+    receive(workspace, iter(transfer()), auth)
+    Worker.drive_executions(worker)
+    assert executions.retention_required("owner")
+    activate(
+        workspace,
+        pb.WorkspaceActivationCall(
+            claim=auth.claim,
+            migration_id=incoming[0].begin.migration_id,
+        ),
+        auth,
+    )
+    Worker.drive_executions(worker)
+    assert not executions.retention_required("owner")
+    executions.submit("owner", "accepted", b"c" * 32, offer("accepted"))
+    assert executions.pending("owner") == ("accepted",)

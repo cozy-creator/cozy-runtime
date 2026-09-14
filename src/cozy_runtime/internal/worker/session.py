@@ -114,8 +114,10 @@ from cozy_runtime.internal.worker.lanes import (
     fold_memory,
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
+from cozy_runtime.internal.worker.machine_publication import PublicationTLS
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding, PreparedModel
 from cozy_runtime.internal.worker.records import WorkerRecords
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -301,6 +303,8 @@ class WorkerOptions:
     """
     environment_python: Path | None = None
     """An already-complete local package venv; mutually exclusive with materialization root."""
+    publication_tls: PublicationTLS | None = None
+    """Privileged worker mTLS configuration, never an executor or captured-code value."""
     tensorfs_root: Path | None = None
     """The one host-local executable TensorFS Store."""
     artifact_cache: Path | None = None
@@ -1242,6 +1246,19 @@ class Worker:
             lambda: self.fence.wire_minor,
             workspace=self.workspace,
             owner=lambda: self.fence.record_owner_id,
+            local=self._machine_call,
+        )
+        from .machine_calls import Calls as MachineCalls
+        from .machine_effects import Effects
+
+        self.machine_calls = MachineCalls(self) if self.workspace is not None else None
+        from .machine_sources import Sources as MachineSources
+
+        self.machine_sources = MachineSources(self)
+        self.machine_effects = (
+            Effects(self.workspace, self.executions, options.publication_tls)
+            if self.workspace is not None and self.executions is not None
+            else None
         )
         self.engine.calls = self.calls
         from cozy_runtime.internal.worker.source_calls import SourceCalls
@@ -1549,8 +1566,10 @@ class Worker:
         selected_job = None
         bindings_digest = ""
         if attempt.spec.get("job") is not None or self.accepted.mode == "job":
+            from . import machine_slots
+
             descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
-            selected_job = next(
+            selected_job = self.job_slots.get(machine_slots.key(attempt.request_id)) or next(
                 (
                     slot
                     for slot in self.job_slots.values()
@@ -1613,7 +1632,11 @@ class Worker:
             )
             if attempt.spec.get("job") is not None
             else 0,
-            orchestration=lane is self.lanes.orchestration,
+            orchestration=not lane.ordinals,
+            job_binding=selected_job.binding if selected_job is not None else None,
+            job_resource_caps=documents.body(selected_job.directive.resource_caps)
+            if selected_job is not None
+            else documents.body(self.job_caps),
             bindings_digest=bindings_digest,
         )
         attempt.slot = slot
@@ -1640,6 +1663,8 @@ class Worker:
 
     def _lane_dispatchable(self, lane: DeviceLane) -> bool:
         """Whether THIS lane has a placement that takes offers (job mode: the envelope)."""
+        if lane.lane_id.startswith("cpu-") and (slot := self.job_slots.get(lane.lane_id)):
+            return slot.ready()
         if self.accepted.mode == "job":
             slot = self.job_slots.get(lane.lane_id)
             return (
@@ -1927,6 +1952,7 @@ class Worker:
                 base=self.base,
                 materialized=materialized.append,
                 dependency_python=self.options.environment_python,
+                dependency_cache=self.config.dependency_cache,
             )
             prepared = read_placement_set(result.placement_set)
             if len(prepared) != 1 or not prepared[0].get("development"):
@@ -2035,6 +2061,16 @@ class Worker:
             raise ValueError("worker has no execution workspace")
         return self.executions, owner
 
+    def _machine_call(
+        self, attempt: AttemptRecord, request: pb.ChildCallRequest, action: str
+    ) -> pb.ChildCallResult | None:
+        if self.executions is None or not self.executions.owns(
+            self.fence.record_owner_id, attempt.request_id
+        ):
+            return None
+        assert self.machine_calls is not None
+        return self.machine_calls.handle(attempt, request, action)
+
     def submit_execution(
         self,
         claim: pb.Claim,
@@ -2046,16 +2082,19 @@ class Worker:
         retry_delay_ms: int = 0,
         capture_document: bytes = b"",
         preparation: bytes = b"",
+        publication_authorization_id: str = "",
     ) -> workspace_executions.Receipt:
         """Authenticated root intake; accepted execution never depends on the caller's stream."""
         with self.control_lock:
             executions, owner = self._execution_service(claim)
+            if publication_authorization_id and self.options.publication_tls is None:
+                raise WorkspaceRefusal("worker has no independent publication authority configured")
             result_schema, memoize = b"", False
             spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
             if "job" in spec:
                 descriptor = spec["job"]["job_descriptor_id"]
                 binding = self.engine.jobs.get(descriptor)
-                if binding is None:
+                if binding is None or binding.build_id != spec["job"]["build_id"]:
                     from cozy_runtime.internal import job_plan
 
                     binding = JobBinding.read(
@@ -2083,6 +2122,7 @@ class Worker:
                 capture_document=capture_document,
                 preparation=preparation,
                 worker_id=self.options.worker_id,
+                publication_authorization_id=publication_authorization_id,
             )
             self.publish_activity(strict=True)
             return receipt
@@ -2121,11 +2161,24 @@ class Worker:
             return state
 
     def drive_executions(self) -> None:
+        """A custody handoff fences dispatch without killing the lifecycle watchdog."""
+        from .workspace import WorkspaceInactive
+
+        try:
+            self._drive_executions()
+        except WorkspaceInactive:
+            return
+
+    def _drive_executions(self) -> None:
         """Admit retained roots through the existing lanes, independently of observers."""
         if self.executions is None or not self.fence.record_owner_recorded:
             return
         with self.control_lock:
             owner = self.fence.record_owner_id
+            if self.machine_effects is not None:
+                self.machine_effects.drive(owner)
+            if self.machine_calls is not None:
+                self.machine_calls.drive()
             self.executions.retry_due(owner, worker_boot=self.fence.worker_boot_id)
             for request in self.executions.pending(owner):
                 state = self.executions.status(owner, request)
@@ -2172,7 +2225,7 @@ class Worker:
                     continue
                 preparation = self.executions.preparation(owner, request)
                 try:
-                    if preparation and not self._prepare_execution(preparation):
+                    if preparation and not self._prepare_execution(preparation, request):
                         continue
                 except Exception as exc:
                     self.refuse(
@@ -2196,18 +2249,58 @@ class Worker:
                 offered.admission_epoch = self.admission_epoch
                 self.on_offer(offered, machine_owned=True)
 
-    def _prepare_execution(self, preparation: dict[str, Any]) -> bool:
+    def _prepare_execution(self, preparation: dict[str, Any], request_id: str = "") -> bool:
         """Reuse the existing preparation/convergence engine without replacing live work."""
         from . import machine_capture
 
         desired = pb.DesiredWorkerState.FromString(
             base64.b64decode(preparation["state"], validate=True)
         )
+        if request_id and desired.WhichOneof("mode") == "job" and desired.job.orchestration:
+            from cozy_runtime.internal import job_plan
+
+            from . import machine_slots
+
+            held = self.job_slots.get(machine_slots.key(request_id))
+            if held is not None and held.ready():
+                return True
+            binding = JobBinding.read(
+                json.loads(
+                    job_plan.path(
+                        self.config.cozy_home / "job-plans",
+                        desired.job.build_id,
+                        desired.job.job_descriptor_id,
+                    ).read_bytes()
+                )
+            )
+            declaration = self.engine._job_declaration(binding, binding.job_descriptor_id)
+            if not (
+                desired.job.device_count
+                or desired.job.resource_caps.device_required
+                or desired.job.resource_caps.max_device_memory_bytes
+                or declaration.get("models")
+                or declaration.get("weights_outputs")
+            ):
+                machine_capture.restore(self, preparation)
+                return machine_slots.ensure(self, request_id, desired.job, binding)
         desired.revision = self.accepted.accepted_desired_state_revision
         same = desired_state_body(desired) == self.accepted.desired_state_body
         if same:
             return True
-        if any(attempt.state in self.engine.HELD for attempt in self.engine.history.values()):
+        if any(
+            (attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD)
+            and not (
+                (
+                    desired.WhichOneof("mode") == "placement_set"
+                    or (desired.WhichOneof("mode") == "job" and not desired.job.orchestration)
+                )
+                and attempt.lane_id.startswith("cpu-")
+                and attempt.state != "queued"
+            )
+            for attempt in self.engine.history.values()
+        ):
+            # on_offer journals the queue before a lane begins accepting it. That queue
+            # already owns its preparation and admission epoch, just like a running job.
             return False
         desired = machine_capture.restore(self, preparation)
         desired.revision = self.accepted.accepted_desired_state_revision + 1
@@ -2391,6 +2484,8 @@ class Worker:
             and bool(subject_id)
             and self.executions.owns(self.fence.record_owner_id, subject_id)
         )
+        if machine_message and frame.HasField("native_source_status"):
+            self.machine_sources.observe(frame.native_source_status)
         if machine_message and frame.HasField("child_call_request"):
             request = frame.child_call_request
             self.calls.absorb(
@@ -2547,6 +2642,8 @@ class Worker:
         """Can this worker take an offer AT ALL right now? Serving asks the placement's
         axis; job mode asks whether its one build is ready. Neither answer is a SLOT count —
         `available_attempt_slots` is the other half, and #486c keeps them apart on purpose."""
+        if any(slot.ready() for name, slot in self.job_slots.items() if name.startswith("cpu-")):
+            return True
         if self.accepted.mode == "job":
             return self.job_ready
         return bool(
@@ -3429,6 +3526,9 @@ class Worker:
         if disposition != "closed":
             return
         self.calls.close(acked.request_id, acked.attempt_ordinal)
+        from . import machine_slots
+
+        machine_slots.release(self, acked.request_id, ordinal=acked.attempt_ordinal)
         if self.connected.is_set():
             self.send(pb.WorkerFrame(observed_state=self.observed_state()))
         # An acknowledged stopped attempt can leave retained work for another
@@ -3554,8 +3654,15 @@ class Worker:
             and self.job_slots
             and any(
                 self._job_lane_busy(slot.lane)
-                for slot in self.job_slots.values()
+                for name, slot in self.job_slots.items()
                 if slot is not retained_parent
+                and (
+                    not name.startswith("cpu-")
+                    or any(
+                        attempt.lane_id == slot.lane.lane_id and attempt.state == "queued"
+                        for attempt in self.engine.history.values()
+                    )
+                )
             )
         ):
             self.engine.fault(
@@ -3640,9 +3747,11 @@ class Worker:
             if cpu is not None and cpu is not retained_parent:
                 cpu.supervision.close()
                 self.lanes.orchestration.forget("")
-            self.job_slots = (
-                {"orchestration": retained_parent} if retained_parent is not None else {}
-            )
+            self.job_slots = {
+                name: slot for name, slot in self.job_slots.items() if name.startswith("cpu-")
+            }
+            if retained_parent is not None:
+                self.job_slots["orchestration"] = retained_parent
             self.jobs = {
                 slot.binding.job_descriptor_id: slot.binding for slot in self.job_slots.values()
             }
@@ -4562,12 +4671,8 @@ class Worker:
                     or parent.resource_caps.max_device_memory_bytes
                     or declaration.get("models")
                     or declaration.get("weights_outputs")
-                    or not binding.call_interfaces
                 ):
-                    raise ValueError(
-                        "orchestration requires frozen child interfaces "
-                        "and no Model, weights, or GPU grant"
-                    )
+                    raise ValueError("CPU orchestration cannot hold a Model, weights, or GPU grant")
                 if not job.orchestration and parent.job_descriptor_id == job.job_descriptor_id:
                     raise ValueError("one job cannot occupy the parent and ordinary slots together")
             old_cpu = self.job_slots.get("orchestration")
@@ -5853,7 +5958,13 @@ class Worker:
                 CAUSE.CAUSE_CODE_ADMISSION_EPOCH_STALE,
             )
             return
-        if self.accepted.mode == "serving":
+        try:
+            job_offer = machine_owned and "job" in documents.read(
+                offered.invocation_spec_canonical_bytes, pb.InvocationSpec
+            )
+        except documents.DocumentError:
+            job_offer = False  # The ordinary AttemptEngine records the malformed offer refusal.
+        if self.accepted.mode == "serving" and not job_offer:
             selected = self._placement_by_id(offered.placement_id)
             if selected is None:
                 hosted_ids = sorted(self.hosted)
@@ -5913,8 +6024,15 @@ class Worker:
                 descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
                 # Execution attaches attempt.job later. The prepared engine binding
                 # is available on both local and placement-hosted paths at offer time.
-                binding = self.engine.jobs.get(descriptor)
-                if binding is None:
+                from . import machine_slots
+
+                child_slot = self.job_slots.get(machine_slots.key(attempt.request_id))
+                binding = (
+                    child_slot.binding
+                    if child_slot is not None
+                    else self.engine.jobs.get(descriptor)
+                )
+                if binding is None or binding.build_id != attempt.spec["job"]["build_id"]:
                     self.refuse(
                         offered,
                         "job_binding_unavailable",
@@ -6010,8 +6128,12 @@ class Worker:
         """The lane an offer draws its seat from: the placement's, or the envelope for a job.
         Called after the placement is known to be hosted, so an unassigned placement here
         is one that is not dispatchable, and its lane is whichever its slot would take."""
-        if self.accepted.mode == "job":
+        if self.accepted.mode == "job" or (attempt is not None and "job" in attempt.spec):
             if attempt is not None:
+                from . import machine_slots
+
+                if local := self.job_slots.get(machine_slots.key(attempt.request_id)):
+                    return local.lane
                 descriptor = (attempt.spec.get("job") or {}).get("job_descriptor_id", "")
                 for slot in self.job_slots.values():
                     if slot.binding.job_descriptor_id == descriptor:
@@ -6124,7 +6246,8 @@ class Worker:
             # Called under the control lock during assignment. Never wait here for a
             # retiring consumer that may itself need that lock to finish its last event.
             for consumer in self._retired_consumers:
-                consumer.join(timeout=0)
+                if consumer is not threading.current_thread():
+                    consumer.join(timeout=0)
             self._retired_consumers = [t for t in self._retired_consumers if t.is_alive()]
 
     def device_lane(self, lane: DeviceLane) -> None:
@@ -6139,7 +6262,9 @@ class Worker:
             if item is None:
                 return
             if isinstance(item, ExecutorDeath):
-                if lane is self.lanes.orchestration:
+                if lane.lane_id.startswith("cpu-"):
+                    continue
+                elif lane is self.lanes.orchestration:
                     self._rebuild_orchestration()
                 else:
                     self.rebuild_exited(item.executor, item.placement_id)
@@ -6155,7 +6280,9 @@ class Worker:
                     self.execute(attempt, lane)
             # Rebuild on REFUSALS too (#458): a poisoned generation refuses every attempt,
             # so a rebuild gated on admission could never run again.
-            if lane is self.lanes.orchestration:
+            if lane.lane_id.startswith("cpu-"):
+                continue
+            elif lane is self.lanes.orchestration:
                 self._rebuild_orchestration()
             else:
                 self.rebuild_if_needed(attempt.placement_id)
@@ -6204,7 +6331,7 @@ class Worker:
                     CAUSE.CAUSE_CODE_ADMISSION_EPOCH_STALE,
                 )
                 return False
-            if self.accepted.mode == "serving":
+            if self.accepted.mode == "serving" and "job" not in attempt.spec:
                 selected = self._placement_by_id(attempt.placement_id)
                 if selected is None:
                     self.note(
@@ -6814,14 +6941,19 @@ class Worker:
         with self.claim_lock:
             self.claim_ready.clear()
         supervisions = [self.supervision] + [hosted.supervision for hosted in self.hosted.values()]
-        if (cpu := self.job_slots.get("orchestration")) is not None:
-            supervisions.append(cpu.supervision)
+        for name, slot in self.job_slots.items():
+            if name == "orchestration" or name.startswith("cpu-"):
+                supervisions.append(slot.supervision)
         seam = [
             supervision.current.channel.accounting()
             for supervision in supervisions
             if supervision.current is not None
         ]
         self.request_stop()
+        if self.machine_calls is not None:
+            self.machine_calls.close()
+        if self.machine_effects is not None:
+            self.machine_effects.close()
         self.weights.close()
         if self.artifact_transfers is not None:
             self.artifact_transfers.close()

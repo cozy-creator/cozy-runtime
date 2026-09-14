@@ -203,7 +203,9 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
     if verb in ("builtin-prepare", "builtin-capture"):
         from cozy_runtime.cli import builtin_prepare
 
-        return builtin_prepare.run(args, opts, capture=verb == "builtin-capture")
+        return builtin_prepare.run(
+            args, opts, capture=verb == "builtin-capture", dependency_cache=config.dependency_cache
+        )
     if opts.builtin and (
         verb != "describe"
         or opts.distribution

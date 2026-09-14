@@ -130,6 +130,28 @@ def delivered(workspace: Workspace, owner: str, consumer: str) -> None:
         )
 
 
+def release_lookup(workspace: Workspace, owner: str, consumer: str) -> None:
+    """Release temporary attempt lookup custody after its recipient owns the result."""
+    workspace.owner(owner)
+    with workspace.locked() as db:
+        row = db.execute(
+            "SELECT body FROM operation_lookups WHERE owner=? AND consumer=?", (owner, consumer)
+        ).fetchone()
+        if row is None:
+            return
+        payload = canonical_json.decode(row["body"])
+        _require_kind(payload, "attempt")
+        db.execute(
+            "UPDATE operation_lookups SET state='released' WHERE owner=? AND consumer=?",
+            (owner, consumer),
+        )
+        for hold in payload["holds"]:
+            workspace._change_hold(
+                db, owner, _request(hold), kind=hold.get("kind", "derived"), release=True
+            )
+        compact_released(db, owner)
+
+
 def compact_released(db: Journal, owner: str) -> None:
     """Compact settled lookup bodies only after every planned hold is released."""
     db.execute(

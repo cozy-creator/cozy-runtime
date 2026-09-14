@@ -33,6 +33,10 @@ class WorkspaceRefusal(ValueError):
     """A stable workspace identity or custody invariant refused the operation."""
 
 
+class WorkspaceInactive(WorkspaceRefusal):
+    """The journal is fenced while existing Host custody transfers to Runtime."""
+
+
 class WorkspaceBusy(WorkspaceRefusal):
     """A foreground custody transition takes precedence over optional collection."""
 
@@ -188,7 +192,7 @@ class Workspace:
                     + _MIGRATION_3
                     + "PRAGMA user_version=3; COMMIT;"
                 )
-            elif version not in (3, 4, 5, 6, 7):
+            elif version not in (3, 4, 5, 6, 7, 8, 9):
                 raise WorkspaceRefusal("workspace journal schema is not supported")
             if version <= 3:
                 from .workspace_sources import SCHEMA4
@@ -206,12 +210,20 @@ class Workspace:
                 from .workspace_executions import SCHEMA7
 
                 db.executescript("BEGIN IMMEDIATE;" + SCHEMA7 + "PRAGMA user_version=7; COMMIT;")
+            if version <= 7:
+                from .workspace_calls import SCHEMA8
+
+                db.executescript("BEGIN IMMEDIATE;" + SCHEMA8 + "PRAGMA user_version=8; COMMIT;")
+            if version <= 8:
+                from .machine_models import SCHEMA9
+
+                db.executescript("BEGIN IMMEDIATE;" + SCHEMA9 + "PRAGMA user_version=9; COMMIT;")
             if (
                 not allow_frozen
                 and db.execute("SELECT state FROM workspace_state WHERE singleton=1").fetchone()[0]
                 != "active"
             ):
-                raise WorkspaceRefusal("workspace authority transfer is not active")
+                raise WorkspaceInactive("workspace authority transfer is not active")
             yield db
         finally:
             if db is not None:

@@ -26,7 +26,7 @@ from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDiv
 from cozy_runtime.internal.worker import lane_wire, lanes
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.ledger import Ledger
+from cozy_runtime.internal.worker.ledger import DeviceFacts, Ledger
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     PlanChooser,
@@ -148,22 +148,25 @@ def test_a_group_pin_refuses_typed_then_fuses() -> None:
     assert "declares no sequence-parallel degree" in undeclared.detail
     wrong = refused((0, 2), degrees=(4,))
     assert wrong.code == "device_group_unsupported" and "[4]" in wrong.detail
-    # 3. per-device fit: every rank holds the full weights, so EVERY card must hold them
+    # 3. readable capacity: every rank must receive a measured prepare ceiling
     unreadable = refused((0, 2))
     assert unreadable.code == "device_group_infeasible"
     assert "ordinal 2 ('2') free bytes unreadable" in unreadable.detail
     lanes_.release("t")
-    short = refused((0, 1), declared=5 * GiB)
-    assert short.code == "device_group_infeasible"
-    assert "ordinal 1 ('1') has 4294967296 B measured headroom" in short.detail
-    assert "ordinal 0" not in short.detail, "device 0 fits; only the short card is named"
     # a weightless placement shards nothing
     with pytest.raises(lanes.LaneRefusal) as weightless:
         lanes_.assign("w", model_bearing=False, declared_bytes=0, measured={}, pin=(0, 1))
     assert weightless.value.code == "device_group_unsupported"
-    # then the fuse: one lane, both devices, one row per device when measured
+    # Estimated weights exceed both cards: bounded construction, not assignment,
+    # discovers paging and decides the executable working set.
+    # Then the fuse: one lane, both devices, one row per device when measured
     group = lanes_.assign(
-        "g", model_bearing=True, declared_bytes=GiB, measured=MEASURED, pin=(0, 1), degrees=(2,)
+        "g",
+        model_bearing=True,
+        declared_bytes=50 * GiB,
+        measured=MEASURED,
+        pin=(0, 1),
+        degrees=(2,),
     )
     assert group.lane_id == "lane-0+1" and group.placements == {"g"} and lanes_.revision == 1
     assert lanes_.lane_of("g") is group
@@ -197,9 +200,8 @@ def test_per_device_rows_and_the_min_ceiling() -> None:
     assert ledger.rows()["devices"]["0"]["free"] == 6 * GiB
     granted = group.authorize("g", lanes.fold_memory({0: MEASURED[0], 1: MEASURED[1]}).free_bytes)
     assert granted == 4 * GiB and ledger.authorized_device_limit_bytes == 4 * GiB
-    # the group's chooser knows its degree; a device lane's does not
-    assert group.row("g").chooser.degree == 2
-    assert lanes_.lanes[1].row("x").chooser.degree == 1
+    # The chooser consumes the already-folded ledger; it needs no second copy of degree.
+    assert group.row("g").chooser.ledger is ledger
     # a generation change clears the rows with everything else
     ledger.begin_generation(0)
     assert ledger.devices == {} and ledger.device_free == -1
@@ -262,30 +264,40 @@ def _pressed_ledger() -> Ledger:
     return ledger
 
 
-def test_the_chooser_refuses_the_ladder_under_a_group() -> None:
-    """The same pressed ledger: a single-device chooser DEEPENS to a staged rung (cr-008's
-    single-tenant rule); a group's chooser REFUSES `CONSTRAINT_INFEASIBLE`-shaped, priced
-    against the MIN device, because every rank runs one plan and no rank adapts."""
+@pytest.mark.parametrize("degree", [1, 2, 4])
+@pytest.mark.parametrize("measured", [False, True])
+def test_one_common_plan_deepens_under_group_pressure(degree: int, measured: bool) -> None:
+    """Asymmetric ranks use the tightest ledger and preserve forward headroom."""
+    ledger = _pressed_ledger()
+    ledger.observe_devices(
+        {
+            rank: DeviceFacts(rank, str(rank), (100 + rank * 100) << 20, 8 * GiB)
+            for rank in range(degree)
+        }
+    )
+    if not measured:
+        ledger.activations_by_cell.clear()
+    assert ledger.device_free == 100 << 20
     declared = _binding()
     prepared = PreparedRequest.unresolved("serve", {"width": 512, "height": 512})
-    model = PreparedModel(delivery_rung="verbatim")
-    alone = PlanChooser(_pressed_ledger())
-    plan = alone.choose(declared, model, prepared)
-    assert plan.placement == "component_staged" and "DEGRADED" in plan.decision_explanation
-    grouped = PlanChooser(_pressed_ledger(), degree=2)
-    assert grouped.fits(declared, prepared.cell()) == "", "nothing fits; nothing is invented"
-    with pytest.raises(PlanRefusal) as refused:
-        grouped.choose(declared, model, prepared)
-    assert refused.value.code == "group_constraint_infeasible"
-    assert "2-device group" in refused.value.detail and "not deepened" in refused.value.detail
-    assert refused.value.shortfall == {
-        "resource": "vram",
-        "scope": "group",
-        "needed_bytes": 512 << 20,
-        "available_bytes": 100 << 20,
-        "evidence_class": "measured",
+    chooser = PlanChooser(ledger)
+    assert chooser.fits(declared, prepared.cell()) == ""
+    plan = chooser.choose(declared, PreparedModel(delivery_rung="verbatim"), prepared)
+    assert plan.placement == "component_staged"
+    assert plan.headroom_bytes == (512 << 20 if measured else 0)
+    assert chooser.walks[-1]["deepened_to"] == "component_staged"
+
+
+def test_deepening_does_not_repeat_a_falsified_strategy() -> None:
+    ledger = _pressed_ledger()
+    ledger.unsuitable_placements = {
+        "all_resident": "allocation failed",
+        "component_staged": "smallest supported scope cannot fit",
     }
-    assert grouped.walks[-1]["refused_under_group"] == 2
+    prepared = PreparedRequest.unresolved("serve", {"width": 512, "height": 512})
+    with pytest.raises(PlanRefusal) as refused:
+        PlanChooser(ledger).choose(_binding(), PreparedModel(delivery_rung="verbatim"), prepared)
+    assert refused.value.code == "placement_capacity_falsified"
 
 
 def _placement(placement_id: str, lane_id: str = "") -> Placement:

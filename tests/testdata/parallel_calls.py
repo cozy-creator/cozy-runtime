@@ -31,6 +31,7 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
     ) -> Any:
         assert in_gated_call()
         assert not torch.is_grad_enabled()
+        torch.testing.assert_close(self.weight.cpu(), torch.tensor([2.0]))
         if check:
             torch.testing.assert_close(value.cpu(), torch.tensor([3.0, 5.0, 9.0]))
             return value
@@ -204,10 +205,28 @@ def h3_model() -> H3Calls:
     return H3Calls.for_test(dit=dit, text_encoder=torch.nn.Linear(4, 4))
 
 
-def h3_batch() -> dict[str, Any]:
+def h3_batch(*, mixed_lengths: bool = False) -> dict[str, Any]:
     # Interleaved modalities exercise packed indices across each shard. Gloo cannot
     # gather uneven tensor sizes; actual uneven H3 lengths require the NCCL CLI gate.
     generator = torch.Generator().manual_seed(91)
+    if mixed_lengths:
+        # Different modality lengths and a nonperiodic packing catch an accidental
+        # per-modality split. Packed length 32 keeps the final Gloo gather uniform.
+        tags = torch.tensor([0] * 5 + [1] * 16 + [2] * 11)
+        tags = tags[torch.randperm(32, generator=generator)]
+        return {
+            "hidden_states": torch.randn(1, 5, 2, generator=generator),
+            "audio_hidden_states": torch.randn(1, 11, 2, generator=generator),
+            "encoder_hidden_states": torch.randn(1, 16, 4, generator=generator),
+            "timestep": torch.tensor([0.0, 0.25, 0.75]),
+            "timestep_indices": torch.arange(32) % 3,
+            "token_tags": tags,
+            "position_ids": torch.arange(96).reshape(32, 3) % 5,
+            "video_indices": torch.where(tags == 0)[0],
+            "text_indices": torch.where(tags == 1)[0],
+            "audio_indices": torch.where(tags == 2)[0],
+            "return_dict": False,
+        }
     return {
         "hidden_states": torch.randn(1, 8, 2, generator=generator),
         "audio_hidden_states": torch.randn(1, 8, 2, generator=generator),
