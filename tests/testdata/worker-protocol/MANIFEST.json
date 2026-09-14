@@ -290,6 +290,11 @@
       "sha256": "32d605caf47d20ad20c1c50c872eae829bf4a93782402762e886dce8a38125ac",
       "type": "cozy.worker.v1.RecordOwnerFrame"
     },
+    "input_tree_import_abort": {
+      "bytes": 4,
+      "sha256": "ba6c5be5969389c839a29c3cb849bc729a543535ac6e926074e6fa806717a35d",
+      "type": "cozy.worker.v1.InputTreeImportFrame"
+    },
     "input_tree_import_blob": {
       "bytes": 52,
       "sha256": "a6414ca4875af293916654bf1ec82c2bd63e7149a7a2fc7f1981e37422947cc9",

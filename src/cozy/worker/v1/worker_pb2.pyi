@@ -3900,8 +3900,10 @@ class InputTreeImportBlob(_message.Message):
     def __init__(self, object: _Optional[_Union[Ref, _Mapping]] = ..., offset: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
 
 class InputTreeImportCommit(_message.Message):
-    __slots__ = ()
-    def __init__(self) -> None: ...
+    __slots__ = ("abort",)
+    ABORT_FIELD_NUMBER: _ClassVar[int]
+    abort: bool
+    def __init__(self, abort: bool = ...) -> None: ...
 
 class InputTreeImportFrame(_message.Message):
     __slots__ = ("header", "blob", "commit")

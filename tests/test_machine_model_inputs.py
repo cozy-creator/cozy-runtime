@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import tensorfs
 
+from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import machine_model_inputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import Executions
@@ -89,5 +90,23 @@ def test_root_input_refuses_foreign_unowned_and_wrong_length_before_acceptance(
     release_original(workspace, completed(workspace, receipt), receipt)
     with pytest.raises(WorkspaceRefusal, match="derived custody"):
         machine_model_inputs.retain(workspace, "owner", selected, {"source"})
+    with workspace.locked() as db:
+        assert not db.execute("SELECT 1 FROM execution_model_holds").fetchone()
+
+
+def test_multi_model_unknown_source_refuses_before_creating_any_recipient(tmp_path: Path) -> None:
+    _, workspace, receipt = produced(tmp_path)
+    selected = model_offer(receipt.artifact.manifest.digest, receipt.artifact.manifest.length)
+    spec = documents.read(selected.invocation_spec_canonical_bytes, pb.InvocationSpec)
+    unknown = "sha256:" + "ff" * 32
+    spec["inputs"].append(dict(spec["inputs"][0], input_id="model:z_unknown", digest=unknown))
+    selected.invocation_spec_canonical_bytes = canonical_json.encode(spec)
+    selected.invocation_spec_digest = documents.digest_of(selected.invocation_spec_canonical_bytes)
+    selected.grant.invocation_spec_digest = selected.invocation_spec_digest
+    selected.grant.inputs.append(
+        pb.InputAccess(input_id="model:z_unknown", url="model://" + unknown)
+    )
+    with pytest.raises(WorkspaceRefusal, match="derived custody"):
+        machine_model_inputs.retain(workspace, "owner", selected, {"source", "z_unknown"})
     with workspace.locked() as db:
         assert not db.execute("SELECT 1 FROM execution_model_holds").fetchone()

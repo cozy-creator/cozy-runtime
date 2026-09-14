@@ -23,9 +23,12 @@ def retain(workspace: Workspace, owner: str, offer: pb.AttemptOffer, declared: s
     selected = grants.model_inputs(grants.bind(spec, offer.grant, offer.invocation_spec_digest))
     if set(selected) != declared:
         raise WorkspaceRefusal("root Model inputs differ from the captured job declaration")
-    for parameter, entry in sorted(selected.items()):
-        manifest = documents.spell(entry.digest)
-        artifact = _owned(workspace, owner, manifest, entry.length)
+    # Reject incomplete multi-model declarations before minting any recipient hold.
+    sources = [
+        (parameter, _owned(workspace, owner, documents.spell(entry.digest), entry.length))
+        for parameter, entry in sorted(selected.items())
+    ]
+    for parameter, artifact in sources:
         request, held = machine_models.retain(
             workspace, owner, offer.request_id, "input/" + parameter, artifact
         )
