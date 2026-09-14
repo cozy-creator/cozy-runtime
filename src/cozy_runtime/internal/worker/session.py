@@ -2325,6 +2325,28 @@ class Worker:
         desired.revision = self.accepted.accepted_desired_state_revision
         same = desired_state_body(desired) == self.accepted.desired_state_body
         if same:
+            if desired.WhichOneof("mode") == "placement_set":
+                candidates = [self.placement, self.pending]
+                candidates.extend(hosted.placement for hosted in self.hosted.values())
+                for placement in candidates:
+                    if (
+                        placement is not None
+                        and placement.placement_set_digest
+                        == desired.placement_set.placement_set_digest
+                        and placement.materialization == pb.MATERIALIZATION_STATE_FAILED
+                    ):
+                        fault = next(
+                            (
+                                f
+                                for f in reversed(self.engine.faults)
+                                if f.subject == placement.placement_id
+                            ),
+                            None,
+                        )
+                        detail = (
+                            f"{fault.reason}: {fault.detail}" if fault else placement.placement_id
+                        )
+                        raise WorkspaceRefusal(f"model preparation failed: {detail}")
             return True
         if any(
             (attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD)
