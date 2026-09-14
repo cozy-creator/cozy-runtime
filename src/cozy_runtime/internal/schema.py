@@ -6,7 +6,9 @@ It reuses `author._walker`'s primitives (`strip`, `unwrap_optional`, `is_struct`
 than re-deriving annotation semantics — one answer to "what does this type tree declare".
 
 Only the wire grammar Creator consumes is emitted. Python names, default factories and
-decoded in-memory ceilings stay with the installed signature that enforces them.
+input decoded-memory ceilings stay with the installed signature that enforces them.
+Result schemas preserve explicit decoded bounds so generated callers can consume
+returned media. Input descriptors keep their existing identity.
 """
 
 from __future__ import annotations
@@ -42,19 +44,27 @@ _ASSET_KINDS: tuple[tuple[type[Asset], str], ...] = (
 )
 
 
-def render(annotation: object) -> Json:
+def render(annotation: object, *, decoded_bounds: bool = False) -> Json:
     """One type as a canonical schema value."""
-    return _render(annotation, frozenset())
+    return _render(annotation, frozenset(), decoded_bounds=decoded_bounds)
 
 
 def _render(
-    annotation: object, seen: frozenset[type], *, union_owns_tag_field: bool = False
+    annotation: object,
+    seen: frozenset[type],
+    *,
+    union_owns_tag_field: bool = False,
+    decoded_bounds: bool = False,
 ) -> Json:
     base, _ = strip(annotation)
     inner, optional = unwrap_optional(base)
     if optional:
-        return {"union": sorted_union([_render(inner, seen), "null"])}
-    return _render_bare(inner, seen, union_owns_tag_field=union_owns_tag_field)
+        return {
+            "union": sorted_union([_render(inner, seen, decoded_bounds=decoded_bounds), "null"])
+        }
+    return _render_bare(
+        inner, seen, union_owns_tag_field=union_owns_tag_field, decoded_bounds=decoded_bounds
+    )
 
 
 def sorted_union(members: list[Json]) -> list[Json]:
@@ -62,7 +72,13 @@ def sorted_union(members: list[Json]) -> list[Json]:
     return sorted(members, key=write)
 
 
-def _render_bare(tp: object, seen: frozenset[type], *, union_owns_tag_field: bool = False) -> Json:
+def _render_bare(
+    tp: object,
+    seen: frozenset[type],
+    *,
+    union_owns_tag_field: bool = False,
+    decoded_bounds: bool = False,
+) -> Json:
     if tp is ModelArtifact:
         return {"input": "model"}
     if tp is SourceArtifact:
@@ -73,24 +89,29 @@ def _render_bare(tp: object, seen: frozenset[type], *, union_owns_tag_field: boo
     if origin is Literal:
         return _enumeration(tp, get_args(tp))
     if origin is typing.Union or origin is types.UnionType:
-        return _union(get_args(tp), seen)
+        return _union(get_args(tp), seen, decoded_bounds=decoded_bounds)
     if origin in (list, Sequence, set, frozenset, Set):
         args = get_args(tp)
         if not args:
             return {"list": _opaque(tp)}
-        return {"list": _render(args[0], seen)}
+        return {"list": _render(args[0], seen, decoded_bounds=decoded_bounds)}
     if origin in (dict, Mapping):
         args = get_args(tp)
         if len(args) != 2:
             return _opaque(tp)
-        return {"map": {"key": _render(args[0], seen), "value": _render(args[1], seen)}}
+        return {
+            "map": {
+                "key": _render(args[0], seen, decoded_bounds=decoded_bounds),
+                "value": _render(args[1], seen, decoded_bounds=decoded_bounds),
+            }
+        }
     if origin is tuple:
         args = get_args(tp)
         if not args:
             return {"list": _opaque(tp)}
         if len(args) == 2 and args[1] is Ellipsis:
-            return {"list": _render(args[0], seen)}
-        return {"tuple": [_render(arg, seen) for arg in args]}
+            return {"list": _render(args[0], seen, decoded_bounds=decoded_bounds)}
+        return {"tuple": [_render(arg, seen, decoded_bounds=decoded_bounds) for arg in args]}
     if isinstance(tp, type):
         for asset, kind in _ASSET_KINDS:
             if issubclass(tp, asset):
@@ -106,6 +127,7 @@ def _render_bare(tp: object, seen: frozenset[type], *, union_owns_tag_field: boo
                 typing.cast(type[msgspec.Struct], tp),
                 seen,
                 union_owns_tag_field=union_owns_tag_field,
+                decoded_bounds=decoded_bounds,
             )
     # ANYTHING ELSE IS OPAQUE, NOT A BUILD FAILURE. `bytes`, `datetime`, a third-party
     # value type — msgspec still codes it and JSON still carries it. The package interface says
@@ -162,7 +184,7 @@ def _tag(value: object) -> Json:
     )
 
 
-def _union(members: tuple[object, ...], seen: frozenset[type]) -> Json:
+def _union(members: tuple[object, ...], seen: frozenset[type], *, decoded_bounds: bool) -> Json:
     structs: list[tuple[type[msgspec.Struct], object, object]] = []
     for member in members:
         base, _ = strip(member)
@@ -172,7 +194,11 @@ def _union(members: tuple[object, ...], seen: frozenset[type]) -> Json:
         config = struct.__struct_config__
         structs.append((struct, config.tag_field, config.tag))
     if len(structs) <= 1:
-        return {"union": sorted_union([_render(member, seen) for member in members])}
+        return {
+            "union": sorted_union(
+                [_render(member, seen, decoded_bounds=decoded_bounds) for member in members]
+            )
+        }
     if any(tag is None for _, _, tag in structs):
         raise ConformanceError(
             "a union with multiple structs requires every struct to declare a tag",
@@ -198,7 +224,12 @@ def _union(members: tuple[object, ...], seen: frozenset[type]) -> Json:
         )
     rendered = sorted_union(
         [
-            _render(member, seen, union_owns_tag_field=is_struct(strip(member)[0]))
+            _render(
+                member,
+                seen,
+                union_owns_tag_field=is_struct(strip(member)[0]),
+                decoded_bounds=decoded_bounds,
+            )
             for member in members
         ]
     )
@@ -210,12 +241,13 @@ def _struct(
     seen: frozenset[type],
     *,
     union_owns_tag_field: bool = False,
+    decoded_bounds: bool = False,
 ) -> Json:
     if tp in seen:
         return _opaque(tp)
     nested = seen | {tp}
     config = tp.__struct_config__
-    fields = [_field(f, nested) for f in msgspec.structs.fields(tp)]
+    fields = [_field(f, nested, decoded_bounds=decoded_bounds) for f in msgspec.structs.fields(tp)]
     if config.tag is not None and (not isinstance(config.tag_field, str) or not config.tag_field):
         raise ConformanceError(
             f"tagged struct {tp.__name__} declares no string tag field",
@@ -229,12 +261,17 @@ def _struct(
     return doc
 
 
-def _field(field: msgspec.structs.FieldInfo, seen: frozenset[type]) -> Json:
+def _field(
+    field: msgspec.structs.FieldInfo, seen: frozenset[type], *, decoded_bounds: bool
+) -> Json:
     # Excluded/deleted field names refuse one layer up, in the describe-time conformance
     # layer that owns both lists (`author/_describe.assert_declaration_shape`).
     name = field.encode_name
     base, markers = strip(field.type)
-    doc: dict[str, Json] = {"name": name, "type": _render(base, seen)}
+    doc: dict[str, Json] = {
+        "name": name,
+        "type": _render(base, seen, decoded_bounds=decoded_bounds),
+    }
     omissible = any(isinstance(m, _ModelDefaultMarker) for m in markers)
     if omissible:
         doc["wire"] = "omissible"
@@ -248,6 +285,8 @@ def _field(field: msgspec.structs.FieldInfo, seen: frozenset[type]) -> Json:
             bound: dict[str, Json] = {}
             if marker.max_bytes is not None:
                 bound["max_bytes"] = marker.max_bytes
+            if decoded_bounds and marker.max_decoded_bytes is not None:
+                bound["max_decoded_bytes"] = marker.max_decoded_bytes
             if marker.media_types:
                 bound["media_types"] = list(marker.media_types)
             if bound:

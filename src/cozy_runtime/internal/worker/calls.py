@@ -340,7 +340,7 @@ class Calls:
                 self.owner(),
                 result,
                 attempt.spool,
-                max_bytes=output_budget.admitted(attempt.spec) - held_bytes,
+                max_bytes=output_budget.intermediate(attempt.spec) - held_bytes,
             )
             received = dict(self.received.get(parent, {}))
             for metadata, grant in zip(granted, result.byte_result_grants, strict=True):

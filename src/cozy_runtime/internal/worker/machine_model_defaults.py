@@ -148,14 +148,16 @@ def select(
         if (row["callee_revision_digest"], row["entrypoint"])
         == (target.revision, target.entrypoint)
     }
+    for parameter in sorted(missing):
+        row = defaults.get(parameter)
+        if row is None or row.get("unavailable_code"):
+            raise WorkspaceRefusal("captured Model default is unavailable for " + parameter)
     facts = hostfacts.measure(worker.options.accelerator_backend)
     if "gpu_name" in facts.unreadable:
         raise WorkspaceRefusal("captured Model default cannot select an unreadable accelerator")
     selected = []
     for parameter in sorted(missing):
-        row = defaults.get(parameter)
-        if row is None or row.get("unavailable_code"):
-            raise WorkspaceRefusal("captured Model default is unavailable for " + parameter)
+        row = defaults[parameter]
         rung = next((rung for rung in row["rungs"] if matches(rung["gpu"], facts.gpu_name)), None)
         if rung is None:
             raise WorkspaceRefusal("captured Model default has no rung for this accelerator")
