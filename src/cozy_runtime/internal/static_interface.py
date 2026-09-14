@@ -46,7 +46,7 @@ from cozy_runtime import author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import DefaultLadder, check_model_arguments, model_defaults
-from cozy_runtime.author._script_metadata import declarations, main_definition
+from cozy_runtime.author._script_metadata import byte_parameter, declarations, main_definition
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import AssetsBinding, _classify, assets_binding, assets_payload
 from cozy_runtime.author._walker import is_struct
@@ -1692,6 +1692,7 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
     except (ValueError, TypeError) as exc:
         reader.refuse(module, fn, f"invalid script metadata: {exc}")
     models: list[dict[str, Json]] = []
+    payload_fields: list[tuple[str, type]] = []
     model_names: set[str] = set()
     services: set[str] = set()
     native_context = False
@@ -1737,7 +1738,15 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
         ):
             spec = reader.model(found.module, found.node)
         if spec is None:
-            reader.refuse(module, arg, "script parameters must be declared models or services")
+            translated = reader.translate(module, node)
+            if byte_parameter(translated):
+                payload_fields.append((arg.arg, typing.cast(type, translated)))
+                continue
+            reader.refuse(
+                module,
+                arg,
+                "script parameters must be declared models or services, or typed assets",
+            )
         model_names.add(arg.arg)
         models.append(
             package_interface.model_slot(
@@ -1770,7 +1779,7 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
     return package_interface.callable_doc(
         name="main",
         kind="job",
-        payload_type=msgspec.defstruct("_ScriptRequest", []),
+        payload_type=msgspec.defstruct("_ScriptRequest", payload_fields),
         result_type=result,
         models=models,
         assets=None,

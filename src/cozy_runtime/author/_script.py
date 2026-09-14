@@ -15,7 +15,7 @@ import msgspec
 from cozy_runtime.author._app import App
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._script_metadata import declarations, main_definition
+from cozy_runtime.author._script_metadata import byte_parameter, declarations, main_definition
 from cozy_runtime.author._script_types import annotation, parameter_type
 from cozy_runtime.author._services import Telemetry
 from cozy_runtime.author._signature import _classify
@@ -83,6 +83,7 @@ def script_app(module: str) -> App:
     positional = [*args.posonlyargs, *args.args]
     parameters = [*positional, *args.kwonlyargs]
     types: dict[str, Any] = {}
+    payload_types: dict[str, Any] = {}
     execution_context = False
     try:
         models, weights = declarations(raw)
@@ -97,6 +98,9 @@ def script_app(module: str) -> App:
             if parameter.annotation is None:
                 raise ValueError("injected parameters need a type")
             value = parameter_type(parameter.annotation, tree)
+            if byte_parameter(value):
+                payload_types[parameter.arg] = value
+                continue
             if _classify(parameter.arg, value, "script main").role not in {"model", "service"}:
                 raise ValueError("script parameter must declare a model or service")
             types[parameter.arg] = value
@@ -131,7 +135,8 @@ def script_app(module: str) -> App:
         ctx, telemetry = injected.pop("_script_context"), injected[telemetry_name]
         if telemetry_name == "_script_telemetry":
             injected.pop(telemetry_name)
-        injected.pop("_script_request")
+        payload = injected.pop("_script_request")
+        injected.update({name: getattr(payload, name) for name in payload_types})
         ctx.raise_if_cancelled()
         result: Any = None
         try:
@@ -168,7 +173,11 @@ def script_app(module: str) -> App:
     # No custom invocation path or authority is introduced by a plain script.
     types = {
         "_script_context": Context,
-        "_script_request": _ScriptRequest,
+        "_script_request": msgspec.defstruct(
+            "_ScriptRequest", list(payload_types.items()), module=__name__
+        )
+        if payload_types
+        else _ScriptRequest,
         telemetry_name: Telemetry,
         **types,
     }
