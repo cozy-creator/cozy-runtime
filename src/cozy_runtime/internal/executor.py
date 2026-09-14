@@ -3072,7 +3072,14 @@ class Executor:
                         "self call is not a registered App export", code="child_interface"
                     )
                 binding = _CallType(
-                    interface, module, export, surface.payload_type, surface.result_type
+                    interface,
+                    module,
+                    export,
+                    surface.payload_type,
+                    surface.result_type,
+                    tuple((name,) for name in surface.model_params)
+                    if surface.kind == "entrypoint"
+                    else (),
                 )
                 bindings[("", module, export)] = binding
             else:

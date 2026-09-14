@@ -8,11 +8,11 @@ import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from decimal import Decimal
 from functools import cache
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.author._model_bindings import scale_string as _scale_string
 from cozy_runtime.internal.encoding import SPEC_PLAIN, TORCH_DTYPES
 from cozy_runtime.internal.fill import Checkpoint, PlanRow
 from cozy_runtime.internal.lora import TILE_ROWS, AdapterInput, AdapterRefusal
@@ -33,20 +33,10 @@ def implementation_digest() -> str:
 
 def scale_string(value: float) -> str:
     """The finite shortest decimal spelling used by Go FormatFloat(g, -1, 64)."""
-    if not math.isfinite(value):
-        raise AdapterRefusal("adapter_scale", "adapter strength must be finite")
-    number = Decimal(repr(value)).normalize()
-    sign, digits, exponent = number.as_tuple()
-    assert isinstance(exponent, int)
-    text = "".join(str(n) for n in digits)
-    prefix = "-" if sign else ""
-    if not number:
-        return "0"
-    power = len(text) + exponent - 1
-    if power < -4 or power >= 6:
-        fraction = "." + text[1:] if len(text) > 1 else ""
-        return f"{prefix}{text[0]}{fraction}e{power:+03d}"
-    return format(number, "f")
+    try:
+        return _scale_string(value)
+    except (ValueError, OverflowError) as exc:
+        raise AdapterRefusal("adapter_scale", "adapter strength must be finite") from exc
 
 
 def parse_scale(text: str) -> float:
