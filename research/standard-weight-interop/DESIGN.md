@@ -26,3 +26,11 @@ Two execution gates remain before replacing the serving path:
 The CPU forward used here is explicitly TorchAO's BF16-activation **weight-only dequantization path**, not FP8 CUDA GEMM or a speed result. It must not become an accidental production fallback. Unchanged encoded operands can exercise the upstream W8A8 path on H100 next. Fusion is disabled without a real re-quantization recipe, and rounded `unmerge` is never a recovery strategy: a prepared merged variant must be separately qualified and recovered from immutable base bytes.
 
 This is a design/prototype stage of h3a-065. It does not close the PEFT serving implementation or GPU qualification work.
+
+The first serving-side prerequisite now has a regression fix:
+`internal.forensics.distinct_storage_bytes` uses TorchAO's upstream flattening
+utility for wrapper tensors. Real CPU tests cover direct Float8Tensor parameters,
+shared payload/scale views, unchanged logical keys and meta eviction. Ordinary
+tensor accounting still needs neither a TorchAO import nor a TorchAO dependency.
+This fixes physical census only; it does not authorize whole-tree eviction or
+select a new GEMM provider.
