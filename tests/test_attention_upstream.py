@@ -43,6 +43,28 @@ def test_cpu_is_not_a_silent_attention_fallback(adapter: Callable[..., Any]) -> 
         adapter(q, q, q)
 
 
+@pytest.mark.parametrize("adapter", ADAPTERS)
+def test_grouped_heads_require_explicit_permission_and_inputs_are_tensors(
+    adapter: Callable[..., Any],
+) -> None:
+    q = torch.zeros((1, 2, 2, 128), dtype=torch.bfloat16)
+    kv = q[:, :, :1]
+    with pytest.raises(ValueError, match="enable_gqa=True"):
+        adapter(q, kv, kv)
+    with pytest.raises(ValueError, match="same CUDA device"):
+        adapter(q, kv, kv, enable_gqa=True)
+    with pytest.raises(ValueError, match="must be tensors"):
+        adapter(q, None, q)
+
+
+def test_upstream_output_contract_rejects_wrong_shape_dtype_or_non_tensor() -> None:
+    q = torch.zeros((1, 2, 2, 128), dtype=torch.bfloat16)
+    assert upstream._output(q.clone(), q).shape == q.shape
+    for output in (None, (q,), q.float(), q[:, :1]):
+        with pytest.raises(ValueError, match="query shape, dtype and device"):
+            upstream._output(output, q)
+
+
 def test_mixed_backend_does_not_cast_qk_or_discard_padding() -> None:
     q = torch.zeros((1, 2, 2, 128), dtype=torch.float16)
     with pytest.raises(ValueError, match="requires BF16 inputs"):

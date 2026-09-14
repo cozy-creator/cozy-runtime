@@ -34,9 +34,11 @@ def _inference_options(
         raise ValueError("this attention adapter has not qualified context parallelism")
 
 
-def _inputs(query: Any, key: Any, value: Any, *, mixed: bool) -> None:
+def _inputs(query: Any, key: Any, value: Any, *, mixed: bool, enable_gqa: bool) -> None:
     import torch
 
+    if any(not isinstance(x, torch.Tensor) for x in (query, key, value)):
+        raise ValueError("attention Q/K/V must be tensors")
     if any(x.ndim != 4 for x in (query, key, value)):
         raise ValueError("attention Q/K/V must have shape [batch, sequence, heads, dimension]")
     if query.dtype not in (torch.bfloat16, torch.float16):
@@ -55,6 +57,8 @@ def _inputs(query: Any, key: Any, value: Any, *, mixed: bool) -> None:
         or heads % key.shape[2]
     ):
         raise ValueError("attention needs matching K/V and compatible batch/head dimensions")
+    if heads != key.shape[2] and not enable_gqa:
+        raise ValueError("unequal Q/KV head counts require enable_gqa=True")
     if (mixed and dim != 128) or dim > 256:
         raise ValueError("FlashInfer mixed attention needs D128; Kitchen supports D1 through D256")
     if query.device.type != "cuda" or key.device != query.device or value.device != query.device:
@@ -67,6 +71,19 @@ def _inputs(query: Any, key: Any, value: Any, *, mixed: bool) -> None:
         raise ValueError(f"this attention adapter admits {admitted}, not {capability}")
     if torch.is_grad_enabled() and any(x.requires_grad for x in (query, key, value)):
         raise ValueError("this attention adapter is inference-only")
+
+
+def _output(output: Any, query: Any) -> Any:
+    import torch
+
+    if (
+        not isinstance(output, torch.Tensor)
+        or output.shape != query.shape
+        or output.dtype != query.dtype
+        or output.device != query.device
+    ):
+        raise ValueError("upstream attention must return the query shape, dtype and device")
+    return output
 
 
 def kitchen_int8_attention(
@@ -85,16 +102,17 @@ def kitchen_int8_attention(
 
     Kitchen owns GQA, range reduction, quantization and the kernel. Layout changes
     are views when the input's head dimension is contiguous (including packed QKV).
-    ``enable_gqa`` is accepted because upstream infers grouping from head counts.
+    Unequal head counts require an explicit ``enable_gqa=True``.
     """
     _inference_options(dropout_p, is_causal, scale, return_lse, _parallel_config)
-    _inputs(query, key, value, mixed=False)
+    _inputs(query, key, value, mixed=False, enable_gqa=enable_gqa)
     kitchen = import_module("comfy_kitchen")
     tensors = [x if x.stride(-1) == 1 else x.contiguous() for x in (query, key, value)]
     output = kitchen.int8_attention(
         *(x.transpose(1, 2) for x in tensors), scale=scale, attn_mask=attn_mask
     )
-    return output.transpose(1, 2)
+    # Check the public HND result before attempting its layout conversion.
+    return _output(output, query.transpose(1, 2)).transpose(1, 2)
 
 
 def _quantize_value(value: Any) -> tuple[Any, float]:
@@ -136,7 +154,7 @@ def flashinfer_mixed_attention(
     _inference_options(dropout_p, is_causal, scale, return_lse, _parallel_config)
     if attn_mask is not None:
         raise ValueError("FlashInfer mixed attention does not support an attention mask")
-    _inputs(query, key, value, mixed=True)
+    _inputs(query, key, value, mixed=True, enable_gqa=enable_gqa)
     import torch
 
     fmha = import_module("flashinfer.attention.cute_dsl.fmha")
@@ -171,4 +189,4 @@ def flashinfer_mixed_attention(
         skip_softmax_threshold_scale_factor=None,
         enable_pdl=False,
     )
-    return output.reshape(batch, q_length, q_heads, dim)
+    return _output(output.reshape(batch, q_length, q_heads, dim), query)
