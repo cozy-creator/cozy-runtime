@@ -13,8 +13,8 @@ import hashlib
 import importlib.metadata as metadata
 import json
 import os
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -47,7 +47,10 @@ def main() -> None:
     original_scale = scale.clone()
     x = torch.randn(8, in_features, dtype=torch.bfloat16)
     result: dict[str, Any] = {
-        "scope": "CPU ownership/interface proof; real adapter factors; generated FP8 base; no CUDA GEMM or quality/speed claim",
+        "scope": (
+            "CPU ownership/interface proof; real adapter factors; generated FP8 base; "
+            "no CUDA GEMM or quality/speed claim"
+        ),
         "versions": {
             n: metadata.version(n)
             for n in ("torch", "torchao", "peft", "diffusers", "transformers", "tensorfs")
