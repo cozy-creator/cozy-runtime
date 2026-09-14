@@ -28,6 +28,7 @@ class Calls:
         self.worker = worker
         self.journal = JournalCalls(worker.workspace)
         self.lock = threading.Lock()
+        self.finishing_lock = threading.RLock()
         self.pending: dict[tuple[str, int], pb.ChildCallRequest] = {}
         from .machine_serving import Serving
 
@@ -109,6 +110,7 @@ class Calls:
                 self._finish(owner, call)
             workspace_memo.release_lookup(self.worker.workspace, owner, call.child_request)
             result.state, result.result_canonical_bytes = pb.CHILD_CALL_STATE_SUCCEEDED, call.result
+            capture = self._observation(owner, call, result)
             result.byte_result_grants.extend(
                 machine_byte_results.grants(
                     self.worker.workspace,
@@ -116,6 +118,7 @@ class Calls:
                     call.parent_request,
                     call.call_index,
                     canonical_json.decode(call.prepared).get("result_schema", {}),
+                    capture=capture,
                 )
             )
             return result
@@ -133,9 +136,9 @@ class Calls:
         state = executions.status(owner, call.child_request)
         if state.state not in ("succeeded", "failed", "canceled", "paused"):
             return result
-        terminal = executions.collect(owner, call.child_request)
-        body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
         if state.state != "succeeded":
+            terminal = executions.collect(owner, call.child_request)
+            body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
             result.state = pb.CHILD_CALL_STATE_FAILED
             result.safe_code = "child_failed"
             result.safe_detail = str(body.get("safe_message", "child operation stopped"))[:1024]
@@ -144,7 +147,10 @@ class Calls:
         if held is not None and held.state != "closed":
             return result
         self._finish(owner, call)
+        terminal = executions.collect(owner, call.child_request)
+        body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
         assert self.worker.workspace is not None
+        capture = self._observation(owner, call, result)
         result.byte_result_grants.extend(
             machine_byte_results.grants(
                 self.worker.workspace,
@@ -152,6 +158,7 @@ class Calls:
                 call.parent_request,
                 call.call_index,
                 canonical_json.decode(call.prepared).get("result_schema", {}),
+                capture=capture,
             )
         )
         result.result_canonical_bytes = base64.b64decode(
@@ -159,6 +166,30 @@ class Calls:
         )
         result.state = pb.CHILD_CALL_STATE_SUCCEEDED
         return result
+
+    def _observation(self, owner: str, call: Call, result: pb.ChildCallResult) -> bool:
+        from cozy_runtime.internal.capture_observation import environment
+
+        executions = self.worker.executions
+        assert executions is not None
+        if not executions.owns(owner, call.child_request):
+            return False
+        terminal = executions.collect(owner, call.child_request)
+        body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+        observation = body.get("observation", {})
+        if env := observation.get("environment"):
+            result.observation.environment.CopyFrom(
+                environment(env, boot_id=env.get("worker_boot_id", ""))
+            )
+        if capture := observation.get("capture"):
+            result.observation.capture.CopyFrom(
+                pb.ActivationCaptureResult(
+                    output_id=capture["output_id"],
+                    content_digest=documents.raw(capture["content_digest"]),
+                )
+            )
+            return True
+        return False
 
     def drive(self) -> None:
         owner, executions = self.worker.fence.record_owner_id, self.worker.executions
@@ -397,6 +428,14 @@ class Calls:
             )
 
     def _finish(self, owner: str, call: Call) -> None:
+        # Polling executors and the watchdog can reach the same terminal together.
+        # One finalizer owns custody transfer, result persistence and native ACK.
+        with self.finishing_lock:
+            self._finish_locked(
+                owner, self.journal.get(owner, call.parent_request, call.call_index)
+            )
+
+    def _finish_locked(self, owner: str, call: Call) -> None:
         executions = self.worker.executions
         assert executions is not None
         state = executions.status(owner, call.child_request)
@@ -442,6 +481,7 @@ class Calls:
                 canonical_json.decode(raw_result),
                 plan.get("result_schema", {}),
                 body.get("output_manifest", {}).get("outputs", []),
+                capture="capture" in body.get("observation", {}),
             )
             self.journal.observe_result(owner, call, raw_result)
         ack = pb.AttemptOutcomeAck(

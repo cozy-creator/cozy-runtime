@@ -155,6 +155,51 @@ async def nested(ctx: Context, payload: Request) -> Result:
 """
 
 
+MODELED_SERVING_SOURCE = (
+    "from cozy_runtime.author import ActivationCapture, Config, Telemetry, uses_components\n"
+    + MODEL_SOURCE.replace(
+        "        del loader",
+        "        self.pipe = loader.construct(Pipeline, factory=build_pipeline)\n"
+        "    @uses_components('body')\n"
+        "    def infer(self, n, tel):\n"
+        "        import torch\n"
+        "        body = self.pipe.components['body']\n"
+        "        on_step = tel.step_callback(1, stage='denoise')\n"
+        "        with torch.inference_mode():\n"
+        "            value = body(torch.ones((1,32), dtype=torch.float16,\n"
+        "                                    device=body.layer.weight.device))\n"
+        "            assert bool(torch.isfinite(value).all())\n"
+        "        on_step(0)\n"
+        "        return int(value.shape[1])",
+    ).replace(
+        "    return await consume(model=first)",
+        "    call = generate(model=first, n=n, capture=ActivationCapture(('body',), (0,)))\n"
+        "    result = await call\n"
+        "    assert call.observation.environment.worker_boot_id\n"
+        "    assert call.observation.capture.tree is not None\n"
+        "    return result",
+    )
+    + """
+class Pipeline:
+    def __init__(self):
+        import torch
+        class Body(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = torch.nn.Linear(32, 16, dtype=torch.float16)
+            def forward(self, value):
+                return self.layer(value)
+        self.components = {'body': Body()}
+def build_pipeline(config: Config) -> Pipeline:
+    return Pipeline()
+@invocable
+async def generate(ctx: Context, tel: Telemetry, *, model: Source, n: int) -> Result:
+    return Result(model.infer(n, tel))
+app.entrypoint(generate)
+"""
+)
+
+
 def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread]:
     fixture = Path(__file__).parent / "testdata/native_source"
     body = (fixture / "first.safetensors").read_bytes()
@@ -210,6 +255,7 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
         "source",
         "file",
         "serving",
+        "serving_model",
     ],
 )
 def test_nested_capture_and_leaf_memoization_without_control_stream(
@@ -217,6 +263,12 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
 ) -> None:
     import test_job_preparation_isolation as fixture
     from conftest import image_python
+
+    if case == "serving_model":
+        import importlib.util
+
+        if importlib.util.find_spec("torch") is None:
+            pytest.skip("modeled serving requires the Torch image qualification environment")
 
     with tempfile.TemporaryDirectory(prefix="cz-child.") as directory:
         root = Path(directory)
@@ -244,9 +296,18 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
         if case == "file":
             source = FILE_SOURCE
         if case == "serving":
-            source = SOURCE.replace("@invocable(memoize=True)", "@invocable").replace(
-                "app.job(leaf)", "app.entrypoint(leaf)"
+            source = (
+                SOURCE.replace("@invocable(memoize=True)", "@invocable")
+                .replace("app.job(leaf)", "app.entrypoint(leaf)")
+                .replace(
+                    "    first = await leaf(n=n)",
+                    "    call = leaf(n=n)\n"
+                    "    first = await call\n"
+                    "    assert call.observation.environment.worker_boot_id\n",
+                )
             )
+        if case == "serving_model":
+            source = MODELED_SERVING_SOURCE
         if case == "source":
             source = source.replace(
                 'return Result(len(view.components["body"]))',
@@ -347,7 +408,9 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                             entrypoint=export,
                         )
                         for export in (
-                            ("compose", "consume", "leaf")
+                            ("compose", "consume", "generate", "leaf")
+                            if case == "serving_model"
+                            else ("compose", "consume", "leaf")
                             if case in ("model", "model_result", "model_admission", "source")
                             else ("compose", "leaf")
                         )
@@ -528,16 +591,26 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 )
                 return
             assert canonical_json.decode(base64.b64decode(body["result"]["inline_result"])) == {
-                "value": 1 if case == "source" else 2 if case == "model" else 12
+                "value": 16
+                if case == "serving_model"
+                else 1
+                if case == "source"
+                else 2
+                if case == "model"
+                else 12
             }
             assert not worker.connected.is_set()
             assert worker.workspace is not None
             with worker.workspace.locked() as db:
                 assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == (
-                    2 if case == "source" else 4 if case in ("model", "serving") else 3
+                    2
+                    if case == "source"
+                    else 4
+                    if case in ("model", "serving", "serving_model")
+                    else 3
                 )
                 assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == (
-                    4 if case in ("model", "source") else 3
+                    4 if case in ("model", "source", "serving_model") else 3
                 )
                 assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == (
                     2 if case == "source" else 0 if case == "serving" else 1
