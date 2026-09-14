@@ -174,3 +174,64 @@ def test_complete_locked_install_admits_metadata_and_releases_wheel_stage(
     )
     assert replayed.generation == installed.generation and replayed.reused
     assert len(fetched) == 1
+
+
+def test_locked_sdk_snapshot_survives_sdk_and_index_loss(tmp_path: Path) -> None:
+    from cozy_runtime.internal import canonical
+    from test_publish_derivation import _SimpleIndex
+
+    dependency = _wheel(tmp_path, "sdk_dependency", (), b"VALUE = 73\n")
+    project = _wheel(tmp_path, "sdk_project", ("sdk-dependency==1.0",), b"VALUE = 0\n")
+    sdk = tmp_path / "sdk"
+    uv = str(environment._uv_binary())
+    subprocess.run([uv, "venv", "--python", sys.executable, str(sdk)], check=True)
+    python = sdk / "bin/python"
+    subprocess.run(
+        [uv, "pip", "install", "--python", str(python), str(dependency), str(project)], check=True
+    )
+    # The mutable SDK's project bytes are superseded by the exact exported wheel.
+    project = _wheel(
+        tmp_path, "sdk_project", ("sdk-dependency==1.0",), b"from sdk_dependency import VALUE\n"
+    )
+    index = _SimpleIndex(tmp_path / "index", [project])
+    try:
+        locked = environment.read_locked_requirements(
+            (
+                f"--index-url {index.url}\nsdk-project==1.0 "
+                f"--hash=sha256:{hashlib.sha256(project.read_bytes()).hexdigest()}\n"
+            ).encode()
+        )
+        digest = "sha256:" + "31" * 32
+        root = tmp_path / "installs"
+        installed = environment.materialize_locked(
+            locked,
+            locked.rows,
+            root,
+            environment_digest=digest,
+            python=Path(sys.executable),
+            dependency_python=python,
+        )
+    finally:
+        index.close()
+    receipt = environment.parse_environment_receipt(installed.receipt_bytes)
+    assert receipt["environment_digest"] == digest
+    assert receipt["locked_requirements"] == {"digest": locked.digest, "length": locked.length}
+    identity = canonical.parse_canonical(
+        (installed.generation / environment.CONTENT_IDENTITY_NAME).read_bytes()
+    )
+    assert identity["dependency_snapshot"]["digest"].startswith("sha256:")
+    shutil.rmtree(sdk)
+    project.unlink()
+    reopened = environment.open_generation(
+        root,
+        receipt_digest=installed.receipt_digest,
+        environment_digest=digest,
+        python=Path(sys.executable),
+    )
+    result = subprocess.run(
+        [str(reopened.python), "-I", "-c", "import sdk_project; print(sdk_project.VALUE)"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "73"

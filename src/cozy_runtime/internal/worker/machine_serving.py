@@ -19,7 +19,7 @@ from cozy_runtime.internal import package_environment
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from . import machine_byte_results, machine_models, package_prepare
+from . import machine_byte_results, machine_capture, machine_models, package_prepare
 from .machine_child_target import Target
 from .workspace import WorkspaceRefusal
 from .workspace_calls import Call
@@ -239,7 +239,7 @@ class Serving:
                 candidates = [dict(value.document) for value in worker.prepared_revisions.values()]
             for candidate in candidates:
                 if (
-                    candidate.get("development", {}).get("local_revision_digest") != target.revision
+                    machine_capture.code_identity(candidate) != target.revision
                     or candidate.get("environment_digest") != prepared["environment_digest"]
                     or candidate.get("package_interface") != prepared["package_interface"]
                 ):
@@ -278,12 +278,8 @@ class Serving:
                     worker.verified_artifacts.record(digest, length, path)
 
                 native.sort(key=lambda model: model.slot)
-                result = package_prepare.prepare_unpublished_placement(
-                    pb.PreparePrivatePlacementRequest(
-                        operation_id=call.child_request,
-                        local_revision_digest=documents.raw(target.revision),
-                        native_models=native,
-                    ),
+                result = package_prepare.prepare_model_placement(
+                    native_models=native,
                     prepared=prepared,
                     installed=installed,
                     artifact_cache=Path(worker.options.artifact_cache or ""),

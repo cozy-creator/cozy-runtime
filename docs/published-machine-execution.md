@@ -5,17 +5,28 @@ Published jobs keep their existing `PackageCodeDigest`: the digest of the canoni
 closure. Published execution does not invent a `LocalPackageRevision` or rename the
 package into a local namespace.
 
-The capture inventory adds published package/environment/interface references next
-to private wheel revisions. Runtime validates both against the same prepared
-revision inventory, retains the immutable environment receipt with accepted work,
-and restores it through the existing package-environment reader. Submission,
-attempts, events, retries and collection use the same workspace journal and engine.
+Wire54 adds published package/environment/interface references beside private wheel
+revisions. Runtime verifies both inventories against the same prepared revisions,
+requires an immutable installed receipt, and journals that exact preparation with
+accepted work. Inference roots select the exact prepared placement ID and model
+bindings. Jobs, inference, child calls, retries, events, and collection share the
+existing workspace journal and AttemptEngine; inference results are never memoized.
 
-`PreparePackageSet` already creates immutable receipts for rented preparation. The
-local preinstalled interpreter path has no such receipt; machine acceptance must
-first establish a Runtime-owned immutable environment, without treating a mutable
-Creator installation as retained custody.
+Published preparation from a local SDK installs the release's hash-pinned wheel
+selection and copies SDK dependencies through the existing immutable RECORD snapshot
+reader. Snapshot bytes join environment content identity, while public build identity
+remains the canonical Environment digest. Receipt restoration needs neither the
+source SDK directory nor the package index. The older describe-only local install
+adapter still opens an ordinary venv; it cannot establish machine-execution custody.
 
-Explicitly external callable placement continues to require external coordination.
-The capture/transport contract must distinguish this from captured same-machine
-execution; package publication alone must not choose an execution coordinator.
+Qualification in this branch uses real Runtime/worker executors for private,
+published base-image, and published SDK roots: submit, query, collect, worker
+replacement, resume with the package index stopped, and fresh repeated published
+inference all pass. A separate test removes the SDK and exported wheel, then opens
+and executes from the retained receipt. These tests supplement ordinary Creator CLI
+qualification, which remains required before a product completion claim.
+
+Creator routing in this increment is limited to explicit same-machine selection.
+Existing default and cross-machine published orchestration remains in place. Durable
+external delegation and default placement policy remain followups in cr170/cl259;
+package publication alone must not choose an execution coordinator.

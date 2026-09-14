@@ -54,6 +54,7 @@ def prepare_package_set(
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
     preinstalled_python: Path | None = None,
+    dependency_cache: Path | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Parse the desired download set plus the request's release facts (wire 30) and prepare.
@@ -91,13 +92,6 @@ def prepare_package_set(
     application, slot_paths, inventory, locked = _request_facts(
         request, models, preinstalled=preinstalled_python is not None
     )
-    installed = None
-    if preinstalled_python is not None:
-        # This path is selected only by the local worker's launch configuration.
-        # RPC callers cannot choose an interpreter or claim an image inventory.
-        installed = package_environment.open_existing_environment(
-            preinstalled_python, canonical.digest({"locked_requirements": locked.digest})
-        )
     return _prepare_published(
         package_name=package_name,
         release=release,
@@ -117,7 +111,8 @@ def prepare_package_set(
         verified=verified,
         job_plan_root=job_plan_root,
         base=base,
-        installed_environment=installed,
+        dependency_python=preinstalled_python,
+        dependency_cache=dependency_cache,
         materialized=materialized,
     )
 
@@ -214,7 +209,7 @@ def _filtered_rows(
     package_name: str,
     release: str,
     locked: package_environment.LockedRequirements,
-    inventory: image_inventory.Inventory,
+    inventory: image_inventory.Inventory | None,
     platform_versions: Mapping[str, str],
 ) -> list[package_environment.LockedRow]:
     """The export minus immutable image and physically inherited framework providers.
@@ -231,7 +226,7 @@ def _filtered_rows(
             "package_prepare_project_pin_missing",
             f"the export must pin {expected}=={release} exactly once",
         )
-    provided = inventory.versions
+    provided = inventory.versions if inventory is not None else {}
     for name in ("cozy-runtime", "tensorfs"):
         if name in platform_versions:
             provided.setdefault(name, platform_versions[name])
@@ -286,6 +281,8 @@ def _prepare_published(
     job_plan_root: Path | None,
     base: base_observation.Observation | None,
     installed_environment: package_environment.InstalledEnvironment | None = None,
+    dependency_python: Path | None = None,
+    dependency_cache: Path | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Install from the exact export, derive the interface, and author the PlacementSet.
@@ -306,19 +303,23 @@ def _prepare_published(
     if installed_environment is not None:
         installed = installed_environment
     else:
-        if inventory is None:
+        if inventory is None and dependency_python is None:
             raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
         try:
             observed_base = base or package_environment.observe_base(python)
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
 
-        lie = image_inventory.disagreement(inventory, observed_base.distribution_versions)
+        lie = (
+            image_inventory.disagreement(inventory, observed_base.distribution_versions)
+            if inventory is not None
+            else None
+        )
         if lie is not None:
             raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
         platform = (
             observed_base.distribution_versions
-            if package_environment.is_base_interpreter(python)
+            if dependency_python is not None or package_environment.is_base_interpreter(python)
             else {}
         )
         install_rows = _filtered_rows(package_name, release, locked, inventory, platform)
@@ -330,10 +331,13 @@ def _prepare_published(
                 environment_digest=environment_digest,
                 python=python,
                 base=observed_base,
+                dependency_python=dependency_python,
+                dependency_cache=dependency_cache,
             )
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
-        _refuse_platform_shadow(installed, package_name, platform)
+        if dependency_python is None:
+            _refuse_platform_shadow(installed, package_name, platform)
 
     expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     interface_raw = describe(installed, expected_distribution)
@@ -813,47 +817,70 @@ def prepare_unpublished_placement(
         raise PreparationRefusal(
             "private_placement_download_set_invalid", "download signature has no model set"
         )
-    slots = [row.slot for row in request.native_models]
+    return prepare_model_placement(
+        prepared=prepared,
+        installed=installed,
+        models=models,
+        native_models=request.native_models,
+        artifact_cache=artifact_cache,
+        tensorfs_root=tensorfs_root,
+        verified=verified,
+    )
+
+
+def prepare_model_placement(
+    *,
+    prepared: Mapping[str, Any],
+    installed: package_environment.InstalledEnvironment,
+    native_models: Sequence[pb.NativeModelBinding],
+    artifact_cache: Path,
+    tensorfs_root: Path | None,
+    verified: Callable[[str, int, Path], None],
+    models: Sequence[Any] = (),
+) -> pb.PreparePackageSetResult:
+    """Derive new Model bindings from either origin's exact immutable preparation."""
+    package = prepared.get("package") or prepared.get("development") or {}
+    interface_ref = prepared["package_interface"]
+    models = list(models)
+    slots = [row.slot for row in native_models]
     if slots != sorted(set(slots)) or not all(slots):
         raise PreparationRefusal(
-            "private_placement_native_models_invalid",
+            "prepared_placement_native_models_invalid",
             "native model slots must be unique and sorted",
         )
     models.extend(
         {
-            "package": str(development["package"]),
+            "package": str(package["package"]),
             "slot": row.slot,
             "model": row.model,
             "manifest": documents.spell(row.manifest.digest),
             "manifest_length": row.manifest.length,
         }
-        for row in request.native_models
+        for row in native_models
     )
     if not 0 < len(models) <= 32:
         raise PreparationRefusal(
-            "private_placement_models_invalid", "a placement requires between 1 and 32 model slots"
+            "prepared_placement_models_invalid", "a placement requires between 1 and 32 model slots"
         )
     digest = str(interface_ref["digest"])
     length = int(interface_ref["length"])
     try:
         documents.raw(digest)
     except (documents.DocumentError, ValueError) as exc:
-        raise PreparationRefusal("private_placement_interface_invalid", digest) from exc
+        raise PreparationRefusal("prepared_placement_interface_invalid", digest) from exc
     interface_raw = _read_file(artifact_cache / digest.removeprefix("sha256:"), length)
     if (
         len(interface_raw) != length
         or "sha256:" + hashlib.sha256(interface_raw).hexdigest() != digest
     ):
-        raise PreparationRefusal("private_placement_interface_invalid", digest)
+        raise PreparationRefusal("prepared_placement_interface_invalid", digest)
     try:
-        interface_body = package_interface.read_bytes(
-            interface_raw, "prepared local package interface"
-        )
+        interface_body = package_interface.read_bytes(interface_raw, "prepared package interface")
     except package_interface.StalePackageInterface as exc:
-        raise PreparationRefusal("private_placement_interface_invalid", str(exc)) from exc
+        raise PreparationRefusal("prepared_placement_interface_invalid", str(exc)) from exc
     selected_models, entrypoints = _entrypoints(
         interface_body,
-        package_name=str(development.get("package", "")),
+        package_name=str(package.get("package", "")),
         selections=models,
         tensorfs_root=tensorfs_root,
         verified=verified,

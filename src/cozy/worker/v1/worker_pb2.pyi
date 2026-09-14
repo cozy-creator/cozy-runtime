@@ -570,14 +570,26 @@ class ProtocolInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class MachineExecutionCapture(_message.Message):
-    __slots__ = ("root_revision_digest", "revisions", "bindings")
+    __slots__ = ("root_revision_digest", "revisions", "bindings", "published_revisions")
     ROOT_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     REVISIONS_FIELD_NUMBER: _ClassVar[int]
     BINDINGS_FIELD_NUMBER: _ClassVar[int]
+    PUBLISHED_REVISIONS_FIELD_NUMBER: _ClassVar[int]
     root_revision_digest: bytes
     revisions: _containers.RepeatedCompositeFieldContainer[LocalPackageRevision]
     bindings: _containers.RepeatedCompositeFieldContainer[MachineCallableBinding]
-    def __init__(self, root_revision_digest: _Optional[bytes] = ..., revisions: _Optional[_Iterable[_Union[LocalPackageRevision, _Mapping]]] = ..., bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ...) -> None: ...
+    published_revisions: _containers.RepeatedCompositeFieldContainer[PublishedPackageRevision]
+    def __init__(self, root_revision_digest: _Optional[bytes] = ..., revisions: _Optional[_Iterable[_Union[LocalPackageRevision, _Mapping]]] = ..., bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ..., published_revisions: _Optional[_Iterable[_Union[PublishedPackageRevision, _Mapping]]] = ...) -> None: ...
+
+class PublishedPackageRevision(_message.Message):
+    __slots__ = ("package", "environment", "package_interface")
+    PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    ENVIRONMENT_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
+    package: PackageSelection
+    environment: Environment
+    package_interface: Ref
+    def __init__(self, package: _Optional[_Union[PackageSelection, _Mapping]] = ..., environment: _Optional[_Union[Environment, _Mapping]] = ..., package_interface: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
 class MachineCallableBinding(_message.Message):
     __slots__ = ("caller_revision_digest", "interface_digest", "module", "export", "callee_revision_digest", "entrypoint")

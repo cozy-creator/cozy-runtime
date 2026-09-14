@@ -14,11 +14,18 @@ from cozy_runtime.internal import (
     package_interface,
 )
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import PUBLISHED_MACHINE_CAPTURE_WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
     from .session import Worker
+
+
+def code_identity(placement: dict[str, Any]) -> str:
+    """The established code identity for each origin, independent of Model bindings."""
+    if placement.get("development"):
+        return str(placement["development"].get("local_revision_digest", ""))
+    return str(placement.get("environment_digest", ""))
 
 
 def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
@@ -29,10 +36,15 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
     ):
         raise WorkspaceRefusal("execution capture does not bind its bounded canonical bytes")
     capture = documents.read(raw, pb.MachineExecutionCapture)
+    published = capture.get("published_revisions", [])
+    if published and request.claim.wire_minor < PUBLISHED_MACHINE_CAPTURE_WIRE_MINOR:
+        raise WorkspaceRefusal("published execution capture requires wire54")
     if (
-        set(capture) != {"format", "root_revision_digest", "revisions", "bindings"}
+        set(capture) - {"published_revisions"}
+        != {"format", "root_revision_digest", "revisions", "bindings"}
         or not isinstance(capture["revisions"], list)
-        or not 1 <= len(capture["revisions"]) <= 128
+        or not isinstance(published, list)
+        or not 1 <= len(capture["revisions"]) + len(published) <= 128
         or not isinstance(capture["bindings"], list)
         or len(capture["bindings"]) > 4096
     ):
@@ -41,22 +53,52 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
     prepared: dict[str, dict[str, Any]] = {}
     interfaces: dict[str, dict[str, Any]] = {}
     exports: dict[str, set[tuple[str, str, str]]] = {}
-    for revision in capture["revisions"]:
-        digest = documents.spell(
-            documents.embedded_document_digest(revision, "cozy.worker.v1.LocalPackageRevision")
+    inventory = [
+        (
+            documents.spell(
+                documents.embedded_document_digest(revision, "cozy.worker.v1.LocalPackageRevision")
+            ),
+            revision,
+            False,
         )
+        for revision in capture["revisions"]
+    ]
+    public_inventory = [
+        (
+            documents.spell(
+                documents.embedded_document_digest(
+                    revision["environment"], "cozy.worker.v1.Environment"
+                )
+            ),
+            revision,
+            True,
+        )
+        for revision in published
+    ]
+    for rows in (inventory, public_inventory):
+        identities = [row[0] for row in rows]
+        if identities != sorted(set(identities)):
+            raise WorkspaceRefusal("execution capture needs sorted unique revisions")
+    for digest, revision, is_published in [*inventory, *public_inventory]:
         if digest in revisions:
             raise WorkspaceRefusal("execution capture repeats a revision")
         revisions[digest] = revision
         candidates = [
-            value for (_, selected), value in worker.prepared_revisions.items() if selected == digest
+            value
+            for (_, selected), value in worker.prepared_revisions.items()
+            if selected == digest
+            and (
+                digest != capture["root_revision_digest"]
+                or request.prepared_state.WhichOneof("mode") == "job"
+                or value.placement_id == request.offer.placement_id
+            )
         ]
         if not candidates:
             raise WorkspaceRefusal(
                 "execution capture revision has not been prepared on this machine"
             )
         selected = candidates[0]
-        if selected.installed is None:
+        if selected.installed is None or not selected.installed.receipt_digest:
             raise WorkspaceRefusal("execution capture has no retained immutable environment")
         installed = package_environment.open_generation(
             Path(worker.options.install_root or ""),
@@ -64,7 +106,13 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             environment_digest=documents.spell(selected.environment_digest),
             python=Path(worker.options.python or selected.installed.python),
         )
-        if (
+        if is_published:
+            if selected.development or any(
+                revision[field] != selected.document.get(field)
+                for field in ("package", "environment", "package_interface")
+            ):
+                raise WorkspaceRefusal("execution capture differs from its prepared publication")
+        elif (
             revision["package"],
             revision["release"],
             revision["source_digest"],
@@ -94,11 +142,7 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             "placement": selected.document,
             "receipt_digest": installed.receipt_digest,
         }
-    if (
-        not 1 <= len(revisions) <= 128
-        or list(revisions) != sorted(revisions)
-        or capture.get("root_revision_digest") not in revisions
-    ):
+    if not 1 <= len(revisions) <= 128 or capture.get("root_revision_digest") not in revisions:
         raise WorkspaceRefusal("execution capture needs sorted unique revisions and its exact root")
     keys = []
     bound: dict[str, set[tuple[str, str, str]]] = {digest: set() for digest in revisions}
@@ -180,7 +224,8 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         )
         if (
             selected_entry is None
-            or selected_entry.get("development", {}).get("local_revision_digest") != root
+            or code_identity(selected_entry) != root
+            or selected_entry != prepared[root]["placement"]
         ):
             raise WorkspaceRefusal("execution inference does not name the captured root")
     return canonical.write({"revisions": prepared, "state": state_identity(state)})
@@ -199,7 +244,7 @@ def restore(worker: Worker, preparation: dict[str, Any]) -> pb.DesiredWorkerStat
     """Reopen Runtime-owned receipts; no source install IDs or laptop paths are admitted."""
     for digest, row in preparation["revisions"].items():
         placement = worker._placement_from_entry(row["placement"], b"")
-        if placement.development.get("local_revision_digest") != digest:
+        if code_identity(placement.document) != digest:
             raise WorkspaceRefusal("execution preparation revision changed")
         placement.installed = package_environment.open_generation(
             Path(worker.options.install_root or ""),

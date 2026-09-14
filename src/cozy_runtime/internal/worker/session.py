@@ -2004,6 +2004,7 @@ class Worker:
             if self.options.environment_python is not None
             else None,
             materialized=published.append,
+            dependency_cache=self.config.dependency_cache,
         )
         entries = read_placement_set(result.placement_set)
         if len(entries) != 1 or not entries[0].get("package") or len(published) != 1:
@@ -4411,9 +4412,12 @@ class Worker:
                 terminal=True,
             )
             return None
-        if placement.development:
-            local_revision = str(placement.development.get("local_revision_digest", ""))
-            prepared = self.prepared_revisions.get((placement.placement_id, local_revision))
+        from .machine_capture import code_identity
+
+        prepared = self.prepared_revisions.get(
+            (placement.placement_id, code_identity(placement.document))
+        )
+        if placement.development or prepared is not None:
             if prepared is None:
                 self._materialization_failed(
                     placement,
@@ -4427,6 +4431,7 @@ class Worker:
                 )
                 return None
             core_fields = (
+                "package",
                 "development",
                 "environment_digest",
                 "environment",
