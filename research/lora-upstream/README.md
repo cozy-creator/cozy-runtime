@@ -88,8 +88,8 @@ FP8 CUDA forward nor full-video generation is claimed by this proof.
 | PEFT default / explicit no-autocast factors | FP32 / BF16 |
 | BF16 spatial delta vs FP32 delta, strength 0.3 | 0.38191% relative L2 |
 | BF16 Wushu delta vs FP32 delta, strength 0.8 | 0.30959% relative L2 |
-| ComfyUI residual bypass vs PEFT BF16 delta | Exactly equal, both adapters |
-| PEFT spatial → Wushu → spatial selection | Exactly equal restored output |
+| ComfyUI residual bypass vs PEFT BF16 delta | Exact numerical equality, both adapters |
+| PEFT spatial → Wushu → spatial selection | Exact numerical equality of restored output |
 | PEFT dense BF16 fusion vs its residual | 0.22478% output relative L2 |
 | PEFT merge/unmerge restores original BF16 weight bytes | **No** |
 | ComfyUI patch/unpatch restores original BF16 weight bytes | **Yes** |

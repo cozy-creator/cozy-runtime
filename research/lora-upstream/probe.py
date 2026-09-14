@@ -26,6 +26,7 @@ def main() -> None:
     from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
     from peft.tuners.lora.layer import Linear
 
+    from cozy_runtime.internal.encoding.formats import SPEC_ROWWISE
     from cozy_runtime.internal.encoding.leaves import (
         PreQuantized,
         RowwiseNativeLeaf,
@@ -207,7 +208,7 @@ def main() -> None:
         # Construct the REAL Cozy leaf; do not invent a dense .weight facade or CPU GEMM.
         payload = base_weight.to(torch.float8_e4m3fn)
         scales = torch.ones(out_features, dtype=torch.float32)
-        leaf = RowwiseNativeLeaf("cpu-integration-fixture").leaf(
+        leaf = RowwiseNativeLeaf(SPEC_ROWWISE).leaf(
             torch,
             {"data": payload, "scale": scales},
             torch.nn.Linear(in_features, out_features, bias=False, device="meta"),
@@ -307,7 +308,7 @@ def main() -> None:
             "flatten_attribute_names": list(attributes),
             "base_path_after_peft": "base_model.model.0.base_layer",
         }
-        dtype_leaf = RowwiseNativeLeaf("cpu-dtype-fixture").leaf(
+        dtype_leaf = RowwiseNativeLeaf(SPEC_ROWWISE).leaf(
             torch,
             {"data": payload.clone(), "scale": scales.clone()},
             torch.nn.Linear(in_features, out_features, bias=False, device="meta"),
