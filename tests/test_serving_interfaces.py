@@ -8,9 +8,13 @@ from pathlib import Path
 
 import pytest
 
+from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import interface_wheel, package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.worker.machine_child_target import Target
+from cozy_runtime.internal.worker.machine_serving import arguments
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 
 SOURCE = """from enum import Enum
 from typing import Any
@@ -234,14 +238,45 @@ assert "capture" not in body
 assert sent[0]["capture"]["components"] == ["unet"]
 assert "capture" not in sent[1]
 assert json.loads(sent[2]["payload"])["models"] == {"model":None}
+from pathlib import Path
+Path(sys.argv[2]).write_text(sent[0]["payload"])
 """
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", check, str(output)],
+        [sys.executable, "-I", "-c", check, str(output), str(tmp_path / "serving-call.json")],
         capture_output=True,
         text=True,
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+    entry = next(
+        row for row in static_interface.build(root)["entrypoints"] if row["name"] == "generate"
+    )
+    target = Target(
+        "revision", "generate", "interface", entry, {}, None, "digest", serving_envelope=True
+    )
+    frozen = (tmp_path / "serving-call.json").read_bytes()
+    payload, models = arguments(target, frozen)
+    assert canonical_json.decode(payload) == {
+        "prompt": "same",
+        "mode": "one",
+        "tags": {},
+        "wire_count": 3,
+    }
+    assert models["model"]["producer_request_id"] == "producer"
+    body = canonical_json.decode(frozen)
+    for wrong in [
+        body["payload"],
+        {**body, "extra": 1},
+        {**body, "models": {}},
+        {**body, "payload": []},
+    ]:
+        with pytest.raises(WorkspaceRefusal, match="invalid payload or Model slots"):
+            arguments(target, canonical_json.encode(wrong))
+    # A self-call is the original invocable contract, even when its user fields
+    # happen to be named payload and models. No heuristic peeks inside user data.
+    from dataclasses import replace
+
+    assert arguments(replace(target, serving_envelope=False), frozen) == (frozen, body)
     caller = output / "uses.py"
     caller.write_text(
         "from serving_fixture import generate, Result\n"
