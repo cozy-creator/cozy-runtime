@@ -11,6 +11,7 @@ import re
 import stat
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -829,6 +830,21 @@ def prepare_unpublished_placement(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class NativeAdapterSelection:
+    """Local preparation facts whose source is held by the native call owner.
+
+    This is deliberately not a DownloadAdapterRef: no Hub repository or download
+    capability is invented for an unpublished retained artifact.
+    """
+
+    component: str
+    manifest: str
+    manifest_length: int
+    source_component: str
+    scale: str
+
+
 def prepare_model_placement(
     *,
     prepared: Mapping[str, Any],
@@ -838,6 +854,7 @@ def prepare_model_placement(
     tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
     models: Sequence[Any] = (),
+    native_adapters: Mapping[str, Sequence[NativeAdapterSelection]] = {},
 ) -> pb.PreparePackageSetResult:
     """Derive new Model bindings from either origin's exact immutable preparation."""
     package = prepared.get("package") or prepared.get("development") or {}
@@ -849,6 +866,11 @@ def prepare_model_placement(
             "prepared_placement_native_models_invalid",
             "native model slots must be unique and sorted",
         )
+    if (
+        set(native_adapters) - set(slots)
+        or len(models) + len(slots) + sum(len(rows) for rows in native_adapters.values()) > 32
+    ):
+        raise PreparationRefusal("adapter_selection", "native adapters exceed selected slots/bound")
     models.extend(
         {
             "package": str(package["package"]),
@@ -888,6 +910,7 @@ def prepare_model_placement(
         interface_body,
         package_name=str(package.get("package", "")),
         selections=models,
+        native_adapters=native_adapters,
         tensorfs_root=tensorfs_root,
         verified=verified,
         derive=_deriver(installed, str(interface_body.get("application", ""))),
@@ -1226,6 +1249,7 @@ def _entrypoints(
     tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
     derive: Deriver | None,
+    native_adapters: Mapping[str, Sequence[NativeAdapterSelection]] = {},
 ) -> tuple[list[pb.Model], list[pb.Entrypoint]]:
     rows = body.get("entrypoints")
     if not isinstance(rows, list):
@@ -1285,7 +1309,11 @@ def _entrypoints(
                 path, model["config_bytes"], model["assets"], model["tensor_dtypes"]
             )
             adapter_models, adapter_slots = _slot_adapters(
-                model["selection"], constructed, tensorfs_root, len(models)
+                model["selection"],
+                constructed,
+                tensorfs_root,
+                len(models),
+                native=native_adapters.get(path, ()),
             )
             models.extend(adapter_models)
             slots.append(
@@ -1340,10 +1368,28 @@ def _slot_adapters(
     components: Sequence[str],
     root: Path | None,
     first_id: int,
+    *,
+    native: Sequence[NativeAdapterSelection] = (),
 ) -> tuple[list[pb.Model], list[pb.ModelAdapter]]:
     requested = selection.get("adapters", [])
     if not isinstance(requested, list):
         raise PreparationRefusal("adapter_selection", "adapter selections must be an ordered list")
+    if native:
+        if requested:
+            raise PreparationRefusal(
+                "adapter_selection", "one adapter stack cannot have two origins"
+            )
+        # Labels below identify local native manifests; no downloader sees these rows.
+        requested = [
+            {
+                "component": row.component,
+                "manifest": row.manifest,
+                "model": "native/" + row.manifest.removeprefix("sha256:"),
+                "source_component": row.source_component,
+                "scale": row.scale,
+            }
+            for row in native
+        ]
     if not requested:
         return [], []
     if root is None:
@@ -1367,6 +1413,8 @@ def _slot_adapters(
         documents.raw(digest)
         adapters.parse_scale(row["scale"])
         raw = bytes(store.manifest(digest)["manifest"])
+        if native and len(raw) != native[index].manifest_length:
+            raise PreparationRefusal("adapter_manifest_mismatch", "retained adapter length changed")
         if documents.spell(documents.digest_of(raw)) != digest:
             raise PreparationRefusal("adapter_manifest_mismatch", digest)
         if release:

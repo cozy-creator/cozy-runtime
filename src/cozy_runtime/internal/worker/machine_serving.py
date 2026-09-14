@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
+from cozy_runtime.author._model_bindings import read_binding
 from cozy_runtime.internal import package_environment
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -31,7 +31,7 @@ from . import (
     package_prepare,
 )
 from .machine_child_target import Target
-from .workspace import WorkspaceRefusal
+from .workspace import Workspace, WorkspaceRefusal
 from .workspace_calls import Call
 from .workspace_calls import Calls as JournalCalls
 
@@ -48,9 +48,16 @@ def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, Any]]:
     value = canonical_json.decode(raw)
     if not isinstance(value, dict):
         raise WorkspaceRefusal("captured serving arguments must be an object")
-    if not target.serving_envelope:
-        return raw, value
     names = {model["path"].rpartition(".")[2] for model in target.declaration.get("models", [])}
+    if not target.serving_envelope:
+        payload = dict(value)
+        for name in names:
+            if value.get(name) is not None:
+                base, _ = read_binding(value[name])
+                payload[name] = msgspec.to_builtins(base)
+        return canonical_json.encode(payload), {
+            name: value[name] for name in names if value.get(name) is not None
+        }
     if (
         set(value) != {"payload", "models"}
         or not isinstance(value["payload"], dict)
@@ -278,77 +285,30 @@ class Serving:
         if not target.declaration.get("models"):
             return Prepared(dict(prepared), [], contextlib.ExitStack())
         _, model_arguments = arguments(target, request.request_canonical_bytes)
-        native: list[pb.NativeModelBinding] = []
         defaults = machine_model_defaults.select(worker, owner, call, target, model_arguments)
         access = contextlib.ExitStack()
         try:
             machine_model_defaults.materialize(worker, defaults, access)
-            for model in target.declaration["models"]:
-                prefix = target.entrypoint + ".models."
-                path = model["path"]
-                if not path.startswith(prefix) or not path.removeprefix(prefix).isidentifier():
-                    raise WorkspaceRefusal("captured serving Model has no exact parameter")
-                if model_arguments.get(path.removeprefix(prefix)) is None:
-                    continue
-                supplied = model_arguments.get(path.removeprefix(prefix))
-                if supplied is None:
-                    raise WorkspaceRefusal("captured serving Model default has not been retained")
-                artifact = msgspec.convert(supplied, type=ModelArtifact, strict=True)
-                retention, held = machine_models.retain(
-                    workspace,
-                    owner,
-                    call.child_request,
-                    "input/" + path.removeprefix(prefix),
-                    artifact,
-                )
-                access.enter_context(workspace.held_model(owner, retention, held.manifest))
-                native.append(
-                    pb.NativeModelBinding(
-                        slot=path,
-                        model="native/" + artifact.manifest.digest[7:39],
-                        manifest=held.manifest,
-                        retention=retention,
-                    )
-                )
-            # The existing immutable preparation registry already owns this work.
-            # Reusing its exact checkpoint bindings does not reuse an inference result.
-            expected = {
-                model.slot.removeprefix(target.entrypoint + ".models."): documents.body(
-                    model.manifest
-                )
-                for model in native
-            }
-            expected.update({row["parameter"]: row["manifest"] for row in defaults})
+            native, native_adapters = _retain_models(
+                workspace,
+                owner,
+                call.child_request,
+                target.entrypoint,
+                target.declaration["models"],
+                model_arguments,
+                access,
+            )
             with worker.control_lock:
                 candidates = [dict(value.document) for value in worker.prepared_revisions.values()]
             for candidate in candidates:
                 if (
-                    machine_capture.code_identity(candidate) != target.revision
-                    or candidate.get("environment_digest") != prepared["environment_digest"]
-                    or candidate.get("package_interface") != prepared["package_interface"]
+                    machine_capture.code_identity(candidate) == target.revision
+                    and candidate.get("environment_digest") == prepared["environment_digest"]
+                    and candidate.get("package_interface") == prepared["package_interface"]
+                    and _matches_bindings(
+                        candidate, target.entrypoint, native, native_adapters, defaults
+                    )
                 ):
-                    continue
-                entry = next(
-                    (
-                        row
-                        for row in candidate.get("entrypoints", [])
-                        if row["name"] == target.entrypoint
-                    ),
-                    None,
-                )
-                models = {row["id"]: row["manifest"] for row in candidate.get("models", [])}
-                if entry is None:
-                    continue
-                used = {slot["reference_model_id"] for slot in entry["slots"]}
-                if used != models.keys() or any(
-                    component["model_id"] != slot["reference_model_id"]
-                    for slot in entry["slots"]
-                    for component in slot.get("components", [])
-                ):
-                    continue
-                if {
-                    slot["slot"]: models[slot["reference_model_id"]] for slot in entry["slots"]
-                } == expected:
                     return Prepared(candidate, defaults, access)
             installed = package_environment.open_generation(
                 Path(worker.options.install_root or ""),
@@ -364,6 +324,7 @@ class Serving:
                 native.sort(key=lambda model: model.slot)
                 result = package_prepare.prepare_model_placement(
                     native_models=native,
+                    native_adapters=native_adapters,
                     models=[
                         {
                             "package": (prepared.get("package") or prepared["development"])[
@@ -394,3 +355,117 @@ class Serving:
         except BaseException:
             access.close()
             raise
+
+
+def _matches_bindings(
+    candidate: dict[str, Any],
+    entrypoint: str,
+    native: list[pb.NativeModelBinding],
+    adapters: dict[str, tuple[package_prepare.NativeAdapterSelection, ...]],
+    defaults: list[dict[str, Any]] | None = None,
+) -> bool:
+    entry = next(
+        (row for row in candidate.get("entrypoints", []) if row["name"] == entrypoint), None
+    )
+    if entry is None:
+        return False
+    models = {row["id"]: row["manifest"] for row in candidate.get("models", [])}
+    slots = {row["slot"]: row for row in entry["slots"]}
+    prefix = entrypoint + ".models."
+    expected = {row.slot.removeprefix(prefix): documents.body(row.manifest) for row in native}
+    expected.update({row["parameter"]: row["manifest"] for row in defaults or []})
+    if set(slots) != set(expected):
+        return False
+    used: set[str] = set()
+    for parameter, manifest in expected.items():
+        slot = slots[parameter]
+        reference = slot["reference_model_id"]
+        used.add(reference)
+        if models.get(reference) != manifest or any(
+            component["model_id"] != reference for component in slot.get("components", [])
+        ):
+            return False
+        selected = slot.get("adapters", [])
+        expected_adapters = adapters.get(prefix + parameter, ())
+        if len(selected) != len(expected_adapters):
+            return False
+        for actual, adapter in zip(selected, expected_adapters, strict=True):
+            used.add(actual["model_id"])
+            if (actual["component"], actual["source_component"], actual["scale"]) != (
+                adapter.component,
+                adapter.source_component,
+                adapter.scale,
+            ) or models.get(actual["model_id"]) != {
+                "digest": adapter.manifest,
+                "length": adapter.manifest_length,
+            }:
+                return False
+    return used == models.keys()
+
+
+def _retain_models(
+    workspace: Workspace,
+    owner: str,
+    recipient: str,
+    entrypoint: str,
+    declared: list[dict[str, Any]],
+    arguments: dict[str, Any],
+    access: contextlib.ExitStack,
+) -> tuple[
+    list[pb.NativeModelBinding], dict[str, tuple[package_prepare.NativeAdapterSelection, ...]]
+]:
+    native: list[pb.NativeModelBinding] = []
+    native_adapters: dict[str, tuple[package_prepare.NativeAdapterSelection, ...]] = {}
+    for model in declared:
+        prefix = entrypoint + ".models."
+        path = model["path"]
+        if not path.startswith(prefix) or not path.removeprefix(prefix).isidentifier():
+            raise WorkspaceRefusal("captured serving Model has no exact parameter")
+        supplied = arguments.get(path.removeprefix(prefix))
+        if supplied is None:
+            continue  # Captured defaults own omitted slots and their separate catalog custody.
+        artifact, selected_adapters = read_binding(supplied)
+        retention, held = machine_models.retain(
+            workspace,
+            owner,
+            recipient,
+            "input/" + path.removeprefix(prefix),
+            artifact,
+        )
+        access.enter_context(workspace.held_model(owner, retention, held.manifest))
+        adapter_rows = []
+        for index, adapter in enumerate(selected_adapters):
+            adapter_retention, adapter_held = machine_models.retain(
+                workspace,
+                owner,
+                recipient,
+                "input/" + path.removeprefix(prefix) + "/adapters/" + str(index),
+                adapter.source,
+            )
+            access.enter_context(
+                workspace.held_model(
+                    owner,
+                    adapter_retention,
+                    adapter_held.manifest,
+                )
+            )
+            adapter_rows.append(
+                package_prepare.NativeAdapterSelection(
+                    adapter.component,
+                    adapter.source.manifest.digest,
+                    adapter.source.manifest.length,
+                    adapter.source_component,
+                    adapter.scale,
+                )
+            )
+        if adapter_rows:
+            native_adapters[path] = tuple(adapter_rows)
+        native.append(
+            pb.NativeModelBinding(
+                slot=path,
+                model="native/" + artifact.manifest.digest[7:39],
+                manifest=held.manifest,
+                retention=retention,
+            )
+        )
+    return native, native_adapters

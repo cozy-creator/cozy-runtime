@@ -120,6 +120,7 @@ from cozy_runtime.author._model import (
     sequence_parallel,
     uses_components,
 )
+from cozy_runtime.author._model_bindings import AdaptedModel, LoRA, with_adapters
 from cozy_runtime.author._model_reader import WeightsReader, WeightsView
 from cozy_runtime.author._script import ScriptContext, script_app
 from cozy_runtime.author._services import (
@@ -169,6 +170,7 @@ __all__ = [
     "SERVING_ONLY",
     "ActivationCapture",
     "ActivationCaptureResult",
+    "AdaptedModel",
     "AdapterRef",
     "AdjustmentRow",
     "Adjustments",
@@ -231,6 +233,7 @@ __all__ = [
     "InvalidRequest",
     "Invocation",
     "InvocationResult",
+    "LoRA",
     "Loader",
     "MediaDecodeError",
     "MediaDecoder",
@@ -297,4 +300,5 @@ __all__ = [
     "sequence_parallel",
     "upload_checkpoint",
     "uses_components",
+    "with_adapters",
 ]
