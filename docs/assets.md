@@ -66,3 +66,23 @@ The advanced `Assets[ImageAsset | VideoAsset | AudioAsset]` view yields the exis
 raw handles. `AssetBound` can narrow MIME, encoded bytes or decoded bytes on individual
 kinds. Raw and decoded value types cannot be mixed in one view. Both views use the
 same occurrence records, input grants, decoder and attempt budget.
+
+For a native `Tree`, project a member through the same typed input interface:
+
+```python
+image = prefix.member(
+    "shots/000000/continuation.png",
+    ImageAsset,
+    bound=AssetBound(max_bytes=8 << 20, max_decoded_bytes=64 << 20),
+)
+decoded = media.decode_image(image)
+await next_shot(opening_frame=image)
+```
+
+`member` also accepts `VideoAsset`, `AudioAsset` and `FileAsset`. Runtime verifies
+the native Tree membership, byte identity, media type and explicit bound. It uses
+the already materialized member; selecting it does not copy the Tree again.
+Forwarding creates independent child custody over that one file. The handle is
+valid only during this attempt. Use `Outputs` to copy it into a declared output
+when exporting it. A manually constructed Tree or a directory path cannot grant
+this capability.

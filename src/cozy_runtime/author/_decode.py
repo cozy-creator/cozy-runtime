@@ -1121,6 +1121,8 @@ class MediaDecoder:
                 code="decoded_bound_missing",
                 fields=[asset._input_id] if asset._input_id else (),
             )
+        if asset._read_guard is not None:
+            asset._read_guard()
         av = _av()
         budget = _Budget(
             min(asset._max_decoded_bytes, self._limits.max_decoded_bytes),

@@ -23,7 +23,7 @@ from typing import Any, ClassVar, Final, Literal, Self, cast, get_args, overload
 from PIL.Image import Image as Image
 
 from cozy_runtime.author._errors import CapabilityError, PreflightViolation, RuntimeFailure
-from cozy_runtime.author._markers import ImagePreparation
+from cozy_runtime.author._markers import AssetBound, ImagePreparation
 from cozy_runtime.author._walker import strip, unwrap_optional
 
 _UNBOUND: Final = ""
@@ -391,7 +391,16 @@ class Tree:
     it was not granted — the capability is the grant, and there is no ambient store handle.
     """
 
-    __slots__ = ("_attempt", "_grant_token", "_read_guard", "_root", "digest", "ref", "size_bytes")
+    __slots__ = (
+        "_attempt",
+        "_grant_token",
+        "_member_token",
+        "_read_guard",
+        "_root",
+        "digest",
+        "ref",
+        "size_bytes",
+    )
 
     kind: ClassVar[str] = "tree"
 
@@ -405,6 +414,7 @@ class Tree:
         self.size_bytes = 0
         self._read_guard: Callable[[], None] | None = None
         self._grant_token: object | None = None
+        self._member_token: object | None = None
 
     def __repr__(self) -> str:
         return f"Tree({self.ref!r}, hydrated={self.hydrated})"
@@ -436,6 +446,17 @@ class Tree:
     def files(self) -> tuple[Path, ...]:
         """Every regular file in the tree, sorted. The whole read surface of an input."""
         return tuple(p for p in sorted(self.path.rglob("*")) if p.is_file())
+
+    def member[A: Asset](self, path: str, asset_type: type[A], *, bound: AssetBound) -> A:
+        """Project a verified native member as an attempt-scoped typed read capability.
+
+        The explicit bound governs encoded bytes, admitted media and decoded bytes.
+        Runtime verifies the path and native membership; use Outputs to copy a member
+        into a declared output when returning it.
+        """
+        from cozy_runtime.author._tree_members import project
+
+        return project(self, path, asset_type, bound=bound)
 
     def row(self) -> dict[str, Any]:
         return {

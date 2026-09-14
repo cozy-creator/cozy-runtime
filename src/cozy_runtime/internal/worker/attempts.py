@@ -1484,6 +1484,10 @@ class AttemptEngine:
     def durable_exchange(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Dispatch the existing executor control request lane by typed operation."""
         kind = str(frame.get("kind", ""))
+        if kind == "tree_member" and self.calls is not None:
+            from cozy_runtime.internal.worker.tree_members import project
+
+            return project(self.calls, attempt, frame)
         if kind in ("child_call", "child_poll", "child_cancel", "child_forget"):
             if self.calls is None:
                 return {

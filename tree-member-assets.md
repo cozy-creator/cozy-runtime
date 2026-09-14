@@ -11,7 +11,7 @@ code never supplies a local hydrated path. MediaDecoder and normal child calls
 consume the resulting attempt-scoped read capability. Output copy/re-export uses
 the existing Outputs writer and native output commit.
 
-The implementation also propagates an explicitly declared fixed-output aggregate
-budget through existing worker/executor admission and output checks for a final
-video plus prefix Tree. Default budgets and separately bounded root input intake
-remain unchanged. No new storage authority, file manager or general workflow DSL.
+The follow-up cr180 propagates an explicitly declared fixed-output aggregate budget
+through existing worker/executor admission and output checks for a final video plus
+prefix Tree. This change keeps current byte ceilings. No new storage authority,
+file manager or general workflow DSL.
