@@ -267,11 +267,13 @@ Path(sys.argv[2]).write_text(sent[0]["payload"])
     for wrong in [
         body["payload"],
         {**body, "extra": 1},
-        {**body, "models": {}},
+        {**body, "models": {"foreign": None}},
         {**body, "payload": []},
     ]:
         with pytest.raises(WorkspaceRefusal, match="invalid payload or Model slots"):
             arguments(target, canonical_json.encode(wrong))
+    for omitted in ({}, {"model": None}):
+        assert arguments(target, canonical_json.encode({**body, "models": omitted}))[1] == {}
     # A self-call is the original invocable contract, even when its user fields
     # happen to be named payload and models. No heuristic peeks inside user data.
     from dataclasses import replace

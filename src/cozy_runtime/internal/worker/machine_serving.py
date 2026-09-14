@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -20,9 +21,12 @@ from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import (
+    grants,
     machine_byte_inputs,
     machine_byte_results,
     machine_capture,
+    machine_checkpoint_inputs,
+    machine_model_defaults,
     machine_models,
     package_prepare,
 )
@@ -51,20 +55,33 @@ def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, Any]]:
         set(value) != {"payload", "models"}
         or not isinstance(value["payload"], dict)
         or not isinstance(value["models"], dict)
-        or set(value["models"]) != names
+        or not set(value["models"]) <= names
     ):
         raise WorkspaceRefusal("generated serving call has invalid payload or Model slots")
-    return canonical_json.encode(value["payload"]), value["models"]
+    return canonical_json.encode(value["payload"]), {
+        name: model for name, model in value["models"].items() if model is not None
+    }
+
+
+@dataclass
+class Prepared:
+    placement: dict[str, Any]
+    defaults: list[dict[str, Any]]
+    access: contextlib.ExitStack
 
 
 class Serving:
     def __init__(self, worker: Worker):
         self.worker = worker
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="machine-prepare")
-        self.pending: dict[tuple[str, str], Future[dict[str, Any]]] = {}
+        self.pending: dict[tuple[str, str], Future[Prepared]] = {}
 
     def close(self) -> None:
         self.pool.shutdown(wait=True, cancel_futures=True)
+        for future in self.pending.values():
+            if not future.cancelled():
+                with contextlib.suppress(Exception):
+                    future.result().access.close()
 
     def sweep(self, owner: str) -> None:
         workspace, executions = self.worker.workspace, self.worker.executions
@@ -80,6 +97,8 @@ class Serving:
                     key,
                 ).fetchone()
             if row is not None and row["desired"] == "cancel":
+                with contextlib.suppress(Exception):
+                    future.result().access.close()
                 machine_models.release(workspace, owner, key[1])
                 self.pending.pop(key, None)
 
@@ -112,8 +131,10 @@ class Serving:
             return
         if not future.done():
             return
+        prepared = None
         try:
-            placement = future.result()
+            prepared = future.result()
+            placement = prepared.placement
             journal.check_active(owner, call)
             selected = next(
                 (entry for entry in placement["entrypoints"] if entry["name"] == target.entrypoint),
@@ -169,6 +190,9 @@ class Serving:
                 self.worker.calls,
             )
             spec.inputs.extend(byte_bindings)
+            default_bindings, default_access = machine_model_defaults.inputs(prepared.defaults)
+            spec.inputs.extend(default_bindings)
+            spec.inputs.sort(key=lambda entry: entry.input_id)
             raw, identity = documents.identity(spec)
             offer = pb.AttemptOffer(
                 request_id=call.child_request,
@@ -191,6 +215,8 @@ class Serving:
                 ),
             )
             offer.grant.inputs.extend(byte_access)
+            offer.grant.inputs.extend(default_access)
+            offer.grant.inputs.sort(key=lambda entry: entry.input_id)
             placement_bytes = canonical_json.encode(
                 {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement]}
             )
@@ -218,38 +244,52 @@ class Serving:
             )
             capture = canonical_json.encode(executions.capture(owner, call.parent_request))
             attempts, delay = executions.retry_policy(owner, call.parent_request)
-            executions.submit(
-                owner,
-                call.child_request,
-                hashlib.sha256(capture).digest(),
-                offer,
-                result_schema=canonical_json.encode(target.declaration["result"]),
-                worker_boot=self.worker.fence.worker_boot_id,
-                memoize=False,
-                preparation=preparation,
-                worker_id=self.worker.options.worker_id,
-                max_attempts=attempts,
-                retry_delay_ms=delay,
-            )
+            with machine_checkpoint_inputs.admission(workspace, owner, offer.request_id):
+                catalog = grants.model_inputs(
+                    grants.bind(documents.read(raw, pb.InvocationSpec), offer.grant, identity)
+                )
+                machine_checkpoint_inputs.preflight(workspace, owner, offer, catalog)
+                for entry in catalog.values():
+                    machine_checkpoint_inputs.retain(workspace, owner, offer, entry)
+                executions.submit(
+                    owner,
+                    call.child_request,
+                    hashlib.sha256(capture).digest(),
+                    offer,
+                    result_schema=canonical_json.encode(target.declaration["result"]),
+                    worker_boot=self.worker.fence.worker_boot_id,
+                    memoize=False,
+                    preparation=preparation,
+                    worker_id=self.worker.options.worker_id,
+                    max_attempts=attempts,
+                    retry_delay_ms=delay,
+                )
         finally:
+            if prepared is not None:
+                prepared.access.close()
             self.pending.pop(key, None)
 
     def _prepare(
         self, owner: str, call: Call, target: Target, request: pb.ChildCallRequest
-    ) -> dict[str, Any]:
+    ) -> Prepared:
         worker, workspace = self.worker, self.worker.workspace
         assert workspace is not None
         prepared = target.prepared_revision["placement"]
         if not target.declaration.get("models"):
-            return dict(prepared)
+            return Prepared(dict(prepared), [], contextlib.ExitStack())
         _, model_arguments = arguments(target, request.request_canonical_bytes)
         native: list[pb.NativeModelBinding] = []
-        with contextlib.ExitStack() as access:
+        defaults = machine_model_defaults.select(worker, owner, call, target, model_arguments)
+        access = contextlib.ExitStack()
+        try:
+            machine_model_defaults.materialize(worker, defaults, access)
             for model in target.declaration["models"]:
                 prefix = target.entrypoint + ".models."
                 path = model["path"]
                 if not path.startswith(prefix) or not path.removeprefix(prefix).isidentifier():
                     raise WorkspaceRefusal("captured serving Model has no exact parameter")
+                if model_arguments.get(path.removeprefix(prefix)) is None:
+                    continue
                 supplied = model_arguments.get(path.removeprefix(prefix))
                 if supplied is None:
                     raise WorkspaceRefusal("captured serving Model default has not been retained")
@@ -278,6 +318,7 @@ class Serving:
                 )
                 for model in native
             }
+            expected.update({row["parameter"]: row["manifest"] for row in defaults})
             with worker.control_lock:
                 candidates = [dict(value.document) for value in worker.prepared_revisions.values()]
             for candidate in candidates:
@@ -308,7 +349,7 @@ class Serving:
                 if {
                     slot["slot"]: models[slot["reference_model_id"]] for slot in entry["slots"]
                 } == expected:
-                    return candidate
+                    return Prepared(candidate, defaults, access)
             installed = package_environment.open_generation(
                 Path(worker.options.install_root or ""),
                 receipt_digest=target.prepared_revision["receipt_digest"],
@@ -323,14 +364,33 @@ class Serving:
                 native.sort(key=lambda model: model.slot)
                 result = package_prepare.prepare_model_placement(
                     native_models=native,
+                    models=[
+                        {
+                            "package": (prepared.get("package") or prepared["development"])[
+                                "package"
+                            ],
+                            "slot": target.entrypoint + ".models." + row["parameter"],
+                            "model": row["repository"],
+                            "manifest": row["manifest"]["digest"],
+                            "manifest_length": row["manifest"]["length"],
+                        }
+                        for row in defaults
+                    ],
                     prepared=prepared,
                     installed=installed,
                     artifact_cache=Path(worker.options.artifact_cache or ""),
                     tensorfs_root=workspace.store_root,
                     verified=verified,
                 )
-            return dict(
-                documents.read(result.placement_set.placement_set_canonical_bytes, pb.PlacementSet)[
-                    "placements"
-                ][0]
+            return Prepared(
+                dict(
+                    documents.read(
+                        result.placement_set.placement_set_canonical_bytes, pb.PlacementSet
+                    )["placements"][0]
+                ),
+                defaults,
+                access,
             )
+        except BaseException:
+            access.close()
+            raise
