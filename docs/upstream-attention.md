@@ -14,7 +14,8 @@ Kitchen supports more architectures upstream; this initial adapter deliberately
 admits only the Hopper/datacenter Blackwell scope under investigation. Neither
 entrypoint silently falls back. Both refuse causal attention, nonzero dropout,
 log-sum-exp output, active autograd, and context parallelism. Grouped-query
-attention and unequal Q/KV sequence lengths preserve their upstream semantics.
+attention requires `enable_gqa=True` for unequal head counts. Unequal Q/KV
+sequence lengths preserve their upstream semantics.
 Kitchen forwards the standard `[B,H,Q,K]` boolean/additive mask and optional
 softmax scale. FlashInfer refuses masks rather than dropping padding metadata.
 
