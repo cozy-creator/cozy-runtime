@@ -209,10 +209,11 @@ def test_instance_callable_keeps_self_and_wrapper_name_keywords() -> None:
         return self + _cozy_module
 
     module.forward = original
+    # This is a direct forward-call contract; nn.Module.__call__ itself reserves
+    # its own self keyword before any installed forward can be reached.
+    expected = module.forward(self=torch.ones(1), _cozy_module=torch.ones(1))
     attention_sol.install_site(module, "dit", "attn")
     assert inspect.signature(module.forward) == inspect.signature(original)
-    assert torch.equal(
-        module(self=torch.ones(1), _cozy_module=torch.ones(1)), torch.full((1,), 2.0)
-    )
+    assert torch.equal(module.forward(self=torch.ones(1), _cozy_module=torch.ones(1)), expected)
     attention_sol.remove_site(module, "dit", "attn")
     assert module.forward is original
