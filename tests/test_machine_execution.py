@@ -536,7 +536,8 @@ def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path
 
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-def test_real_executor_and_next_queued_root_finish_without_control_stream() -> None:
+@pytest.mark.parametrize("origin", ["private", "published", "published-sdk"])
+def test_real_executor_and_next_queued_root_finish_without_control_stream(origin: str) -> None:
     from conftest import image_python
     from cozy_runtime.internal import child_env
     from cozy_runtime.internal.config import Credentials, RuntimeConfig
@@ -548,6 +549,7 @@ def test_real_executor_and_next_queued_root_finish_without_control_stream() -> N
     from cozy_runtime.protocol import worker_pb2_grpc as rpc
     from test_end_to_end import _run, _wheel_rows
     from test_job_preparation_isolation import measure, package
+    from test_publish_derivation import _download_set, _SimpleIndex
 
     with tempfile.TemporaryDirectory(prefix="cz-machine.") as raw:
         root = Path(raw)
@@ -563,7 +565,18 @@ from cozy_runtime.author import invocable
 async def helper(ctx: Context, *, n: int) -> Result:
     return Result(n)
 app.job(helper)
+@app.entrypoint
+def serve(payload: Request) -> Result:
+    path = Path(payload.entered)
+    count = int(path.read_text()) + 1 if path.exists() else 1
+    path.write_text(str(count))
+    return Result(count)
 """
+        )
+        source.write_text(
+            source.read_text()
+            .replace("def offline(", "async def offline(")
+            .replace("return Result(7)", "return await helper(n=7)")
         )
         uv = shutil.which("uv")
         assert uv is not None
@@ -571,6 +584,16 @@ app.job(helper)
         _run(uv, "build", "--wheel", "--out-dir", str(wheels), str(project))
         preparation.ClearField("wheels")
         preparation.wheels.extend(_wheel_rows(list(wheels.glob("*.whl"))))
+        sdk_python = None
+        if origin == "published-sdk":
+            sdk = root / "sdk"
+            _run(uv, "venv", "--python", str(image_python()), str(sdk))
+            sdk_python = sdk / "bin/python"
+            runtime_wheel = next(
+                image_python().parent.parent.parent.glob("wheels/cozy_runtime-*.whl")
+            )
+            _run(uv, "pip", "install", "--python", str(sdk_python), str(runtime_wheel))
+        indexes = []
         (root / "artifacts").mkdir()
         worker = Worker(
             RuntimeConfig(
@@ -591,6 +614,7 @@ app.job(helper)
                 devices="",
                 accelerator_backend="none",
                 python=str(image_python()),
+                environment_python=sdk_python,
                 install_root=environment,
                 artifact_cache=root / "artifacts",
                 tensorfs_root=root / "store",
@@ -601,9 +625,43 @@ app.job(helper)
         thread = threading.Thread(target=worker.run, daemon=True)
         try:
             captures = {}
+            placements = {}
             for current_preparation in (preparation, second_preparation):
-                measure(worker, current_preparation)
-                prepared = worker.prepare_local_package(current_preparation)
+                if origin == "private":
+                    measure(worker, current_preparation)
+                    prepared = worker.prepare_local_package(current_preparation)
+                else:
+                    wheel = Path(current_preparation.wheels[0].path)
+                    package_name = "published/" + wheel.name.split("-")[0].replace("_", "-")
+                    index = _SimpleIndex(
+                        root / ("index-" + current_preparation.operation_id), [wheel]
+                    )
+                    indexes.append(index)
+                    locked = (
+                        f"--index-url {index.url}\n"
+                        f"{package_name.split('/')[1]}==1.0.0 "
+                        f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}\n"
+                    ).encode()
+                    prepared = worker.prepare_package_set(
+                        pb.PreparePackageSetRequest(
+                            download_delegation=_download_set(package_name, "1.0.0"),
+                            install_root=str(environment),
+                            application="prepare_" + current_preparation.operation_id + ":app",
+                            image_inventory=None
+                            if sdk_python
+                            else pb.ImageInventory(
+                                profile="test",
+                                python="3.12",
+                                distributions=[
+                                    pb.ImageDistribution(
+                                        distribution="cozy-runtime",
+                                        version=worker.base.distribution_versions["cozy-runtime"],
+                                    )
+                                ],
+                            ),
+                            locked_requirements=locked,
+                        )
+                    )
                 placement_body = documents.read(
                     prepared.placement_set.placement_set_canonical_bytes, pb.PlacementSet
                 )["placements"][0]
@@ -622,17 +680,35 @@ app.job(helper)
                         for w in current_preparation.wheels
                     ],
                 )
+                revision_digest = (
+                    current_preparation.package.local_revision_digest
+                    if origin == "private"
+                    else documents.raw(placement_body["environment_digest"])
+                )
+                public_revision = None
+                if origin != "private":
+                    public_revision = pb.PublishedPackageRevision()
+                    locked_ref = placement_body["environment"]["locked_requirements"]
+                    public_revision.environment.locked_requirements.CopyFrom(
+                        pb.Ref(
+                            digest=documents.raw(locked_ref["digest"]), length=locked_ref["length"]
+                        )
+                    )
+                    public_revision.package.package = package_name
+                    public_revision.package.release = "1.0.0"
+                    public_revision.package_interface.CopyFrom(revision.package_interface)
                 capture, capture_digest = documents.identity(
                     pb.MachineExecutionCapture(
-                        root_revision_digest=current_preparation.package.local_revision_digest,
-                        revisions=[revision],
+                        root_revision_digest=revision_digest,
+                        revisions=[revision] if origin == "private" else [],
+                        published_revisions=[public_revision] if public_revision else [],
                         bindings=[
                             pb.MachineCallableBinding(
-                                caller_revision_digest=current_preparation.package.local_revision_digest,
+                                caller_revision_digest=revision_digest,
                                 interface_digest=revision.package_interface.digest,
                                 module="prepare_offline",
                                 export="helper",
-                                callee_revision_digest=current_preparation.package.local_revision_digest,
+                                callee_revision_digest=revision_digest,
                                 entrypoint="helper",
                             )
                         ]
@@ -641,6 +717,7 @@ app.job(helper)
                     )
                 )
                 captures[current_preparation.operation_id] = (capture, capture_digest)
+                placements[current_preparation.operation_id] = prepared.placement_set
             if worker.supervision.current is not None:
                 worker.supervision.retire_current(
                     worker.supervision.current, "begin worker lifecycle"
@@ -763,7 +840,10 @@ app.job(helper)
                         dict(denied.value.trailing_metadata())["cozy-error-code"]
                         == "execution_submission_refused"
                     )
-                    for minor, detail in ((51, "wire52"), (52, "no independent publication")):
+                    authority_cases = [(51, "wire52"), (54, "no independent publication")]
+                    if origin != "private":
+                        authority_cases.append((53, "wire54"))
+                    for minor, detail in authority_cases:
                         assert worker.executions is not None
                         invalid.CopyFrom(submission)
                         invalid.offer.request_id = f"rejected-authority-{minor}"
@@ -777,6 +857,27 @@ app.job(helper)
                         assert ungranted.value.code() == grpc.StatusCode.FAILED_PRECONDITION
                         assert detail in ungranted.value.details()
                         assert not worker.executions.owns("owner", invalid.offer.request_id)
+                if identifier == "first" and origin != "private":
+                    for field in ("package", "environment", "duplicate"):
+                        invalid.CopyFrom(submission)
+                        invalid.offer.request_id = "rejected-capture-" + field
+                        invalid.submission_id = invalid.offer.request_id
+                        damaged = documents.read(capture, pb.MachineExecutionCapture)
+                        if field == "package":
+                            damaged["published_revisions"][0]["package"]["release"] = "2.0.0"
+                        elif field == "environment":
+                            damaged["published_revisions"][0]["environment"]["locked_requirements"][
+                                "digest"
+                            ] = "sha256:" + "01" * 32
+                        else:
+                            damaged["published_revisions"] *= 2
+                        invalid.capture_canonical_bytes = canonical_json.encode(damaged)
+                        invalid.capture_digest = documents.digest_of(
+                            invalid.capture_canonical_bytes
+                        )
+                        with pytest.raises(grpc.RpcError) as wrong_capture:
+                            client.SubmitMachineExecution(invalid, timeout=5)
+                        assert wrong_capture.value.code() == grpc.StatusCode.FAILED_PRECONDITION
                 receipt = client.SubmitMachineExecution(submission, timeout=30)
                 assert client.SubmitMachineExecution(submission, timeout=30) == receipt
                 if identifier == "first":
@@ -871,10 +972,89 @@ app.job(helper)
             with pytest.raises(grpc.RpcError) as mismatched:
                 client.GetMachineExecution(query, timeout=5)
             assert mismatched.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+            if origin != "private":
+                # Published inference uses the exact prepared placement and remains fresh.
+                serving_placement = documents.read(
+                    placements["offline"].placement_set_canonical_bytes, pb.PlacementSet
+                )["placements"][0]
+                entrypoint = next(
+                    row for row in serving_placement["entrypoints"] if row["name"] == "serve"
+                )
+                payload = canonical_json.encode({"entered": str(root / "inference-count")})
+                payload_digest = documents.spell(documents.digest_of(payload))
+                serving_spec, serving_digest = documents.identity(
+                    pb.InvocationSpec(
+                        environment_digest=serving_placement["environment_digest"],
+                        payload_digest=payload_digest,
+                        inputs=[
+                            pb.InputBinding(
+                                input_id="payload",
+                                digest=payload_digest,
+                                length=len(payload),
+                                kind_mime="application/json",
+                            )
+                        ],
+                        serving=pb.ServingInvocationSpec(
+                            entrypoint_binding_digest=entrypoint["entrypoint_binding_digest"],
+                            attempt_binding_id=entrypoint["entrypoint_binding_digest"],
+                            bindings_digest=serving_placement["bindings_digest"],
+                        ),
+                    )
+                )
+                serving_capture, serving_capture_digest = captures["offline"]
+                for ordinal in (1, 2):
+                    serving_offer = pb.AttemptOffer(
+                        request_id=f"inference-{ordinal}",
+                        attempt_ordinal=1,
+                        placement_id=serving_placement["placement_id"],
+                        invocation_spec_canonical_bytes=serving_spec,
+                        invocation_spec_digest=serving_digest,
+                        grant=pb.DeliveryGrant(
+                            invocation_spec_digest=serving_digest,
+                            inputs=[
+                                pb.InputAccess(
+                                    input_id="payload",
+                                    url="data:application/json;base64,"
+                                    + base64.b64encode(payload).decode(),
+                                )
+                            ],
+                        ),
+                    )
+                    client.SubmitMachineExecution(
+                        pb.MachineExecutionSubmit(
+                            claim=claim,
+                            submission_id=serving_offer.request_id,
+                            capture_digest=serving_capture_digest,
+                            capture_canonical_bytes=serving_capture,
+                            offer=serving_offer,
+                            payload_canonical_bytes=payload,
+                            prepared_state=pb.DesiredWorkerState(
+                                revision=1,
+                                wire_minor=WIRE_MINOR,
+                                posture=pb.POSTURE_ACCEPTING,
+                                placement_set=placements["offline"],
+                            ),
+                        ),
+                        timeout=30,
+                    )
+                    while worker.execution_status(claim, serving_offer.request_id).state not in (
+                        "succeeded",
+                        "failed",
+                    ):
+                        assert time.monotonic() < until, worker.latched
+                        time.sleep(0.02)
+                    inference = worker.collect_execution(claim, serving_offer.request_id)
+                    result = documents.read(
+                        inference.outcome_canonical_bytes, pb.AttemptOutcomeBody
+                    )
+                    assert result["status"] == pb.OUTCOME_STATUS_SUCCEEDED, result
+                    assert json.loads(base64.b64decode(result["result"]["inline_result"])) == {
+                        "value": ordinal
+                    }
             channel.close()
             # Replace the entire Worker and gRPC server. No client preparation is
             # replayed, and the old wheel upload is no longer available.
-            config, options = worker.config, dataclasses.replace(worker.options, python="")
+            config, options = worker.config, worker.options
             old_boot = worker.fence.worker_boot_id
             worker.request_stop()
             worker.host.stop()
@@ -882,9 +1062,12 @@ app.job(helper)
             assert not thread.is_alive()
             for path in (environment / ".stage").rglob("*.whl"):
                 path.unlink()
+            for index in indexes:
+                index.close()
+            indexes.clear()
             (root / "control.addr").unlink()
             worker = Worker(config, options, GrpcControlHost("127.0.0.1:0", root / "control.addr"))
-            assert not worker.local_revisions and not worker.engine.jobs
+            assert not worker.prepared_revisions and not worker.engine.jobs
             thread = threading.Thread(target=worker.run, daemon=True)
             thread.start()
             while not (root / "control.addr").exists():
@@ -895,7 +1078,7 @@ app.job(helper)
             client = rpc.WorkerControlStub(channel)
             query.expected_execution_workspace_id = receipt.execution_workspace_id
             assert client.SubmitMachineExecution(submission, timeout=5) == receipt
-            assert not worker.local_revisions and not worker.engine.jobs
+            assert not worker.prepared_revisions and not worker.engine.jobs
             query.request_id = "second"
             assert (
                 client.CollectMachineExecution(
@@ -927,12 +1110,23 @@ app.job(helper)
             while client.GetMachineExecution(query, timeout=5).state not in ("succeeded", "failed"):
                 assert time.monotonic() < until
                 time.sleep(0.02)
-            assert client.GetMachineExecution(query, timeout=5).state == "succeeded"
+            assert worker.workspace is not None
+            with worker.workspace.locked() as db:
+                child_failures = [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT safe_code,safe_detail FROM execution_calls "
+                        "WHERE parent_request='paused'"
+                    )
+                ]
+            assert client.GetMachineExecution(query, timeout=5).state == "succeeded", child_failures
             assert client.ControlMachineExecution(resume, timeout=5) == resumed
-            assert worker.local_revisions and worker.engine.jobs
+            assert worker.prepared_revisions and worker.engine.jobs
             assert not worker.connected.is_set() and not worker.fence.dispatch_open
             channel.close()
         finally:
+            for index in indexes:
+                index.close()
             worker.request_stop()
             worker.host.stop()
             if thread.ident is not None:
