@@ -60,3 +60,10 @@ leaves no persistent read lease; checking/reading pins the source until close. R
 part reads require no disk-write grant. Runtime keeps only the logical float32 decoder,
 invocation binding and resource cleanup. Eval's actual native measurement and instrument
 normalization drivers qualify the new types and transport without claiming model quality.
+
+Native `FileAsset` and `Tree` results can be passed directly to another managed
+call. The worker selects only typed input fields, checks the parent's actual
+received or input capability, and retains an independent native root for each
+child input before dispatch. Existing grant loaders materialize those inputs for
+both job and serving executors. Failed admission releases the child's holds;
+parent cleanup and GC cannot release a live child's copy of the capability.

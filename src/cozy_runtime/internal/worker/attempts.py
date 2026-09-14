@@ -833,6 +833,14 @@ class AttemptEngine:
                 workspace=Workspace(self.tensorfs_root) if self.tensorfs_root is not None else None,
                 owner=self.owner_scope(),
             )
+            attempt.trees = grants.read_trees(
+                attempt.grant,
+                self.authorizer,
+                workspace=Workspace(self.tensorfs_root) if self.tensorfs_root is not None else None,
+                owner=self.owner_scope(),
+                spool=spool,
+                max_bytes=binding.max_inputs_total_bytes if binding else 256 << 20,
+            )
             supervision = self.supervision_for(attempt)
             if getattr(supervision, "isolated", False):
                 supervision.grant_directory(spool, attempt.executor_epoch)
@@ -1045,22 +1053,6 @@ class AttemptEngine:
         attempt.placement_id = ""  # job attempts are not placement-routed
         self._fetch_payload(attempt)
         self._hydrate_inputs(attempt)
-        try:
-            attempt.trees = grants.read_trees(
-                attempt.grant,
-                self.authorizer,
-                workspace=Workspace(self.tensorfs_root) if self.tensorfs_root is not None else None,
-                owner=self.owner_scope(),
-                spool=attempt.spool,
-            )
-        except grants.GrantRefusal as exc:
-            raise AttemptRefusal(
-                exc.code,
-                exc.detail,
-                cause=CAUSE.CAUSE_CODE_GRANT_EXPIRED
-                if exc.code == "grant_expired"
-                else CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-            ) from exc
 
         caps = slot.job_resource_caps
         plan = AttemptPlan.for_job(
@@ -1757,6 +1749,7 @@ class AttemptEngine:
             # which is why it installs `sandbox.refuse_network` (cr-042); that fence bounds
             # a buggy package at the Python layer and is not a kernel bound.
             "inputs": inputs,
+            "trees": {ref: [str(r), d] for ref, (r, d) in attempt.trees.items()},
             "max_input_bytes": attempt.declared.max_input_bytes,
         }
 

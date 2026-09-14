@@ -2267,6 +2267,10 @@ class Executor:
                         # handler that dials one anyway is refused rather than merely unexpected.
                         # That fence is Python-level (cr-042) — it bounds a buggy package, not a
                         # hostile one, and there is no netns or seccomp under it.
+                        trees={
+                            ref: (Path(root), digest)
+                            for ref, (root, digest) in (command.get("trees") or {}).items()
+                        },
                         assets=_granted_inputs(command),
                         max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
                     ),
