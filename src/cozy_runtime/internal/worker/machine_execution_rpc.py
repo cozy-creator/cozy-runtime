@@ -41,6 +41,7 @@ class MachineExecutionRPC:
             return context.abort(grpc.StatusCode.ABORTED, str(exc))
         except (
             ValueError,
+            canonical.CanonicalError,
             OSError,
             documents.DocumentError,
             EnvironmentRefusal,
