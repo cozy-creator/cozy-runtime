@@ -61,6 +61,7 @@ from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.internal import (
     accel,
     attention,
+    attention_sol,
     canonical,
     child_env,
     model_config,
@@ -1704,6 +1705,14 @@ class Executor:
                     "envelope": envelope,
                 }
         stage("warm")
+        if "sol-attn" in applied.totals():
+            frozen = attention._baked_in({**backend.components, **backend.parked})
+            if frozen:
+                return {
+                    "ok": False,
+                    "code": "attention_kernel_frozen",
+                    "detail": f"Sol requires eager execution: {frozen}",
+                }
         self.attention_defaults = attention.snapshot({**backend.components, **backend.parked})
         group_facts = dict(self.facts)
         memory = accel.allocation(torch, self.device_kind)
@@ -2279,48 +2288,65 @@ class Executor:
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
+        served_attention: attention.Applied | None = None
+        sol_counts: dict[str, int] = {}
         capture = None
         capture_result: dict[str, Any] | None = None
         record: AuthorAttempt | None = None
         try:
-            if swap is not None:
-                swap.apply()
-            capture = self._capture_session(command, surface)
-            with capture if capture is not None else contextlib.nullcontext():
-                envelope, outcome, record = run_prepared(
-                    prepared,
-                    Invocation(
-                        request_id=command["request_id"],
-                        spool=spool,
-                        deadline=deadline,
-                        device=self._device(),
-                        cancel=lambda: _cancelled(self.root, command["request_id"]),
-                        models=self.models,
-                        progress=progress,
-                        # cr-012: the inputs the WORKER already fetched, verified and spooled.
-                        # Every value is a path inside this attempt's own spool: this process is
-                        # never HANDED an address, and `main` installs `sandbox.refuse_network` so a
-                        # handler that dials one anyway is refused rather than merely unexpected.
-                        # That fence is Python-level (cr-042) — it bounds a buggy package, not a
-                        # hostile one, and there is no netns or seccomp under it.
-                        trees={
-                            ref: (Path(root), digest)
-                            for ref, (root, digest) in (command.get("trees") or {}).items()
-                        },
-                        assets=_granted_inputs(command),
-                        max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
-                        max_output_bytes=int(command.get("max_output_bytes", MAX_OUTPUT_BYTES)),
-                    ),
-                )
-            if capture is not None and outcome.terminal == "succeeded":
-                capture_result = capture.write(spool)
+            with (
+                attention.override(
+                    self._attention_snapshot(), self._attention_roots(), swap, pin
+                ) as served_attention,
+                attention_sol.observing() as sol_counts,
+            ):
+                capture = self._capture_session(command, surface)
+                with capture if capture is not None else contextlib.nullcontext():
+                    envelope, outcome, record = run_prepared(
+                        prepared,
+                        Invocation(
+                            request_id=command["request_id"],
+                            spool=spool,
+                            deadline=deadline,
+                            device=self._device(),
+                            cancel=lambda: _cancelled(self.root, command["request_id"]),
+                            models=self.models,
+                            progress=progress,
+                            # cr-012: the inputs the WORKER already fetched, verified and spooled.
+                            # Every value is a path inside this attempt's own spool: this process is
+                            # `sandbox.refuse_network` rejects ungranted network access.
+                            # Input bytes arrive only through the worker grant.
+                            # That fence is Python-level (cr-042) — it bounds a buggy package, not a
+                            # hostile one, and there is no netns or seccomp under it.
+                            trees={
+                                ref: (Path(root), digest)
+                                for ref, (root, digest) in (command.get("trees") or {}).items()
+                            },
+                            assets=_granted_inputs(command),
+                            max_input_bytes=int(command.get("max_input_bytes") or 64 << 20),
+                            max_output_bytes=int(command.get("max_output_bytes", MAX_OUTPUT_BYTES)),
+                        ),
+                    )
+                if capture is not None and outcome.terminal == "succeeded":
+                    capture_result = capture.write(spool)
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             if record is None:
                 record = AuthorAttempt(command["request_id"], spool, 0, sink=progress)
-        finally:
-            self._restore_attention()
         assert record is not None
+        if served_attention is not None:
+            self._emit_attention(record, served_attention, "attention.selected")
+            if "sol-attn" in served_attention.totals():
+                record.emit(
+                    "confession",
+                    "attention.sol.calls",
+                    "sol-attn",
+                    dense_reference=attention_sol.dense_identity(),
+                    **sol_counts,
+                )
+        self._emit_attention(
+            record, attention.observed(self._attention_roots()), "attention.restored"
+        )
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
         self._attempt_spool = None
         if self.group is not None and self.group.broken and not self.poisoned:
@@ -2377,7 +2403,7 @@ class Executor:
             "attribution": record.attribution.document(),
             "position": record.position,
             "outcome": terminal,
-            "execution_observation": self._execution_observation(),
+            "execution_observation": self._execution_observation(served_attention),
             "capture": capture_result,
             "quiescent": quiescent,
             **_env_document(),
@@ -2417,9 +2443,17 @@ class Executor:
 
     # ------------------------------------------------------- the per-request attention pin
 
+    def _attention_snapshot(self) -> attention.Snapshot:
+        return attention.Snapshot(
+            tuple(
+                choice
+                for executor in (self.model_executors or [self])
+                for choice in executor.attention_defaults.choices
+            )
+        )
+
     def _restore_attention(self) -> None:
-        for executor in self.model_executors or [self]:
-            executor.attention_defaults.restore()
+        self._attention_snapshot().restore()
 
     def _attention_roots(self) -> dict[str, Any]:
         roots: dict[str, Any] = {}
@@ -2495,7 +2529,21 @@ class Executor:
                 roots[name] = root
         return CaptureSession(options, roots)
 
-    def _execution_observation(self) -> dict[str, Any]:
+    @staticmethod
+    def _emit_attention(record: AuthorAttempt, choices: attention.Applied, name: str) -> None:
+        for component, kernels in choices.hosts.items():
+            for kernel, sites in kernels.items():
+                record.emit(
+                    "confession",
+                    name,
+                    kernel,
+                    component=component,
+                    sites=sites,
+                    pin=choices.pin,
+                    dense_reference=attention_sol.dense_identity() if kernel == "sol-attn" else "",
+                )
+
+    def _execution_observation(self, choices: attention.Applied | None = None) -> dict[str, Any]:
         from cozy_runtime import __version__
 
         # Observed generation facts; image and boot identity are added by the worker.
@@ -2507,7 +2555,7 @@ class Executor:
             "driver": str(self.facts.get("device_driver") or ""),
             "execution_lane": "",  # no generic eager/compiled observation exists yet
             "execution_contract_digest": "",
-            "kernel_symbol": "",
+            "kernel_symbol": ",".join(sorted(choices.totals())) if choices is not None else "",
         }
 
     # ------------------------------------------------------------------ job

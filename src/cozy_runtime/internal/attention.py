@@ -15,13 +15,14 @@ from __future__ import annotations
 import json
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import import_module, metadata
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._attention import AttentionContext
-from cozy_runtime.internal import attention_fp8, attention_upstream
+from cozy_runtime.internal import attention_fp8, attention_sol, attention_upstream
 from cozy_runtime.internal.anima_optimization import DIFFUSERS_VERSION
 from cozy_runtime.internal.encoding import DeviceFacts
 
@@ -105,9 +106,10 @@ PINNABLE: tuple[Candidate, ...] = (
         baked="flash-attn3",
         rel_l2_max=6e-2,
         why=(
-            "H100 SXM kernel benchmark: 1.292x/1.317x versus BF16 FA3 at sequences "
-            "37,710/103,966, including quantization; h3a-013 results3/runtime_check.json. "
-            "Inexact; no clip qualification."
+            "Explicit experiment: matched H3 clips change. The corrected experimental "
+            "FA3 FP8 build took 781.3 s versus BF16 907.1 s for 15 s video; qualification "
+            "is specific to that build, not every FA3 FP8 binary. "
+            "Evidence: outputs/h3-kernel-quality-20260914/comparison15/REPORT.md."
         ),
     ),
     Candidate(
@@ -120,7 +122,11 @@ PINNABLE: tuple[Candidate, ...] = (
         baked="flash-attn4",
         jit=True,
         rel_l2_max=2e-2,
-        why="Unranked: limited B200 kernel screen in h3a-022, no controlled serving comparison.",
+        why=(
+            "Unranked: matched H100 BF16 kernels showed no consistent FA4 gain over FA3. "
+            "Evidence: outputs/h3-attention-oracle-20260914/"
+            "torch214-cudnn924/qualification/REPORT.md."
+        ),
     ),
     Candidate(
         name="cudnn",
@@ -142,8 +148,9 @@ PINNABLE: tuple[Candidate, ...] = (
         distribution="sageattention",
         rel_l2_max=2e-1,
         why=(
-            "H100 SXM kernel benchmark: 1.12x versus BF16 FA3; h3a-013. "
-            "Inexact and slower than the FP8 FA3 benchmark."
+            "Explicit experiment: H100 15 s/30-step H3 generation took 801.2 s versus "
+            "BF16 907.1 s; matched clips differ. No automatic quality approval. "
+            "Evidence: outputs/h3-kernel-quality-20260914/comparison15/REPORT.md."
         ),
     ),
     Candidate(
@@ -171,6 +178,19 @@ PINNABLE: tuple[Candidate, ...] = (
         import_name="flashinfer",
         rel_l2_max=2e-1,
         why="Explicit BF16 Q/K + FP8 P/V experiment; H3 qualification pending (h3a-060).",
+    ),
+    Candidate(
+        name="sol-attn",
+        backend="_cozy_sol_bf16",
+        min_sm=90,
+        max_sm=90,
+        sms=frozenset({90}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        distribution="sol-attn",
+        rel_l2_max=2e-1,
+        why="Explicit sparse experiment; requires model layout and eager single-GPU execution.",
     ),
 )
 
@@ -215,6 +235,7 @@ def _member(backend: str) -> Any:
         # OURS, not diffusers': registered into its registry on first use (cr-136).
         return attention_fp8.member()
     upstream = {
+        "_cozy_sol_bf16": attention_sol.sol_attention,
         attention_upstream.KITCHEN_BACKEND: attention_upstream.kitchen_int8_attention,
         attention_upstream.FLASHINFER_BACKEND: attention_upstream.flashinfer_mixed_attention,
     }
@@ -394,23 +415,47 @@ def _computes(entry: Ready, device: DeviceFacts) -> None:
         if not entry.candidate.dtypes or "bfloat16" in entry.candidate.dtypes
         else torch.float16
     )
-    seed = torch.Generator(device="cuda").manual_seed(0x5A6E)
+    target = torch.device("cuda", device.index)
+    seed = torch.Generator(device=target).manual_seed(0x5A6E)
     shape = (batch, sequence, heads, dim)
     query, key, value = (
-        (torch.randn(shape, generator=seed, device="cuda", dtype=torch.float32) * 0.5).to(dtype)
+        (torch.randn(shape, generator=seed, device=target, dtype=torch.float32) * 0.5).to(dtype)
         for _ in range(3)
     )
-    with torch.no_grad():
-        got: Any = dispatch_attention_fn(query, key, value, backend=entry.member)
+    with torch.no_grad(), torch.cuda.device(target):
+        if entry.name == "sol-attn":
+            from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
+
+            probe: Any = torch.nn.Module()
+            probe.forward = lambda q, k, v: dispatch_attention_fn(q, k, v, backend=entry.member)
+            attention_sol.install_site(probe, "probe", "attention")
+            # Explicit synthetic smoke data, not inferred model conditioning metadata.
+            with attention_scope(AttentionLayout(sequence, 0, 0)):
+                got: Any = probe(query, key, value)
+        else:
+            got = dispatch_attention_fn(query, key, value, backend=entry.member)
     if isinstance(got, tuple):
         got = got[0]
 
     q_ref, k_ref, v_ref = (tensor.transpose(1, 2).float() for tensor in (query, key, value))
     exact = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref).transpose(1, 2)
+    _validate_probe(entry, device, got, query, exact)
+
+
+def _validate_probe(entry: Ready, device: DeviceFacts, got: Any, query: Any, exact: Any) -> None:
+    """Check a real result's contract and small numerical smoke, not model quality."""
+    import torch
+
+    if not isinstance(got, torch.Tensor) or got.dtype != query.dtype or got.device != query.device:
+        raise AttentionRefusal(
+            "attention_kernel_wrong",
+            f"{entry.name} must return {query.dtype} on {query.device}, matching its input",
+        )
     if tuple(got.shape) != tuple(exact.shape):
         raise AttentionRefusal(
             "attention_kernel_wrong",
-            f"{entry.name} returned {tuple(got.shape)} where attention over {shape} is "
+            f"{entry.name} returned {tuple(got.shape)}; attention over "
+            f"{tuple(query.shape)} requires "
             f"{tuple(exact.shape)}",
         )
     got = got.float()
@@ -464,6 +509,18 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
                 f"{candidate.distribution}=={installed} does not import: "
                 f"{type(exc).__name__}: {exc}",
             ) from exc
+    if candidate.name == "sol-attn" and not attention_sol.dense_identity():
+        dense = next(
+            (entry for entry in available(device) if _admits(entry.candidate, "bfloat16", 128)),
+            None,
+        )
+        if dense is None:
+            raise AttentionRefusal(
+                "attention_kernel_absent", "Sol has no qualified dense reference"
+            )
+        attention_sol.bind_dense(
+            registry._backends[dense.member], dense.name + ":" + dense.location
+        )
     ready = Ready(candidate, member)
     _computes(ready, device)
     return ready
@@ -622,10 +679,38 @@ def _head_dim(module: Any) -> int:
     return 0
 
 
+def _projection_dtype(projection: Any) -> str:
+    """Encoded output contract, or an ordinary floating Linear's result dtype."""
+    import torch
+
+    declared = getattr(projection, "out_dtype", None)
+    if declared is None and type(projection) is torch.nn.Linear:
+        declared = projection.weight.dtype
+    name = str(declared).removeprefix("torch.")
+    return name if name in {"float16", "bfloat16", "float32", "float64"} else ""
+
+
 def _dtype(module: Any) -> str:
-    for parameter in module.parameters():
-        return str(parameter.dtype).removeprefix("torch.")
-    return ""
+    """Infer attention activation precision from the active Q/K/V projection contracts.
+
+    Never inspect unrelated norm parameters or encoded weight buffers. Unknown or
+    disagreeing projection contracts admit only an unbounded dtype backend (SDPA).
+    Floating Linear inference assumes no external autocast changes its output dtype.
+    """
+    q, k, v = (getattr(module, name, None) for name in ("to_q", "to_k", "to_v"))
+    packed = getattr(module, "to_qkv", None)
+    fused = getattr(module, "fused_projections", None)
+    projections: tuple[Any, ...]
+    if packed is not None and (fused is True or (fused is None and q is None)):
+        projections = (packed,)
+    elif q is not None and getattr(module, "to_kv", None) is not None and fused is True:
+        projections = (q, module.to_kv)
+    elif q is not None and k is not None and v is not None:
+        projections = (q, k, v)
+    else:
+        return ""
+    dtypes = {_projection_dtype(projection) for projection in projections}
+    return next(iter(dtypes)) if len(dtypes) == 1 and "" not in dtypes else ""
 
 
 def _admits(candidate: Candidate, dtype: str, head_dim: int) -> bool:
@@ -787,7 +872,7 @@ def install(
     scope, name = _pin_parts(pin)
     hosts: dict[str, dict[str, int]] = {}
     locations: dict[str, str] = {}
-    assignments: list[tuple[Any, Ready]] = []
+    assignments: list[tuple[str, str, Any, Any, Ready]] = []
     resolved = {entry.name: entry for entry in ready}
     matched = False
     eligible_sites: dict[tuple[str, int], tuple[str, ...]] = {}
@@ -847,7 +932,7 @@ def install(
                 if selection not in resolved:
                     resolved[selection] = pinned(selection, device)[0]
                 entry = resolved[selection]
-        assignments.append((processor, entry))
+        assignments.append((component, path, module, processor, entry))
         hosts.setdefault(component, {})
         hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
         if entry.location:
@@ -856,9 +941,46 @@ def install(
         raise AttentionRefusal(
             "attention_kernel_unsupported", f"{pin!r} matches no attention component"
         )
-    for processor, entry in assignments:
+    _install_sites(
+        [
+            (entry, component, path, module)
+            for component, path, module, _processor, entry in assignments
+        ]
+    )
+    for _component, _path, _module, processor, entry in assignments:
         processor._attention_backend = entry.member
     return Applied(hosts, locations, tuple(resolved), pin)
+
+
+def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
+    """Install metadata hooks atomically, preserving hooks owned by preparation."""
+    added: list[tuple[str, str, Any]] = []
+    try:
+        for entry, component, path, module in records:
+            if entry.name != "sol-attn":
+                continue
+            local = component.rsplit("/", 1)[-1]
+            if getattr(module, "_cozy_sol_site", None) is None:
+                added.append((local, path, module))
+            attention_sol.install_site(module, local, path)
+    except BaseException:
+        for component, path, module in reversed(added):
+            if getattr(module, "_cozy_sol_site", None) is not None:
+                attention_sol.remove_site(module, component, path)
+        raise
+
+
+def observed(roots: Mapping[str, Any], pin: str = "") -> Applied:
+    """Read actual processor choices; never substitute the prepared recommendation."""
+    names = {candidate.backend: candidate.name for candidate in BY_NAME.values()}
+    hosts: dict[str, dict[str, int]] = {}
+    for component, _module, processor in _sites(roots):
+        backend = getattr(processor, "_attention_backend", None)
+        value = getattr(backend, "value", str(backend))
+        name = names.get(value, value)
+        hosts.setdefault(component, {})
+        hosts[component][name] = hosts[component].get(name, 0) + 1
+    return Applied(hosts, {}, (), pin)
 
 
 @dataclass(frozen=True, slots=True)
@@ -876,6 +998,34 @@ def snapshot(roots: Mapping[str, Any]) -> Snapshot:
     return Snapshot(
         tuple((processor, processor._attention_backend) for _, _, processor in _sites(roots))
     )
+
+
+@contextmanager
+def override(
+    defaults: Snapshot, roots: Mapping[str, Any], swap: Swap | None, pin: str = ""
+) -> Iterator[Applied]:
+    """Observe one temporary request selection and restore it even when execution raises."""
+    defaults.restore()
+    temporary_sites = (
+        [
+            (component.rsplit("/", 1)[-1], path, module)
+            for component, path, module in swap.modules
+            if getattr(module, "_cozy_sol_site", None) is None
+        ]
+        if swap is not None and swap.entry.name == "sol-attn"
+        else []
+    )
+    try:
+        if swap is not None:
+            swap.apply()
+        yield observed(roots, pin)
+    finally:
+        try:
+            for component, path, module in temporary_sites:
+                if getattr(module, "_cozy_sol_site", None) is not None:
+                    attention_sol.remove_site(module, component, path)
+        finally:
+            defaults.restore()
 
 
 def _site_refusal(name: str, component: str, dtype: str, head_dim: int) -> AttentionRefusal:
@@ -903,9 +1053,13 @@ class Swap:
     entry: Ready
     sites: tuple[tuple[str, Any], ...]
     pin: str = ""
+    modules: tuple[tuple[str, str, Any], ...] = ()
 
     def apply(self) -> Applied:
         hosts: dict[str, dict[str, int]] = {}
+        _install_sites(
+            [(self.entry, component, path, module) for component, path, module in self.modules]
+        )
         for component, processor in self.sites:
             processor._attention_backend = self.entry.member
             hosts.setdefault(component, {})
@@ -948,14 +1102,16 @@ def plan(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str =
     candidate = check(device, roots, name, frozen)
     scope, _ = _pin_parts(name)
     entry = pinned(candidate.name, device)[0]
+    records = [
+        (component, path, module, processor)
+        for component, path, module, processor in _site_records(roots)
+        if _matches(component, scope)
+    ]
     return Swap(
         entry,
-        tuple(
-            (component, processor)
-            for component, _, processor in _sites(roots)
-            if _matches(component, scope)
-        ),
+        tuple((c, p) for c, _, _, p in records),
         name,
+        tuple((c, path, m) for c, path, m, _ in records),
     )
 
 

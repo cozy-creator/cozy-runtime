@@ -22,7 +22,11 @@ class VideoModel(Model[object]):
 
 The immutable context contains component and module path, device kind/name/SM,
 attention activation dtype, head dimension, parallel degree, eligible names and
-the recommendation's evidence/reason. It has no tensors or device methods. FP8
+the recommendation's evidence/reason. Activation dtype comes from active projection
+output contracts (or ordinary floating Linear inference without external autocast),
+never unrelated normalization parameters or encoded storage dtype. Unknown or
+disagreeing projection contracts admit only a dtype-unbounded backend.
+It has no tensors or device methods. FP8
 checkpoint weights do not imply FP8 attention. Eligibility checks site/hardware,
 installed dependency metadata and context-parallel support; selecting an optional
 backend then resolves and checks that implementation. Nothing benchmarks every
@@ -59,3 +63,11 @@ Validation includes actual Diffusers CPU processors and dispatch, metadata-only
 FA3 installation controls, model hook/scoping/rollback tests and architecture
 fences. No GPU performance, model quality, worker deployment or CLI end-to-end
 qualification is established by these tests.
+
+Request observations record selected and restored backend names and per-component
+site counts. `ExecutionObservation.kernel_symbol` carries the selected backend
+names, not a claim of a GPU profiler trace. Sol additionally records its resolved
+dense reference and request-local sparse, dense-step, dense-path and dense-prefix
+call counts. A Turbo request whose policy stays dense is therefore not evidence
+of sparse acceleration. Request-owned Sol hooks are removed even if applying or
+executing an override fails; prepared Sol hooks remain owned by the generation.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
@@ -24,9 +25,11 @@ def _roots() -> dict[str, Any]:
     pytest.importorskip("diffusers")
     from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
 
+    processor_type: Any = WanAttnProcessor
+
     return {
         name: torch.nn.ModuleList(
-            [WanAttention(dim=8, heads=1, dim_head=8, processor=WanAttnProcessor())]
+            [WanAttention(dim=8, heads=1, dim_head=8, processor=processor_type())]
         )
         for name in ("dit", "vae")
     }
@@ -165,7 +168,8 @@ def test_registration_is_idempotent_local_and_dispatches_real_cpu_attention() ->
             enable_gqa=enable_gqa,
         ).transpose(1, 2)
 
-    active = _AttentionBackendRegistry.get_active_backend()
+    registry: Any = _AttentionBackendRegistry
+    active = registry.get_active_backend()
     member = register("_cozy_cpu_policy_test", cpu_attention)
     assert register("_cozy_cpu_policy_test", cpu_attention) is member
     with pytest.raises(ValueError, match="another implementation"):
@@ -175,7 +179,7 @@ def test_registration_is_idempotent_local_and_dispatches_real_cpu_attention() ->
     got = dispatch_attention_fn(q, q, q, backend=member, attn_mask=mask, scale=0.3)
     assert torch.equal(got, cpu_attention(q, q, q, attn_mask=mask, scale=0.3))
     assert not attention._context_parallel(member)
-    assert _AttentionBackendRegistry.get_active_backend() == active
+    assert registry.get_active_backend() == active
 
 
 def test_new_approximate_backends_remain_explicit_and_architecture_exact() -> None:
@@ -204,3 +208,159 @@ def test_explicit_install_rejects_all_sites_before_any_change() -> None:
     with pytest.raises(attention.AttentionRefusal):
         attention.install(_ready("flash-attn3-fp8"), roots, "flash-attn3-fp8")
     assert _choices(roots) == original
+
+
+def test_failure_restores_policy_and_observations_keep_actual_choice(
+    tmp_path: Path,
+) -> None:
+    from cozy_runtime.author._services import Attempt
+
+    roots = _roots()
+    torch = pytest.importorskip("torch")
+    for root in roots.values():
+        root.to(dtype=torch.bfloat16)
+    prepared = attention.install(_ready("flash-attn3"), roots)
+    defaults = attention.snapshot(roots)
+    executor = Executor(None, tmp_path)  # type: ignore[arg-type]
+    executor.attention = prepared
+    record = Attempt("attention-policy-test", tmp_path, 0)
+    swap = attention.plan(_device(), roots, "dit=sdpa")
+    with (
+        pytest.raises(RuntimeError, match="handler failed"),
+        attention.override(defaults, roots, swap, "dit=sdpa") as choices,
+    ):
+        executor._emit_attention(record, choices, "attention.selected")
+        assert executor._execution_observation(choices)["kernel_symbol"] == "flash-attn3,sdpa"
+        assert executor.attention.totals() == {"flash-attn3": 2}
+        raise RuntimeError("handler failed")
+    with attention.override(defaults, roots, None) as choices:
+        assert choices.totals() == {"flash-attn3": 2}
+        assert executor._execution_observation(choices)["kernel_symbol"] == "flash-attn3"
+        executor._emit_attention(record, choices, "attention.restored")
+    rows = record.ring.rows()
+    assert any(row["name"] == "attention.selected" and row["value"] == "sdpa" for row in rows)
+    assert not any(row["name"] == "attention.restored" and row["value"] == "sdpa" for row in rows)
+
+
+def test_sol_sites_are_removed_after_request_and_partial_apply_failure() -> None:
+    from cozy_runtime.internal import attention_sol
+
+    roots = _roots()
+    attention.install(_ready("sdpa"), roots)
+    defaults = attention.snapshot(roots)
+    dit, vae = roots["dit"][0], roots["vae"][0]
+    entry = _ready("sol-attn")[0]
+    swap = attention.Swap(entry, (("dit", dit.processor),), "dit=sol-attn", (("dit", "0", dit),))
+    with attention.override(defaults, roots, swap):
+        assert hasattr(dit, "_cozy_sol_site")
+    assert not hasattr(dit, "_cozy_sol_site")
+    assert not dit._forward_pre_hooks and not dit._forward_hooks
+    attention_sol.install_site(vae, "vae", "prepared")
+    conflicting = attention.Swap(
+        entry,
+        (("dit", dit.processor), ("vae", vae.processor)),
+        "sol-attn",
+        (("dit", "0", dit), ("vae", "changed", vae)),
+    )
+    with (
+        pytest.raises(ValueError, match="another Sol site"),
+        attention.override(defaults, roots, conflicting),
+    ):
+        pytest.fail("conflicting installation must fail before entering the request")
+    assert not hasattr(dit, "_cozy_sol_site")
+    assert hasattr(vae, "_cozy_sol_site")
+    assert _choices(roots) == ("native", "native")
+    attention_sol.remove_site(vae, "vae", "prepared")
+
+
+def test_sol_cannot_be_installed_for_context_parallel_degree() -> None:
+    torch = pytest.importorskip("torch")
+    from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
+
+    processor_type: Any = WanAttnProcessor
+
+    roots = {
+        "dit": torch.nn.ModuleList(
+            [WanAttention(dim=128, heads=1, dim_head=128, processor=processor_type())]
+        ).to(torch.bfloat16)
+    }
+    with pytest.raises(attention.AttentionRefusal, match="degree 4"):
+        attention.install(_ready("sol-attn"), roots, "sol-attn", degree=4)
+
+
+def test_probe_refuses_wrong_output_dtype_even_with_perfect_values() -> None:
+    torch = pytest.importorskip("torch")
+    query = torch.ones(1, 2, 1, 8, dtype=torch.bfloat16)
+    exact = query.float()
+    entry = _ready("sdpa")[0]
+    attention._validate_probe(entry, _device(), query, query, exact)
+    with pytest.raises(attention.AttentionRefusal, match="must return"):
+        attention._validate_probe(entry, _device(), exact, query, exact)
+
+
+def test_encoded_projection_output_contract_wins_over_norm_and_storage_dtype() -> None:
+    torch = pytest.importorskip("torch")
+    from cozy_runtime.internal.encoding import RowwiseNativeLeaf
+
+    module = _roots()["dit"][0]
+    provider = RowwiseNativeLeaf(encoding="fp8-rowwise/1")
+    for name in ("to_q", "to_k", "to_v"):
+        linear = getattr(module, name).to(dtype=torch.bfloat16)
+        parts = {
+            "data": torch.zeros_like(linear.weight, dtype=torch.float8_e4m3fn),
+            "scale": torch.ones(linear.out_features, dtype=torch.float32),
+        }
+        setattr(module, name, provider.leaf(torch, parts, linear, torch.bfloat16))
+    assert next(module.parameters()).dtype == torch.float32
+    assert module.to_q.data.dtype == torch.float8_e4m3fn
+    assert attention._dtype(module) == "bfloat16"
+    module.to_v.out_dtype = torch.float16
+    assert attention._dtype(module) == ""
+
+
+def test_active_packed_projection_and_unknown_contract_are_distinguished() -> None:
+    torch = pytest.importorskip("torch")
+    module = _roots()["dit"][0]
+    module.fuse_projections()
+    module.to_qkv.to(dtype=torch.bfloat16)
+    assert module.to_q.weight.dtype == torch.float32
+    assert attention._dtype(module) == "bfloat16"
+    module.fused_projections = False
+    assert attention._dtype(module) == "float32"
+    module.to_q = torch.nn.Identity()
+    assert attention._dtype(module) == ""
+
+
+@pytest.mark.skipif(
+    os.environ.get("COZY_TEST_ATTENTION_CUDA") != "1",
+    reason="requires two explicitly owned CUDA devices",
+)
+def test_numerical_probe_runs_on_the_selected_nondefault_device() -> None:
+    torch = pytest.importorskip("torch")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two explicitly owned CUDA devices")
+    indices: list[int] = []
+
+    def reference(query: Any, key: Any, value: Any) -> Any:
+        indices.append(query.device.index)
+        assert query.device == key.device == value.device == torch.device("cuda", 1)
+        assert torch.cuda.current_device() == 1
+        return torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+        ).transpose(1, 2)
+
+    member = register("_cozy_probe_device_test", reference)
+    entry = attention.Ready(
+        attention.Candidate(
+            "index-probe", member.value, 0, frozenset({"bfloat16"}), 128, rel_l2_max=2e-2
+        ),
+        member,
+    )
+    major, minor = torch.cuda.get_device_capability(1)
+    selected = DeviceFacts(
+        kind="cuda", name="owned GPU 1", sm=major * 10 + minor, driver="", configuration="", index=1
+    )
+    with torch.cuda.device(0):
+        attention._computes(entry, selected)
+        assert torch.cuda.current_device() == 0
+    assert indices == [1]

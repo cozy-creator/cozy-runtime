@@ -10,6 +10,8 @@ class AttentionContext:
     Eligibility covers installed dependencies, hardware, site dtype/head size and
     parallelism support. It is not a model-quality approval. Returning an explicit
     backend still requires Runtime's kernel validation; unavailable choices refuse.
+    Activation dtype comes from projection output contracts, with an ordinary floating
+    Linear fallback (no external autocast). Unknown/mismatched contracts are empty.
     Weight storage precision is deliberately separate from attention activation dtype.
     """
 
