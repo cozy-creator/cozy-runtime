@@ -11,6 +11,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
 from cozy_runtime.internal import effect_interfaces, source_interfaces
 from cozy_runtime.internal.worker import (
+    machine_builtin,
     machine_byte_inputs,
     machine_byte_results,
     machine_child_target,
@@ -38,8 +39,12 @@ class Calls:
         from .machine_serving import Serving
 
         self.serving = Serving(worker)
+        from .machine_builtin import Builtins
+
+        self.builtins = Builtins(worker)
 
     def close(self) -> None:
+        self.builtins.close()
         self.serving.close()
 
     def handle(
@@ -257,6 +262,8 @@ class Calls:
                     "computation": key.hex(),
                     "result_schema": target.declaration["result"],
                 }
+                if "runtime_builtin" in target.prepared_revision:
+                    plan["builtin_preparation"] = target.prepared_revision
                 self.journal.freeze(owner, call, canonical_json.encode(plan))
                 call = self.journal.get(owner, parent.request_id, request.call_index)
                 if key:
@@ -395,6 +402,8 @@ class Calls:
                     max_attempts=max_attempts,
                     retry_delay_ms=retry_delay_ms,
                 )
+            except machine_builtin.Preparing:
+                continue
             except Exception as exc:
                 # Admission refusal has no accepted child attempt to duplicate. Keep its
                 # exact failure beside the frozen call so a polling parent receives it.
