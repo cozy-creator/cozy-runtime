@@ -170,8 +170,8 @@ def test_streaming_mp4_survives_native_child_handoff(tmp_path: Path) -> None:
         color_range=1,
         max_bytes=200000,
     )
-    for value in (32, 96, 160):
-        encoder.write_video(bytes([value]) * (16 * 16 * 3))
+    for pixel in (32, 96, 160):
+        encoder.write_video(bytes([pixel]) * (16 * 16 * 3))
     assert encoder.finish().frame_count == 3
     data = path.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
