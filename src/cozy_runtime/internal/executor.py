@@ -2793,7 +2793,7 @@ class Executor:
                     (
                         surface
                         for surface in self.discovered.surfaces
-                        if surface.invocable
+                        if (surface.invocable or surface.kind == "entrypoint")
                         and surface.fn.__module__ == module
                         and surface.fn.__name__ == export
                     ),
