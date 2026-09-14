@@ -254,3 +254,34 @@ def test_encoded_leaf_keeps_payload_and_disables_prequantized_carrier() -> None:
     binding.close()
     assert _rowwise_leaf(leaf)
     # Construction/guard proof only: the encoded GEMM itself requires a CUDA worker.
+
+
+def test_retained_exception_and_context_release_attempt_factor_storage() -> None:
+    import gc
+    import weakref
+
+    model, binding, source, x = _fixture()
+    refs: list[Any] = []
+    cancel = False
+
+    def check() -> None:
+        if cancel:
+            raise InterruptedError("cancelled")
+
+    with (
+        pytest.raises(InterruptedError) as retained,
+        binding.request([source], device="cpu", max_device_bytes=4096, check_cancelled=check),
+    ):
+        copied = copy_context()
+        attempt = binding._active.get()
+        assert attempt is not None
+        for terms in attempt.terms.values():
+            for term in terms:
+                refs.extend((weakref.ref(term.a), weakref.ref(term.b)))
+        # Retain the term, context and exception for diagnostics, as worker failure
+        # reporting does. None may keep the attempt's factor allocations alive.
+        cancel = True
+        model(x)
+    gc.collect()
+    assert retained.value is not None and copied is not None
+    assert all(ref() is None for ref in refs)

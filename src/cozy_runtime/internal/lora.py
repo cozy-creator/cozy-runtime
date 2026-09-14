@@ -42,7 +42,7 @@ class AdapterInput:
     kind: str = "lora"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _Term:
     a: Any
     b: Any
@@ -308,6 +308,11 @@ class LinearAdapters:
                 self._poisoned = True
                 raise
             finally:
+                # A retained exception traceback or copied context can still reference
+                # a term. Clear its device references as well as the lookup container.
+                for stack in terms.values():
+                    for term in stack:
+                        term.a = term.b = None
                 terms.clear()
                 ca = cb = None
                 self._lock.release()
