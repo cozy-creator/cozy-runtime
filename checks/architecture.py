@@ -56,6 +56,7 @@ PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
     # The activation probe (cr-075): a public mechanism surface shaped like `derive` — job
     # code and the runtime verb both build on it; it never reaches the worker planes.
     "probe": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
+    "models": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
     "internal": ("cozy_runtime.cli",),
     "cli": (),
 }
@@ -584,10 +585,13 @@ def fence_torch_free_import() -> list[str]:
 
     torch is an optional extra: the derive harness imports it INSIDE `torch_module()`, so a
     cloned package stays inspectable and the base package installs without a 3 GB wheel. A
-    module-scope `import torch` anywhere under `src/` breaks that, silently, for everyone.
+    Builtin implementations under models/ may import optional ML libraries; their
+    namespace modules remain lazy and the import-boundary tests verify base imports.
     """
     bad = []
     for path in py_files():
+        if path.is_relative_to(SRC / "models") and path.name != "__init__.py":
+            continue
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Import, ast.ImportFrom)):

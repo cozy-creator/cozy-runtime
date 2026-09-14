@@ -153,12 +153,21 @@ module = ["cozy_runtime.internal.derive"]
 warn_unused_ignores = false
 
 [project.optional-dependencies]
+# Builtins are imported only on explicit use. Worker images keep ownership of the
+# compatible Torch/CUDA family; this extra does not pin a CUDA wheel or index.
+minimax-h3 = [
+    "diffusers==0.40.0",
+    "transformers==5.16.1",
+    "torch>=2.13,<3",
+    "torchvision>=0.28,<1",
+    "numpy>=1.26",
+    "safetensors==0.8.0",
+    "tokenizers==0.23.1",
+]
 assessment = ["cozy-eval>=0.7,<0.8"]
 # The derivation harness and the serving executor. Corpus venvs install this.
 derive = ["torch>=2.13,<3"]
-# `corpus/sdxl_real.py` is a real PACKAGE: the model architecture is its dependency, not
-# the runtime's (§1.1 — cozy-runtime defines none). Pinned here only so cr-005's real fill
-# run reproduces; nothing under `src/` may import it.
+# The separate SDXL corpus retains its own upstream dependency cohort.
 corpus = ["torch>=2.13,<3", "diffusers>=0.36", "transformers>=4.40,<5"]
 media = [
     "av>=18.1,<19",
