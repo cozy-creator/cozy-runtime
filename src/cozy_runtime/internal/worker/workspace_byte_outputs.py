@@ -506,9 +506,11 @@ def owned(db: Journal, owner: str, source: pb.NativeByteTreeRef, *, released: bo
     row = db.execute(
         "SELECT * FROM byte_outputs WHERE owner=? AND id=?", (owner, source.producer_root_id)
     ).fetchone()
-    if row is None or row["state"] not in (
-        ("complete", "releasing", "released") if released else ("complete",)
-    ):
+    if row is None:
+        from .workspace_input_trees import owned as input_owned
+
+        return input_owned(db, owner, source, released=released)
+    if row["state"] not in (("complete", "releasing", "released") if released else ("complete",)):
         return False
     if row["native_service_id"] and not recorded_native(db, row, complete=True, released=released):
         return False

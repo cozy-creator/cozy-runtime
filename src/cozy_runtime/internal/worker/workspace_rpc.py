@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from cozy_runtime.internal.worker import workspace_byte_outputs, workspace_memo
-from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
+from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceBusy, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -48,6 +48,8 @@ class WorkspaceRPC:
 
             with service.workspace.authorized(guard):
                 return operation(service, service.authorize(request.claim))
+        except WorkspaceBusy as exc:
+            return context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(exc)[:512])
         except WorkspaceRefusal as exc:
             return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:512])
         except Exception as exc:
@@ -183,6 +185,31 @@ class WorkspaceRPC:
 
     def WorkspaceWeightsIntentReady(self, request: pb.WeightsIntentReadyCall, context: Any) -> Any:
         return self._workspace_call(request, context, lambda s, _: s.ready(request))
+
+    def ImportInputTree(self, requests: Iterable[pb.InputTreeImportFrame], context: Any) -> Any:
+        import grpc
+
+        from cozy_runtime.internal.worker import workspace_input_trees
+        from cozy_runtime.protocol import weights_limits
+
+        iterator = iter(requests)
+        first = next(iterator, None)
+        if first is None or first.WhichOneof("body") != "header":
+            return context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "input tree needs its exact first header"
+            )
+        header = first.header
+        if header.claim.wire_minor < weights_limits.NATIVE_ROOT_INPUTS_WIRE_MINOR:
+            return context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "native root input requires wire55"
+            )
+        return self._workspace_call(
+            header,
+            context,
+            lambda service, owner: workspace_input_trees.receive(
+                service.workspace, owner, header, iterator
+            ),
+        )
 
     def ImportWorkspace(self, requests: Iterable[pb.WorkspaceImportFrame], context: Any) -> Any:
         import grpc
