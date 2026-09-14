@@ -102,6 +102,9 @@ class RuntimeConfig:
     dependency_cache: Path | None = None
     """Creator-owned local cache of immutable dependency payloads; not executor authority."""
 
+    object_storage_hosts: tuple[str, ...] = ()
+    """Deployment-declared TensorFS egress hosts; never inferred from download URLs."""
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerHostConfig:
@@ -123,6 +126,7 @@ class WorkerHostConfig:
     tensorhub_origin: str = ""
     tensorhub_ca_der: bytes = b""
     """Operator-owned mTLS edge metadata; never inherited by a job executor."""
+    object_storage_hosts: tuple[str, ...] = ()
     lease_expiry_unix: int = 0
     """What the supervisor SAID the lease expires at, or 0 for no lease. Carried, never
     decided on (xs-007 row 18): tensorhub deleted the rental cap, the supervisor still
@@ -148,6 +152,7 @@ WORKER_HOST_ENV = {
     "COZY_RECORD_OWNER_AUTH_JSON",
     "COZY_WORKER_INTERNAL_PORT",
     "COZY_STORAGE_ADMISSION_FD",
+    "TENSORHUB_OBJECT_STORAGE_HOSTS",
 }
 
 # The host starts one current control worker. Provider/image inheritance is not a config
@@ -258,6 +263,29 @@ def parse_tensorhub_origin(value: str) -> TensorhubOrigin:
     return TensorhubOrigin(value=value, host=parsed.hostname, port=port)
 
 
+def parse_object_storage_hosts(value: str) -> tuple[str, ...]:
+    """Consume the existing podenv bounded, sorted DNS host/suffix declaration."""
+    hosts = tuple(value.split(",")) if value else ()
+    if (
+        len(hosts) > 8
+        or hosts != tuple(sorted(set(hosts)))
+        or any(
+            len(host) > 253
+            or re.fullmatch(
+                r"\.?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*", host
+            )
+            is None
+            for host in hosts
+        )
+    ):
+        raise ConfigError(
+            "config",
+            "TENSORHUB_OBJECT_STORAGE_HOSTS is not a bounded sorted unique DNS host list",
+            "use the deployment's explicit object storage hosts",
+        )
+    return hosts
+
+
 def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
     """Read + validate the process environment ONCE at the entrypoint.
 
@@ -309,6 +337,9 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
         ),
         fill_forensics_dir=env.get(child_env.FILL_FORENSICS_DIR, "").strip(),
         dependency_cache=Path(dependency_cache) if dependency_cache else None,
+        object_storage_hosts=parse_object_storage_hosts(
+            env.get("TENSORHUB_OBJECT_STORAGE_HOSTS", "")
+        ),
     )
 
 
@@ -436,6 +467,9 @@ def read_worker_host_config(
         )
     hub_origin, ca_der = _machine_publication_authority(publication_authority_path)
     parsed = WorkerHostConfig(
+        object_storage_hosts=parse_object_storage_hosts(
+            env.get("TENSORHUB_OBJECT_STORAGE_HOSTS", "")
+        ),
         tensorhub_origin=hub_origin,
         tensorhub_ca_der=ca_der,
         storage_admission_fd=4 if storage_fd == "4" else None,
@@ -498,4 +532,5 @@ def runtime_config_from_host(host: WorkerHostConfig) -> RuntimeConfig:
         credentials=Credentials(),
         record_owner_public_key=host.control_public_key_ed25519,
         child_base_env=host.child_base_env,
+        object_storage_hosts=host.object_storage_hosts,
     )
