@@ -2502,7 +2502,12 @@ def _materialize_dependency_snapshot(
     def copy_dependencies(target: Path) -> None:
         nonlocal manifest
         manifest = _installed_dependencies.snapshot(
-            dependency_python, target, set(provided), included=included, cache=dependency_cache
+            dependency_python,
+            target,
+            set(provided),
+            included=included,
+            cache=dependency_cache,
+            current_system_sdk=builtin_capture is not None,
         )
 
     try:

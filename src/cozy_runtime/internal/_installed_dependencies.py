@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import sys
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -367,6 +368,7 @@ def snapshot(
     included: set[str] | None = None,
     inventory_only: bool = False,
     cache: Path | None = None,
+    current_system_sdk: bool = False,
 ) -> bytes:
     # Metadata discovery must never start this interpreter: its editable hooks are mutable.
     prefix = source_python.parent.parent
@@ -375,11 +377,17 @@ def snapshot(
             "package_environment_dependency_source_invalid", str(source_python)
         )
     sites = list(prefix.glob("lib/python*/site-packages"))
+    system_sdk = (
+        current_system_sdk
+        and not inventory_only
+        and prefix == Path(sys.prefix) == Path(sys.base_prefix)
+        and source_python.resolve() == Path(sys.executable).resolve()
+    )
     if (
         not source_python.is_absolute()
         or source_python.parent.name != "bin"
         or not source_python.is_file()
-        or not (prefix / "pyvenv.cfg").is_file()
+        or (not system_sdk and not (prefix / "pyvenv.cfg").is_file())
         or prefix.resolve() != prefix
         or len(sites) != 1
         or sites[0].resolve() != sites[0]
