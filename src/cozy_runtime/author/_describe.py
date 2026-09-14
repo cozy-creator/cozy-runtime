@@ -220,6 +220,9 @@ def _media_decode_bounds(surface: Surface) -> None:
             (binding.parameter, frozenset({cls.kind}), bound) for cls, bound in binding.kinds
         )
     for path, kinds, bound in fields:
+        if "tree" in kinds:
+            # Tree.member supplies an explicit per-member decoded-byte bound.
+            reached += 1
         kinds = kinds & {"image", "video", "audio"}
         if not kinds:
             continue

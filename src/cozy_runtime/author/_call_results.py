@@ -9,7 +9,16 @@ from typing import Any
 
 import msgspec
 
-from cozy_runtime.author._assets import Asset, AudioAsset, FileAsset, ImageAsset, Tree, VideoAsset
+from cozy_runtime.author._assets import (
+    Asset,
+    AudioAsset,
+    FileAsset,
+    ImageAsset,
+    Tree,
+    VideoAsset,
+    bind,
+    file_state,
+)
 from cozy_runtime.author._capture import ExecutionObservation
 from cozy_runtime.author._media import admits, normalize
 
@@ -89,9 +98,10 @@ def decode(
             tree = Tree(digest, digest=digest, root=Path(grant["local"]), attempt=request_id)
             tree.size_bytes = size
             tree._read_guard = guard
+            tree._member_token = grant_token
             handle: Asset | Tree = tree
         else:
-            asset = _ASSETS[kind](
+            asset: Asset = _ASSETS[kind](
                 digest,
                 digest=digest,
                 media_type=media_type,
@@ -140,6 +150,32 @@ def decode(
             return item
         raise TypeError("result asset is not a verified grant of this attempt")
 
-    return msgspec.convert(
-        replace(value, ""), type=result_type, dec_hook=granted, strict=True
-    ), observation
+    result = msgspec.convert(replace(value, ""), type=result_type, dec_hook=granted, strict=True)
+    # A received result becomes an input to the rest of the parent's Python
+    # composition. Preserve its declared per-field media/decode limits through
+    # the same concrete-value traversal used for ordinary input hydration.
+    from cozy_runtime.author._invoke import asset_inputs
+
+    for item in asset_inputs(result):
+        asset, bound = item.asset, item.bound
+        if bound is not None:
+            bound.check_kind(asset.kind)
+            if (bound.max_bytes is not None and asset.size_bytes > bound.max_bytes) or (
+                bound.media_types and asset.media_type not in bound.media_types
+            ):
+                raise ValueError("native result exceeds its declared asset bound")
+        assert asset._local is not None
+        bind(
+            asset,
+            local=asset._local,
+            attempt=request_id,
+            media_type=asset.media_type,
+            digest=asset.digest,
+            length=asset.size_bytes,
+            max_decoded_bytes=(bound.max_decoded_bytes or 0) if bound is not None else 0,
+            input_id=item.input_id,
+            order=item.order,
+            read_guard=guard,
+            source_state=file_state(asset._local),
+        )
+    return result, observation
