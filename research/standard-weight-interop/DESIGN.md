@@ -34,3 +34,27 @@ shared payload/scale views, unchanged logical keys and meta eviction. Ordinary
 tensor accounting still needs neither a TorchAO import nor a TorchAO dependency.
 This fixes physical census only; it does not authorize whole-tree eviction or
 select a new GEMM provider.
+
+The next candidate is now implemented in `encoding/torchao_rowwise.py`, with
+`BaseWeights` integrated into streamed fill, eviction and restaging for that
+provider. It binds the weight in place on the existing `nn.Linear`; original
+hooks and parameter names remain valid. A receiver-bound forward performs the
+existing activation quantization, upstream TorchAO `F.linear` without fused bias,
+then the original separate bias addition. This small binding is necessary for
+the first comparison because upstream's ordinary BF16 bias epilogue changes the
+rounding order. Its CPU forward explicitly refuses a weight-only fallback.
+
+The provider is deliberately **not in `launch_providers` yet**. Qualification
+must run the actual CUDA test, then the native streaming lifecycle and ordinary
+request/clip comparisons. Do not infer GPU proof from CPU tests. The current
+CPU tests cover all638 logical slots of an actual50-block upstream H3 meta
+construction, real PEFT base eviction/reload and exact CPU weight-only output,
+retained external storage aliases, tied Parameter objects, late request-owned
+Parameters, hook handles and deepcopy. Distinct shared views and components
+mixing this standard binding with legacy encoded replacement modules explicitly
+refuse. They are not silently normalized.
+
+The permanent request-level PEFT change is still pending the coordinated modern
+LoRA integration foundation. The existing wire55 qualification cohort already
+has that foundation and can receive a bounded math/lifetime delta for testing;
+that cohort is never a permanent feature branch or production protocol upgrade.
