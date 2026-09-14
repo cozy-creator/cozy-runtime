@@ -375,7 +375,7 @@ def bind(spec: Mapping[str, Any], grant: pb.DeliveryGrant, invocation_digest: by
             ) from exc
         if is_model:
             parameter = input_id[len(MODEL_PREFIX) :]
-            if spec.get("job") is None:
+            if spec.get("job") is None and not (spec.get("serving") and catalog_repository):
                 raise GrantRefusal(
                     "grant_model_serving_refused",
                     f"serving InvocationSpec cannot carry job Model input {input_id!r}",

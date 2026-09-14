@@ -15,7 +15,7 @@ import msgspec
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_BYTES, MAX_CALL_INDEX
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._errors import InvalidRequest
-from cozy_runtime.internal import canonical, package_interface
+from cozy_runtime.internal import canonical, output_budget, package_interface
 from cozy_runtime.internal.capture_observation import document as observation_document
 from cozy_runtime.internal.seam import MAX_FRAME
 from cozy_runtime.internal.worker import byte_inputs, child_byte_results
@@ -340,7 +340,7 @@ class Calls:
                 self.owner(),
                 result,
                 attempt.spool,
-                max_bytes=byte_inputs.MAX_BYTES - held_bytes,
+                max_bytes=output_budget.admitted(attempt.spec) - held_bytes,
             )
             received = dict(self.received.get(parent, {}))
             for metadata, grant in zip(granted, result.byte_result_grants, strict=True):

@@ -107,6 +107,8 @@ def _callable(surface: Surface) -> dict[str, Json]:
         from cozy_runtime.internal import invocable_interface
 
         doc["invocable"] = invocable_interface.metadata(surface)
+        if surface.invocable and surface.kind == "entrypoint":
+            invocable_interface.project_serving_models(doc)
     return doc
 
 

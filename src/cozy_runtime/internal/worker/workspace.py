@@ -312,6 +312,14 @@ class Workspace:
             if row["state"] in ("outcome", "released"):
                 return Workspace._outcome_frame(row)
             return None
+        if any(entry.HasField("catalog_model") for entry in offer.grant.inputs):
+            spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)
+            if "serving" in spec:
+                # A direct control offer cannot bypass the retained input gate
+                # used by machine children. Replay above preserves collected rows.
+                from .machine_checkpoint_inputs import check_submit
+
+                check_submit(db, owner, offer)
         db.execute(
             "INSERT INTO attempts(owner,request,ordinal,spec,invocation,state,"
             "worker_boot,result_schema,process_owner,memoize) "

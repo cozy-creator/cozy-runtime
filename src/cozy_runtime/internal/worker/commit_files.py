@@ -13,9 +13,11 @@ from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
+from cozy_runtime.internal import output_budget
 from cozy_runtime.internal.pathkey import opaque_key
 from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
@@ -29,6 +31,11 @@ def prepare(
     call = command.parent_call
     with workspace.locked() as db:
         native = outputs.native_call(db, owner, command)
+        parent = db.execute(
+            "SELECT invocation FROM attempts WHERE owner=? AND request=? AND ordinal=?",
+            (owner, call.parent_request_id, call.parent_attempt_ordinal),
+        ).fetchone()
+        budget = output_budget.admitted(documents.read(parent["invocation"], pb.InvocationSpec))
         args = canonical_json.decode(native["accepted"])
         slot = args.get("slot")
         tail = str(slot).removeprefix("file/")
@@ -67,10 +74,11 @@ def prepare(
     with workspace.locked() as db:
         outputs.native_call(db, owner, command)
         total = db.execute(
-            "SELECT sum(content_bytes) FROM byte_outputs WHERE owner=? AND request=? AND ordinal=?",
+            "SELECT coalesce(sum(content_bytes),0) FROM byte_outputs "
+            "WHERE owner=? AND request=? AND ordinal=? AND slot LIKE 'runtime.commit_file.%'",
             (owner, row["request"], row["ordinal"]),
         ).fetchone()[0]
-        if total > MAX_OUTPUT_BYTES:
+        if total > budget:
             raise WorkspaceRefusal("file commit exceeds its parent output byte budget")
         db.execute(
             "UPDATE native_calls SET state='executing',computation_digest=? "

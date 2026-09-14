@@ -1,0 +1,225 @@
+"""Typed native member projection, independent forwarding and refusal boundaries."""
+
+from __future__ import annotations
+
+import hashlib
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+import tensorfs
+from PIL import Image
+
+from cozy_runtime.author import AssetBound, Context, ImageAsset, Tree
+from cozy_runtime.author._calls import _Broker, _current, _input_ref
+from cozy_runtime.author._decode import MediaDecoder
+from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._services import Attempt
+from cozy_runtime.internal.worker import (
+    byte_inputs,
+    byte_outputs,
+    grants,
+    machine_byte_inputs,
+    machine_models,
+    tree_members,
+    workspace_byte_outputs,
+)
+from cozy_runtime.internal.worker.attempts import AttemptRecord
+from cozy_runtime.internal.worker.calls import Calls, _Received
+from cozy_runtime.internal.worker.workspace_executions import Executions
+from cozy_runtime.protocol import documents
+from cozy_runtime.protocol import worker_pb2 as pb
+from test_workspace_byte_outputs import producing
+
+
+def prepared(tmp_path: Path, *, root_input: bool = False) -> tuple[Any, ...]:
+    workspace, spec, _, _ = producing(tmp_path)
+    Executions(workspace)
+    source = tmp_path / "source"
+    source.mkdir()
+    Image.new("RGB", (4, 3), "red").save(source / "frame.png")
+    (source / "unrelated.txt").write_text("not part of the forwarded file")
+    manifest, files = byte_outputs.roster(source, tree=True, max_bytes=1000)
+    native = workspace_byte_outputs.commit(
+        workspace, "owner", "producer", 1, spec, "bundle", manifest, files, 1000
+    )
+    held = machine_models.retain_bytes(workspace, "owner", "producer", "input/bundle", native)
+    hold = pb.NativeByteRetentionRequest(source=held.source, retention_id=held.retention_id)
+    local = tmp_path / "spool" / "bundle"
+    byte_inputs.copy_retained(workspace, "owner", hold, local)
+    parent = AttemptRecord("producer", 1, spec, {}, state="running", spool=tmp_path / "spool")
+    calls = Calls(lambda _: None, lambda: 1, lambda: 56, workspace=workspace, owner=lambda: "owner")
+    digest = documents.spell(native.manifest.digest)
+    if root_input:
+        parent.grant.inputs["bundle"] = grants.BoundInput(
+            "bundle",
+            "",
+            native.manifest.digest,
+            native.manifest.length,
+            byte_inputs.TREE_MIME,
+            0,
+            hold,
+        )
+        parent.trees[digest] = (local, digest)
+    else:
+        calls.received[("producer", 1)] = {
+            "tree": _Received(
+                {
+                    "kind": "tree",
+                    "digest": digest,
+                    "local": str(local),
+                    "media_type": byte_inputs.TREE_MIME,
+                    "content_bytes": native.content_bytes,
+                },
+                hold,
+            )
+        }
+    frame = {
+        "tree": digest,
+        "path": "frame.png",
+        "asset_kind": "image",
+        "max_bytes": 1000,
+        "media_types": ["image/png"],
+    }
+    return workspace, parent, calls, hold, local, frame
+
+
+@pytest.mark.parametrize("root_input", [False, True])
+def test_member_projects_without_spool_copy_and_child_survives_parent_gc(
+    tmp_path: Path,
+    root_input: bool,
+) -> None:
+    workspace, parent, calls, hold, local, frame = prepared(tmp_path, root_input=root_input)
+    inode = (local / "frame.png").stat().st_ino
+    broker = _Broker("producer", {}, lambda kind, value: tree_members.project(calls, parent, value))
+    broker.bind(Context("producer", time.monotonic() + 30))
+    tree = Tree(frame["tree"], digest=frame["tree"], root=local, attempt="producer")
+    tree._member_token = broker.grant_token
+    token = _current.set(broker)
+    try:
+        asset = tree.member(
+            "frame.png",
+            ImageAsset,
+            bound=AssetBound(
+                max_bytes=1000,
+                max_decoded_bytes=1000,
+                media_types=("image/png",),
+            ),
+        )
+        assert asset.read_bytes() == (local / "frame.png").read_bytes()
+        assert asset._local is not None
+        assert asset._local == local / "frame.png" and asset._local.stat().st_ino == inode
+        decoder = MediaDecoder(Attempt("producer", tmp_path / "decode"), active=lambda: False)
+        decoded = decoder.decode_image(asset)
+        assert (decoded.width, decoded.height) == (4, 3)
+        assert calls.materialized == {}
+        again = tree.member("frame.png", ImageAsset, bound=AssetBound(max_bytes=1000))
+        assert again.digest == asset.digest and _input_ref(asset, "producer") == asset.digest
+        with workspace.locked() as db:
+            assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 2
+        schema = {
+            "fields": [
+                {"name": "image", "type": {"asset": "image"}, "asset_bound": {"max_bytes": 1000}}
+            ]
+        }
+        bindings, access = machine_byte_inputs.inputs(
+            workspace,
+            "owner",
+            parent,
+            "child",
+            schema,
+            {"image": asset.digest},
+            calls,
+        )
+        assert access[0].native_tree.source.content_bytes == len(asset.read_bytes())
+        assert access[0].native_tree.source.manifest.digest != hold.source.manifest.digest
+        broker.closed = True
+        with pytest.raises(CapabilityError, match="escaped_handle"):
+            asset.read_bytes()
+        with pytest.raises(CapabilityError, match="escaped_handle"):
+            decoder.decode_image(asset)
+    finally:
+        _current.reset(token)
+    machine_models.release(workspace, "owner", "producer")
+    with workspace.locked() as db:
+        roots = [row[0] for row in db.execute("SELECT id FROM byte_outputs").fetchall()]
+        db.execute("UPDATE byte_outputs SET state='releasing'")
+    for root in roots:
+        workspace_byte_outputs.release(workspace, "owner", root)
+    byte_inputs.remove_checkout(local)
+    tensorfs.gc(str(workspace.store_root))
+    spec = pb.InvocationSpec(inputs=bindings)
+    _, digest = documents.identity(spec)
+    grant = grants.bind(
+        documents.body(spec),
+        pb.DeliveryGrant(
+            invocation_spec_digest=digest,
+            inputs=access,
+        ),
+        digest,
+    )
+    hydrated = grants.hydrate_inputs(
+        grant,
+        grants.Authorizer(),
+        spool=tmp_path / "child",
+        workspace=workspace,
+        owner="owner",
+    )
+    assert (
+        "sha256:" + hashlib.sha256(hydrated["image"].local.read_bytes()).hexdigest()
+        == bindings[0].digest
+    )
+    with Image.open(hydrated["image"].local) as image:
+        assert image.size == (4, 3)
+    machine_models.release(workspace, "owner", "child")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "../escape",
+        "/absolute",
+        "frame.png/",
+        "absent",
+        "size",
+        "kind",
+        "media",
+        "changed",
+        "symlink",
+        "released",
+        "foreign",
+        "cancelled",
+        "missing_file",
+    ],
+)
+def test_member_refuses_before_minting_custody(tmp_path: Path, mutation: str) -> None:
+    workspace, parent, calls, hold, local, frame = prepared(tmp_path)
+    if mutation in ("../escape", "/absolute", "frame.png/", "absent"):
+        frame["path"] = mutation
+    elif mutation == "size":
+        frame["max_bytes"] = 1
+    elif mutation == "kind":
+        frame["asset_kind"] = "video"
+    elif mutation == "media":
+        frame["media_types"] = ["image/jpeg"]
+    elif mutation == "changed":
+        (local / "frame.png").chmod(0o644)
+        (local / "frame.png").write_bytes(b"changed")
+    elif mutation == "missing_file":
+        local.chmod(0o755)
+        (local / "frame.png").unlink()
+    elif mutation == "symlink":
+        local.chmod(0o755)
+        (local / "frame.png").unlink()
+        (local / "frame.png").symlink_to(tmp_path / "source" / "frame.png")
+    elif mutation == "released":
+        workspace_byte_outputs.change_hold(workspace, "owner", hold, release=True)
+    elif mutation == "foreign":
+        parent.request_id = "foreign"
+    else:
+        parent.canceling = "requested"
+    reply = tree_members.project(calls, parent, frame)
+    assert not reply["ok"], reply
+    with workspace.locked() as db:
+        assert db.execute("SELECT count(*) FROM byte_outputs").fetchone()[0] == 1

@@ -238,6 +238,11 @@ class AssetBound:
                 fields=["max_decoded_bytes"],
             )
         allowed = KIND_MEDIA.get(kind, ())
+        if kind == "tree" and self.media_types:
+            raise ConformanceError(
+                "Tree bounds govern content bytes; declare media types on Tree.member instead",
+                fields=["media_types"],
+            )
         outside = [m for m in self.media_types if allowed and m not in allowed]
         if outside:
             raise ConformanceError(
