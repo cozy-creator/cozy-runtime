@@ -102,11 +102,43 @@ def verify(result_path: Path, events_path: Path, degree: int, active: bool) -> d
     }
 
 
+def retained_result(path: Path) -> bool:
+    try:
+        document = json.loads(path.read_text())
+        if not isinstance(document, dict) or document.get("status") != "completed":
+            return False
+        saved = {row["output"]: row for row in document.get("saved", [])}
+        return all(
+            name in saved
+            and Path(saved[name]["path"]).is_file()
+            and digest(Path(saved[name]["path"])) == saved[name]["digest"]
+            for name in ("video", "continuation_frame")
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def preserve_partial_logs(root: Path) -> None:
+    number = 1
+    while any(root.glob(f"*.partial-{number:03d}.*")):
+        number += 1
+    for filename in ("result.json", "events.jsonl", "process.json"):
+        path = root / filename
+        if path.exists():
+            path.rename(root / f"{path.stem}.partial-{number:03d}{path.suffix}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cozy", default="cozy")
     parser.add_argument("--rental", required=True)
-    parser.add_argument("--degree", type=int, choices=(1, 2, 4), required=True)
+    parser.add_argument(
+        "--degree",
+        type=int,
+        choices=(1, 2, 4),
+        required=True,
+        help="assert observed Runtime degree; machine width/placement selects devices",
+    )
     parser.add_argument(
         "--key-prefix",
         required=True,
@@ -160,7 +192,13 @@ def main() -> None:
             if not task.endswith("_turbo"):
                 payload["steps"] = 30
             input_path = root / "input.json"
-            argv = [binary, "run", f"paul/minimax-h3/{task}", f"model.{parameter}={BASE}"]
+            argv = [
+                binary,
+                "run",
+                f"paul/minimax-h3/{task}",
+                f"model.{parameter}={BASE}",
+                "--attention-kernel=flash-attn3",
+            ]
             if task.endswith("_turbo"):
                 argv.append(f"model.turbo_lora={PDD}")
             for ref, scale in CASES[case]:
@@ -190,8 +228,9 @@ def main() -> None:
             write(input_path, payload)
             write(command_path, command)
             stdout, stderr = root / "result.json", root / "events.jsonl"
-            if not stdout.exists():
-                print(f"Starting {label} on {args.rental}", flush=True)
+            if not retained_result(stdout):
+                preserve_partial_logs(root)
+                print(f"Starting/reattaching {label} on {args.rental}", flush=True)
                 started = time.monotonic()
                 with stdout.open("x") as output, stderr.open("x") as events:
                     completed = subprocess.run(argv, stdout=output, stderr=events, check=False)

@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 from email.parser import BytesParser
@@ -42,12 +43,25 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def native_inputs(commit: str) -> None:
+def native_inputs(commit: str, source_commit: str = "") -> None:
     """The single comparison used before and after the Python build."""
-    changed = run("git", "diff", "--quiet", commit, "--", *NATIVE_INPUTS, check=False)
+    changed = run(
+        "git",
+        "diff",
+        "--quiet",
+        commit,
+        *((source_commit,) if source_commit else ()),
+        "--",
+        *NATIVE_INPUTS,
+        check=False,
+    )
     added = run("git", "ls-files", "--others", "--exclude-standard", "--", *NATIVE_INPUTS)
     old = tomllib.loads(run("git", "show", f"{commit}:pyproject.toml").stdout)
-    new = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    new = tomllib.loads(
+        run("git", "show", f"{source_commit}:pyproject.toml").stdout
+        if source_commit
+        else (ROOT / "pyproject.toml").read_text()
+    )
 
     def config(value: dict[str, object]) -> object:
         project, tool = value["project"], value["tool"]
@@ -59,7 +73,7 @@ def native_inputs(commit: str) -> None:
             tool["hatch"],
         )
 
-    if changed.returncode or added.stdout or config(old) != config(new):
+    if changed.returncode or (added.stdout and not source_commit) or config(old) != config(new):
         raise ValueError("native build inputs changed; build a new native wheel before reusing it")
 
 
@@ -68,6 +82,11 @@ def main() -> None:
     parser.add_argument("--native-wheel", type=Path, required=True)
     parser.add_argument("--native-sha256", required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--source-commit",
+        default="",
+        help="build an immutable Git archive and embed its exact source revision",
+    )
     args = parser.parse_args()
     donor = args.native_wheel.resolve()
     donor_digest = digest(donor)
@@ -94,7 +113,25 @@ def main() -> None:
             raise ValueError("native donor must be one CPython 3.12 abi3 platform wheel")
         if set(native.rglob("*.so*")) != {native / KERNEL}:
             raise ValueError("native donor has an unsupported extension or bundled-library layout")
-        native_inputs(native_commit)
+        source_commit = (
+            run("git", "rev-parse", f"{args.source_commit}^{{commit}}").stdout.strip()
+            if args.source_commit
+            else ""
+        )
+        if source_commit and re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+            raise ValueError("source commit did not resolve to one exact revision")
+        native_inputs(native_commit, source_commit)
+        build_root = ROOT
+        if source_commit:
+            build_root = work / "source"
+            build_root.mkdir()
+            archive = work / "source.tar"
+            run("git", "archive", "--format=tar", "--output", str(archive), source_commit)
+            with tarfile.open(archive) as stream:
+                stream.extractall(build_root, filter="data")
+            run(
+                sys.executable, str(build_root / "scripts/stamp-build-provenance.py"), source_commit
+            )
         # Build edits as they exist now. This immutable wheel, not Git HEAD, is their identity.
         run(
             shutil.which("uv") or "uv",
@@ -106,9 +143,9 @@ def main() -> None:
             sys.executable,
             "--out-dir",
             str(work / "pure"),
-            str(ROOT),
+            str(build_root),
         )
-        native_inputs(native_commit)
+        native_inputs(native_commit, source_commit)
         pure = next((work / "pure").glob("*.whl"))
         source_digest = digest(pure)
         run(sys.executable, "-m", "wheel", "unpack", str(pure), "--dest", str(work / "python"))
@@ -137,11 +174,13 @@ def main() -> None:
         info.rename(tree / f"cozy_runtime-{version}.dist-info")
         (tree / KERNEL).write_bytes((native / KERNEL).read_bytes())
         (tree / "cozy_runtime/_build_provenance.py").write_text(
-            f'"""Development wheel snapshot; no Git commit is claimed."""\n\n'
-            f'COMMIT = "unknown"\nSOURCE_WHEEL_SHA256 = "sha256:{source_digest}"\n'
+            f'"""Development wheel snapshot; source provenance is independently recorded."""\n\n'
+            f'COMMIT = "{source_commit or "unknown"}"\n'
+            f'SOURCE_WHEEL_SHA256 = "sha256:{source_digest}"\n'
         )
         provenance = {
             "recipe_sha256": recipe_digest,
+            "source_commit": source_commit or "unknown",
             "native_source_commit": native_commit,
             "native_wheel_sha256": donor_digest,
             "native_extension_sha256": digest(native / KERNEL),
@@ -160,6 +199,7 @@ def main() -> None:
                     "wheel": str(built),
                     "sha256": digest(built),
                     "source_wheel_sha256": source_digest,
+                    "source_wheel": str(snapshot / pure.name),
                     **provenance,
                 },
                 sort_keys=True,
