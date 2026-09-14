@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import sys
+import sysconfig
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -43,12 +44,37 @@ MANIFEST_NAME = "installed-dependencies.json"
 MAX_DEPENDENCY_MANIFEST_BYTES = 64 << 20
 
 
+def _source_site(source_python: Path, *, current_system_sdk: bool = False) -> tuple[Path, bool]:
+    prefix = source_python.parent.parent
+    system = (
+        current_system_sdk
+        and prefix == Path(sys.prefix) == Path(sys.base_prefix)
+        and source_python.resolve() == Path(sys.executable).resolve()
+    )
+    sites = (
+        list({Path(sysconfig.get_path(name)) for name in ("purelib", "platlib")})
+        if system
+        else list(prefix.glob("lib/python*/site-packages"))
+    )
+    if (
+        len(sites) != 1
+        or not sites[0].is_dir()
+        or sites[0].resolve() != sites[0]
+        or not sites[0].is_relative_to(prefix)
+    ):
+        raise EnvironmentRefusal(
+            "package_environment_dependency_source_invalid", str(source_python)
+        )
+    return sites[0], system
+
+
 def required_distributions(
     source_python: Path,
     provided: Mapping[str, tuple[str, Sequence[Requirement]]],
     environment: dict[str, str],
     *,
     allow_absent: frozenset[str] = frozenset(),
+    current_system_sdk: bool = False,
 ) -> set[str]:
     """Read the declared dependency graph without importing a mutable source venv.
 
@@ -56,14 +82,10 @@ def required_distributions(
     unrelated packages, including heavyweight optional accelerator dependencies.
     Extras propagate along dependency edges and cycles terminate by visited extras.
     """
-    sites = list(source_python.parent.parent.glob("lib/python*/site-packages"))
-    if len(sites) != 1 or sites[0].resolve() != sites[0]:
-        raise EnvironmentRefusal(
-            "package_environment_dependency_source_invalid", str(source_python)
-        )
+    source_site, _ = _source_site(source_python, current_system_sdk=current_system_sdk)
     installed: dict[str, tuple[str, Sequence[Requirement]]] = {}
     requires_python: dict[str, str] = {}
-    for info in sorted(sites[0].glob("*.dist-info")):
+    for info in sorted(source_site.glob("*.dist-info")):
         metadata = info / "METADATA"
         if (
             info.is_symlink()
@@ -376,29 +398,34 @@ def snapshot(
         raise EnvironmentRefusal(
             "package_environment_dependency_source_invalid", str(source_python)
         )
-    sites = list(prefix.glob("lib/python*/site-packages"))
-    system_sdk = (
-        current_system_sdk
-        and not inventory_only
-        and prefix == Path(sys.prefix) == Path(sys.base_prefix)
-        and source_python.resolve() == Path(sys.executable).resolve()
+    source_site, system_sdk = _source_site(
+        source_python,
+        current_system_sdk=current_system_sdk and not inventory_only,
     )
+    target_sites = list(staging.glob("lib/python*/site-packages"))
     if (
         not source_python.is_absolute()
         or source_python.parent.name != "bin"
         or not source_python.is_file()
         or (not system_sdk and not (prefix / "pyvenv.cfg").is_file())
         or prefix.resolve() != prefix
-        or len(sites) != 1
-        or sites[0].resolve() != sites[0]
-        or not (staging / sites[0].relative_to(prefix)).is_dir()
-        or list(sites[0].glob("*.egg-link"))
-        or list(sites[0].glob("*.egg-info"))
+        or len(target_sites) != 1
+        or target_sites[0].resolve() != target_sites[0]
+        or list(source_site.glob("*.egg-link"))
+        or list(source_site.glob("*.egg-info"))
     ):
         raise EnvironmentRefusal(
             "package_environment_dependency_source_invalid", str(source_python)
         )
-    source_site = sites[0]
+    source_data = Path(sysconfig.get_path("data")) if system_sdk else prefix
+    source_scripts = Path(sysconfig.get_path("scripts")) if system_sdk else prefix / "bin"
+    if any(
+        path.resolve() != path or not path.is_relative_to(prefix)
+        for path in (source_data, source_scripts)
+    ):
+        raise EnvironmentRefusal(
+            "package_environment_dependency_source_invalid", str(source_python)
+        )
     if os.name != "posix":
         cache = None
     if cache is not None:
@@ -412,7 +439,7 @@ def snapshot(
             or stat.S_IMODE(cache_info.st_mode) != 0o700
         ):
             raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(cache))
-    target_site = staging / source_site.relative_to(prefix)
+    target_site = target_sites[0]
     distributions: list[dict[str, Any]] = []
     copied: set[Path] = set()
     verified: dict[Path, tuple[str, int]] = {}
@@ -476,8 +503,17 @@ def snapshot(
                 continue
             if not member.is_file():
                 raise EnvironmentRefusal("package_environment_dependency_member_missing", relative)
-            destination = staging / resolved.relative_to(prefix)
-            if resolved.parent == prefix / "bin":
+            if resolved.is_relative_to(source_site):
+                destination = target_site / resolved.relative_to(source_site)
+            elif resolved.parent == source_scripts:
+                destination = staging / "bin" / resolved.name
+            elif resolved.is_relative_to(source_data):
+                destination = staging / resolved.relative_to(source_data)
+            else:
+                raise EnvironmentRefusal(
+                    "package_environment_dependency_member_unsupported", relative
+                )
+            if resolved.parent == source_scripts:
                 if resolved.name in launchers:
                     continue
                 with member.open("rb") as stream:

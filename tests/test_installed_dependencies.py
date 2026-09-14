@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import zipfile
@@ -459,3 +460,68 @@ def test_cross_filesystem_cache_uses_independent_copies(tmp_path: Path) -> None:
         dependencies.verify_files(target, manifest)
         assert not list(cache.iterdir())
     assert not (site / "payload.bin").samefile(destination / "payload.bin")
+
+
+def test_explicit_current_system_sdk_relocates_dist_packages_and_recorded_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = Path(sys.executable)
+    source, staging = tmp_path / "system", tmp_path / "staging"
+    (source / "bin").mkdir(parents=True)
+    python = source / "bin/python"
+    python.write_text('#!/bin/sh\ntouch "${0%/*}/executed"\nexit 77\n')
+    python.chmod(0o755)
+    site = source / "local/lib/python3.12/dist-packages"
+    site.mkdir(parents=True)
+    target = _venv(staging, executable=executable)
+    _distribution(
+        site,
+        "cozy_runtime",
+        {
+            "cozy_runtime/__init__.py": b"VALUE = 'captured system SDK'\n",
+            "cozy_runtime-1.0.dist-info/entry_points.txt": (
+                b"[console_scripts]\nsdk-proof = sys:exit\n"
+            ),
+            "../../../bin/sdk-proof": b"#!/source/python\n",
+            "../../../bin/native-helper": b"\x7fELFrecorded native helper",
+            "../../../share/sdk/data": b"recorded data resource",
+        },
+    )
+    environment = default_environment()
+    monkeypatch.setattr(sys, "prefix", str(source))
+    monkeypatch.setattr(sys, "base_prefix", str(source))
+    monkeypatch.setattr(sys, "executable", str(python))
+    paths = {
+        "purelib": str(site),
+        "platlib": str(site),
+        "scripts": str(source / "local/bin"),
+        "data": str(source / "local"),
+    }
+    monkeypatch.setattr(sysconfig, "get_path", lambda name: paths[name])
+    with pytest.raises(package_environment.EnvironmentRefusal):
+        dependencies.required_distributions(python, {}, environment)
+    selected = dependencies.required_distributions(
+        python,
+        {},
+        environment,
+        current_system_sdk=True,
+    )
+    assert selected == {"cozy-runtime"}
+    manifest = dependencies.snapshot(
+        python,
+        staging,
+        set(),
+        included=selected,
+        current_system_sdk=True,
+    )
+    dependencies.verify_files(staging, manifest)
+    assert (target / "cozy_runtime/__init__.py").read_bytes() == b"VALUE = 'captured system SDK'\n"
+    assert (staging / "bin/native-helper").read_bytes() == b"\x7fELFrecorded native helper"
+    assert (staging / "share/sdk/data").read_bytes() == b"recorded data resource"
+    assert (staging / "bin/sdk-proof").read_text().startswith("#!/bin/sh\n")
+    assert not (staging / "local").exists() and not (source / "bin/executed").exists()
+    foreign = tmp_path / "foreign/bin/python"
+    foreign.parent.mkdir(parents=True)
+    foreign.symlink_to(python)
+    with pytest.raises(package_environment.EnvironmentRefusal):
+        dependencies.snapshot(foreign, staging, set(), current_system_sdk=True)
