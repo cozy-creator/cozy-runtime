@@ -884,7 +884,7 @@ app.job(helper)
                 path.unlink()
             (root / "control.addr").unlink()
             worker = Worker(config, options, GrpcControlHost("127.0.0.1:0", root / "control.addr"))
-            assert not worker.local_revisions and not worker.engine.jobs
+            assert not worker.prepared_revisions and not worker.engine.jobs
             thread = threading.Thread(target=worker.run, daemon=True)
             thread.start()
             while not (root / "control.addr").exists():
@@ -895,7 +895,7 @@ app.job(helper)
             client = rpc.WorkerControlStub(channel)
             query.expected_execution_workspace_id = receipt.execution_workspace_id
             assert client.SubmitMachineExecution(submission, timeout=5) == receipt
-            assert not worker.local_revisions and not worker.engine.jobs
+            assert not worker.prepared_revisions and not worker.engine.jobs
             query.request_id = "second"
             assert (
                 client.CollectMachineExecution(
@@ -929,7 +929,7 @@ app.job(helper)
                 time.sleep(0.02)
             assert client.GetMachineExecution(query, timeout=5).state == "succeeded"
             assert client.ControlMachineExecution(resume, timeout=5) == resumed
-            assert worker.local_revisions and worker.engine.jobs
+            assert worker.prepared_revisions and worker.engine.jobs
             assert not worker.connected.is_set() and not worker.fence.dispatch_open
             channel.close()
         finally:

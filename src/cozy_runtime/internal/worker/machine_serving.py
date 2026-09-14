@@ -236,7 +236,7 @@ class Serving:
                 for model in native
             }
             with worker.control_lock:
-                candidates = [dict(value.document) for value in worker.local_revisions.values()]
+                candidates = [dict(value.document) for value in worker.prepared_revisions.values()]
             for candidate in candidates:
                 if (
                     candidate.get("development", {}).get("local_revision_digest") != target.revision

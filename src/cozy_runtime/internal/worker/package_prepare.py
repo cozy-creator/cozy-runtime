@@ -54,6 +54,7 @@ def prepare_package_set(
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
     preinstalled_python: Path | None = None,
+    materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Parse the desired download set plus the request's release facts (wire 30) and prepare.
 
@@ -117,6 +118,7 @@ def prepare_package_set(
         job_plan_root=job_plan_root,
         base=base,
         installed_environment=installed,
+        materialized=materialized,
     )
 
 
@@ -284,6 +286,7 @@ def _prepare_published(
     job_plan_root: Path | None,
     base: base_observation.Observation | None,
     installed_environment: package_environment.InstalledEnvironment | None = None,
+    materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Install from the exact export, derive the interface, and author the PlacementSet.
 
@@ -395,6 +398,8 @@ def _prepare_published(
     placement_bytes = canonical.write(
         {"format": "cozy.worker.v1.PlacementSet/1", "placements": [documents.body(placement)]}
     )
+    if materialized is not None:
+        materialized(installed)
     return pb.PreparePackageSetResult(
         placement_set=pb.DesiredPlacementSet(
             placement_set_digest=documents.digest_of(placement_bytes),

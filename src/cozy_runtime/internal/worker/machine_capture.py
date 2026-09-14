@@ -49,7 +49,7 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             raise WorkspaceRefusal("execution capture repeats a revision")
         revisions[digest] = revision
         candidates = [
-            value for (_, selected), value in worker.local_revisions.items() if selected == digest
+            value for (_, selected), value in worker.prepared_revisions.items() if selected == digest
         ]
         if not candidates:
             raise WorkspaceRefusal(
@@ -207,5 +207,5 @@ def restore(worker: Worker, preparation: dict[str, Any]) -> pb.DesiredWorkerStat
             environment_digest=documents.spell(placement.environment_digest),
             python=Path(worker.options.python or sys.executable),
         )
-        worker.local_revisions[(placement.placement_id, digest)] = placement
+        worker.prepared_revisions[(placement.placement_id, digest)] = placement
     return pb.DesiredWorkerState.FromString(base64.b64decode(preparation["state"], validate=True))
