@@ -1,13 +1,17 @@
 """Publication absence refuses before a send, without polluting another call."""
 
+import hashlib
 import time
 from pathlib import Path
 
+from cozy_runtime import canonical_json
 from cozy_runtime.internal import effect_interfaces
 from cozy_runtime.internal.worker.machine_effects import Effects
+from cozy_runtime.internal.worker.machine_publication import PublicationTLS
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
+from cozy_runtime.protocol import documents
 from test_machine_calls import request, running
 from test_machine_execution import offer
 
@@ -51,3 +55,53 @@ def test_failed_effect_remains_reconcilable_after_parent_stops(tmp_path: Path) -
     observed = calls.get("owner", "parent", 0)
     assert observed.result and not observed.safe_code
     assert not calls.has_unsettled_effects("owner", "parent")
+
+
+def test_credential_io_failure_is_visible_and_background_threads_are_pollers(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace(tmp_path / "store")
+    executions = Executions(workspace)
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        publication_authorization_id="019aaaab-0000-7000-8000-000000000003",
+    )
+    call = request(running(executions), module=effect_interfaces.MODULE)
+    call.interface_digest = documents.raw(effect_interfaces.DIGEST)
+    call.intent_digest = hashlib.sha256(
+        canonical_json.encode(
+            {
+                "interface_digest": effect_interfaces.DIGEST,
+                "module": call.module,
+                "export": call.export,
+                "request": {"value": 1},
+            }
+        )
+    ).digest()
+    calls = Calls(workspace)
+    calls.accept("owner", call)
+    effects = Effects(
+        workspace,
+        executions,
+        PublicationTLS(
+            "https://example.test",
+            tmp_path / "missing.crt",
+            tmp_path / "missing.key",
+        ),
+    )
+    try:
+        until = time.monotonic() + 5
+        while not calls.get("owner", "parent", 0).safe_code:
+            effects.drive("owner")
+            assert time.monotonic() < until
+            time.sleep(0.01)
+        observed = calls.get("owner", "parent", 0)
+        assert observed.safe_code == "publication.adapter_failed.FileNotFoundError"
+        assert not observed.sent and not observed.result
+        assert effects.pollers
+    finally:
+        effects.close()
+    assert not effects.pollers
