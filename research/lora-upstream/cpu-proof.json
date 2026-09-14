@@ -1,0 +1,187 @@
+{
+  "scope": "CPU: real full-size adapter factors; generated base and activations; no GPU/video claim",
+  "versions": {
+    "torch": "2.13.0",
+    "peft": "0.20.1.dev0",
+    "diffusers": "0.41.0.dev0",
+    "transformers": "5.16.1",
+    "accelerate": "1.15.0"
+  },
+  "shape": {
+    "input": [
+      64,
+      5376
+    ],
+    "weight": [
+      7168,
+      5376
+    ]
+  },
+  "factor_sources": [
+    {
+      "label": "spatial",
+      "parts": [
+        {
+          "key": "transformer_blocks.0.attn.to_k.lora_A.weight",
+          "dtype": "f16",
+          "shape": [
+            16,
+            5376
+          ],
+          "sha256": "sha256:f4c9abc9e50a9396b7b2b57dbc203437ef9e041b76ecaa4e4ba904977afef26d"
+        },
+        {
+          "key": "transformer_blocks.0.attn.to_k.lora_B.weight",
+          "dtype": "f16",
+          "shape": [
+            7168,
+            16
+          ],
+          "sha256": "sha256:b18ac8c51897096046606663b83a6b627505fe1e55215d1e95cc28dafc599c7a"
+        }
+      ],
+      "rows": [
+        0,
+        13,
+        127,
+        2047,
+        7167
+      ],
+      "strength": 0.3,
+      "alpha": null
+    },
+    {
+      "label": "wushu",
+      "parts": [
+        {
+          "key": "transformer_blocks.0.attn.to_k.lora_A.weight",
+          "dtype": "f32",
+          "shape": [
+            32,
+            5376
+          ],
+          "sha256": "sha256:b773adeac8542b1d15817d4e6f48e574124a17b85c4c30498855d6e4abe046cb"
+        },
+        {
+          "key": "transformer_blocks.0.attn.to_k.lora_B.weight",
+          "dtype": "f32",
+          "shape": [
+            7168,
+            32
+          ],
+          "sha256": "sha256:ec6b5f7a9e93ecb40f3a229d6e1c307726708de5c1c1d31beae093a4ef4532cd"
+        }
+      ],
+      "rows": [
+        0,
+        13,
+        127,
+        2047,
+        7167
+      ],
+      "strength": 0.7,
+      "alpha": 32.0
+    }
+  ],
+  "adapters": {
+    "spatial": {
+      "rank": 16,
+      "strength": 0.3,
+      "bf16_delta_vs_fp32": {
+        "relative_l2": 0.0038190989634676042,
+        "max_abs": 6.633903831243515e-05
+      },
+      "bf16_result_vs_fp32": {
+        "relative_l2": 0.0001314857127623883,
+        "max_abs": 0.0078125
+      },
+      "comfy_bypass_equals_peft_bf16_delta": true
+    },
+    "wushu": {
+      "rank": 32,
+      "strength": 0.8,
+      "bf16_delta_vs_fp32": {
+        "relative_l2": 0.0030959460357508307,
+        "max_abs": 0.0007258355617523193
+      },
+      "bf16_result_vs_fp32": {
+        "relative_l2": 0.00044683909679060443,
+        "max_abs": 0.015625
+      },
+      "comfy_bypass_equals_peft_bf16_delta": true
+    }
+  },
+  "peft_default_dtype": "torch.float32",
+  "peft_autocast_false_dtype": "torch.bfloat16",
+  "peft_switch_back_exact": true,
+  "peft_bf16_fusion_vs_residual": {
+    "relative_l2": 0.0022477981339102593,
+    "max_abs": 0.015625
+  },
+  "peft_bf16_unmerge_restores_weight_bytes": false,
+  "comfy_patch_changed_weight": true,
+  "comfy_unpatch_restores_weight_bytes": true,
+  "encoded_default_injection_refusal": "Target module EncodedLinear(in_features=5376, out_features=7168, provider='cozy.fp8-rowwise.native-leaf/1', roles=['data', 'scale'], out_dtype=torch.bfloat16) is not supported. Currently, only the following modules are supported: `torch.nn.Linear`, `torch.nn.Embedding`, `torch.nn.Conv1d`, `torch.nn.Conv2d`, `torch.nn.Conv3d`, `transformers.pytorch_utils.Conv1D`, `torch.nn.MultiheadAttention.`.",
+  "encoded_custom_injection_refusal": "StopIteration: LoraModel._replace_module uses next(child.parameters()) when the leaf has no weight/qweight/W_q/in_proj_weight",
+  "encoded_direct_upstream_wrapper": {
+    "wrapper": "peft.tuners.lora.layer.Linear",
+    "base_identity_preserved": true,
+    "payload_alias_preserved": true,
+    "has_fake_weight": false
+  },
+  "encoded_generic_merge_refusal": "'EncodedLinear' object has no attribute 'weight'",
+  "encoded_forward": "not run: native W8A8 forward requires CUDA",
+  "torchao_encoded_injection": {
+    "wrapper": "peft.tuners.lora.torchao.TorchaoLoraLinear",
+    "weight_type": "torchao.quantization.Float8Tensor",
+    "payload_alias_preserved": true,
+    "scale_alias_preserved": true,
+    "factor_dtype": "torch.bfloat16",
+    "forward": "not run: no CUDA kernel qualification in CPU proof"
+  },
+  "torchao_storage_census": {
+    "named_base_parameters": [
+      "weight"
+    ],
+    "named_base_buffers": [],
+    "logical_weight_bytes": 77070336,
+    "physical_weight_bytes": 38563840,
+    "flatten_tensor_names": [
+      "qdata",
+      "scale"
+    ],
+    "flatten_attribute_names": [
+      "block_size",
+      "mm_config",
+      "act_quant_kwargs",
+      "kernel_preference",
+      "dtype"
+    ],
+    "base_path_after_peft": "base_model.model.0.base_layer"
+  },
+  "torchao_to_fp16_refusal": "Float8Tensor dispatch: attempting to run unimplemented operator/function: func=<OpOverload(op='aten.to', overload='dtype')>, types=(<class 'torchao.quantization.Float8Tensor'>,), arg_types=(<class 'torchao.quantization.Float8Tensor'>, <class 'torch.dtype'>), kwarg_types={}",
+  "recursive_dtype_conversion": {
+    "cozy_after_to_bf16": {
+      "payload_dtype": "torch.bfloat16",
+      "scale_dtype": "torch.bfloat16"
+    },
+    "torchao_after_to_fp16": {
+      "logical_dtype": "torch.bfloat16",
+      "payload_dtype": "torch.float8_e4m3fn",
+      "scale_dtype": "torch.float32",
+      "payload_alias_preserved": true,
+      "scale_alias_preserved": true
+    }
+  },
+  "torchao_default_activation_quantizer": {
+    "zero_row_scale": 0.0,
+    "zero_row_finite": false,
+    "cozy_zero_row_scale": 9.999999960041972e-13,
+    "ordinary_scale_bytes_equal": false,
+    "ordinary_changed_codes": 6105,
+    "scope": "TorchAO Torch CPU quantizer versus Cozy eager CPU floor; no GPU kernel claim"
+  },
+  "torchao_cozy_prequantized_refusal": "linear(): argument 'input' (position 1) must be Tensor, not PreQuantized",
+  "torchao_merge_without_codec_metadata_refusal": "TorchaoLoraLinear was instantiated without `get_apply_tensor_subclass`, which is required to re-quantize the base layer after merging.",
+  "cuda_initialized": false
+}
