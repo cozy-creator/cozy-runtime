@@ -56,6 +56,17 @@ class _Attempt:
     closed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _Hook:
+    binding: LinearAdapters
+    site: tuple[str, str]
+
+    def __call__(
+        self, module: Any, args: tuple[Any, ...], kwargs: Mapping[str, Any], output: Any
+    ) -> Any:
+        return self.binding._apply(self.site, args, kwargs, output)
+
+
 class LinearAdapters:
     """Construction-lifetime hooks with exclusive, attempt-lifetime factor allocations.
 
@@ -111,61 +122,58 @@ class LinearAdapters:
                     raise AdapterRefusal("adapter_compute_dtype", f"{site}: unsupported {dtype}")
                 if id(module) in seen_modules:
                     raise AdapterRefusal("adapter_target_alias", f"{site}: aliased linear target")
+                if any(isinstance(hook, _Hook) for hook in module._forward_hooks.values()):
+                    raise AdapterRefusal(
+                        "adapter_target_owned", f"{site}: leaf already has an adapter binding"
+                    )
                 seen_modules.add(id(module))
                 self._sites[site] = module.in_features, module.out_features, dtype
                 modules.append((site, module))
         try:
             for site, module in modules:
                 self._handles.append(
-                    module.register_forward_hook(self._hook(site), with_kwargs=True)
+                    module.register_forward_hook(_Hook(self, site), with_kwargs=True)
                 )
         except BaseException:
             self.close()
             raise
 
-    def _hook(self, site: tuple[str, str]) -> Callable[..., Any]:
-        def apply(
-            module: Any, args: tuple[Any, ...], kwargs: Mapping[str, Any], output: Any
-        ) -> Any:
-            attempt = self._active.get()
-            if attempt is None:
-                if self._lock.locked():
-                    raise AdapterRefusal(
-                        "adapter_context_missing", "model called outside its active adapter context"
-                    )
-                return output
-            if attempt.closed:
+    def _apply(
+        self, site: tuple[str, str], args: tuple[Any, ...], kwargs: Mapping[str, Any], output: Any
+    ) -> Any:
+        attempt = self._active.get()
+        if attempt is None:
+            if self._lock.locked():
                 raise AdapterRefusal(
-                    "adapter_attempt_closed", "adapter context outlived its attempt"
+                    "adapter_context_missing", "model called outside its active adapter context"
                 )
-            attempt.check_cancelled()
-            terms = attempt.terms.get(site, ())
-            if not terms:
-                return output
-            x = args[0] if args else kwargs.get("input", kwargs.get("x"))
-            torch = self._torch
-            if not isinstance(x, torch.Tensor) or not isinstance(output, torch.Tensor):
-                raise AdapterRefusal("adapter_input", f"{site} did not receive an ordinary Tensor")
-            in_features, out_features, dtype = self._sites[site]
-            if (
-                x.ndim < 1
-                or x.shape[-1] != in_features
-                or output.shape != (*x.shape[:-1], out_features)
-                or x.dtype != dtype
-                or output.dtype != dtype
-                or x.device != output.device
-            ):
-                raise AdapterRefusal(
-                    "adapter_input", f"{site}: input/output geometry or dtype changed"
-                )
-            linear = torch.nn.functional.linear
-            for term in terms:
-                if term.a.device != x.device:
-                    raise AdapterRefusal("adapter_device", f"{site}: factors on another device")
-                output = output + linear(linear(x, term.a), term.b) * term.scale
             return output
-
-        return apply
+        if attempt.closed:
+            raise AdapterRefusal("adapter_attempt_closed", "adapter context outlived its attempt")
+        attempt.check_cancelled()
+        terms = attempt.terms.get(site, ())
+        if not terms:
+            return output
+        x = args[0] if args else kwargs.get("input", kwargs.get("x"))
+        torch = self._torch
+        if not isinstance(x, torch.Tensor) or not isinstance(output, torch.Tensor):
+            raise AdapterRefusal("adapter_input", f"{site} did not receive an ordinary Tensor")
+        in_features, out_features, dtype = self._sites[site]
+        if (
+            x.ndim < 1
+            or x.shape[-1] != in_features
+            or output.shape != (*x.shape[:-1], out_features)
+            or x.dtype != dtype
+            or output.dtype != dtype
+            or x.device != output.device
+        ):
+            raise AdapterRefusal("adapter_input", f"{site}: input/output geometry or dtype changed")
+        linear = torch.nn.functional.linear
+        for term in terms:
+            if term.a.device != x.device:
+                raise AdapterRefusal("adapter_device", f"{site}: factors on another device")
+            output = output + linear(linear(x, term.a), term.b) * term.scale
+        return output
 
     def _validate(
         self, adapters: Sequence[AdapterInput], max_device_bytes: int
@@ -235,20 +243,21 @@ class LinearAdapters:
                 alpha = pair.get("alpha")
                 if alpha is not None and alpha.ndim != 0:
                     raise AdapterRefusal("adapter_alpha", f"{site}: alpha must be a scalar")
-                if any(not bool(torch.isfinite(t).all()) for t in pair.values()):
-                    raise AdapterRefusal("adapter_nonfinite", f"{site}: nonfinite adapter tensor")
                 scale = adapter.scale * (a.shape[0] if alpha is None else float(alpha)) / a.shape[0]
                 if not math.isfinite(scale):
                     raise AdapterRefusal("adapter_scale", f"{site}: effective scale is not finite")
+                if scale != 0:
+                    nbytes += (a.numel() + b.numel()) * (4 if dtype == torch.float32 else 2)
+                    if nbytes > max_device_bytes:
+                        raise AdapterRefusal(
+                            "adapter_budget", f"adapter factors need {nbytes} device bytes"
+                        )
+                # Do not scan a rejected over-budget factor or allocate its finite mask.
+                if any(not bool(torch.isfinite(t).all()) for t in pair.values()):
+                    raise AdapterRefusal("adapter_nonfinite", f"{site}: nonfinite adapter tensor")
                 # Zero scale still validates every tensor, but owns no device factors.
-                if scale == 0:
-                    continue
-                nbytes += (a.numel() + b.numel()) * torch.empty((), dtype=dtype).element_size()
-                if nbytes > max_device_bytes:
-                    raise AdapterRefusal(
-                        "adapter_budget", f"adapter factors need {nbytes} device bytes"
-                    )
-                rows.append((site, a, b, scale))
+                if scale != 0:
+                    rows.append((site, a, b, scale))
         return rows, nbytes
 
     @contextmanager

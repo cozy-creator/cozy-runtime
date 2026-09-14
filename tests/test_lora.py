@@ -285,3 +285,13 @@ def test_retained_exception_and_context_release_attempt_factor_storage() -> None
     gc.collect()
     assert retained.value is not None and copied is not None
     assert all(ref() is None for ref in refs)
+
+
+def test_a_coalesced_leaf_cannot_acquire_two_independent_adapter_owners() -> None:
+    model, binding, source, x = _fixture()
+    with pytest.raises(AdapterRefusal) as error:
+        LinearAdapters({"dit": model}, {"dit": "base-A"}, {"dit": ["0"]})
+    assert error.value.code == "adapter_target_owned"
+    assert len(model[0]._forward_hooks) == 1
+    with _request(binding, source):
+        assert model(x).shape == (2, 5, 3)
