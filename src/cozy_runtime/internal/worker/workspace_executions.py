@@ -289,6 +289,9 @@ class Executions:
                 "SELECT 1 FROM attempts WHERE owner=? AND request=?", (owner, offer.request_id)
             ).fetchone():
                 raise WorkspaceRefusal("request already belongs to another execution path")
+            from .workspace_input_trees import verify_adoption
+
+            verify_adoption(db, owner, offer)
             self.workspace.accept_in(
                 db,
                 owner,

@@ -126,6 +126,7 @@ class MachineExecutionRPC:
                     capture_document=request.capture_canonical_bytes,
                     preparation=preparation,
                     publication_authorization_id=request.publication_authorization_id,
+                    arguments=value,
                 )
             assert self.worker.executions is not None
             return pb.MachineExecutionReceipt(

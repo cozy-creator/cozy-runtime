@@ -15,6 +15,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import machine_models, workspace_byte_outputs
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceBusy, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_input_trees import receive
+from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
@@ -207,3 +208,85 @@ def test_input_stream_refuses_unclosed_or_changed_objects(tmp_path: Path, failur
             db.execute("SELECT count(*) FROM input_tree_intakes WHERE receipt!=x''").fetchone()[0]
             == 0
         )
+
+
+@pytest.mark.parametrize("accept_first", [False, True])
+def test_root_acceptance_and_intake_abort_have_one_durable_order(
+    tmp_path: Path, accept_first: bool
+) -> None:
+    from cozy_runtime.internal.worker import machine_byte_inputs
+    from cozy_runtime.internal.worker.workspace_executions import Executions
+
+    workspace = Workspace(tmp_path)
+    executions = Executions(workspace)
+    header, frames, data = intake()
+    imported = receive(workspace, "owner", header, frames)
+    source = imported.source
+    spec = pb.InvocationSpec(
+        job=pb.JobInvocationSpec(
+            build_id="sha256:" + "11" * 32, job_descriptor_id="sha256:" + "12" * 32
+        ),
+        inputs=[
+            pb.InputBinding(
+                input_id="files",
+                digest=documents.spell(source.manifest.digest),
+                length=source.manifest.length,
+                kind_mime=workspace_byte_outputs.TREE_MIME,
+            )
+        ],
+    )
+    raw, digest = documents.identity(spec)
+    submitted = pb.AttemptOffer(
+        request_id=header.request_id,
+        attempt_ordinal=1,
+        invocation_spec_digest=digest,
+        invocation_spec_canonical_bytes=raw,
+        grant=pb.DeliveryGrant(
+            invocation_spec_digest=digest,
+            inputs=[
+                pb.InputAccess(
+                    input_id="files",
+                    native_tree=pb.NativeByteRetentionRequest(
+                        source=source, retention_id=imported.retention_id
+                    ),
+                )
+            ],
+        ),
+    )
+    machine_byte_inputs.retain_root(
+        workspace,
+        "owner",
+        submitted,
+        {"fields": [{"name": "files", "type": {"input": "tree"}}]},
+        {"files": documents.spell(source.manifest.digest)},
+        wire_minor=55,
+    )
+    own = pb.NativeByteRetentionResult(
+        source=source,
+        retention_id=machine_models.byte_retention_id(
+            "owner", header.request_id, "input/files", source
+        ),
+    )
+    if accept_first:
+        receipt = executions.submit("owner", "submission", b"c" * 32, submitted)
+    receive(
+        workspace,
+        "owner",
+        header,
+        [pb.InputTreeImportFrame(commit=pb.InputTreeImportCommit(abort=True))],
+    )
+    tensorfs.gc(str(tmp_path))
+    if accept_first:
+        assert executions.submit("owner", "submission", b"c" * 32, submitted) == receipt
+        read(workspace, own, data)
+        dispatch = executions.offer("owner", header.request_id)
+        machine_byte_inputs.bind_root_grant("owner", dispatch)
+        assert dispatch.grant.inputs[0].native_tree.retention_id == own.retention_id
+        assert submitted.grant.inputs[0].native_tree.retention_id == imported.retention_id
+    else:
+        with pytest.raises(WorkspaceRefusal, match="aborted"):
+            executions.submit("owner", "submission", b"c" * 32, submitted)
+        with workspace.locked() as db:
+            held = db.execute("SELECT state FROM holds WHERE id=?", (own.retention_id,)).fetchone()
+            assert held["state"] == "released"
+            assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 0

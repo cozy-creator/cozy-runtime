@@ -150,6 +150,31 @@ def _abort(workspace: Workspace, db: Journal, row: Any) -> pb.NativeByteRetentio
     row = _recover(workspace, db, row)
     source = _source(row) if row["receipt"] else None
     if source is not None:
+        if (
+            db.execute(
+                "SELECT 1 FROM executions WHERE owner=? AND request=?",
+                (row["owner"], row["request"]),
+            ).fetchone()
+            is None
+        ):
+            from . import machine_models
+
+            # Admission checks the abort tombstone in its own SQL transaction.
+            # Fence this unaccepted root's pending recipient even if its native
+            # retain crossed the abort; an already accepted root keeps its hold.
+            workspace._change_hold(
+                db,
+                row["owner"],
+                pb.DerivedRetentionRequest(
+                    weights_transaction_id=row["id"],
+                    tensorfs_receipt_digest=row["native_digest"],
+                    retention_id=machine_models.byte_retention_id(
+                        row["owner"], row["request"], "input/" + row["input_id"], source
+                    ),
+                ),
+                release=True,
+                kind="tree",
+            )
         hold = db.execute("SELECT 1 FROM holds WHERE id=?", (row["intake_hold"],)).fetchone()
         if hold is not None:
             workspace._change_hold(
@@ -399,3 +424,27 @@ def _receive_objects(
     finally:
         if output is not None:
             output.close()
+
+
+def verify_adoption(db: Journal, owner: str, offer: pb.AttemptOffer) -> None:
+    """The input abort and root acceptance have one durable ordering boundary."""
+    for access in offer.grant.inputs:
+        if not access.HasField("native_tree"):
+            continue
+        row = db.execute(
+            "SELECT state,request,input_id,intake_hold FROM input_tree_intakes "
+            "WHERE owner=? AND id=?",
+            (owner, access.native_tree.source.producer_root_id),
+        ).fetchone()
+        if (
+            row is not None
+            and row["intake_hold"] == access.native_tree.retention_id
+            and (
+                row["state"] != "prepared"
+                or row["request"] != offer.request_id
+                or row["input_id"] != access.input_id
+            )
+        ):
+            raise WorkspaceRefusal(
+                "root input intake was aborted or belongs to another request field"
+            )
