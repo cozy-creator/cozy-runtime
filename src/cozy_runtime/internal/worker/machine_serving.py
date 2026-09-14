@@ -35,6 +35,28 @@ if TYPE_CHECKING:
     from .session import Worker
 
 
+def arguments(target: Target, raw: bytes) -> tuple[bytes, dict[str, Any]]:
+    """Generated library callers separate Model overrides from the handler payload.
+
+    A registered self-call uses the original invocable's flat request. The frozen
+    caller/callee binding identifies that convention; user field names never do.
+    """
+    value = canonical_json.decode(raw)
+    if not isinstance(value, dict):
+        raise WorkspaceRefusal("captured serving arguments must be an object")
+    if not target.serving_envelope:
+        return raw, value
+    names = {model["path"].rpartition(".")[2] for model in target.declaration.get("models", [])}
+    if (
+        set(value) != {"payload", "models"}
+        or not isinstance(value["payload"], dict)
+        or not isinstance(value["models"], dict)
+        or set(value["models"]) != names
+    ):
+        raise WorkspaceRefusal("generated serving call has invalid payload or Model slots")
+    return canonical_json.encode(value["payload"]), value["models"]
+
+
 class Serving:
     def __init__(self, worker: Worker):
         self.worker = worker
@@ -99,7 +121,7 @@ class Serving:
             )
             if selected is None:
                 raise WorkspaceRefusal("captured inference has no complete prepared Model binding")
-            payload = request.request_canonical_bytes
+            payload, _ = arguments(target, request.request_canonical_bytes)
             digest = documents.spell(hashlib.sha256(payload).digest())
             with workspace.locked() as db:
                 row = db.execute(
@@ -220,7 +242,7 @@ class Serving:
         prepared = target.prepared_revision["placement"]
         if not target.declaration.get("models"):
             return dict(prepared)
-        arguments = canonical_json.decode(request.request_canonical_bytes)
+        _, model_arguments = arguments(target, request.request_canonical_bytes)
         native: list[pb.NativeModelBinding] = []
         with contextlib.ExitStack() as access:
             for model in target.declaration["models"]:
@@ -228,9 +250,10 @@ class Serving:
                 path = model["path"]
                 if not path.startswith(prefix) or not path.removeprefix(prefix).isidentifier():
                     raise WorkspaceRefusal("captured serving Model has no exact parameter")
-                artifact = msgspec.convert(
-                    arguments[path.removeprefix(prefix)], type=ModelArtifact, strict=True
-                )
+                supplied = model_arguments.get(path.removeprefix(prefix))
+                if supplied is None:
+                    raise WorkspaceRefusal("captured serving Model default has not been retained")
+                artifact = msgspec.convert(supplied, type=ModelArtifact, strict=True)
                 retention, held = machine_models.retain(
                     workspace,
                     owner,

@@ -29,6 +29,7 @@ class Target:
     prepared_revision: dict[str, Any]
     binding: JobBinding | None
     digest: str
+    serving_envelope: bool = False
 
 
 def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
@@ -123,6 +124,7 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
         prepared,
         binding,
         "sha256:" + hashlib.sha256(identity).hexdigest(),
+        binding is None and selected["caller_revision_digest"] != revision,
     )
 
 
