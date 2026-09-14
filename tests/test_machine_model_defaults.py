@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+import threading
+import time
 from collections.abc import Callable
 from contextlib import ExitStack
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -21,7 +26,7 @@ from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_machine_execution import ack, complete
-from test_model_runtime_closure import _snapshot
+from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
 REVISION = "sha256:" + "11" * 32
 MANIFEST = {"digest": "sha256:" + "22" * 32, "length": 321}
@@ -213,3 +218,86 @@ def test_unavailable_default_refuses_before_accelerator_discovery(
     for capture in captures:
         with pytest.raises(WorkspaceRefusal, match="captured Model default is unavailable"):
             defaults.select(peer(capture), "owner", call, target(), {"adapter": {}})
+
+
+def test_cold_default_native_pull_requires_deployment_object_storage_host(
+    tmp_path: Path,
+) -> None:
+    origin_root = tmp_path / "origin"
+    origin_root.mkdir()
+    _, manifest, length, origin = _snapshot(origin_root, include_asset=True, checkpoint_only=True)
+    bodies = {hashlib.sha256(body).hexdigest(): body for body in (_HEADER, _ASSET)}
+    objects = [{"length": len(body), "sha256": digest} for digest, body in sorted(bodies.items())]
+    bodies[manifest.removeprefix("sha256:")] = origin.manifest(manifest)["manifest"]
+    fetched: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_: Any) -> None:
+            pass
+
+        def answer(self, body: bytes) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path == "/v1/tensorfs/closure":
+                response = {
+                    "complete": True,
+                    "lane": "bf16",
+                    "model": "proof/adapter",
+                    "manifest": {"sha256": manifest.removeprefix("sha256:"), "length": length},
+                    "objects": objects,
+                    "presign_max_digests": 10,
+                    "release": "1.0.0",
+                    "scope": "runtime",
+                    "server_time_unix": int(time.time()),
+                }
+            else:
+                assert self.path == "/v1/tensorfs/presign"
+                response = {
+                    "expires_at_unix": int(time.time()) + 3600,
+                    "server_time_unix": int(time.time()),
+                    "urls": {
+                        digest: f"http://127.0.0.1:{server.server_port}/{digest}"
+                        for digest in request["digests"]
+                    },
+                }
+            self.answer(json.dumps(response, sort_keys=True, separators=(",", ":")).encode())
+
+        def do_GET(self) -> None:
+            fetched.append(self.path)
+            self.answer(bodies[self.path.removeprefix("/")])
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    root = tmp_path / "destination"
+    store = tensorfs.Store.init(str(root))
+    worker = peer({})
+    worker.workspace = Workspace(root)
+    row = {
+        "public_origin": f"http://localhost:{server.server_port}",
+        "repository": "proof/adapter",
+        "manifest": {"digest": manifest, "length": length},
+    }
+    try:
+        worker.config = cast(
+            Any, SimpleNamespace(bootstrap_credential="local", object_storage_hosts=())
+        )
+        with ExitStack() as access, pytest.raises(WorkspaceRefusal, match="SOURCE_NOT_ALLOWED"):
+            defaults.materialize(worker, [row], access)
+        assert fetched == []
+        worker.config = cast(
+            Any, SimpleNamespace(bootstrap_credential="local", object_storage_hosts=("127.0.0.1",))
+        )
+        with ExitStack() as access:
+            defaults.materialize(worker, [row], access)
+            store.verify_checkpoint_source("proof/adapter", manifest, length)
+        assert set(fetched) == {"/" + digest for digest in bodies}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
