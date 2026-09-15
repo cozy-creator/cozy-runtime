@@ -64,6 +64,11 @@ _AAC_BIT_RATE = 192_000
 _FLAC_CHUNK = 4096
 AAC_FRAME_SAMPLES = 1024
 
+# Delayed MP4 metadata must not turn a missing initial track into an unbounded
+# native muxer queue. Payload bytes and packet count bound data and per-packet metadata.
+_MP4_PREAMBLE_BYTES = 8 << 20
+_MP4_PREAMBLE_PACKETS = 1024
+
 
 def x264_threads() -> int:
     """The x264 thread count on THIS host: its CPU count, under the ceiling."""
@@ -540,6 +545,12 @@ class StreamingMP4Encoder:
         self.color_range = color_range
         self.video_frames = 0
         self.audio_samples = 0
+        self._max_bytes = max_bytes
+        self._encoded_bytes = 0
+        self._preamble_bytes = 0
+        self._preamble_packets = 0
+        self._preamble_written = not bool(audio_channels)
+        self._streams_started: set[int] = set()
         self._av = _av()
         try:
             self._colorspace = _color.colorspace(self._av, color_matrix)
@@ -557,8 +568,11 @@ class StreamingMP4Encoder:
                 options={
                     "fflags": "+bitexact",
                     "frag_duration": "1000000",
-                    "movflags": "+empty_moov+default_base_moof+frag_keyframe+skip_sidx",
-                    "use_editlist": "0",
+                    # Delay the initial metadata until timestamps are known so the
+                    # edit list can discard AAC encoder priming without moving video.
+                    "movflags": "+empty_moov+default_base_moof+frag_keyframe+skip_sidx"
+                    + ("+delay_moov" if audio_channels else ""),
+                    "use_editlist": "1" if audio_channels else "0",
                 },
             )
             self._video = self._container.add_stream("libx264", rate=frame_rate)
@@ -631,7 +645,7 @@ class StreamingMP4Encoder:
         frame.time_base = Fraction(self.frame_rate.denominator, self.frame_rate.numerator)
         for packet in self._video.encode(frame):
             packet.duration = 1
-            self._container.mux(packet)
+            self._mux(packet)
         self.video_frames += 1
 
     def write_audio(self, planar: Planar) -> None:
@@ -648,12 +662,12 @@ class StreamingMP4Encoder:
             self.audio_sample_rate,
             "flt",
             AAC_FRAME_SAMPLES,
-            # AAC delays its first packet by one codec frame. Offset the submitted PTS so
-            # fragmented MP4 starts both tracks at zero instead of stretching video frame 0.
-            start_pts=self.audio_samples + AAC_FRAME_SAMPLES,
+            # Keep the author's sample clock. The MP4 edit list accounts for the
+            # encoder's negative initial timestamp; it is not an extra PCM frame.
+            start_pts=self.audio_samples,
         ):
             for packet in self._audio.encode(frame):
-                self._container.mux(packet)
+                self._mux(packet)
         self.audio_samples += planar.shape[1]
 
     def finish(self) -> EncodedVideoFacts:
@@ -661,15 +675,46 @@ class StreamingMP4Encoder:
             raise OutputError("streaming video contains no frames", code="frame_shape")
         for packet in self._video.encode():
             packet.duration = 1
-            self._container.mux(packet)
+            self._mux(packet)
         if self._audio is not None:
             for packet in self._audio.encode():
-                self._container.mux(packet)
+                self._mux(packet)
         self._container.close()
         self._raw.flush()
         os.fsync(self._raw.fileno())
         self._raw.close()
         return probe_mp4(self.path)
+
+    def _mux(self, packet: Any) -> None:
+        # Encoded payload is a lower bound on container bytes. Charge it before
+        # handing it to a muxer that can buffer instead of calling the file writer.
+        self._encoded_bytes += int(packet.size)
+        if self._encoded_bytes > self._max_bytes:
+            raise OutputError(
+                f"encoded streaming payload would cross the {self._max_bytes}-byte attempt limit",
+                code="output_too_large",
+            )
+        if not self._preamble_written:
+            self._preamble_bytes += int(packet.size)
+            self._preamble_packets += 1
+            if (
+                self._preamble_bytes > _MP4_PREAMBLE_BYTES
+                or self._preamble_packets > _MP4_PREAMBLE_PACKETS
+            ):
+                raise OutputError(
+                    "streaming audio/video startup exceeds its 8 MiB or 1024-packet buffer; "
+                    "interleave both tracks earlier",
+                    code="media_interleave",
+                )
+        self._container.mux(packet)
+        self._streams_started.add(int(packet.stream.index))
+        if (
+            not self._preamble_written
+            and self._audio is not None
+            and {self._video.index, self._audio.index} <= self._streams_started
+            and self._raw.tell() > 0
+        ):
+            self._preamble_written = True
 
     def abort(self) -> None:
         with suppress(Exception):

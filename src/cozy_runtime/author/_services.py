@@ -544,8 +544,7 @@ class Outputs(_Bound):
                         or facts.audio_frame_samples != self.video_audio_frame_samples
                     )
                 )
-                or facts.audio_decoded_samples - audio_samples
-                not in (0, self.video_audio_frame_samples)
+                or facts.audio_decoded_samples != audio_samples
             ):
                 raise OutputError(
                     "streaming MP4 probe disagrees with submitted media: "
