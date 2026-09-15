@@ -2426,7 +2426,6 @@ class Executor:
                         "sol-attn",
                         rank=rank,
                         world=self.world,
-                        dense_reference=attention_sol.dense_identity(),
                         **counts,
                     )
         self._emit_attention(
