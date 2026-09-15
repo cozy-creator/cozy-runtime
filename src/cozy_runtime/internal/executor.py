@@ -67,6 +67,7 @@ from cozy_runtime.internal import (
     child_env,
     model_config,
     package_interface,
+    prepare_diagnostics,
     proctree,
     sandbox,
 )
@@ -466,6 +467,7 @@ class Executor:
         self.group: RankGroup | None = None
         self.pg: Any = None
         self._device_ready = False
+        self._startup_reported = False
         #: the attempt spool while an attempt runs: where a mirrored call's payloads go
         self._attempt_spool: Path | None = None
         #: cr-038: the fill plane's capture directory, taken from the sealed environment
@@ -543,6 +545,22 @@ class Executor:
         already exists when this runs is a refusal (`cuda_initialized_before_runtime`) -
         something else picked a device first.
         """
+        owner = self._group_parent or self
+        if not owner._startup_reported:
+            # Observe before the explicit boundary on every rank, including a
+            # previously adopted context. Stderr survives even a pre-reply crash.
+            print(
+                "[executor] prepare startup: "
+                + json.dumps(
+                    prepare_diagnostics.startup_facts(
+                        rank=self.rank, world=self.world, device_kind=self.device_kind
+                    ),
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            owner._startup_reported = True
         if self._device_ready:
             return None
         if accel.initialized(torch, self.device_kind):
@@ -598,6 +616,7 @@ class Executor:
                 "ok": False,
                 "code": "group_unformed",
                 "detail": f"rank {self.rank} could not join: {type(exc).__name__}: {exc}"[:900],
+                "traceback": prepare_diagnostics.exception_trace(exc),
             }
         return {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
 
@@ -1720,6 +1739,7 @@ class Executor:
                     "ok": False,
                     "code": exc.code,
                     "detail": str(exc)[:900],
+                    "traceback": prepare_diagnostics.exception_trace(exc),
                     "state": backend.state,
                     "envelope": envelope,
                 }
@@ -3281,6 +3301,12 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
             "env_intact": reply.get("env_intact"),
             "env_changed": reply.get("env_changed") or [],
             "poisoned": reply.get("poisoned"),
+            **(
+                {"traceback": "\n".join(prepare_diagnostics.activity_lines(reply["traceback"]))}
+                if reply.get("reply") in {"prepare", "preconstruct", "join"}
+                and reply.get("traceback")
+                else {}
+            ),
             "metrics": reply.get("metrics"),
             "outputs": reply.get("outputs") or [],
             "result_ref": reply.get("result_ref"),
@@ -3491,6 +3517,8 @@ def main(argv: list[str] | None = None) -> int:
                 "terminal": outcome.terminal,
                 "origin": outcome.origin,
             }
+            if name in {"preconstruct", "prepare", "join"}:
+                reply["traceback"] = prepare_diagnostics.exception_trace(exc)
         reply["reply"] = name
         _send_reply(channel, reply)
 
