@@ -11,9 +11,10 @@ from pathlib import Path
 
 
 def main() -> None:
-    import torch
+    from cozy_runtime.internal.executor import _CONSTRUCTION_MODULES, Executor, _capture_seal
 
-    from cozy_runtime.internal.executor import _CONSTRUCTION_MODULES, Executor
+    _capture_seal()
+    import torch
 
     mode, directory = sys.argv[1:]
     if mode == "cpu-order":
