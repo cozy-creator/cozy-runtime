@@ -153,7 +153,7 @@ _WARM_VIDEO_TAG, _WARM_TEXT_TAG, _WARM_AUDIO_TAG = 0, 1, 2
 _DENSE_ATTENTION_PATHS = ("token_refiner", "transformer_blocks.0", "transformer_blocks.1")
 
 
-def _attention_layout(state: Any, step: int) -> AttentionLayout:
+def _attention_layout(state: Any, step: int, *, sol_dense_steps: int = 10) -> AttentionLayout:
     fields = state.denoiser_input_fields
     # NVIDIA's H3 policy protects every row before target video, including target
     # audio. Diffusers packs text, reference media, target audio, then target video.
@@ -166,7 +166,7 @@ def _attention_layout(state: Any, step: int) -> AttentionLayout:
             + fields["audio_indices"].numel()
         ),
         step=step,
-        dense_until_step=10,
+        dense_until_step=sol_dense_steps,
         dense_paths=_DENSE_ATTENTION_PATHS,
     )
 
@@ -1233,7 +1233,10 @@ class OfficialH3Pipeline:
         on_step: Callable[[int], None],
         cancel: Callable[[], None],
         checks: NumericalChecks | None = None,
+        sol_dense_steps: int = 10,
     ) -> ScheduleFacts:
+        if type(sol_dense_steps) is not int or sol_dense_steps < 0:
+            raise ValueError("sol_dense_steps must be a nonnegative integer")
         blocks = self._blocks[self._workflow(task, state)].sub_blocks
         scoped = _ScopedPipeline(
             self._pipes[self._workflow(task, state)],
@@ -1273,7 +1276,9 @@ class OfficialH3Pipeline:
         block_state = loop.get_block_state(state)
         for index, timestep in enumerate(block_state.timesteps):
             cancel()
-            with attention_scope(_attention_layout(block_state, index)):
+            with attention_scope(
+                _attention_layout(block_state, index, sol_dense_steps=sol_dense_steps)
+            ):
                 _, block_state = loop.loop_step(scoped, block_state, i=index, t=timestep)
             if checks is not None:
                 checks.tensors(
