@@ -8,7 +8,7 @@ Publication belongs to Tensorhub's production transaction.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from importlib.resources import files
 from typing import Any, NamedTuple
 
@@ -157,8 +157,24 @@ def completed_parts(transaction: DerivedTransaction) -> set[tuple[str, str, str]
     return set(transaction.completed_parts())
 
 
-def prepare_bf16(structure: SourceInspection, *, keep: tuple[str, ...] = ()) -> Bf16Plan:
-    """Plan only plain f32 normalization; preserve other precision and encodings."""
+def bf16_source_dtypes(sources: Sequence[str]) -> tuple[str, ...]:
+    """Validate the explicit floating-point source cut; ordering has no meaning."""
+    if not sources or len(set(sources)) != len(sources) or set(sources) - {"f16", "f32"}:
+        raise UnsupportedInput(
+            "bf16_sources must contain unique f16 or f32 source dtypes",
+            code="quantization_plan",
+        )
+    return tuple(sorted(sources))
+
+
+def prepare_bf16(
+    structure: SourceInspection,
+    *,
+    keep: tuple[str, ...] = (),
+    source_dtypes: tuple[str, ...] = ("f32",),
+) -> Bf16Plan:
+    """Normalize selected plain floats; other source dtypes inherit unchanged."""
+    source_dtypes = bf16_source_dtypes(source_dtypes)
     keep_set = set(keep)
     if len(keep_set) != len(keep):
         raise UnsupportedInput("keep list repeats a component")
@@ -171,7 +187,7 @@ def prepare_bf16(structure: SourceInspection, *, keep: tuple[str, ...] = ()) -> 
     kept: list[tuple[str, str]] = []
     order = [(component, key) for component, key, _ in rows]
     for component, key, tensor in rows:
-        if tensor.logical_dtype != "f32":
+        if tensor.logical_dtype not in source_dtypes:
             continue
         if component in keep_set:
             kept.append((component, key))
@@ -233,7 +249,7 @@ def bf16_targets(
     source: str,
     excluded: set[tuple[str, str]] | None = None,
 ) -> dict[str, Target]:
-    """Declare BF16 replacements for the plan's f32 cut; everything else inherits."""
+    """Declare BF16 replacements for the selected float cut; everything else inherits."""
     omitted = excluded or set()
     targets: dict[str, Target] = {}
     for component in plan.components:
@@ -265,7 +281,7 @@ def write_bf16(
     source: str,
     excluded: set[tuple[str, str]] | None = None,
 ) -> Bf16Stats:
-    """Stream the plan's f32 cut through one bounded RNE conversion, stats recorded.
+    """Stream the selected float cut through one bounded RNE conversion, stats recorded.
 
     Every converted tensor's round trip is measured against the bf16 representational
     bound (``BF16_ROUND_TRIP_BOUND`` of its amax) and logged per tensor; the worst

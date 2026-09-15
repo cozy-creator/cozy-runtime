@@ -3,7 +3,7 @@
 One thin layer over the existing derivation math in ``.quantization`` — a per-family
 ingest producer is its model class, one ``plan(...)``, and its threshold policy.
 ``quantize`` opens one declared lane transaction, normalizes every plain f32 tensor to
-BF16 as a recorded derivation (#695: fp16 stays fp16; ``keep``-listed components stay
+BF16 as a recorded derivation (FP16 is opt-in; ``keep``-listed components stay
 at source precision; per-tensor round-trip stats recorded on the cut), encodes the
 plan's selected GEMM weights, and runs the tier-1 tripwire INSIDE (per-tensor
 round-trip against the encoding bound, worst relative Frobenius against the declared
@@ -37,9 +37,10 @@ if TYPE_CHECKING:
 class QuantizePlan(msgspec.Struct, frozen=True):
     """One lane intent: BF16 normalization plus ``encoding`` over ``components``' weights.
 
-    ``encoding=None`` is the canonical plain lane (#695): f32 normalizes to bf16,
-    fp16/bf16/encoded tensors inherit, and ``keep``-listed components' f32 tensors
-    inherit at source precision. ``max_relative_frobenius`` is the caller's tier-1
+    ``encoding=None`` is the canonical plain lane (#695): f32 normalizes to bf16
+    by default. ``bf16_sources`` may explicitly include f16 for a BF16 execution
+    lane; other tensors and ``keep``-listed components inherit at source precision.
+    ``max_relative_frobenius`` is the caller's tier-1
     threshold policy over the worst per-tensor round-trip; the encoding's own
     round-trip bound is always enforced underneath it.
     """
@@ -48,6 +49,7 @@ class QuantizePlan(msgspec.Struct, frozen=True):
     encoding: str | None
     max_relative_frobenius: float | None
     keep: tuple[str, ...] = ()
+    bf16_sources: tuple[str, ...] = ("f32",)
 
 
 class QuantizeResult(msgspec.Struct):
@@ -65,9 +67,9 @@ class QuantizeResult(msgspec.Struct):
     new_bytes_written_this_run: int
     saturated_elements_this_run: int
     worst_relative_frobenius: float | None
-    #: f32 tensors held at source precision by the plan's keep list (#695).
+    #: Selected float tensors held at source precision by the plan's keep list.
     kept_keys: int
-    #: worst per-tensor relative Frobenius of the fp32→bf16 cut — the recorded stat.
+    #: Worst per-tensor relative Frobenius of the selected float→bf16 cut.
     normalization_worst_relative_frobenius: float | None
     #: True on the plain lane: the ingest record marks the canonical bf16 lane (#695).
     canonical: bool
@@ -78,14 +80,16 @@ def plan(
     encoding: str | None = None,
     *,
     keep: Sequence[str] = (),
+    bf16_sources: Sequence[str] = ("f32",),
     max_relative_frobenius: float | None = None,
 ) -> QuantizePlan:
     """Build one reviewed lane plan; selection resolves against the source in ``quantize``.
 
     ``keep`` is the ingest config's per-component keep list (#695): a named component's
-    f32 tensors inherit at source precision instead of normalizing to bf16.
+    selected float tensors inherit at source precision instead of normalizing to bf16.
+    ``bf16_sources=("f16", "f32")`` also prepares FP16 adapters ahead of inference.
     """
-    from .quantization import _ENCODINGS
+    from .quantization import _ENCODINGS, bf16_source_dtypes
 
     selected = tuple(components)
     kept = tuple(keep)
@@ -126,7 +130,9 @@ def plan(
                 "max_relative_frobenius must be one finite nonnegative value",
                 code="quantization_plan",
             )
-    return QuantizePlan(selected, encoding, max_relative_frobenius, kept)
+    return QuantizePlan(
+        selected, encoding, max_relative_frobenius, kept, bf16_source_dtypes(bf16_sources)
+    )
 
 
 def quantize(
@@ -216,7 +222,7 @@ def _quantize(
         if preserve_precision
         else plan.keep
     )
-    bf16 = prepare_bf16(structure, keep=keep)
+    bf16 = prepare_bf16(structure, keep=keep, source_dtypes=plan.bf16_sources)
     canonical = plan.encoding is None
     if plan.encoding is None:
         artifact = None
@@ -227,14 +233,14 @@ def _quantize(
         selected = {(tensor.component, tensor.key) for tensor in artifact.tensors}
         targets = bf16_targets(bf16, source="source", excluded=selected)
         for component in artifact.components:
-            # Encoded F16/BF16 tensors keep their loader contract. Only F32 is
-            # normalized to BF16, just like the unselected tensors below.
+            # Encoded tensors follow the same explicit logical-dtype cut as the
+            # unselected tensors. The encoding still reads the original values.
             additions = quantization_additions(plan.encoding, artifact, component)
             combined = {
                 **targets[component].add,
                 **{
                     key: replace(tensor, logical_dtype="bf16")
-                    if tensor.logical_dtype == "f32" and not preserve_precision
+                    if tensor.logical_dtype in plan.bf16_sources and not preserve_precision
                     else tensor
                     for key, tensor in additions.items()
                 },
