@@ -134,7 +134,7 @@ def computation(
     numerical: bytes,
     capture: dict[str, Any] | None = None,
 ) -> bytes:
-    """Same canonical key as the existing client path, excluding its caller and custody."""
+    """Bind the callee's frozen implementation and inputs, excluding caller and custody."""
     inputs = dict(arguments)
     for model in target.declaration.get("models", []):
         parameter = model["path"].removeprefix(target.entrypoint + ".models.")
@@ -142,7 +142,11 @@ def computation(
         if not isinstance(value, dict) or not isinstance(value.get("manifest"), dict):
             raise WorkspaceRefusal("memoized Model argument requires an exact retained manifest")
         inputs[parameter] = {"manifest": value["manifest"]}
-    identity: dict[str, Any] = {"target_digest": target.digest, "inputs": inputs}
+    identity: dict[str, Any] = {
+        "target_digest": target.digest,
+        "installed_receipt_digest": target.prepared_revision["receipt_digest"],
+        "inputs": inputs,
+    }
     if capture is not None:
         identity["capture"] = capture
     base = "sha256:" + hashlib.sha256(canonical_json.encode(identity)).hexdigest()
