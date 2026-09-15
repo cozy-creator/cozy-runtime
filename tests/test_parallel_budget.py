@@ -93,7 +93,8 @@ def test_follower_refuses_invalid_or_larger_decision(decision: dict[str, object]
         leader.send(decision)
         with pytest.raises(RankDivergence, match="invalid group residence ceiling"):
             receive_resident_budget(follower, rank=1, model="base", ceiling=100)
-        assert leader.recv()["ceiling"] == 100
+        offered = leader.recv()
+        assert offered is not None and offered["ceiling"] == 100
     finally:
         follower.close()
         leader.close()
