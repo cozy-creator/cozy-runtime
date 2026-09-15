@@ -557,8 +557,10 @@ class StreamingMP4Encoder:
                 options={
                     "fflags": "+bitexact",
                     "frag_duration": "1000000",
-                    "movflags": "+empty_moov+default_base_moof+frag_keyframe+skip_sidx",
-                    "use_editlist": "0",
+                    # Delay the initial metadata until timestamps are known so the
+                    # edit list can discard AAC encoder priming without moving video.
+                    "movflags": "+empty_moov+delay_moov+default_base_moof+frag_keyframe+skip_sidx",
+                    "use_editlist": "1",
                 },
             )
             self._video = self._container.add_stream("libx264", rate=frame_rate)
@@ -648,9 +650,9 @@ class StreamingMP4Encoder:
             self.audio_sample_rate,
             "flt",
             AAC_FRAME_SAMPLES,
-            # AAC delays its first packet by one codec frame. Offset the submitted PTS so
-            # fragmented MP4 starts both tracks at zero instead of stretching video frame 0.
-            start_pts=self.audio_samples + AAC_FRAME_SAMPLES,
+            # Keep the author's sample clock. The MP4 edit list accounts for the
+            # encoder's negative initial timestamp; it is not an extra PCM frame.
+            start_pts=self.audio_samples,
         ):
             for packet in self._audio.encode(frame):
                 self._container.mux(packet)
