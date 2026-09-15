@@ -141,10 +141,34 @@ def reopen(
                 nested_ref=True,
             ),
         ]
-        requested = {
-            (documents.spell(row.digest), row.length, row.filename) for row in request.wheels
-        }
-        if any((wheel.digest, wheel.length, wheel.filename) not in requested for wheel in wheels):
+        project = (
+            package_prepare._DISTRIBUTION.sub(
+                "-", request.package.package.rsplit("/", 1)[-1]
+            ).lower(),
+            request.package.release,
+        )
+        expected = set()
+        for row in request.wheels:
+            named = package_environment.wheel_name_version(row.filename)
+            if named is None:
+                raise package_prepare.PreparationRefusal(
+                    "local_package_revision_mismatch", "revision wheel filename is invalid"
+                )
+            # Cold preparation verifies import ownership before omitting these
+            # protected image distributions. Every other supplied wheel must remain.
+            if named == project or not package_environment.base_owned_distribution(named[0], base):
+                expected.add((documents.spell(row.digest), row.length, row.filename))
+        supplied = {(wheel.digest, wheel.length, wheel.filename) for wheel in wheels}
+        if (
+            supplied != expected
+            or len(supplied) != len(wheels)
+            or (wheels[0].distribution, wheels[0].version) != project
+            or any(
+                package_environment.wheel_name_version(wheel.filename)
+                != (wheel.distribution, wheel.version)
+                for wheel in wheels
+            )
+        ):
             raise package_prepare.PreparationRefusal(
                 "local_package_revision_mismatch", "installed wheels differ from the revision"
             )

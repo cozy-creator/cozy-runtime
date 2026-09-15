@@ -25,7 +25,7 @@ from cozy_runtime.internal.worker.package_prepare import PreparationRefusal
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
-from test_end_to_end import NO_EXECUTOR, _run
+from test_end_to_end import NO_EXECUTOR, _run, _wheel_rows
 from test_installed_dependencies import _distribution
 from test_job_preparation_isolation import measure, package
 
@@ -37,6 +37,14 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers(snaps
         root = Path(raw)
         environment, request = package(root, "retained")
         _, other_request = package(root, "another")
+        if not snapshot:
+            _, dependency = package(root, "dependency")
+            dependency_path = Path(dependency.wheels[0].path)
+            for closure in (request, other_request):
+                retained_wheels = Path(closure.wheels[0].path).parent
+                shutil.copyfile(dependency_path, retained_wheels / dependency_path.name)
+                closure.ClearField("wheels")
+                closure.wheels.extend(_wheel_rows(list(retained_wheels.glob("*.whl"))))
         dependency_python = None
         if snapshot:
             uv = shutil.which("uv")
@@ -160,6 +168,59 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers(snaps
             inventory = canonical.parse_canonical(installation_path.read_bytes())
             assert "receipt_digest" not in inventory
             assert ("dependency_snapshot" in inventory) is snapshot
+            if not snapshot:
+                # A second valid generation has the same project, but drops one
+                # supplied dependency. Its valid receipt must not cross-bind either.
+                original_inventory = installation_path.read_bytes()
+                placement = inventory["placement_set"]["placements"][0]
+                placement["environment"] = {"local_wheels": []}
+                placement["environment_digest"] = documents.spell(
+                    documents.embedded_document_digest(
+                        placement["environment"], "cozy.worker.v1.Environment"
+                    )
+                )
+                project_digest = placement["development"]["project_wheel"]["ref"]["digest"]
+                material = placement_materialization.package_environment_input(
+                    package_name=request.package.package,
+                    release=request.package.release,
+                    project_wheel=placement["development"]["project_wheel"],
+                    environment=placement["environment"],
+                    environment_digest=placement["environment_digest"],
+                    wheel_paths={
+                        project_digest: next(
+                            Path(row.path)
+                            for row in request.wheels
+                            if documents.spell(row.digest) == project_digest
+                        )
+                    },
+                )
+                missing_dependency = package_environment.materialize(
+                    material, environment, python=image_python(), base=worker.base
+                )
+                assert missing_dependency.content_digest != installed.content_digest
+                assert (
+                    package_environment.open_generation(
+                        environment,
+                        receipt_digest=missing_dependency.receipt_digest,
+                        environment_digest=placement["environment_digest"],
+                        python=image_python(),
+                    ).generation
+                    == missing_dependency.generation
+                )
+                _replace(installation_path, canonical.write(inventory))
+                with pytest.raises(PreparationRefusal, match="local_package_revision_mismatch"):
+                    worker.prepare_local_package(request)
+                _replace(installation_path, original_inventory)
+                inventory = canonical.parse_canonical(original_inventory)
+            original_inventory = installation_path.read_bytes()
+            inventory["placement_set"]["placements"][0]["development"]["project_wheel"][
+                "version"
+            ] = "9.0.0"
+            _replace(installation_path, canonical.write(inventory))
+            with pytest.raises(PreparationRefusal, match="local_package_revision_mismatch"):
+                worker.prepare_local_package(request)
+            _replace(installation_path, original_inventory)
+            inventory = canonical.parse_canonical(original_inventory)
             carrier_paths = [Path(wheel.path) for wheel in request.wheels]
             carriers = [path.read_bytes() for path in carrier_paths]
             for wheel in request.wheels:

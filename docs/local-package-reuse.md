@@ -28,6 +28,12 @@ dependencies requires a new revision/generation, rather than mutating an install
 generation. Its content digest includes the snapshot and remains part of execution
 and memoization identity.
 
+The retained wheel set must contain every supplied project and dependency wheel,
+except protected distributions supplied by the current image, using the same
+classification as cold preparation. Wheel metadata must agree with its filename
+and package identity. Receipt reconstruction uses the installer's distribution
+order for the complete wheel roster.
+
 Missing interface metadata is a recoverable installation miss. Missing job plans
 are regenerated from the verified installed interface. An existing conflicting job
 plan raises `local_package_job_plan_conflict`; uploading wheels cannot repair an

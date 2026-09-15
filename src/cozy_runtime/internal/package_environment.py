@@ -332,6 +332,13 @@ def preflight_environment(
     return base, ordered, tuple(observed)
 
 
+def base_owned_distribution(distribution: str, base: base_observation.Observation) -> bool:
+    """Whether the current worker image owns this protected distribution."""
+    return distribution in base.distribution_versions and base_observation.protected_distribution(
+        distribution
+    )
+
+
 def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
     """Identify a redundant worker-image distribution by its complete import ownership.
 
@@ -342,9 +349,9 @@ def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
 
     if wheel.owner != "custom":
         return False
-    version = base.distribution_versions.get(wheel.distribution)
-    if version is None or not base_observation.protected_distribution(wheel.distribution):
+    if not base_owned_distribution(wheel.distribution, base):
         return False
+    version = base.distribution_versions[wheel.distribution]
     roots = tuple(
         sorted(
             root
@@ -734,12 +741,13 @@ def wheel_receipt_digest(
 ) -> str:
     """Derive a wheel installation receipt from placement and frozen snapshot facts.
 
-    The row order is Input order — the project wheel first, then the supplied local wheels in
-    their document's sorted-by-distribution order — exactly what `_receipt` recorded.
+    Materialization sorts the complete inventory by distribution before publishing
+    its receipt, including the project wheel among the dependency wheels.
     A captured local SDK adds its immutable snapshot ref to the same content identity.
     """
 
     _require_digest(environment_digest, "environment_digest")
+    wheels = sorted(wheels, key=lambda wheel: wheel.distribution)
     project = next((wheel for wheel in wheels if wheel.owner == "project"), None)
     if project is None:
         raise EnvironmentRefusal(
