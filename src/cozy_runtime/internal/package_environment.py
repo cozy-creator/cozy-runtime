@@ -1690,24 +1690,12 @@ def _inspect(
                 raise EnvironmentRefusal(
                     "package_environment_project_wheel_not_pure", "Root-Is-Purelib is not true"
                 )
-            if native_members and root_is_pure != "false":
-                raise EnvironmentRefusal(
-                    "package_environment_native_wheel_metadata_invalid",
-                    f"{wheel.filename} carries native members but Root-Is-Purelib is not false",
-                )
-            if native_members and any(
-                tag.interpreter.startswith("py") or tag.abi == "none" or tag.platform == "any"
-                for tag in declared_tags
-            ):
+            # FFI libraries can be ABI-neutral and installed into purelib (NVIDIA's
+            # wheels use both). Native bytes still require a concrete target platform.
+            if native_members and any(tag.platform == "any" for tag in declared_tags):
                 raise EnvironmentRefusal(
                     "package_environment_native_wheel_tag_not_concrete",
-                    f"{wheel.filename}: native custom wheels require concrete CPython ABI and "
-                    "platform tags",
-                )
-            if native_members and any(".data/" in name for name in names):
-                raise EnvironmentRefusal(
-                    "package_environment_native_install_scheme_forbidden",
-                    f"{wheel.filename}: native wheels may not use a .data install scheme",
+                    f"{wheel.filename}: native custom wheels require concrete platform tags",
                 )
             record_name = dist_infos[0].removesuffix("METADATA") + "RECORD"
             if record_name not in names:

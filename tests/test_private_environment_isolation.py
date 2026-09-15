@@ -472,3 +472,54 @@ def test_wheel_hooks_require_recorded_verified_bytes(tmp_path: Path, damage: str
     wheel.write_bytes(output.getvalue())
     with pytest.raises(environment.EnvironmentRefusal, match="wheel_record_"):
         environment.measure_wheel(wheel, "custom", environment.observe_base())
+
+
+@pytest.mark.parametrize("purelib", ["true", "false"])
+@pytest.mark.parametrize("scheme", ["root", "platlib"])
+def test_platform_shared_library_wheels_need_no_cpython_abi(
+    tmp_path: Path, purelib: str, scheme: str
+) -> None:
+    tag = "py3-none-manylinux_2_17_x86_64"
+    prefix = "" if scheme == "root" else "ffi_payload-1.0.data/platlib/"
+    wheel = _wheel(
+        tmp_path,
+        "ffi_payload",
+        (),
+        b"VALUE=1\n",
+        resources={
+            prefix + "ffi_payload/libffi.so": b"\x7fELFverified platform library",
+            "ffi_payload-1.0.data/data/share/doc/ffi_payload/LICENSE": b"license\n",
+            "ffi_payload-1.0.dist-info/WHEEL": (
+                f"Wheel-Version: 1.0\nRoot-Is-Purelib: {purelib}\nTag: {tag}\n"
+            ).encode(),
+        },
+    )
+    wheel = wheel.rename(wheel.with_name(f"ffi_payload-1.0-{tag}.whl"))
+    item, _ = environment._measure_inspected_wheel(wheel, "custom", environment.observe_base())
+    assert item.native_members == ("ffi_payload/libffi.so",)
+
+
+@pytest.mark.parametrize("platform", ["any", "manylinux_2_17_aarch64"])
+def test_shared_libraries_still_require_a_matching_concrete_platform(
+    tmp_path: Path, platform: str
+) -> None:
+    tag = f"py3-none-{platform}"
+    wheel = _wheel(
+        tmp_path,
+        "ffi_payload",
+        (),
+        b"VALUE=1\n",
+        resources={
+            "ffi_payload/libffi.so": b"\x7fELFverified platform library",
+            "ffi_payload-1.0.dist-info/WHEEL": (
+                f"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: {tag}\n"
+            ).encode(),
+        },
+    )
+    wheel = wheel.rename(wheel.with_name(f"ffi_payload-1.0-{tag}.whl"))
+    base = environment.observe_base()
+    with pytest.raises(
+        environment.EnvironmentRefusal, match=r"(tag_not_concrete|platform_incompatible)"
+    ):
+        item, _ = environment._measure_inspected_wheel(wheel, "custom", base)
+        environment._require_compatible_tags(item.wheel, base)
