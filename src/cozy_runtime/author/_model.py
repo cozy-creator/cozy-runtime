@@ -493,7 +493,8 @@ class Model[PipelineT]:
                     fields=["sampler"],
                 )
         effective = derive_seed(ctx.request_id) if seed is None else seed
-        return RequestView._make(effective, ctx._adapters, self._cozy_schedulers, sampler)
+        adapters = ctx._model_adapters.get(id(self), ctx._adapters)
+        return RequestView._make(effective, adapters, self._cozy_schedulers, sampler)
 
     # ----------------------------------------------------------------- testing
 

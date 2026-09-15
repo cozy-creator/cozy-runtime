@@ -17,6 +17,7 @@ from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
 from cozy_runtime.author._capture import ActivationCapture, ExecutionObservation
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
+from cozy_runtime.author._model_bindings import lower_bindings, restore_bindings
 from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
 
 P = ParamSpec("P")
@@ -135,6 +136,7 @@ class _CallType:
     export: str
     request: type[msgspec.Struct]
     result: type[msgspec.Struct]
+    model_paths: tuple[tuple[str, ...], ...] = ()
 
 
 class PendingCall[R](Awaitable[R]):
@@ -225,16 +227,20 @@ class _Broker:
                     ]
                 return _input_ref(value, ctx.request_id)
 
-            plain = msgspec.to_builtins(dict(arguments), enc_hook=asset_value)
+            arguments, selected = lower_bindings(arguments, binding.model_paths)
+            plain = msgspec.to_builtins(arguments, enc_hook=asset_value)
             request = msgspec.convert(
                 plain, type=binding.request, dec_hook=asset_dec_hook, strict=True
             )
             payload = canonical_json.encode(
-                msgspec.to_builtins(
-                    request,
-                    enc_hook=lambda value: (
-                        value.ref if isinstance(value, (Asset, Tree)) else asset_value(value)
+                restore_bindings(
+                    msgspec.to_builtins(
+                        request,
+                        enc_hook=lambda value: (
+                            value.ref if isinstance(value, (Asset, Tree)) else asset_value(value)
+                        ),
                     ),
+                    selected,
                 )
             )
         except (TypeError, ValueError, msgspec.ValidationError) as exc:

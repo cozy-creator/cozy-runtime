@@ -11,10 +11,12 @@ import re
 import stat
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import (
+    adapters,
     base_observation,
     canonical,
     derive_child,
@@ -828,6 +830,21 @@ def prepare_unpublished_placement(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class NativeAdapterSelection:
+    """Local preparation facts whose source is held by the native call owner.
+
+    This is deliberately not a DownloadAdapterRef: no Hub repository or download
+    capability is invented for an unpublished retained artifact.
+    """
+
+    component: str
+    manifest: str
+    manifest_length: int
+    source_component: str
+    scale: str
+
+
 def prepare_model_placement(
     *,
     prepared: Mapping[str, Any],
@@ -837,6 +854,7 @@ def prepare_model_placement(
     tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
     models: Sequence[Any] = (),
+    native_adapters: Mapping[str, Sequence[NativeAdapterSelection]] = {},
 ) -> pb.PreparePackageSetResult:
     """Derive new Model bindings from either origin's exact immutable preparation."""
     package = prepared.get("package") or prepared.get("development") or {}
@@ -848,6 +866,11 @@ def prepare_model_placement(
             "prepared_placement_native_models_invalid",
             "native model slots must be unique and sorted",
         )
+    if (
+        set(native_adapters) - set(slots)
+        or len(models) + len(slots) + sum(len(rows) for rows in native_adapters.values()) > 32
+    ):
+        raise PreparationRefusal("adapter_selection", "native adapters exceed selected slots/bound")
     models.extend(
         {
             "package": str(package["package"]),
@@ -855,6 +878,11 @@ def prepare_model_placement(
             "model": row.model,
             "manifest": documents.spell(row.manifest.digest),
             "manifest_length": row.manifest.length,
+            **(
+                {"adapters": [documents.body(adapter) for adapter in row.adapters]}
+                if row.adapters
+                else {}
+            ),
         }
         for row in native_models
     )
@@ -882,6 +910,7 @@ def prepare_model_placement(
         interface_body,
         package_name=str(package.get("package", "")),
         selections=models,
+        native_adapters=native_adapters,
         tensorfs_root=tensorfs_root,
         verified=verified,
         derive=_deriver(installed, str(interface_body.get("application", ""))),
@@ -1220,6 +1249,7 @@ def _entrypoints(
     tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
     derive: Deriver | None,
+    native_adapters: Mapping[str, Sequence[NativeAdapterSelection]] = {},
 ) -> tuple[list[pb.Model], list[pb.Entrypoint]]:
     rows = body.get("entrypoints")
     if not isinstance(rows, list):
@@ -1278,8 +1308,17 @@ def _entrypoints(
             constructed = derive(
                 path, model["config_bytes"], model["assets"], model["tensor_dtypes"]
             )
+            adapter_models, adapter_slots = _slot_adapters(
+                model["selection"],
+                constructed,
+                tensorfs_root,
+                len(models),
+                native=native_adapters.get(path, ()),
+            )
+            models.extend(adapter_models)
             slots.append(
                 pb.Slot(
+                    adapters=adapter_slots,
                     slot=path.removeprefix(prefix),
                     reference_model_id=model_id,
                     # WHAT THE DERIVE CONSTRUCTED, in construction order (D9) — never the
@@ -1304,6 +1343,10 @@ def _entrypoints(
         raise PreparationRefusal("package_prepare_interface_invalid", "duplicate entrypoint")
     unbound = sorted(set(selected) - described_slots)
     if unbound:
+        if any(selected[path]["selection"].get("adapters") for path in unbound):
+            raise PreparationRefusal(
+                "adapter_job_unsupported", "LoRA bindings currently require a serving model slot"
+            )
         # A JOB's model slot is legitimately unbound here. A job has no placement and no
         # residency: its Model parameter is an attempt-held, derive-only view of one
         # TensorFS Manifest, so the selection exists to admit those bytes to this pod,
@@ -1316,7 +1359,94 @@ def _entrypoints(
                 f"nothing binds {stranded}: no job declares them, and no entrypoint that "
                 "declares them had its whole slot set selected",
             )
+    models.sort(key=lambda row: row.id)
     return models, out
+
+
+def _slot_adapters(
+    selection: Mapping[str, Any],
+    components: Sequence[str],
+    root: Path | None,
+    first_id: int,
+    *,
+    native: Sequence[NativeAdapterSelection] = (),
+) -> tuple[list[pb.Model], list[pb.ModelAdapter]]:
+    requested = selection.get("adapters", [])
+    if not isinstance(requested, list):
+        raise PreparationRefusal("adapter_selection", "adapter selections must be an ordered list")
+    if native:
+        if requested:
+            raise PreparationRefusal(
+                "adapter_selection", "one adapter stack cannot have two origins"
+            )
+        # Labels below identify local native manifests; no downloader sees these rows.
+        requested = [
+            {
+                "component": row.component,
+                "manifest": row.manifest,
+                "model": "native/" + row.manifest.removeprefix("sha256:"),
+                "source_component": row.source_component,
+                "scale": row.scale,
+            }
+            for row in native
+        ]
+    if not requested:
+        return [], []
+    if root is None:
+        raise PreparationRefusal("adapter_store_absent", "adapter selection requires TensorFS")
+    store = fill.open_store(fill.tensorfs_module(), root)
+    models: list[pb.Model] = []
+    slots: list[pb.ModelAdapter] = []
+    resolved: list[adapters.AdapterSelection] = []
+    for index, row in enumerate(requested):
+        required = {"component", "model", "manifest", "source_component", "scale"}
+        if (
+            not isinstance(row, dict)
+            or not required <= row.keys()
+            or set(row) - required - {"release", "lane"}
+        ):
+            raise PreparationRefusal("adapter_selection", "adapter selection fields are incomplete")
+        repo, release, lane = row["model"], row.get("release", ""), row.get("lane", "")
+        if len(repo.split("/")) != 2 or not all(repo.split("/")) or bool(release) != bool(lane):
+            raise PreparationRefusal("adapter_selection", "adapter repository/release is invalid")
+        digest = row["manifest"]
+        documents.raw(digest)
+        adapters.parse_scale(row["scale"])
+        raw = bytes(store.manifest(digest)["manifest"])
+        if native and len(raw) != native[index].manifest_length:
+            raise PreparationRefusal("adapter_manifest_mismatch", "retained adapter length changed")
+        if documents.spell(documents.digest_of(raw)) != digest:
+            raise PreparationRefusal("adapter_manifest_mismatch", digest)
+        if release:
+            _resolved_manifest_length(
+                store.resolve_release(*repo.split("/"), release, lane), digest, len(raw), repo
+            )
+        store.acquire_cozytensors(digest).release()
+        model_id = f"adapter-{first_id + index:04d}"
+        models.append(
+            pb.Model(
+                id=model_id,
+                repo=repo,
+                version=release,
+                lane=lane,
+                manifest=pb.Ref(digest=documents.raw(digest), length=len(raw)),
+            )
+        )
+        slots.append(
+            pb.ModelAdapter(
+                component=row["component"],
+                model_id=model_id,
+                source_component=row["source_component"],
+                scale=row["scale"],
+            )
+        )
+        resolved.append(
+            adapters.AdapterSelection(
+                row["component"], digest, row["source_component"], row["scale"]
+            )
+        )
+    adapters.inspect(root, resolved, {component: selection["manifest"] for component in components})
+    return models, slots
 
 
 def _stage_job_plans(

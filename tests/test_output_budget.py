@@ -180,7 +180,9 @@ def test_worker_command_keeps_intermediate_room_for_a_small_final_report(tmp_pat
         job=None,
         spec=spec_for(7, 11),
         trees={},
-        declared=SimpleNamespace(entrypoint="report", max_input_bytes=64 << 20),
+        declared=SimpleNamespace(
+            entrypoint="report", max_input_bytes=64 << 20, model_bindings=lambda: ()
+        ),
         plan=SimpleNamespace(placement="cpu", headroom_bytes=0, scope_headroom_bytes={}),
     )
     command = AttemptEngine._command(
