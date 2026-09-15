@@ -373,54 +373,18 @@ describe disagrees with them. `package_interface_digest` is SHA-256 over those c
 
 ### Per-package uv environments
 
-`internal/package_environment.py` is the rental materializer. The image already contains Python,
-cozy-runtime, TensorFS, and—on accelerator profiles—Torch/CUDA. Each placement gets one uv
-venv created from that exact base interpreter with system site packages visible. uv installs only
-the deterministic project wheel and exact package dependency wheels with offline, no-index,
-no-dependency, and no-build semantics. Python, Torch/CUDA, cozy-runtime, and TensorFS are never
-installed a second time inside a rental.
+Every published package, editable project and unpublished script must use a private
+uv environment with its complete selected dependency closure, locally and remotely.
+Baked Python distributions are reuse optimizations, not package version constraints.
+The accepted migration and mandatory development gates are in
+[Package dependency isolation](docs/package-dependency-isolation.md).
 
-Runtime observes the interpreter it will actually execute once per worker boot: CPython ABI,
-Linux architecture/glibc, uv, standard-library roots, every installed distribution version for
-dependency resolution, and import-root ownership for the protected Python/Torch/Triton/CUDA/
-NVIDIA/cozy-runtime/TensorFS families plus msgspec, Runtime's public interface ABI. Packages may
-still carry their own incompatible ordinary dependencies when the selected base does not own that
-distribution.
-Runtime measures each arriving wheel's real ZIP roots and rejects protected distribution/root
-shadowing, duplicate package roots, incompatible tags, and unsatisfied requirements before uv
-runs. No image inventory document or caller-authored base fact participates.
-
-Runtime hashes each arriving package wheel once. A worker-boot-local verified-file receipt binds
-its digest/length to device, inode, size, mtime and ctime; stable reuse reads that receipt, while a
-stat change or worker restart re-hashes before trust. Package admission consumes the receipt instead
-of hashing the same wheel again. A venv content identity contains the interpreter ABI/platform,
-exact uv version, and sorted package-owned wheel digests. It deliberately excludes observed base
-packages: a compatible Runtime patch rechecks declared requirements and reuses the venv,
-while a real requirement or ABI conflict refuses. Creation is stage-then-rename and no partial venv
-is selectable.
-
-The rented-pod worker stays root and non-dumpable; the exec-first trampoline sets `no_new_privs`
-and drops package execution to uid/gid 65533. Runtime keeps control state in memory because its
-pod-supervisor owns the durable replay ledger. Receipts, acquisition cache, and worker credentials
-remain root-only. Content is root-owned/read-only. The worker keeps no scratch tree: an attempt's
-spool and a derived interface's handoff live under its `run/` root for exactly one attempt or
-call, and bytes a job stages are the owner's `tmp/<request-id>/`, granted per run and removed by
-the owner when the request settles. A worker that cannot perform the
-identity split refuses before binding. Native/local development keeps its explicit same-user lane.
-Base bytecode is baked in the image and uv compiles package bytecode during installation. Any later
-bytecode is directed to the worker-boot/content cache outside the read-only venv. The executor starts
-with the venv's own Python; it receives no package `PYTHONPATH` or appended import directory.
-
-Local installed packages use the same ordinary venv boundary but not the rental base policy.
-Creator resolves the full lock with uv, so two local packages may carry different Python or Torch
-families. `prepare-package --environment-python <venv>/bin/python --package-interface
-<download>/metadata/package-interface.json` validates that existing venv and the exact published
-interface, and recognizes exact non-protected project/dependency versions as contents of that
-completed package environment, not as worker-image distributions. A version disagreement or
-protected-family/root collision still refuses. It then authors the PlacementSet without installing
-another environment. Local `serve`
-receives the same `--environment-python`; `--install-root` is reserved for rental
-materialization and the two flags are mutually exclusive.
+The current implementation still contains inherited-system-site and protected-family
+policies being replaced under proto-053/cr-161. Do not use those restrictions as a
+contract for new code. Preserve atomic generations, immutable byte custody, storage
+admission and executor process/credential isolation while removing image-dependent
+resolution. Exact captured locks preserve reproducibility; authors declare compatible
+ranges. Dependency repair must solve and validate the full closure before dispatch.
 
 A model has exactly three lifecycle methods — `load(loader)`, optional `warm(ctx)`,
 `unload(loader)` (model-lifecycle.md, #708). `warm` is the author's one place for post-fill,
