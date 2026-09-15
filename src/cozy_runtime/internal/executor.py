@@ -427,7 +427,6 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.encoding",
     "cozy_runtime.internal.fill",
     "cozy_runtime.internal.fusion",
-    "cozy_runtime.internal.fusion_install",
     "cozy_runtime.internal.planfacts",
     "cozy_runtime.internal.warm",
     "cozy_runtime.internal.probe",
@@ -1134,6 +1133,14 @@ class Executor:
 
         self.torch = torch
         stage("torch_import")
+        # Kernel integration imports may query the CUDA device (for example,
+        # Diffusers importing TorchAO's optional Triton kernels). Runtime must
+        # establish the selected device before loading those modules.
+        refused = self._initialize_device(torch)
+        if refused is not None:
+            return refused
+        cuda_ms = (time.perf_counter() - started) * 1000
+        stage("cuda_init")
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
         from cozy_runtime.author._model import component_use
@@ -1169,11 +1176,6 @@ class Executor:
         from cozy_runtime.internal.warm import WarmFailed
 
         stage("runtime_imports")
-        refused = self._initialize_device(torch)
-        if refused is not None:
-            return refused
-        cuda_ms = (time.perf_counter() - started) * 1000
-        stage("cuda_init")
         changed = _env_changes()
         if changed:
             return {

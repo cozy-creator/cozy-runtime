@@ -332,6 +332,13 @@ def preflight_environment(
     return base, ordered, tuple(observed)
 
 
+def base_owned_distribution(distribution: str, base: base_observation.Observation) -> bool:
+    """Whether the current worker image owns this protected distribution."""
+    return distribution in base.distribution_versions and base_observation.protected_distribution(
+        distribution
+    )
+
+
 def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
     """Identify a redundant worker-image distribution by its complete import ownership.
 
@@ -342,9 +349,9 @@ def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
 
     if wheel.owner != "custom":
         return False
-    version = base.distribution_versions.get(wheel.distribution)
-    if version is None or not base_observation.protected_distribution(wheel.distribution):
+    if not base_owned_distribution(wheel.distribution, base):
         return False
+    version = base.distribution_versions[wheel.distribution]
     roots = tuple(
         sorted(
             root
@@ -466,18 +473,32 @@ def materialize(
             "rented execution requires bounded exact dependency wheels, not an online boot resolve",
         )
     if receipt_path.exists():
-        installed = open_generation(
-            root,
-            receipt_digest=receipt_digest,
-            environment_digest=source.environment_digest,
-            reused=True,
-            python=python,
-        )
-        _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
-        _verify_prefix_resources(installed.generation, inspected)
-        if exact_dependencies:
-            _verify_installed_requirements(installed.site_packages, inspected, observed)
-        return installed
+        try:
+            installed = open_generation(
+                root,
+                receipt_digest=receipt_digest,
+                environment_digest=source.environment_digest,
+                reused=True,
+                python=python,
+            )
+        except EnvironmentRefusal as exc:
+            if exc.code != "package_environment_content_absent":
+                raise
+            # The receipt is valid but its generation may have been evicted. Rebuild
+            # only an absent exact generation from the freshly verified wheels.
+            # An existing incomplete/malformed generation is never overwritten.
+            try:
+                final.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise
+        else:
+            _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+            _verify_prefix_resources(installed.generation, inspected)
+            if exact_dependencies:
+                _verify_installed_requirements(installed.site_packages, inspected, observed)
+            return installed
     reused = final.exists()
     with storage_admission.admit(_wheel_write_bound(root, inspected, reused=reused)):
         _require_owned_root(root)
@@ -730,21 +751,26 @@ def wheel_receipt_digest(
     *,
     wheels: Sequence[Wheel],
     environment_digest: str,
+    dependency_snapshot: Mapping[str, Any] | None = None,
 ) -> str:
-    """The receipt digest a wheel-sourced materialize published, from placement facts alone.
+    """Derive a wheel installation receipt from placement and frozen snapshot facts.
 
-    The row order is Input order — the project wheel first, then the supplied local wheels in
-    their document's sorted-by-distribution order — exactly what `_receipt` recorded."""
+    Materialization sorts the complete inventory by distribution before publishing
+    its receipt, including the project wheel among the dependency wheels.
+    A captured local SDK adds its immutable snapshot ref to the same content identity.
+    """
 
     _require_digest(environment_digest, "environment_digest")
+    wheels = sorted(wheels, key=lambda wheel: wheel.distribution)
     project = next((wheel for wheel in wheels if wheel.owner == "project"), None)
     if project is None:
         raise EnvironmentRefusal(
             "package_environment_project_wheel_absent", "no project wheel fact"
         )
-    content_bytes = canonical.write(
-        _content_identity(wheels, base.interpreter_identity, base.uv_version)
-    )
+    identity = _content_identity(wheels, base.interpreter_identity, base.uv_version)
+    if dependency_snapshot is not None:
+        identity["dependency_snapshot"] = dict(dependency_snapshot)
+    content_bytes = canonical.write(identity)
     receipt = {
         "content_digest": _sha(content_bytes),
         "environment_digest": environment_digest,

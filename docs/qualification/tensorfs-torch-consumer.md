@@ -1,8 +1,8 @@
 # TensorFS Torch API consumer
 
-This branch is stacked on the native PEFT integration at `734139c2`. It requires
-the new TensorFS 0.3.44 API; it must not be merged with a lock file that still
-resolves 0.3.43. No worker, CLI, database, checkpoint or published artifact changes
+This branch is stacked on the refreshed native PEFT integration at `4f2d8c3d`,
+including Runtime master `cab0c8eb`. It requires the new TensorFS 0.3.44 API;
+the lock now resolves the published release. No worker, CLI, database, checkpoint changes
 as part of this source patch.
 
 Stored weights now go through `tensorfs.from_parts`, with the checkpoint's exact
@@ -34,8 +34,9 @@ full Runtime streamed CUDA fill and full H3 serving still require their own
 coherent worker qualification. Earlier isolated H100 measurements belong to the
 frozen pre-consumer artifacts, not this new source.
 
-The Runtime repository exposes no private sibling source credential in its
-repository secret inventory. Remote dependency resolution and the regenerated
-lock remain pending the real TensorFS 0.3.44 release (or a coordinated reproducible
-source/artifact route). The qualification wheel is not vendored in Git and no
-machine-local path override is committed.
+TensorFS 0.3.44 is published from source `87f972a9`. The portable wheel SHA256 is
+`5879f3e065753415ddd24955ec57009d68520954ab4910f5336ccec09e315238`.
+The regenerated lock uses the ordinary registry artifact. No qualification wheel
+is vendored in Git and no machine-local path override is committed. Final source
+CI and Runtime streamed CUDA qualification remain separate gates; the user ended
+the paid qualification window before the latter probe ran.
