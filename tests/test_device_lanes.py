@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+from conftest import sample_python
 from cozy_runtime.internal import accel, child_env, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
@@ -102,7 +103,7 @@ def _slice(
                 "build_id": revision,
                 "application": str(body["application"]),
                 "package_interface": str(interface_path),
-                "python": sys.executable,
+                "python": str(sample_python()),
                 "environment_content_digest": revision,
                 "job": "marco_job",
                 "publishes": False,
@@ -149,7 +150,9 @@ def _slice(
             package_interface_document=body if kind == "entrypoint" else None,
             project=PACKAGE,
             development_tensorfs_root=config.cozy_home / "tensorfs",
-            options=WorkerOptions(root=workspace / "worker", devices=devices),
+            options=WorkerOptions(
+                root=workspace / "worker", devices=devices, python=str(sample_python())
+            ),
             record_owner_hook=capture,
         )
     return outcome, seals

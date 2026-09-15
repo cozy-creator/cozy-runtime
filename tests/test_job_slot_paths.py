@@ -146,11 +146,20 @@ def _selection(slot: str, manifest: str) -> dict[str, Any]:
 
 def _installed(tmp_path: Path) -> package_environment.InstalledEnvironment:
     """A metadata-backed tenant overlay using the real test interpreter and SDK."""
+    import subprocess
+
+    from conftest import authored_python
+    from cozy_runtime.internal import _installed_dependencies
+
     generation = tmp_path / "generation"
-    (generation / "bin").mkdir(parents=True)
-    python = generation / "bin" / "python"
-    python.symlink_to(sys.executable)
-    site_packages = generation / "lib"
+    subprocess.run(
+        ["uv", "venv", "--python", sys.executable, str(generation)], check=True, capture_output=True
+    )
+    python = generation / "bin/python"
+    (site_packages,) = generation.glob("lib/python*/site-packages")
+    _installed_dependencies.snapshot(
+        authored_python(), generation, {"tenant"}, cache=tmp_path.parent / "sdk-cache"
+    )
     metadata = site_packages / "tenant-1.0.0.dist-info"
     metadata.mkdir(parents=True)
     (metadata / "METADATA").write_text(
