@@ -1121,6 +1121,7 @@ class Worker:
         self.model_source_operations: set[str] = set()
         self.restart_requested = False
         self.restart_sequence = 0
+        self.idle_restart_pending = threading.Event()
         if options.owns_tensorfs_store:
             try:
                 self.model_source_operations.update(
@@ -3696,6 +3697,10 @@ class Worker:
             else:
                 self.note("restart_refused", "worker update refused while execution is active")
             return accepted
+
+    def schedule_idle_restart(self) -> None:
+        """Signal handlers only wake the supervisor thread; they cannot reenter admission."""
+        self.idle_restart_pending.set()
 
     def shutdown_from_stream(self) -> None:
         self.request_stop()

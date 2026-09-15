@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -11,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from cozy_runtime.cli.runtime_worker import _restart_handler, _watch_supervisor
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -48,6 +51,52 @@ def test_runtime_cli_reports_guarded_restart_capability() -> None:
         ).stdout
     )
     assert set(selected) == {"distribution", "next"}
+
+
+def test_real_hup_cannot_reenter_main_thread_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker, claim = _worker(tmp_path)
+    read, write = os.pipe()
+    entered = threading.Event()
+    guarded_restart = worker.request_idle_restart
+
+    def observed_guard() -> bool:
+        entered.set()
+        return guarded_restart()
+
+    monkeypatch.setattr(worker, "request_idle_restart", observed_guard)
+    previous = signal.signal(signal.SIGHUP, _restart_handler(worker))
+    watcher = threading.Thread(
+        target=_watch_supervisor,
+        args=(worker, worker.request_stop, read),
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        # A real signal interrupts the main thread while it owns the reentrant lock.
+        # The watcher must wait for its admission to commit before deciding idle/busy.
+        with worker.control_lock:
+            os.kill(os.getpid(), signal.SIGHUP)
+            assert entered.wait(5)
+            assert not worker.stop.is_set()
+            worker.submit_execution(claim, "root", b"c" * 32, offer(job=False))
+        with worker.control_lock:
+            pass
+        worker.request_stop()
+        watcher.join(5)
+        assert not watcher.is_alive()
+        verdict = json.loads((worker.root / "restart-status.json").read_bytes())
+        assert verdict["status"] == "busy" and verdict["active_executions"] == 1
+        assert not worker.restart_requested
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+        worker.request_stop()
+        watcher.join(5)
+        os.close(read)
+        os.close(write)
+        worker.shutdown()
 
 
 def test_queued_detached_root_refuses_update_then_can_finish(tmp_path: Path) -> None:

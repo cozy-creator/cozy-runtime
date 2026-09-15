@@ -164,20 +164,9 @@ def _run(config: WorkerHostConfig) -> int:
     def stop_signal(_signum: int, _frame: object) -> None:
         stop_worker()
 
-    def restart_signal(_signum: int, _frame: object) -> None:
-        # Only the root operator can signal this process. The supervisor watcher
-        # closes transport outside the signal handler after noticing the stop event.
-        try:
-            worker.request_idle_restart()
-        except Exception as exc:
-            # An unreadable activity journal cannot turn an idle-only update into a crash.
-            worker.note(
-                "restart_refused", f"idle restart check failed: {type(exc).__name__}: {exc}"
-            )
-
     signal.signal(signal.SIGTERM, stop_signal)
     signal.signal(signal.SIGINT, stop_signal)
-    signal.signal(signal.SIGHUP, restart_signal)
+    signal.signal(signal.SIGHUP, _restart_handler(worker))
     threading.Thread(
         target=_watch_supervisor,
         args=(worker, stop_worker),
@@ -263,17 +252,36 @@ def _arm_supervisor_lifetime() -> None:
         )
 
 
-def _watch_supervisor(worker: Worker, stop: Callable[[], None]) -> None:
+def _restart_handler(worker: Worker) -> Callable[[int, object], None]:
+    def restart_signal(_signum: int, _frame: object) -> None:
+        # The supervisor takes the lock on another thread; signals cannot reenter its RLock.
+        worker.schedule_idle_restart()
+
+    return restart_signal
+
+
+def _watch_supervisor(
+    worker: Worker, stop: Callable[[], None], descriptor: int = SUPERVISOR_STOP_FD
+) -> None:
     """EOF stops cooperatively; data is a structural refusal, never a command."""
 
-    os.set_blocking(SUPERVISOR_STOP_FD, False)
+    os.set_blocking(descriptor, False)
     poller = select.poll()
-    poller.register(SUPERVISOR_STOP_FD, select.POLLIN | select.POLLHUP | select.POLLERR)
+    poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
     while not worker.stop.is_set():
+        if worker.idle_restart_pending.is_set():
+            worker.idle_restart_pending.clear()
+            try:
+                worker.request_idle_restart()
+            except Exception as exc:
+                # Unreadable activity cannot turn an idle-only update into a process crash.
+                worker.note(
+                    "restart_refused", f"idle restart check failed: {type(exc).__name__}: {exc}"
+                )
         if not poller.poll(250):
             continue
         try:
-            data = os.read(SUPERVISOR_STOP_FD, 1)
+            data = os.read(descriptor, 1)
         except BlockingIOError:
             continue
         if data:
