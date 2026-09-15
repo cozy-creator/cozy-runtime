@@ -240,6 +240,7 @@ class Surface:
     never off the kind (§2) — a job that declares neither cannot be granted a destination."""
     demand_bound: Bound | None = None
     preflight: PreflightSpec | None = None
+    internal: bool = False
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d). Hidden callables stay in the local registry but
     are absent from the package interface, so no binding is staged and no request reaches them."""
@@ -350,6 +351,7 @@ def analyze(
     demand_bound: Bound | None = None,
     preflight: Callable[..., object] | None = None,
     hidden: bool = False,
+    internal: bool = False,
     invocable: bool = False,
     memoize: bool = False,
     model_defaults: Mapping[str, DefaultLadder] | None = None,
@@ -539,6 +541,7 @@ def analyze(
         demand_bound=demand_bound,
         preflight=spec,
         hidden=hidden,
+        internal=internal,
         invocable=invocable,
         memoize=memoize,
         model_defaults=model_defaults or {},

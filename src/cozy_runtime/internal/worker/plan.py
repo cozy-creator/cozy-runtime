@@ -373,6 +373,7 @@ class DeclaredBinding:
     model_parameter_name: str
     release: str
     models: tuple[ModelBinding, ...] = ()
+    internal: bool = False
     environment_digest: str = ""
     """The exact inline Environment selected beside this binding."""
     application: str = ""

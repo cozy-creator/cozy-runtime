@@ -1251,6 +1251,7 @@ def development_placement_documents(
             models=model_set,
             application=str(interface.get("application", "")),
             interface_path=interface_path,
+            internal=bool(entry.get("internal", False)),
             development_project=str(project) if project is not None else "",
             store=first.store if first is not None else "",
             variant=first.variant if first is not None else "",

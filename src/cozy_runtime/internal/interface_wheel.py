@@ -18,7 +18,7 @@ from packaging.version import Version
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical, invocable_interface, package_interface
 
-GENERATOR_ABI = "cozy.interface-generator/5"
+GENERATOR_ABI = "cozy.interface-generator/6"
 MAX_IMPLEMENTATION_WHEEL = 256 << 20
 _DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
@@ -30,7 +30,7 @@ def generate(interface: bytes) -> dict[str, bytes]:
     modules: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
         for entry in document[collection]:
-            if "invocable" in entry:
+            if "invocable" in entry and not entry.get("internal", False):
                 metadata = invocable_interface.validate(
                     entry["invocable"], entry["request"], entry["result"], kind=kind
                 )

@@ -333,6 +333,9 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
     "case",
     [
         "normal",
+        "internal",
+        "internal_root",
+        "internal_serving",
         "pause",
         "loss",
         "cycle",
@@ -417,7 +420,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 "bundle: Tree, z_rejected: Annotated[FileAsset, "
                 "AssetBound(max_bytes=1)]) -> Result:",
             ).replace("bundle=first.bundle)", "bundle=first.bundle, z_rejected=first.report)")
-        if case == "serving":
+        if case in ("serving", "internal_serving"):
             source = (
                 SOURCE.replace("@invocable(memoize=True)", "@invocable")
                 .replace("app.job(leaf)", "app.entrypoint(leaf)")
@@ -470,6 +473,12 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             )
         if case == "cycle":
             source = source.replace("first = await leaf(n=n)", "first = await compose(n=n)")
+        if case in ("internal", "internal_root", "internal_serving"):
+            source = source.replace("app.job(leaf)", "app.job(leaf, internal=True)")
+            source = source.replace("app.entrypoint(leaf)", "app.entrypoint(leaf, internal=True)")
+            source = source.replace("app.job(compose)", "app.job(compose, internal=True)")
+        if case == "internal_root":
+            source = source.replace("@app.job\n", "@app.job(internal=True)\n")
         if case == "capacity":
             from cozy_runtime.internal.worker import machine_slots
 
@@ -614,18 +623,24 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             state.job.orchestration = True
             channel = grpc.insecure_channel((root / "address").read_text().strip())
             client = rpc.WorkerControlStub(channel)
-            client.SubmitMachineExecution(
-                pb.MachineExecutionSubmit(
-                    claim=claim,
-                    submission_id="root",
-                    capture_digest=capture_digest,
-                    capture_canonical_bytes=captured,
-                    offer=offered.attempt_offer,
-                    prepared_state=state,
-                    payload_canonical_bytes=canonical_json.encode({}),
-                    max_attempts=2 if case == "loss" else 1,
-                )
+            submitted = pb.MachineExecutionSubmit(
+                claim=claim,
+                submission_id="root",
+                capture_digest=capture_digest,
+                capture_canonical_bytes=captured,
+                offer=offered.attempt_offer,
+                prepared_state=state,
+                payload_canonical_bytes=canonical_json.encode({}),
+                max_attempts=2 if case == "loss" else 1,
             )
+            if case == "internal_root":
+                with pytest.raises(grpc.RpcError, match="internal_callable") as refused:
+                    client.SubmitMachineExecution(submitted)
+                assert refused.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                assert worker.executions is not None
+                assert not worker.executions.owns("owner", "root")
+                return
+            client.SubmitMachineExecution(submitted)
             if case == "model_sequence":
                 while not (root / "between-children").exists():
                     assert thread.is_alive() and time.monotonic() < deadline
@@ -802,7 +817,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             assert not worker.connected.is_set()
             assert worker.workspace is not None
             with worker.workspace.locked() as db:
-                if case == "serving":
+                if case in ("serving", "internal_serving"):
                     logs = [
                         canonical_json.decode(row["body"])
                         for row in db.execute("SELECT body FROM execution_events WHERE kind='log'")
@@ -828,7 +843,14 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     if case == "model_sequence"
                     else 4
                     if case
-                    in ("model", "serving", "serving_model", "byte_inputs", "byte_inputs_serving")
+                    in (
+                        "model",
+                        "serving",
+                        "internal_serving",
+                        "serving_model",
+                        "byte_inputs",
+                        "byte_inputs_serving",
+                    )
                     else 3
                 )
                 assert db.execute("SELECT count(*) FROM execution_calls").fetchone()[0] == (
@@ -840,7 +862,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     else 3
                 )
                 assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == (
-                    2 if case == "source" else 0 if case == "serving" else 1
+                    2 if case == "source" else 0 if case in ("serving", "internal_serving") else 1
                 )
         finally:
             worker.request_stop()

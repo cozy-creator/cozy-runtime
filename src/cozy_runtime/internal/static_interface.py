@@ -239,8 +239,12 @@ _SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
 #: A fold carries no local names unless a comprehension binds its own target.
 _NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
-_ENTRYPOINT_KEYWORDS = frozenset({"name", "preflight", "demand", "hidden", "memoize", "defaults"})
-_JOB_KEYWORDS = frozenset({"name", "publishes", "emits_media", "weights", "demand", "defaults"})
+_ENTRYPOINT_KEYWORDS = frozenset(
+    {"name", "preflight", "demand", "hidden", "memoize", "defaults", "internal"}
+)
+_JOB_KEYWORDS = frozenset(
+    {"name", "publishes", "emits_media", "weights", "demand", "defaults", "internal"}
+)
 
 
 # -------------------------------------------------------------------------- the reader
@@ -1126,6 +1130,7 @@ class Registration:
     invocable: bool = False
     memoize: bool = False
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
+    internal: bool = False
 
 
 def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
@@ -1417,6 +1422,8 @@ def _registration(
     allowed = _ENTRYPOINT_KEYWORDS if method == "entrypoint" else _JOB_KEYWORDS
     name = fn.name
     publishes = False
+    internal = False
+    hidden = False
     weights: tuple[author.WeightsOutput, ...] = ()
     for keyword in keywords:
         if keyword.arg not in allowed:
@@ -1450,7 +1457,11 @@ def _registration(
         elif keyword.arg == "name":
             name = str(value)
         elif keyword.arg == "hidden" and value is True:
-            return None
+            hidden = True
+        elif keyword.arg == "internal":
+            if type(value) is not bool:
+                reader.refuse(module, keyword.value, "internal must be a boolean")
+            internal = value
         elif keyword.arg == "publishes":
             publishes = bool(value)
         elif keyword.arg == "memoize":
@@ -1460,6 +1471,10 @@ def _registration(
         elif keyword.arg == "weights":
             assert isinstance(value, tuple)
             weights = tuple(value)
+    if hidden and internal:
+        reader.refuse(module, fn, "an internal callable cannot also be hidden")
+    if hidden:
+        return None
     return Registration(
         function_module,
         fn,
@@ -1470,6 +1485,7 @@ def _registration(
         invocable,
         memoize,
         default_models,
+        internal,
     )
 
 
@@ -1505,7 +1521,10 @@ def _parameter_annotation(
 
 def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
     if registration.invocable:
-        return static_invocable.build(reader, registration)
+        doc = static_invocable.build(reader, registration)
+        if registration.internal:
+            doc["internal"] = True
+        return doc
     module, fn = registration.module, registration.fn
     if fn.args.vararg or fn.args.kwarg:
         reader.refuse(module, fn, "*args/**kwargs on a handler", "static_unsupported")
@@ -1598,6 +1617,7 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         assets=assets,
         publishes=registration.publishes,
         weights_outputs=registration.weights,
+        internal=registration.internal,
     )
     if registration.kind == "entrypoint":
         doc["invocable"] = invocable_interface.serving_metadata(

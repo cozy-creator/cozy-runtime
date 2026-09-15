@@ -187,6 +187,10 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             ),
             None,
         )
+        if entry and entry.get("internal", False) and caller != callee:
+            raise WorkspaceRefusal(
+                "internal_callable: child requires the same installed package revision"
+            )
         invocable = entry.get("invocable", {}) if entry else {}
         if (invocable.get("module"), invocable.get("export")) != target[1:]:
             raise WorkspaceRefusal("execution callable does not identify the prepared callee")
@@ -231,6 +235,39 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
             or selected_entry != prepared[root]["placement"]
         ):
             raise WorkspaceRefusal("execution inference does not name the captured root")
+    root_interface = interfaces[root]
+    if "job" in spec:
+        root_callable = next(
+            (
+                entry
+                for entry in root_interface["jobs"]
+                if package_interface.job_descriptor_id(root_interface, entry["name"])
+                == spec["job"]["job_descriptor_id"]
+            ),
+            None,
+        )
+    else:
+        binding = next(
+            (
+                entry
+                for entry in prepared[root]["placement"]["entrypoints"]
+                if entry["entrypoint_binding_digest"]
+                == spec.get("serving", {}).get("entrypoint_binding_digest")
+            ),
+            None,
+        )
+        root_callable = next(
+            (
+                entry
+                for entry in root_interface["entrypoints"]
+                if binding is not None and entry["name"] == binding["name"]
+            ),
+            None,
+        )
+    if root_callable and root_callable.get("internal", False):
+        raise WorkspaceRefusal(
+            "internal_callable: an internal callable cannot be an execution root"
+        )
     preparation: dict[str, Any] = {"revisions": prepared, "state": state_identity(state)}
     assert worker.machine_calls is not None
     if sdk := worker.machine_calls.builtins.capture():
