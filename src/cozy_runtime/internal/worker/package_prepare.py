@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
-import importlib.metadata
 import os
 import re
 import stat
@@ -226,40 +225,7 @@ def _filtered_rows(
             "package_prepare_project_pin_missing",
             f"the export must pin {expected}=={release} exactly once",
         )
-    provided = inventory.versions if inventory is not None else {}
-    for name in ("cozy-runtime", "tensorfs"):
-        if name in platform_versions:
-            provided.setdefault(name, platform_versions[name])
-    install_rows: list[package_environment.LockedRow] = []
-    served: dict[str, str] = {}
-    for row in locked.rows:
-        if row.name != expected and row.name in provided:
-            served[row.name] = row.version
-            continue
-        install_rows.append(row)
-    if served:
-        listed = ", ".join(
-            f"{name} (base {provided[name]} over lock {version})"
-            for name, version in sorted(served.items())
-        )
-        print(f"[package-prepare] worker base serves {listed}", flush=True)
-    return install_rows
-
-
-def _refuse_platform_shadow(
-    installed: package_environment.InstalledEnvironment,
-    package_name: str,
-    platform_versions: Mapping[str, str],
-) -> None:
-    """An older cached venv must not silently keep app-local framework copies."""
-    project = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
-    for distribution in importlib.metadata.distributions(path=[str(installed.site_packages)]):
-        name = _DISTRIBUTION.sub("-", distribution.metadata.get("Name", "")).lower()
-        if name != project and name in {"cozy-runtime", "tensorfs"} and name in platform_versions:
-            raise PreparationRefusal(
-                "package_prepare_platform_shadowed",
-                f"cached application environment contains its own {name}; rebuild that environment",
-            )
+    return list(locked.rows)
 
 
 def _prepare_published(
@@ -344,8 +310,6 @@ def _prepare_published(
             )
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
-        if dependency_python is None:
-            _refuse_platform_shadow(installed, package_name, platform)
 
     expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     interface_raw = describe(installed, expected_distribution)
@@ -584,7 +548,6 @@ def _compatibility_environment(
         )
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
-    _refuse_platform_shadow(installed, package_name, platform)
     return installed
 
 
@@ -776,6 +739,7 @@ def prepare_local_package(
         dependency_python=dependency_python,
         dependency_cache=dependency_cache,
         materialized=materialized,
+        dependency_requirements=bytes(request.dependency_requirements),
     )
 
 
@@ -932,6 +896,7 @@ def prepare_package(
     dependency_cache: Path | None = None,
     job_plan_root: Path | None = None,
     development: pb.DevelopmentPackage | None = None,
+    dependency_requirements: bytes = b"",
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact local package revision.
@@ -1000,128 +965,153 @@ def prepare_package(
                     "package_prepare_project_wheel_no_import_roots",
                     f"{row.filename} installs no importable module",
                 )
-        try:
-            base_owned = owner == "custom" and package_environment.base_owned_wheel(
-                wheel, observed_base
-            )
-        except package_environment.EnvironmentRefusal as exc:
-            raise PreparationRefusal(exc.code, exc.detail) from exc
-        if base_owned:
-            # The supplied wheel proves which protected distribution the frozen local
-            # closure selected; this host's base supplies the executable bytes.
-            verified(digest, row.length, path)
-            continue
         facts.append((wheel, path, receipt))
-    projects = [item for item in facts if item[0].owner == "project"]
-    if len(projects) != 1:
-        raise PreparationRefusal("package_prepare_project_wheel_count", str(len(projects)))
-    project = projects[0][0]
-    if project.distribution != expected_distribution or project.version != release:
-        raise PreparationRefusal("package_prepare_project_wheel_mismatch", project.filename)
+    with contextlib.ExitStack() as downloaded:
+        locked_dependencies = None
+        if dependency_requirements:
+            try:
+                locked_dependencies = package_environment.read_dependency_requirements(
+                    dependency_requirements
+                )
+                names = {wheel.distribution for wheel, _path, _receipt in facts}
+                overlap = names.intersection(row.name for row in locked_dependencies.rows)
+                if overlap:
+                    raise package_environment.EnvironmentRefusal(
+                        "package_environment_wheel_duplicate", ", ".join(sorted(overlap))
+                    )
+                downloaded.callback(
+                    package_environment._release_locked_wheels, locked_dependencies.rows
+                )
+                for item in package_environment.fetch_locked_wheels(
+                    locked_dependencies.rows, install_root, observed_base
+                ):
+                    facts.append(
+                        (
+                            item.wheel,
+                            item.path,
+                            package_environment.VerifiedFile.record(
+                                item.path, item.wheel.digest, item.wheel.length
+                            ),
+                        )
+                    )
+            except package_environment.EnvironmentRefusal as exc:
+                raise PreparationRefusal(exc.code, exc.detail) from exc
+        projects = [item for item in facts if item[0].owner == "project"]
+        if len(projects) != 1:
+            raise PreparationRefusal("package_prepare_project_wheel_count", str(len(projects)))
+        project = projects[0][0]
+        if project.distribution != expected_distribution or project.version != release:
+            raise PreparationRefusal("package_prepare_project_wheel_mismatch", project.filename)
 
-    dependency_facts = sorted(
-        (wheel for wheel, _path, _receipt in facts if wheel.owner == "custom"),
-        key=lambda wheel: wheel.distribution,
-    )
-    environment = pb.Environment(local_wheels=[_wheel_fact(wheel) for wheel in dependency_facts])
-    environment_body = documents.body(environment)
-    environment_digest = documents.spell(
-        documents.embedded_document_digest(environment_body, "cozy.worker.v1.Environment")
-    )
-    wheel_paths = {wheel.digest: path for wheel, path, _receipt in facts}
-    receipts = {wheel.digest: receipt for wheel, _path, receipt in facts}
-    try:
-        source = placement_materialization.package_environment_input(
+        dependency_facts = sorted(
+            (wheel for wheel, _path, _receipt in facts if wheel.owner == "custom"),
+            key=lambda wheel: wheel.distribution,
+        )
+        environment = pb.Environment(
+            local_wheels=[_wheel_fact(wheel) for wheel in dependency_facts]
+        )
+        environment_body = documents.body(environment)
+        environment_digest = documents.spell(
+            documents.embedded_document_digest(environment_body, "cozy.worker.v1.Environment")
+        )
+        wheel_paths = {wheel.digest: path for wheel, path, _receipt in facts}
+        receipts = {wheel.digest: receipt for wheel, _path, receipt in facts}
+        try:
+            source = placement_materialization.package_environment_input(
+                package_name=package_name,
+                release=release,
+                project_wheel=documents.body(_wheel_fact(project)),
+                environment=environment_body,
+                environment_digest=environment_digest,
+                wheel_paths=wheel_paths,
+                verified_wheels=receipts,
+            )
+            installed = package_environment.materialize(
+                source,
+                install_root,
+                python=python,
+                base=observed_base,
+                dependency_python=None if dependency_requirements else dependency_python,
+                exact_dependencies=True,
+                dependency_cache=dependency_cache,
+            )
+        except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
+            code = getattr(exc, "code", "package_environment_install_failed")
+            detail = getattr(exc, "detail", type(exc).__name__)
+            raise PreparationRefusal(str(code), str(detail)) from exc
+        for wheel, path, _receipt in facts:
+            verified(wheel.digest, wheel.length, path)
+        if materialized is not None:
+            materialized(installed)
+
+        interface_raw = describe(installed, project.distribution)
+        try:
+            interface_body = package_interface.read_bytes(
+                interface_raw, "prepared package interface"
+            )
+        except package_interface.StalePackageInterface as exc:
+            raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
+        interface_ref = _stage(artifact_cache, interface_raw)
+        _verify_local_revision(development, interface_ref, rows, dependency_requirements)
+        _stage_job_plans(
+            interface_body,
+            root=job_plan_root,
+            build_id=documents.spell(development.local_revision_digest),
+            interface_path=artifact_cache / interface_ref[0].removeprefix("sha256:"),
+            installed=installed,
+        )
+        # Local package transport freezes code, PackageInterface, and Environment only. A
+        # later ordinary PlacementSet supplies exact modeled serving bindings; JobDirective
+        # + InvocationSpec supplies a job's exact model inputs. Weightless serving bindings
+        # need no later model authority and are already exact consequences of this retained
+        # package interface.
+        selected_models, entrypoints = _entrypoints(
+            interface_body,
             package_name=package_name,
-            release=release,
-            project_wheel=documents.body(_wheel_fact(project)),
-            environment=environment_body,
-            environment_digest=environment_digest,
-            wheel_paths=wheel_paths,
-            verified_wheels=receipts,
+            selections=(),
+            tensorfs_root=None,
+            verified=verified,
+            derive=None,
         )
-        installed = package_environment.materialize(
-            source,
-            install_root,
-            python=python,
-            base=observed_base,
-            dependency_python=dependency_python,
-            exact_dependencies=True,
-            dependency_cache=dependency_cache,
+        entrypoint_bodies = [documents.body(row) for row in entrypoints]
+        bindings_digest = documents.digest_of(
+            canonical.write(
+                {
+                    "entrypoints": entrypoint_bodies,
+                    "models": [documents.body(model) for model in selected_models],
+                }
+            )
         )
-    except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
-        code = getattr(exc, "code", "package_environment_install_failed")
-        detail = getattr(exc, "detail", type(exc).__name__)
-        raise PreparationRefusal(str(code), str(detail)) from exc
-    for wheel, path, _receipt in facts:
-        verified(wheel.digest, wheel.length, path)
-    if materialized is not None:
-        materialized(installed)
-
-    interface_raw = describe(installed, project.distribution)
-    try:
-        interface_body = package_interface.read_bytes(interface_raw, "prepared package interface")
-    except package_interface.StalePackageInterface as exc:
-        raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
-    interface_ref = _stage(artifact_cache, interface_raw)
-    _verify_local_revision(development, interface_ref, rows)
-    _stage_job_plans(
-        interface_body,
-        root=job_plan_root,
-        build_id=documents.spell(development.local_revision_digest),
-        interface_path=artifact_cache / interface_ref[0].removeprefix("sha256:"),
-        installed=installed,
-    )
-    # Local package transport freezes code, PackageInterface, and Environment only. A
-    # later ordinary PlacementSet supplies exact modeled serving bindings; JobDirective
-    # + InvocationSpec supplies a job's exact model inputs. Weightless serving bindings
-    # need no later model authority and are already exact consequences of this retained
-    # package interface.
-    selected_models, entrypoints = _entrypoints(
-        interface_body,
-        package_name=package_name,
-        selections=(),
-        tensorfs_root=None,
-        verified=verified,
-        derive=None,
-    )
-    entrypoint_bodies = [documents.body(row) for row in entrypoints]
-    bindings_digest = documents.digest_of(
-        canonical.write(
-            {
-                "entrypoints": entrypoint_bodies,
-                "models": [documents.body(model) for model in selected_models],
-            }
+        placement = pb.Placement(
+            placement_id="package-" + hashlib.sha256(placement_seed).hexdigest()[:24],
+            environment_digest=documents.raw(environment_digest),
+            package_interface=pb.Ref(
+                digest=documents.raw(interface_ref[0]), length=interface_ref[1]
+            ),
+            bindings_digest=bindings_digest,
+            models=selected_models,
+            entrypoints=entrypoints,
+            environment=environment,
         )
-    )
-    placement = pb.Placement(
-        placement_id="package-" + hashlib.sha256(placement_seed).hexdigest()[:24],
-        environment_digest=documents.raw(environment_digest),
-        package_interface=pb.Ref(digest=documents.raw(interface_ref[0]), length=interface_ref[1]),
-        bindings_digest=bindings_digest,
-        models=selected_models,
-        entrypoints=entrypoints,
-        environment=environment,
-    )
-    placement.development.CopyFrom(
-        pb.DevelopmentPackage(
-            package=development.package,
-            release=development.release,
-            source_digest=development.source_digest,
-            local_revision_digest=development.local_revision_digest,
-            project_wheel=_wheel_fact(project),
+        placement.development.CopyFrom(
+            pb.DevelopmentPackage(
+                package=development.package,
+                release=development.release,
+                source_digest=development.source_digest,
+                local_revision_digest=development.local_revision_digest,
+                project_wheel=_wheel_fact(project),
+            )
         )
-    )
-    placement_body = documents.body(placement)
-    placement_bytes = canonical.write(
-        {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement_body]}
-    )
-    return pb.PreparePackageSetResult(
-        placement_set=pb.DesiredPlacementSet(
-            placement_set_digest=documents.digest_of(placement_bytes),
-            placement_set_canonical_bytes=placement_bytes,
+        placement_body = documents.body(placement)
+        placement_bytes = canonical.write(
+            {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement_body]}
         )
-    )
+        return pb.PreparePackageSetResult(
+            placement_set=pb.DesiredPlacementSet(
+                placement_set_digest=documents.digest_of(placement_bytes),
+                placement_set_canonical_bytes=placement_bytes,
+            )
+        )
 
 
 def _wheel_fact(wheel: package_environment.Wheel) -> pb.WheelFact:
@@ -1139,6 +1129,7 @@ def _verify_local_revision(
     development: pb.DevelopmentPackage,
     interface_ref: tuple[str, int],
     wheels: Sequence[pb.LocalPackageWheel],
+    dependency_requirements: bytes = b"",
 ) -> None:
     revision = pb.LocalPackageRevision(
         package=development.package,
@@ -1154,6 +1145,13 @@ def _verify_local_revision(
             for row in wheels
         ],
     )
+    if dependency_requirements:
+        revision.dependency_requirements.CopyFrom(
+            pb.Ref(
+                digest=documents.digest_of(dependency_requirements),
+                length=len(dependency_requirements),
+            )
+        )
     _raw, measured = documents.identity(revision)
     if measured != development.local_revision_digest:
         raise PreparationRefusal(

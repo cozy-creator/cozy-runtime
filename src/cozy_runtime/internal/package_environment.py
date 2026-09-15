@@ -1,19 +1,7 @@
-"""Per-package uv environments over the immutable base-worker-image Python environment.
+"""Complete private package environments installed with uv and atomically retained.
 
-Runtime observes the actual interpreter's standard library and narrow protected platform families:
-Python, cozy-runtime, msgspec, TensorFS, and, when present, Torch/Triton/CUDA/NVIDIA. A placement
-creates one ordinary uv venv containing only the package project wheel and package-owned dependency
-wheels. It never re-resolves the lock, copies a protected package, or re-hashes the base
-environment's RECORD tree in the image-backed path. The cr-070 boot-install slow path installs an
-image-carried distribution whose observed version falls outside the wheels' declared ranges
-in range from the index, alone (`--no-deps`), logged, and re-verified on every open.
-
-The OCI image digest protects image-resident bytes. This module protects bytes that arrive
-after boot: exact wheel grants are hashed once, inspected, installed by uv into private staging,
-and atomically published. Local preparation can instead snapshot the regular installed
-dependency closure into staging; that copied content joins the wheel identity. Reuse reads only
-the small receipt; actual base compatibility is re-observed before admission and Runtime does
-not walk or hash the installed tree again.
+Exact artifact identities own the dependency closure. Image inventory supplies only
+interpreter compatibility facts; it never supplies missing package distributions.
 """
 
 from __future__ import annotations
@@ -24,6 +12,7 @@ import errno
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -41,18 +30,17 @@ from urllib.parse import unquote, urlsplit
 
 from packaging.markers import default_environment
 from packaging.requirements import InvalidRequirement, Requirement
-from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.tags import Tag, parse_tag
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
 from cozy_runtime.internal import base_observation, canonical, storage_admission
-from cozy_runtime.internal.config import inherited_environment
+from cozy_runtime.internal.config import package_install_environment
 from cozy_runtime.protocol import weights_limits
 
 RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
 LOCKED_RECEIPT_FORMAT = "cozy.runtime.LockedEnvironmentReceipt/1"
-LOCKED_CONTENT_FORMAT = "cozy.runtime.LockedPackageEnvironment/1"
+LOCKED_CONTENT_FORMAT = "cozy.runtime.LockedPackageEnvironment/2"
 CONTENT_IDENTITY_NAME = "package-environment-content.json"
 MAX_WHEEL_BYTES = 2 << 30
 MAX_WHEEL_MEMBERS = 100_000
@@ -137,26 +125,6 @@ class BlobGrant:
     length: int
     path: Path
     verified: VerifiedFile | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class BootInstall:
-    """One image-carried distribution whose base version falls outside a declared range.
-
-    The pod venv installs an in-range version at prepare time — the boot-install slow path
-    (cr-070, xs-008): allowed, non-ideal, expected never, logged. The venv copy then shadows
-    the image's through ordinary venv precedence.
-    """
-
-    distribution: str
-    specifier: str
-    extras: tuple[str, ...]
-    image_version: str
-
-    @property
-    def requirement(self) -> str:
-        extras = f"[{','.join(self.extras)}]" if self.extras else ""
-        return f"{self.distribution}{extras}{self.specifier}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,8 +282,7 @@ def preflight_environment(
     for path in dependencies:
         row = measure_wheel(path, "custom", base, allow_base_owned=True)
         observed.append(row[0])
-        if not base_owned_wheel(row[0], base):
-            measured.append((row[0], row[1], path))
+        measured.append((row[0], row[1], path))
     wheels = tuple(row[0] for row in measured)
     source = Input(
         environment_digest=_sha(canonical.write({"wheels": [wheel.digest for wheel in wheels]})),
@@ -330,78 +297,6 @@ def preflight_environment(
     inspected = _verify_grants(source, ordered, base)
     _verify_python_requirements(inspected, base)
     return base, ordered, tuple(observed)
-
-
-def base_owned_distribution(distribution: str, base: base_observation.Observation) -> bool:
-    """Whether the current worker image owns this protected distribution."""
-    return distribution in base.distribution_versions and base_observation.protected_distribution(
-        distribution
-    )
-
-
-def base_owned_wheel(wheel: Wheel, base: base_observation.Observation) -> bool:
-    """Identify a redundant worker-image distribution by its complete import ownership.
-
-    Package metadata, not the supplied wheel version, constrains the worker-image version.
-    The caller omits a base-owned wheel and the ordinary requirement check below then admits
-    or refuses the version actually provided by the worker image.
-    """
-
-    if wheel.owner != "custom":
-        return False
-    if not base_owned_distribution(wheel.distribution, base):
-        return False
-    version = base.distribution_versions[wheel.distribution]
-    roots = tuple(
-        sorted(
-            root
-            for root, providers in base.root_providers.items()
-            if wheel.distribution in providers
-        )
-    )
-    try:
-        Version(version)
-        Version(wheel.version)
-    except InvalidVersion as exc:
-        raise EnvironmentRefusal(
-            "package_environment_base_invalid",
-            f"distribution={wheel.distribution} worker_image_version={version!r}",
-        ) from exc
-    if roots != wheel.import_roots:
-        raise EnvironmentRefusal(
-            "package_environment_base_distribution_import_roots_conflict",
-            f"package supplied {wheel.distribution} {wheel.version} with import roots "
-            f"{wheel.import_roots}, but the worker image provides {wheel.distribution} "
-            f"{version} with import roots {roots}; worker-image distributions cannot be replaced",
-        )
-    return True
-
-
-def _allows_observed_wheel(
-    wheel: Wheel,
-    base: base_observation.Observation,
-    *,
-    allow_base_owned: bool,
-    allow_installed_package: bool,
-) -> bool:
-    """Distinguish immutable image ownership from an already-complete package venv."""
-
-    if allow_base_owned and base_owned_wheel(wheel, base):
-        return True
-    version = base.distribution_versions.get(wheel.distribution)
-    if (
-        not allow_installed_package
-        or version is None
-        or base_observation.protected_distribution(wheel.distribution)
-    ):
-        return False
-    try:
-        return Version(version) == Version(wheel.version)
-    except InvalidVersion as exc:
-        raise EnvironmentRefusal(
-            "package_environment_base_invalid",
-            f"distribution={wheel.distribution} installed_version={version!r}",
-        ) from exc
 
 
 def materialize(
@@ -423,11 +318,8 @@ def materialize(
     actually loads and launches is answered where it can only be answered — by the executor
     that imports it — and, when an author wants an offline proof, by `cozy-native-wheel-proof`.
 
-    An image-carried distribution whose observed version falls outside the wheels' declared
-    ranges is boot-installed into the venv from the index (cr-070) rather than refused. The
-    boot plan is a pure function of the exact wheels and the re-observed base — the same
-    inputs every admission already re-derives — so it is deliberately NOT part of the content
-    identity, and every open of the generation re-verifies the installed versions in range.
+    The selected wheels must supply their complete closure, including Runtime and ordinary
+    transitive dependencies. Image distributions never fill missing requirements.
     """
 
     _require_digest(source.environment_digest, "environment_digest")
@@ -466,12 +358,7 @@ def materialize(
     final = contents / content_digest.removeprefix("sha256:")
     receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
     inspected = _verify_grants(source, wheels, observed)
-    boot_installs = _verify_python_requirements(inspected, observed, boot=not exact_dependencies)
-    if boot_installs and storage_admission.enabled():
-        raise EnvironmentRefusal(
-            "package_environment_dependency_wheels_required",
-            "rented execution requires bounded exact dependency wheels, not an online boot resolve",
-        )
+    _verify_python_requirements(inspected, observed)
     if receipt_path.exists():
         try:
             installed = open_generation(
@@ -494,7 +381,6 @@ def materialize(
             else:
                 raise
         else:
-            _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
             _verify_prefix_resources(installed.generation, inspected)
             if exact_dependencies:
                 _verify_installed_requirements(installed.site_packages, inspected, observed)
@@ -512,7 +398,10 @@ def materialize(
         if not reused:
             staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
             try:
-                _install_with_uv(uv, python, staging, inspected, boot_installs)
+                _warn_accelerator_stack(
+                    {item.wheel.distribution: item.wheel.version for item in inspected}, observed
+                )
+                _install_with_uv(uv, python, staging, inspected, cache_root=dependency_cache)
                 staged = _installed_at(
                     staging,
                     content_digest=content_digest,
@@ -521,7 +410,6 @@ def materialize(
                     reused=False,
                     base=observed,
                 )
-                _verify_boot_installs(staged.site_packages, boot_installs, reused=False)
                 _verify_prefix_resources(staging, inspected)
                 if exact_dependencies:
                     _verify_installed_requirements(staged.site_packages, inspected, observed)
@@ -550,11 +438,31 @@ def materialize(
             python=python,
         )
         if reused:
-            _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
             _verify_prefix_resources(installed.generation, inspected)
         if exact_dependencies:
             _verify_installed_requirements(installed.site_packages, inspected, observed)
         return installed
+
+
+def accelerator_warnings(
+    versions: Mapping[str, str], base: base_observation.Observation
+) -> tuple[str, ...]:
+    return tuple(
+        f"Degraded accelerator preparation: private {name} {selected}; "
+        f"image {base.distribution_versions.get(name, 'none')}. "
+        "Startup/disk use may increase; image optimizations may be unavailable. "
+        "Native compatibility is checked when loading."
+        for name in ("torch", "triton")
+        if (selected := versions.get(name)) is not None
+        and selected != base.distribution_versions.get(name)
+    )
+
+
+def _warn_accelerator_stack(
+    versions: Mapping[str, str], base: base_observation.Observation
+) -> None:
+    for message in accelerator_warnings(versions, base):
+        logging.getLogger(__name__).warning(message)
 
 
 def _wheel_write_bound(
@@ -596,7 +504,7 @@ def _verify_installed_requirements(
                 f"distribution={item.wheel.distribution} expected={item.wheel.version} "
                 f"actual={installed.get(item.wheel.distribution)!r}",
             )
-    joined = {**base.distribution_versions, **installed}
+    joined = installed
     environment = _marker_environment(base)
     for item in inspected:
         for requirement in item.requirements:
@@ -825,15 +733,10 @@ def materialize_locked(
 ) -> InstalledEnvironment:
     """Materialize one venv from the release's exact hash-pinned export (xs-017).
 
-    `install_rows` is the caller's image-inventory-filtered subset; identity is over the FULL
-    export bytes, so the filter — a pure function of the export and the re-observed base —
-    is deliberately not part of the content identity, exactly like the old boot plan.
-    Every artifact must match a hash the export names (`--require-hashes`); the indexes have
-    no authority over bytes. The uv cache is operation-scoped derived work: it lives beside
-    the staging tree and is deleted after install without invalidating hardlinked venv files.
-    The joined venv's metadata is checked against its inherited providers before any
-    application import, including on reuse. A local SDK copies its dependency RECORD closure
-    into the generation; that snapshot joins content identity and is checked by open_generation.
+    `install_rows` contains the complete export. Every artifact must match its selected
+    hash; indexes have no authority over bytes. A shared uv cache reuses immutable artifacts.
+    Private metadata closure is checked before import, including on reuse. A captured local
+    SDK closure is copied into the generation and becomes part of its content identity.
     """
 
     from cozy_runtime.internal import package_requirements
@@ -901,6 +804,7 @@ def materialize_locked(
                     cache=dependency_cache,
                 )
 
+            _warn_accelerator_stack({row.name: row.version for row in install_rows}, observed)
             _install_locked(
                 uv,
                 python,
@@ -909,6 +813,7 @@ def materialize_locked(
                 locked.indexes,
                 install_rows,
                 dependencies=copy_dependencies if dependency_python is not None else None,
+                cache_root=dependency_cache,
             )
             if dependency_python is not None:
                 from cozy_runtime.internal import _installed_dependencies
@@ -986,14 +891,19 @@ def _install_locked(
     install_rows: Sequence[LockedRow],
     *,
     dependencies: Callable[[Path], None] | None = None,
+    cache_root: Path | None = None,
 ) -> None:
     if storage_admission.enabled():
-        _install_locked_bounded(uv, python, staging, install_rows, dependencies=dependencies)
+        _install_locked_bounded(
+            uv, python, staging, install_rows, dependencies=dependencies, cache_root=cache_root
+        )
         return
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     requirements = cache / "locked-requirements.txt"
     requirements.write_text("".join(row.text + "\n" for row in install_rows))
-    scoped = ["--cache-dir", str(cache)]
+    shared_cache = (cache_root or staging.parent) / "uv-cache"
+    shared_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    scoped = ["--cache-dir", str(shared_cache)]
     commands = [
         [
             str(uv),
@@ -1006,7 +916,6 @@ def _install_locked(
             "hardlink",
             "--python",
             str(python),
-            "--system-site-packages",
             *scoped,
             str(staging),
         ],
@@ -1040,6 +949,7 @@ def _install_locked(
             capture_output=True,
             text=True,
             check=False,
+            env=package_install_environment(),
         )
         if result.returncode != 0:
             detail = result.stderr.strip()[-2000:] or result.stdout.strip()[-2000:]
@@ -1065,8 +975,20 @@ def _install_locked_bounded(
     rows: Sequence[LockedRow],
     *,
     dependencies: Callable[[Path], None] | None = None,
+    cache_root: Path | None = None,
 ) -> None:
     observed = observe_base(python)
+    inspected = fetch_locked_wheels(rows, staging.parent, observed)
+    with storage_admission.admit(_wheel_write_bound(staging.parent, inspected)):
+        _install_with_uv(
+            uv, python, staging, inspected, dependencies=dependencies, cache_root=cache_root
+        )
+
+
+def fetch_locked_wheels(
+    rows: Sequence[LockedRow], root: Path, observed: base_observation.Observation
+) -> list[_Inspected]:
+    """Fetch exact dependency artifacts through the existing bounded storage owner."""
     inspected: list[_Inspected] = []
     operation = _locked_operation(rows)
     for row in rows:
@@ -1076,8 +998,13 @@ def _install_locked_bounded(
                 "refresh preparation facts from Tensorhub to obtain the exact selected wheels",
             )
         filename = unquote(Path(urlsplit(row.url).path).name)
-        path, length = storage_admission.fetch_wheel(operation, filename, row.hashes[0], row.url)
-        expected = staging.parent / ".stage" / operation / "wheels" / filename
+        expected = root / ".stage" / operation / "wheels" / filename
+        if storage_admission.enabled():
+            path, length = storage_admission.fetch_wheel(
+                operation, filename, row.hashes[0], row.url
+            )
+        else:
+            path, length = _fetch_local_locked_wheel(expected, row)
         if path != expected:
             raise EnvironmentRefusal(
                 "package_environment_wheel_invalid", "wheel staging path changed"
@@ -1096,8 +1023,58 @@ def _install_locked_bounded(
                 "package_environment_wheel_invalid", "wheel differs from exact lock"
             )
         inspected.append(item)
-    with storage_admission.admit(_wheel_write_bound(staging.parent, inspected)):
-        _install_with_uv(uv, python, staging, inspected, dependencies=dependencies)
+    return inspected
+
+
+def _fetch_local_locked_wheel(path: Path, row: LockedRow) -> tuple[Path, int]:
+    """The local disk owner admits downloads before bytes are written, as on a rental."""
+    if path.exists():
+        if path.is_symlink() or not path.is_file() or _hash_file(path) != row.hashes[0]:
+            raise EnvironmentRefusal("package_environment_wheel_invalid", "cached wheel changed")
+        return path, path.stat().st_size
+
+    from cozy_runtime.internal import egress
+
+    _require_public_wheel_url(row.url)
+    return egress.fetch_public_wheel(path, row.url, row.hashes[0], MAX_WHEEL_BYTES)
+
+
+def _require_public_wheel_url(url: str) -> None:
+    parsed = urlsplit(url)
+    if (
+        not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.scheme not in {"https", "http"}
+        or (parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "::1"})
+    ):
+        raise EnvironmentRefusal(
+            "package_environment_lock_invalid", "dependency URL must be public and credential-free"
+        )
+
+
+def read_dependency_requirements(raw: bytes) -> LockedRequirements:
+    """Private dependency transport selects exact public wheel artifacts before submission."""
+    locked = read_locked_requirements(raw)
+    if locked.indexes or len(locked.rows) > MAX_PACKAGE_WHEELS:
+        raise EnvironmentRefusal(
+            "package_environment_lock_invalid", "dependency lock must contain only exact wheel rows"
+        )
+    for row in locked.rows:
+        _require_public_wheel_url(row.url)
+        requirement = Requirement(row.text.split(" --", 1)[0])
+        if (
+            requirement.marker is not None
+            or len(row.hashes) != 1
+            or not _DIGEST.fullmatch(row.hashes[0])
+        ):
+            raise EnvironmentRefusal(
+                "package_environment_lock_invalid",
+                "dependency wheel must have one exact sha256 and no marker",
+            )
+    return locked
 
 
 def _locked_content_identity(
@@ -1193,7 +1170,7 @@ def _interpreter_layout(python: Path) -> dict[str, str]:
 
 
 def is_base_interpreter(python: Path) -> bool:
-    """Only a base prefix provides its own site-packages to a child system-site venv."""
+    """Identify the control interpreter independently of a private package venv."""
     layout = _interpreter_layout(python)
     return layout["prefix"] == layout["base_prefix"]
 
@@ -1456,29 +1433,6 @@ def _verify_inventory(
                 "package_environment_project_wheel_not_pure",
                 f"{wheel.filename} tags={','.join(wheel.tags)}; project must be py3-none-any",
             )
-        base_version = base.distribution_versions.get(name)
-        if base_version is None and base_observation.protected_distribution(name):
-            raise EnvironmentRefusal(
-                "package_environment_second_protected_family",
-                f"distribution={name} is worker-image-owned and absent from this worker",
-            )
-        if (
-            base_version is not None
-            and not _allows_observed_wheel(
-                wheel,
-                base,
-                allow_base_owned=allow_base_owned,
-                allow_installed_package=allow_installed_package,
-            )
-            # A fresh `--system-site-packages` venv legitimately shadows a NON-protected
-            # base copy: the venv wins the import by ordinary precedence (cr-070). The
-            # protected worker-image families keep their fence.
-            and not (venv_precedence and not base_observation.protected_distribution(name))
-        ):
-            raise EnvironmentRefusal(
-                "package_environment_shadows_base_distribution",
-                f"distribution={name} package_version={wheel.version} image_version={base_version}",
-            )
         if wheel.import_roots != tuple(sorted(set(wheel.import_roots))) or not all(
             valid_import_root(root) for root in wheel.import_roots
         ):
@@ -1486,7 +1440,7 @@ def _verify_inventory(
         _require_compatible_tags(wheel, base)
         for root in wheel.import_roots:
             providers = base.root_providers.get(root)
-            if providers is not None and not (allow_base_owned and wheel.distribution in providers):
+            if providers is not None and "python-stdlib" in providers:
                 raise _base_import_collision(wheel, root, providers)
         if name in names or wheel.digest in digests:
             raise EnvironmentRefusal("package_environment_wheel_duplicate", name)
@@ -1744,9 +1698,7 @@ def _inspect(
                 )
             for root in measured_roots:
                 providers = base.root_providers.get(root)
-                if providers is not None and not (
-                    allow_base_owned and wheel.distribution in providers
-                ):
+                if providers is not None and "python-stdlib" in providers:
                     raise _base_import_collision(wheel, root, providers)
             requires_python = parsed.get("Requires-Python")
             requirements: list[Requirement] = []
@@ -1941,96 +1893,17 @@ def _marker_environment(base: base_observation.Observation) -> dict[str, str]:
 def _verify_python_requirements(
     inspected: Sequence[_Inspected],
     base: base_observation.Observation,
-    *,
-    boot: bool = False,
-) -> tuple[BootInstall, ...]:
-    """Verify Requires-Python and every marker-true Requires-Dist against the joined venv.
+) -> None:
+    """Validate the complete selected wheel closure without ambient image providers."""
+    from cozy_runtime.internal import package_requirements
 
-    With ``boot`` — the fresh-venv build lane — a requirement naming an image-carried
-    distribution the package does not itself provide, whose observed image version falls
-    outside the range, becomes one BootInstall row instead of a refusal (cr-070): the venv
-    installs an in-range version that shadows the image's copy. The row's specifier is the
-    intersection of EVERY declared range naming that distribution, so the chosen version
-    satisfies all of them or the install itself refuses.
-    """
-
-    environment = _marker_environment(base)
-    python = Version(environment["python_full_version"])
-    base_versions = base.distribution_versions
-    package_versions = {item.wheel.distribution: item.wheel.version for item in inspected}
-    versions = {**base_versions, **package_versions}
-    rejected: set[str] = set()
-    merged: dict[str, tuple[SpecifierSet, frozenset[str]]] = {}
-    for item in inspected:
-        if item.requires_python:
-            try:
-                supported = SpecifierSet(item.requires_python).contains(python, prereleases=True)
-            except InvalidSpecifier as exc:
-                raise EnvironmentRefusal(
-                    "package_environment_requires_python_invalid",
-                    f"{item.wheel.distribution}: {item.requires_python}",
-                ) from exc
-            if not supported:
-                raise EnvironmentRefusal(
-                    "package_environment_python_incompatible",
-                    f"distribution={item.wheel.distribution} "
-                    f"requires_python={item.requires_python} "
-                    f"target={python}",
-                )
-        for requirement in item.requirements:
-            if requirement.marker is not None and not requirement.marker.evaluate(environment):
-                continue
-            name = _name(requirement.name)
-            installed = versions.get(name)
-            if installed is None:
-                raise EnvironmentRefusal(
-                    "package_environment_dependency_missing",
-                    f"distribution={item.wheel.distribution} requirement={requirement}",
-                )
-            try:
-                accepted = not requirement.specifier or requirement.specifier.contains(
-                    Version(installed), prereleases=True
-                )
-            except InvalidVersion as exc:
-                raise EnvironmentRefusal(
-                    "package_environment_base_invalid",
-                    f"{name} has invalid version {installed!r}",
-                ) from exc
-            bootable = boot and name in base_versions and name not in package_versions
-            if bootable:
-                specifier, extras = merged.get(name, (SpecifierSet(), frozenset()))
-                merged[name] = (
-                    specifier & requirement.specifier,
-                    extras | frozenset(requirement.extras),
-                )
-            if accepted:
-                continue
-            if bootable:
-                rejected.add(name)
-                continue
-            if name in base_versions and name not in package_versions:
-                detail = (
-                    f"package distribution {item.wheel.distribution} requires {requirement}, "
-                    f"but the worker image provides {name} {installed}"
-                )
-            else:
-                detail = (
-                    f"package distribution {item.wheel.distribution} requires {requirement}, "
-                    f"but the package environment provides {name} {installed}"
-                )
-            raise EnvironmentRefusal(
-                "package_environment_dependency_base_conflict",
-                detail,
-            )
-    return tuple(
-        BootInstall(
-            distribution=name,
-            specifier=str(merged[name][0]),
-            extras=tuple(sorted(merged[name][1])),
-            image_version=base_versions[name],
+    available = {
+        item.wheel.distribution: package_requirements._Distribution(
+            item.wheel.version, item.requires_python or "", item.requirements
         )
-        for name in sorted(rejected)
-    )
+        for item in inspected
+    }
+    package_requirements.validate_closure(available, set(available), base)
 
 
 def _install_path(name: str) -> PurePosixPath | None:
@@ -2120,11 +1993,13 @@ def _install_with_uv(
     python: Path,
     staging: Path,
     inspected: Sequence[_Inspected],
-    boot_installs: Sequence[BootInstall] = (),
+    supplements: Sequence[str] = (),
     *,
     dependencies: Callable[[Path], None] | None = None,
+    cache_root: Path | None = None,
 ) -> None:
-    cache = staging.parent / (".uv-cache-" + staging.name)
+    cache = (cache_root or staging.parent) / "uv-cache"
+    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     commands = [
         [
             str(uv),
@@ -2134,10 +2009,9 @@ def _install_with_uv(
             "--offline",
             "--no-python-downloads",
             "--link-mode",
-            "clone",
+            "hardlink",
             "--python",
             str(python),
-            *(["--system-site-packages"] if dependencies is None else []),
             str(staging),
         ],
         [
@@ -2150,17 +2024,15 @@ def _install_with_uv(
             "--no-deps",
             "--no-build",
             "--link-mode",
-            "clone",
+            "hardlink",
             "--python",
             str(staging / "bin" / "python"),
             *(str(item.path) for item in sorted(inspected, key=lambda item: item.wheel.digest)),
         ],
     ]
-    if boot_installs:
-        # The boot-install slow path (cr-070): ONE online resolve of exactly the named
-        # image-owned distributions, `--no-deps` so no digest-verified lock wheel is ever
-        # replaced by a resolver choice. `_verify_boot_installs` then proves each installed
-        # version in range, and the package interface derivation exercises the joined venv for real.
+    if supplements:
+        # Only the fixed built-in local capture can request a numpy supplement.
+        # Private package closures are complete and never reach this compatibility lane.
         commands.append(
             [
                 str(uv),
@@ -2170,19 +2042,15 @@ def _install_with_uv(
                 "--no-deps",
                 "--no-build",
                 "--link-mode",
-                "clone",
+                "hardlink",
                 "--python",
                 str(staging / "bin" / "python"),
-                *(row.requirement for row in boot_installs),
+                *supplements,
             ]
         )
     for command in commands:
         command.extend(["--cache-dir", str(cache)])
-    try:
-        _run_install_commands(commands, staging, dependencies)
-    finally:
-        if cache.exists():
-            _remove_tree(cache)
+    _run_install_commands(commands, staging, dependencies)
 
 
 def _run_install_commands(
@@ -2198,7 +2066,7 @@ def _run_install_commands(
             text=True,
             check=False,
             env={
-                **inherited_environment(),
+                **package_install_environment(),
                 "TMPDIR": str(staging.parent),
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
@@ -2214,54 +2082,6 @@ def _run_install_commands(
     # Installation cannot overwrite a prior capture through a shared payload.
     if dependencies is not None:
         dependencies(staging)
-
-
-def _verify_boot_installs(
-    site_packages: Path, boot_installs: Sequence[BootInstall], *, reused: bool
-) -> dict[str, str]:
-    """Prove every boot-installed distribution present and in range, then say so.
-
-    Runs on EVERY open of a generation that needs boot rows — fresh or reused — because the
-    rows are re-derived from the wheels and the re-observed base rather than carried in the
-    content identity. A generation that predates this image's needs is named, not served.
-    """
-
-    chosen_versions: dict[str, str] = {}
-    if not boot_installs:
-        return chosen_versions
-    installed: dict[str, str] = {}
-    for entry in site_packages.glob("*.dist-info"):
-        name, separator, version = entry.name.removesuffix(".dist-info").rpartition("-")
-        if separator and name:
-            installed[_name(name)] = version
-    for row in boot_installs:
-        chosen = installed.get(row.distribution)
-        if chosen is None:
-            raise EnvironmentRefusal(
-                "package_environment_boot_install_missing",
-                f"distribution={row.distribution} required={row.specifier} "
-                f"image_version={row.image_version}; the generation predates this need",
-            )
-        try:
-            in_range = SpecifierSet(row.specifier).contains(Version(chosen), prereleases=True)
-        except (InvalidSpecifier, InvalidVersion) as exc:
-            raise EnvironmentRefusal(
-                "package_environment_boot_install_invalid",
-                f"distribution={row.distribution} required={row.specifier} chosen={chosen!r}",
-            ) from exc
-        if not in_range:
-            raise EnvironmentRefusal(
-                "package_environment_boot_install_out_of_range",
-                f"distribution={row.distribution} required={row.specifier} chosen={chosen}",
-            )
-        chosen_versions[row.distribution] = chosen
-        print(
-            f"[package-environment] boot-install distribution={row.distribution} "
-            f"image_version={row.image_version} required={row.specifier} "
-            f"chosen={chosen} reused={str(reused).lower()}",
-            flush=True,
-        )
-    return chosen_versions
 
 
 def _receipt(source: Input, wheels: Sequence[Wheel], content_digest: str) -> dict[str, Any]:
@@ -2286,7 +2106,7 @@ def _content_identity(
     wheels: Sequence[Wheel], interpreter: Mapping[str, str], uv_version: str
 ) -> dict[str, Any]:
     return {
-        "format": "cozy.runtime.PackageEnvironment/1",
+        "format": "cozy.runtime.PackageEnvironment/2",
         "interpreter": dict(interpreter),
         "uv_version": uv_version,
         "wheel_digests": sorted(wheel.digest for wheel in wheels),
@@ -2341,7 +2161,7 @@ def _content_matches_receipt(identity: object, receipt: Mapping[str, Any]) -> bo
             {"format", "interpreter", "uv_version", "wheel_digests"},
             {"format", "interpreter", "uv_version", "wheel_digests", "dependency_snapshot"},
         )
-        and identity.get("format") == "cozy.runtime.PackageEnvironment/1"
+        and identity.get("format") == "cozy.runtime.PackageEnvironment/2"
         and isinstance(identity.get("interpreter"), dict)
         and set(identity["interpreter"]) == {"libc", "os_arch", "python_abi"}
         and all(isinstance(value, str) and value for value in identity["interpreter"].values())
@@ -2453,7 +2273,12 @@ def _write_once(path: Path, data: bytes) -> None:
 def _make_read_only(root: Path) -> None:
     for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
         if not path.is_symlink():
-            mode = path.stat().st_mode
+            info = path.stat()
+            mode = info.st_mode
+            # uv owns shared payload inodes. Seal private directories/metadata only;
+            # chmod on a hardlink would mutate every sibling and the uv cache.
+            if stat.S_ISREG(mode) and info.st_nlink > 1:
+                continue
             path.chmod(0o555 if stat.S_ISDIR(mode) or mode & 0o111 else 0o444)
 
 
@@ -2490,7 +2315,7 @@ def _materialize_dependency_snapshot(
     observed = base or observe_base(python)
     wheels = _verify_inventory(source, observed, venv_precedence=True)
     inspected = _verify_grants(source, wheels, observed)
-    supplements: tuple[BootInstall, ...] = ()
+    supplements: tuple[str, ...] = ()
     if builtin_capture is not None:
         from cozy_runtime.internal import builtin_operations
 
@@ -2500,7 +2325,7 @@ def _materialize_dependency_snapshot(
             )
         builtin_operations.validate_carrier(inspected[0].path, inspected[0].wheel.version)
         if not builtin_capture and "numpy" not in observed.distribution_versions:
-            supplements = (BootInstall("numpy", ">=1.26", (), "absent"),)
+            supplements = ("numpy>=1.26",)
     provided = {
         item.wheel.distribution: (item.wheel.version, item.requirements) for item in inspected
     }
@@ -2543,7 +2368,13 @@ def _materialize_dependency_snapshot(
 
     try:
         _install_with_uv(
-            uv, python, staging, inspected, supplements, dependencies=copy_dependencies
+            uv,
+            python,
+            staging,
+            inspected,
+            supplements,
+            dependencies=copy_dependencies,
+            cache_root=dependency_cache,
         )
         if supplements:
             # Only newly resolved optional numerical files join the existing immutable
@@ -2592,7 +2423,16 @@ def _materialize_dependency_snapshot(
             )
         _verify_inventory(source, actual, venv_precedence=True)
         if not builtin_capture:
-            _verify_python_requirements(inspected, actual)
+            from cozy_runtime.internal import package_requirements
+
+            package_requirements.validate(
+                staging
+                / "lib"
+                / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                / "site-packages",
+                python,
+                actual,
+            )
         snapshot = canonical.parse_canonical(manifest)
         assert isinstance(snapshot, dict)
         for row in snapshot["distributions"]:

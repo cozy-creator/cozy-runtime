@@ -49,6 +49,7 @@ import socket
 import ssl
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import urljoin, urlparse
 
@@ -442,3 +443,71 @@ def put_from(
             http_status=status, etag=etag, exact=status != HTTP_PRECONDITION_FAILED
         )
     raise AssertionError("unreachable: the send loop returns or raises on its last attempt")
+
+
+def fetch_public_wheel(
+    path: Path, url: str, expected_digest: str, ceiling: int
+) -> tuple[Path, int]:
+    """Local private-wheel transfer through the single Runtime egress boundary."""
+    import os
+    import uuid
+    from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+    from cozy_runtime.internal import storage_admission
+    from cozy_runtime.internal.package_environment import (
+        EnvironmentRefusal,
+        _require_public_wheel_url,
+    )
+
+    class PublicRedirect(HTTPRedirectHandler):
+        def redirect_request(
+            self, req: object, fp: object, code: int, msg: str, headers: object, newurl: str
+        ) -> Request | None:
+            check(newurl)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)  # type: ignore[arg-type]
+
+    def check(target: str) -> None:
+        _require_public_wheel_url(target)
+        host = urlparse(target).hostname or ""
+        _validate(
+            target, EgressPolicy(allowed_hosts=(host,), allow_private=host in {"127.0.0.1", "::1"})
+        )
+
+    check(url)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".partial")
+    try:
+        with build_opener(PublicRedirect()).open(url, timeout=SILENCE_SECONDS) as response:
+            header = response.headers.get("Content-Length")
+            bound = int(header) if header is not None else ceiling
+            if not 0 < bound <= ceiling:
+                raise EnvironmentRefusal("package_environment_wheel_invalid", "wheel size bound")
+            with storage_admission.admit(storage_admission.Write(path.parent, bound, 16)):
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                digest = hashlib.sha256()
+                length = 0
+                with temporary.open("xb") as target:
+                    while block := response.read(CHUNK):
+                        length += len(block)
+                        if length > bound:
+                            raise EnvironmentRefusal(
+                                "package_environment_wheel_invalid", "wheel size bound"
+                            )
+                        digest.update(block)
+                        target.write(block)
+                    target.flush()
+                    os.fsync(target.fileno())
+                if (
+                    header is not None and length != bound
+                ) or "sha256:" + digest.hexdigest() != expected_digest:
+                    raise EnvironmentRefusal(
+                        "package_environment_wheel_invalid", "wheel hash or length changed"
+                    )
+                temporary.chmod(0o444)
+                os.replace(temporary, path)
+        return path, length
+    except (OSError, ValueError, EgressRefusal) as exc:
+        raise EnvironmentRefusal(
+            "package_environment_wheel_fetch_failed", type(exc).__name__
+        ) from exc
+    finally:
+        temporary.unlink(missing_ok=True)

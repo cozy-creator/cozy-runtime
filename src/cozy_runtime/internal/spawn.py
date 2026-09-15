@@ -91,6 +91,7 @@ def spawn_executor(
     )
     argv = [
         python,
+        "-I",
         "-c",
         "import sys; from cozy_runtime.internal.trampoline import main; main(sys.argv[1:])",
         "--expect-parent",
@@ -164,6 +165,7 @@ def spawn_follower(
     """
     argv = [
         python,
+        "-I",
         "-c",
         "import sys; from cozy_runtime.internal.trampoline import main; main(sys.argv[1:])",
         "--expect-parent",

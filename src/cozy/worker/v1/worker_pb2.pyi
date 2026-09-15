@@ -1280,16 +1280,18 @@ class CheckPackageSetCompatibilityResult(_message.Message):
     def __init__(self, refusal_code: _Optional[str] = ..., refusal_detail: _Optional[str] = ...) -> None: ...
 
 class PrepareLocalPackageRequest(_message.Message):
-    __slots__ = ("operation_id", "package", "wheels", "install_root")
+    __slots__ = ("operation_id", "package", "wheels", "install_root", "dependency_requirements")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     WHEELS_FIELD_NUMBER: _ClassVar[int]
     INSTALL_ROOT_FIELD_NUMBER: _ClassVar[int]
+    DEPENDENCY_REQUIREMENTS_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     package: DevelopmentPackage
     wheels: _containers.RepeatedCompositeFieldContainer[LocalPackageWheel]
     install_root: str
-    def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., wheels: _Optional[_Iterable[_Union[LocalPackageWheel, _Mapping]]] = ..., install_root: _Optional[str] = ...) -> None: ...
+    dependency_requirements: bytes
+    def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., wheels: _Optional[_Iterable[_Union[LocalPackageWheel, _Mapping]]] = ..., install_root: _Optional[str] = ..., dependency_requirements: _Optional[bytes] = ...) -> None: ...
 
 class LocalPackageWheel(_message.Message):
     __slots__ = ("digest", "filename", "length", "path")
@@ -2028,14 +2030,16 @@ class DesiredPackageSet(_message.Message):
     def __init__(self, download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ...) -> None: ...
 
 class DesiredLocalPackageSet(_message.Message):
-    __slots__ = ("operation_id", "package", "files")
+    __slots__ = ("operation_id", "package", "files", "dependency_requirements")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     FILES_FIELD_NUMBER: _ClassVar[int]
+    DEPENDENCY_REQUIREMENTS_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     package: DevelopmentPackage
     files: _containers.RepeatedCompositeFieldContainer[LocalPackageFileRef]
-    def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ...) -> None: ...
+    dependency_requirements: bytes
+    def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ..., dependency_requirements: _Optional[bytes] = ...) -> None: ...
 
 class DesiredPrivatePlacementSet(_message.Message):
     __slots__ = ("operation_id", "local_revision_digest", "download_delegation", "download_delegation_signature", "native_models")
@@ -2074,18 +2078,20 @@ class LocalPackageFileRef(_message.Message):
     def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., length: _Optional[int] = ...) -> None: ...
 
 class LocalPackageRevision(_message.Message):
-    __slots__ = ("package", "release", "source_digest", "package_interface", "files")
+    __slots__ = ("package", "release", "source_digest", "package_interface", "files", "dependency_requirements")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
     SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
     FILES_FIELD_NUMBER: _ClassVar[int]
+    DEPENDENCY_REQUIREMENTS_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
     source_digest: bytes
     package_interface: Ref
     files: _containers.RepeatedCompositeFieldContainer[LocalPackageFileRef]
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., package_interface: _Optional[_Union[Ref, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ...) -> None: ...
+    dependency_requirements: Ref
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., package_interface: _Optional[_Union[Ref, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ..., dependency_requirements: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
 class DesiredPlacementSet(_message.Message):
     __slots__ = ("placement_set_digest", "placement_set_canonical_bytes", "device_pins", "orchestration_parent")

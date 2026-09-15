@@ -1850,6 +1850,20 @@ class Worker:
         """Derive one local PlacementSet while package imports stay in the isolated executor."""
 
         with self.preparation_lock:
+            # Publish stack warnings on the durable activity lane consumed by Creator,
+            # in addition to the installer's process-local diagnostics.
+            raw_requirements = (
+                request.dependency_requirements
+                if isinstance(request, pb.PrepareLocalPackageRequest)
+                else request.locked_requirements
+            )
+            if raw_requirements:
+                with contextlib.suppress(package_environment.EnvironmentRefusal):
+                    selected = package_environment.read_locked_requirements(bytes(raw_requirements))
+                    for warning in package_environment.accelerator_warnings(
+                        {row.name: row.version for row in selected.rows}, self.base
+                    ):
+                        self.note("warning", warning)
             if local:
                 from cozy_runtime.internal.worker import local_installations, package_prepare
 

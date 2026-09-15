@@ -1,14 +1,10 @@
-"""Validate a joined package environment from metadata, without importing package code."""
+"""Validate a complete private environment without importing package code."""
 
 from __future__ import annotations
 
-import json
-import subprocess
 from dataclasses import dataclass
 from email.parser import BytesParser
-from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -37,7 +33,8 @@ class DependencyConflict(EnvironmentRefusal):
         super().__init__(
             "package_environment_dependency_base_conflict",
             f"{package} requires {requirement}, but the execution environment provides "
-            f"{requirement.name} {installed}; update the worker or select a compatible package",
+            f"{requirement.name} {installed}; "
+            "prepare a complete compatible private dependency closure",
         )
 
 
@@ -57,58 +54,13 @@ def _distribution(version: str, python: str, requirements: list[str]) -> _Distri
         raise EnvironmentRefusal("package_environment_requirement_invalid", str(exc)) from exc
 
 
-@lru_cache(maxsize=16)
-def _base_metadata(
-    python: Path,
-    base: base_observation.Observation,
-) -> dict[str, _Distribution]:
-    """The immutable worker SDK is probed once per observed base, never per inference."""
-    result = subprocess.run(
-        [
-            str(python),
-            "-I",
-            "-c",
-            "import importlib.metadata as m,json; "
-            "print(json.dumps([[d.metadata.get('Name',''),d.version,"
-            "d.metadata.get('Requires-Python',''),d.metadata.get_all('Requires-Dist',[])] "
-            "for d in m.distributions()]))",
-        ],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    try:
-        if result.returncode or len(result.stdout) > MAX_METADATA_BYTES:
-            raise ValueError("base dependency metadata is unavailable or oversized")
-        rows: Any = json.loads(result.stdout)
-        if not isinstance(rows, list) or len(rows) > MAX_PACKAGE_WHEELS:
-            raise ValueError("base dependency metadata is invalid or oversized")
-        available: dict[str, _Distribution] = {}
-        for name, version, requires_python, requirements in rows:
-            name = _name(name)
-            # Mirror the measured base's precedence, not arbitrary sys.path ordering.
-            if base.distribution_versions.get(name) == version and name not in available:
-                available[name] = _distribution(version, requires_python, requirements)
-        if available.keys() != base.distribution_versions.keys():
-            raise ValueError("worker dependencies changed since its base observation")
-    except (ValueError, TypeError) as exc:
-        raise EnvironmentRefusal("package_environment_base_changed", str(exc)) from exc
-    return available
-
-
 def validate(
     site_packages: Path,
     python: Path,
     base: base_observation.Observation,
 ) -> None:
-    """Check every installed root and its selected extras against actual inherited providers.
-
-    Only the trusted base interpreter runs; the application's interpreter and modules do
-    not. Reading METADATA is small and repeated on reuse because the base can be updated
-    independently of the immutable package generation. Unrelated base packages are not roots.
-    """
-    available = dict(_base_metadata(python, base))
+    """Read private METADATA and validate transitive dependencies and selected extras."""
+    available: dict[str, _Distribution] = {}
 
     roots: set[str] = set()
     infos = sorted(site_packages.glob("*.dist-info"))
@@ -138,6 +90,13 @@ def validate(
             headers.get_all("Requires-Dist", []),
         )
 
+    validate_closure(available, roots, base)
+
+
+def validate_closure(
+    available: dict[str, _Distribution], roots: set[str], base: base_observation.Observation
+) -> None:
+    """Traverse selected extras and transitive requirements within a private closure."""
     environment = _marker_environment(base)
     pending = [(name, Requirement(name)) for name in sorted(roots)]
     visited: dict[str, set[str]] = {}
