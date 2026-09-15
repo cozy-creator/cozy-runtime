@@ -30,23 +30,45 @@ _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
 _DENSE: Callable[..., Any] | None = None
 _DENSE_IDENTITY = ""
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
+_RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
+    "cozy_sol_rank_counts", default=None
+)
 
 
 @contextmanager
-def observing() -> Iterator[dict[str, int]]:
+def observing(*, ranks: dict[int, dict[str, int]] | None = None) -> Iterator[dict[str, int]]:
     """Count successful calls in this request, restoring any outer observation."""
     counts = dict.fromkeys(("sparse", "dense_step", "dense_path", "dense_prefix"), 0)
     token = _COUNTS.set(counts)
+    rank_token = _RANK_COUNTS.set(ranks)
     try:
         yield counts
     finally:
         _COUNTS.reset(token)
+        _RANK_COUNTS.reset(rank_token)
 
 
 def _count(kind: str) -> None:
     counts = _COUNTS.get()
     if counts is not None:
         counts[kind] += 1
+
+
+def record_rank(rank: int, counts: dict[str, int]) -> None:
+    """Retain counts acknowledged by a follower on the existing mirrored-call reply."""
+    ranks = _RANK_COUNTS.get()
+    if ranks is None:
+        return
+    if (
+        type(rank) is not int
+        or rank < 1
+        or set(counts) != {"sparse", "dense_step", "dense_path", "dense_prefix"}
+        or any(type(value) is not int or value < 0 for value in counts.values())
+    ):
+        raise ValueError("invalid follower Sol attention counts")
+    total = ranks.setdefault(rank, dict.fromkeys(counts, 0))
+    for name, value in counts.items():
+        total[name] += value
 
 
 def bind_dense(call: Callable[..., Any], identity: str) -> None:
@@ -215,8 +237,7 @@ def sol_attention(
         )
     if attn_mask is not None or is_causal or dropout_p != 0 or enable_gqa or return_lse:
         raise ValueError("Sol supports unmasked noncausal inference without dropout, GQA or LSE")
-    if _parallel_config is not None:
-        raise ValueError("Sol context parallelism is not qualified")
+    group = _parallel_group(_parallel_config) if _parallel_config is not None else None
     tensors = (query, key, value)
     if any(not isinstance(t, torch.Tensor) or t.ndim != 4 for t in tensors):
         raise ValueError("Sol requires batch/sequence/head/dimension tensors")
@@ -235,7 +256,64 @@ def sol_attention(
 
         if not math.isfinite(scale):
             raise ValueError("attention scale must be finite")
+    if group is not None:
+        return _execute_parallel(query, key, value, scale, layout, site, group)
     return _execute(query, key, value, scale, layout, site)
+
+
+def _parallel_group(config: Any) -> Any:
+    """Only Runtime's initialized, head-divisible two/four-rank Ulysses route."""
+    import torch.distributed as dist
+    from diffusers.models._modeling_parallel import ParallelConfig
+
+    if not isinstance(config, ParallelConfig):
+        raise ValueError("Sol context parallelism requires an initialized Ulysses configuration")
+    cp = config.context_parallel_config
+    if cp is None or cp.ring_degree != 1 or cp.ulysses_degree not in (2, 4):
+        raise ValueError("Sol supports Ulysses degrees 2/4 only; ring attention is unsupported")
+    if cp._ulysses_mesh is None:
+        raise ValueError("Sol Ulysses configuration is not initialized")
+    group = cp._ulysses_mesh.get_group()
+    if (
+        group is None
+        or not dist.is_initialized()
+        or dist.get_world_size(group) != cp.ulysses_degree
+    ):
+        raise ValueError("Sol Ulysses group does not match its declared degree")
+    return group
+
+
+def _execute_parallel(
+    query: Any,
+    key: Any,
+    value: Any,
+    scale: float | None,
+    layout: AttentionLayout,
+    site: Site,
+    group: Any,
+) -> Any:
+    """Exchange sequence shards for heads, then apply the same global-document policy.
+
+    Use Diffusers 0.40's actual unequal-length Ulysses exchange in both directions.
+    No rank-local interpretation of the model's prefix or trailing padding is valid:
+    Sol and the dense reference see the original full token order on each head shard.
+    """
+    import torch.distributed as dist
+    from diffusers.models.attention_dispatch import (
+        all_to_all_single_any_o_async,
+        all_to_all_single_any_qkv_async,
+        ulysses_anything_metadata,
+    )
+
+    if query.shape[2] % dist.get_world_size(group):
+        raise ValueError("Sol Ulysses requires heads divisible by the group degree")
+    metadata = ulysses_anything_metadata(query)
+    waits = [all_to_all_single_any_qkv_async(t, group, **metadata) for t in (query, key, value)]
+    q, k, v = (wait() for wait in waits)
+    output = _execute(q, k, v, scale, layout, site)
+    result = all_to_all_single_any_o_async(output, group, **metadata)()
+    _validate_result(result, query)
+    return result
 
 
 def _execute(

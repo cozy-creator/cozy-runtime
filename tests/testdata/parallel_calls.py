@@ -15,6 +15,7 @@ from tensorfs.derived import Config as NativeConfig
 from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import Model, uses_components
+from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
 from cozy_runtime.internal.executor import Executor, _capture_seal
 from cozy_runtime.internal.parallel.cp import in_gated_call
 from cozy_runtime.internal.seam import Channel
@@ -27,9 +28,17 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
         self.weight = torch.nn.Parameter(torch.full((1,), 2.0))
 
     def forward(
-        self, value: Any, *, check: bool = False, fail: bool = False, expected_stages: int = 0
+        self,
+        value: Any,
+        *,
+        check: bool = False,
+        fail: bool = False,
+        expected_stages: int = 0,
+        step: int | None = None,
     ) -> Any:
         assert in_gated_call()
+        expected_layout = None if step is None else AttentionLayout(29, 9, step, 1, ("blocks.0",))
+        assert _ACTIVE_LAYOUT.get() == expected_layout
         assert not torch.is_grad_enabled()
         torch.testing.assert_close(self.weight.cpu(), torch.tensor([2.0]))
         if check:
@@ -54,7 +63,11 @@ class ModelCalls(Model[object]):
             self.block(state.value, check=True, expected_stages=state.expected_stages)
             for step in range(2):
                 assert not cancel()
-                result = self.block(state.value, expected_stages=state.expected_stages)
+                with attention_scope(AttentionLayout(29, 9, step, 1, ("blocks.0",))):
+                    result = self.block(
+                        state.value, expected_stages=state.expected_stages, step=step
+                    )
+                assert _ACTIVE_LAYOUT.get() is None
                 degree = torch.distributed.get_world_size()
                 torch.testing.assert_close(
                     result, (state.value + 1) * degree + degree * (degree - 1) // 2

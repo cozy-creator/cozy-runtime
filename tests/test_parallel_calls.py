@@ -19,7 +19,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.internal import spawn  # noqa: E402
+from cozy_runtime.internal import attention_sol, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.parallel import cp, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
@@ -257,7 +257,12 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                     expected_stages=2 if kind == "staged" and attempt == "attempt-a" else 0,
                 )
                 steps: list[int] = []
-                model.sample(state, on_step=steps.append, cancel=lambda: False)
+                rank_counts: dict[int, dict[str, int]] = {}
+                with attention_sol.observing(ranks=rank_counts):
+                    model.sample(state, on_step=steps.append, cancel=lambda: False)
+                assert set(rank_counts) == set(range(1, degree))
+                assert all(not any(counts.values()) for counts in rank_counts.values())
+                assert attention_sol._RANK_COUNTS.get() is None
                 assert steps == [0, 1]
                 torch.testing.assert_close(
                     state.result, (state.value + 1) * degree + degree * (degree - 1) // 2

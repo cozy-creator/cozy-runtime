@@ -47,8 +47,13 @@ The existing developer attention override string supports:
   callable. An unqualified component scope matches that component in each model.
 
 Unknown scopes refuse. A package policy cannot override a developer's matching
-explicit pin. Per-request pins still refuse compiled or context-parallel frozen
-constructions. They do not silently substitute a kernel or recompile the model.
+explicit pin. Per-request backend changes still refuse compiled or context-parallel
+frozen constructions. A group may repeat its prepared pin: every matching live
+processor and its saved preparation must already select that backend. This is a
+verified no-op, with no kernel search or mutation. Empty, unknown, mixed or changed
+selections do not qualify. Remote request pins do not themselves choose a group's
+preparation backend; use the model's preparation policy for that selection. No
+request silently substitutes a kernel or recompiles the model.
 Prepared selections are saved and restored across all model executors before and
 after request execution, including handler failures. An ordinary request therefore
 retains its prepared model policy, without repeating resolution or a previous
@@ -66,9 +71,11 @@ qualification is established by these tests.
 
 Request observations record selected and restored backend names and per-component
 site counts. `ExecutionObservation.kernel_symbol` carries the selected backend
-names, not a claim of a GPU profiler trace. Sol additionally records its resolved
-dense reference and request-local sparse, dense-step, dense-path and dense-prefix
-call counts. A Turbo request whose policy stays dense is therefore not evidence
+names, not a claim of a GPU profiler trace. Sol additionally records request-local
+sparse, dense-step, dense-path and dense-prefix call counts, tagged with rank and
+world size. The leader records its resolved dense reference. Follower counts travel
+on existing component-call replies and include only successful acknowledgements;
+an interrupted call is not fabricated as complete. A Turbo request whose policy stays dense is therefore not evidence
 of sparse acceleration. Request-owned Sol hooks are removed even if applying or
 executing an override fails; prepared Sol hooks remain owned by the generation.
 

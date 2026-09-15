@@ -659,6 +659,7 @@ class Executor:
                 "rank": self.rank,
             }
         _model, component = target
+        sol_counts: dict[str, int] = {}
         models = {key[0]: model for key, (model, _root) in self.group_components.items()}
         try:
             spool = Path(command["spool"])
@@ -699,6 +700,8 @@ class Executor:
                 stack.enter_context(self.torch.inference_mode(command["inference_mode"]))
                 stack.enter_context(self.torch.set_grad_enabled(command["grad_enabled"]))
                 stack.enter_context(cp.gated_call())
+                stack.enter_context(wire.attention_context(command))
+                sol_counts = stack.enter_context(attention_sol.observing())
                 args, kwargs = wire.run_call(
                     command,
                     wire.TensorSpool(spool / "ranks", references),
@@ -716,7 +719,7 @@ class Executor:
                 "detail": f"{type(exc).__name__}: {exc}"[:900],
                 "rank": self.rank,
             }
-        return {"ok": True, "rank": self.rank, "component": list(name)}
+        return {"ok": True, "rank": self.rank, "component": list(name), "sol_calls": sol_counts}
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
         """A group that could not form or hold is THIS process's poison: the worker
@@ -2359,6 +2362,7 @@ class Executor:
         started_wall = time.time()
         served_attention: attention.Applied | None = None
         sol_counts: dict[str, int] = {}
+        sol_rank_counts: dict[int, dict[str, int]] = {}
         capture = None
         capture_result: dict[str, Any] | None = None
         record: AuthorAttempt | None = None
@@ -2367,7 +2371,7 @@ class Executor:
                 attention.override(
                     self._attention_snapshot(), self._attention_roots(), swap, pin
                 ) as served_attention,
-                attention_sol.observing() as sol_counts,
+                attention_sol.observing(ranks=sol_rank_counts) as sol_counts,
             ):
                 capture = self._capture_session(command, surface)
                 with capture if capture is not None else contextlib.nullcontext():
@@ -2410,9 +2414,20 @@ class Executor:
                     "confession",
                     "attention.sol.calls",
                     "sol-attn",
+                    rank=0,
+                    world=self.world,
                     dense_reference=attention_sol.dense_identity(),
                     **sol_counts,
                 )
+                for rank, counts in sorted(sol_rank_counts.items()):
+                    record.emit(
+                        "confession",
+                        "attention.sol.calls",
+                        "sol-attn",
+                        rank=rank,
+                        world=self.world,
+                        **counts,
+                    )
         self._emit_attention(
             record, attention.observed(self._attention_roots()), "attention.restored"
         )
@@ -2582,11 +2597,19 @@ class Executor:
         )
 
     def _attention_check(self, pin: str) -> None:
+        if self._attention_frozen() and attention._is_selected(
+            self._attention_snapshot(), self._attention_roots(), pin
+        ):
+            return
         attention.check(
             self._attention_device(pin), self._attention_roots(), pin, self._attention_frozen()
         )
 
-    def _attention_plan(self, pin: str) -> attention.Swap:
+    def _attention_plan(self, pin: str) -> attention.Swap | None:
+        if self._attention_frozen() and attention._is_selected(
+            self._attention_snapshot(), self._attention_roots(), pin
+        ):
+            return None
         return attention.plan(
             self._attention_device(pin), self._attention_roots(), pin, self._attention_frozen()
         )

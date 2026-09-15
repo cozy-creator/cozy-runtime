@@ -291,6 +291,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         sequence_parallel_degree=degree,
         authorized_device_limit_bytes=2 << 30,
     )
+    command["attention_pin"] = "base/dit=sdpa"
     # Tiny weights do not need the production 256 MiB staging ring on every rank.
     for row in command["models"]:
         row["binding"].update(window_bytes=1 << 20, slots=2, readers=1, inflight=1)
@@ -340,8 +341,26 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         ledger.observe_construction(reply["facts"])
         chooser = PlanChooser(ledger)
         request_id = "native-multi-model-invocation"
+        if degree > 1:
+            for changed_pin in ("base/dit=flash-attn3", "absent/dit=sdpa"):
+                refused = executor.prepare_request(
+                    {
+                        "request_id": "changed-pin",
+                        "entrypoint": "generate",
+                        "payload": {"value": 9},
+                        "attention_kernel": changed_pin,
+                    }
+                )
+                assert refused["code"] == "attention_kernel_frozen", refused
+                assert "changed-pin" not in executor.prepared
+                assert not executor.poisoned
         request = executor.prepare_request(
-            {"request_id": request_id, "entrypoint": "generate", "payload": {"value": 9}}
+            {
+                "request_id": request_id,
+                "entrypoint": "generate",
+                "payload": {"value": 9},
+                "attention_kernel": "base/dit=sdpa",
+            }
         )
         assert request["ok"], request
         prepared = PreparedRequest(
@@ -364,6 +383,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
             {
                 "request_id": request_id,
                 "entrypoint": "generate",
+                "attention_kernel": "base/dit=sdpa",
                 "deadline_s": None,
                 "spool": str(root / "invocation"),
                 "placement": attempt_plan.placement,

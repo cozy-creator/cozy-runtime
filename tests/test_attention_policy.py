@@ -139,11 +139,12 @@ def test_model_scope_and_restore_use_actual_executor_roots(
         parent = Executor(None, tmp_path / "parent")  # type: ignore[arg-type]
         parent.model_executors = children
     all_roots = parent._attention_roots()
-    assert len(parent._attention_plan("model0/dit=sdpa").sites) == 1
-    assert len(parent._attention_plan("dit=sdpa").sites) == model_count
-    assert len(parent._attention_plan("sdpa").sites) == 2 * model_count
+    expected_sites = {"model0/dit=sdpa": 1, "dit=sdpa": model_count, "sdpa": 2 * model_count}
     if aliases:
-        assert len(parent._attention_plan("alternate/dit=sdpa").sites) == 1
+        expected_sites["alternate/dit=sdpa"] = 1
+    for pin, count in expected_sites.items():
+        planned = parent._attention_plan(pin)
+        assert planned is not None and len(planned.sites) == count
     with pytest.raises(attention.AttentionRefusal, match="matches no"):
         parent._attention_check("absent/dit=sdpa")
     parent._attention_check("model0/dit=sdpa")
@@ -305,7 +306,7 @@ def test_sol_sites_are_removed_after_request_and_partial_apply_failure() -> None
     attention_sol.remove_site(vae, "vae", "prepared")
 
 
-def test_sol_cannot_be_installed_for_context_parallel_degree() -> None:
+def test_sol_can_be_installed_for_context_parallel_degree() -> None:
     torch = pytest.importorskip("torch")
     from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
 
@@ -313,11 +314,11 @@ def test_sol_cannot_be_installed_for_context_parallel_degree() -> None:
 
     roots = {
         "dit": torch.nn.ModuleList(
-            [WanAttention(dim=128, heads=1, dim_head=128, processor=processor_type())]
+            [WanAttention(dim=512, heads=4, dim_head=128, processor=processor_type())]
         ).to(torch.bfloat16)
     }
-    with pytest.raises(attention.AttentionRefusal, match="degree 4"):
-        attention.install(_ready("sol-attn"), roots, "sol-attn", degree=4)
+    applied = attention.install(_ready("sol-attn"), roots, "sol-attn", degree=4)
+    assert applied.totals() == {"sol-attn": 1}
 
 
 def test_probe_refuses_wrong_output_dtype_even_with_perfect_values() -> None:
@@ -396,3 +397,29 @@ def test_numerical_probe_runs_on_the_selected_nondefault_device() -> None:
         attention._computes(entry, selected)
         assert torch.cuda.current_device() == 0
     assert indices == [1]
+
+
+def test_repeated_group_pin_requires_every_scoped_prepared_site() -> None:
+    torch = pytest.importorskip("torch")
+    from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
+
+    processor_type: Any = WanAttnProcessor
+    modules = [
+        WanAttention(dim=128, heads=1, dim_head=128, processor=processor_type()) for _ in range(2)
+    ]
+    roots = {"base/dit": torch.nn.ModuleList(modules).to(torch.bfloat16)}
+    attention.install(_ready("sdpa"), roots, "sdpa", degree=2)
+    defaults = attention.snapshot(roots)
+    assert attention._is_selected(defaults, roots, "base/dit=sdpa")
+    assert not attention._is_selected(defaults, roots, "missing/dit=sdpa")
+    assert not attention._is_selected(defaults, roots, "base/dit=absent")
+    # A changed site is not a no-op, even if the other site still matches.
+    modules[1].processor._attention_backend = attention._member(attention.BY_NAME["cudnn"].backend)
+    assert not attention._is_selected(defaults, roots, "base/dit=sdpa")
+    changed_defaults = attention.snapshot(roots)
+    defaults.restore()
+    # Nor may restoration silently replace a currently matching choice with another.
+    assert not attention._is_selected(changed_defaults, roots, "base/dit=sdpa")
+    del modules[1].processor._attention_backend
+    # Class defaults do not turn an unmanaged/missing instance choice into a match.
+    assert not attention._is_selected(defaults, roots, "base/dit=sdpa")

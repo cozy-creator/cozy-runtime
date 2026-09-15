@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -163,3 +165,79 @@ def test_native_sol_preserves_protected_queries_and_input_bytes() -> None:
     assert counts == dict(sparse=1, dense_step=0, dense_path=0, dense_prefix=1)
     for tensor, before in zip((q, k, v), original, strict=True):
         assert torch.equal(tensor.view(torch.uint8), before.view(torch.uint8))
+
+
+def test_mirrored_attention_layout_is_closed_and_restores_on_failure(tmp_path: Path) -> None:
+    from cozy_runtime.internal.parallel import wire
+
+    outer = AttentionLayout(40, 12, 3, 4, ("transformer_blocks.0",))
+    with attention_scope(outer):
+        command = json.loads(json.dumps(wire.run_command((), {}, wire.TensorSpool(tmp_path))))
+    assert _ACTIVE_LAYOUT.get() is None
+    with pytest.raises(RuntimeError), wire.attention_context(command):
+        assert _ACTIVE_LAYOUT.get() == outer
+        raise RuntimeError("follower failed")
+    assert _ACTIVE_LAYOUT.get() is None
+    with attention_scope(outer):
+        with wire.attention_context({"attention_layout": None}):
+            assert _ACTIVE_LAYOUT.get() is None
+        assert _ACTIVE_LAYOUT.get() is outer
+    for value in (
+        {},
+        {**command["attention_layout"], "extra": 1},
+        {**command["attention_layout"], "step": True},
+        {**command["attention_layout"], "dense_paths": "blocks.0"},
+    ):
+        with (
+            pytest.raises(wire.UncrossableArgument),
+            wire.attention_context({"attention_layout": value}),
+        ):
+            pytest.fail("invalid layout must be refused before executing")
+    assert _ACTIVE_LAYOUT.get() is None
+
+
+@pytest.mark.parametrize("degree", [2, 4])
+def test_sol_global_document_exchange_on_real_gloo(tmp_path: Path, degree: int) -> None:
+    """Actual Diffusers unequal-sequence all-to-all and dense policy; no sparse GPU claim."""
+    import os
+    import subprocess
+    import sys
+
+    pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).parent / "testdata" / "sol_ulysses.py"),
+            "--degree",
+            str(degree),
+            "--root",
+            str(tmp_path),
+        ],
+        env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["degree"] == degree and report["device"] == "cpu"
+    assert len(report["cases"]) == 4
+
+
+@pytest.mark.parametrize("kind", ["ring", "degree8", "uninitialized", "no_cp"])
+def test_sol_refuses_unsupported_parallel_configuration_before_collectives(kind: str) -> None:
+    pytest.importorskip("diffusers")
+    from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelConfig
+
+    cp = (
+        None
+        if kind == "no_cp"
+        else ContextParallelConfig(
+            ulysses_degree=8 if kind == "degree8" else 2,
+            ring_degree=2 if kind == "ring" else 1,
+        )
+    )
+    with pytest.raises(ValueError, match="Ulysses"):
+        attention_sol._parallel_group(ParallelConfig(context_parallel_config=cp))
