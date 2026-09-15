@@ -22,7 +22,7 @@ from typing import Any, Protocol
 
 from cozy_runtime.internal import liveness, spawn
 from cozy_runtime.internal.config import inherited_environment
-from cozy_runtime.internal.parallel.plan import GroupRefusal
+from cozy_runtime.internal.parallel.plan import GroupRefusal, RankDivergence
 from cozy_runtime.internal.seam import Channel, SeamError
 
 #: NCCL reads this once, at communicator creation. NVLink SHARP multicast needs a privilege
@@ -119,6 +119,23 @@ def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     dist.init_process_group(spec.backend, store=store, rank=spec.rank, world_size=spec.world)
     dist.barrier()
     return dist.group.WORLD
+
+
+def receive_resident_budget(channel: Channel, *, rank: int, model: str, ceiling: int) -> int:
+    """Offer this rank's safe limit and accept only a matching, no-larger group limit."""
+    channel.send({"reply": "resident_budget", "rank": rank, "model": model, "ceiling": ceiling})
+    decision = channel.recv(timeout=None)
+    shared = (decision or {}).get("ceiling")
+    if (
+        decision is None
+        or set(decision) != {"cmd", "model", "ceiling"}
+        or decision.get("cmd") != "resident_budget"
+        or decision.get("model") != model
+        or type(shared) is not int
+        or not 0 <= shared <= ceiling
+    ):
+        raise RankDivergence(rank, "resident_budget_bytes", "invalid group residence ceiling")
+    return shared
 
 
 class RankGroup:
@@ -320,6 +337,32 @@ class RankGroup:
                 replies.append(frame)
                 break
         return replies
+
+    def agree_resident_budget(self, *, model: str, ceiling: int) -> int:
+        """Agree the smallest measured ceiling before any rank starts filling.
+
+        Qualification and CUDA initialization consume different amounts on each card.
+        These local measurements bound the group plan; they are not model identities.
+        The existing control seam also observes an early prepare failure or rank death,
+        without parking the leader in a new device collective.
+        """
+        shared = ceiling
+        for follower, reply in zip(self.followers, self.collect("resident_budget"), strict=True):
+            offered = reply.get("ceiling")
+            if (
+                set(reply) != {"reply", "rank", "model", "ceiling"}
+                or type(reply.get("rank")) is not int
+                or reply.get("rank") != follower.rank
+                or reply.get("model") != model
+                or type(offered) is not int
+                or offered < 0
+            ):
+                raise RankDivergence(
+                    follower.rank, "resident_budget_bytes", "invalid rank residence ceiling"
+                )
+            shared = min(shared, offered)
+        self.broadcast({"cmd": "resident_budget", "model": model, "ceiling": shared})
+        return shared
 
     def call(self, command: dict[str, Any]) -> list[dict[str, Any]]:
         self.broadcast(command)

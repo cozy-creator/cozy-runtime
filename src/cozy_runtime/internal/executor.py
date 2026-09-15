@@ -75,7 +75,12 @@ from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.parallel import cp, wire
-from cozy_runtime.internal.parallel.group import RankGroup, RankSpec, join_rank
+from cozy_runtime.internal.parallel.group import (
+    RankGroup,
+    RankSpec,
+    join_rank,
+    receive_resident_budget,
+)
 from cozy_runtime.internal.parallel.mirror import mirror_component
 from cozy_runtime.internal.parallel.plan import (
     GroupPlan,
@@ -1418,6 +1423,25 @@ class Executor:
             authorized=authorized - overhead,
             allocatable=int(allocatable) - overhead,
         )
+        local_resident_ceiling = resident_budget
+        if self.world > 1:
+            try:
+                if self.rank == 0:
+                    assert self.group is not None
+                    resident_budget = self.group.agree_resident_budget(
+                        model=self._group_model_key, ceiling=local_resident_ceiling
+                    )
+                else:
+                    resident_budget = receive_resident_budget(
+                        self.channel,
+                        rank=self.rank,
+                        model=self._group_model_key,
+                        ceiling=local_resident_ceiling,
+                    )
+            except (GroupRefusal, SeamError) as exc:
+                return self._group_refusal(
+                    exc if isinstance(exc, GroupRefusal) else GroupRefusal(str(exc))
+                )
         if resident_budget <= 0:
             self.poisoned = "fill refused: device_shortfall"
             return {
@@ -1447,6 +1471,7 @@ class Executor:
         envelope = {
             **envelope,
             "resident_destination_bytes": resident_destinations,
+            "local_resident_ceiling_bytes": local_resident_ceiling,
             "resident_budget_bytes": resident_budget,
             "authorized_device_limit_bytes": authorized,
             "required_bytes": required,
