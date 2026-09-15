@@ -1757,6 +1757,32 @@ class Worker:
     ) -> pb.PreparePackageSetResult:
         return self._prepare_package(request, local=True)
 
+    def _register_local_package(
+        self,
+        request: pb.PrepareLocalPackageRequest,
+        result: pb.PreparePackageSetResult,
+        installed: package_environment.InstalledEnvironment,
+    ) -> pb.PreparePackageSetResult:
+        from cozy_runtime.internal.worker import package_prepare
+
+        prepared = read_placement_set(result.placement_set)
+        if len(prepared) != 1 or not prepared[0].get("development"):
+            raise package_prepare.PreparationRefusal(
+                "local_package_result_invalid",
+                "local preparation did not return one development Placement",
+            )
+        stored = self._placement_from_entry(prepared[0], result.placement_set.placement_set_digest)
+        stored.installed = installed
+        revision = str(stored.development.get("local_revision_digest", ""))
+        if revision != documents.spell(request.package.local_revision_digest):
+            raise package_prepare.PreparationRefusal(
+                "local_package_revision_mismatch",
+                "prepared Placement changed the declared local revision",
+            )
+        self.local_operations[(request.operation_id, revision)] = stored
+        self.prepared_revisions[(stored.placement_id, revision)] = stored
+        return result
+
     def prepare_unpublished_placement(
         self, request: pb.PreparePrivatePlacementRequest
     ) -> pb.PreparePackageSetResult:
@@ -1821,6 +1847,26 @@ class Worker:
         """Derive one local PlacementSet while package imports stay in the isolated executor."""
 
         with self.preparation_lock:
+            if local:
+                from cozy_runtime.internal.worker import local_installations, package_prepare
+
+                assert isinstance(request, pb.PrepareLocalPackageRequest)
+                retained = local_installations.reopen(
+                    Path(self.options.install_root or ""),
+                    request,
+                    artifact_cache=Path(self.options.artifact_cache or ""),
+                    python=Path(self.options.python or sys.executable),
+                    base=self.base,
+                    job_plan_root=self.config.cozy_home / "job-plans",
+                )
+                if retained is not None:
+                    result, installed = retained
+                    return self._register_local_package(request, result, installed)
+                if request.wheels and not any(wheel.path for wheel in request.wheels):
+                    raise package_prepare.PreparationRefusal(
+                        "local_package_reuse_unavailable",
+                        "the installed local revision is absent or changed; upload a new operation",
+                    )
             # Preparation never borrows execution authority. Even an apparently
             # idle primary slot can be admitted by a concurrent desired-state
             # transition while describe is importing the new package.
@@ -1954,40 +2000,13 @@ class Worker:
                 dependency_python=self.options.environment_python,
                 dependency_cache=self.config.dependency_cache,
             )
-            prepared = read_placement_set(result.placement_set)
-            if len(prepared) != 1 or not prepared[0].get("development"):
-                raise package_prepare.PreparationRefusal(
-                    "local_package_result_invalid",
-                    "local preparation did not return one development Placement",
-                )
-            entry = prepared[0]
-            package_interface = dict(entry.get("package_interface", {}))
-            stored = Placement(
-                placement_id=str(entry.get("placement_id", "")),
-                placement_set_digest=result.placement_set.placement_set_digest,
-                package=dict(entry.get("package", {})),
-                development=dict(entry.get("development", {})),
-                environment_digest=_digest_field(entry.get("environment_digest")),
-                package_interface=(
-                    str(package_interface.get("digest", "")),
-                    int(package_interface.get("length", 0)),
-                ),
-                bindings_digest=_digest_field(entry.get("bindings_digest")),
-                models=tuple(dict(row) for row in entry.get("models", [])),
-                entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
-                environment=dict(entry.get("environment", {})),
-                document=dict(entry),
-                installed=materialized[0] if materialized else None,
+            from cozy_runtime.internal.worker import local_installations
+
+            installed = materialized[0]
+            local_installations.record(
+                Path(self.options.install_root or ""), request, result, installed, self.base
             )
-            revision = str(stored.development.get("local_revision_digest", ""))
-            if revision != documents.spell(request.package.local_revision_digest):
-                raise package_prepare.PreparationRefusal(
-                    "local_package_revision_mismatch",
-                    "prepared Placement changed the declared local revision",
-                )
-            self.local_operations[(request.operation_id, revision)] = stored
-            self.prepared_revisions[(stored.placement_id, revision)] = stored
-            return result
+            return self._register_local_package(request, result, installed)
         assert isinstance(request, pb.PreparePackageSetRequest)
         published: list[package_environment.InstalledEnvironment] = []
         result = package_prepare.prepare_package_set(

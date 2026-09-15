@@ -427,6 +427,7 @@ class _PreparationServicer(WorkspaceRPC):
             wire_minor=WIRE_MINOR,
             minimum_wire_minor=MIN_COMPATIBLE_WIRE_MINOR,
             supports_model_materialization_recovery=True,
+            supports_local_installation_reuse=self.local_package_handler is not None,
             supports_mixed_model_inputs=self.unpublished_placement_handler is not None,
         )
 
