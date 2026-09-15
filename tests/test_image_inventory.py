@@ -1,16 +1,4 @@
-"""cr-070 at wire 30: the pod package venv is built by NAME against the image inventory.
-
-The inventory rides the request (`ImageInventory` rows), the dependency set rides the
-release's locked-requirements export, and the filter is `_filtered_rows`: an
-inventory-owned NAME is served by the image's site-packages copy and its export row never
-enters the venv. A LYING inventory — one promising a distribution the image does not
-provide, or provides at another version — refuses typed before any install.
-
-The cr-070 boot-install slow path is DELETED with the wheel plane: an image-owned
-distribution outside a declared range surfaces as a typed refusal before the derivation
-import, never as a silent index install. The full locked install path (real venv, both
-indexes, real import) is proven in test_publish_derivation.py.
-"""
+"""Image inventory is checked as a fact but cannot prune the private dependency closure."""
 
 from __future__ import annotations
 
@@ -63,8 +51,8 @@ def _inventory(pins: dict[str, str]) -> image_inventory.Inventory:
     )
 
 
-def test_locked_export_minus_inventory_names(capsys: pytest.CaptureFixture[str]) -> None:
-    """Name-based export-minus-provided: the inventory-owned row never enters the venv."""
+def test_locked_export_keeps_inventory_names() -> None:
+    """Every selected row enters the private venv, even when the image also has it."""
 
     locked = _locked(
         [
@@ -76,10 +64,7 @@ def test_locked_export_minus_inventory_names(capsys: pytest.CaptureFixture[str])
     rows = _filtered_rows(
         "paul/ranged-marco", "1.0.4", locked, _inventory({DEPENDENCY: "0.0.5"}), {}
     )
-    assert [row.name for row in rows] == ["ranged-marco", "some-helper"]
-    out = capsys.readouterr().out
-    assert "[package-prepare] worker base serves" in out
-    assert f"{DEPENDENCY} (base 0.0.5 over lock 0.0.5)" in out
+    assert rows == list(locked.rows)
 
     # The package's own pin is what the org-index install actually installs; an export
     # without it — or with the wrong release — is not this release's export.
@@ -172,7 +157,7 @@ def test_lying_inventory_refuses_before_any_install() -> None:
     assert phantom.value.detail == f"distribution={DEPENDENCY} inventory=0.0.5 image=absent"
 
 
-def test_inherited_frameworks_do_not_shadow_other_locked_dependencies() -> None:
+def test_frameworks_remain_in_the_complete_locked_dependencies() -> None:
     locked = _locked(
         [
             _pin("cozy-runtime", "0.2.24"),
@@ -188,7 +173,7 @@ def test_inherited_frameworks_do_not_shadow_other_locked_dependencies() -> None:
         _inventory({}),
         {"cozy-runtime": "0.2.25", "tensorfs": "0.3.11", "some-helper": "99.0.0"},
     )
-    assert rows == [row for row in locked.rows if row.name in {"ranged-marco", "some-helper"}]
+    assert rows == list(locked.rows)
     # Importability in an unrelated parent venv is not inherited platform custody.
     assert _filtered_rows("paul/ranged-marco", "1.0.4", locked, _inventory({}), {}) == list(
         locked.rows

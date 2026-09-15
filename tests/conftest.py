@@ -49,3 +49,46 @@ def image_python() -> Path:
         capture_output=True,
     )
     return python
+
+
+@functools.cache
+def authored_python() -> Path:
+    """An explicit author SDK venv, suitable for complete immutable source capture."""
+    import shutil
+    import subprocess
+
+    image = image_python()
+    root = image.parent.parent.parent
+    sdk = root / "author-sdk"
+    uv = shutil.which("uv")
+    assert uv is not None
+    subprocess.run([uv, "venv", "--python", str(image), str(sdk)], check=True, capture_output=True)
+    wheel = next((root / "wheels").glob("cozy_runtime-*.whl"))
+    python = sdk / "bin/python"
+    subprocess.run(
+        [uv, "pip", "install", "--python", str(python), str(wheel)], check=True, capture_output=True
+    )
+    return python
+
+
+@functools.cache
+def sample_python() -> Path:
+    """Install the sample project so executor tests never borrow their working directory."""
+    import shutil
+    import subprocess
+
+    image = image_python()
+    root = image.parent.parent.parent
+    sdk = root / "sample-sdk"
+    uv = shutil.which("uv")
+    assert uv is not None
+    subprocess.run([uv, "venv", "--python", str(image), str(sdk)], check=True, capture_output=True)
+    wheel = next((root / "wheels").glob("cozy_runtime-*.whl"))
+    python = sdk / "bin/python"
+    project = Path(__file__).parent.parent / "examples/marco-polo"
+    subprocess.run(
+        [uv, "pip", "install", "--python", str(python), str(wheel), str(project)],
+        check=True,
+        capture_output=True,
+    )
+    return python

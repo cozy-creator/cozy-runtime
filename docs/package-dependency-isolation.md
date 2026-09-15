@@ -1,6 +1,6 @@
 # Package dependency isolation
 
-Status: accepted design, implementation and end-user qualification pending (proto-057).
+Status: Runtime implementation in PR548; coordinated end-user qualification pending (proto-057).
 Owner: `/root/package_venv_design`; branch `docs/package-venv-isolation`;
 base `a502bfc8df88076b3c462ed96298d14e017d227d`.
 
@@ -66,15 +66,26 @@ working package environment when another package fails.
 
 ## Runtime control versus package SDK
 
-The host worker's control Runtime remains in its own immutable environment. The
-package executor needs the Runtime SDK/implementation and TensorFS dependencies
-that its package closure actually selects. Their versions must meet the explicit
-control/executor protocol and native interoperability contracts; a different
-huggingface-hub, pydantic-core or Torch is not a protocol mismatch. Do not enforce
-compatibility by importing the host SDK through a shared site directory. Initially
-the supported executor Runtime can be installed/captured into each venv with its
-own dependency closure. Broader Runtime version interoperability requires actual
-protocol evidence, not a speculative SDK split or a universal version-equality gate.
+The host worker's control Runtime remains in its own environment. Each package
+executor contains its selected Runtime SDK and TensorFS dependency closure. Both
+local and remote paths use the existing process validation and executor commands;
+this change adds no new child protocol negotiation or compatibility owner.
+A different huggingface-hub, pydantic-core or Torch version is not itself a control
+protocol failure. Missing APIs and native load errors are reported where exercised.
+Never import the host SDK through a shared site directory to satisfy missing code.
+
+## Coordinated hard cut
+
+Update Creator, Runtime, Tensorhub and worker images as one cohort. The worker
+protocol floor is57. There is no feature probe, old dependency-shape adapter or
+image-owned fallback. All newly prepared environments contain their complete
+selected closure. Explicit authored SDK capture remains a supported source of exact
+private dependency bytes; its contents are copied and validated, never inherited.
+
+Old inherited environment records are invalidated by version2 content and local
+installation identities and rebuilt on next preparation. Existing retained files
+can remain until normal eviction; their presence does not make them valid new
+preparations. Preserve active ownership while completing the coordinated rollout.
 
 ## Minimal migration
 
