@@ -45,7 +45,7 @@ print(json.dumps({"cpu_only":True,"interface_built":True}))
     )
     assert result.returncode == 0, result.stdout + result.stderr
     receipts = json.loads((tmp_path / "checkpoints.json").read_text())
-    assert sum(row["weight_bytes"] for row in receipts) == 3_697_560
+    assert sum(row["weight_bytes"] for row in receipts) == 3_705_752
     events = [json.loads(line) for line in result.stderr.splitlines() if line.startswith("{")]
     entries = [row for row in events if row.get("event") == "h3a093.component_enter"]
     assert [(row["tokens"], row["text_tokens"]) for row in entries] == [

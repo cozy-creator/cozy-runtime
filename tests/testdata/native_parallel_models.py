@@ -245,6 +245,11 @@ def follower(args: Any) -> None:
             "active": {key: model._cozy_active for key, model in models.items()},
             "models": sorted(models),
             "filled": [child.facts.get("filled_bytes") for child in self.model_executors],
+            "warm_observations": {
+                key: model.pipe.warm_observations
+                for key, model in models.items()
+                if hasattr(model.pipe, "warm_observations")
+            },
         }
 
     Executor.probe = probe  # type: ignore[method-assign]
@@ -333,6 +338,12 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         assert len(executor.model_executors) == 2
         assert set(executor.models) == {"base", "overlay"}
         assert all(child.facts["filled_bytes"] > 0 for child in executor.model_executors)
+        warm_observation = [{"spare_device": "meta", "scope": "plain", "active": ["dit"]}]
+        assert executor.models["base"].pipe.warm_observations == warm_observation
+        assert set(executor.model_executors[0].facts["resident"]) == {"dit"}
+        assert executor.model_executors[0].facts["parked"] == ["spare"]
+        for remote in group.call({"cmd": "probe"}) if group is not None else []:
+            assert list(remote["warm_observations"].values()) == [warm_observation], remote
         # Cross the real admission boundary before calling either model directly.
         # The former fixture skipped the chooser and could not expose the invented
         # aggregate delivery rung that refused real turbo serving requests.

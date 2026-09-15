@@ -97,7 +97,10 @@ class BasePipe:
         dit = _apply_transformer_dtype(dit)
         dit.set_attention_backend("native")
         dit.register_forward_pre_hook(execution_facts, with_kwargs=True)
-        self.components = {"fl2va_dit": dit}
+        self.components = {
+            "fl2va_dit": dit,
+            "spare": torch.nn.Linear(64, 64, bias=False, dtype=torch.bfloat16),
+        }
         self._plans = {
             "fl2va": SimpleNamespace(
                 schedules=[SimpleNamespace(video_timesteps=(1.0,), audio_timesteps=(1.0,))]
@@ -121,6 +124,34 @@ class Base(Model[BasePipe], encoded_leaves="accept"):
 
     def load(self, loader: Loader) -> None:
         self.pipe = loader.construct(BasePipe, factory=BasePipe)
+
+        def scope_ready(module: Any, args: Any) -> None:
+            del module, args
+            active = self._cozy_active
+            assert active is not None
+            spare_device = self.pipe.components["spare"].weight.device.type
+            assert spare_device == "meta", "warm kept unrelated filled weights resident"
+            print(
+                json.dumps(
+                    {
+                        "event": "h3a093.warm_scope",
+                        "pid": os.getpid(),
+                        "rank": torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else 0,
+                        "spare_device": spare_device,
+                        "active_components": list(active[1]),
+                    }
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+
+        self.pipe.components["fl2va_dit"].register_forward_pre_hook(scope_ready)
+
+    @uses_components("spare")
+    def spare_checksum(self) -> float:
+        return float(self.pipe.components["spare"].weight.detach().sum())
 
     def warm(self, ctx: Any) -> None:
         ctx.raise_if_cancelled()
