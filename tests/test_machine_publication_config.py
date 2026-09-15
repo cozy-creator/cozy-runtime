@@ -43,7 +43,8 @@ except ConfigError as exc:
     print(exc.name)
     raise SystemExit(2)
 print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env),
-                  "hosts":runtime_config_from_host(cfg).object_storage_hosts}))
+                  "hosts":runtime_config_from_host(cfg).object_storage_hosts,
+                  "dependency_cache":str(runtime_config_from_host(cfg).dependency_cache)}))
 """
     result = subprocess.run(
         [sys.executable, "-c", program],
@@ -56,6 +57,7 @@ print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env)
         "origin": "https://hub.example.test",
         "child": {"PATH": "/usr/bin:/bin"},
         "hosts": [".objects.example", "storage.example"],
+        "dependency_cache": "/var/lib/cozy/dependencies",
     }
     for env_change, change in (
         ({"TENSORHUB_TOKEN": "broad-token-must-not-cross"}, {}),
