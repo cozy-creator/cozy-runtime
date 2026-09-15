@@ -77,6 +77,7 @@ def main() -> None:
     parser.add_argument("--factor-dir", type=Path, required=True)
     parser.add_argument("--rows", type=int, default=8192)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--legacy-lora", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.rows <= 0 or args.rows % 4 or args.repeats < 1:
@@ -90,6 +91,15 @@ def main() -> None:
         RowwiseNativeLeaf,
         quantize_activation_rowwise,
     )
+
+    legacy_lora = None
+    legacy_hash = None
+    if args.legacy_lora:
+        from cozy_runtime.internal import lora as legacy_lora
+
+        if getattr(legacy_lora, "TILE_ROWS", None) != 4096:
+            raise SystemExit("legacy reference must be the installed4096-row implementation")
+        legacy_hash = hashlib.sha256(Path(legacy_lora.__file__).read_bytes()).hexdigest()
 
     candidate_hashes = load_candidates(args.candidate_dir)
     from cozy_runtime.internal.base_weights import BaseWeights
@@ -123,6 +133,7 @@ def main() -> None:
         "required_free_bytes": required_free,
         "base_quantizer_scratch_bound": scratch_bound,
         "candidate_sha256": candidate_hashes,
+        "legacy_lora_source_sha256": legacy_hash,
         "versions": {
             name: importlib.metadata.version(name)
             for name in ("torch", "torchao", "peft", "cozy-runtime")
@@ -216,6 +227,12 @@ def main() -> None:
         }
         del standard_reference
         binding = LinearAdapters({"dit": model}, {"dit": "base"}, {"dit": ["0"]})
+        legacy_model = torch.nn.Sequential(legacy)
+        legacy_binding = (
+            legacy_lora.LinearAdapters({"dit": legacy_model}, {"dit": "base"}, {"dit": ["0"]})
+            if legacy_lora is not None
+            else None
+        )
         report["arms"]["inactive_peft"] = {
             **measure(model),
             "versus_legacy": compare(cpu_result(model), reference),
@@ -240,6 +257,22 @@ def main() -> None:
                 adapter = AdapterInput(
                     label, "dit", "base", tensors, scale={"spatial": 0.3, "wushu": 0.8}[label]
                 )
+                legacy_arm = None
+                legacy_output = None
+                if legacy_binding is not None:
+                    with legacy_binding.request(
+                        [
+                            legacy_lora.AdapterInput(
+                                label, "dit", "base", tensors, scale=adapter.scale
+                            )
+                        ],
+                        device=device,
+                        max_device_bytes=8 << 20,
+                        check_cancelled=lambda: None,
+                        check_capacity=capacity,
+                    ):
+                        legacy_output = cpu_result(legacy_model)
+                        legacy_arm = measure(legacy_model)
                 torch.cuda.empty_cache()
                 started = time.perf_counter()
                 with binding.request(
@@ -271,6 +304,12 @@ def main() -> None:
                         "adapter_only_row_partitions": {},
                         "source_parts": row["parts"],
                     }
+                    if legacy_output is not None:
+                        arm["legacy_fp32_tiled"] = {
+                            "timing": legacy_arm,
+                            "comparison": compare(full, legacy_output),
+                        }
+                        del legacy_output
                     for partitions in (2, 4):
                         arm["row_partitions"][str(partitions)] = {
                             "comparison": compare(cpu_result(model, partitions), full),
@@ -302,6 +341,8 @@ def main() -> None:
             report["base_after_requests"] = compare(cpu_result(model), reference)
         finally:
             binding.close()
+            if legacy_binding is not None:
+                legacy_binding.close()
     report["complete"] = True
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({"output": str(args.output), "complete": True, "rows": args.rows}))
