@@ -301,7 +301,13 @@ def test_exact_checkpoint_prepares_and_streams_without_any_release(
             store.resolve_release("example", "model", "1", "main")
         compatible = _compatibility_models([selection], tensorfs_root=root)
         assert compatible[selection["slot"]]["config"] == _CONFIG
-        prepared = _selected_models("example/package", [selection], root, lambda *_args: None)
+        prepared = _selected_models(
+            "example/package",
+            [selection],
+            root,
+            lambda *_args: None,
+            construction_slots={selection["slot"]},
+        )
         assert prepared[selection["slot"]]["manifest_length"] == length
         assert prepared[selection["slot"]]["config_bytes"] == _CONFIG
         assert prepared[selection["slot"]]["assets"] == {"tokenizer/vocab.txt": _ASSET}
@@ -341,7 +347,13 @@ def test_checkpoint_selection_refuses_partial_release_or_incomplete_model(
     with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
         _compatibility_models([selection], tensorfs_root=root)
     with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
-        _selected_models("example/package", [selection], root, lambda *_args: None)
+        _selected_models(
+            "example/package",
+            [selection],
+            root,
+            lambda *_args: None,
+            construction_slots={selection["slot"]},
+        )
 
 
 def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path) -> None:
@@ -354,14 +366,27 @@ def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path)
                 [dict(selection, manifest_length=wrong_length)],
                 root,
                 lambda *_args: None,
+                construction_slots={selection["slot"]},
             )
     with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
-        _selected_models("other/package", [selection], root, lambda *_args: None)
+        _selected_models(
+            "other/package",
+            [selection],
+            root,
+            lambda *_args: None,
+            construction_slots={selection["slot"]},
+        )
     missing = dict(selection, manifest="sha256:" + "f" * 64)
     with pytest.raises(PreparationRefusal):
         _compatibility_models([missing], tensorfs_root=root)
     with pytest.raises(PreparationRefusal):
-        _selected_models("example/package", [missing], root, lambda *_args: None)
+        _selected_models(
+            "example/package",
+            [missing],
+            root,
+            lambda *_args: None,
+            construction_slots={selection["slot"]},
+        )
     candidate = _compatibility_models([selection], tensorfs_root=root)[selection["slot"]]
     mismatch = tensorfs.fit(
         [tensorfs.TensorRequirement("unet", "weight", [2], "f32")],
@@ -382,7 +407,13 @@ def test_checkpoint_selection_refuses_corrupt_header(tmp_path: Path) -> None:
     with pytest.raises(PreparationRefusal):
         _compatibility_models([selection], tensorfs_root=root)
     with pytest.raises(PreparationRefusal):
-        _selected_models("example/package", [selection], root, lambda *_args: None)
+        _selected_models(
+            "example/package",
+            [selection],
+            root,
+            lambda *_args: None,
+            construction_slots={selection["slot"]},
+        )
 
 
 def test_evicted_preparation_rechecks_native_bytes(tmp_path: Path) -> None:
