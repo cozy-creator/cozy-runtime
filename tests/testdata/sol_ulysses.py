@@ -9,8 +9,8 @@ from typing import Any, cast
 
 import torch
 import torch.distributed as dist
-from torch.multiprocessing.spawn import spawn
 from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelConfig
+from torch.multiprocessing.spawn import spawn
 
 from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
 from cozy_runtime.internal import attention_sol
@@ -81,8 +81,10 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str) -> None:
                         attention_scope(layout),
                     ):
                         if device_kind == "cuda":
-                            actual = attention_sol.sol_attention(*shards, _parallel_config=config)
-                            reference = attention_sol.sol_attention(*tensors)
+                            q, k, v = shards
+                            actual = attention_sol.sol_attention(q, k, v, _parallel_config=config)
+                            q, k, v = tensors
+                            reference = attention_sol.sol_attention(q, k, v)
                         else:
                             q, k, v = shards
                             actual = attention_sol._execute_parallel(
