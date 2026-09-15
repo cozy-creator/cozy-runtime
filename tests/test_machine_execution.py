@@ -566,7 +566,7 @@ from cozy_runtime.author import invocable
 @invocable(memoize=True)
 async def helper(ctx: Context, *, n: int) -> Result:
     return Result(n)
-app.job(helper)
+app.job(helper, internal=True)
 @app.entrypoint
 def serve(payload: Request) -> Result:
     path = Path(payload.entered)
@@ -831,6 +831,41 @@ def serve(payload: Request) -> Result:
                 for path in generator.grant_dir.glob("*.json"):
                     path.unlink()
                 if identifier == "first":
+                    helper = JobBinding.read(
+                        next(row for row in plans if row.get("job") == "helper")
+                    )
+                    internal_generator = LocalRecordOwner(
+                        dataclasses.replace(
+                            request,
+                            request_id="internal-root",
+                            entrypoint=helper.job,
+                            job_descriptor_id=helper.job_descriptor_id,
+                            payload={"n": 7},
+                        ),
+                        {},
+                        root / "internal-grants",
+                        package_code_digest=helper.build_id,
+                    )
+                    internal_generator.host.inbound.get_nowait()
+                    internal_generator._dispatch()
+                    internal_offer = internal_generator.host.inbound.get_nowait()
+                    assert internal_offer is not None
+                    with pytest.raises(grpc.RpcError, match="internal_callable") as private_root:
+                        client.SubmitMachineExecution(
+                            pb.MachineExecutionSubmit(
+                                claim=claim,
+                                submission_id="internal-root",
+                                capture_digest=capture_digest,
+                                capture_canonical_bytes=capture,
+                                offer=internal_offer.attempt_offer,
+                                prepared_state=internal_generator._desired_state(),
+                                payload_canonical_bytes=canonical_json.encode({"n": 7}),
+                            ),
+                            timeout=30,
+                        )
+                    assert private_root.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                    assert worker.executions is not None
+                    assert not worker.executions.owns("owner", "internal-root")
                     invalid = pb.MachineExecutionSubmit()
                     invalid.CopyFrom(submission)
                     invalid.offer.request_id = "rejected-input"

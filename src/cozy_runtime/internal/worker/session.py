@@ -6101,10 +6101,32 @@ class Worker:
             )
             self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
             return
-        if (
-            self.workspace is not None
-            and ("job" in attempt.spec or self.fence.wire_minor >= 43)
-            and attempt.state not in ("outcome", "closed")
+        if "serving" in attempt.spec:
+            hosted = self.hosted.get(offered.placement_id)
+            bindings = hosted.bindings if hosted is not None else self.bindings
+            declared = bindings.get(attempt.spec["serving"]["entrypoint_binding_digest"])
+            if declared is not None and declared.internal:
+                from . import internal_calls, machine_capture
+
+                placement = self._placement_by_id(offered.placement_id)
+                revision = machine_capture.code_identity(placement.document) if placement else ""
+                try:
+                    internal_calls.require_child(
+                        self.workspace,
+                        self.fence.record_owner_id,
+                        offered,
+                        revision,
+                        declared.entrypoint,
+                        machine_owned=machine_owned,
+                    )
+                except WorkspaceRefusal as exc:
+                    self.refuse(
+                        offered, "internal_callable", str(exc), CAUSE.CAUSE_CODE_INVALID_REQUEST
+                    )
+                    return
+        if ("job" in attempt.spec or self.fence.wire_minor >= 43) and attempt.state not in (
+            "outcome",
+            "closed",
         ):
             result_schema, memoize = b"", False
             if "job" in attempt.spec:
@@ -6132,14 +6154,35 @@ class Worker:
                 except AttemptRefusal as exc:
                     self.refuse(offered, exc.code, exc.detail, exc.cause, exc.origin)
                     return
+                if declaration.get("internal", False):
+                    from . import internal_calls
+
+                    try:
+                        internal_calls.require_child(
+                            self.workspace,
+                            self.fence.record_owner_id,
+                            offered,
+                            binding.build_id,
+                            binding.job,
+                            machine_owned=machine_owned,
+                        )
+                    except WorkspaceRefusal as exc:
+                        self.refuse(
+                            offered, "internal_callable", str(exc), CAUSE.CAUSE_CODE_INVALID_REQUEST
+                        )
+                        return
                 result_schema = canonical.write(declaration["result"])
                 memoize = declaration.get("invocable", {}).get("memoize", False) is True
-            replay = self.workspace.accept(
-                self.fence.record_owner_id,
-                offered,
-                result_schema=result_schema,
-                worker_boot=self.fence.worker_boot_id,
-                memoize=memoize,
+            replay = (
+                self.workspace.accept(
+                    self.fence.record_owner_id,
+                    offered,
+                    result_schema=result_schema,
+                    worker_boot=self.fence.worker_boot_id,
+                    memoize=memoize,
+                )
+                if self.workspace is not None
+                else None
             )
             if replay is not None:
                 self.send(pb.WorkerFrame(attempt_outcome=replay))

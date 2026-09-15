@@ -70,6 +70,8 @@ class Registration:
     weights_outputs: tuple[WeightsOutput, ...] = ()
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
+    internal: bool = False
+    """Managed children from this installed package revision only; never a root request."""
     hidden: bool = False
     """This surface is DECLARED but NOT PUBLISHED (#572d). A hidden entrypoint stays in the
     local registry but is absent from the package interface, so no deployment stages a binding and
@@ -98,6 +100,7 @@ class Registration:
                 demand_bound=self.demand_bound,
                 preflight=self.preflight,
                 hidden=self.hidden,
+                internal=self.internal,
                 invocable=self.invocable,
                 memoize=self.memoize,
                 model_defaults=self.model_defaults,
@@ -120,6 +123,7 @@ class App:
         *,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         memoize: bool = False,
+        internal: bool = False,
     ) -> Callable[P, R]: ...
 
     @overload
@@ -133,6 +137,7 @@ class App:
         source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         hidden: bool = False,
+        internal: bool = False,
         memoize: bool = False,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
@@ -147,12 +152,16 @@ class App:
         source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         hidden: bool = False,
+        internal: bool = False,
         memoize: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a request-serving callable. BARE is the common case (§1.2).
 
         `hidden=True` declares a surface that is real but NOT READY: it is omitted from the
         published interface and gets no binding staged and no traffic (§1.2, #572d).
+
+        `internal=True` permits managed calls from this installed package revision only.
+        It retains bindings and metadata, but cannot be invoked as an external request.
 
         `memoize=True` explicitly admits deterministic measurement results to the managed
         operation cache. Ordinary generation remains nonmemoized by default.
@@ -172,6 +181,7 @@ class App:
             preflight=preflight,
             demand=demand,
             hidden=hidden,
+            internal=internal,
             memoize=memoize,
             defaults=defaults,
         )
@@ -189,6 +199,7 @@ class App:
         source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         demand: Bound | None = None,
+        internal: bool = False,
     ) -> Callable[P, R]: ...
 
     @overload
@@ -203,6 +214,7 @@ class App:
         source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         demand: Bound | None = None,
+        internal: bool = False,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def job(
@@ -217,6 +229,7 @@ class App:
         source_profiles: Mapping[str, str] | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         demand: Bound | None = None,
+        internal: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a RUN-TO-COMPLETION callable (§2).
 
@@ -225,6 +238,7 @@ class App:
         off the declaration, never off the kind — and everything else about the job is
         derived from the signature exactly as it is for an entrypoint. There is no
         JobContext, no second kernel and no serving loop.
+        `internal=True` retains this job for same-package managed child calls only.
 
         ``source_profiles`` is RETIRED (cr-077): capability is the slot's class annotation,
         and selection defaults live in ``package.toml [bindings]``. Passing it refuses with
@@ -240,6 +254,7 @@ class App:
             weights_outputs=weights,
             preflight=None,
             demand=demand,
+            internal=internal,
             defaults=defaults,
         )
 
@@ -255,9 +270,14 @@ class App:
         demand: Bound | None,
         emits_media: bool = False,
         hidden: bool = False,
+        internal: bool = False,
         memoize: bool = False,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
+        if type(internal) is not bool:
+            raise RegistrationError("internal must be a boolean")
+        if hidden and internal:
+            raise RegistrationError("an internal callable cannot also be hidden")
         declared_defaults = model_defaults(defaults)
 
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
@@ -289,6 +309,7 @@ class App:
                 demand_bound=demand,
                 preflight=preflight,
                 hidden=hidden,
+                internal=internal,
             )
             return target
 

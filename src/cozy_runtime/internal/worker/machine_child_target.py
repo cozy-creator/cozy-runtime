@@ -87,6 +87,10 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     )
     if declared is None:
         raise WorkspaceRefusal("captured child has no callable declaration")
+    if declared.get("internal", False) and caller != revision:
+        raise WorkspaceRefusal(
+            "internal_callable: child requires the same installed package revision"
+        )
     invocable = declared.get("invocable", {})
     if (invocable.get("module"), invocable.get("export")) != (intent["module"], intent["export"]):
         raise WorkspaceRefusal("captured child export changed")

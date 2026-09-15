@@ -102,6 +102,7 @@ def _callable(surface: Surface) -> dict[str, Json]:
         assets=surface.assets_binding,
         publishes=surface.publishes,
         weights_outputs=surface.weights_outputs,
+        internal=surface.internal,
     )
     if surface.invocable or surface.kind == "entrypoint":
         from cozy_runtime.internal import invocable_interface
@@ -122,6 +123,7 @@ def callable_doc(
     assets: AssetsBinding | None,
     publishes: bool,
     weights_outputs: Sequence[WeightsOutput],
+    internal: bool = False,
 ) -> dict[str, Json]:
     """One callable's document from plain facts — the import and static readers meet here."""
     doc: dict[str, Json] = {
@@ -129,6 +131,8 @@ def callable_doc(
         "request": schema.render(payload_type),
         "result": schema.render(result_type, decoded_bounds=True),
     }
+    if internal:
+        doc["internal"] = True
     if models:
         doc["models"] = list(models)
     if assets:
@@ -421,11 +425,13 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
         for index, row in enumerate(rows):
             path = f"{collection}[{index}]"
             required = {"name", "request", "result"}
-            optional = {"models", "invocable", "assets"}
+            optional = {"models", "invocable", "assets", "internal"}
             if kind == "job":
                 required.add("publishes")
                 optional.add("weights_outputs")
             item = _closed(row, required, optional, source, path)
+            if "internal" in item and type(item["internal"]) is not bool:
+                _invalid(source, f"{path}.internal", "must be a boolean")
             name = item["name"]
             if not isinstance(name, str) or not name or name in names:
                 _invalid(source, f"{path}.name", "must be non-empty and unique")

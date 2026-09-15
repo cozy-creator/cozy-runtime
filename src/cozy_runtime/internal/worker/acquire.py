@@ -633,6 +633,7 @@ class Acquirer:
                     model_parameter_name="",
                     application=application,
                     interface_path=str(interface_path),
+                    internal=bool(described.get("internal", False)),
                 )
                 continue
             described_by_path = {
@@ -727,6 +728,7 @@ class Acquirer:
                 model_parameter_name=first.model_parameter_name,
                 application=application,
                 interface_path=str(interface_path),
+                internal=bool(described.get("internal", False)),
                 store=first.store,
                 variant=first.variant,
                 reference_snapshot=first.reference_snapshot,
