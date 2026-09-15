@@ -41,6 +41,7 @@ import socket
 import sys
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -419,6 +420,29 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.residency",
     "cozy_runtime.internal.resolution",
 )
+
+
+def _model_parameter_names(binding: Mapping[str, Any]) -> tuple[str, ...]:
+    """Every declared name for this shared construction, including its primary."""
+    return tuple(
+        dict.fromkeys(
+            str(name)
+            for name in (
+                binding.get("model_parameter_name"),
+                *(binding.get("model_parameter_names") or ()),
+            )
+            if name
+        )
+    )
+
+
+def _local_attention_pin(pin: str, parameters: tuple[str, ...]) -> str:
+    scope, _ = attention._pin_parts(pin)
+    if "/" in scope and scope.split("/", 1)[0] not in parameters:
+        raise attention.AttentionRefusal(
+            "attention_kernel_unsupported", f"{pin} matches no model in {list(parameters)}"
+        )
+    return attention.for_model(pin, parameters)
 
 
 class Executor:
@@ -1045,6 +1069,10 @@ class Executor:
                     "weightless package holds no attention site and a pin is never ignored",
                 }
             return self._prepare_weightless(binding, started)
+        try:
+            _local_attention_pin(pin, _model_parameter_names(binding))
+        except attention.AttentionRefusal as exc:
+            return {"ok": False, "code": exc.code, "detail": str(exc)}
         if "authorized_device_limit_bytes" not in command:
             # NO SELF-DERIVED CEILING (cr-025/cr-066): the worker assigns one before every
             # model-bearing prepare. An absent assignment is a worker defect, refused
@@ -1492,24 +1520,15 @@ class Executor:
             # not a per-attempt one. The degree rides in because a sharded site admits only
             # a kernel `cp.py` can shard, and the fp8 rank is not one (cr-138).
             roots = {**backend.components, **backend.parked}
-            scope, _ = attention._pin_parts(pin)
-            if (
-                optional_attention_scope
-                and scope
-                and not any(
-                    attention._matches(component, scope)
-                    for component, _, _, _ in attention._attention_records(roots)
-                )
-            ):
-                pin = ""
-            applied = attention.select(
-                device_facts,
+            applied = self._prepare_attention(
+                binding,
                 roots,
                 pin,
-                degree=self.world,
+                device_facts,
                 choose=model.choose_attention
                 if type(model).choose_attention is not Model.choose_attention
                 else None,
+                optional_scope=optional_attention_scope,
             )
             self.device_facts = device_facts
             stage("attention_pin")
@@ -1605,10 +1624,7 @@ class Executor:
         self.registry = registry
         # ONE generation under EVERY parameter name the placement's bindings spell
         # (h3a-018): two entrypoints over one construction share the object.
-        self.models = {
-            str(name): model
-            for name in (binding.get("model_parameter_names") or [binding["model_parameter_name"]])
-        }
+        self.models = {name: model for name in _model_parameter_names(binding)}
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY, installed on the constructed
         # generation. From here on, entering a declared scope admits and materializes its
         # set before the body runs; the package cannot observe that it happened.
@@ -1857,11 +1873,14 @@ class Executor:
             scope, _ = attention._pin_parts(aggregate_pin)
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)}
-        if "/" in scope and scope.split("/", 1)[0] not in parameters:
+        declared_parameters = tuple(
+            dict.fromkeys(name for row in rows for name in _model_parameter_names(row["binding"]))
+        )
+        if "/" in scope and scope.split("/", 1)[0] not in declared_parameters:
             return {
                 "ok": False,
                 "code": "attention_kernel_unsupported",
-                "detail": f"{aggregate_pin} matches no model in {parameters}",
+                "detail": f"{aggregate_pin} matches no model in {list(declared_parameters)}",
             }
 
         # ONE authorization for the PROCESS: each construction fits under what the previous
@@ -1895,7 +1914,9 @@ class Executor:
                     ),
                     "devices": command.get("devices", ""),
                     "authorized_device_limit_bytes": max(authorized - held, 0),
-                    "attention_pin": attention.for_model(aggregate_pin, [parameter]),
+                    "attention_pin": aggregate_pin
+                    if attention.for_model(aggregate_pin, _model_parameter_names(binding))
+                    else "",
                 },
                 optional_attention_scope=True,
             )
@@ -2443,6 +2464,32 @@ class Executor:
         }
 
     # ------------------------------------------------------- the per-request attention pin
+
+    def _prepare_attention(
+        self,
+        binding: Mapping[str, Any],
+        roots: Mapping[str, Any],
+        pin: str,
+        device: Any,
+        *,
+        choose: Any = None,
+        optional_scope: bool = False,
+    ) -> attention.Applied:
+        """Select locally while preserving the caller's explicit qualified pin."""
+        local = _local_attention_pin(pin, _model_parameter_names(binding))
+        scope, _ = attention._pin_parts(local)
+        if (
+            optional_scope
+            and "/" not in attention._pin_parts(pin)[0]
+            and scope
+            and not any(
+                attention._matches(component, scope)
+                for component, _, _, _ in attention._attention_records(roots)
+            )
+        ):
+            local = ""
+        applied = attention.select(device, roots, local, degree=self.world, choose=choose)
+        return replace(applied, pin=pin) if local else applied
 
     def _attention_snapshot(self) -> attention.Snapshot:
         return attention.Snapshot(
