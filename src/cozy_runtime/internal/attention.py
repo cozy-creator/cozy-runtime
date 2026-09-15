@@ -190,7 +190,7 @@ PINNABLE: tuple[Candidate, ...] = (
         head_dims=frozenset({128}),
         distribution="sol-attn",
         rel_l2_max=2e-2,  # Native all-keys arithmetic control, not sparse approximation error.
-        why="Explicit sparse experiment; requires model layout and eager execution; Ulysses degrees 2/4 supported.",
+        why="Explicit sparse experiment; eager model layout and optional Ulysses degrees 2/4.",
     ),
 )
 

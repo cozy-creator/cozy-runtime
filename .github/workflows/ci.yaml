@@ -80,7 +80,8 @@ jobs:
       - run: uv pip install --python .venv/bin/python "diffusers==0.40.0" "accelerate==1.14.0" "transformers==5.16.1"
       - run: .venv/bin/python -c "import torch; assert torch.version.cuda is None"
       - run: >-
-          .venv/bin/python -m pytest tests/test_parallel_calls.py tests/test_h3_group_warm_fixture.py
+          .venv/bin/python -m pytest tests/test_parallel_calls.py tests/test_attention_sol.py
+          tests/test_h3_group_warm_fixture.py
           tests/test_job_source_derivation.py tests/test_construction_dtype.py
           tests/test_h3_conditioner_lifecycle.py tests/test_gpu_job_device.py
           tests/test_prepare_diagnostics.py

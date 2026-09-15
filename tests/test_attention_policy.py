@@ -313,7 +313,7 @@ def test_sol_can_be_installed_for_context_parallel_degree() -> None:
 
     roots = {
         "dit": torch.nn.ModuleList(
-            [WanAttention(dim=128, heads=1, dim_head=128, processor=processor_type())]
+            [WanAttention(dim=512, heads=4, dim_head=128, processor=processor_type())]
         ).to(torch.bfloat16)
     }
     applied = attention.install(_ready("sol-attn"), roots, "sol-attn", degree=4)
