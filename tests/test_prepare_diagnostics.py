@@ -2,22 +2,31 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
-import socket
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from cozy_runtime.internal import prepare_diagnostics as diagnostics
+
+
+def test_real_chained_warm_retains_causal_frames_without_values() -> None:
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("the real warm boundary requires Torch")
+    # The warm/derive boundary belongs to an executor, not the test runner that
+    # also proves worker metadata preparation never imports derive.
+    script = """
+import json, socket
 from cozy_runtime.author import Context, Model
 from cozy_runtime.author._context import Device
 from cozy_runtime.internal import prepare_diagnostics as diagnostics
 from cozy_runtime.internal.executor import _send_reply
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.warm import WarmFailed, warm_generation
-
 
 class ChainedWarm(Model[None]):
     def warm(self, ctx: Context) -> None:
@@ -34,33 +43,31 @@ class ChainedWarm(Model[None]):
         exc.add_note("private diagnostic note")
         raise exc
 
-
-def test_real_chained_warm_retains_causal_frames_without_values() -> None:
-    pytest.importorskip("torch")
-    with pytest.raises(WarmFailed) as caught:
-        warm_generation(ChainedWarm(), device=Device("cpu"), cancel=lambda: False)
-    trace = diagnostics.exception_trace(caught.value)
-    # Cross the real IPC sender, including its oversized-reply reduction. The
-    # diagnostic must survive when unrelated preparation metadata is too large.
-    left, right = socket.socketpair()
-    with left, right:
-        _send_reply(
-            Channel(left),
-            {
-                "reply": "prepare",
-                "ok": False,
-                "code": "warm_failed",
-                "detail": str(caught.value),
-                "traceback": trace,
-                "envelope": "x" * 100000,
-            },
-        )
-        reply = Channel(right).recv(timeout=2)
-    assert reply is not None and reply["code"] == "warm_failed"
+try:
+    warm_generation(ChainedWarm(), device=Device("cpu"), cancel=lambda: False)
+except WarmFailed as exc:
+    trace = diagnostics.exception_trace(exc)
+    detail = str(exc)
+else:
+    raise AssertionError("the warm must fail")
+left, right = socket.socketpair()
+with left, right:
+    _send_reply(Channel(left), {
+        "reply": "prepare", "ok": False, "code": "warm_failed", "detail": detail,
+        "traceback": trace, "envelope": "x" * 100000,
+    })
+    reply = Channel(right).recv(timeout=2)
+assert reply is not None and reply["code"] == "warm_failed"
+print(json.dumps(reply))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    reply = json.loads(result.stdout)
     retained = "\n".join(diagnostics.activity_lines(reply["traceback"]))
     assert retained.index("OSError") < retained.index("RuntimeError") < retained.index("WarmFailed")
     assert "in collective" in retained and "in warm_generation" in retained
-    assert "test_prepare_diagnostics.py:" in retained
+    assert "<string>:" in retained
     assert "not-for-diagnostics" not in retained
     assert "private diagnostic note" not in retained
     assert "secret =" not in retained and str(__file__) not in retained
