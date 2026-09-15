@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -362,7 +363,55 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers(snaps
             installed.generation.rename(moved)
             with pytest.raises(PreparationRefusal, match="local_package_reuse_unavailable"):
                 worker.prepare_local_package(request)
-            moved.rename(installed.generation)
+            if snapshot:
+                moved.rename(installed.generation)
+            else:
+                repair = pb.PrepareLocalPackageRequest()
+                repair.CopyFrom(request)
+                repair.operation_id = "repair-missing-generation"
+                repair_wheels = environment / ".stage" / repair.operation_id / "wheels"
+                repair_wheels.mkdir(parents=True)
+                for wheel, contents in zip(repair.wheels, carriers, strict=True):
+                    path = repair_wheels / wheel.filename
+                    path.write_bytes(contents)
+                    wheel.path = str(path)
+                # Existing partial generations are not an eviction and cannot be
+                # replaced while another execution may still own their files.
+                installed.generation.mkdir(mode=0o555)
+                with pytest.raises(PreparationRefusal, match="package_environment_content_absent"):
+                    worker.prepare_local_package(repair)
+                assert not list(installed.generation.iterdir())
+                installed.generation.rmdir()  # only the empty test-owned directory above
+
+                other_inode = other_installed.generation.stat().st_ino
+                before_repair = time.monotonic()
+                worker.prepare_local_package(repair)
+                repaired = worker.local_operations[(repair.operation_id, revision)].installed
+                assert repaired is not None
+                assert repaired.content_digest == installed.content_digest
+                assert repaired.receipt_digest == installed.receipt_digest
+                assert repaired.generation == installed.generation and not repaired.reused
+                assert receipt.read_bytes() == saved
+                assert other_installed.generation.stat().st_ino == other_inode
+                assert moved.is_dir()
+                assert plan.read_bytes() == plan_raw
+                imported = subprocess.run(
+                    [
+                        str(repaired.python),
+                        "-I",
+                        "-c",
+                        "import prepare_retained; print(prepare_retained.__file__)",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                assert Path(imported.stdout.strip()).parent == repaired.site_packages
+                print(f"missing generation repaired in {time.monotonic() - before_repair:.3f}s")
+                for wheel in repair.wheels:
+                    Path(wheel.path).unlink()
+                    wheel.path = ""
+                assert worker.prepare_local_package(repair).placement_set
             assert worker.prepare_local_package(request) == first
             print(
                 f"local installation ({snapshot=}): prepare={cold_seconds:.3f}s "

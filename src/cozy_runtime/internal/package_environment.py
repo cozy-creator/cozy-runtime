@@ -473,18 +473,32 @@ def materialize(
             "rented execution requires bounded exact dependency wheels, not an online boot resolve",
         )
     if receipt_path.exists():
-        installed = open_generation(
-            root,
-            receipt_digest=receipt_digest,
-            environment_digest=source.environment_digest,
-            reused=True,
-            python=python,
-        )
-        _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
-        _verify_prefix_resources(installed.generation, inspected)
-        if exact_dependencies:
-            _verify_installed_requirements(installed.site_packages, inspected, observed)
-        return installed
+        try:
+            installed = open_generation(
+                root,
+                receipt_digest=receipt_digest,
+                environment_digest=source.environment_digest,
+                reused=True,
+                python=python,
+            )
+        except EnvironmentRefusal as exc:
+            if exc.code != "package_environment_content_absent":
+                raise
+            # The receipt is valid but its generation may have been evicted. Rebuild
+            # only an absent exact generation from the freshly verified wheels.
+            # An existing incomplete/malformed generation is never overwritten.
+            try:
+                final.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise
+        else:
+            _verify_boot_installs(installed.site_packages, boot_installs, reused=True)
+            _verify_prefix_resources(installed.generation, inspected)
+            if exact_dependencies:
+                _verify_installed_requirements(installed.site_packages, inspected, observed)
+            return installed
     reused = final.exists()
     with storage_admission.admit(_wheel_write_bound(root, inspected, reused=reused)):
         _require_owned_root(root)

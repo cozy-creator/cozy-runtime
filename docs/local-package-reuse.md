@@ -39,6 +39,11 @@ are regenerated from the verified installed interface. An existing conflicting j
 plan raises `local_package_job_plan_conflict`; uploading wheels cannot repair an
 immutable-plan conflict and never overwrites it.
 
+A valid receipt whose exact generation is absent can be repaired from newly
+verified wheels. Runtime rebuilds that generation through normal storage admission
+and atomic publication, preserving the receipt identity and other installations.
+An existing incomplete generation is a hard refusal and is never overwritten.
+
 The independently negotiated `supports_local_installation_reuse` capability is
 required before making that probe. Older Hosts rebuild `ProtocolInfoResult` from
 their supported fields, so they cannot pass this capability through from a newer
