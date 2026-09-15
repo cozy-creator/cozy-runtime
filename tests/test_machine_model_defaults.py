@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 import threading
@@ -15,17 +16,22 @@ from typing import Any, cast
 import pytest
 import tensorfs
 
+from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, hostfacts
 from cozy_runtime.internal.worker import grants, machine_checkpoint_inputs
 from cozy_runtime.internal.worker import machine_model_defaults as defaults
+from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.machine_child_target import Target
-from cozy_runtime.internal.worker.session import Worker
+from cozy_runtime.internal.worker.machine_serving import Serving
+from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Call
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
-from test_machine_execution import ack, complete
+from test_device_lanes import _config
+from test_group_lanes import _placement
+from test_machine_execution import ack, complete, offer
 from test_model_runtime_closure import _ASSET, _HEADER, _snapshot
 
 REVISION = "sha256:" + "11" * 32
@@ -138,8 +144,9 @@ def test_unused_or_overridden_defaults_do_not_touch_catalog_or_storage(
     assert not defaults.matches("H100", "")
 
 
+@pytest.mark.parametrize("reuse", [False, True])
 def test_serving_default_uses_real_catalog_input_pin_without_derived_provenance(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reuse: bool
 ) -> None:
     root, manifest, length, store = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
     operation = store.begin_operation("default-fixture", "proof", "adapter")
@@ -160,7 +167,9 @@ def test_serving_default_uses_real_catalog_input_pin_without_derived_provenance(
 
     monkeypatch.setattr(tensorfs, "pull", no_download)
     with ExitStack() as read_access:
-        defaults.materialize(worker, [row], read_access)
+        leases = set((root / "tmp/leases").glob("read-*.lease"))
+        defaults.materialize(worker, [row], None if reuse else read_access)
+        assert bool(set((root / "tmp/leases").glob("read-*.lease")) - leases) is not reuse
         bindings, accesses = defaults.inputs([row])
         spec = pb.InvocationSpec(
             inputs=bindings,
@@ -218,6 +227,112 @@ def test_unavailable_default_refuses_before_accelerator_discovery(
     for capture in captures:
         with pytest.raises(WorkspaceRefusal, match="captured Model default is unavailable"):
             defaults.select(peer(capture), "owner", call, target(), {"adapter": {}})
+
+
+@pytest.mark.parametrize("mutation", ["repository", "asset"])
+def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root, manifest, length, store = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
+    operation = store.begin_operation("registered-default", "proof", "adapter")
+    operation.hold_manifest(manifest, length)
+    operation.commit_release(None, "1.0.0", "bf16", manifest, length)
+    worker = Worker(
+        _config(tmp_path / "home"),
+        WorkerOptions(root=tmp_path / "worker", tensorfs_root=root, accelerator_backend="none"),
+        InMemoryControlHost(),
+    )
+    serving = Serving(worker)
+    worker.fence.record_owner_id = "owner"
+    assert worker.executions is not None
+    source = {"digest": manifest, "length": length}
+    capture = captured()
+    capture["format"] = "cozy.worker.v1.MachineExecutionCapture/1"
+    capture["model_defaults"] = [
+        {
+            "callee_revision_digest": REVISION,
+            "entrypoint": "generate",
+            "parameter": "adapter",
+            "public_origin": "https://unreachable.example",
+            "rungs": [{"gpu": "*", "repository": "proof/adapter", "manifest": source}],
+        }
+    ]
+    worker.executions.submit(
+        "owner", "parent", b"c" * 32, offer(), capture_document=canonical_json.encode(capture)
+    )
+    document = {
+        "development": {"local_revision_digest": REVISION},
+        "environment_digest": REVISION,
+        "package_interface": MANIFEST,
+        "models": [{"id": "default", "manifest": source}],
+        "entrypoints": [
+            {
+                "name": "generate",
+                "slots": [{"slot": "adapter", "reference_model_id": "default"}],
+            }
+        ],
+    }
+    placement = _placement("registered")
+    placement.document = document
+    worker.prepared_revisions[(placement.placement_id, REVISION)] = placement
+    selected = dataclasses.replace(
+        target(),
+        declaration={"models": [{"path": "generate.models.adapter"}]},
+        prepared_revision={"placement": document},
+    )
+    call = Call("root", 0, 1, 1, b"i" * 32, b"{}", "child", b"", False, b"", "", "")
+    request = pb.ChildCallRequest(
+        parent_attempt_ordinal=1, request_canonical_bytes=b'{"payload":{},"models":{}}'
+    )
+    try:
+        with serving._prepare("owner", call, selected, request).access:
+            assert not list((root / "tmp/leases").glob("read-*.lease"))
+        # Exact registered metadata is not byte custody. A change after the fast path
+        # must still be refused by the child's ordinary native admission.
+        bindings, accesses = defaults.inputs(
+            [{"parameter": "adapter", "repository": "proof/adapter", "manifest": source}]
+        )
+        spec = pb.InvocationSpec(
+            inputs=bindings,
+            serving=pb.ServingInvocationSpec(
+                entrypoint_binding_digest=REVISION,
+                attempt_binding_id=REVISION,
+                bindings_digest=REVISION,
+            ),
+        )
+        raw, digest = documents.identity(spec)
+        child = pb.AttemptOffer(
+            request_id="child",
+            attempt_ordinal=1,
+            invocation_spec_canonical_bytes=raw,
+            invocation_spec_digest=digest,
+            grant=pb.DeliveryGrant(invocation_spec_digest=digest, inputs=accesses),
+        )
+        entries = grants.model_inputs(
+            grants.bind(documents.read(raw, pb.InvocationSpec), child.grant, digest)
+        )
+        if mutation == "repository":
+            (root / "repos/proof/adapter.json").unlink()
+            reason = "REPOSITORY_ABSENT"
+        else:
+            asset = next(
+                path
+                for path in (root / "blobs").rglob("*")
+                if path.is_file() and path.read_bytes() == _ASSET
+            )
+            asset.chmod(0o600)
+            asset.write_bytes(b"wrong\n")
+            reason = "OBJECT_CORRUPT"
+        assert worker.workspace is not None
+        with pytest.raises(WorkspaceRefusal, match=reason):
+            machine_checkpoint_inputs.preflight(worker.workspace, "owner", child, entries)
+        with worker.workspace.locked() as db:
+            assert not db.execute("SELECT 1 FROM execution_checkpoint_inputs").fetchone()
+    finally:
+        serving.close()
+        worker.supervision.close()
+        worker.weights.close()
 
 
 def test_cold_default_native_pull_requires_deployment_object_storage_host(

@@ -344,8 +344,6 @@ class Serving:
             defaults = machine_model_defaults.select(worker, owner, call, target, model_arguments)
         access = contextlib.ExitStack()
         try:
-            with self.phase(call, request, "materialize_model_defaults"):
-                machine_model_defaults.materialize(worker, defaults, access)
             for model in target.declaration["models"]:
                 prefix = target.entrypoint + ".models."
                 path = model["path"]
@@ -382,6 +380,7 @@ class Serving:
             expected.update({row["parameter"]: row["manifest"] for row in defaults})
             with worker.control_lock:
                 candidates = [dict(value.document) for value in worker.prepared_revisions.values()]
+            matched = None
             for candidate in candidates:
                 if (
                     machine_capture.code_identity(candidate) != target.revision
@@ -410,7 +409,14 @@ class Serving:
                 if {
                     slot["slot"]: models[slot["reference_model_id"]] for slot in entry["slots"]
                 } == expected:
-                    return Prepared(candidate, defaults, access)
+                    matched = candidate
+                    break
+            with self.phase(call, request, "materialize_model_defaults"):
+                machine_model_defaults.materialize(
+                    worker, defaults, access if matched is None else None
+                )
+            if matched is not None:
+                return Prepared(matched, defaults, access)
             installed = package_environment.open_generation(
                 Path(worker.options.install_root or ""),
                 receipt_digest=target.prepared_revision["receipt_digest"],
