@@ -29,6 +29,10 @@ CUDA_VISIBLE_DEVICES='' python tests/testdata/h3_group_warm_fixture.py \
 
 The GPU execution gate requires a root-controlled, explicitly owned GPU host,
 with Runtime/TensorFS/Torch and the fixture's released dependencies installed.
+The runner calls TensorFS's `Store.prepare_readers()` on its own synthetic Store
+before the worker starts, so separate reader UIDs can create their lease markers.
+It does not chmod TensorFS internals itself.
+
 Stage the package, harness and interpreter in directories traversable by UID65533
 (for example a dedicated `/tmp/h3a093-...` tree and its venv). The runner verifies
 actual UID access before constructing a worker. Do not chmod unrelated directories

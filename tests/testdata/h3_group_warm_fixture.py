@@ -160,6 +160,8 @@ def main() -> None:
         return
     if os.geteuid() != 0:
         parser.error("actual pod executor UID qualification requires root")
+    # TensorFS owns its lease/recovery path policy for separate reader UIDs.
+    tensorfs.Store.ensure(str(store)).prepare_readers()
     preflight_uid(root)
     config = RuntimeConfig(
         cozy_home=root / "home",
