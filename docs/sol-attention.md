@@ -37,8 +37,12 @@ The Turbo model sampling methods accept the request-local keyword
 
 ```python
 base_model.sample_fl2va_turbo(
-    state, turbo_lora=turbo_model, on_step=on_step, cancel=cancel,
-    checks=checks, sol_dense_steps=4,
+    state,
+    turbo_lora=turbo_model,
+    on_step=on_step,
+    cancel=cancel,
+    checks=checks,
+    sol_dense_steps=4,
 )
 ```
 
