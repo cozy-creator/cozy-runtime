@@ -77,7 +77,7 @@ def sparse_control(tensors: list[Any], output: Any, degree: int, live: int) -> d
     }
 
 
-def rank_main(rank: int, degree: int, root: Path, device_kind: str) -> None:
+def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) -> None:
     torch.set_num_threads(1)
     device = torch.device(f"cuda:{rank}" if device_kind == "cuda" else "cpu")
     if device_kind == "cuda":
@@ -104,7 +104,7 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str) -> None:
                 torch.randn(
                     1,
                     length,
-                    8,
+                    heads,
                     128,
                     generator=generator,
                     device=device,
@@ -177,6 +177,8 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str) -> None:
                         "sparse_control": control,
                         "length": length,
                         "local_length": shards[0].shape[1],
+                        "heads": heads,
+                        "heads_per_rank": heads // degree,
                         "step": layout.step,
                         "dense_paths": layout.dense_paths,
                         "combined_reference_and_parallel_calls": counts,
@@ -193,18 +195,37 @@ def main() -> None:
     parser.add_argument("--degree", type=int, choices=(2, 4), required=True)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--heads", type=int, choices=(8, 56), default=8)
     args = parser.parse_args()
     args.root.mkdir(parents=True, exist_ok=True)
     spawn_ranks: Any = spawn
     spawn_ranks(
-        rank_main, args=(args.degree, args.root, args.device), nprocs=args.degree, join=True
+        rank_main,
+        args=(args.degree, args.root, args.device, args.heads),
+        nprocs=args.degree,
+        join=True,
     )
     ranks = [
         json.loads((args.root / f"rank-{rank}.json").read_text()) for rank in range(args.degree)
     ]
-    report = {"degree": args.degree, "device": args.device, "cases": ranks[0], "ranks": ranks}
+    report = {
+        "degree": args.degree,
+        "device": args.device,
+        "heads": args.heads,
+        "cases": ranks[0],
+        "ranks": ranks,
+    }
     (args.root / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps({"degree": args.degree, "device": args.device, "cases": len(ranks[0])}))
+    print(
+        json.dumps(
+            {
+                "degree": args.degree,
+                "device": args.device,
+                "heads": args.heads,
+                "cases": len(ranks[0]),
+            }
+        )
+    )
 
 
 if __name__ == "__main__":
