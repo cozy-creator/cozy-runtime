@@ -20,6 +20,9 @@ import re
 import sys
 import tomllib
 
+from packaging.requirements import Requirement
+from packaging.version import Version
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "cozy_runtime"
 
@@ -184,6 +187,42 @@ def fence_forbidden_dependency() -> list[str]:
         for name in imports(ast.parse(path.read_text())):
             if token := denied(name):
                 bad.append(f"{path.relative_to(ROOT)}: forbidden import {name!r} ({token})")
+    return bad
+
+
+def fence_dependency_version_ranges() -> list[str]:
+    """Published requirements permit patch upgrades; exact cohorts live in uv.lock."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    groups = {"dependencies": project.get("dependencies", [])}
+    groups.update(project.get("optional-dependencies", {}))
+    bad: list[str] = []
+    for group, requirements in groups.items():
+        for declaration in requirements:
+            requirement = Requirement(declaration)
+            for bound in requirement.specifier:
+                if bound.operator == "===":
+                    bad.append(
+                        f"pyproject.toml: {group} requirement {declaration!r} pins "
+                        "an exact version; pin resolved versions in uv.lock"
+                    )
+                    continue
+                version = bound.version.removesuffix(".*")
+                release = Version(version).release
+                pinned = (
+                    (
+                        bound.operator == "=="
+                        and (not bound.version.endswith(".*") or len(release) > 2)
+                    )
+                    or (bound.operator == "~=" and len(release) > 3)
+                    or (bound.operator == "<=" and len(release) > 2)
+                    or (bound.operator == "<" and any(release[2:]))
+                )
+                if pinned:
+                    bad.append(
+                        f"pyproject.toml: {group} requirement {declaration!r} restricts "
+                        "patch versions; use a minimum or major/minor range, and pin "
+                        "resolved versions in uv.lock"
+                    )
     return bad
 
 
@@ -1060,6 +1099,7 @@ def fence_one_address_predicate() -> list[str]:
 FENCES = {
     "one-address-predicate": fence_one_address_predicate,
     "forbidden-dependency": fence_forbidden_dependency,
+    "dependency-version-ranges": fence_dependency_version_ranges,
     "one-attempt-kernel": fence_one_attempt_kernel,
     "canonical-numbers": fence_canonical_numbers,
     "torch-free-import": fence_torch_free_import,

@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.18.4"
+version = "0.18.5"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
@@ -13,12 +13,12 @@ requires-python = ">=3.12,<3.13"
 # what `worker-protocol/scripts/vendored-diff.sh` checks (#536d), and it is why the copy no
 # longer carries the old import rewrite.
 dependencies = [
-    "tensorfs>=0.3.43,<0.4",
+    "tensorfs>=0.3.43",
     "cryptography>=45",
     "grpcio>=1.76",
     "msgspec>=0.19",
     "packaging>=24",
-    "pillow>=12,<13",
+    "pillow>=12",
     "protobuf>=6.31",
 ]
 
@@ -67,9 +67,8 @@ packages = ["src/cozy_runtime", "src/cozy"]
 
 [tool.uv]
 package = true
-# The historical SDXL development corpus is qualified against Transformers 4;
-# MiniMax H3's upstream implementation requires Transformers 5. These are separate
-# test/inference environments, not two compatible dependency sets for one venv.
+# The historical SDXL development corpus and MiniMax H3 keep independently locked
+# dependency cohorts; their published requirements describe minimum versions only.
 conflicts = [[{ extra = "corpus" }, { extra = "minimax-h3" }]]
 
 # Read only on the COZY_RUNTIME_BUILD_KERNELS=1 wheel build; the root CMakeLists.txt is
@@ -160,26 +159,26 @@ warn_unused_ignores = false
 # Builtins are imported only on explicit use. Worker images keep ownership of the
 # compatible Torch/CUDA family; this extra does not pin a CUDA wheel or index.
 minimax-h3 = [
-    "diffusers==0.40.0",
-    "transformers==5.16.1",
-    "torch>=2.13,<3",
-    "torchvision>=0.28,<1",
+    "diffusers>=0.40.0",
+    "transformers>=5.16.1",
+    "torch>=2.13",
+    "torchvision>=0.28",
     "numpy>=1.26",
-    "safetensors==0.8.0",
-    "tokenizers==0.23.1",
+    "safetensors>=0.8.0",
+    "tokenizers>=0.23.1",
 ]
-assessment = ["cozy-eval>=0.7,<0.8"]
+assessment = ["cozy-eval>=0.7"]
 # The derivation harness and the serving executor. Corpus venvs install this.
-derive = ["torch>=2.13,<3"]
+derive = ["torch>=2.13"]
 # The separate SDXL corpus retains its own upstream dependency cohort.
-corpus = ["torch>=2.13,<3", "diffusers>=0.36", "transformers>=4.40,<5"]
+corpus = ["torch>=2.13", "diffusers>=0.36", "transformers>=4.40"]
 media = [
-    "av>=18.1,<19",
+    "av>=18.1",
 ]
 # Runtime owns the model byte plane. Local package environments select this complete
 # capability; base worker images provide TensorFS from the same PyPI range.
 # 0.3.18 provides derived recovery, source adoption and independent result custody.
-model-execution = ["tensorfs>=0.3.43,<0.4"]
+model-execution = ["tensorfs>=0.3.43"]
 
 [[tool.mypy.overrides]]
 # grpcio ships no type information; the stub module is generated.

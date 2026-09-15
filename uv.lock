@@ -195,7 +195,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.18.4"
+version = "0.18.5"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -249,27 +249,27 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "av", marker = "extra == 'media'", specifier = ">=18.1,<19" },
-    { name = "cozy-eval", marker = "extra == 'assessment'", specifier = ">=0.7,<0.8" },
+    { name = "av", marker = "extra == 'media'", specifier = ">=18.1" },
+    { name = "cozy-eval", marker = "extra == 'assessment'", specifier = ">=0.7" },
     { name = "cryptography", specifier = ">=45" },
     { name = "diffusers", marker = "extra == 'corpus'", specifier = ">=0.36" },
-    { name = "diffusers", marker = "extra == 'minimax-h3'", specifier = "==0.40.0" },
+    { name = "diffusers", marker = "extra == 'minimax-h3'", specifier = ">=0.40.0" },
     { name = "grpcio", specifier = ">=1.76" },
     { name = "msgspec", specifier = ">=0.19" },
     { name = "numpy", marker = "extra == 'minimax-h3'", specifier = ">=1.26" },
     { name = "packaging", specifier = ">=24" },
-    { name = "pillow", specifier = ">=12,<13" },
+    { name = "pillow", specifier = ">=12" },
     { name = "protobuf", specifier = ">=6.31" },
-    { name = "safetensors", marker = "extra == 'minimax-h3'", specifier = "==0.8.0" },
-    { name = "tensorfs", specifier = ">=0.3.43,<0.4" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.43,<0.4" },
-    { name = "tokenizers", marker = "extra == 'minimax-h3'", specifier = "==0.23.1" },
-    { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13,<3" },
-    { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
-    { name = "torch", marker = "extra == 'minimax-h3'", specifier = ">=2.13,<3" },
-    { name = "torchvision", marker = "extra == 'minimax-h3'", specifier = ">=0.28,<1" },
-    { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
-    { name = "transformers", marker = "extra == 'minimax-h3'", specifier = "==5.16.1" },
+    { name = "safetensors", marker = "extra == 'minimax-h3'", specifier = ">=0.8.0" },
+    { name = "tensorfs", specifier = ">=0.3.43" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.43" },
+    { name = "tokenizers", marker = "extra == 'minimax-h3'", specifier = ">=0.23.1" },
+    { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13" },
+    { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13" },
+    { name = "torch", marker = "extra == 'minimax-h3'", specifier = ">=2.13" },
+    { name = "torchvision", marker = "extra == 'minimax-h3'", specifier = ">=0.28" },
+    { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40" },
+    { name = "transformers", marker = "extra == 'minimax-h3'", specifier = ">=5.16.1" },
 ]
 provides-extras = ["minimax-h3", "assessment", "derive", "corpus", "media", "model-execution"]
 
