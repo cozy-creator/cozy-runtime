@@ -380,7 +380,7 @@ The accepted migration and mandatory development gates are in
 [Package dependency isolation](docs/package-dependency-isolation.md).
 
 The current implementation still contains inherited-system-site and protected-family
-policies being replaced under proto-053/cr-161. Do not use those restrictions as a
+policies being replaced under proto-057/cr-186. Do not use those restrictions as a
 contract for new code. Preserve atomic generations, immutable byte custody, storage
 admission and executor process/credential isolation while removing image-dependent
 resolution. Exact captured locks preserve reproducibility; authors declare compatible

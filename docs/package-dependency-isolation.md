@@ -1,6 +1,6 @@
 # Package dependency isolation
 
-Status: accepted design, implementation and end-user qualification pending (proto-053).
+Status: accepted design, implementation and end-user qualification pending (proto-057).
 Owner: `/root/package_venv_design`; branch `docs/package-venv-isolation`;
 base `a502bfc8df88076b3c462ed96298d14e017d227d`.
 
