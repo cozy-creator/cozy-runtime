@@ -51,19 +51,15 @@ def distinct_storage_bytes(tensors: Any) -> int:
     subtracted and the difference is the census's own error rather than a mystery.
 
     Quantized wrapper tensors expose logical geometry but do not own a directly
-    addressable storage. TorchAO's flattening utility exposes their physical parts
+    addressable storage. TensorFS exposes their upstream physical parts
     without changing the module, its parameters or its state-dict keys.
     """
     seen: set[tuple[str, int]] = set()
     total = 0
     for tensor in tensors:
-        if callable(getattr(tensor, "__tensor_flatten__", None)):
-            # Optional and lazy: ordinary modules never need TorchAO installed.
-            from torchao.utils import UnwrapTensorSubclass
+        from tensorfs import physical_tensors
 
-            parts = UnwrapTensorSubclass().right_inverse(tensor)
-        else:
-            parts = (tensor,)
+        parts = physical_tensors(tensor)
         for part in parts:
             try:
                 storage = part.untyped_storage()

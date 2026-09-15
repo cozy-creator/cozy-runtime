@@ -4,6 +4,7 @@ import pytest
 
 from cozy_runtime.internal.encoding.torchao_rowwise import bind_rowwise_weight
 from cozy_runtime.internal.lora import AdapterInput, LinearAdapters, prequantized_input_allowed
+from rowwise_fixture import rowwise_spec
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("torchao")
@@ -37,6 +38,7 @@ def test_fusion_installer_preserves_storage_and_only_quantizes_inactive_peft_inp
                 module,
                 torch.ones_like(module.weight, dtype=torch.float8_e4m3fn),
                 torch.ones(module.out_features, 1, dtype=torch.float32),
+                spec=rowwise_spec((module.out_features, module.in_features)),
             )
     target = "transformer_blocks.0.attn.to_q"
     original = transformer.get_submodule(target)
@@ -72,7 +74,12 @@ def test_unowned_upstream_peft_requires_original_input_even_without_runtime_hook
     from cozy_runtime.internal.fusion_install import _rowwise_leaf
 
     base = torch.nn.Linear(16, 32, dtype=torch.bfloat16)
-    bind_rowwise_weight(base, torch.ones(32, 16, dtype=torch.float8_e4m3fn), torch.ones(32, 1))
+    bind_rowwise_weight(
+        base,
+        torch.ones(32, 16, dtype=torch.float8_e4m3fn),
+        torch.ones(32, 1),
+        spec=rowwise_spec((base.out_features, base.in_features)),
+    )
     model = get_peft_model(
         torch.nn.Sequential(base),
         LoraConfig(r=2, lora_alpha=2, target_modules=["0"]),

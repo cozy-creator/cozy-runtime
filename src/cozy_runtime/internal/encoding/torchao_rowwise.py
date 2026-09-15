@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from types import MethodType
 from typing import Any
 
+from tensorfs.derived import Part, Tensor
+
+from cozy_runtime.author._loader import canonical_dtype
 from cozy_runtime.internal.encoding.leaves import (
     PreQuantized,
     RowwiseNativeLeaf,
@@ -20,8 +23,8 @@ from cozy_runtime.internal.encoding.leaves import (
 )
 
 
-def rowwise_tensor(payload: Any, scale: Any, *, dtype: Any) -> Any:
-    """Adopt row-scaled physical parts without copying or requantizing them."""
+def _activation_tensor(payload: Any, scale: Any, *, dtype: Any) -> Any:
+    """Wrap ephemeral activations; stored weights use TensorFS.from_parts."""
     import torch
     from torchao.float8.inference import Float8MMConfig
     from torchao.quantization.quantize_.common import KernelPreference
@@ -68,7 +71,7 @@ def rowwise_input(value: Any, *, dtype: Any) -> Any:
             raise ValueError("rowwise FP8 expects an ordinary floating activation")
         shape = tuple(value.shape)
         payload, scale = quantize_activation_rowwise(torch, value)
-    return rowwise_tensor(
+    return _activation_tensor(
         payload.view(shape if len(shape) > 1 else (1, shape[0])), scale, dtype=dtype
     )
 
@@ -86,7 +89,7 @@ def _rowwise_forward(self: Any, input: Any) -> Any:
     return result if self.bias is None else result + self.bias
 
 
-def bind_rowwise_weight(module: Any, payload: Any, scale: Any) -> Any:
+def bind_rowwise_weight(module: Any, payload: Any, scale: Any, *, spec: Tensor) -> Any:
     """Replace only a Linear's weight; return its former Parameter to its owner.
 
     The receiver-bound method contains no closure over a model or Parameter, so
@@ -94,6 +97,9 @@ def bind_rowwise_weight(module: Any, payload: Any, scale: Any) -> Any:
     stay on the original module. Lifecycle ownership belongs to the fill plane.
     """
     import torch
+    from tensorfs import from_parts
+    from torchao.float8.inference import Float8MMConfig
+    from torchao.quantization.quantize_.common import KernelPreference
 
     if type(module) is not torch.nn.Linear:
         raise TypeError("standard rowwise binding requires an ordinary nn.Linear")
@@ -101,9 +107,17 @@ def bind_rowwise_weight(module: Any, payload: Any, scale: Any) -> Any:
     if forward is not None and getattr(forward, "__func__", None) is not _rowwise_forward:
         raise ValueError("standard rowwise binding cannot replace an authored forward")
     previous = module.weight
-    if tuple(payload.shape) != (module.out_features, module.in_features):
-        raise ValueError("encoded weight shape differs from the Linear geometry")
-    weight = rowwise_tensor(payload, scale, dtype=previous.dtype)
+    if tuple(spec.shape) != (module.out_features, module.in_features):
+        raise ValueError("stored weight shape differs from the Linear geometry")
+    if spec.logical_dtype != canonical_dtype(previous.dtype):
+        raise ValueError("stored logical dtype differs from the Linear weight")
+    weight = from_parts(
+        spec,
+        {"data": payload, "scale": scale},
+        mm_config=Float8MMConfig(use_fast_accum=True),
+        kernel_preference=KernelPreference.TORCH,
+        act_quant_kwargs=None,
+    )
     module.weight = torch.nn.Parameter(weight, requires_grad=False)
     module.forward = MethodType(_rowwise_forward, module)
     return previous
@@ -131,5 +145,15 @@ class TorchaoRowwiseLeaf(RowwiseNativeLeaf):
         )
         if replaced.bias is not None:
             module.bias = torch.nn.Parameter(replaced.bias, requires_grad=False)
-        bind_rowwise_weight(module, parts["data"], parts["scale"])
+        # Provider probes already supply their exact encoding and physical roles.
+        spec = Tensor(
+            canonical_dtype(out_dtype),
+            (replaced.out_features, replaced.in_features),
+            self.encoding,
+            {
+                role: Part(canonical_dtype(value.dtype), tuple(value.shape))
+                for role, value in parts.items()
+            },
+        )
+        bind_rowwise_weight(module, parts["data"], parts["scale"], spec=spec)
         return module

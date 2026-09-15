@@ -23,10 +23,12 @@ def main() -> None:
         raise SystemExit("CPU qualification requires CUDA_VISIBLE_DEVICES=''")
 
     import torch
+    from tensorfs import from_parts
+    from tensorfs.derived import Part, Tensor
 
     from cozy_runtime.author._loader import census
     from cozy_runtime.internal.base_weights import BaseWeights
-    from cozy_runtime.internal.encoding.torchao_rowwise import rowwise_tensor
+    from cozy_runtime.internal.encoding.formats import SPEC_ROWWISE_KEEPDIM
     from cozy_runtime.internal.lora import AdapterInput, LinearAdapters
 
     torch.set_num_threads(2)
@@ -40,7 +42,16 @@ def main() -> None:
 
     def adopt() -> None:
         base.weight = torch.nn.Parameter(
-            rowwise_tensor(payload, scales, dtype=torch.bfloat16), requires_grad=False
+            from_parts(
+                Tensor(
+                    "bf16",
+                    (7168, 5376),
+                    SPEC_ROWWISE_KEEPDIM,
+                    {"data": Part("f8_e4m3fn", (7168, 5376)), "scale": Part("f32", (7168, 1))},
+                ),
+                {"data": payload, "scale": scales},
+            ),
+            requires_grad=False,
         )
 
     adopt()

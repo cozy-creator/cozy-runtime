@@ -298,12 +298,9 @@ def _ff_output_rowwise(ff: Any) -> bool:
 
 def _tensor_census(module: Any) -> tuple[object, ...]:
     def physical_identity(value: Any) -> tuple[object, ...]:
-        if callable(getattr(value, "__tensor_flatten__", None)):
-            from torchao.utils import UnwrapTensorSubclass
+        from tensorfs import physical_tensors
 
-            parts = UnwrapTensorSubclass().right_inverse(value)
-        else:
-            parts = (value,)
+        parts = physical_tensors(value)
         return tuple((str(part.dtype), tuple(part.shape), int(part.data_ptr())) for part in parts)
 
     return tuple(

@@ -12,8 +12,8 @@ from cozy_runtime.internal.encoding.leaves import (
 from cozy_runtime.internal.encoding.torchao_rowwise import (
     bind_rowwise_weight,
     rowwise_input,
-    rowwise_tensor,
 )
+from rowwise_fixture import rowwise_spec
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("torchao")
@@ -45,7 +45,12 @@ def test_binding_keeps_real_linear_bias_hooks_and_deepcopy_receiver() -> None:
     hooks = module._forward_pre_hooks
     payload = torch.ones(32, 16, dtype=torch.float8_e4m3fn)
     scale = torch.ones(32, 1, dtype=torch.float32)
-    assert bind_rowwise_weight(module, payload, scale) is previous
+    assert (
+        bind_rowwise_weight(
+            module, payload, scale, spec=rowwise_spec((module.out_features, module.in_features))
+        )
+        is previous
+    )
     assert type(module) is torch.nn.Linear
     assert module.bias is bias
     assert module._forward_pre_hooks is hooks
@@ -68,12 +73,16 @@ def test_mismatched_parts_and_authored_forward_refuse_before_weight_mutation() -
     payload = torch.ones(32, 16, dtype=torch.float8_e4m3fn)
     scale = torch.ones(32, 1, dtype=torch.float32)
     with pytest.raises(ValueError, match="row scales"):
-        rowwise_tensor(payload, scale.to(torch.bfloat16), dtype=torch.bfloat16)
+        rowwise_input(
+            PreQuantized(payload, scale.to(torch.bfloat16), (32, 16)), dtype=torch.bfloat16
+        )
     with pytest.raises(ValueError, match="logical shape"):
         rowwise_input(PreQuantized(payload, scale, (16, 32)), dtype=torch.bfloat16)
     module.forward = lambda input: input
     with pytest.raises(ValueError, match="authored forward"):
-        bind_rowwise_weight(module, payload, scale)
+        bind_rowwise_weight(
+            module, payload, scale, spec=rowwise_spec((module.out_features, module.in_features))
+        )
     assert module.weight is original
 
 
@@ -92,7 +101,9 @@ def test_native_torchao_preserves_existing_operands_bias_and_peft_input() -> Non
     reference = RowwiseNativeLeaf("rowwise").leaf(
         torch, {"data": payload, "scale": scale}, module, module.weight.dtype
     )
-    bind_rowwise_weight(module, payload, scale)
+    bind_rowwise_weight(
+        module, payload, scale, spec=rowwise_spec((module.out_features, module.in_features))
+    )
     with torch.no_grad():
         expected = reference(value)
         assert torch.equal(module(value), expected)

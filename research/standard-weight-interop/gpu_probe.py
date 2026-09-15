@@ -124,7 +124,10 @@ def main() -> None:
         legacy_hash = hashlib.sha256(Path(legacy_lora.__file__).read_bytes()).hexdigest()
 
     candidate_hashes = load_candidates(args.candidate_dir)
+    from tensorfs.derived import Part, Tensor
+
     from cozy_runtime.internal.base_weights import BaseWeights
+    from cozy_runtime.internal.encoding.formats import SPEC_ROWWISE_KEEPDIM
     from cozy_runtime.internal.encoding.torchao_rowwise import bind_rowwise_weight
     from cozy_runtime.internal.forensics import distinct_storage_bytes
     from cozy_runtime.internal.lora import AdapterInput, LinearAdapters
@@ -194,7 +197,16 @@ def main() -> None:
     legacy = RowwiseNativeLeaf("rowwise").leaf(
         torch, {"data": payload, "scale": scales}, base, torch.bfloat16
     )
-    bind_rowwise_weight(base, payload, scales)
+    spec = Tensor(
+        "bf16",
+        (out_features, in_features),
+        SPEC_ROWWISE_KEEPDIM,
+        {
+            "data": Part("f8_e4m3fn", (out_features, in_features)),
+            "scale": Part("f32", (out_features, 1)),
+        },
+    )
+    bind_rowwise_weight(base, payload, scales, spec=spec)
     x = torch.randn(1, args.rows, in_features, device=device, dtype=torch.bfloat16)
     report["physical_base_parameter_bytes"] = distinct_storage_bytes(base.parameters())
 
@@ -376,7 +388,7 @@ def main() -> None:
                     ]
                     owned.evict()
                     owned.reserve(device)
-                    bind_rowwise_weight(base, payload, scales)
+                    bind_rowwise_weight(base, payload, scales, spec=spec)
                     base.bias.copy_(bias)
                     arm["base_evict_reload"] = compare(cpu_result(model), full)
                     assert all(p.data_ptr() == pointer for p, pointer in before)

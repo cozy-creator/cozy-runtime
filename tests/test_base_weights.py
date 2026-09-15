@@ -3,10 +3,11 @@
 from types import SimpleNamespace
 
 import pytest
+from tensorfs import from_parts
 
 from cozy_runtime.author._loader import census
 from cozy_runtime.internal.base_weights import BaseWeights
-from cozy_runtime.internal.encoding.torchao_rowwise import rowwise_tensor
+from rowwise_fixture import rowwise_spec
 
 torch = pytest.importorskip("torch")
 
@@ -24,7 +25,8 @@ def test_peft_parameters_survive_base_eviction_and_logical_slots_survive_nesting
     payload = torch.randn(32, 16).to(torch.float8_e4m3fn)
     scale = torch.rand(32, 1, dtype=torch.float32)
     base.weight = torch.nn.Parameter(
-        rowwise_tensor(payload, scale, dtype=torch.bfloat16), requires_grad=False
+        from_parts(rowwise_spec(payload.shape), {"data": payload, "scale": scale}),
+        requires_grad=False,
     )
     model = peft.get_peft_model(
         root,
@@ -60,7 +62,8 @@ def test_peft_parameters_survive_base_eviction_and_logical_slots_survive_nesting
             tensor.copy_(source[key])
         # The ordinary fill transaction adopts the same encoded parts again.
         base.weight = torch.nn.Parameter(
-            rowwise_tensor(payload, scale, dtype=torch.bfloat16), requires_grad=False
+            from_parts(rowwise_spec(payload.shape), {"data": payload, "scale": scale}),
+            requires_grad=False,
         )
         assert torch.equal(model(value), expected)
         assert all(

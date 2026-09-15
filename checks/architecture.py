@@ -219,7 +219,24 @@ def fence_package_imports() -> list[str]:
                     f"{rel}: Runtime modules must import generated bindings through "
                     "cozy_runtime.protocol"
                 )
-            if not scoped_tensorfs and any(
+            # Built-in numerical checks inspect tensors, never Store authority.
+            physical_tensor_inspection = (
+                name == "tensorfs"
+                and path.relative_to(SRC).as_posix() == "models/minimax_h3/official.py"
+                and all(
+                    isinstance(node, ast.ImportFrom)
+                    and node.level == 0
+                    and node.module == "tensorfs"
+                    and all(alias.name == "physical_tensors" for alias in node.names)
+                    for node in ast.walk(tree)
+                    if (isinstance(node, ast.ImportFrom) and node.module == "tensorfs")
+                    or (
+                        isinstance(node, ast.Import)
+                        and any(alias.name == "tensorfs" for alias in node.names)
+                    )
+                )
+            )
+            if not (scoped_tensorfs or physical_tensor_inspection) and any(
                 name == f or name.startswith(f + ".") for f in forbidden
             ):
                 bad.append(f"{rel}: {module_of(path)} may not import {name}")

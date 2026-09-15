@@ -16,6 +16,7 @@ from cozy_runtime.internal.lora import (
     LinearAdapters,
     prequantized_input_allowed,
 )
+from rowwise_fixture import rowwise_spec
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("peft")
@@ -225,7 +226,12 @@ def test_cuda_request_without_temporary_admission_refuses_before_device_access()
 def test_standard_weight_admission_includes_compatible_base_quantizer_workspace() -> None:
     pytest.importorskip("torchao")
     base = torch.nn.Linear(4, 6, bias=False, dtype=torch.bfloat16)
-    bind_rowwise_weight(base, torch.ones(6, 4, dtype=torch.float8_e4m3fn), torch.ones(6, 1))
+    bind_rowwise_weight(
+        base,
+        torch.ones(6, 4, dtype=torch.float8_e4m3fn),
+        torch.ones(6, 1),
+        spec=rowwise_spec((base.out_features, base.in_features)),
+    )
     model = torch.nn.Sequential(base)
     binding = LinearAdapters({"dit": model}, {"dit": "base"}, {"dit": ["0"]})
     adapter = AdapterInput(

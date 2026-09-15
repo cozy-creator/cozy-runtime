@@ -13,6 +13,7 @@ from cozy_runtime.author._loader import census
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.internal.base_weights import BaseWeights
 from cozy_runtime.internal.encoding.torchao_rowwise import bind_rowwise_weight
+from rowwise_fixture import rowwise_spec
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("torchao")
@@ -33,7 +34,9 @@ def test_h3_checks_physical_fp8_parts_caches_and_rescans_after_refill(tmp_path: 
     checks = NumericalChecks(telemetry, resident)
     codes = torch.ones(32, 16, dtype=torch.float8_e4m3fn)
     scales = torch.ones(32, 1, dtype=torch.float32)
-    bind_rowwise_weight(base, codes, scales)
+    bind_rowwise_weight(
+        base, codes, scales, spec=rowwise_spec((base.out_features, base.in_features))
+    )
     checks.component("dit", root)
     assert events[-1].fields["tensors"] == 2
     assert events[-1].fields["elements"] == codes.numel() + scales.numel()
@@ -69,7 +72,9 @@ def test_h3_checks_physical_fp8_parts_caches_and_rescans_after_refill(tmp_path: 
     owned.reserve("cpu")
     codes = torch.ones(32, 16, dtype=torch.float8_e4m3fn)
     scales = torch.full((32, 1), 2.0, dtype=torch.float32)
-    bind_rowwise_weight(base, codes, scales)
+    bind_rowwise_weight(
+        base, codes, scales, spec=rowwise_spec((base.out_features, base.in_features))
+    )
     assert not resident.verified(base.weight)
     checks.component("dit", root)
     assert events[-1].fields["status"] == "finite_resident"

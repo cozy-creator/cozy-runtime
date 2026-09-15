@@ -623,14 +623,14 @@ def _inspectable(tensor: Any) -> bool:
 
 def _physical_parts(value: Any) -> list[tuple[str, Any]]:
     """Inspect encoded parts without dequantizing a logical weight."""
-    if isinstance(value, torch.Tensor) and callable(getattr(value, "__tensor_flatten__", None)):
-        from torchao.utils import UnwrapTensorSubclass
+    from tensorfs import physical_tensors
 
-        return [
-            (f".part[{index}]", part)
-            for index, part in enumerate(UnwrapTensorSubclass().right_inverse(value))
-        ]
-    return [("", value)]
+    if not isinstance(value, torch.Tensor):
+        return [("", value)]
+    parts = physical_tensors(value)
+    if len(parts) == 1 and parts[0] is value:
+        return [("", value)]
+    return [(f".part[{index}]", part) for index, part in enumerate(parts)]
 
 
 class ResidentWeights:

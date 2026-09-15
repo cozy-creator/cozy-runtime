@@ -2419,7 +2419,17 @@ class StreamingFillBackend:
         destination = self.enqueued[row.key]
         owner, replaced, attribute = self._leaf_site(row.key, row, destination)
         if isinstance(selection.provider, TorchaoRowwiseLeaf):
-            previous_weight = bind_rowwise_weight(replaced, parts["data"], parts["scale"])
+            from tensorfs.derived import Part, Tensor
+
+            spec = Tensor(
+                row.dtype,
+                row.shape,
+                row.encoded.encoding,
+                {part.role: Part(part.dtype, part.shape) for part in row.encoded.parts},
+            )
+            previous_weight = bind_rowwise_weight(
+                replaced, parts["data"], parts["scale"], spec=spec
+            )
             self.standard_bindings[row.key] = replaced
             return {"#destination": previous_weight}
         leaf = selection.provider.leaf(self.torch, parts, replaced, destination.dtype)
