@@ -264,7 +264,7 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             )
         return describe_verb.run(args[0] if args else None, opts)
     if verb == "version":
-        return version_verb.run(config, opts.full)
+        return version_verb.run(config, opts.full, opts.fields)
     if verb == "new":
         if len(args) != 1:
             raise CliError(

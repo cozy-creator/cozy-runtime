@@ -8,7 +8,7 @@ from cozy_runtime.cli.io import Result
 from cozy_runtime.internal.config import RuntimeConfig
 
 
-def run(config: RuntimeConfig, full: bool = False) -> Result:
+def run(config: RuntimeConfig, full: bool = False, fields: tuple[str, ...] = ()) -> Result:
     rows: tuple[tuple[str, str], ...] = (
         ("distribution", __version__),
         ("tag", f"v{__version__}"),
@@ -26,8 +26,12 @@ def run(config: RuntimeConfig, full: bool = False) -> Result:
         rows=rows,
         next=("cozy-runtime new <name> — scaffold a package",),
         document={
-            **dict(rows),
-            "supports_guarded_restart": True,
+            **{key: value for key, value in rows if not fields or key in fields},
+            **(
+                {"supports_guarded_restart": True}
+                if not fields or "supports_guarded_restart" in fields
+                else {}
+            ),
             "next": ["cozy-runtime new <name> — scaffold a package"],
         },
     )

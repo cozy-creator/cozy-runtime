@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -31,6 +33,21 @@ def _worker(root: Path) -> tuple[Worker, pb.Claim]:
     )
     assert worker.accept_claim(claim, lambda frame: None)[0] == 1
     return worker, claim
+
+
+def test_runtime_cli_reports_guarded_restart_capability() -> None:
+    command = [str(Path(sys.executable).with_name("cozy-runtime")), "version", "--json"]
+    value = json.loads(subprocess.run(command, capture_output=True, text=True, check=True).stdout)
+    assert value["supports_guarded_restart"] is True
+    selected = json.loads(
+        subprocess.run(
+            [*command, "--fields", "distribution"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
+    assert set(selected) == {"distribution", "next"}
 
 
 def test_queued_detached_root_refuses_update_then_can_finish(tmp_path: Path) -> None:
