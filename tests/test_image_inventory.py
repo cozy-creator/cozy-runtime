@@ -7,7 +7,7 @@ enters the venv. A LYING inventory — one promising a distribution the image do
 provide, or provides at another version — refuses typed before any install.
 
 The cr-070 boot-install slow path is DELETED with the wheel plane: an image-owned
-distribution outside a declared range now surfaces as a typed refusal at the derivation
+distribution outside a declared range surfaces as a typed refusal before the derivation
 import, never as a silent index install. The full locked install path (real venv, both
 indexes, real import) is proven in test_publish_derivation.py.
 """

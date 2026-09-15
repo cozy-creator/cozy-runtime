@@ -831,12 +831,12 @@ def materialize_locked(
     Every artifact must match a hash the export names (`--require-hashes`); the indexes have
     no authority over bytes. The uv cache is operation-scoped derived work: it lives beside
     the staging tree and is deleted after install without invalidating hardlinked venv files.
-    The joined venv (image site-packages included) is proven by the derivation that follows —
-    a real import of the installed application in the venv's own interpreter — so an
-    image-owned distribution outside a declared range is a typed refusal there, never a
-    boot-install. A local SDK instead copies its dependency RECORD closure into the
-    generation; that snapshot joins content identity and is checked by open_generation.
+    The joined venv's metadata is checked against its inherited providers before any
+    application import, including on reuse. A local SDK copies its dependency RECORD closure
+    into the generation; that snapshot joins content identity and is checked by open_generation.
     """
+
+    from cozy_runtime.internal import package_requirements
 
     _require_digest(environment_digest, "environment_digest")
     if not locked.indexes:
@@ -872,6 +872,7 @@ def materialize_locked(
             reused=True,
             python=python,
         )
+        package_requirements.validate(installed.site_packages, python, observed)
         _release_locked_wheels(install_rows)
         return installed
     reused = dependency_python is None and final.exists()
@@ -932,7 +933,7 @@ def materialize_locked(
                 receipt_path = receipts / f"{receipt_digest.removeprefix('sha256:')}.json"
                 _write_once(staging / _installed_dependencies.MANIFEST_NAME, manifest)
             # Validates the staged venv's shape; the typed refusal is the point here.
-            _installed_at(
+            staged = _installed_at(
                 staging,
                 content_digest=content_digest,
                 receipt_bytes=receipt_bytes,
@@ -940,6 +941,7 @@ def materialize_locked(
                 reused=False,
                 base=observed,
             )
+            package_requirements.validate(staged.site_packages, python, observed)
             with storage_admission.admit(storage_admission.Write(root, 1 << 20, 128)):
                 _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
                 _make_read_only(staging)
@@ -969,6 +971,8 @@ def materialize_locked(
         reused=reused,
         python=python,
     )
+    if reused:
+        package_requirements.validate(installed.site_packages, python, observed)
     _release_locked_wheels(install_rows)
     return installed
 
