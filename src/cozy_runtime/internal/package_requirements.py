@@ -6,6 +6,7 @@ import json
 import subprocess
 from dataclasses import dataclass
 from email.parser import BytesParser
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -56,17 +57,12 @@ def _distribution(version: str, python: str, requirements: list[str]) -> _Distri
         raise EnvironmentRefusal("package_environment_requirement_invalid", str(exc)) from exc
 
 
-def validate(
-    site_packages: Path,
+@lru_cache(maxsize=16)
+def _base_metadata(
     python: Path,
     base: base_observation.Observation,
-) -> None:
-    """Check every installed root and its selected extras against actual inherited providers.
-
-    Only the trusted base interpreter runs; the application's interpreter and modules do
-    not. Reading METADATA is small and repeated on reuse because the base can be updated
-    independently of the immutable package generation. Unrelated base packages are not roots.
-    """
+) -> dict[str, _Distribution]:
+    """The immutable worker SDK is probed once per observed base, never per inference."""
     result = subprocess.run(
         [
             str(python),
@@ -98,12 +94,27 @@ def validate(
             raise ValueError("worker dependencies changed since its base observation")
     except (ValueError, TypeError) as exc:
         raise EnvironmentRefusal("package_environment_base_changed", str(exc)) from exc
+    return available
+
+
+def validate(
+    site_packages: Path,
+    python: Path,
+    base: base_observation.Observation,
+) -> None:
+    """Check every installed root and its selected extras against actual inherited providers.
+
+    Only the trusted base interpreter runs; the application's interpreter and modules do
+    not. Reading METADATA is small and repeated on reuse because the base can be updated
+    independently of the immutable package generation. Unrelated base packages are not roots.
+    """
+    available = dict(_base_metadata(python, base))
 
     roots: set[str] = set()
     infos = sorted(site_packages.glob("*.dist-info"))
-    if len(infos) > MAX_PACKAGE_WHEELS:
+    if not infos or len(infos) > MAX_PACKAGE_WHEELS:
         raise EnvironmentRefusal(
-            "package_environment_requirement_invalid", "too many distributions"
+            "package_environment_requirement_invalid", "package metadata is absent or oversized"
         )
     for info in infos:
         path = info / "METADATA"

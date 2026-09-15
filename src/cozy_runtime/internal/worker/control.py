@@ -359,6 +359,18 @@ def _refuse(context: Any, exc: BaseException) -> Any:
     from . import package_prepare
 
     if isinstance(exc, package_prepare.PreparationRefusal):
+        from cozy_runtime.internal.package_requirements import DependencyConflict
+
+        cause: BaseException | None = exc
+        seen: set[int] = set()
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            if isinstance(cause, DependencyConflict):
+                context.set_trailing_metadata(
+                    tuple((f"cozy-requirement-{key}", value) for key, value in cause.facts.items())
+                )
+                break
+            cause = cause.__cause__
         return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
     # The type is part of the diagnosis and was being discarded: `PermissionError` and
     # `FileNotFoundError` send an operator to two different places, and `str(exc)` alone
