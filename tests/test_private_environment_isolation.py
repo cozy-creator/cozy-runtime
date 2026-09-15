@@ -193,7 +193,7 @@ def test_prepared_private_revision_reopens_without_dependency_carriers(tmp_path:
         dependency_requirements=raw,
     )
     base = environment.observe_base()
-    held = []
+    held: list[environment.InstalledEnvironment] = []
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
 

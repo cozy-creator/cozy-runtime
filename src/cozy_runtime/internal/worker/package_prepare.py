@@ -983,7 +983,10 @@ def prepare_package(
                     package_environment._release_locked_wheels, locked_dependencies.rows
                 )
                 for item in package_environment.fetch_locked_wheels(
-                    locked_dependencies.rows, install_root, observed_base
+                    locked_dependencies.rows,
+                    install_root,
+                    observed_base,
+                    cache_root=dependency_cache,
                 ):
                     facts.append(
                         (

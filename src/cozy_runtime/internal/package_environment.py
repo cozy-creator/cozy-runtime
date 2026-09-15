@@ -986,7 +986,11 @@ def _install_locked_bounded(
 
 
 def fetch_locked_wheels(
-    rows: Sequence[LockedRow], root: Path, observed: base_observation.Observation
+    rows: Sequence[LockedRow],
+    root: Path,
+    observed: base_observation.Observation,
+    *,
+    cache_root: Path | None = None,
 ) -> list[_Inspected]:
     """Fetch exact dependency artifacts through the existing bounded storage owner."""
     inspected: list[_Inspected] = []
@@ -1004,6 +1008,10 @@ def fetch_locked_wheels(
                 operation, filename, row.hashes[0], row.url
             )
         else:
+            # Local package install roots differ. Retain each exact archive only once
+            # under the machine cache, independently of the project's full closure.
+            if cache_root is not None:
+                expected = cache_root / ".stage" / row.hashes[0].removeprefix("sha256:") / filename
             path, length = _fetch_local_locked_wheel(expected, row)
         if path != expected:
             raise EnvironmentRefusal(
