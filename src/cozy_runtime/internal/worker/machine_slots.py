@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
@@ -25,23 +24,8 @@ def key(request: str) -> str:
 
 
 def free_memory() -> int:
-    """Current host/cgroup availability already charges suspended parent processes."""
-    rows = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
-    available = int(rows["MemAvailable"].split()[0]) * 1024
-    for line in Path("/proc/self/cgroup").read_text().splitlines():
-        if not line.startswith("0::"):
-            continue
-        relative = line.partition("0::")[2].lstrip("/")
-        group = Path("/sys/fs/cgroup") / relative
-        for directory in (group, *group.parents):
-            if not directory.is_relative_to("/sys/fs/cgroup"):
-                break
-            maximum, current = directory / "memory.max", directory / "memory.current"
-            if maximum.is_file() and current.is_file():
-                cap = maximum.read_text().strip()
-                if cap != "max":
-                    available = min(available, int(cap) - int(current.read_text()))
-    return max(0, available)
+    """Current effective host/cgroup availability, including suspended parents."""
+    return max(proctree.available_host_bytes(), 0)
 
 
 def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: JobBinding) -> bool:

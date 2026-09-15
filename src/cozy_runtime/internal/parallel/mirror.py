@@ -19,6 +19,7 @@ def mirror_component(
     prepared: Mapping[tuple[str, str], tuple[Any, Any]],
     group: RankGroup,
     spool: Callable[[], Path | None],
+    adapter_digest: Callable[[], str] = lambda: "",
 ) -> None:
     """Wrap the module call outside all torch and diffusers hooks.
 
@@ -73,6 +74,7 @@ def mirror_component(
                 "component": list(name),
                 "spool": str(directory),
                 "scopes": scopes,
+                "adapter_digest": adapter_digest(),
                 "grad_enabled": torch.is_grad_enabled(),
                 "inference_mode": torch.is_inference_mode_enabled(),
             }

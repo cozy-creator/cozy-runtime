@@ -763,6 +763,11 @@ class AttemptEngine:
                     "request_id": f"{attempt.request_id}#{attempt.attempt}",
                     "entrypoint": declared.entrypoint,
                     "payload": attempt.payload,
+                    "model_adapters": {
+                        model.model_parameter_name: [a.document() for a in model.adapters]
+                        for model in declared.model_bindings()
+                        if model.adapters
+                    },
                     **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
                     **_attention_pin(attempt.spec),
                     "input_metadata": {
@@ -1779,6 +1784,11 @@ class AttemptEngine:
             **_attention_pin(attempt.spec),
             "request_id": key,
             "entrypoint": attempt.declared.entrypoint,
+            "model_adapters": {
+                model.model_parameter_name: [a.document() for a in model.adapters]
+                for model in attempt.declared.model_bindings()
+                if model.adapters
+            },
             "deadline_s": seconds,
             "spool": str(spool),
             "placement": attempt.plan.placement,
