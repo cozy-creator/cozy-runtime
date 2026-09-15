@@ -58,6 +58,7 @@ from cozy_runtime.internal import (
     fill,
     hostfacts,
     package_environment,
+    prepare_diagnostics,
     proctree,
     weights_sink,
 )
@@ -5451,11 +5452,13 @@ class Worker:
                 "boot",
                 f"{placement_id!r} prepare REFUSED for {first.entrypoint_binding_digest[:20]}: "
                 f"{reply.get('code')} - {detail} "
-                f"[peak allocator {reply.get('peak_allocator_bytes', 0)} B was LIVE when "
-                f"it failed; the allocator holds {reply.get('allocator_bytes', -1)} B and "
-                f"the device has {reply.get('device_free_bytes', -1)} B free. The executor "
+                f"[{prepare_diagnostics.memory_summary(reply)}. The executor "
                 "is poisoned and replaced; the card returns with the process (#613)]",
             )
+            for line in prepare_diagnostics.activity_lines(reply.get("traceback")):
+                self.note(
+                    "boot", f"prepare traceback {first.entrypoint_binding_digest[:20]}: {line}"
+                )
             # A failed construction owns no retry policy. Retire its possibly retained
             # allocations and remain offline; convergence decides whether to try again.
             try:

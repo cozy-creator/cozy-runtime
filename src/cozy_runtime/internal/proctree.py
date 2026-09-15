@@ -35,9 +35,11 @@ from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
 PLATFORM = sys.platform
 
 _PR_SET_PDEATHSIG = 1
+_PR_GET_DUMPABLE = 3
 _PR_SET_DUMPABLE = 4
 _PR_SET_CHILD_SUBREAPER = 36
 _PR_SET_NO_NEW_PRIVS = 38
+_PR_GET_NO_NEW_PRIVS = 39
 
 # Linux assigns these through asm-generic and x86_64 alike. The process backend is selected
 # only on Linux; Python builds that expose the typed wrappers use those instead.
@@ -216,6 +218,25 @@ def deny_process_inspection() -> None:
 
     _linux_only("deny_process_inspection")
     _prctl(_PR_SET_DUMPABLE, 0)
+
+
+def own_protection() -> dict[str, int | None]:
+    """Observe this process's credentials/protection without changing its boundary."""
+    facts: dict[str, int | None] = {
+        name: getattr(os, method)() if hasattr(os, method) else None
+        for name, method in (
+            ("uid", "getuid"),
+            ("gid", "getgid"),
+            ("euid", "geteuid"),
+            ("egid", "getegid"),
+        )
+    }
+    for name, option in (("no_new_privs", _PR_GET_NO_NEW_PRIVS), ("dumpable", _PR_GET_DUMPABLE)):
+        facts[name] = None
+        if PLATFORM == "linux":
+            with contextlib.suppress(OSError):
+                facts[name] = _prctl(option)
+    return facts
 
 
 @dataclass(frozen=True, slots=True)
