@@ -80,6 +80,7 @@ def main() -> None:
     parser.add_argument("--out-features", type=int, default=7168)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--legacy-lora", action="store_true")
+    parser.add_argument("--no-bf16-reduced-precision-reduction", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if min(args.rows, args.in_features, args.out_features, args.repeats) < 1:
@@ -112,6 +113,10 @@ def main() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         raise SystemExit("this native qualification is scoped to one SM90 GPU")
     torch.set_num_threads(2)
+    if args.no_bf16_reduced_precision_reduction:
+        # An isolated upstream-kernel experiment. The worker's process-wide flag
+        # is unchanged, and arbitrary-M bit identity remains an empirical check.
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     device = torch.device("cuda")
     in_features, out_features = args.in_features, args.out_features
     weight_bytes = in_features * out_features + out_features * 4
