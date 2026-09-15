@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
+import shutil
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -278,3 +282,122 @@ def test_separate_package_roots_share_uv_payload_inodes_and_safe_cleanup(tmp_pat
     remaining = second.stat()
     assert (remaining.st_ino, remaining.st_mode) == (after.st_ino, after.st_mode)
     assert second.read_bytes().startswith(b"#")
+
+
+@pytest.mark.parametrize("installer", ["locked", "wheel", "fetch"])
+@pytest.mark.parametrize("snapshot_first", [False, True])
+def test_installers_and_snapshots_share_private_cache_root(
+    tmp_path: Path, installer: str, snapshot_first: bool
+) -> None:
+    from cozy_runtime.internal import _installed_dependencies as dependencies
+    from test_installed_dependencies import _distribution, _venv
+    from test_publish_derivation import _SimpleIndex
+
+    cache = tmp_path / "local-packages" / "dependency-objects"
+    source = tmp_path / "source"
+    _distribution(_venv(source), "captured", {"captured.py": b"VALUE=73\n"})
+    snapshots: list[tuple[Path, bytes]] = []
+
+    def capture(target: Path) -> None:
+        manifest = dependencies.snapshot(source / "bin/python", target, set(), cache=cache)
+        snapshots.append((target, manifest))
+
+    if snapshot_first:
+        first = tmp_path / "first-snapshot"
+        _venv(first)
+        capture(first)
+    wheel = _wheel(tmp_path, "cache_client", (), b"VALUE=91\n")
+    index = _SimpleIndex(tmp_path / "index", [wheel])
+    uv_path = shutil.which("uv")
+    assert uv_path is not None
+    uv, python = Path(uv_path), Path(sys.executable)
+    target = tmp_path / "installed"
+    raw = (
+        f"cache-client @ {index.url}cache-client/{wheel.name} "
+        f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}\n"
+    ).encode()
+    rows = environment.read_locked_requirements(raw).rows
+    try:
+        if installer == "locked":
+            environment._install_locked(
+                uv,
+                python,
+                target,
+                tmp_path / "requirements",
+                (index.url,),
+                rows,
+                dependencies=capture,
+                cache_root=cache,
+            )
+        else:
+            if installer == "fetch":
+                inspected = environment.fetch_locked_wheels(
+                    rows, tmp_path / "fetch", environment.observe_base(), cache_root=cache
+                )
+            else:
+                item, _ = environment._measure_inspected_wheel(
+                    wheel, "custom", environment.observe_base()
+                )
+                inspected = [item]
+            environment._install_with_uv(
+                uv, python, target, inspected, dependencies=capture, cache_root=cache
+            )
+    finally:
+        index.close()
+    later = tmp_path / "later-snapshot"
+    _venv(later)
+    capture(later)
+    for root in (cache, cache / "uv-cache"):
+        info = root.lstat()
+        assert stat.S_ISDIR(info.st_mode)
+        assert stat.S_IMODE(info.st_mode) == 0o700
+        assert info.st_uid == os.geteuid()
+        assert root.resolve() == root
+    payloads = []
+    for path, manifest in snapshots:
+        dependencies.verify_files(path, manifest)
+        payloads.append(next(path.glob("lib/python*/site-packages/captured.py")))
+    assert all(path.samefile(payloads[0]) for path in payloads)
+    result = subprocess.run(
+        [
+            str(target / "bin/python"),
+            "-I",
+            "-c",
+            "import cache_client, captured; "
+            "assert (cache_client.VALUE, captured.VALUE) == (91, 73)",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "include-system-site-packages = false" in (target / "pyvenv.cfg").read_text()
+
+
+@pytest.mark.parametrize("kind", ["permissions", "symlink", "file", "relative"])
+def test_dependency_cache_rejects_existing_unsafe_roots_without_repair(
+    tmp_path: Path, kind: str
+) -> None:
+    cache = tmp_path / "cache"
+    if kind == "permissions":
+        cache.mkdir(mode=0o755)
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.mkdir(mode=0o700)
+        cache.symlink_to(target, target_is_directory=True)
+    elif kind == "file":
+        cache.write_text("user-owned")
+    else:
+        cache = Path("relative-dependency-cache")
+    before = cache.lstat() if kind != "relative" else None
+    with pytest.raises(environment.EnvironmentRefusal, match="dependency_cache_invalid"):
+        environment._install_with_uv(
+            Path("/must-not-run"), Path(sys.executable), tmp_path / "staging", [], cache_root=cache
+        )
+    if before is not None:
+        after = cache.lstat()
+        assert (before.st_ino, before.st_mode, before.st_uid) == (
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+        )
+        assert not (cache / "uv-cache").exists()
