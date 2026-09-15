@@ -203,10 +203,18 @@ def main() -> None:
         del q, scale, pq, old_pq, new_pq
         reference = cpu_result(legacy)
         report["arms"]["legacy_base"] = measure(legacy)
+        report["arms"]["legacy_base"]["row_partitions"] = {
+            str(parts): compare(cpu_result(legacy, parts), reference) for parts in (2, 4)
+        }
         report["arms"]["standard_base"] = {
             **measure(base),
             "versus_legacy": compare(cpu_result(base), reference),
         }
+        standard_reference = cpu_result(base)
+        report["arms"]["standard_base"]["row_partitions"] = {
+            str(parts): compare(cpu_result(base, parts), standard_reference) for parts in (2, 4)
+        }
+        del standard_reference
         binding = LinearAdapters({"dit": model}, {"dit": "base"}, {"dit": ["0"]})
         report["arms"]["inactive_peft"] = {
             **measure(model),
@@ -243,12 +251,24 @@ def main() -> None:
                 ):
                     preparation_ms = (time.perf_counter() - started) * 1000
                     full = cpu_result(model)
+                    layer = model[0]
+
+                    def adapter_only(value: Any, layer: Any = layer) -> Any:
+                        # Diagnostic isolation of the same native PEFT A/B
+                        # modules, not a serving implementation or new kernel.
+                        return (
+                            layer.lora_B["request_0"](layer.lora_A["request_0"](value))
+                            * layer.scaling["request_0"]
+                        )
+
+                    adapter_full = cpu_result(adapter_only)
                     arm = {
                         "preparation_wall_ms": preparation_ms,
                         "preparation": binding.preparation_facts(),
                         "full": measure(model),
                         "repeat": compare(cpu_result(model), full),
                         "row_partitions": {},
+                        "adapter_only_row_partitions": {},
                         "source_parts": row["parts"],
                     }
                     for partitions in (2, 4):
@@ -256,6 +276,10 @@ def main() -> None:
                             "comparison": compare(cpu_result(model, partitions), full),
                             "timing": measure(model, partitions),
                         }
+                        arm["adapter_only_row_partitions"][str(partitions)] = compare(
+                            cpu_result(adapter_only, partitions), adapter_full
+                        )
+                    del adapter_full
                     before = [
                         (p, p.data_ptr())
                         for name, p in model.named_parameters()
