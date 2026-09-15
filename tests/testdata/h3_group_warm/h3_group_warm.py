@@ -164,7 +164,7 @@ class Overlay(Model[OverlayPipe]):
 
     @uses_components("projection")
     def checksum(self) -> float:
-        return float(self.pipe.components["projection"].weight.float().sum())
+        return float(self.pipe.components["projection"].weight.detach().float().sum())
 
 
 class Input(msgspec.Struct):

@@ -58,5 +58,8 @@ stdout/stderr continuously to the controlling machine before a rental can end.
 
 CPU qualification: the official 24-row warm and both larger forwards passed with
 these dimensions; the package interface builds; native TensorFS checkpoint creation
-passes. GPU/UID/full-worker execution has not yet run. The independent overlay is
+passes. The real Worker/UID path subsequently passed on four H100 NVL GPUs with both
+SDPA and Sol selection, production expandable allocation and all three warm
+geometries, followed by one successful invocation. These cards reported PIX/SYS
+links; this does not explain or reproduce the earlier full-model SXM/NCCL refusal. The independent overlay is
 prepared but no foreign-module callback behavior is claimed.
