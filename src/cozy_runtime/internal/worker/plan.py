@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cozy_runtime.internal import canonical
+from cozy_runtime.internal.adapters import AdapterSelection, implementation_digest
 from cozy_runtime.internal.delivery import RUNGS_BY_NAME, DeliveryRefusal, cost_class
 from cozy_runtime.internal.resolution import ROUTE_KERNEL
 from cozy_runtime.internal.worker.ledger import Ledger
@@ -340,11 +341,16 @@ class ModelBinding:
     """`org/name@release/lane` — the checkpoint's catalog name, for the one line a person
     reads when the code does not fit it (model-code-fit §3). Resolution, never identity."""
 
+    adapters: tuple[AdapterSelection, ...] = ()
+    adapter_compatibility: tuple[Mapping[str, Any], ...] = ()
+    adapter_device_bytes: int = 0
+    adapter_scratch_bytes: int = 0
+
     def snapshot_for(self, component: str) -> str:
         return self.snapshots.get(component, self.reference_snapshot)
 
     def key_document(self) -> dict[str, Any]:
-        return {
+        body = {
             "store": self.store,
             "snapshot": self.reference_snapshot,
             "variant": self.variant,
@@ -356,6 +362,10 @@ class ModelBinding:
             "model_weight_bytes": self.model_weight_bytes,
             "custody": self.custody,
         }
+        if self.adapter_compatibility:
+            body["adapter_targets"] = list(self.adapter_compatibility)
+            body["adapter_implementation"] = implementation_digest()
+        return body
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,10 +483,15 @@ class DeclaredBinding:
 
     def group_weight_bytes(self) -> int:
         """Declared per-rank weight requirement before measured executor preparation."""
-        return (
+        base = (
             self.model_weight_bytes
             if self.staged_weight_bytes is None
             else self.staged_weight_bytes
+        )
+        return (
+            base
+            + sum(model.adapter_device_bytes for model in self.model_bindings())
+            + max((model.adapter_scratch_bytes for model in self.model_bindings()), default=0)
         )
 
     def snapshot_for(self, component: str) -> str:
@@ -739,6 +754,10 @@ class PlanChooser:
         ]
         largest = max([max(sizes.values(), default=declared.model_weight_bytes), *scoped])
         activations = terms["activations"]
+        adapter_bytes = sum(model.adapter_device_bytes for model in declared.model_bindings())
+        adapter_scratch = max(
+            (model.adapter_scratch_bytes for model in declared.model_bindings()), default=0
+        )
         free = self.ledger.device_free
         # WHAT MAY DENY A RUNG, AND WHAT MAY ONLY DESCRIBE ONE (cr-100).
         #
@@ -832,6 +851,7 @@ class PlanChooser:
             else:
                 headroom = max(scope_demands.values(), default=planning_headroom + largest)
                 capacity = allocatable + sum(resident.values())
+            headroom += adapter_bytes + adapter_scratch
             fits = (allocatable < 0 or capacity >= headroom) and not denied
             row = {
                 "rung": placement,
@@ -855,9 +875,10 @@ class PlanChooser:
         # Estimates can select a conservative strategy without becoming a required
         # allocation. In particular, the uncalibrated 1 GiB reserve must not refuse
         # a small staged model. Actual component/block checks still run in the executor.
-        admitted_headroom = activations.value if activations.enforceable else 0
+        admitted_headroom = (activations.value if activations.enforceable else 0) + adapter_scratch
         scope_headrooms = {
-            method: measured_scopes.get(method, admitted_headroom)
+            method: measured_scopes.get(method, admitted_headroom - adapter_scratch)
+            + adapter_scratch
             for method in self.ledger.declared_scopes
         }
         walk = {
@@ -877,6 +898,8 @@ class PlanChooser:
             # with. They are the same number whenever the envelope may be enforced, and
             # they part company exactly when it may not — which is the fact a reader needs
             # in front of them rather than one they have to reconstruct.
+            "adapter_device_bytes": adapter_bytes,
+            "adapter_scratch_bytes": adapter_scratch,
             "enforceable_headroom_bytes": admitted_headroom,
             "resident_headroom_bytes": resident_headroom,
             "headroom_basis": headroom_basis,
@@ -937,6 +960,24 @@ class PlanChooser:
         weights = walk["declared_bytes"] or declared.model_weight_bytes
         scope_headrooms = walk["scope_headroom_bytes"]
         if not chosen:
+            required_adapter = int(walk["adapter_device_bytes"]) + int(
+                walk["adapter_scratch_bytes"]
+            )
+            capacity = max(
+                (int(row.get("capacity_bytes", -1)) for row in walk["rungs"]), default=-1
+            )
+            if required_adapter and capacity >= 0 and required_adapter > capacity:
+                raise PlanRefusal(
+                    "adapter_device_shortfall",
+                    "adapter factors and fixed tile scratch cannot fit this lane",
+                    {
+                        "resource": "vram",
+                        "scope": "adapters",
+                        "needed_bytes": required_adapter,
+                        "available_bytes": capacity,
+                        "evidence_class": "structural",
+                    },
+                )
             proven = tuple(placement for placement, _why, status in RUNGS if status == "proven")
             if proven and all(self.ledger.placement_refusal(placement) for placement in proven):
                 reasons = "; ".join(

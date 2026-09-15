@@ -42,6 +42,12 @@
       "id": "sha256:bd785a9583123816342d0ba73e9121d3adc11ec7c66381a5b061d3938b536738",
       "type": "cozy.worker.v1.DownloadDelegation"
     },
+    "download_delegation_adapted": {
+      "bytes": 995,
+      "document": "cozy.worker.v1.DownloadDelegation/1",
+      "id": "sha256:1f00445b49ed1e76a702d5e32655e42d4e02c021b33855ad9d0da639a4eb3ea8",
+      "type": "cozy.worker.v1.DownloadDelegation"
+    },
     "host_snapshot_body": {
       "bytes": 945,
       "document": "cozy.worker.v1.HostSnapshotBody/1",
@@ -100,6 +106,12 @@
       "bytes": 2505,
       "document": "cozy.worker.v1.PlacementSet/1",
       "id": "sha256:e1bfc50413551faba7e9017810ec2fde2b35f6b66572fa9350bbf7ab18808af2",
+      "type": "cozy.worker.v1.PlacementSet"
+    },
+    "placement_set_adapted": {
+      "bytes": 3043,
+      "document": "cozy.worker.v1.PlacementSet/1",
+      "id": "sha256:c625b5e2fd9f15f472441b68252986527d1f08f24f3d91fe08e3ea7f584b6ce6",
       "type": "cozy.worker.v1.PlacementSet"
     },
     "weights_receipt": {

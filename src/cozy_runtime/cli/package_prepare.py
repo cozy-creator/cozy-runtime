@@ -83,7 +83,11 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             "manifest",
             "manifest_length",
         }
-        if not isinstance(row, dict) or set(row) != required_model:
+        if (
+            not isinstance(row, dict)
+            or not required_model <= row.keys()
+            or set(row) - required_model - {"adapters"}
+        ):
             raise CliError(
                 "usage",
                 "invalid modeled-package selection",

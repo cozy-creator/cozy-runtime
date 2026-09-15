@@ -1248,41 +1248,63 @@ def rss_bytes(pid: int) -> int:
     return -1
 
 
-def available_host_bytes() -> int:
-    """The LIVE host budget, from the cgroup when there is one, else MemAvailable.
+def _v2_host_available(meminfo: Path, cgroup_root: Path, membership: Path) -> int:
+    """Read the tightest visible host/current/ancestor memory budget; -1 is unreadable."""
+    try:
+        available = next(
+            int(line.split()[1]) * 1024
+            for line in meminfo.read_text().splitlines()
+            if line.startswith("MemAvailable:")
+        )
+        relative = next(
+            line.partition("0::")[2].lstrip("/")
+            for line in membership.read_text().splitlines()
+            if line.startswith("0::")
+        )
+        group = cgroup_root / relative
+        if ".." in Path(relative).parts:
+            return -1
+        for directory in (group, *group.parents):
+            if not directory.is_relative_to(cgroup_root):
+                break
+            maximum, current = directory / "memory.max", directory / "memory.current"
+            if not maximum.exists():
+                continue
+            cap = maximum.read_text().strip()
+            if cap != "max":
+                available = min(available, int(cap) - int(current.read_text()))
+        return max(available, 0)
+    except (OSError, StopIteration, ValueError, IndexError):
+        return -1
 
-    §3.2's host-RAM rule: re-read at every grant, because a budget fixed at boot describes
-    a machine nobody else is on. -1 means UNREADABLE, never 0.
+
+def available_host_bytes() -> int:
+    """The minimum live MemAvailable and applicable cgroup memory headroom.
+
+    Ancestor limits apply even when the executor's own cgroup is unlimited. An
+    unreadable applicable limit returns -1 rather than inventing host-wide capacity.
     """
     _linux_only("available_host_bytes")
-    if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
-        try:
-            relative = next(
-                line.split("::", 1)[1]
-                for line in Path("/proc/self/cgroup").read_text().splitlines()
-                if line.startswith("0::")
-            )
-            cgroup = Path("/sys/fs/cgroup") / relative.lstrip("/")
-            v2_limit = (cgroup / "memory.max").read_text().strip()
-            if v2_limit != "max":
-                current = int((cgroup / "memory.current").read_text().strip())
-                return max(int(v2_limit) - current, 0)
-        except (OSError, StopIteration, ValueError):
-            pass
-    else:
-        try:
-            memory = _cgroup_v1_controller_path("memory")
-            v1_limit = int((memory / "memory.limit_in_bytes").read_text().strip())
-            current = int((memory / "memory.usage_in_bytes").read_text().strip())
-            # cgroup v1 represents "unlimited" as a page-rounded value near LONG_MAX.
-            if 0 < v1_limit < (1 << 60):
-                return max(v1_limit - current, 0)
-        except (ContainmentUnavailable, OSError, ValueError):
-            pass
+    root = Path("/sys/fs/cgroup")
+    if (root / "cgroup.controllers").is_file():
+        return _v2_host_available(Path("/proc/meminfo"), root, Path("/proc/self/cgroup"))
     try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    except (OSError, IndexError, ValueError):
+        available = next(
+            int(line.split()[1]) * 1024
+            for line in Path("/proc/meminfo").read_text().splitlines()
+            if line.startswith("MemAvailable:")
+        )
+        memory = _cgroup_v1_controller_path("memory")
+        for directory in (memory, *memory.parents):
+            if not directory.is_relative_to(root):
+                break
+            limit = directory / "memory.limit_in_bytes"
+            if not limit.exists():
+                continue
+            maximum = int(limit.read_text().strip())
+            if 0 < maximum < (1 << 60):
+                current = int((directory / "memory.usage_in_bytes").read_text().strip())
+                available = min(available, maximum - current)
+        return max(available, 0)
+    except (ContainmentUnavailable, OSError, StopIteration, ValueError, IndexError):
         return -1
-    return -1
