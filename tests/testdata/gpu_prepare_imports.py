@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.abc
 import json
 import os
 import sys
@@ -15,6 +16,37 @@ def main() -> None:
     from cozy_runtime.internal.executor import _CONSTRUCTION_MODULES, Executor
 
     mode, directory = sys.argv[1:]
+    if mode == "cpu-order":
+        executor = Executor(None, Path(directory))  # type: ignore[arg-type]
+        executor.device_kind = "cpu"  # type: ignore[assignment]  # CPU-only boundary control.
+
+        class ReachedKernelImport(Exception):
+            pass
+
+        class CheckBoundary(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname: str, path: object, target: object = None) -> None:
+                if fullname == "cozy_runtime.internal.fusion_install":
+                    assert executor._device_ready, "kernel import preceded Runtime device boundary"
+                    raise ReachedKernelImport()
+
+        finder = CheckBoundary()
+        sys.meta_path.insert(0, finder)
+        try:
+            executor._prepare_first(
+                {
+                    "devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                    "authorized_device_limit_bytes": 1 << 30,
+                    "binding": {"model_class": "Model", "model_parameter_name": "model"},
+                    "budgets": {},
+                }
+            )
+        except ReachedKernelImport:
+            print(json.dumps({"runtime_device_boundary_before_kernel_import": True}))
+        else:
+            raise AssertionError("kernel integration import was not reached")
+        finally:
+            sys.meta_path.remove(finder)
+        return
     assert torch.cuda.is_available() and not torch.cuda.is_initialized()
     if mode == "preload":
         # This is the actual preconstruct import list, before any package import

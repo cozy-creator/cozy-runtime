@@ -30,6 +30,23 @@ def test_cpu_parent_never_imports_torch_or_opens_cuda(tmp_path: Path) -> None:
     assert result["quiescent"] and result["gpu_count"] == 0
 
 
+def test_prepare_establishes_device_boundary_before_kernel_imports(tmp_path: Path) -> None:
+    pytest.importorskip("torch")
+    run = subprocess.run(
+        [
+            sys.executable,
+            str(PROBE.with_name("gpu_prepare_imports.py")),
+            "cpu-order",
+            str(tmp_path),
+        ],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        text=True,
+        capture_output=True,
+        timeout=90,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+
+
 @pytest.mark.skipif(not REAL_GPU, reason="set COZY_TEST_GPU_JOB_DEVICE=1 on a real CUDA worker")
 def test_gpu_job_initializes_before_handler_and_proves_completion(tmp_path: Path) -> None:
     result = probe("gpu", tmp_path)
