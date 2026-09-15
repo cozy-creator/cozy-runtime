@@ -14,7 +14,9 @@ from cozy_runtime.internal import (
     canonical,
     package_environment,
     package_interface,
+    placement_materialization,
 )
+from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -35,6 +37,12 @@ def record(
     """Publish the installed entrypoint inventory beside its immutable environment receipt."""
     path = _path(root, request)
     path.parent.mkdir(mode=0o700, exist_ok=True)
+    identity = canonical.parse_canonical(
+        package_prepare._read_file(
+            installed.generation / package_environment.CONTENT_IDENTITY_NAME,
+            canonical.DOC_MAX_BYTES,
+        )
+    )
     raw = canonical.write(
         {
             "format": "cozy.runtime.LocalInstallation/1",
@@ -42,7 +50,13 @@ def record(
             "placement_set": documents.read(
                 result.placement_set.placement_set_canonical_bytes, pb.PlacementSet
             ),
-            "receipt_digest": installed.receipt_digest,
+            # A local SDK snapshot is frozen at installation, independently of its
+            # mutable source venv. The receipt itself is derived from these facts.
+            **(
+                {"dependency_snapshot": identity["dependency_snapshot"]}
+                if "dependency_snapshot" in identity
+                else {}
+            ),
         }
     )
     temporary = path.parent / (".install-" + uuid.uuid4().hex)
@@ -113,10 +127,44 @@ def reopen(
         development.pop("project_wheel")
         if development != documents.body(request.package):
             return None
+        wheels = [
+            placement_materialization._wheel(
+                placement["development"]["project_wheel"],
+                "project",
+                import_roots=True,
+                nested_ref=True,
+            ),
+            *placement_materialization._wheels(
+                placement["environment"]["local_wheels"],
+                "environment",
+                import_roots=True,
+                nested_ref=True,
+            ),
+        ]
+        requested = {
+            (documents.spell(row.digest), row.length, row.filename) for row in request.wheels
+        }
+        if any((wheel.digest, wheel.length, wheel.filename) not in requested for wheel in wheels):
+            raise package_prepare.PreparationRefusal(
+                "local_package_revision_mismatch", "installed wheels differ from the revision"
+            )
+        environment_digest = documents.spell(
+            documents.embedded_document_digest(
+                placement["environment"], "cozy.worker.v1.Environment"
+            )
+        )
+        if environment_digest != placement["environment_digest"]:
+            return None
+        receipt_digest = package_environment.wheel_receipt_digest(
+            base,
+            wheels=wheels,
+            environment_digest=environment_digest,
+            dependency_snapshot=value.get("dependency_snapshot"),
+        )
         installed = package_environment.open_generation(
             root,
-            receipt_digest=value["receipt_digest"],
-            environment_digest=placement["environment_digest"],
+            receipt_digest=receipt_digest,
+            environment_digest=environment_digest,
             python=python,
         )
         interface_path = artifact_cache / documents.raw(interface["digest"]).hex()
@@ -147,6 +195,10 @@ def reopen(
                 placement_set_canonical_bytes=raw,
             )
         ), installed
+    except package_prepare.PreparationRefusal as exc:
+        if exc.code == "package_prepare_file_unreadable":
+            return None
+        raise
     except (
         OSError,
         KeyError,
@@ -156,5 +208,6 @@ def reopen(
         documents.DocumentError,
         package_environment.EnvironmentRefusal,
         package_interface.StalePackageInterface,
+        LaunchRefusal,
     ):
         return None

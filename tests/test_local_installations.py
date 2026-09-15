@@ -12,22 +12,47 @@ from pathlib import Path
 import pytest
 
 from conftest import image_python
-from cozy_runtime.internal import child_env
+from cozy_runtime.internal import (
+    canonical,
+    child_env,
+    package_environment,
+    placement_materialization,
+)
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
+from cozy_runtime.internal.worker.machine_child_target import Target, computation
 from cozy_runtime.internal.worker.package_prepare import PreparationRefusal
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
-from test_end_to_end import NO_EXECUTOR
+from test_end_to_end import NO_EXECUTOR, _run
+from test_installed_dependencies import _distribution
 from test_job_preparation_isolation import measure, package
 
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-def test_installed_revision_reopens_after_runtime_restart_without_carriers() -> None:
+@pytest.mark.parametrize("snapshot", [False, True], ids=["image-base", "local-sdk"])
+def test_installed_revision_reopens_after_runtime_restart_without_carriers(snapshot: bool) -> None:
     with tempfile.TemporaryDirectory(prefix="cz-install.") as raw:
         root = Path(raw)
         environment, request = package(root, "retained")
+        _, other_request = package(root, "another")
+        dependency_python = None
+        if snapshot:
+            uv = shutil.which("uv")
+            assert uv is not None
+            sdk = root / "sdk"
+            _run(uv, "venv", "--python", str(image_python()), str(sdk))
+            dependency_python = sdk / "bin/python"
+            runtime_wheel = next(
+                image_python().parent.parent.parent.glob("wheels/cozy_runtime-*.whl")
+            )
+            _run(uv, "pip", "install", "--python", str(dependency_python), str(runtime_wheel))
+            _distribution(
+                next(sdk.glob("lib/python*/site-packages")),
+                "installation_dependency",
+                {"installation_dependency.py": b"value=1\n"},
+            )
         config = RuntimeConfig(
             cozy_home=root / "home",
             credentials=Credentials(),
@@ -57,6 +82,7 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers() -> 
                     devices="",
                     accelerator_backend="none",
                     python=str(image_python()),
+                    environment_python=dependency_python,
                     install_root=environment,
                     artifact_cache=root / "artifacts",
                     tensorfs_root=root / "store",
@@ -73,12 +99,89 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers() -> 
             revision = documents.spell(request.package.local_revision_digest)
             installed = worker.local_operations[(request.operation_id, revision)].installed
             assert installed is not None
+            if snapshot:
+                # Same project wheels and dependency versions, different frozen SDK bytes.
+                sdk_site = next((root / "sdk").glob("lib/python*/site-packages"))
+                _distribution(
+                    sdk_site,
+                    "installation_dependency",
+                    {"installation_dependency.py": b"value=2\n"},
+                )
+                placement = documents.read(
+                    first.placement_set.placement_set_canonical_bytes, pb.PlacementSet
+                )["placements"][0]
+                material = placement_materialization.package_environment_input(
+                    package_name=request.package.package,
+                    release=request.package.release,
+                    project_wheel=placement["development"]["project_wheel"],
+                    environment=placement["environment"],
+                    environment_digest=placement["environment_digest"],
+                    wheel_paths={
+                        documents.spell(row.digest): Path(row.path) for row in request.wheels
+                    },
+                )
+                changed_snapshot = package_environment.materialize(
+                    material,
+                    environment,
+                    python=image_python(),
+                    base=worker.base,
+                    dependency_python=dependency_python,
+                )
+                assert changed_snapshot.content_digest != installed.content_digest
+                assert package_environment.observe_base(changed_snapshot.python).distributions == (
+                    package_environment.observe_base(installed.python).distributions
+                )
+                _assert_memo_identity(installed, changed_snapshot, revision)
+                _distribution(
+                    sdk_site,
+                    "installation_dependency",
+                    {"installation_dependency.py": b"value=1\n"},
+                )
+            measure(worker, other_request)
+            worker.prepare_local_package(other_request)
+            other_installed = worker.local_operations[
+                (
+                    other_request.operation_id,
+                    documents.spell(other_request.package.local_revision_digest),
+                )
+            ].installed
+            assert other_installed is not None
+            _assert_memo_identity(installed, other_installed, revision)
+            assert installed.generation != other_installed.generation
+            assert (
+                package_environment.parse_environment_receipt(installed.receipt_bytes)[
+                    "environment_digest"
+                ]
+                == package_environment.parse_environment_receipt(other_installed.receipt_bytes)[
+                    "environment_digest"
+                ]
+            )
+            installation_path = environment / "local-installations" / (revision[7:] + ".json")
+            inventory = canonical.parse_canonical(installation_path.read_bytes())
+            assert "receipt_digest" not in inventory
+            assert ("dependency_snapshot" in inventory) is snapshot
+            carrier_paths = [Path(wheel.path) for wheel in request.wheels]
+            carriers = [path.read_bytes() for path in carrier_paths]
             for wheel in request.wheels:
                 Path(wheel.path).unlink()
                 wheel.path = ""
             before = time.monotonic()
             assert worker.prepare_local_package(request) == first
             warm_seconds = time.monotonic() - before
+            # The current operation has no carriers, but metadata absence is repairable.
+            placement = inventory["placement_set"]["placements"][0]
+            interface_path = root / "artifacts" / placement["package_interface"]["digest"][7:]
+            interface_path.unlink()
+            with pytest.raises(PreparationRefusal, match="local_package_reuse_unavailable"):
+                worker.prepare_local_package(request)
+            repair = pb.PrepareLocalPackageRequest()
+            repair.CopyFrom(request)
+            for wheel, path, contents in zip(repair.wheels, carrier_paths, carriers, strict=True):
+                path.write_bytes(contents)
+                wheel.path = str(path)
+            assert worker.prepare_local_package(repair) == first
+            for path in carrier_paths:
+                path.unlink()
         finally:
             worker.shutdown()
 
@@ -86,6 +189,10 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers() -> 
         # installation receipts survive. A Host replay has no wheel paths.
         shutil.rmtree(root / "home/job-plans")
         worker = start()
+        if snapshot:
+            # Worker startup observes the configured base once. Reopening the
+            # installation itself must not need the source SDK again.
+            shutil.rmtree(root / "sdk")
         try:
             assert not worker.local_operations and not worker.prepared_revisions
             before = time.monotonic()
@@ -96,6 +203,60 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers() -> 
             assert restored.installed.generation == installed.generation
             assert worker.prepared_revisions[(restored.placement_id, revision)] is restored
             assert list((root / "home/job-plans").glob("*/*.json"))
+            # A valid other-project receipt shares the Environment digest. An old or
+            # corrupt pointer in the inventory must never select that executable code.
+            saved_inventory = installation_path.read_bytes()
+            inventory["receipt_digest"] = other_installed.receipt_digest
+            _replace(installation_path, canonical.write(inventory))
+            assert worker.prepare_local_package(request) == first
+            assert (
+                worker.local_operations[(request.operation_id, revision)].installed
+                == restored.installed
+            )
+            receipt = environment / "receipts" / (installed.receipt_digest[7:] + ".json")
+            hidden = receipt.with_suffix(".missing")
+            receipt.rename(hidden)
+            with pytest.raises(PreparationRefusal, match="local_package_reuse_unavailable"):
+                worker.prepare_local_package(request)
+            hidden.rename(receipt)
+            other_placement = canonical.parse_canonical(
+                (
+                    environment
+                    / "local-installations"
+                    / (other_request.package.local_revision_digest.hex() + ".json")
+                ).read_bytes()
+            )["placement_set"]["placements"][0]
+            inventory["placement_set"]["placements"][0]["development"]["project_wheel"] = (
+                other_placement["development"]["project_wheel"]
+            )
+            _replace(installation_path, canonical.write(inventory))
+            with pytest.raises(PreparationRefusal, match="local_package_revision_mismatch"):
+                worker.prepare_local_package(request)
+            _replace(installation_path, saved_inventory)
+
+            plan = next((root / "home/job-plans" / revision[7:]).glob("*.json"))
+            plan_raw = plan.read_bytes()
+            _replace(plan, b"corrupt")
+            with pytest.raises(PreparationRefusal, match="local_package_job_plan_conflict"):
+                worker.prepare_local_package(request)
+            assert plan.read_bytes() == b"corrupt"
+            _replace(plan, plan_raw)
+
+            if snapshot:
+                from cozy_runtime.internal import _installed_dependencies
+
+                snapshot_path = installed.generation / _installed_dependencies.MANIFEST_NAME
+                snapshot_raw = snapshot_path.read_bytes()
+                _replace(snapshot_path, b"corrupt")
+                with pytest.raises(PreparationRefusal, match="local_package_reuse_unavailable"):
+                    worker.prepare_local_package(request)
+                _replace(snapshot_path, snapshot_raw)
+                inventory = canonical.parse_canonical(saved_inventory)
+                inventory["dependency_snapshot"]["digest"] = "sha256:" + "1" * 64
+                _replace(installation_path, canonical.write(inventory))
+                with pytest.raises(PreparationRefusal, match="local_package_reuse_unavailable"):
+                    worker.prepare_local_package(request)
+                _replace(installation_path, saved_inventory)
 
             # A fresh transfer operation can bind the same immutable installation.
             other = pb.PrepareLocalPackageRequest()
@@ -143,8 +304,47 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers() -> 
             moved.rename(installed.generation)
             assert worker.prepare_local_package(request) == first
             print(
-                f"local installation: prepare={cold_seconds:.3f}s "
+                f"local installation ({snapshot=}): prepare={cold_seconds:.3f}s "
                 f"reopen={warm_seconds:.3f}s restart_reopen={restart_seconds:.3f}s"
             )
         finally:
             worker.shutdown()
+
+
+def _replace(path: Path, raw: bytes) -> None:
+    mode = path.stat().st_mode & 0o777
+    path.chmod(0o600)
+    path.write_bytes(raw)
+    path.chmod(mode)
+
+
+def _assert_memo_identity(
+    installed: package_environment.InstalledEnvironment,
+    changed: package_environment.InstalledEnvironment,
+    revision: str,
+) -> None:
+    target = Target(
+        revision=revision,
+        entrypoint="retained",
+        interface_digest=revision,
+        declaration={},
+        prepared_revision={"receipt_digest": installed.receipt_digest},
+        binding=None,
+        digest=revision,
+    )
+    numerical = b"n" * 32
+    key = computation(target, {"value": 1}, numerical)
+    another_root = dataclasses.replace(
+        target,
+        prepared_revision={
+            "receipt_digest": installed.receipt_digest,
+            "root": "another-root",
+            "caller_revision": "sha256:" + "c" * 64,
+            "operation": "fresh-operation",
+        },
+    )
+    assert computation(another_root, {"value": 1}, numerical) == key
+    changed_target = dataclasses.replace(
+        target, prepared_revision={"receipt_digest": changed.receipt_digest}
+    )
+    assert computation(changed_target, {"value": 1}, numerical) != key

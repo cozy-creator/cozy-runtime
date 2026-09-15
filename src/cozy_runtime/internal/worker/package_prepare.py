@@ -1362,7 +1362,10 @@ def _stage_job_plans(
             record["call_interfaces"] = call_interfaces
         from cozy_runtime.internal import job_plan
 
-        job_plan.write(root, record)
+        try:
+            job_plan.write(root, record)
+        except ValueError as exc:
+            raise PreparationRefusal("local_package_job_plan_conflict", str(exc)) from exc
         staged.add(descriptor_id)
     return staged
 

@@ -730,11 +730,14 @@ def wheel_receipt_digest(
     *,
     wheels: Sequence[Wheel],
     environment_digest: str,
+    dependency_snapshot: Mapping[str, Any] | None = None,
 ) -> str:
-    """The receipt digest a wheel-sourced materialize published, from placement facts alone.
+    """Derive a wheel installation receipt from placement and frozen snapshot facts.
 
     The row order is Input order — the project wheel first, then the supplied local wheels in
-    their document's sorted-by-distribution order — exactly what `_receipt` recorded."""
+    their document's sorted-by-distribution order — exactly what `_receipt` recorded.
+    A captured local SDK adds its immutable snapshot ref to the same content identity.
+    """
 
     _require_digest(environment_digest, "environment_digest")
     project = next((wheel for wheel in wheels if wheel.owner == "project"), None)
@@ -742,9 +745,10 @@ def wheel_receipt_digest(
         raise EnvironmentRefusal(
             "package_environment_project_wheel_absent", "no project wheel fact"
         )
-    content_bytes = canonical.write(
-        _content_identity(wheels, base.interpreter_identity, base.uv_version)
-    )
+    identity = _content_identity(wheels, base.interpreter_identity, base.uv_version)
+    if dependency_snapshot is not None:
+        identity["dependency_snapshot"] = dict(dependency_snapshot)
+    content_bytes = canonical.write(identity)
     receipt = {
         "content_digest": _sha(content_bytes),
         "environment_digest": environment_digest,
