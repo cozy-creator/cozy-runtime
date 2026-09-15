@@ -975,6 +975,7 @@ def _install_locked(
                 "package_environment_uv_failed",
                 detail or f"uv exited {result.returncode}",
             )
+    _rewrite_installed_launchers(staging)
 
 
 def _locked_operation(rows: Sequence[LockedRow]) -> str:
@@ -1619,7 +1620,7 @@ def _inspect(
                 if member.is_dir():
                     continue
                 installed = _install_path(name)
-                prefix_resource = wheel.owner == "custom" and _prefix_resource(name) is not None
+                prefix_resource = _prefix_resource(name)
                 if installed is None and ".data/" in name and not prefix_resource:
                     raise EnvironmentRefusal(
                         "package_environment_wheel_install_scheme_forbidden", name
@@ -1644,15 +1645,12 @@ def _inspect(
                     )
                 magic = archive.open(member).read(4)
                 native = suffix in _NATIVE_SUFFIXES or magic == b"\x7fELF"
-                if native and prefix_resource:
-                    raise EnvironmentRefusal(
-                        "package_environment_native_install_scheme_forbidden", name
-                    )
                 if wheel.owner == "project" and native:
                     raise EnvironmentRefusal("package_environment_project_wheel_native", name)
                 if native:
-                    assert installed is not None
-                    native_members.append(installed.as_posix())
+                    native_path = installed if installed is not None else prefix_resource
+                    assert native_path is not None
+                    native_members.append(native_path.as_posix())
             dist_infos = sorted(
                 name
                 for name in names
@@ -1930,11 +1928,28 @@ def _install_path(name: str) -> PurePosixPath | None:
 
 
 def _prefix_resource(name: str) -> PurePosixPath | None:
-    """Dependency documentation/data belongs to the venv share tree, outside imports."""
+    """Map standard wheel data schemes into this CPython venv's prefix."""
     parts = PurePosixPath(name).parts
-    if len(parts) > 3 and parts[0].endswith(".data") and parts[1:3] == ("data", "share"):
+    if len(parts) < 3 or not parts[0].endswith(".data"):
+        return None
+    if parts[1] == "data":
         return PurePosixPath(*parts[2:])
+    if parts[1] == "scripts":
+        return PurePosixPath("bin", *parts[2:])
+    if parts[1] == "headers":
+        distribution = _name(parts[0].removesuffix(".data").rsplit("-", 1)[0])
+        return PurePosixPath(
+            "include",
+            "site",
+            f"python{sys.version_info.major}.{sys.version_info.minor}",
+            distribution,
+            *parts[2:],
+        )
     return None
+
+
+def _relocatable_python_script(body: bytes) -> bytes:
+    return b"#!/bin/sh\n'''exec' \"${0%/*}/python\" \"$0\" \"$@\"\n' '''\n" + body
 
 
 def _verify_prefix_resources(generation: Path, inspected: Sequence[_Inspected]) -> None:
@@ -1951,17 +1966,26 @@ def _verify_prefix_resources(generation: Path, inspected: Sequence[_Inspected]) 
                 target = generation / resource
                 try:
                     info = target.lstat()
-                    if (
-                        not stat.S_ISREG(info.st_mode)
-                        or target.resolve() != target
-                        or info.st_size != member.file_size
-                    ):
+                    if not stat.S_ISREG(info.st_mode) or target.resolve() != target:
                         raise OSError("resource path or size changed")
                     digest = hashlib.sha256()
+                    length = 0
                     with archive.open(member) as source:
+                        if resource.parts[0] == "bin" and source.read(8).startswith(b"#!python"):
+                            source.seek(0)
+                            source.readline()
+                            prefix = _relocatable_python_script(b"")
+                            digest.update(prefix)
+                            length += len(prefix)
+                        else:
+                            source.seek(0)
                         while chunk := source.read(1 << 20):
                             digest.update(chunk)
-                    if _hash_file(target) != "sha256:" + digest.hexdigest():
+                            length += len(chunk)
+                    if (
+                        info.st_size != length
+                        or _hash_file(target) != "sha256:" + digest.hexdigest()
+                    ):
                         raise OSError("resource bytes changed")
                 except OSError as exc:
                     raise EnvironmentRefusal(
@@ -2093,10 +2117,20 @@ def _run_install_commands(
                 detail or f"uv exited {result.returncode}",
             )
 
+    _rewrite_installed_launchers(staging)
     # uv must finish before immutable shared dependency inodes enter the venv.
     # Installation cannot overwrite a prior capture through a shared payload.
     if dependencies is not None:
         dependencies(staging)
+
+
+def _rewrite_installed_launchers(staging: Path) -> None:
+    from cozy_runtime.internal import _installed_dependencies
+
+    site = next(staging.glob("lib/python*/site-packages"))
+    _installed_dependencies.rewrite_launchers(
+        staging, site, sorted(site.glob("*.dist-info")), set(), replace=True
+    )
 
 
 def _receipt(source: Input, wheels: Sequence[Wheel], content_digest: str) -> dict[str, Any]:

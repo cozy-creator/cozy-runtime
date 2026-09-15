@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 import sysconfig
@@ -35,6 +36,7 @@ from cozy_runtime.internal.package_environment import (
     _fsync_dir,
     _hash_file,
     _name,
+    _relocatable_python_script,
     _require_dependency_cache_root,
     _sha,
     normalized_distribution,
@@ -505,14 +507,8 @@ def snapshot(
                 raise EnvironmentRefusal(
                     "package_environment_dependency_member_unsupported", relative
                 )
-            if resolved.parent == source_scripts:
-                if resolved.name in launchers:
-                    continue
-                with member.open("rb") as stream:
-                    if stream.read(4) != b"\x7fELF":
-                        raise EnvironmentRefusal(
-                            "package_environment_dependency_launcher_unsupported", relative
-                        )
+            if resolved.parent == source_scripts and resolved.name in launchers:
+                continue
             if inventory_only:
                 if length and (not length.isdecimal() or int(length) != member.stat().st_size):
                     raise EnvironmentRefusal(
@@ -577,6 +573,41 @@ def rewrite_launchers(
     for info in infos:
         rows = _dependency_record(info)
         entries = _dependency_entrypoints(info)
+        changed: set[Path] = set()
+        for relative, _, _ in rows:
+            path = (target_site / relative).resolve()
+            if path.parent != staging / "bin" or path.name in entries:
+                continue
+            with path.open("rb") as source:
+                header = source.readline()
+                interpreter = os.fsdecode(header[2:].strip()) if header.startswith(b"#!") else ""
+                if header == b"#!/bin/sh\n":
+                    command, closing = source.readline(), source.readline()
+                    if not command.startswith(b"'''exec' ") or closing.strip() != b"' '''":
+                        continue
+                    try:
+                        arguments = shlex.split(os.fsdecode(command[len(b"'''exec' ") :]))
+                    except ValueError:
+                        continue
+                    if len(arguments) != 3 or arguments[1:] != ["$0", "$@"]:
+                        continue
+                    interpreter = arguments[0]
+                if interpreter == "${0%/*}/python" or Path(interpreter).name not in {
+                    "python",
+                    "python3",
+                    f"python{sys.version_info.major}.{sys.version_info.minor}",
+                    "pythonw",
+                }:
+                    continue
+                raw = _relocatable_python_script(source.read())
+            # Snapshot payloads may share immutable cache inodes.
+            path.unlink()
+            path.write_bytes(raw)
+            path.chmod(0o755)
+            changed.add(path)
+            copied.add(path)
+            if verified is not None:
+                verified[path] = (_sha(raw), len(raw))
         for name, target in entries.items():
             module, attribute = target.split(":", 1)
             body = (
@@ -593,11 +624,13 @@ def rewrite_launchers(
                 )
             path.write_text(body)
             path.chmod(0o755)
+            changed.add(path)
             copied.add(path)
             if verified is not None:
                 raw = body.encode()
                 verified[path] = (_sha(raw), len(raw))
         existing = {relative for relative, _, _ in rows}
+        recorded = {relative: (digest, length) for relative, digest, length in rows}
         for name in entries:
             existing.add(os.path.relpath(staging / "bin" / name, target_site))
         record = info / "RECORD"
@@ -609,6 +642,8 @@ def rewrite_launchers(
                     continue
                 if path == record:
                     writer.writerow((relative, "", ""))
+                elif replace and path not in changed and relative in recorded:
+                    writer.writerow((relative, *recorded[relative]))
                 else:
                     digest, length = (
                         verified[path]
