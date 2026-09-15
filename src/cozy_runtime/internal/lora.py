@@ -90,7 +90,13 @@ def prequantized_input_allowed(module: Any) -> bool:
         return False
     gates = [hook for hook in module._forward_pre_hooks.values() if isinstance(hook, _Gate)]
     if not gates:
-        return not module._forward_pre_hooks and not module._forward_hooks
+        # An upstream/custom adapter wrapper may have active residuals without
+        # our request gate. Only an unwrapped base is safe by hook absence alone.
+        return (
+            not hasattr(module, "base_layer")
+            and not module._forward_pre_hooks
+            and not module._forward_hooks
+        )
     if len(gates) != 1 or len(module._forward_pre_hooks) != 1:
         return False
     gate = gates[0]
