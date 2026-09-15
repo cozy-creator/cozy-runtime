@@ -193,13 +193,15 @@ class LinearAdapters:
                         layer = Linear(base, "_inactive", config=self._config, r=1, lora_alpha=1)
                 layer.set_adapter([])
                 layer.eval()
+                # If a custom parent refuses replacement, the base's hooks have
+                # not moved yet and its existing handles remain valid.
+                setattr(parent, attribute, layer)
+                self._layers[site] = layer
+                self._owners[site] = parent, attribute, base
                 for name in _HOOK_REGISTRIES:
                     registry = getattr(base, name)
                     setattr(layer, name, registry)
                     setattr(base, name, type(registry)())
-                self._layers[site] = layer
-                self._owners[site] = parent, attribute, base
-                setattr(parent, attribute, layer)
                 self._handles.append(
                     layer.register_forward_pre_hook(_Gate(self, site), with_kwargs=True)
                 )
@@ -214,6 +216,11 @@ class LinearAdapters:
         self, site: tuple[str, str], layer: Any, args: tuple[Any, ...], kwargs: Any
     ) -> None:
         self.check_ready()
+        if len(args) + len(kwargs) != 1 or len(args) > 1 or set(kwargs) - {"input", "x"}:
+            raise AdapterRefusal(
+                "adapter_arguments",
+                "expected a single Linear input; PEFT selection/variant kwargs are unsupported",
+            )
         attempt = self._active.get()
         if attempt is None:
             if self._lock.locked():
@@ -391,12 +398,10 @@ class LinearAdapters:
         try:
             if self._closed:
                 return
-            for handle in self._handles:
-                handle.remove()
-            self._handles.clear()
+            # Validate every owner before changing any tree or hook registry.
             for site, (parent, attribute, base) in self._owners.items():
                 layer = self._layers[site]
-                if getattr(parent, attribute) is not layer:
+                if getattr(parent, attribute, None) is not layer:
                     raise AdapterRefusal(
                         "adapter_target_changed", f"{site}: adapter target was replaced"
                     )
@@ -404,10 +409,20 @@ class LinearAdapters:
                     raise AdapterRefusal(
                         "adapter_hooks_changed", f"{site}: base hooks changed while owned"
                     )
+            for site, (parent, attribute, base) in self._owners.items():
+                layer = self._layers[site]
                 for name in _HOOK_REGISTRIES:
                     setattr(base, name, getattr(layer, name))
                 setattr(parent, attribute, base)
+            # Handles still address the same registries, now restored on each
+            # base. Retain the gates until every restoration has succeeded.
+            for handle in self._handles:
+                handle.remove()
+            self._handles.clear()
             self._closed = True
+        except BaseException:
+            self._poisoned = True
+            raise
         finally:
             self._lock.release()
 

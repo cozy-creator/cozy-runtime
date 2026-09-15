@@ -90,7 +90,16 @@ request/clip comparisons remain promotion gates.
 
 For prepared BF16 checkpoint lanes, reuse the existing public derivation pipeline
 (`prepare_bf16`, `bf16_targets`, `write_bf16`, TensorFS derivation and ordinary
-upload/release). Its current planner intentionally converts only F32, preserving
-F16; therefore Spatial needs an explicit planner selection for F16. Do not change
-that global default or create a separate H3 producer. No prepared BF16 adapter
-manifest has yet been produced by this task.
+upload/release). The original planner converted only F32, preserving F16. The
+separate PR517 adds explicit `bf16_sources=("f16", "f32")` without changing that
+default or creating a separate H3 producer. No prepared BF16 adapter manifest has
+yet been produced by this task.
+
+Independent review reproduced two new integration defects before promotion:
+h3a-073 found that failed teardown could remove request gates, and h3a-075 found
+that PEFT's `adapter_names` could bypass the declared stack. Teardown now validates
+every owner first, retains gates through restoration, and poisons any failed
+binding. The call gate now enforces one ordinary Linear input and refuses PEFT
+selection/variant kwargs. All five adversarial cases failed before the fix and
+pass afterward; the complete native PEFT CPU set has 19 passing cases. The GPU
+probe is refreshed from this fixed source before use.

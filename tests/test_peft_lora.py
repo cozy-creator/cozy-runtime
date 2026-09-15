@@ -294,3 +294,36 @@ def test_actual_diffusers_scale_decorator_cannot_silently_reset_request_strength
     with scope(binding, adapter):
         assert torch.equal(pipeline(x), expected)
     binding.close()
+
+
+@pytest.mark.parametrize("changed", [0, 1])
+def test_failed_close_keeps_other_targets_gated_and_prevents_request_reuse(changed: int) -> None:
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+    binding = LinearAdapters({"dit": model}, {"dit": "base"}, {"dit": ["0", "1"]})
+    other = model[1 - changed]
+    model[changed] = torch.nn.Identity()
+    with pytest.raises(AdapterRefusal, match="target was replaced"):
+        binding.close()
+    assert model[1 - changed] is other
+    assert len(other._forward_pre_hooks) == 1
+    with pytest.raises(AdapterRefusal, match="closed or poisoned"):
+        binding.check_ready()
+    with pytest.raises(AdapterRefusal, match="closed or poisoned"):
+        other(torch.ones(1000, 4))
+    with pytest.raises(AdapterRefusal, match="closed or poisoned"), scope(binding):
+        pass
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"adapter_names": ["__base__", "__base__"]},
+        {"adapter_names": ["request_0", "request_0"]},
+        {"alora_offsets": [1, 1]},
+    ],
+)
+def test_peft_selection_and_variant_kwargs_cannot_override_request(kwargs: dict[str, Any]) -> None:
+    model, _base, binding, adapter = fixture()
+    with scope(binding, adapter), pytest.raises(AdapterRefusal, match="single Linear input"):
+        model[0](torch.ones(2, 4, dtype=torch.bfloat16), **kwargs)
+    binding.close()
