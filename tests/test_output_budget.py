@@ -30,6 +30,7 @@ from cozy_runtime.internal.worker import (
 )
 from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRecord
 from cozy_runtime.internal.worker.calls import Calls, _Pending
+from cozy_runtime.internal.worker.plan import DeclaredBinding
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -180,7 +181,14 @@ def test_worker_command_keeps_intermediate_room_for_a_small_final_report(tmp_pat
         job=None,
         spec=spec_for(7, 11),
         trees={},
-        declared=SimpleNamespace(entrypoint="report", max_input_bytes=64 << 20),
+        declared=DeclaredBinding(
+            entrypoint_binding_digest="report-binding",
+            entrypoint="report",
+            model_class="",
+            model_binding_path="",
+            model_parameter_name="",
+            release="report-release",
+        ),
         plan=SimpleNamespace(placement="cpu", headroom_bytes=0, scope_headroom_bytes={}),
     )
     command = AttemptEngine._command(
