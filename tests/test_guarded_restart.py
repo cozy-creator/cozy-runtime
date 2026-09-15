@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from cozy_runtime.cli.runtime_worker import _restart_handler, _watch_supervisor
+from cozy_runtime.internal import proctree
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -51,6 +52,29 @@ def test_runtime_cli_reports_guarded_restart_capability() -> None:
         ).stdout
     )
     assert set(selected) == {"distribution", "next"}
+
+
+def test_running_guard_capability_names_process_birth_and_worker_boot(tmp_path: Path) -> None:
+    worker, _claim = _worker(tmp_path)
+    try:
+        worker.mark_claim_ready()
+        path = worker.root / "restart-capability.json"
+        document = json.loads(path.read_bytes())
+        process = proctree.process_identity(os.getpid())
+        assert document == {
+            "supports_guarded_restart": True,
+            "pid": process.pid,
+            "started_ticks": process.started_ticks,
+            "worker_boot_id": worker.fence.worker_boot_id,
+        }
+        assert path.stat().st_mode & 0o777 == 0o400
+        assert worker.request_idle_restart()
+        verdict = json.loads((worker.root / "restart-status.json").read_bytes())
+        assert all(
+            verdict[key] == document[key] for key in ("pid", "started_ticks", "worker_boot_id")
+        )
+    finally:
+        worker.shutdown()
 
 
 def test_real_hup_cannot_reenter_main_thread_admission(

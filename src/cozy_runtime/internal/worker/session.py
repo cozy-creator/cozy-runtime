@@ -3198,6 +3198,7 @@ class Worker:
     def mark_claim_ready(self) -> None:
         """Open Claim only after fixed-host listener proof and readiness publication."""
 
+        self._publish_restart_fact("restart-capability.json", {"supports_guarded_restart": True})
         self.claim_ready.set()
 
     def record_ownership(self, claim: pb.Claim) -> None:
@@ -3672,23 +3673,14 @@ class Worker:
             accepted = not (active_executions or active_attempts or preparing)
             self.restart_sequence += 1
             document = {
-                "worker_boot_id": self.fence.worker_boot_id,
-                "pid": os.getpid(),
                 "sequence": self.restart_sequence,
                 "status": "accepted" if accepted else "busy",
                 "active_executions": active_executions,
                 "active_attempts": active_attempts,
                 "preparing": preparing,
             }
-            path = self.root / "restart-status.json"
-            staged = self.root / f".restart-status-{os.getpid()}"
             try:
-                with staged.open("wb") as handle:
-                    handle.write(canonical.write(document))
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                staged.chmod(0o400)
-                os.replace(staged, path)
+                self._publish_restart_fact("restart-status.json", document)
             except OSError as exc:
                 self.note("restart_refused", f"could not record the restart verdict: {exc}")
                 return False
@@ -3697,6 +3689,22 @@ class Worker:
             else:
                 self.note("restart_refused", "worker update refused while execution is active")
             return accepted
+
+    def _publish_restart_fact(self, name: str, document: dict[str, Any]) -> None:
+        process = proctree.process_identity(os.getpid())
+        body = {
+            **document,
+            "worker_boot_id": self.fence.worker_boot_id,
+            "pid": process.pid,
+            "started_ticks": process.started_ticks,
+        }
+        staged = self.root / f".{name}-{process.pid}"
+        with staged.open("wb") as handle:
+            handle.write(canonical.write(body))
+            handle.flush()
+            os.fsync(handle.fileno())
+        staged.chmod(0o400)
+        os.replace(staged, self.root / name)
 
     def schedule_idle_restart(self) -> None:
         """Signal handlers only wake the supervisor thread; they cannot reenter admission."""
