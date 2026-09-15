@@ -70,7 +70,10 @@ package = true
 # The historical SDXL development corpus is qualified against Transformers 4;
 # MiniMax H3's upstream implementation requires Transformers 5. These are separate
 # test/inference environments, not two compatible dependency sets for one venv.
-conflicts = [[{ extra = "corpus" }, { extra = "minimax-h3" }]]
+conflicts = [
+    [{ extra = "corpus" }, { extra = "minimax-h3" }],
+    [{ extra = "corpus" }, { extra = "lora" }],
+]
 
 # Read only on the COZY_RUNTIME_BUILD_KERNELS=1 wheel build; the root CMakeLists.txt is
 # the reviewed kernels build (static cudart, abi3, the upstream fleet arch policy).
@@ -180,6 +183,16 @@ media = [
 # capability; base worker images provide TensorFS from the same PyPI range.
 # 0.3.18 provides derived recovery, source adoption and independent result custody.
 model-execution = ["tensorfs>=0.3.43,<0.4"]
+# Optional execution capability selected by the platform/image when adapters are
+# requested. Base-only model execution does not import or require these packages.
+# Preserve the worker-owned Torch/CUDA family; no CUDA build or index is pinned.
+lora = [
+    "peft==0.20.0",
+    "torchao==0.18.0",
+    "accelerate==1.15.0",
+    "transformers==5.16.1",
+    "torch>=2.13,<3",
+]
 
 [[tool.mypy.overrides]]
 # grpcio ships no type information; the stub module is generated.

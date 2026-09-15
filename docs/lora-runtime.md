@@ -53,3 +53,18 @@ Tensorhub nested model closure. No partial protocol deployment or PyPI release
 is implied. The experimental wire55 qualification branch is never a production
 merge base. Current local-installation reuse capability and newer native custody
 behavior remain part of the refreshed protocol and Runtime.
+
+## Declared execution dependencies
+
+Base-only `[model-execution]` does not require or import PEFT/TorchAO. The platform
+or image selects `[lora]` when adapters are requested. Its qualified release cohort
+is PEFT 0.20.0, TorchAO 0.18.0, Accelerate 1.15.0 and Transformers 5.16.1, with the
+worker-owned Torch family satisfying `>=2.13,<3`. No CUDA wheel/index is forced.
+This cohort and the historical Transformers4 corpus are explicitly separate
+extras; selecting incompatible extras refuses dependency resolution.
+
+A fresh CPU environment installed the built Runtime wheel with `[model-execution]`
+and proved empty adapter selection without PEFT/TorchAO. Adding `[lora]` resolved
+the released dependencies through package metadata and passed 71 caller/PEFT tests
+with one GPU skip, preserving CPU Torch and without installing Ruff. This CPU
+closure proof does not replace native H100 qualification of the released libraries.
