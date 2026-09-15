@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import io
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -401,3 +403,72 @@ def test_dependency_cache_rejects_existing_unsafe_roots_without_repair(
             after.st_uid,
         )
         assert not (cache / "uv-cache").exists()
+
+
+def test_verified_wheel_hook_runs_in_private_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import builtins
+
+    poison = tmp_path / "ambient"
+    poison.mkdir()
+    (poison / "declared_hook.py").write_text("raise RuntimeError('ambient hook')\n")
+    monkeypatch.setenv("PYTHONPATH", str(poison))
+    hook = _wheel(
+        tmp_path,
+        "declared_hook",
+        (),
+        b"import builtins; builtins.cozy_declared_hook_origin = __file__\n",
+        resources={"declared_hook.pth": b"import declared_hook\n"},
+    )
+    project = _wheel(tmp_path, "hook_client", ("declared-hook==1.0",), b"VALUE=47\n")
+    base = environment.observe_base()
+    source = _material(project, (hook,), base)
+    assert not hasattr(builtins, "cozy_declared_hook_origin")
+    installed = environment.materialize(
+        source, tmp_path / "private", base=base, exact_dependencies=True
+    )
+    result = subprocess.run(
+        [
+            str(installed.python),
+            "-I",
+            "-c",
+            "import builtins,sys; from pathlib import Path; import hook_client; "
+            "assert Path(builtins.cozy_declared_hook_origin).is_relative_to(sys.prefix); "
+            "assert hook_client.VALUE == 47",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not hasattr(builtins, "cozy_declared_hook_origin")
+    assert (installed.site_packages / "declared_hook.pth").read_bytes() == b"import declared_hook\n"
+
+
+@pytest.mark.parametrize("damage", ["changed", "unrecorded"])
+def test_wheel_hooks_require_recorded_verified_bytes(tmp_path: Path, damage: str) -> None:
+    wheel = _wheel(
+        tmp_path,
+        "declared_hook",
+        (),
+        b"VALUE=1\n",
+        resources={"declared_hook.pth": b"import declared_hook\n"},
+    )
+    with zipfile.ZipFile(wheel) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    if damage == "changed":
+        members["declared_hook.pth"] = b"import altered_hook_\n"
+    else:
+        record = "declared_hook-1.0.dist-info/RECORD"
+        members[record] = b"".join(
+            line
+            for line in members[record].splitlines(keepends=True)
+            if not line.startswith(b"declared_hook.pth,")
+        )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, body in members.items():
+            archive.writestr(name, body)
+    wheel.write_bytes(output.getvalue())
+    with pytest.raises(environment.EnvironmentRefusal, match="wheel_record_"):
+        environment.measure_wheel(wheel, "custom", environment.observe_base())

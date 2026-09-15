@@ -1616,8 +1616,6 @@ def _inspect(
                 mode = member.external_attr >> 16
                 if stat.S_ISLNK(mode):
                     raise EnvironmentRefusal("package_environment_wheel_symlink", name)
-                if not member.is_dir() and PurePosixPath(name).suffix == ".pth":
-                    raise EnvironmentRefusal("package_environment_pth_forbidden", name)
                 if member.is_dir():
                     continue
                 installed = _install_path(name)
