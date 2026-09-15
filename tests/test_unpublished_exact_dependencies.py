@@ -175,10 +175,11 @@ def test_dependency_share_resource_installs_and_reuse_verifies_bytes(
         )
 
 
-def test_share_resource_admission_keeps_project_and_native_scheme_refusals(tmp_path: Path) -> None:
+def test_native_resources_still_require_native_package_tags(tmp_path: Path) -> None:
     base = environment.observe_base(Path(sys.executable))
     resource = "resource-1.0.data/data/share/man/manual"
-    for owner, content in (("project", b"manual\n"), ("custom", b"\x7fELFpretend native")):
+    for owner in ("project", "custom"):
+        content = b"\x7fELFpretend native"
         wheel = _wheel(tmp_path, "resource", (), b"VALUE=1\n", resources={resource: content})
         with pytest.raises(environment.EnvironmentRefusal):
             environment.measure_wheel(wheel, owner, base)
@@ -188,9 +189,8 @@ def test_share_resource_admission_keeps_project_and_native_scheme_refusals(tmp_p
     "member",
     [
         "resource-1.0.data/data/share/../../outside",
-        "resource-1.0.data/scripts/start",
-        "resource-1.0.data/headers/api.h",
-        "resource-1.0.data/data/lib/inject.py",
+        "resource-1.0.data/scripts/../../outside",
+        "resource-1.0.data/unknown/api.h",
     ],
 )
 def test_dependency_share_resource_keeps_closed_install_schemes(
@@ -347,3 +347,45 @@ def test_prebuilt_dependency_zip_bounds_remain_enforced(tmp_path: Path, fault: s
             "package_environment_wheel_invalid",
             "package_environment_wheel_record_mismatch",
         }
+
+
+def test_standard_wheel_schemes_survive_install_rename_and_snapshot(tmp_path: Path) -> None:
+    from cozy_runtime.internal import _installed_dependencies as dependencies
+    from test_installed_dependencies import _venv
+
+    base = environment.observe_base()
+    wheel = _wheel(
+        tmp_path,
+        "scheme_payload",
+        (),
+        b"VALUE=73\n",
+        resources={
+            "scheme_payload-1.0.data/scripts/ordinary-script": (
+                b"#!python\nfrom scheme_payload import VALUE; print(VALUE)\n"
+            ),
+            "scheme_payload-1.0.data/scripts/shell-script": b"#!/bin/sh\nprintf 'shell-ok\\n'\n",
+            "scheme_payload-1.0.data/headers/api.h": b"// API\n",
+            "scheme_payload-1.0.data/data/lib/data-file": b"data bytes\n",
+        },
+    )
+    project = _wheel(tmp_path, "scheme_client", ("scheme-payload==1.0",), b"VALUE=1\n")
+    source = _material(project, (wheel,), base)
+    installed = environment.materialize(
+        source, tmp_path / "installed", base=base, exact_dependencies=True
+    )
+    assert (
+        installed.generation / "include/site/python3.12/scheme-payload/api.h"
+    ).read_bytes() == b"// API\n"
+    assert (installed.generation / "lib/data-file").read_bytes() == b"data bytes\n"
+    target = tmp_path / "captured"
+    _venv(target, executable=Path(sys.executable))
+    manifest = dependencies.snapshot(installed.python, target, set())
+    dependencies.verify_files(target, manifest)
+    for prefix in (installed.generation, target):
+        for name, output in (("ordinary-script", "73"), ("shell-script", "shell-ok")):
+            result = subprocess.run([str(prefix / "bin" / name)], capture_output=True, text=True)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.strip() == output
+    assert environment.materialize(
+        source, tmp_path / "installed", base=base, exact_dependencies=True
+    ).reused
