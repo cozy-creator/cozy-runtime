@@ -218,7 +218,7 @@ def main() -> None:
     }
     (root / "outcome.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)
-    if outcome.exit_code or outcome.status != "succeeded":
+    if outcome.exit_code or outcome.status != "OUTCOME_STATUS_SUCCEEDED":
         raise SystemExit(outcome.exit_code or 1)
 
 
