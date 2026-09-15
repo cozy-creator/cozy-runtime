@@ -882,6 +882,22 @@ def materialize_locked(
     return installed
 
 
+def _require_dependency_cache_root(cache: Path) -> None:
+    if not cache.is_absolute() or cache.resolve() != cache:
+        raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(cache))
+    try:
+        cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+        info = cache.lstat()
+    except OSError as exc:
+        raise EnvironmentRefusal(
+            "package_environment_dependency_cache_invalid", str(cache)
+        ) from exc
+    if not stat.S_ISDIR(info.st_mode) or (
+        os.name == "posix" and (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700)
+    ):
+        raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(cache))
+
+
 def _install_locked(
     uv: Path,
     python: Path,
@@ -901,6 +917,8 @@ def _install_locked(
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     requirements = cache / "locked-requirements.txt"
     requirements.write_text("".join(row.text + "\n" for row in install_rows))
+    if cache_root is not None:
+        _require_dependency_cache_root(cache_root)
     shared_cache = (cache_root or staging.parent) / "uv-cache"
     shared_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     scoped = ["--cache-dir", str(shared_cache)]
@@ -1011,6 +1029,7 @@ def fetch_locked_wheels(
             # Local package install roots differ. Retain each exact archive only once
             # under the machine cache, independently of the project's full closure.
             if cache_root is not None:
+                _require_dependency_cache_root(cache_root)
                 expected = cache_root / ".stage" / row.hashes[0].removeprefix("sha256:") / filename
             path, length = _fetch_local_locked_wheel(expected, row)
         if path != expected:
@@ -2006,6 +2025,8 @@ def _install_with_uv(
     dependencies: Callable[[Path], None] | None = None,
     cache_root: Path | None = None,
 ) -> None:
+    if cache_root is not None:
+        _require_dependency_cache_root(cache_root)
     cache = (cache_root or staging.parent) / "uv-cache"
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     commands = [
