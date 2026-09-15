@@ -1224,8 +1224,11 @@ def _entrypoints(
     rows = body.get("entrypoints")
     if not isinstance(rows, list):
         raise PreparationRefusal("package_prepare_interface_invalid", "entrypoints")
-    selected = _selected_models(package_name, selections, tensorfs_root, verified)
-    if selected and derive is None:
+    construction_slots = _slot_paths(body, "entrypoints")
+    selected = _selected_models(
+        package_name, selections, tensorfs_root, verified, construction_slots=construction_slots
+    )
+    if construction_slots.intersection(selected) and derive is None:
         raise PreparationRefusal(
             "package_prepare_derive_refused", "a modeled selection needs the package environment"
         )
@@ -1405,13 +1408,17 @@ def _selected_models(
     selections: Sequence[Any],
     tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
+    *,
+    construction_slots: set[str],
 ) -> dict[str, dict[str, Any]]:
     """Resolve each selected model from the local TensorFS Store (wire 30).
 
     The privileged host and TensorFS admitted every model byte before preparation ran; this
     plane cross-checks release rows when selected, or reads an exact admitted checkpoint
     without a release alias. It proves the runtime closure complete with the store's own
-    verified walk and reads config plus assets through it. Hub/Host owns repository
+    verified walk for every slot. Only serving slots need construction config,
+    assets and dtype projection; job Model arguments are source-only capabilities.
+    Hub/Host owns repository
     membership; no model file rides this request and nothing here writes to the store.
     """
 
@@ -1478,27 +1485,31 @@ def _selected_models(
             store.acquire_cozytensors(digest).release()
             held = store.manifest(digest)
             header = tensorfs.parse_header(bytes(held["header"]))
-            configs = header.get("configs")
             if not header.get("components"):
                 raise PreparationRefusal(
                     "package_prepare_model_header_unsupported",
-                    f"{digest}: expected configs and components",
+                    f"{digest}: expected tensor components",
                 )
-            try:
-                config_bytes = model_config.construction_config(configs)
-                assets = fill.Checkpoint(tensorfs_root, digest).model_assets()
-            except model_config.ModelConfigRefusal as exc:
-                raise PreparationRefusal(
-                    "package_prepare_model_config_mismatch", f"{digest}: {exc}"
-                ) from exc
-            for value in selected.values():
+            construction: dict[str, Any] = {}
+            if any(
+                slot in construction_slots and value["selection"]["manifest"] == digest
+                for slot, value in selected.items()
+            ):
+                try:
+                    construction = {
+                        "config_bytes": model_config.construction_config(header.get("configs")),
+                        "assets": fill.Checkpoint(tensorfs_root, digest).model_assets(),
+                        "tensor_dtypes": model_config.tensor_dtypes(header),
+                    }
+                except model_config.ModelConfigRefusal as exc:
+                    raise PreparationRefusal(
+                        "package_prepare_model_config_mismatch", f"{digest}: {exc}"
+                    ) from exc
+            for slot, value in selected.items():
                 if value["selection"]["manifest"] == digest:
-                    value.update(
-                        manifest_length=length,
-                        config_bytes=config_bytes,
-                        assets=assets,
-                        tensor_dtypes=model_config.tensor_dtypes(header),
-                    )
+                    value["manifest_length"] = length
+                    if slot in construction_slots:
+                        value.update(construction)
     except PreparationRefusal:
         raise
     except (acquire.AcquisitionRefusal, fill.FillRefusal) as exc:
