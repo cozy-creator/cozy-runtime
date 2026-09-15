@@ -76,12 +76,14 @@ def main() -> None:
     parser.add_argument("--candidate-dir", type=Path, required=True)
     parser.add_argument("--factor-dir", type=Path, required=True)
     parser.add_argument("--rows", type=int, default=8192)
+    parser.add_argument("--in-features", type=int, default=5376)
+    parser.add_argument("--out-features", type=int, default=7168)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--legacy-lora", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.rows <= 0 or args.rows % 4 or args.repeats < 1:
-        raise SystemExit("rows must be positive/divisible by4 and repeats positive")
+    if min(args.rows, args.in_features, args.out_features, args.repeats) < 1:
+        raise SystemExit("geometry and repeats must be positive")
 
     import torch
 
@@ -111,12 +113,15 @@ def main() -> None:
         raise SystemExit("this native qualification is scoped to one SM90 GPU")
     torch.set_num_threads(2)
     device = torch.device("cuda")
-    in_features, out_features = 5376, 7168
+    in_features, out_features = args.in_features, args.out_features
     weight_bytes = in_features * out_features + out_features * 4
     input_bytes = args.rows * in_features * 2
     # Matches the candidate's conservative admission, plus a context/library margin.
-    scratch_bound = args.rows * (in_features * 10 + out_features * 2 + 12)
-    required_free = input_bytes + weight_bytes + scratch_bound + (1 << 30)
+    scratch_bound = max(
+        args.rows * (in_features * 10 + out_features * 2 + 12),
+        args.rows * (3 * out_features + 32) * 2,
+    )
+    required_free = 2 * input_bytes + weight_bytes + scratch_bound + (1 << 30)
     free, total = torch.cuda.mem_get_info()
     if free < required_free:
         raise SystemExit(
@@ -131,7 +136,7 @@ def main() -> None:
         "device": torch.cuda.get_device_name(),
         "capacity": {"free": free, "total": total},
         "required_free_bytes": required_free,
-        "base_quantizer_scratch_bound": scratch_bound,
+        "temporary_scratch_bound": scratch_bound,
         "candidate_sha256": candidate_hashes,
         "legacy_lora_source_sha256": legacy_hash,
         "versions": {
@@ -169,14 +174,22 @@ def main() -> None:
     x = torch.randn(1, args.rows, in_features, device=device, dtype=torch.bfloat16)
     report["physical_base_parameter_bytes"] = distinct_storage_bytes(base.parameters())
 
-    def cpu_result(fn: Any, partitions: int = 1) -> Any:
-        return torch.cat([fn(part).detach().cpu() for part in x.chunk(partitions, dim=1)], dim=1)
+    def parts(partitions: int, pad_to_degree: bool = False) -> tuple[Any, ...]:
+        padding = (-args.rows) % partitions if pad_to_degree else 0
+        source = torch.nn.functional.pad(x, (0, 0, 0, padding)) if padding else x
+        return source.tensor_split(partitions, dim=1)
+
+    def cpu_result(fn: Any, partitions: int = 1, *, pad_to_degree: bool = False) -> Any:
+        output = torch.cat(
+            [fn(part).detach().cpu() for part in parts(partitions, pad_to_degree)], dim=1
+        )
+        return output[:, : args.rows].contiguous()
 
     def measure(fn: Any, partitions: int = 1) -> dict[str, Any]:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         start = time.perf_counter()
-        for part in x.chunk(partitions, dim=1):
+        for part in parts(partitions):
             result = fn(part)
             del result
         torch.cuda.synchronize()
@@ -185,7 +198,7 @@ def main() -> None:
         for _ in range(args.repeats):
             begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             begin.record()
-            for part in x.chunk(partitions, dim=1):
+            for part in parts(partitions):
                 result = fn(part)
                 del result
             end.record()
@@ -217,6 +230,9 @@ def main() -> None:
         report["arms"]["legacy_base"]["row_partitions"] = {
             str(parts): compare(cpu_result(legacy, parts), reference) for parts in (2, 4)
         }
+        report["arms"]["legacy_base"]["degree4_pad_crop"] = compare(
+            cpu_result(legacy, 4, pad_to_degree=True), reference
+        )
         report["arms"]["standard_base"] = {
             **measure(base),
             "versus_legacy": compare(cpu_result(base), reference),
@@ -225,6 +241,9 @@ def main() -> None:
         report["arms"]["standard_base"]["row_partitions"] = {
             str(parts): compare(cpu_result(base, parts), standard_reference) for parts in (2, 4)
         }
+        report["arms"]["standard_base"]["degree4_pad_crop"] = compare(
+            cpu_result(base, 4, pad_to_degree=True), standard_reference
+        )
         del standard_reference
         binding = LinearAdapters({"dit": model}, {"dit": "base"}, {"dit": ["0"]})
         legacy_model = torch.nn.Sequential(legacy)
@@ -302,6 +321,7 @@ def main() -> None:
                         "repeat": compare(cpu_result(model), full),
                         "row_partitions": {},
                         "adapter_only_row_partitions": {},
+                        "degree4_padded_rows": args.rows + (-args.rows) % 4,
                         "source_parts": row["parts"],
                     }
                     if legacy_output is not None:
@@ -318,6 +338,12 @@ def main() -> None:
                         arm["adapter_only_row_partitions"][str(partitions)] = compare(
                             cpu_result(adapter_only, partitions), adapter_full
                         )
+                    arm["degree4_pad_crop"] = compare(
+                        cpu_result(model, 4, pad_to_degree=True), full
+                    )
+                    arm["adapter_only_degree4_pad_crop"] = compare(
+                        cpu_result(adapter_only, 4, pad_to_degree=True), adapter_full
+                    )
                     del adapter_full
                     before = [
                         (p, p.data_ptr())
