@@ -64,6 +64,7 @@ def test_refused_expansion_does_not_start_uv_or_create_environment(
 ) -> None:
     root, wheel, row = wheel_fixture(tmp_path)
     staging = root / "generation"
+    monkeypatch.setattr(storage, "enabled", lambda: True)
     monkeypatch.setattr(storage, "fetch_wheel", lambda *args: (wheel, wheel.stat().st_size))
 
     def refuse(*bounds: storage.Write) -> NoReturn:
@@ -86,6 +87,7 @@ def test_exact_downloaded_wheel_installs_with_uv_offline(
 ) -> None:
     root, wheel, row = wheel_fixture(tmp_path)
     staging = root / "generation"
+    monkeypatch.setattr(storage, "enabled", lambda: True)
     monkeypatch.setattr(storage, "fetch_wheel", lambda *args: (wheel, wheel.stat().st_size))
 
     def unexpected_rehash(_path: Path) -> NoReturn:

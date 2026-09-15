@@ -91,6 +91,7 @@ def spawn_executor(
     )
     argv = [
         python,
+        "-I",
         "-c",
         "import sys; from cozy_runtime.internal.trampoline import main; main(sys.argv[1:])",
         "--expect-parent",
@@ -104,6 +105,7 @@ def spawn_executor(
         *containment,
         "--",
         python,
+        "-I",
         *module_argv,
     ]
     pid = os.posix_spawn(
@@ -164,6 +166,7 @@ def spawn_follower(
     """
     argv = [
         python,
+        "-I",
         "-c",
         "import sys; from cozy_runtime.internal.trampoline import main; main(sys.argv[1:])",
         "--expect-parent",
@@ -178,6 +181,7 @@ def spawn_follower(
         "inherit",
         "--",
         python,
+        "-I",
         *module_argv,
     ]
     os.set_inheritable(inherit_fd, True)

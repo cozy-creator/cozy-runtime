@@ -28,9 +28,10 @@ def _wheel(
     *,
     resources: dict[str, bytes] | None = None,
     requires_python: str = "",
+    version: str = "1.0",
 ) -> Path:
-    info = f"{name}-1.0.dist-info"
-    metadata = f"Metadata-Version: 2.3\nName: {name}\nVersion: 1.0\n"
+    info = f"{name}-{version}.dist-info"
+    metadata = f"Metadata-Version: 2.3\nName: {name}\nVersion: {version}\n"
     if requires_python:
         metadata += f"Requires-Python: {requires_python}\n"
     metadata += "".join(f"Requires-Dist: {value}\n" for value in requirements)
@@ -52,7 +53,7 @@ def _wheel(
     record = io.StringIO()
     csv.writer(record).writerows([*rows, (f"{info}/RECORD", "", "")])
     members[f"{info}/RECORD"] = record.getvalue().encode()
-    path = root / f"{name}-1.0-py3-none-any.whl"
+    path = root / f"{name}-{version}-py3-none-any.whl"
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for member, body in members.items():
             archive.writestr(member, body)
@@ -116,7 +117,7 @@ def test_actual_patch_requires_python_and_inactive_marker_install(tmp_path: Path
 
 
 @pytest.mark.parametrize("distribution", ["numpy", "setuptools"])
-def test_unpublished_refuses_divergent_base_before_install(
+def test_unpublished_missing_dependency_cannot_borrow_base(
     tmp_path: Path, distribution: str
 ) -> None:
     base = environment.observe_base(Path(sys.executable))
@@ -132,7 +133,7 @@ def test_unpublished_refuses_divergent_base_before_install(
     root = tmp_path / "refused"
     with pytest.raises(environment.EnvironmentRefusal) as caught:
         environment.materialize(material, root, base=base, exact_dependencies=True)
-    assert caught.value.code == "package_environment_dependency_base_conflict"
+    assert caught.value.code == "package_environment_dependency_missing"
     assert not root.exists()
 
 

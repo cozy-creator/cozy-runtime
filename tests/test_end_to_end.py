@@ -33,7 +33,7 @@ from typing import Any
 
 import pytest
 
-from conftest import image_python
+from conftest import authored_python, image_python
 from cozy_runtime.internal import (
     base_observation,
     package_environment,
@@ -312,12 +312,11 @@ def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
 
 
 def test_editable_revision_materializes_from_supplied_wheels() -> None:
-    """The one preparation that still receives files (wire 30): an editable revision's
-    wheels, installed into a fresh venv over a REAL base that owns the runtime closure —
-    exactly a pod's image python. The project wheel is the row that MEASURES as the
-    package's own distribution/release; the placement carries the supplied dependency as
-    Environment.local_wheels and the project fact on DevelopmentPackage. A wheel shadowing
-    a protected image family at another version refuses typed."""
+    """Capture an explicit authored SDK closure alongside exact private project wheels.
+
+    The retained environment owns the copied Runtime and every dependency. It neither
+    borrows image imports nor changes earlier generations when a private wheel changes.
+    """
 
     uv = shutil.which("uv")
     assert uv is not None
@@ -329,18 +328,14 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
         root = Path(raw)
         dependency = root / "annotated-doc-0.0.5"
         _write_annotated_doc(dependency, "0.0.5")
-        impostor = root / "impostor"
-        _write_pure_project(impostor, "cozy-runtime", "9.9.9", "cozy_runtime_impostor")
         artifact_cache = root / "artifacts"
         artifact_cache.mkdir()
         wheel_set = root / "environments" / ".stage" / "editable-revision-proof" / "wheels"
         wheel_set.mkdir(parents=True)
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(PACKAGE))
         _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(dependency))
-        _run(uv, "build", "--wheel", "--out-dir", str(wheel_set), str(impostor))
         project_wheel = next(wheel_set.glob("marco_polo-*.whl"))
         dependency_wheel = next(wheel_set.glob("annotated_doc-0.0.5-*.whl"))
-        impostor_wheel = next(wheel_set.glob("cozy_runtime-9.9.9-*.whl"))
         environment = root / "environments"
 
         def describe_real(
@@ -371,6 +366,7 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,
                 base=observed,
+                dependency_python=authored_python(),
                 job_plan_root=root / "job-plans",
             )
 
@@ -391,14 +387,6 @@ def test_editable_revision_materializes_from_supplied_wheels() -> None:
         generation = environment / "contents"
         (venv_python,) = generation.glob("*/bin/python")
         _run(str(venv_python), "-I", "-c", "import marco_polo_package, annotated_doc", cwd="/")
-
-        # A protected image family cannot be replaced by a supplied wheel: the measure
-        # itself convicts the impostor before any install.
-        with pytest.raises(PreparationRefusal) as shadowed:
-            prepare([project_wheel, impostor_wheel], revision)
-        assert shadowed.value.code == "package_environment_base_distribution_import_roots_conflict"
-        assert "cozy-runtime 9.9.9" in shadowed.value.detail
-        assert "cannot be replaced" in shadowed.value.detail
 
         # A dependency edit changes the executable closure even when the project
         # wheel and callable interface are identical. Both plans remain resumable.
@@ -491,7 +479,7 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
             ],
         )
     )
-    python = image_python()
+    python = authored_python()
     if bind_model:
         torch = pytest.importorskip("torch", reason="native derivation needs the CPU torch CI lane")
         assert torch.version.cuda is None, "this proof uses CPU/meta derivation only"
@@ -541,6 +529,7 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
         describe=describe,
         verified=lambda _digest, _length, _path: None,
         base=base,
+        dependency_python=python,
         job_plan_root=tmp_path / "job-plans",
         materialized=installed.append,
     )
@@ -760,69 +749,17 @@ def test_project_wheel_with_no_import_roots_is_refused_before_the_document() -> 
     }
 
 
-def test_worker_image_owns_pillow_and_numpy_as_peer_dependencies() -> None:
-    """Pillow and NumPy are worker-image families, so no package copy can displace them.
+def test_private_dependencies_replace_image_versions_without_borrowing_them(tmp_path: Path) -> None:
+    from test_unpublished_exact_dependencies import _wheel
 
-    Pillow is cozy-runtime's own public dependency (`pillow>=12,<13`) and NumPy shares a
-    compiled ABI with the Torch family the image pins, so image code — not only package code
-    — imports whatever ends up on the venv's path. `--system-site-packages` puts the package
-    venv AHEAD of the image, so an admitted copy wins the import.
-
-    Three facts, against the real interpreter this suite runs in:
-      * a package copy of pillow is image-owned: admitted as a fact, omitted from the install;
-      * a FOREIGN distribution that installs the same `PIL` import root is refused — this is
-        the shadow the distribution name alone never caught;
-      * a package requirement the image's pillow cannot satisfy is refused typed, which is
-        what replaces the copy the package was not allowed to bring.
-    """
-
-    uv = shutil.which("uv")
-    assert uv is not None
     base = base_observation.current()
-    pillow = base.distribution_versions.get("pillow")
-    assert pillow, "this interpreter must carry the image's pillow"
-    assert base.root_providers.get("PIL") == ("pillow",)
-
-    with tempfile.TemporaryDirectory(prefix="cozy-image-owned.") as raw:
-        root = Path(raw)
-        vendored = root / "vendored-pillow"
-        foreign = root / "foreign-pil"
-        demanding = root / "demanding"
-        _write_pure_project(vendored, "pillow", "12.99.0", "PIL")
-        _write_pure_project(foreign, "shady-imaging", "0.0.1", "PIL")
-        _write_pure_project(demanding, "demanding", "0.0.1", "demanding", ("pillow>=13",))
-        dist = root / "dist"
-        _run(uv, "build", "--wheel", "--out-dir", str(dist), str(ROOT))
-        _run(uv, "build", "--wheel", "--out-dir", str(dist), str(PACKAGE))
-        _run(uv, "build", "--wheel", "--out-dir", str(dist), str(vendored))
-        _run(uv, "build", "--wheel", "--out-dir", str(dist), str(foreign))
-        _run(uv, "build", "--wheel", "--out-dir", str(dist), str(demanding))
-        project_wheel = next(dist.glob("marco_polo-*.whl"))
-        runtime_wheel = next(dist.glob("cozy_runtime-*.whl"))
-        vendored_wheel = next(dist.glob("pillow-12.99.0-*.whl"))
-        foreign_wheel = next(dist.glob("shady_imaging-*.whl"))
-        demanding_wheel = next(dist.glob("demanding-*.whl"))
-
-        _base, package_wheels, supplied = package_environment.preflight_environment(
-            project_wheel, (vendored_wheel, runtime_wheel), base
-        )
-        assert "pillow" in {wheel.distribution for wheel in supplied}
-        assert "pillow" not in {wheel.distribution for wheel in package_wheels}
-
-        with pytest.raises(
-            package_environment.EnvironmentRefusal,
-            match="package_environment_shadows_base_import",
-        ):
-            package_environment.preflight_environment(
-                project_wheel, (foreign_wheel, runtime_wheel), base
-            )
-
-        with pytest.raises(package_environment.EnvironmentRefusal) as conflict:
-            package_environment.preflight_environment(
-                project_wheel, (demanding_wheel, runtime_wheel), base
-            )
-        assert conflict.value.code == "package_environment_dependency_base_conflict"
-        assert "the worker image provides pillow" in conflict.value.detail
+    project = _wheel(tmp_path, "private_imaging", ("pillow==13.0",), b"import pillow\n")
+    pillow = _wheel(tmp_path, "pillow", (), b"VALUE=13\n", version="13.0")
+    _, selected, supplied = package_environment.preflight_environment(project, (pillow,), base)
+    assert "pillow" in {row.distribution for row in supplied}
+    assert "pillow" in {row.distribution for row in selected}
+    with pytest.raises(package_environment.EnvironmentRefusal, match="dependency_missing"):
+        package_environment.preflight_environment(project, (), base)
 
 
 @needs_executor
@@ -1034,6 +971,7 @@ def test_native_dependency_wheel_installs_like_any_other_wheel() -> None:
                 describe=describe_real,
                 verified=lambda _digest, _length, _path: None,
                 base=observed,
+                dependency_python=authored_python(),
                 development=_development("paul/marco-polo", "1.0.4", revision_digest),
             )
 

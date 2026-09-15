@@ -79,9 +79,10 @@ def test_incompatible_runtime_refuses_fresh_and_legacy_cache_before_import(
         ("cozy-runtime[media]>=999",),
         f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('imported')\n".encode(),
     )
-    index = _SimpleIndex(tmp_path / "index", [wheel])
+    runtime = _wheel(tmp_path, "cozy_runtime", (), b"VALUE=1\n")
+    index = _SimpleIndex(tmp_path / "index", [wheel, runtime])
     try:
-        locked = _locked(index, [wheel])
+        locked = _locked(index, [wheel, runtime])
         root = tmp_path / "installs"
         if reused:
             _legacy_generation(root, locked)
@@ -92,7 +93,7 @@ def test_incompatible_runtime_refuses_fresh_and_legacy_cache_before_import(
             "package": "requires-new-runtime",
             "distribution": "cozy-runtime",
             "required": ">=999",
-            "installed": environment.observe_base().distribution_versions["cozy-runtime"],
+            "installed": "1.0",
         }
         assert not sentinel.exists()
         if not reused:
@@ -105,9 +106,10 @@ def test_selected_extra_rechecks_transitive_constraint(tmp_path: Path) -> None:
     # Root order initially visits helper without extras; following [media] must revisit it.
     project = _wheel(tmp_path, "a_project", ("z-helper[media]==1.0",), b"VALUE=42\n")
     helper = _wheel(tmp_path, "z_helper", ("cozy-runtime>=999; extra == 'media'",), b"VALUE=42\n")
-    index = _SimpleIndex(tmp_path / "index", [project, helper])
+    runtime = _wheel(tmp_path, "cozy_runtime", (), b"VALUE=1\n")
+    index = _SimpleIndex(tmp_path / "index", [project, helper, runtime])
     try:
-        locked = _locked(index, [project, helper])
+        locked = _locked(index, [project, helper, runtime])
         with pytest.raises(package_requirements.DependencyConflict) as caught:
             environment.materialize_locked(
                 locked, locked.rows, tmp_path / "installs", environment_digest=DIGEST
@@ -131,9 +133,10 @@ def test_python_markers_and_compatible_cache_reuse(tmp_path: Path, python: str) 
         b"VALUE=42\n",
         requires_python=python,
     )
-    index = _SimpleIndex(tmp_path / "index", [wheel])
+    runtime = _wheel(tmp_path, "cozy_runtime", (), b"VALUE=1\n")
+    index = _SimpleIndex(tmp_path / "index", [wheel, runtime])
     try:
-        locked = _locked(index, [wheel])
+        locked = _locked(index, [wheel, runtime])
         root = tmp_path / "installs"
         if python == ">=999":
             with pytest.raises(environment.EnvironmentRefusal, match="python_incompatible"):
@@ -147,7 +150,7 @@ def test_python_markers_and_compatible_cache_reuse(tmp_path: Path, python: str) 
             locked, locked.rows, root, environment_digest=DIGEST
         )
         assert replay.reused and replay.generation.stat().st_ino == inode
-        assert not list(replay.site_packages.glob("cozy_runtime*"))
+        assert list(replay.site_packages.glob("cozy_runtime*"))
         assert replay.generation.stat().st_uid == os.geteuid()
     finally:
         index.close()
@@ -160,7 +163,8 @@ def test_preparation_rpc_preserves_requirement_facts(tmp_path: Path) -> None:
         ("cozy-runtime>=999",),
         b"raise AssertionError('imported')\n",
     )
-    index = _SimpleIndex(tmp_path / "index", [wheel])
+    runtime = _wheel(tmp_path, "cozy_runtime", (), b"VALUE=1\n")
+    index = _SimpleIndex(tmp_path / "index", [wheel, runtime])
     base = environment.observe_base()
     root = tmp_path / "installs"
     request = pb.PreparePackageSetRequest(
@@ -181,7 +185,9 @@ def test_preparation_rpc_preserves_requirement_facts(tmp_path: Path) -> None:
             ],
         ),
         locked_requirements=(
-            f"--index-url {index.url}\n" + _locked(index, [wheel]).rows[0].text + "\n"
+            f"--index-url {index.url}\n"
+            + "\n".join(row.text for row in _locked(index, [wheel, runtime]).rows)
+            + "\n"
         ).encode(),
     )
 
@@ -217,7 +223,7 @@ def test_preparation_rpc_preserves_requirement_facts(tmp_path: Path) -> None:
                         "cozy-requirement-package": "requires-new-runtime",
                         "cozy-requirement-distribution": "cozy-runtime",
                         "cozy-requirement-required": ">=999",
-                        "cozy-requirement-installed": base.distribution_versions["cozy-runtime"],
+                        "cozy-requirement-installed": "1.0",
                     }
             finally:
                 server.stop(0).wait()

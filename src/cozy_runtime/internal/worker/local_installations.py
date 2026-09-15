@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import os
 import stat
 import uuid
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from cozy_runtime.internal import (
     base_observation,
@@ -45,8 +45,8 @@ def record(
     )
     raw = canonical.write(
         {
-            "format": "cozy.runtime.LocalInstallation/1",
-            "base_digest": canonical.digest(dataclasses.asdict(base)),
+            "format": "cozy.runtime.LocalInstallation/2",
+            "base_digest": canonical.digest(dict(base.interpreter_identity)),
             "placement_set": documents.read(
                 result.placement_set.placement_set_canonical_bytes, pb.PlacementSet
             ),
@@ -110,8 +110,8 @@ def reopen(
         value = canonical.parse_canonical(raw)
         if (
             not isinstance(value, dict)
-            or value.get("format") != "cozy.runtime.LocalInstallation/1"
-            or value.get("base_digest") != canonical.digest(dataclasses.asdict(base))
+            or value.get("format") != "cozy.runtime.LocalInstallation/2"
+            or value.get("base_digest") != canonical.digest(dict(base.interpreter_identity))
         ):
             return None
         placement_set = value["placement_set"]
@@ -121,7 +121,10 @@ def reopen(
         placement = placements[0]
         interface = placement["package_interface"]
         package_prepare._verify_local_revision(
-            request.package, (interface["digest"], interface["length"]), request.wheels
+            request.package,
+            (interface["digest"], interface["length"]),
+            request.wheels,
+            bytes(request.dependency_requirements),
         )
         development = dict(placement["development"])
         development.pop("project_wheel")
@@ -148,17 +151,34 @@ def reopen(
             request.package.release,
         )
         expected = set()
+        uploaded = set()
         for row in request.wheels:
             named = package_environment.wheel_name_version(row.filename)
             if named is None:
                 raise package_prepare.PreparationRefusal(
                     "local_package_revision_mismatch", "revision wheel filename is invalid"
                 )
-            # Cold preparation verifies import ownership before omitting these
-            # protected image distributions. Every other supplied wheel must remain.
-            if named == project or not package_environment.base_owned_distribution(named[0], base):
-                expected.add((documents.spell(row.digest), row.length, row.filename))
-        supplied = {(wheel.digest, wheel.length, wheel.filename) for wheel in wheels}
+            uploaded.add(named[0])
+            expected.add((documents.spell(row.digest), row.filename))
+            matched = [wheel for wheel in wheels if wheel.digest == documents.spell(row.digest)]
+            if len(matched) != 1 or matched[0].length != row.length:
+                raise package_prepare.PreparationRefusal(
+                    "local_package_revision_mismatch",
+                    "installed wheel length differs from revision",
+                )
+        if request.dependency_requirements:
+            locked = package_environment.read_dependency_requirements(
+                bytes(request.dependency_requirements)
+            )
+            for dependency in locked.rows:
+                if dependency.name in uploaded:
+                    raise package_prepare.PreparationRefusal(
+                        "local_package_revision_mismatch", "dependency overlaps local wheel"
+                    )
+                expected.add(
+                    (dependency.hashes[0], unquote(Path(urlsplit(dependency.url).path).name))
+                )
+        supplied = {(wheel.digest, wheel.filename) for wheel in wheels}
         if (
             supplied != expected
             or len(supplied) != len(wheels)

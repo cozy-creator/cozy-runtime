@@ -533,4 +533,16 @@ def runtime_config_from_host(host: WorkerHostConfig) -> RuntimeConfig:
         record_owner_public_key=host.control_public_key_ed25519,
         child_base_env=host.child_base_env,
         object_storage_hosts=host.object_storage_hosts,
+        dependency_cache=host_paths.DEPENDENCY_CACHE,
     )
+
+
+def package_install_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Explicit uv commands cannot inherit user constraints or Python import paths."""
+    source = os.environ if environ is None else environ
+    return {
+        name: value
+        for name, value in source.items()
+        if not name.startswith(("UV_", "PIP_", "PYTHON"))
+        and name not in {"VIRTUAL_ENV", "CONDA_PREFIX"}
+    }
