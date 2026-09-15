@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import ctypes
 import math
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.internal.parallel.plan import GroupRefusal
 
 _TAG = "__sp__"
@@ -164,6 +167,7 @@ def run_command(
     """Marshal one component call as the `run` command every follower receives."""
     return {
         "cmd": "run",
+        "attention_layout": asdict(layout) if (layout := _ACTIVE_LAYOUT.get()) else None,
         "args": [marshal(a, spool, path=f"args[{i}]") for i, a in enumerate(args)],
         "kwargs": {k: marshal(v, spool, path=k) for k, v in kwargs.items()},
     }
@@ -178,3 +182,31 @@ def run_call(
         str(k): unmarshal(v, spool, device=device) for k, v in (command.get("kwargs") or {}).items()
     }
     return args, kwargs
+
+
+@contextmanager
+def attention_context(command: Mapping[str, Any]) -> Iterator[None]:
+    """Recreate only the leader's closed attention layout, never ambient Python context."""
+    value = command.get("attention_layout")
+    layout = None
+    if value is not None:
+        if not isinstance(value, dict) or set(value) != {
+            "live_tokens",
+            "protected_prefix",
+            "step",
+            "dense_until_step",
+            "dense_paths",
+        }:
+            raise UncrossableArgument("malformed mirrored attention layout")
+        paths = value["dense_paths"]
+        if not isinstance(paths, (list, tuple)):
+            raise UncrossableArgument("mirrored attention dense_paths must be a sequence")
+        try:
+            layout = AttentionLayout(**{**value, "dense_paths": tuple(paths)})
+        except (TypeError, ValueError) as exc:
+            raise UncrossableArgument(f"malformed mirrored attention layout: {exc}") from exc
+    token = _ACTIVE_LAYOUT.set(layout)
+    try:
+        yield
+    finally:
+        _ACTIVE_LAYOUT.reset(token)

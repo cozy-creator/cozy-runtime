@@ -305,7 +305,7 @@ def test_sol_sites_are_removed_after_request_and_partial_apply_failure() -> None
     attention_sol.remove_site(vae, "vae", "prepared")
 
 
-def test_sol_cannot_be_installed_for_context_parallel_degree() -> None:
+def test_sol_can_be_installed_for_context_parallel_degree() -> None:
     torch = pytest.importorskip("torch")
     from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
 
@@ -316,8 +316,8 @@ def test_sol_cannot_be_installed_for_context_parallel_degree() -> None:
             [WanAttention(dim=128, heads=1, dim_head=128, processor=processor_type())]
         ).to(torch.bfloat16)
     }
-    with pytest.raises(attention.AttentionRefusal, match="degree 4"):
-        attention.install(_ready("sol-attn"), roots, "sol-attn", degree=4)
+    applied = attention.install(_ready("sol-attn"), roots, "sol-attn", degree=4)
+    assert applied.totals() == {"sol-attn": 1}
 
 
 def test_probe_refuses_wrong_output_dtype_even_with_perfect_values() -> None:

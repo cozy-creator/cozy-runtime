@@ -699,6 +699,7 @@ class Executor:
                 stack.enter_context(self.torch.inference_mode(command["inference_mode"]))
                 stack.enter_context(self.torch.set_grad_enabled(command["grad_enabled"]))
                 stack.enter_context(cp.gated_call())
+                stack.enter_context(wire.attention_context(command))
                 args, kwargs = wire.run_call(
                     command,
                     wire.TensorSpool(spool / "ranks", references),
