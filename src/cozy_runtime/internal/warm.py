@@ -7,6 +7,12 @@ the placement is never DISPATCHABLE with a cold generation behind it, on a dynam
 as on any other. It never runs on a component stage or evict: residency moves bytes and the
 module objects survive, so what `warm` did to them survives too.
 
+Before calling the author, the executor opens the existing component-staged residency
+contract. Each declared use evicts unrelated completed weights, giving dry forwards room
+for their work; no request's all-resident promise exists yet. Followers receive the same
+contract through the ordinary mirror. The actual post-warm resident set is reported to
+the request planner. This can stage additional components and therefore adds warm I/O.
+
 Inside `warm` the name-renaming `torch.compile(module)` spelling is refused typed, exactly
 as under derive; the in-place `nn.Module.compile` is allowed (#702). The Context carries the
 device, the fill's deadline and cancellation, and can reserve no package call: the broker

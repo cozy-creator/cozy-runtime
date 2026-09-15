@@ -56,14 +56,12 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
         `warm` runs (h3a-015, `fusion="accept"` above); the dry forward is what pays their
         first launches, the rotary tables and the projections' first GEMM plans.
 
-        Offered, not required. A fill that could not hold both DiTs PARKED one, and `warm`
-        runs before any attempt fixes a placement rung, so admission there evicts nothing
-        and staging the parked DiT is a measured `device_shortfall`. That is a capacity
-        fact about the card, not a construction failure: the parked DiT is staged by the
-        ladder on its entrypoint's first request, under a rung that may evict, and pays its
-        first launches there. So a shortfall on one entrypoint's DiT is recorded and
-        skipped while the other is still warmed — consent, not requirement, the shape
-        h3a-015 gave the fused lane itself.
+        Offered, not required. Warm uses the same staged component-use admission as a
+        request: unrelated completed components are evicted before each DiT runs. A
+        parked DiT can therefore warm if its own scope fits. A measured device_shortfall
+        remains optional and is recorded and skipped; it is not a requirement to fit
+        both DiTs simultaneously. Later requests select their own placement rung from
+        the actual post-warm resident set. Warming a parked DiT may add checkpoint I/O.
         """
         warmers: dict[Task, Callable[[], None]] = {
             "fl2va": self.warm_fl2va,

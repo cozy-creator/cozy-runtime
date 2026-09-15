@@ -776,6 +776,11 @@ class Executor:
         """Preparation has its own spool; component calls need no request to warm."""
         from cozy_runtime.internal.warm import warm_generation
 
+        # Warm has no admitted request rung. Its declared component-use scopes must
+        # free unrelated weights before kernel and collective scratch is allocated.
+        # The mirror carries this same existing staged contract to every follower.
+        if self.residency is not None:
+            self.residency.open_attempt("component_staged", 0)
         owner = self._group_parent or self
         owner._attempt_spool = (
             self.root / "warm" / hashlib.sha256(self._group_model_key.encode()).hexdigest()

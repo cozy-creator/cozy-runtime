@@ -66,7 +66,8 @@ class BasePipe:
         dit = dit.eval()
         dit.set_attention_backend("native")
         dit.register_forward_pre_hook(project, with_kwargs=True)
-        self.components = {"dit": dit}
+        self.components = {"dit": dit, "spare": torch.nn.Linear(64, 64, bias=False)}
+        self.warm_observations: list[dict[str, Any]] = []
 
 
 class OverlayPipe:
@@ -81,6 +82,26 @@ class Base(Model[BasePipe], encoded_leaves="accept"):
 
     def load(self, loader: Loader) -> None:
         self.pipe = loader.construct(BasePipe, factory=BasePipe)
+
+        def first_forward(module: Any, args: Any) -> None:
+            del module, args
+            if self.pipe.warm_observations:
+                return
+            # Real filled spare weights must have been evicted by scope admission,
+            # on the leader and actual followers, before any attention collective.
+            residency = self._cozy_residency
+            assert residency is not None
+            assert self._cozy_active == ("plain", ("dit",))
+            assert self.pipe.components["spare"].weight.device.type == "meta"
+            self.pipe.warm_observations.append(
+                {"spare_device": "meta", "scope": "plain", "active": ["dit"]}
+            )
+
+        self.pipe.components["dit"].register_forward_pre_hook(first_forward)
+
+    @uses_components("spare")
+    def spare_checksum(self) -> float:
+        return float(self.pipe.components["spare"].weight.detach().sum())
 
     def warm(self, ctx: Any) -> None:
         ctx.raise_if_cancelled()
