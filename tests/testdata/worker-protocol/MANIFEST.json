@@ -773,8 +773,8 @@
       "type": "cozy.worker.v1.PreparePrivatePlacementRequest"
     },
     "private_dependency_call": {
-      "bytes": 427,
-      "sha256": "0fe7c6d9e66a450735e11d8bc6f21373fa070b7bbfe26c8124959ecd2d558d93",
+      "bytes": 539,
+      "sha256": "fc255a6de4eddb12874068ee85c0f9b4eacd72b28bf4977c2c9c838632ad87dd",
       "type": "cozy.worker.v1.PrepareLocalPackageCall"
     },
     "private_dependency_preparation": {
@@ -794,12 +794,12 @@
     },
     "protocol_info_result": {
       "bytes": 4,
-      "sha256": "1e9e4cf3d9c3d1a89671d51573516dd411747e60d4665cc2633b2feae77f503c",
+      "sha256": "09bc34e57df131b7000fc250dd6d9a069d272f64322ba5f395e8a09054266d13",
       "type": "cozy.worker.v1.ProtocolInfoResult"
     },
     "protocol_info_result_mixed_model_inputs": {
       "bytes": 6,
-      "sha256": "912e9e23f01fdd7344075877f29b50a52f106d7c35306e0efe729c7f4ab11085",
+      "sha256": "546566f5821c8a6181bad7ccd815137c7136e9942cdb1afd4eeb5a46d350f60e",
       "type": "cozy.worker.v1.ProtocolInfoResult"
     },
     "runtime_prepare_private_native": {

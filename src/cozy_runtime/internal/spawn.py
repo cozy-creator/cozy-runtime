@@ -105,6 +105,7 @@ def spawn_executor(
         *containment,
         "--",
         python,
+        "-I",
         *module_argv,
     ]
     pid = os.posix_spawn(
@@ -180,6 +181,7 @@ def spawn_follower(
         "inherit",
         "--",
         python,
+        "-I",
         *module_argv,
     ]
     os.set_inheritable(inherit_fd, True)

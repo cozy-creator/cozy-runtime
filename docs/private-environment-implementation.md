@@ -2,7 +2,7 @@
 
 cr-186 / proto057 implementation for Runtime 0.18.6. Worker protocol wire57
 adds exact dependency requirements to private package preparation and revision
-identity without changing the compatibility floor.
+identity. The coordinated hard cut sets the protocol compatibility floor to57.
 
 Private environments install the complete wheel closure, including executor Runtime,
 Torch and ordinary transitive dependencies. Image inventory cannot supply missing
