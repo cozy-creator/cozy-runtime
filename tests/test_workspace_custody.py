@@ -26,7 +26,11 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 
 def produced(
-    tmp_path: Path, *, request_id: str = "producer", result_schema: bytes = b""
+    tmp_path: Path,
+    *,
+    request_id: str = "producer",
+    result_schema: bytes = b"",
+    part: bytes = b"\x31" * 2048,
 ) -> tuple[tensorfs.Store, Workspace, WeightsReceipt]:
     store = tensorfs.Store.ensure(tmp_path / "store")
     workspace = Workspace(Path(store.root))
@@ -113,7 +117,7 @@ def produced(
     declaration = store.derived_declaration(*args, work_fingerprint=fingerprint)
     epoch = bind("model", transaction, hashlib.sha256(declaration).digest(), declaration)
     writer = store.begin_derived(transaction, epoch, *args, work_fingerprint=fingerprint)
-    writer.add_part("model", "weight", "value", io.BytesIO(b"\x31" * 2048))
+    writer.add_part("model", "weight", "value", io.BytesIO(part))
     facts = writer.commit()
     receipt = receipt_from_native(
         "model", transaction, facts, replayed=False, request_id=request_id

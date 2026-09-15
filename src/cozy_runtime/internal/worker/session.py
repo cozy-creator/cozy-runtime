@@ -62,8 +62,10 @@ from cozy_runtime.internal import (
     proctree,
     weights_sink,
 )
+from cozy_runtime.internal.adapters import implementation_digest, parse_scale
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.lora import AdapterRefusal
 from cozy_runtime.internal.worker import (
     acquire,
     activity,
@@ -842,6 +844,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                     "components",
                     "model_construction_contract",
                     "stamps",
+                    "adapters",
                 },
                 "Slot",
             )
@@ -880,6 +883,27 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                     raise documents.DocumentError("unknown_model", "Component.model_id")
             if len(component_names) != len(set(component_names)):
                 raise documents.DocumentError("sort_order", "Slot.components")
+            adapters = slot.get("adapters", [])
+            if not isinstance(adapters, list):
+                raise documents.DocumentError("wrong_type", "Slot.adapters")
+            for value in adapters:
+                adapter = _closed_document(
+                    value, {"component", "model_id", "source_component", "scale"}, "ModelAdapter"
+                )
+                _required(
+                    adapter, {"component", "model_id", "source_component", "scale"}, "ModelAdapter"
+                )
+                if (
+                    adapter["component"] not in component_names
+                    or adapter["model_id"] not in known_models
+                ):
+                    raise documents.DocumentError("unknown_model", "ModelAdapter target/source")
+                _identifier(adapter["source_component"], "ModelAdapter.source_component")
+                try:
+                    parse_scale(adapter["scale"])
+                except AdapterRefusal as exc:
+                    raise documents.DocumentError("adapter_scale", str(exc)) from exc
+
         if slot_names != sorted(set(slot_names)):
             raise documents.DocumentError("sort_order", "Entrypoint.slots")
         expected_entrypoint = (
@@ -981,6 +1005,17 @@ def executor_prepare_command(
                     "steps_basis": model.steps_basis,
                     "package": binding.package,
                     "model": model.model,
+                    **(
+                        {
+                            "adapter_selections": [a.document() for a in model.adapters],
+                            "adapter_compatibility_digest": canonical.digest(
+                                list(model.adapter_compatibility)
+                            ),
+                            "adapter_implementation": implementation_digest(),
+                        }
+                        if model.adapters
+                        else {}
+                    ),
                 },
                 "budgets": {"declared_weight_bytes": model.model_weight_bytes},
             }
@@ -3820,6 +3855,20 @@ class Worker:
         if mode == "placement_set":
             try:
                 placements = read_placement_set(desired.placement_set)
+                from cozy_runtime.protocol import weights_limits
+
+                if min(
+                    desired.wire_minor, self.fence.wire_minor
+                ) < weights_limits.MODEL_ADAPTER_WIRE_MINOR and any(
+                    slot.get("adapters")
+                    for placement in placements
+                    for entrypoint in placement["entrypoints"]
+                    for slot in entrypoint["slots"]
+                ):
+                    raise documents.DocumentError(
+                        "model_adapters_unsupported",
+                        "adapted model bindings require wire57 on both peers",
+                    )
             except documents.DocumentError as exc:
                 kind = (
                     pb.FaultKind.FAULT_KIND_PLACEMENT_SET_DIGEST_MISMATCH

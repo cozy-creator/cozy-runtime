@@ -4,7 +4,28 @@ requires-python = "==3.12.*"
 conflicts = [[
     { package = "cozy-runtime", extra = "corpus" },
     { package = "cozy-runtime", extra = "minimax-h3" },
+], [
+    { package = "cozy-runtime", extra = "corpus" },
+    { package = "cozy-runtime", extra = "lora" },
 ]]
+
+[[package]]
+name = "accelerate"
+version = "1.15.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub", version = "1.31.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "psutil" },
+    { name = "pyyaml" },
+    { name = "safetensors" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f5/b5/1d3ed029ac71d3f2961346829a268da923698e9fd63f218f78841f216bfd/accelerate-1.15.0.tar.gz", hash = "sha256:5654f8c5eaa0d4fa68b33e287a97765da6849bf6d51dcac874e73fbbddfb6134", size = 422615, upload-time = "2026-09-09T13:04:49.078Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/4c/34f0450479d01195027260da68d8a3880683f1640c3ca5adf64acb3185f1/accelerate-1.15.0-py3-none-any.whl", hash = "sha256:97eacca0b73e45cb867dbf8c5d5d4dc32219544300e0c8992c7334dc2ef33cec", size = 394295, upload-time = "2026-09-09T13:04:47.331Z" },
+]
 
 [[package]]
 name = "annotated-doc"
@@ -103,7 +124,7 @@ name = "cffi"
 version = "2.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/9e/ef/008a1939e372c06329a3fce4279c02f328488f3526744906eeec3da7ad5f/cffi-2.1.1.tar.gz", hash = "sha256:dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be", size = 530807, upload-time = "2026-08-03T21:21:18.939Z" }
 wheels = [
@@ -219,6 +240,13 @@ corpus = [
 derive = [
     { name = "torch" },
 ]
+lora = [
+    { name = "accelerate" },
+    { name = "peft" },
+    { name = "torch" },
+    { name = "torchao" },
+    { name = "transformers", version = "5.16.1", source = { registry = "https://pypi.org/simple" } },
+]
 media = [
     { name = "av" },
 ]
@@ -249,6 +277,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "accelerate", marker = "extra == 'lora'", specifier = "==1.15.0" },
     { name = "av", marker = "extra == 'media'", specifier = ">=18.1,<19" },
     { name = "cozy-eval", marker = "extra == 'assessment'", specifier = ">=0.7,<0.8" },
     { name = "cryptography", specifier = ">=45" },
@@ -258,20 +287,24 @@ requires-dist = [
     { name = "msgspec", specifier = ">=0.19" },
     { name = "numpy", marker = "extra == 'minimax-h3'", specifier = ">=1.26" },
     { name = "packaging", specifier = ">=24" },
+    { name = "peft", marker = "extra == 'lora'", specifier = "==0.20.0" },
     { name = "pillow", specifier = ">=12,<13" },
     { name = "protobuf", specifier = ">=6.31" },
     { name = "safetensors", marker = "extra == 'minimax-h3'", specifier = "==0.8.0" },
-    { name = "tensorfs", specifier = ">=0.3.43,<0.4" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.43,<0.4" },
+    { name = "tensorfs", specifier = ">=0.3.44,<0.4" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.44,<0.4" },
     { name = "tokenizers", marker = "extra == 'minimax-h3'", specifier = "==0.23.1" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13,<3" },
+    { name = "torch", marker = "extra == 'lora'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "extra == 'minimax-h3'", specifier = ">=2.13,<3" },
+    { name = "torchao", marker = "extra == 'lora'", specifier = "==0.18.0" },
     { name = "torchvision", marker = "extra == 'minimax-h3'", specifier = ">=0.28,<1" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40,<5" },
+    { name = "transformers", marker = "extra == 'lora'", specifier = "==5.16.1" },
     { name = "transformers", marker = "extra == 'minimax-h3'", specifier = "==5.16.1" },
 ]
-provides-extras = ["minimax-h3", "assessment", "derive", "corpus", "media", "model-execution"]
+provides-extras = ["minimax-h3", "assessment", "derive", "corpus", "media", "model-execution", "lora"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -281,7 +314,7 @@ dev = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=8.4" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.3.43,<0.4" },
+    { name = "tensorfs", specifier = ">=0.3.44,<0.4" },
     { name = "types-protobuf", specifier = ">=6.30" },
 ]
 
@@ -290,7 +323,7 @@ name = "cryptography"
 version = "50.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "cffi", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bb/ad/5d6702db60b1e40b41ef513b6967ff5848f307d50f8449baf1634f5908f1/cryptography-50.0.1.tar.gz", hash = "sha256:5dd9bda1c12b4162f6ff568eeb5e0ff956c28d14406e875cfe8a63a2d414ff20", size = 880381, upload-time = "2026-08-25T19:45:45.499Z" }
 wheels = [
@@ -353,43 +386,43 @@ wheels = [
 
 [package.optional-dependencies]
 cublas = [
-    { name = "nvidia-cublas", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
-    { name = "nvidia-cuda-nvrtc", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cublas", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cuda-nvrtc", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 cudart = [
-    { name = "nvidia-cuda-runtime", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cuda-runtime", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 cufft = [
-    { name = "nvidia-cufft", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cufft", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 cufile = [
-    { name = "nvidia-cufile", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (sys_platform != 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cufile", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (sys_platform != 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 cupti = [
-    { name = "nvidia-cuda-cupti", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cuda-cupti", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 curand = [
-    { name = "nvidia-curand", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-curand", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 cusolver = [
-    { name = "nvidia-cublas", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
-    { name = "nvidia-cusolver", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
-    { name = "nvidia-cusparse", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cublas", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cusolver", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cusparse", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 cusparse = [
-    { name = "nvidia-cusparse", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cusparse", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 nvjitlink = [
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 nvrtc = [
-    { name = "nvidia-cuda-nvrtc", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cuda-nvrtc", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 nvtx = [
-    { name = "nvidia-nvtx", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-nvtx", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'linux' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (sys_platform == 'win32' and extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 
 [[package]]
@@ -699,7 +732,7 @@ version = "2.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ast-serialize" },
-    { name = "librt", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "librt", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
     { name = "mypy-extensions" },
     { name = "pathspec" },
     { name = "typing-extensions" },
@@ -935,6 +968,27 @@ wheels = [
 ]
 
 [[package]]
+name = "peft"
+version = "0.20.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "accelerate" },
+    { name = "huggingface-hub", version = "1.31.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "psutil" },
+    { name = "pyyaml" },
+    { name = "safetensors" },
+    { name = "torch" },
+    { name = "tqdm" },
+    { name = "transformers", version = "5.16.1", source = { registry = "https://pypi.org/simple" } },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b4/08/02541a2c29be7c78698f73d438bc0e733b214f3f35ec5db79fca8da8fc61/peft-0.20.0.tar.gz", hash = "sha256:4769c8093a4ca145fd6fb3fd4dd50449675f5fe46434ad1e98b285a132d4b1d0", size = 880503, upload-time = "2026-07-28T13:46:01.85Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/28/79/13bcabb8048126422d5c4b880575d40886c726f354db88cfeed4325525bb/peft-0.20.0-py3-none-any.whl", hash = "sha256:0fbba16ffebfad3de96e06f2da6860fd860292324b85b6141909fa1e26ea9233", size = 775777, upload-time = "2026-07-28T13:45:59.809Z" },
+]
+
+[[package]]
 name = "pillow"
 version = "12.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -976,6 +1030,22 @@ wheels = [
 ]
 
 [[package]]
+name = "psutil"
+version = "7.2.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/aa/c6/d1ddf4abb55e93cebc4f2ed8b5d6dbad109ecb8d63748dd2b20ab5e57ebe/psutil-7.2.2.tar.gz", hash = "sha256:0746f5f8d406af344fd547f1c8daa5f5c33dbc293bb8d6a16d80b4bb88f59372", size = 493740, upload-time = "2026-01-28T18:14:54.428Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e7/36/5ee6e05c9bd427237b11b3937ad82bb8ad2752d72c6969314590dd0c2f6e/psutil-7.2.2-cp36-abi3-macosx_10_9_x86_64.whl", hash = "sha256:ed0cace939114f62738d808fdcecd4c869222507e266e574799e9c0faa17d486", size = 129090, upload-time = "2026-01-28T18:15:22.168Z" },
+    { url = "https://files.pythonhosted.org/packages/80/c4/f5af4c1ca8c1eeb2e92ccca14ce8effdeec651d5ab6053c589b074eda6e1/psutil-7.2.2-cp36-abi3-macosx_11_0_arm64.whl", hash = "sha256:1a7b04c10f32cc88ab39cbf606e117fd74721c831c98a27dc04578deb0c16979", size = 129859, upload-time = "2026-01-28T18:15:23.795Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/70/5d8df3b09e25bce090399cf48e452d25c935ab72dad19406c77f4e828045/psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:076a2d2f923fd4821644f5ba89f059523da90dc9014e85f8e45a5774ca5bc6f9", size = 155560, upload-time = "2026-01-28T18:15:25.976Z" },
+    { url = "https://files.pythonhosted.org/packages/63/65/37648c0c158dc222aba51c089eb3bdfa238e621674dc42d48706e639204f/psutil-7.2.2-cp36-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b0726cecd84f9474419d67252add4ac0cd9811b04d61123054b9fb6f57df6e9e", size = 156997, upload-time = "2026-01-28T18:15:27.794Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/13/125093eadae863ce03c6ffdbae9929430d116a246ef69866dad94da3bfbc/psutil-7.2.2-cp36-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:fd04ef36b4a6d599bbdb225dd1d3f51e00105f6d48a28f006da7f9822f2606d8", size = 148972, upload-time = "2026-01-28T18:15:29.342Z" },
+    { url = "https://files.pythonhosted.org/packages/04/78/0acd37ca84ce3ddffaa92ef0f571e073faa6d8ff1f0559ab1272188ea2be/psutil-7.2.2-cp36-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:b58fabe35e80b264a4e3bb23e6b96f9e45a3df7fb7eed419ac0e5947c61e47cc", size = 148266, upload-time = "2026-01-28T18:15:31.597Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/90/e2159492b5426be0c1fef7acba807a03511f97c5f86b3caeda6ad92351a7/psutil-7.2.2-cp37-abi3-win_amd64.whl", hash = "sha256:eb7e81434c8d223ec4a219b5fc1c47d0417b12be7ea866e24fb5ad6e84b3d988", size = 137737, upload-time = "2026-01-28T18:15:33.849Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/c7/7bb2e321574b10df20cbde462a94e2b71d05f9bbda251ef27d104668306a/psutil-7.2.2-cp37-abi3-win_arm64.whl", hash = "sha256:8c233660f575a5a89e6d4cb65d9f938126312bca76d8fe087b947b3a1aaac9ee", size = 134617, upload-time = "2026-01-28T18:15:36.514Z" },
+]
+
+[[package]]
 name = "pycparser"
 version = "3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -998,7 +1068,7 @@ name = "pytest"
 version = "9.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
     { name = "iniconfig" },
     { name = "packaging" },
     { name = "pluggy" },
@@ -1160,11 +1230,11 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.3.43"
+version = "0.3.44"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/db/97/3cfd5bd4f8301e48a39629c6304f2414ac92db63f4a6f2f78a33552a325e/tensorfs-0.3.43.tar.gz", hash = "sha256:de92cf3bad85f60b5b27f003f92190cad21770376de8f586a43cca1898ac70e5", size = 760530, upload-time = "2026-09-14T05:40:21.044Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/34/11/2ae04a0b219973652ee12d459240d6d48f6699bc310ee64f240cf8974c9d/tensorfs-0.3.44.tar.gz", hash = "sha256:28fa4e661c7f41504aa660a4f723b29742bd34df316b04071d3ed54d161f5fd7", size = 766813, upload-time = "2026-09-15T03:29:38.259Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/51/98/91a4e7980865ec2a7fc373078ea052a31f1e369851db4223fdb2b625c502/tensorfs-0.3.43-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e7d7bed24510e2995d4426db826b99cebd102fcd7b9c2eadaa76189cb38455e7", size = 7744094, upload-time = "2026-09-14T05:40:19.277Z" },
+    { url = "https://files.pythonhosted.org/packages/73/43/aa09de9f4c046b7fa83cedbfa910c6e01f1a2dc2356e963b022e44a646e9/tensorfs-0.3.44-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:5879f3e065753415ddd24955ec57009d68520954ab4910f5336ccec09e315238", size = 7751056, upload-time = "2026-09-15T03:29:36.351Z" },
 ]
 
 [[package]]
@@ -1225,19 +1295,19 @@ name = "torch"
 version = "2.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-bindings", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
-    { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "cuda-bindings", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
     { name = "filelock" },
     { name = "fsspec" },
     { name = "jinja2" },
     { name = "networkx" },
-    { name = "nvidia-cudnn-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
-    { name = "nvidia-cusparselt-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
-    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
-    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cudnn-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-cusparselt-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
     { name = "setuptools" },
     { name = "sympy" },
-    { name = "triton", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
+    { name = "triton", marker = "sys_platform == 'linux' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-lora') or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
     { name = "typing-extensions" },
 ]
 wheels = [
@@ -1245,6 +1315,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/df/a9/f6a2a4d763ff1df02e9a64c477029db614295bc9367f4131223791ccc243/torch-2.13.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:572df8be8ffb4599c88cbd6a0726f1f854f4da65d2e3c09f0e2c2283333cd6d4", size = 427210998, upload-time = "2026-07-08T16:04:37.708Z" },
     { url = "https://files.pythonhosted.org/packages/f3/82/fea946351658e6534db52d2cc12bc53087cbf87f9440c5f180f367c1950b/torch-2.13.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:796633c4cdf0fe2cdced72d8f88f22e73dbcfce83132763162f6d4bff13b820b", size = 526605292, upload-time = "2026-07-08T16:04:22.81Z" },
     { url = "https://files.pythonhosted.org/packages/21/d6/e8f3c6f7e01f626f77259de9860d2a78bc84c40539e28e79b7e98b0bb659/torch-2.13.0-cp312-cp312-win_amd64.whl", hash = "sha256:024c6cc0c1b085f2f91f20a3dc27b0471d021c31ce84b81be3afdc39f791fd9d", size = 122057313, upload-time = "2026-07-08T16:03:53.43Z" },
+]
+
+[[package]]
+name = "torchao"
+version = "0.18.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/19/55/ed9ad98f0f09d5a1124d09830043d13a39e63539f9590d2bdb6d71cbc4a4/torchao-0.18.0-cp310-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6540b148e40ba81cbd4de86392225a076a1591146e9cebb099b3b234ba9feebe", size = 3372585, upload-time = "2026-08-03T19:43:10.993Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/4d/485477bb8f05bd501016059c6d8abd742f830cb1b24ab7704e086c7cc35a/torchao-0.18.0-py3-none-any.whl", hash = "sha256:5c2b4485341bf28b7fed2c4fc95b9f298e209f41685350f067de85527a05585e", size = 1369798, upload-time = "2026-08-03T19:43:12.649Z" },
 ]
 
 [[package]]

@@ -68,6 +68,7 @@ from typing import Any
 
 from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding import (
+    SPEC_ROWWISE_KEEPDIM,
     SPEC_VECTORS,
     TORCH_DTYPES,
     Capabilities,
@@ -476,7 +477,13 @@ def _weight_roles(torch: Any, provider: Any, device: Any) -> tuple[Any, dict[str
     weight = torch.randn(rows, cols, generator=generator, dtype=torch.float32).to(device) * 0.05
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
         derived = quantize_rowwise(torch, weight)
-        return weight, {"data": derived.data, "scale": derived.scale}
+        # The two reviewed encoding IDs differ in stored scale rank. The
+        # numerical recipe and physical bytes are identical, but qualification
+        # must present the declared layout to the provider it is measuring.
+        scale = (
+            derived.scale[:, None] if provider.encoding == SPEC_ROWWISE_KEEPDIM else derived.scale
+        )
+        return weight, {"data": derived.data, "scale": scale}
     if provider.suite in ("mxfp8-decode", "mxfp8-native"):
         work = weight.float().view(rows, cols // MX_BLOCK, MX_BLOCK)
         amax = work.abs().amax(dim=-1)

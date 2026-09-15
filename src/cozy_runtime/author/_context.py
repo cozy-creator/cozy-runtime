@@ -127,6 +127,7 @@ class Context:
     device: Device = field(default_factory=Device)
     _cancel: Callable[[], bool] = field(default=lambda: False, repr=False)
     _adapters: tuple[AdapterRef, ...] = field(default=(), repr=False)
+    _model_adapters: Mapping[int, tuple[AdapterRef, ...]] = field(default_factory=dict, repr=False)
     _tensorfs_source: Callable[[Model[object]], SourceCapability] | None = field(
         default=None, repr=False
     )

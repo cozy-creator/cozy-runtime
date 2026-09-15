@@ -626,6 +626,18 @@ def _inspectable(tensor: Any) -> bool:
     return bool((tensor.is_floating_point() or tensor.is_complex()) and not _parked(tensor))
 
 
+def _physical_parts(value: Any) -> list[tuple[str, Any]]:
+    """Inspect encoded parts without dequantizing a logical weight."""
+    from tensorfs import physical_tensors
+
+    if not isinstance(value, torch.Tensor):
+        return [("", value)]
+    parts = physical_tensors(value)
+    if len(parts) == 1 and parts[0] is value:
+        return [("", value)]
+    return [(f".part[{index}]", part) for index, part in enumerate(parts)]
+
+
 class ResidentWeights:
     """Finite-weight verdicts that live exactly as long as the bytes they describe.
 
@@ -648,12 +660,16 @@ class ResidentWeights:
         return storage, (storage.data_ptr(), storage.nbytes(), tensor._version)
 
     def verified(self, tensor: Any) -> bool:
-        storage, fill = self._fill(tensor)
-        return self._verdicts.get(storage) == fill
+        return all(
+            self._verdicts.get(storage) == fill
+            for _, part in _physical_parts(tensor)
+            for storage, fill in [self._fill(part)]
+        )
 
     def record(self, tensor: Any) -> None:
-        storage, fill = self._fill(tensor)
-        self._verdicts[storage] = fill
+        for _, part in _physical_parts(tensor):
+            storage, fill = self._fill(part)
+            self._verdicts[storage] = fill
 
 
 @dataclass
@@ -711,44 +727,45 @@ class NumericalChecks:
         with torch.no_grad():
             for name, value in values:
                 leaves, _ = tree_flatten_with_path(value)
-                for path, tensor in leaves:
-                    label = name + keystr(path)
-                    if not isinstance(tensor, torch.Tensor):
-                        if required and not isinstance(
-                            tensor, (bool, int, float, str, bytes, type(None))
-                        ):
-                            raise OutputError(
-                                f"uninspectable tensor output at {stage}/{label}: "
-                                f"{type(tensor).__name__} needs registered PyTree flattening",
-                                code="numerical_uninspectable",
-                            )
-                        continue
-                    if not (tensor.is_floating_point() or tensor.is_complex()):
-                        continue
-                    if _parked(tensor):
-                        observation.parked += 1
-                        continue
-                    observation.tensors += 1
-                    # Stored FP8 reductions are not supported on every backend.
-                    # Widen only this bounded observation, never the weight itself.
-                    widen = tensor.element_size() == 1
-                    chunk_elements = 1024 * 1024 if widen else 16 * 1024 * 1024
-                    chunks = [tensor.detach()]
-                    while chunks:
-                        part = chunks.pop()
-                        if part.numel() > chunk_elements:
-                            axis = max(range(part.ndim), key=lambda dim: part.shape[dim])
-                            chunks.extend(part.split(max(1, part.shape[axis] // 2), dim=axis))
+                for path, value in leaves:
+                    for suffix, tensor in _physical_parts(value):
+                        label = name + keystr(path) + suffix
+                        if not isinstance(tensor, torch.Tensor):
+                            if required and not isinstance(
+                                tensor, (bool, int, float, str, bytes, type(None))
+                            ):
+                                raise OutputError(
+                                    f"uninspectable tensor output at {stage}/{label}: "
+                                    f"{type(tensor).__name__} needs registered PyTree flattening",
+                                    code="numerical_uninspectable",
+                                )
                             continue
-                        size = part.numel()
-                        observation.elements += size
-                        if not size:
+                        if not (tensor.is_floating_point() or tensor.is_complex()):
                             continue
-                        if widen:
-                            part = part.float()
-                        observation.chunks.append((label, size))
-                        observation.nonfinite.append((~torch.isfinite(part)).sum())
-                        observation.absmax.append(part.abs().amax().float())
+                        if _parked(tensor):
+                            observation.parked += 1
+                            continue
+                        observation.tensors += 1
+                        # Stored FP8 reductions are not supported on every backend.
+                        # Widen only this bounded observation, never the weight itself.
+                        widen = tensor.element_size() == 1
+                        chunk_elements = 1024 * 1024 if widen else 16 * 1024 * 1024
+                        chunks = [tensor.detach()]
+                        while chunks:
+                            part = chunks.pop()
+                            if part.numel() > chunk_elements:
+                                axis = max(range(part.ndim), key=lambda dim: part.shape[dim])
+                                chunks.extend(part.split(max(1, part.shape[axis] // 2), dim=axis))
+                                continue
+                            size = part.numel()
+                            observation.elements += size
+                            if not size:
+                                continue
+                            if widen:
+                                part = part.float()
+                            observation.chunks.append((label, size))
+                            observation.nonfinite.append((~torch.isfinite(part)).sum())
+                            observation.absmax.append(part.abs().amax().float())
         if required and not observation.elements:
             raise OutputError(
                 f"no resident floating tensor values to inspect at {stage}",
@@ -809,7 +826,11 @@ class NumericalChecks:
         Derived rotary/config buffers are not checkpoint payloads but can poison the same
         computation, so nonpersistent buffers are inspected under their exact names.
         """
-        values = [*module.named_parameters(), *module.named_buffers()]
+        values = [
+            (name + suffix, part)
+            for name, tensor in [*module.named_parameters(), *module.named_buffers()]
+            for suffix, part in _physical_parts(tensor)
+        ]
         resident = [(label, tensor) for label, tensor in values if _inspectable(tensor)]
         pending = [
             (label, tensor) for label, tensor in resident if not self.resident.verified(tensor)

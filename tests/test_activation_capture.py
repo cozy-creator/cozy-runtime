@@ -196,6 +196,7 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
     module = Denoiser()
     model = Tiny.for_test(denoiser=module)
     answer: dict[str, Any] = {}
+    forgotten: list[int] = []
 
     def exchange(kind: str, frame: dict[str, Any]) -> dict[str, Any]:
         if kind == "child_call":
@@ -256,6 +257,9 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
                 }
             )
             return {"ok": True}
+        if kind == "child_forget":
+            forgotten.append(frame["call_index"])
+            return {"ok": True}
         assert kind == "child_poll"
         return answer
 
@@ -283,6 +287,8 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
 
     result = asyncio.run(invoke_child())
     assert isinstance(result, Result)
+    assert forgotten == [pending.index]
+    assert not broker.calls and not broker.activated
     assert pending.observation is not None
     assert pending.observation.environment.runtime_version == __version__
     assert pending.observation.environment.accelerator == "CPU"

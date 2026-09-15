@@ -65,6 +65,7 @@ from typing import Any, Literal, cast
 
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, canonical_dtype, census
 from cozy_runtime.internal import accel
+from cozy_runtime.internal.base_weights import BaseWeights
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
     Capabilities,
@@ -77,6 +78,7 @@ from cozy_runtime.internal.encoding import (
     launch_providers,
     measure_device,
 )
+from cozy_runtime.internal.encoding.torchao_rowwise import TorchaoRowwiseLeaf, bind_rowwise_weight
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
 from cozy_runtime.internal.paging import BlockLayout, PageUnit, partition
 from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan, TensorResolution
@@ -1228,6 +1230,10 @@ class StreamingFillBackend:
         #: agreed with it. `materialize` writes it, `_reconcile_leaves` checks the
         #: substitution against it and writes the new one.
         self.census_keys: dict[str, frozenset[str]] = {}
+        # Standard bindings retain the original module and logical weight name.
+        # These slots are captured before request adapters change module nesting.
+        self.base_weights: dict[str, BaseWeights] = {}
+        self.standard_bindings: dict[str, Any] = {}
 
     # -- plan execution (cr-025) --------------------------------------------------
 
@@ -1523,6 +1529,24 @@ class StreamingFillBackend:
                 member = roots.get(name)
                 if member is None or not hasattr(member, "to_empty"):
                     continue
+                native_providers = [
+                    self.selected[row.key].provider
+                    for row in self.plan.values()
+                    if row.component == name and self.resolved[row.key].route == "encoded_gemm"
+                ]
+                if any(isinstance(provider, TorchaoRowwiseLeaf) for provider in native_providers):
+                    if not all(
+                        isinstance(provider, TorchaoRowwiseLeaf) for provider in native_providers
+                    ):
+                        raise _refuse(
+                            "leaf_schema",
+                            "standard binding cannot mix legacy encoded leaves",
+                            [name],
+                        )
+                    try:
+                        self.base_weights[name] = BaseWeights(name, member, walked)
+                    except ValueError as exc:
+                        raise _refuse("leaf_schema", f"{name}: {exc}", [name]) from exc
                 size = sum(t.numel() * t.element_size() for _, t in _tensors(member))
                 memory = self.component_memory[name] = _component_memory(
                     header_memory.get(
@@ -1574,7 +1598,10 @@ class StreamingFillBackend:
                 # moved held by the module. Nothing here frees it: the prepare that owns
                 # this construction is poisoned by the raise and the process is replaced,
                 # which is the one reclaim that cannot miss a byte (#613).
-                member.to_empty(device=self.device, recurse=True)
+                if name in self.base_weights:
+                    self.base_weights[name].reserve(self.device, initial=True)
+                else:
+                    member.to_empty(device=self.device, recurse=True)
                 _restore_derived(member, derived)
                 self.components[name] = member
                 self._mark(
@@ -1620,7 +1647,11 @@ class StreamingFillBackend:
         held: dict[str, int] = {}
         for name, member in list(self.components.items()):
             try:
-                held[name] = distinct_storage_bytes(t for _, t in _tensors(member))
+                held[name] = distinct_storage_bytes(
+                    self.base_weights[name].tensors()
+                    if name in self.base_weights
+                    else (t for _, t in _tensors(member))
+                )
             except Exception:
                 continue
         scratch = 0
@@ -1756,6 +1787,24 @@ class StreamingFillBackend:
         model in silence).
         """
         component, _, local = key.partition(".")
+        if isinstance(self.selected[key].provider, TorchaoRowwiseLeaf):
+            module, attribute = self.base_weights[component].owner(key)
+            if (
+                attribute != "weight"
+                or type(module) is not self.torch.nn.Linear
+                or tuple(module.weight.shape) != tuple(row.shape)
+                or (module.out_features, module.in_features) != tuple(row.shape)
+                or _data_ptr(module.weight) != _data_ptr(tensor)
+                or not _data_ptr(tensor)
+            ):
+                raise _refuse("leaf_schema", f"{key}: incompatible standard Linear slot", [key])
+            if any(
+                other != key and pointer == _data_ptr(tensor)
+                for other, pointer in self.leaf_sites.items()
+            ):
+                raise _refuse("leaf_schema", f"{key}: tied encoded weights are unsupported", [key])
+            self.leaf_sites[key] = _data_ptr(tensor)
+            return module, module, attribute
         if not local.endswith(".weight"):
             raise _refuse(
                 "leaf_schema",
@@ -1949,16 +1998,21 @@ class StreamingFillBackend:
         arithmetic: its real device bytes, read off its own tensors, exactly as
         `materialize` read them before the replacement.
         """
-        if not self.replaced:
+        if not self.replaced and not self.standard_bindings:
             return
         for name, member in self.components.items():
             rows = [r for r in self.replaced.values() if r.contract_key.startswith(f"{name}.")]
-            if not rows:
+            standard = name in self.base_weights
+            if not rows and not standard:
                 continue
             before = self.census_keys.get(name, frozenset())
             gone = {r.contract_key for r in rows}
             arrived = {key for r in rows for key in r.role_keys}
-            present = {f"{name}.{key}" for key in member.state_dict()}
+            present = (
+                set(self.base_weights[name].live())
+                if standard
+                else {f"{name}.{key}" for key in member.state_dict()}
+            )
             want = (before - gone) | arrived
             if present != want:
                 raise _refuse(
@@ -1971,7 +2025,11 @@ class StreamingFillBackend:
                     sorted(want ^ present)[:6],
                 )
             self.census_keys[name] = frozenset(present)
-            after = sum(int(t.numel() * t.element_size()) for _, t in _tensors(member))
+            after = (
+                distinct_storage_bytes(self.base_weights[name].tensors())
+                if standard
+                else sum(int(t.numel() * t.element_size()) for _, t in _tensors(member))
+            )
             charged = self.vram_charge.get(name, 0)
             self.vram_charge[name] = after
             self.component_memory[name].resident = after
@@ -2033,8 +2091,11 @@ class StreamingFillBackend:
 
         charged = self.vram_charge.pop(name, 0)
         with placing():
-            self._free_storages(t for _, t in _tensors(member))
-            member.to_empty(device=self.torch.device("meta"), recurse=True)
+            if name in self.base_weights:
+                self.base_weights[name].evict()
+            else:
+                self._free_storages(t for _, t in _tensors(member))
+                member.to_empty(device=self.torch.device("meta"), recurse=True)
             rows = [r for r in self.replaced.values() if r.contract_key.startswith(f"{name}.")]
             for row in rows:
                 # The original weight storage was retired by _decode; bias may alias the
@@ -2088,9 +2149,16 @@ class StreamingFillBackend:
         # is replaced (#613). Freeing the half that arrived would be an in-process rollback
         # engine, which is exactly what this hardcut deletes.
         with placing():
-            member.to_empty(device=self.device, recurse=True)
+            if name in self.base_weights:
+                self.base_weights[name].reserve(self.device)
+            else:
+                member.to_empty(device=self.device, recurse=True)
             _restore_derived(member, self.derived.get(name, {}))
-            fresh = census(_Holder({name: member}))
+            if name in self.base_weights:
+                owned = self.base_weights[name]
+                fresh = Census(owned.destinations, (name,), (), owned.live())
+            else:
+                fresh = census(_Holder({name: member}))
         reserved = time.perf_counter_ns()
         self.vram_charge[name] = want
         objects = len(self._acquire(name).objects)
@@ -2350,6 +2418,20 @@ class StreamingFillBackend:
         """
         destination = self.enqueued[row.key]
         owner, replaced, attribute = self._leaf_site(row.key, row, destination)
+        if isinstance(selection.provider, TorchaoRowwiseLeaf):
+            from tensorfs.derived import Part, Tensor
+
+            spec = Tensor(
+                row.dtype,
+                row.shape,
+                row.encoded.encoding,
+                {part.role: Part(part.dtype, part.shape) for part in row.encoded.parts},
+            )
+            previous_weight = bind_rowwise_weight(
+                replaced, parts["data"], parts["scale"], spec=spec
+            )
+            self.standard_bindings[row.key] = replaced
+            return {"#destination": previous_weight}
         leaf = selection.provider.leaf(self.torch, parts, replaced, destination.dtype)
         # Hooks are authored computation. Share their registries so existing handles
         # still remove them after replacement and after a component is staged again.
@@ -2418,8 +2500,11 @@ class StreamingFillBackend:
 
         before = accel.allocated(self.torch, self.kind, self.device)
         with placing():
-            self._free_storages(t for _, t in _tensors(member))
-            member.to_empty(device=self.torch.device("meta"), recurse=True)
+            if component in self.base_weights:
+                self.base_weights[component].evict()
+            else:
+                self._free_storages(t for _, t in _tensors(member))
+                member.to_empty(device=self.torch.device("meta"), recurse=True)
         for key in [k for k in self.enqueued if k.split(".")[0] == component]:
             del self.enqueued[key]
         accel.release_cached(self.torch, self.kind)

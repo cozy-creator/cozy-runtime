@@ -36,6 +36,7 @@ is the typed `fusion_dependency_absent`.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import inspect
 import json
@@ -45,6 +46,8 @@ from importlib import metadata
 from typing import Any
 
 from cozy_runtime.internal import fusion
+from cozy_runtime.internal.encoding.torchao_rowwise import _rowwise_forward
+from cozy_runtime.internal.lora import prequantized_input_allowed
 
 try:
     from diffusers.models.activations import SwiGLU
@@ -195,9 +198,13 @@ if not DIFFUSERS_ABSENT:
 
     class FusedSwiGLU(SwiGLU):  # type: ignore[misc]
         _fusion_fp8: bool = False
+        _fusion_output_check: Callable[[], bool] | None = None
 
         def forward(self, hidden_states: Any) -> Any:
-            return fusion.swiglu(self.proj(hidden_states), fp8=self._fusion_fp8)
+            fp8 = self._fusion_fp8 and (
+                self._fusion_output_check is None or self._fusion_output_check()
+            )
+            return fusion.swiglu(self.proj(hidden_states), fp8=fp8)
 
     class FusedMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):  # type: ignore[misc]
         def __call__(
@@ -249,7 +256,8 @@ if not DIFFUSERS_ABSENT:
                 shift_msa,
                 adaln_indices,
                 self.norm1.eps,
-                fp8=self._fusion_attn_fp8,
+                fp8=self._fusion_attn_fp8
+                and all(_rowwise_leaf(m) for m in (self.attn.to_q, self.attn.to_k, self.attn.to_v)),
             )
             attn_output = self.attn(normed, rotary_emb, attention_mask)
             hidden_states, normed = fusion.gate_add_rmsnorm_modulate(
@@ -261,7 +269,7 @@ if not DIFFUSERS_ABSENT:
                 scale_mlp,
                 shift_mlp,
                 self.norm2.eps,
-                fp8=self._fusion_ff_fp8,
+                fp8=self._fusion_ff_fp8 and _rowwise_leaf(self.ff.net[0].proj),
             )
             # `ff.net` is [SwiGLU, Dropout(0.0), Linear]; the identity dropout is skipped so
             # the fused SwiGLU can hand the out projection its fp8 operand directly.
@@ -274,16 +282,29 @@ if not DIFFUSERS_ABSENT:
 
 def _rowwise_leaf(module: Any) -> bool:
     # Semantic hooks must receive the original Tensor, not a quantized carrier.
+    if not prequantized_input_allowed(module):
+        return False
+    base = getattr(module, "base_layer", module)
     return (
-        getattr(module, "provider", None) == ROWWISE_LEAF
-        and not module._forward_pre_hooks
-        and not module._forward_hooks
+        getattr(base, "provider", None) == ROWWISE_LEAF
+        or getattr(base.forward, "__func__", None) is _rowwise_forward
     )
 
 
+def _ff_output_rowwise(ff: Any) -> bool:
+    # Resolve the current leaf after staging, rather than retaining its predecessor.
+    return _rowwise_leaf(ff.net[2])
+
+
 def _tensor_census(module: Any) -> tuple[object, ...]:
+    def physical_identity(value: Any) -> tuple[object, ...]:
+        from tensorfs import physical_tensors
+
+        parts = physical_tensors(value)
+        return tuple((str(part.dtype), tuple(part.shape), int(part.data_ptr())) for part in parts)
+
     return tuple(
-        (name, tuple(value.shape), str(value.dtype), id(value), int(value.data_ptr()))
+        (name, tuple(value.shape), str(value.dtype), id(value), physical_identity(value))
         for name, value in (
             *module.named_parameters(remove_duplicate=False),
             *module.named_buffers(remove_duplicate=False),
@@ -338,6 +359,7 @@ def _install_transformer(transformer: Any, root: str) -> tuple[list[tuple[str, s
         substitutions.append((f"{path}.ff.net.0", _type_name(ff.net[0]), _type_name(FusedSwiGLU)))
         ff.net[0].__class__ = FusedSwiGLU
         ff.net[0]._fusion_fp8 = out_fp8
+        ff.net[0]._fusion_output_check = functools.partial(_ff_output_rowwise, ff)
 
         substitutions.append((path, _type_name(block), _type_name(FusedMiniMaxH3TransformerBlock)))
         block.__class__ = FusedMiniMaxH3TransformerBlock

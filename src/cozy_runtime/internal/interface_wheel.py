@@ -68,7 +68,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         "from cozy_runtime.author import "
         "AssetBound, Assets, ImagePreparation, Image, DecodedAudio, DecodedVideo, "
         "ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
-        "from cozy_runtime.author import ModelArtifact",
+        "from cozy_runtime.author import ModelArtifact, AdaptedModel",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
         "",
     ]
@@ -280,11 +280,13 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                 )
             # Model arguments override injected slots. None leaves selection to the
             # host, which knows both owner bindings and the callee's authored defaults.
-            model_overrides = [f"{name}: ModelArtifact | None = None" for name in model_names]
+            model_overrides = [
+                f"{name}: ModelArtifact | AdaptedModel | None = None" for name in model_names
+            ]
             parameters += model_overrides
             parameters.append("capture: ActivationCapture | None = None")
             models_name, call_name = f"__cozy_{export}Models", f"__cozy_{export}Call"
-            model_fields = [f"    {field}" for field in model_overrides]
+            model_fields = [f"    {name}: ModelArtifact | None = None" for name in model_names]
             _declare(
                 declarations,
                 models_name,
@@ -308,9 +310,15 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
             f"    return cast({returned}, "
             f"_invoke_proxy({digest!r}, {module!r}, {export!r}, {arguments}{options}))\n"
         )
+        model_paths = (
+            tuple(("models", row["path"].rpartition(".")[2]) for row in entry.get("models", []))
+            if serving
+            else ()
+        )
         bindings.append(
             f"    {export!r}: _CallType({digest!r}, {module!r}, {export!r}, "
-            f"{request_name}, {result_name}),"
+            f"{request_name}, {result_name}, "
+            f"{model_paths!r}),"
         )
     return "\n".join(
         imports

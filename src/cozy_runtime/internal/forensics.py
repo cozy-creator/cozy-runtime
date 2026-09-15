@@ -49,19 +49,28 @@ def distinct_storage_bytes(tensors: Any) -> int:
     number the fill plane charges with, and it double-counts every tied weight and every
     view. This is the same walk with the storage identity as the unit, so the two can be
     subtracted and the difference is the census's own error rather than a mystery.
+
+    Quantized wrapper tensors expose logical geometry but do not own a directly
+    addressable storage. TensorFS exposes their upstream physical parts
+    without changing the module, its parameters or its state-dict keys.
     """
-    seen: set[int] = set()
+    seen: set[tuple[str, int]] = set()
     total = 0
     for tensor in tensors:
-        try:
-            storage = tensor.untyped_storage()
-        except Exception:
-            continue
-        token = storage.data_ptr()
-        if token == 0 or token in seen:
-            continue
-        seen.add(token)
-        total += int(storage.nbytes())
+        from tensorfs import physical_tensors
+
+        parts = physical_tensors(tensor)
+        for part in parts:
+            try:
+                storage = part.untyped_storage()
+                pointer = storage.data_ptr()
+            except Exception:
+                continue
+            token = str(part.device), pointer
+            if pointer == 0 or token in seen:
+                continue
+            seen.add(token)
+            total += int(storage.nbytes())
     return total
 
 

@@ -40,14 +40,14 @@ import resource
 import socket
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._assets import GrantedInput, InputMetadata
 from cozy_runtime.author._capture import ActivationCapture
-from cozy_runtime.author._context import Device
+from cozy_runtime.author._context import Context, Device
 from cozy_runtime.author._errors import CapabilityError, Outcome, classify
 from cozy_runtime.author._invoke import (
     Invocation,
@@ -71,9 +71,23 @@ from cozy_runtime.internal import (
     proctree,
     sandbox,
 )
+from cozy_runtime.internal.adapters import (
+    AdapterSelection,
+    implementation_digest,
+)
+from cozy_runtime.internal.adapters import (
+    inspect as inspect_adapters,
+)
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_distribution, discover_installed
+from cozy_runtime.internal.executor_adapters import (
+    AdapterAttempt,
+    AdapterModel,
+    check_host_capacity,
+    validate_slots,
+)
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.lora import AdapterRefusal
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import (
     RankGroup,
@@ -488,6 +502,11 @@ class Executor:
         self.residency: Any = None
         self.model_executors: list[Executor] = []
         self.models: dict[str, Any] = {}
+        self.adapter_model: AdapterModel | None = None
+        self._adapter_attempt: AdapterAttempt | None = None
+        self._adapter_request_id = ""
+        self._adapter_authorized_bytes = 0
+        self._prepared_adapters: dict[str, str] = {}
         self.group_components: dict[tuple[str, str], tuple[Any, Any]] = {}
         self.group_sharded: set[tuple[str, str]] = set()
         self._group_parent: Executor | None = None
@@ -660,6 +679,15 @@ class Executor:
             }
         _model, component = target
         sol_counts: dict[str, int] = {}
+        held_adapter_digest = self._adapter_attempt.digest if self._adapter_attempt else ""
+        if command.get("adapter_digest", "") != held_adapter_digest:
+            self.poisoned = "mirrored adapter stack mismatch"
+            return {
+                "ok": False,
+                "code": "rank_divergence",
+                "detail": self.poisoned,
+                "rank": self.rank,
+            }
         models = {key[0]: model for key, (model, _root) in self.group_components.items()}
         try:
             spool = Path(command["spool"])
@@ -763,6 +791,9 @@ class Executor:
                     prepared=owner.group_components,
                     group=self.group,
                     spool=lambda: owner._attempt_spool,
+                    adapter_digest=lambda: (
+                        owner._adapter_attempt.digest if owner._adapter_attempt else ""
+                    ),
                 )
         self.facts["sequence_parallel"] = {
             "degree": self.world,
@@ -965,6 +996,9 @@ class Executor:
         self.discovered, self.surface_names = child.discovered, dict(child.surface_names)
         self.models.update(child.models)
         self.torch = child.torch
+        self._adapter_authorized_bytes = max(
+            self._adapter_authorized_bytes, child._adapter_authorized_bytes
+        )
         self._device_ready = child._device_ready
         self.residency = _CompositeResidency(
             {
@@ -1116,6 +1150,7 @@ class Executor:
                 "assigns the residence ceiling and this executor derives none",
             }
         authorized = int(command["authorized_device_limit_bytes"])
+        self._adapter_authorized_bytes = authorized
 
         changed = _env_changes()
         if changed:
@@ -1212,6 +1247,20 @@ class Executor:
         # partial read of a whole-pipeline snapshot has no representation (tfs-007).
         names: list[str] = list(binding.get("components") or [binding["component"]])
         per_component: dict[str, str] = dict(binding.get("snapshots") or {})
+        adapter_compatibility: tuple[Mapping[str, Any], ...] = ()
+        if binding.get("adapter_selections"):
+            adapter_geometry = inspect_adapters(
+                binding["store"],
+                tuple(AdapterSelection.read(row) for row in binding["adapter_selections"]),
+                {name: per_component.get(name, binding["snapshot"]) for name in names},
+            )
+            adapter_compatibility = adapter_geometry.compatibility
+            if canonical.digest(list(adapter_compatibility)) != binding.get(
+                "adapter_compatibility_digest"
+            ):
+                raise AdapterRefusal(
+                    "adapter_target_mismatch", "worker and executor target compatibility differ"
+                )
 
         # --------------------------------------------------------- PLAN RESOLUTION (#549.1)
         #
@@ -1541,6 +1590,18 @@ class Executor:
             stage("lease_acquire")
             model = registry.acquire(binding["model_binding_path"], model_cls, artifact)
             stage("construct_and_fill")
+            compatibility = adapter_compatibility
+            if compatibility:
+                if binding.get("adapter_implementation") != implementation_digest():
+                    raise AdapterRefusal(
+                        "adapter_runtime_skew", "worker and executor adapter implementations differ"
+                    )
+                self.adapter_model = AdapterModel(
+                    {**backend.components, **backend.parked},
+                    {name: per_component.get(name, binding["snapshot"]) for name in names},
+                    compatibility,
+                    binding["store"],
+                )
             optimization = apply_anima_execution_plan(
                 model,
                 application=str(binding["application"]),
@@ -1702,6 +1763,14 @@ class Executor:
                 "resident_budget_bytes": resident_budget,
                 "execution_optimization": optimization.document() if optimization else None,
                 "execution_fusion": fused.identity_document() if fused is not None else None,
+                **(
+                    {
+                        "adapter_targets": list(self.adapter_model.compatibility),
+                        "adapter_implementation": implementation_digest(),
+                    }
+                    if self.adapter_model
+                    else {}
+                ),
             }
         )
         self.constructed_model_digest = (
@@ -1941,6 +2010,7 @@ class Executor:
         # ONE authorization for the PROCESS: each construction fits under what the previous
         # ones left of it, measured by this process's own allocator after their fills.
         authorized = int(command["authorized_device_limit_bytes"])
+        self._adapter_authorized_bytes = authorized
         held = 0
         children: list[tuple[str, Executor, dict[str, Any]]] = []
         for row in rows:
@@ -2267,6 +2337,19 @@ class Executor:
                 }
         try:
             self._capture_options(command, registration.surface)
+            selected_adapters = command.get("model_adapters", {})
+            adapter_models = self._adapter_models(command["entrypoint"])
+            for model in adapter_models.values():
+                model.linear.check_ready()
+            if not isinstance(selected_adapters, dict) or set(selected_adapters) - set(
+                adapter_models
+            ):
+                raise AdapterRefusal(
+                    "adapter_slot", "adapter request names an unprepared model slot"
+                )
+            validate_slots(adapter_models, selected_adapters)
+            for name, selections in selected_adapters.items():
+                adapter_models[name].inspect(selections)
             prepared = prepare(
                 registration,
                 command["payload"],
@@ -2286,10 +2369,14 @@ class Executor:
                 "fields": list(outcome.fields),
             }
         self.prepared[command["request_id"]] = prepared
+        self._prepared_adapters[command["request_id"]] = (
+            canonical.digest(selected_adapters) if selected_adapters else ""
+        )
         # A prepared request the worker never dispatched (a refusal after the plan, a
         # cancel while it queued) would otherwise be retained for the generation's life.
         for stale in list(self.prepared)[: -PREPARED_HELD or None]:
             del self.prepared[stale]
+            self._prepared_adapters.pop(stale, None)
         return {
             "ok": True,
             "features": dict(prepared.features.values),
@@ -2326,6 +2413,14 @@ class Executor:
                 "detail": f"nothing was prepared for {command['request_id']!r}: an attempt "
                 "runs the record its plan was priced against, and this executor holds none "
                 "(a fresh epoch holds nothing at all)",
+            }
+        selected_adapters = command.get("model_adapters", {})
+        selected_digest = canonical.digest(selected_adapters) if selected_adapters else ""
+        if self._prepared_adapters.pop(command["request_id"], "") != selected_digest:
+            return {
+                "ok": False,
+                "code": "adapter_request_changed",
+                "detail": "adapter stack differs from preflight",
             }
         pin = str(command.get("attention_kernel", ""))
         try:
@@ -2379,7 +2474,10 @@ class Executor:
                 attention_sol.observing(ranks=sol_rank_counts) as sol_counts,
             ):
                 capture = self._capture_session(command, surface)
-                with capture if capture is not None else contextlib.nullcontext():
+                with (
+                    self._adapter_scope(command),
+                    capture if capture is not None else contextlib.nullcontext(),
+                ):
                     envelope, outcome, record = run_prepared(
                         prepared,
                         Invocation(
@@ -2389,13 +2487,14 @@ class Executor:
                             device=self._device(),
                             cancel=lambda: _cancelled(self.root, command["request_id"]),
                             models=self.models,
+                            model_adapters=self._adapter_attempt.refs
+                            if self._adapter_attempt
+                            else {},
                             progress=progress,
                             # cr-012: the inputs the WORKER already fetched, verified and spooled.
-                            # Every value is a path inside this attempt's own spool: this process is
-                            # `sandbox.refuse_network` rejects ungranted network access.
-                            # Input bytes arrive only through the worker grant.
-                            # That fence is Python-level (cr-042) — it bounds a buggy package, not a
-                            # hostile one, and there is no netns or seccomp under it.
+                            # Each input is an admitted local spool path. The Python
+                            # network fence bounds buggy package code, without claiming
+                            # a netns or seccomp boundary for hostile code.
                             trees={
                                 ref: (Path(root), digest)
                                 for ref, (root, digest) in (command.get("trees") or {}).items()
@@ -2405,6 +2504,30 @@ class Executor:
                             max_output_bytes=int(command.get("max_output_bytes", MAX_OUTPUT_BYTES)),
                         ),
                     )
+                    if torch is not None:
+                        held = self._adapter_attempt
+                        controllers = self._adapter_models(command["entrypoint"])
+                        calls = sum(
+                            controllers[name].linear.observed_calls() for name in selected_adapters
+                        )
+                        record.emit(
+                            "log",
+                            "runtime model execution",
+                            outcome.terminal,
+                            degree=self.world,
+                            matmul_precision=torch.get_float32_matmul_precision(),
+                            lora_backend="peft" if held else "none",
+                            lora_preparation=canonical.write(
+                                {
+                                    name: controllers[name].linear.preparation_facts()
+                                    for name in selected_adapters
+                                }
+                            ).decode(),
+                            lora_calls=calls,
+                            lora_digest=held.digest if held else "",
+                            lora_source_bytes=held.source_bytes if held else 0,
+                            lora_factor_budget_bytes=held.device_bytes if held else 0,
+                        )
                 if capture is not None and outcome.terminal == "succeeded":
                     capture_result = capture.write(spool)
         except Exception as exc:
@@ -2618,6 +2741,159 @@ class Executor:
         return attention.plan(
             self._attention_device(pin), self._attention_roots(), pin, self._attention_frozen()
         )
+
+    def _adapter_models(self, entrypoint: str) -> dict[str, AdapterModel]:
+        parameters = set(self.surface_names[entrypoint].model_params)
+        return {
+            name: executor.adapter_model
+            for executor in self.model_executors or [self]
+            if executor.adapter_model is not None
+            for name in executor.models
+            if name in parameters
+        }
+
+    def _adapter_capacity(self, needed: int) -> None:
+        if self.device_kind != "cuda" or self.torch is None:
+            available = proctree.available_host_bytes()
+            if needed > available:
+                raise AdapterRefusal(
+                    "adapter_host_shortfall",
+                    f"adapter temporaries need {needed} bytes; available {available}",
+                )
+            return
+        memory = accel.allocation(self.torch, self.device_kind, self._rank_device(self.torch))
+        allocatable = memory["driver_free_bytes"] + max(
+            memory["reserved_bytes"] - memory["allocated_bytes"], 0
+        )
+        available = max(
+            min(allocatable, self._adapter_authorized_bytes - memory["allocated_bytes"]), 0
+        )
+        if needed > available:
+            raise AdapterRefusal(
+                "adapter_device_shortfall",
+                f"adapter factors/scratch need {needed} bytes; "
+                f"this rank has {available} authorized bytes free",
+            )
+
+    def adapter_begin(self, command: dict[str, Any]) -> dict[str, Any]:
+        """Open the exact same adapter scope on each rank before a sharded call."""
+        if not self.ready or self.poisoned or self._adapter_attempt is not None:
+            return {
+                "ok": False,
+                "code": "adapter_attempt_state",
+                "detail": "executor is not idle and ready",
+            }
+        request_id = str(command["request_id"])
+        cancel_root = Path(command.get("cancel_root", self.root))
+        ctx = Context(
+            request_id,
+            _deadline(command["deadline_s"]),
+            self._device(),
+            lambda: _cancelled(cancel_root, request_id),
+        )
+        selected = command.get("model_adapters", {})
+        if not isinstance(selected, dict):
+            return {"ok": False, "code": "adapter_slot", "detail": "adapter slot map is malformed"}
+        try:
+            self._adapter_attempt = AdapterAttempt(
+                self._adapter_models(command["entrypoint"]),
+                selected,
+                device=self._rank_device(self.torch),
+                check_cancelled=ctx.raise_if_cancelled,
+                check_capacity=self._adapter_capacity,
+            )
+            self._adapter_request_id = request_id
+        except Exception as exc:
+            outcome = classify(exc)
+            return {"ok": False, "code": outcome.code, "detail": outcome.message, "rank": self.rank}
+        return {
+            "ok": True,
+            "rank": self.rank,
+            "adapter_digest": self._adapter_attempt.digest,
+            "adapter_device_bytes": self._adapter_attempt.device_bytes,
+        }
+
+    def adapter_end(self, command: dict[str, Any]) -> dict[str, Any]:
+        if self._adapter_attempt is None:
+            return {"ok": True, "rank": self.rank}
+        if command.get("request_id") != self._adapter_request_id:
+            return {
+                "ok": False,
+                "code": "adapter_request_changed",
+                "detail": "adapter cleanup names another attempt",
+            }
+        held, self._adapter_attempt = self._adapter_attempt, None
+        self._adapter_request_id = ""
+        try:
+            held.close()
+        except Exception as exc:
+            self.poisoned = f"adapter cleanup failed: {type(exc).__name__}"
+            return {
+                "ok": False,
+                "code": "adapter_cleanup_failed",
+                "detail": self.poisoned,
+                "rank": self.rank,
+            }
+        return {"ok": True, "rank": self.rank}
+
+    @contextlib.contextmanager
+    def _adapter_scope(self, command: dict[str, Any]) -> Iterator[None]:
+        for model in self._adapter_models(command["entrypoint"]).values():
+            model.linear.check_ready()
+        if self._adapter_attempt is not None:
+            raise AdapterRefusal(
+                "adapter_attempt_state", "a previous adapter attempt is still active"
+            )
+        if not command.get("model_adapters"):
+            yield
+            return
+        begin = {
+            "cmd": "adapter_begin",
+            "entrypoint": command["entrypoint"],
+            "request_id": command["request_id"],
+            "deadline_s": command["deadline_s"],
+            "cancel_root": str(self.root),
+            "model_adapters": command["model_adapters"],
+        }
+        selected = command["model_adapters"]
+        models = self._adapter_models(command["entrypoint"])
+        # All followers share this host. Check the aggregate before any rank starts
+        # copying sources, then each rank independently rechecks its remaining budget.
+        check_host_capacity(
+            (models[name].inspect(rows) for name, rows in selected.items()),
+            device=self._rank_device(self.torch),
+            copies=self.world,
+        )
+        group_started = False
+        try:
+            if self.group is not None:
+                self.group.broadcast(begin)
+                group_started = True
+            own = self.adapter_begin(begin)
+            replies = self.group.collect("adapter_begin") if group_started and self.group else []
+            expected = canonical.digest(command["model_adapters"])
+            for reply in [own, *replies]:
+                if not reply.get("ok") or reply.get("adapter_digest") != expected:
+                    raise AdapterRefusal(
+                        str(reply.get("code") or "rank_divergence"),
+                        f"rank {reply.get('rank', self.rank)} adapter setup refused: "
+                        f"{reply.get('detail', '')}",
+                    )
+            yield
+        finally:
+            end = {"cmd": "adapter_end", "request_id": command["request_id"]}
+            remote = bool(group_started and self.group is not None and not self.group.broken)
+            try:
+                if remote:
+                    assert self.group is not None
+                    self.group.broadcast(end)
+            finally:
+                own = self.adapter_end(end)
+            replies = self.group.collect("adapter_end") if remote and self.group else []
+            for reply in [own, *replies]:
+                if not reply.get("ok"):
+                    self.poisoned = "adapter cleanup failed on a rank"
+                    raise AdapterRefusal("adapter_cleanup_failed", str(reply.get("detail", "")))
 
     @staticmethod
     def _capture_options(command: Mapping[str, Any], surface: Any) -> ActivationCapture | None:
@@ -3028,7 +3304,14 @@ class Executor:
                         "self call is not a registered App export", code="child_interface"
                     )
                 binding = _CallType(
-                    interface, module, export, surface.payload_type, surface.result_type
+                    interface,
+                    module,
+                    export,
+                    surface.payload_type,
+                    surface.result_type,
+                    tuple((name,) for name in surface.model_params)
+                    if surface.kind == "entrypoint"
+                    else (),
                 )
                 bindings[("", module, export)] = binding
             else:
@@ -3443,7 +3726,18 @@ def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:
 
 #: What a follower rank answers. It has no worker: rank 0 is its whole control plane.
 _FOLLOWER_COMMANDS = frozenset(
-    {"hello", "join", "prepare", "run", "vacate", "restore", "probe", "shutdown"}
+    {
+        "hello",
+        "join",
+        "prepare",
+        "run",
+        "adapter_begin",
+        "adapter_end",
+        "vacate",
+        "restore",
+        "probe",
+        "shutdown",
+    }
 )
 
 #: A follower's refusal codes rank 0 relays as-is; any other refusal is the group not
@@ -3536,6 +3830,10 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.join(command)
             elif name == "run":
                 reply = executor.run(command)
+            elif name == "adapter_begin":
+                reply = executor.adapter_begin(command)
+            elif name == "adapter_end":
+                reply = executor.adapter_end(command)
             elif name == "describe_installed":
                 reply = executor.describe_installed(command)
             elif name == "preconstruct":
