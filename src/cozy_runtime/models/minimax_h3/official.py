@@ -153,6 +153,11 @@ _WARM_VIDEO_TAG, _WARM_TEXT_TAG, _WARM_AUDIO_TAG = 0, 1, 2
 _DENSE_ATTENTION_PATHS = ("token_refiner", "transformer_blocks.0", "transformer_blocks.1")
 
 
+def _validate_sol_dense_steps(value: int) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError("sol_dense_steps must be a nonnegative integer")
+
+
 def _attention_layout(state: Any, step: int, *, sol_dense_steps: int = 10) -> AttentionLayout:
     fields = state.denoiser_input_fields
     # NVIDIA's H3 policy protects every row before target video, including target
@@ -1235,8 +1240,7 @@ class OfficialH3Pipeline:
         checks: NumericalChecks | None = None,
         sol_dense_steps: int = 10,
     ) -> ScheduleFacts:
-        if type(sol_dense_steps) is not int or sol_dense_steps < 0:
-            raise ValueError("sol_dense_steps must be a nonnegative integer")
+        _validate_sol_dense_steps(sol_dense_steps)
         blocks = self._blocks[self._workflow(task, state)].sub_blocks
         scoped = _ScopedPipeline(
             self._pipes[self._workflow(task, state)],

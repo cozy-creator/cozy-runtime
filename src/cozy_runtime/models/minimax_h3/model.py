@@ -14,6 +14,7 @@ from .official import (
     OfficialH3TurboLoRA,
     ScheduleFacts,
     Task,
+    _validate_sol_dense_steps,
     build_h3_pipeline,
     build_h3_turbo_base,
     build_h3_turbo_lora,
@@ -276,6 +277,7 @@ class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
         checks: NumericalChecks,
         sol_dense_steps: int = 10,
     ) -> ScheduleFacts:
+        _validate_sol_dense_steps(sol_dense_steps)
         task: Task = "fl2va_turbo" if trunk == "fl2va" else "ref2va_turbo"
         overlay = self.pipe.overlay(base.pipe, trunk)
         root = base.pipe.components[f"{trunk}_dit"]
