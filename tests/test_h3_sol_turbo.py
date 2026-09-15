@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from copy import deepcopy
+from inspect import signature
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,7 +19,21 @@ def test_turbo_loop_delivers_policy_to_every_real_attention_site(task: Any) -> N
     from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
     from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
+    from cozy_runtime.models.minimax_h3.model import H3TurboBase, H3TurboLoRA
     from cozy_runtime.models.minimax_h3.official import OfficialH3Pipeline, canonical_timestep_plan
+
+    # The workflow omits this keyword. Both public Turbo entry paths must agree;
+    # the general denoiser retains the standard model's ten-step default.
+    default = (
+        signature(getattr(H3TurboBase, "sample_" + task)).parameters["sol_dense_steps"].default
+    )
+    adapter_default = (
+        signature(getattr(H3TurboLoRA, "sample_" + task.removesuffix("_turbo")))
+        .parameters["sol_dense_steps"]
+        .default
+    )
+    assert default == adapter_default == 4
+    assert signature(OfficialH3Pipeline.denoise).parameters["sol_dense_steps"].default == 10
 
     # Keep the real 50+2 layer topology; only widths and token counts are reduced.
     dit = MiniMaxH3Transformer3DModel(
@@ -121,7 +136,7 @@ def test_turbo_loop_delivers_policy_to_every_real_attention_site(task: Any) -> N
     prior_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(1)
-        for dense_steps in (3, 4, 8, 10):
+        for dense_steps in (default, 3, 8, 10):
             state = deepcopy(initial)
             seen.clear()
             steps.clear()
@@ -152,7 +167,7 @@ def test_turbo_loop_delivers_policy_to_every_real_attention_site(task: Any) -> N
             outputs = (state.get("latents"), state.get("audio_latents"))
             assert all(torch.isfinite(value).all() for value in outputs)
             # No Sol was selected: changing only its policy leaves the real dense
-            # CPU SDPA result byte-identical. FA3/Sol CUDA arithmetic is a GPU gate.
+            # CPU SDPA result equal at zero tolerance. FA3/Sol CUDA arithmetic is a GPU gate.
             if baseline is None:
                 baseline = outputs
             else:
