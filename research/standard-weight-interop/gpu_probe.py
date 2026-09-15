@@ -45,6 +45,25 @@ def compare(actual: Any, reference: Any) -> dict[str, Any]:
     """Bounded CPU comparison; excluded from the CUDA timings."""
     import torch
 
+    if torch.equal(actual, reference):
+        # Exact CPU comparisons need no floating norm. Keep finite checking
+        # chunked so a multi-billion-element output needs no full boolean mask.
+        flat = actual.reshape(-1, actual.shape[-1])
+        nonfinite = 2 * sum(
+            int(torch.count_nonzero(~torch.isfinite(flat[start : start + 256])))
+            for start in range(0, flat.shape[0], 256)
+        )
+        return {
+            "exact": True,
+            "nonfinite_elements": nonfinite,
+            "different_elements": 0,
+            "elements": actual.numel(),
+            "max_absolute_error": 0.0 if not nonfinite else None,
+            "relative_rmse": 0.0 if not nonfinite else None,
+            "sha256": hashlib.sha256(
+                memoryview(actual.view(torch.uint8).numpy()).cast("B")
+            ).hexdigest(),
+        }
     different = 0
     nonfinite = 0
     max_abs = error2 = reference2 = 0.0
