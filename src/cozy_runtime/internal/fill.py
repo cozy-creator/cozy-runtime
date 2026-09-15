@@ -1647,7 +1647,11 @@ class StreamingFillBackend:
         held: dict[str, int] = {}
         for name, member in list(self.components.items()):
             try:
-                held[name] = distinct_storage_bytes(t for _, t in _tensors(member))
+                held[name] = distinct_storage_bytes(
+                    self.base_weights[name].tensors()
+                    if name in self.base_weights
+                    else (t for _, t in _tensors(member))
+                )
             except Exception:
                 continue
         scratch = 0
@@ -1789,6 +1793,7 @@ class StreamingFillBackend:
                 attribute != "weight"
                 or type(module) is not self.torch.nn.Linear
                 or tuple(module.weight.shape) != tuple(row.shape)
+                or (module.out_features, module.in_features) != tuple(row.shape)
                 or _data_ptr(module.weight) != _data_ptr(tensor)
                 or not _data_ptr(tensor)
             ):
