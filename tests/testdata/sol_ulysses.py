@@ -53,7 +53,10 @@ def sparse_control(tensors: list[Any], output: Any, degree: int, live: int) -> d
         ]
         split.append(prepare(*operands, tau=1.0, scale=128**-0.5, thresh_type="exact"))
     equality = {
-        name: torch.equal(value, torch.cat([part[index] for part in split], dim=2))
+        name: torch.equal(
+            value.contiguous().view(torch.uint8),
+            torch.cat([part[index] for part in split], dim=2).contiguous().view(torch.uint8),
+        )
         for index, (name, value) in enumerate(zip(("kc", "vc", "threshold"), full, strict=True))
     }
     kc, _vc, threshold = full
@@ -168,6 +171,9 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
                     assert control["sparse_vs_native_all_keys_relative_l2"] > 1e-3, control
                 expected = reference.tensor_split(degree, dim=1)[rank]
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                assert torch.equal(
+                    actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+                )
                 for original, shard in zip(before, shards, strict=True):
                     assert torch.equal(original.view(torch.uint8), shard.view(torch.uint8))
                 assert torch.isfinite(actual).all()
@@ -183,6 +189,7 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
                         "dense_paths": layout.dense_paths,
                         "combined_reference_and_parallel_calls": counts,
                         "equal": True,
+                        "output_bytes_equal": True,
                     }
                 )
         (root / f"rank-{rank}.json").write_text(json.dumps(results))
