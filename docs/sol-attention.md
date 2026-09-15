@@ -43,7 +43,7 @@ Preprocessing, required contiguous copies, metadata and dense-prefix work must b
 included in H3 benchmarks. This backend stays an explicit approximate choice
 until suitable full-video quality evidence is accepted.
 
-## Eight-step H3 Turbo experiments
+## Eight-step H3 Turbo policy
 
 The Turbo model sampling methods accept the request-local keyword
 `sol_dense_steps`. For example, a Python workflow calls:
@@ -61,9 +61,13 @@ base_model.sample_fl2va_turbo(
 
 The Ref2VA method accepts the same keyword. This only sets the existing model
 layout policy; select `sol-attn` separately through the normal attention override.
-The default remains 10 pending qualification, so an eight-step request remains
-all-dense unless the workflow explicitly supplies a smaller value. Warmup stays
-dense independently. Values must be nonnegative integers, excluding booleans.
+The Turbo default is 4: four dense evaluations followed by four with sparse video
+attention. The user reviewed one matched 15-second fight scene and considered both
+3/5 and 4/4 comparable in quality, preferring 4/4 as closer to the dense original.
+That supports this Turbo policy choice, not a broad quality-equivalence claim or
+an automatic switch to Sol. Explicit 3, 8 and 10 remain supported. Standard
+30-step generation retains ten initial dense evaluations; warmup stays dense
+independently. Values must be nonnegative integers, excluding booleans.
 
 The count names initial transformer evaluations: eight evaluations use a
 nine-point sigma grid, and evaluation indices are 0 through 7. A value of 3
@@ -79,16 +83,24 @@ counts per rank (excluding construction/warmup) are:
 | Initial dense evaluations | sparse | dense_prefix | dense_step | dense_path |
 |---|---:|---:|---:|---:|
 | 3 | 240 | 240 | 144 | 32 |
-| 4 | 192 | 192 | 192 | 32 |
-| 8 or default 10 | 0 | 0 | 384 | 32 |
+| 4 (Turbo default) | 192 | 192 | 192 | 32 |
+| 8 or 10 | 0 | 0 | 384 | 32 |
 
 `dense_prefix` is additional work within each sparse call, not a second complete
 DiT attention. Report each rank separately when evaluating context parallelism.
 
 This starts from the zero-based dense-step/layer gates in the
 [qualified NVIDIA H3 integration](https://github.com/NVlabs/Sana/blob/8e0db4fa562d727ea28b8d63015c196db7d97cae/models/minimax_h3/GB200/sol_attn_h3.py).
-The 3/4-step choices are new Turbo experiments, not upstream quality claims. CPU
+The 3/4-step choices are our Turbo policies, not upstream quality claims. CPU
 tests run both upstream H3 denoisers with reduced widths and the full layer count,
-verify the policy reaches every attention call, preserve exact dense CPU output
-across policy values, and check warmup and failure cleanup. Full FP8-model CUDA
-runs, matched output videos, timing and multi-GPU qualification remain required.
+verify the policy reaches every attention call, preserve dense CPU output at zero
+tolerance across policy values, and check warmup and failure cleanup. Additional
+prompts and environment/GPU-count qualification remain separate evidence.
+
+The ordinary migrated H3 workflow calls `sample_fl2va_turbo` or
+`sample_ref2va_turbo` without a `sol_dense_steps` argument. Once it uses this SDK,
+it inherits 4 directly; no package-specific sampler or policy branch is required.
+Diagnostic helpers that explicitly pass 3/4/8/10 keep their chosen policy. A
+workflow still defining package-local model classes must adopt the existing
+Runtime model migration first; updating its SDK dependency alone does not replace
+those classes.

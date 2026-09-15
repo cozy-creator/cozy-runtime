@@ -161,11 +161,11 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
 class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
     """The five-root base checkpoint with construction-time turbo consumers.
 
-    Turbo sampling accepts ``sol_dense_steps`` for explicit Sol experiments. It
-    counts initial transformer evaluations, not scheduler sigma points or CFG
-    branches. The default 10 keeps all eight Turbo evaluations dense. Values 3
-    and 4 enable comparison policies; they do not select Sol, change its protected
-    prefix, or remove the always-dense refiner and first two transformer blocks.
+    ``sol_dense_steps`` counts initial transformer evaluations, not scheduler
+    sigma points or CFG branches. The default 4 keeps evaluations 1-4 dense and
+    allows sparse video attention in 5-8 when Sol is explicitly selected. Callers
+    can still request 3, 8 or 10; no value selects Sol, changes its protected prefix,
+    or removes the always-dense refiner and first two transformer blocks.
     """
 
     def load(self, loader: Loader) -> None:
@@ -180,7 +180,7 @@ class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
         on_step: Any,
         cancel: Any,
         checks: NumericalChecks,
-        sol_dense_steps: int = 10,
+        sol_dense_steps: int = 4,
     ) -> ScheduleFacts:
         return turbo_lora.sample_fl2va(
             self,
@@ -200,7 +200,7 @@ class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
         on_step: Any,
         cancel: Any,
         checks: NumericalChecks,
-        sol_dense_steps: int = 10,
+        sol_dense_steps: int = 4,
     ) -> ScheduleFacts:
         return turbo_lora.sample_ref2va(
             self,
@@ -233,7 +233,7 @@ class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
         on_step: Any,
         cancel: Any,
         checks: NumericalChecks,
-        sol_dense_steps: int = 10,
+        sol_dense_steps: int = 4,
     ) -> ScheduleFacts:
         return self._sample(
             base,
@@ -254,7 +254,7 @@ class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
         on_step: Any,
         cancel: Any,
         checks: NumericalChecks,
-        sol_dense_steps: int = 10,
+        sol_dense_steps: int = 4,
     ) -> ScheduleFacts:
         return self._sample(
             base,
@@ -275,7 +275,7 @@ class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
         on_step: Any,
         cancel: Any,
         checks: NumericalChecks,
-        sol_dense_steps: int = 10,
+        sol_dense_steps: int,
     ) -> ScheduleFacts:
         _validate_sol_dense_steps(sol_dense_steps)
         task: Task = "fl2va_turbo" if trunk == "fl2va" else "ref2va_turbo"
