@@ -15,6 +15,7 @@ from pathlib import PurePath
 from typing import Any
 
 from cozy_runtime.internal import proctree
+from cozy_runtime.internal.config import inherited_environment
 
 MAX_TRACE_LINES = 40
 MAX_LINE_CHARS = 160
@@ -46,8 +47,13 @@ def exception_trace(exc: BaseException) -> str:
             )
             tb = tb.tb_next
         chain.append([_printable(type(current).__name__), *frames])
-        current = current.__cause__ or (
-            current.__context__ if not current.__suppress_context__ else None
+        cause = current.__cause__
+        current = (
+            cause
+            if cause is not None
+            else current.__context__
+            if not current.__suppress_context__
+            else None
         )
     lines: list[str] = ["earlier exceptions omitted"] if current is not None else []
     for item in reversed(chain):
@@ -81,6 +87,9 @@ def memory_summary(reply: Mapping[str, Any]) -> str:
 
 def startup_facts(*, rank: int, world: int, device_kind: str) -> dict[str, Any]:
     """Observe only approved startup facts; never import Torch or initialize CUDA."""
+    # Config owns environment reads. Narrow its process snapshot immediately;
+    # neither the whole mapping nor unrelated values enter the diagnostic.
+    environment = inherited_environment()
     facts: dict[str, Any] = {
         "pid": os.getpid(),
         "rank": rank,
@@ -88,7 +97,7 @@ def startup_facts(*, rank: int, world: int, device_kind: str) -> dict[str, Any]:
         "device_kind": device_kind,
         **proctree.own_protection(),
         "environment": {
-            name: _printable(os.environ[name]) if name in os.environ else None
+            name: _printable(environment[name]) if name in environment else None
             for name in STARTUP_ENV
         },
     }

@@ -82,6 +82,16 @@ def test_deep_and_cyclic_exceptions_stay_bounded() -> None:
     assert all(len(line) <= 160 for line in diagnostics.activity_lines("x" * 100000))
 
 
+def test_false_valued_cause_is_not_skipped() -> None:
+    class FalseCause(ValueError):
+        def __bool__(self) -> bool:
+            return False
+
+    error = RuntimeError("outer")
+    error.__cause__ = FalseCause("inner")
+    assert "FalseCause" in diagnostics.exception_trace(error)
+
+
 def test_missing_memory_is_unknown_and_explicit_zero_is_preserved() -> None:
     for reply in (
         {},
