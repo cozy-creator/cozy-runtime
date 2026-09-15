@@ -115,7 +115,7 @@ def run(
             transaction = next(iter(owner.client.opened))
             receipt = store.derived_lookup(transaction)["receipt"]
             return result, owner.client.adopt_model(receipt)
-        bf16 = prepare_bf16(view, keep=spec.keep)
+        bf16 = prepare_bf16(view, keep=spec.keep, source_dtypes=spec.bf16_sources)
         selected = (
             None
             if spec.encoding is None
@@ -243,6 +243,9 @@ def test_tripwire_and_nonfinite_values_refuse_before_native_commit(tmp_path: Pat
         lambda: plan(("unet",), "mxfp8/1", max_relative_frobenius=-1),
         lambda: plan(("unet",), "mxfp8/1", keep=("unet",)),
         lambda: plan(keep=("vae", "vae")),
+        lambda: plan(bf16_sources=()),
+        lambda: plan(bf16_sources=("f16", "f16")),
+        lambda: plan(bf16_sources=("fp8",)),
     )
     for invalid_plan in invalid:
         with pytest.raises(UnsupportedInput) as refused:
@@ -310,6 +313,62 @@ def test_fp16_inherits_exact_original_artifact_without_source_reads(tmp_path: Pa
     assert artifact.manifest == source.manifest
     assert (result.converted_keys, result.kept_keys, result.inherited_keys) == (0, 0, 1)
     assert result.source_bytes_read_this_run == 0
+
+
+def test_explicit_fp16_bf16_preparation_commits_exact_bytes_and_replays(tmp_path: Path) -> None:
+    # Exactly representable FP16 inputs include BF16 ties, the FP16 maximum and
+    # its smallest subnormal. Expected BF16 words are independent of the writer.
+    values = np.array([1.00390625, 1.01171875, -1.00390625, 0, 65504, 2**-24], dtype="<f2")
+    expected = np.array([0x3F80, 0x3F82, 0xBF80, 0, 0x4780, 0x3380], dtype="<u2").tobytes()
+    rows = {
+        "adapter": {
+            "a.weight": ("f16", (2, 3), values.tobytes()),
+            "b.weight": ("f32", (2, 3), values.astype("<f4").tobytes()),
+            "ready.weight": ("bf16", (2, 3), expected),
+        },
+        "frozen": {"original.weight": ("f16", (2, 3), values.tobytes())},
+    }
+    store, source = mint(tmp_path, rows)
+    spec = plan(keep=("frozen",), bf16_sources=("f16", "f32"))
+    first, artifact = run(tmp_path, store, source, spec)
+    replay, again = run(tmp_path, store, source, spec, epoch=2)
+    assert first is not None and replay is not None
+    assert (first.converted_keys, first.kept_keys, first.inherited_keys) == (2, 1, 2)
+    assert (first.source_bytes_read_this_run, first.new_bytes_written_this_run) == (36, 24)
+    assert first.normalization_worst_relative_frobenius is not None
+    original, prepared = header(store, source), header(store, artifact)
+    assert original["components"]["frozen"] == prepared["components"]["frozen"]
+    assert (
+        original["components"]["adapter"]["ready.weight"]
+        == prepared["components"]["adapter"]["ready.weight"]
+    )
+    for key in rows["adapter"]:
+        assert prepared["components"]["adapter"][key]["logical"]["logical_dtype"] == "bf16"
+        assert read_value(tmp_path, store, artifact, "adapter", key, len(expected)) == expected
+    assert again == artifact and replay.replayed
+    assert (replay.source_bytes_read_this_run, replay.new_bytes_written_this_run) == (0, 0)
+
+
+@pytest.mark.parametrize("encoding", ["fp8-rowwise/1", "mxfp8/1"])
+def test_explicit_fp16_selection_keeps_quantized_parts_and_changes_logical_dtype(
+    tmp_path: Path, encoding: str
+) -> None:
+    values = np.arange(256, dtype="<f2").reshape(8, 32) / 256
+    store, source = mint(tmp_path, {"adapter": {"a.weight": ("f16", (8, 32), values.tobytes())}})
+    _, original = run(tmp_path, store, source, plan(("adapter",), encoding), name="fp16")
+    result, prepared = run(
+        tmp_path,
+        store,
+        source,
+        plan(("adapter",), encoding, bf16_sources=("f16", "f32")),
+        name="bf16",
+    )
+    before = header(store, original)["components"]["adapter"]["a.weight"]
+    after = header(store, prepared)["components"]["adapter"]["a.weight"]
+    assert before["logical"]["logical_dtype"] == "f16"
+    assert after["logical"]["logical_dtype"] == "bf16"
+    assert before["parts"] == after["parts"]
+    assert result is not None and (result.encoded_keys, result.converted_keys) == (1, 0)
 
 
 def test_keep_listed_fp32_component_preserves_exact_native_objects(tmp_path: Path) -> None:
