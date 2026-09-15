@@ -850,16 +850,18 @@ class WorkspaceActivationCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ...) -> None: ...
 
 class ProtocolInfoResult(_message.Message):
-    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery")
+    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery", "supports_local_installation_reuse")
     WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     MINIMUM_WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_MIXED_MODEL_INPUTS_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_MODEL_MATERIALIZATION_RECOVERY_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_LOCAL_INSTALLATION_REUSE_FIELD_NUMBER: _ClassVar[int]
     wire_minor: int
     minimum_wire_minor: int
     supports_mixed_model_inputs: bool
     supports_model_materialization_recovery: bool
-    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ...) -> None: ...
+    supports_local_installation_reuse: bool
+    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ..., supports_local_installation_reuse: bool = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
     __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "supports_model_materialization_recovery")
@@ -2050,16 +2052,18 @@ class DesiredPrivatePlacementSet(_message.Message):
     def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ...) -> None: ...
 
 class NativeModelBinding(_message.Message):
-    __slots__ = ("slot", "model", "manifest", "retention")
+    __slots__ = ("slot", "model", "manifest", "retention", "adapters")
     SLOT_FIELD_NUMBER: _ClassVar[int]
     MODEL_FIELD_NUMBER: _ClassVar[int]
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
     RETENTION_FIELD_NUMBER: _ClassVar[int]
+    ADAPTERS_FIELD_NUMBER: _ClassVar[int]
     slot: str
     model: str
     manifest: Ref
     retention: DerivedRetentionRequest
-    def __init__(self, slot: _Optional[str] = ..., model: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., retention: _Optional[_Union[DerivedRetentionRequest, _Mapping]] = ...) -> None: ...
+    adapters: _containers.RepeatedCompositeFieldContainer[DownloadAdapterRef]
+    def __init__(self, slot: _Optional[str] = ..., model: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ..., retention: _Optional[_Union[DerivedRetentionRequest, _Mapping]] = ..., adapters: _Optional[_Iterable[_Union[DownloadAdapterRef, _Mapping]]] = ...) -> None: ...
 
 class LocalPackageFileRef(_message.Message):
     __slots__ = ("digest", "filename", "length")
@@ -2130,20 +2134,40 @@ class DownloadDelegation(_message.Message):
     def __init__(self, expires_at_unix: _Optional[int] = ..., models: _Optional[_Iterable[_Union[DownloadModelRef, _Mapping]]] = ..., packages: _Optional[_Iterable[_Union[DownloadPackageRef, _Mapping]]] = ..., rental_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_tls_certificate_digest: _Optional[bytes] = ...) -> None: ...
 
 class DownloadModelRef(_message.Message):
-    __slots__ = ("manifest", "model", "release", "package", "slot", "lane")
+    __slots__ = ("manifest", "model", "release", "package", "slot", "lane", "adapters")
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
     MODEL_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     SLOT_FIELD_NUMBER: _ClassVar[int]
     LANE_FIELD_NUMBER: _ClassVar[int]
+    ADAPTERS_FIELD_NUMBER: _ClassVar[int]
     manifest: str
     model: str
     release: str
     package: str
     slot: str
     lane: str
-    def __init__(self, manifest: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ..., package: _Optional[str] = ..., slot: _Optional[str] = ..., lane: _Optional[str] = ...) -> None: ...
+    adapters: _containers.RepeatedCompositeFieldContainer[DownloadAdapterRef]
+    def __init__(self, manifest: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ..., package: _Optional[str] = ..., slot: _Optional[str] = ..., lane: _Optional[str] = ..., adapters: _Optional[_Iterable[_Union[DownloadAdapterRef, _Mapping]]] = ...) -> None: ...
+
+class DownloadAdapterRef(_message.Message):
+    __slots__ = ("component", "model", "release", "lane", "manifest", "source_component", "scale")
+    COMPONENT_FIELD_NUMBER: _ClassVar[int]
+    MODEL_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_FIELD_NUMBER: _ClassVar[int]
+    LANE_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_COMPONENT_FIELD_NUMBER: _ClassVar[int]
+    SCALE_FIELD_NUMBER: _ClassVar[int]
+    component: str
+    model: str
+    release: str
+    lane: str
+    manifest: str
+    source_component: str
+    scale: str
+    def __init__(self, component: _Optional[str] = ..., model: _Optional[str] = ..., release: _Optional[str] = ..., lane: _Optional[str] = ..., manifest: _Optional[str] = ..., source_component: _Optional[str] = ..., scale: _Optional[str] = ...) -> None: ...
 
 class DownloadPackageRef(_message.Message):
     __slots__ = ("package", "release")
@@ -2254,18 +2278,32 @@ class Entrypoint(_message.Message):
     def __init__(self, name: _Optional[str] = ..., entrypoint_binding_digest: _Optional[bytes] = ..., slots: _Optional[_Iterable[_Union[Slot, _Mapping]]] = ...) -> None: ...
 
 class Slot(_message.Message):
-    __slots__ = ("slot", "reference_model_id", "components", "model_construction_contract", "stamps")
+    __slots__ = ("slot", "reference_model_id", "components", "model_construction_contract", "stamps", "adapters")
     SLOT_FIELD_NUMBER: _ClassVar[int]
     REFERENCE_MODEL_ID_FIELD_NUMBER: _ClassVar[int]
     COMPONENTS_FIELD_NUMBER: _ClassVar[int]
     MODEL_CONSTRUCTION_CONTRACT_FIELD_NUMBER: _ClassVar[int]
     STAMPS_FIELD_NUMBER: _ClassVar[int]
+    ADAPTERS_FIELD_NUMBER: _ClassVar[int]
     slot: str
     reference_model_id: str
     components: _containers.RepeatedCompositeFieldContainer[Component]
     model_construction_contract: Ref
     stamps: _containers.RepeatedCompositeFieldContainer[Stamp]
-    def __init__(self, slot: _Optional[str] = ..., reference_model_id: _Optional[str] = ..., components: _Optional[_Iterable[_Union[Component, _Mapping]]] = ..., model_construction_contract: _Optional[_Union[Ref, _Mapping]] = ..., stamps: _Optional[_Iterable[_Union[Stamp, _Mapping]]] = ...) -> None: ...
+    adapters: _containers.RepeatedCompositeFieldContainer[ModelAdapter]
+    def __init__(self, slot: _Optional[str] = ..., reference_model_id: _Optional[str] = ..., components: _Optional[_Iterable[_Union[Component, _Mapping]]] = ..., model_construction_contract: _Optional[_Union[Ref, _Mapping]] = ..., stamps: _Optional[_Iterable[_Union[Stamp, _Mapping]]] = ..., adapters: _Optional[_Iterable[_Union[ModelAdapter, _Mapping]]] = ...) -> None: ...
+
+class ModelAdapter(_message.Message):
+    __slots__ = ("component", "model_id", "source_component", "scale")
+    COMPONENT_FIELD_NUMBER: _ClassVar[int]
+    MODEL_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_COMPONENT_FIELD_NUMBER: _ClassVar[int]
+    SCALE_FIELD_NUMBER: _ClassVar[int]
+    component: str
+    model_id: str
+    source_component: str
+    scale: str
+    def __init__(self, component: _Optional[str] = ..., model_id: _Optional[str] = ..., source_component: _Optional[str] = ..., scale: _Optional[str] = ...) -> None: ...
 
 class Component(_message.Message):
     __slots__ = ("component", "model_id")
