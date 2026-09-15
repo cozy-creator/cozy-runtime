@@ -100,6 +100,7 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
         assert type(model.model).__name__ == "Qwen3VLModel"
         deltas: Any = model.model.rope_deltas
         assert deltas.numel() == 1
+        del deltas
         observe()
         if device == "cuda":
             assert ledger.device_allocated - opened["device_allocated"] == 512
@@ -107,6 +108,8 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
         model.model.rope_deltas = None
         ledger.unreconciled = ""
         observe()
+        if device == "cuda":
+            assert ledger.device_allocated == opened["device_allocated"]
 
         for index in range(4):
             opened = observe()
