@@ -105,7 +105,7 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str) -> None:
                         "local_length": shards[0].shape[1],
                         "step": layout.step,
                         "dense_paths": layout.dense_paths,
-                        "counts": counts,
+                        "combined_reference_and_parallel_calls": counts,
                         "equal": True,
                     }
                 )

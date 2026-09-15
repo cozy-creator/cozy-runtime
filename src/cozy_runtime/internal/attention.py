@@ -1204,6 +1204,21 @@ class Swap:
         return Applied(hosts, locations, (self.entry.name,), self.pin or self.entry.name, proofs)
 
 
+def _is_selected(defaults: Snapshot, roots: Mapping[str, Any], pin: str) -> bool:
+    """A repeated prepared pin is a no-op only at every site in its nonempty scope."""
+    scope, name = _pin_parts(pin)
+    candidate = BY_NAME.get(name)
+    if candidate is None:
+        return False
+    prepared = {id(processor): member for processor, member in defaults.choices}
+    records = [row for row in _attention_records(roots) if _matches(row[0], scope)]
+    return bool(records) and all(
+        getattr(processor, "_attention_backend", None) == candidate.backend
+        and prepared.get(id(processor)) == candidate.backend
+        for _, _, _, processor in records
+    )
+
+
 def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str = "") -> Candidate:
     scope, backend = _pin_parts(name)
     candidate = BY_NAME.get(backend)

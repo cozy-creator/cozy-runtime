@@ -30,23 +30,45 @@ _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
 _DENSE: Callable[..., Any] | None = None
 _DENSE_IDENTITY = ""
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
+_RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
+    "cozy_sol_rank_counts", default=None
+)
 
 
 @contextmanager
-def observing() -> Iterator[dict[str, int]]:
+def observing(*, ranks: dict[int, dict[str, int]] | None = None) -> Iterator[dict[str, int]]:
     """Count successful calls in this request, restoring any outer observation."""
     counts = dict.fromkeys(("sparse", "dense_step", "dense_path", "dense_prefix"), 0)
     token = _COUNTS.set(counts)
+    rank_token = _RANK_COUNTS.set(ranks)
     try:
         yield counts
     finally:
         _COUNTS.reset(token)
+        _RANK_COUNTS.reset(rank_token)
 
 
 def _count(kind: str) -> None:
     counts = _COUNTS.get()
     if counts is not None:
         counts[kind] += 1
+
+
+def record_rank(rank: int, counts: dict[str, int]) -> None:
+    """Retain counts acknowledged by a follower on the existing mirrored-call reply."""
+    ranks = _RANK_COUNTS.get()
+    if ranks is None:
+        return
+    if (
+        type(rank) is not int
+        or rank < 1
+        or set(counts) != {"sparse", "dense_step", "dense_path", "dense_prefix"}
+        or any(type(value) is not int or value < 0 for value in counts.values())
+    ):
+        raise ValueError("invalid follower Sol attention counts")
+    total = ranks.setdefault(rank, dict.fromkeys(counts, 0))
+    for name, value in counts.items():
+        total[name] += value
 
 
 def bind_dense(call: Callable[..., Any], identity: str) -> None:

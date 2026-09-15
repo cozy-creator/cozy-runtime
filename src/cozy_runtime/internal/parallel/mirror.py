@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.internal import attention_sol
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GroupRefusal
@@ -87,6 +88,7 @@ def mirror_component(
                             f"{reply.get('detail', '')}"[:600],
                             code=str(reply.get("code") or "group_broken"),
                         )
+                    attention_sol.record_rank(reply["rank"], reply["sol_calls"])
                 return result
             except BaseException:
                 group._break(f"mirrored component {name!r} failed")
