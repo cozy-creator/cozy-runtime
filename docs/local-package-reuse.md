@@ -10,8 +10,14 @@ carriers have been removed. Runtime reopens its exact immutable environment,
 verifies the retained interface and current base identity, restores job plans,
 and registers the revision and operation before acknowledging preparation.
 
-A caller may probe a previously successful operation before sending wheels for a
-fresh root. `local_package_reuse_unavailable` means the retained environment cannot
-be reopened; the caller must upload under a new operation. A successful preparation
-reuses code and dependencies only. Every root still creates and executes its own
-request.
+A caller asks about its exact revision under the current operation before sending
+wheels. Runtime reopens by revision and registers that operation even when Host has
+no previous transfer record. A hit does not manufacture received-wheel receipts.
+`local_package_reuse_unavailable` means the caller must upload the missing revision
+under that operation. A successful preparation reuses installed code and dependencies
+only. Every root still creates and executes its own request.
+
+The independently negotiated `supports_local_installation_reuse` capability is
+required before making that probe. Older Hosts rebuild `ProtocolInfoResult` from
+their supported fields, so they cannot pass this capability through from a newer
+Runtime. A new Host with an old Runtime also reports false.
