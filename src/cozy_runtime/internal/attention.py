@@ -940,11 +940,13 @@ def for_model(pin: str, parameters: Sequence[str]) -> str:
 
 
 def _matches(component: str, scope: str) -> bool:
-    return (
-        not scope
-        or component == scope
-        or ("/" not in scope and component.rsplit("/", 1)[-1] == scope)
-    )
+    if not scope or component == scope:
+        return True
+    model, qualified, name = scope.partition("/")
+    if not qualified:
+        return component.rsplit("/", 1)[-1] == scope
+    owners, owned, component_name = component.partition("/")
+    return bool(owned and model in owners.split("+") and name == component_name)
 
 
 def _eligible(
