@@ -1,6 +1,5 @@
 """Real H3 fusion-control compatibility with standard weights and native PEFT."""
 
-
 import pytest
 
 from cozy_runtime.internal.encoding.torchao_rowwise import bind_rowwise_weight
