@@ -327,3 +327,53 @@ def test_peft_selection_and_variant_kwargs_cannot_override_request(kwargs: dict[
     with scope(binding, adapter), pytest.raises(AdapterRefusal, match="single Linear input"):
         model[0](torch.ones(2, 4, dtype=torch.bfloat16), **kwargs)
     binding.close()
+
+
+def test_inner_adapter_failure_retaining_an_operand_requires_generation_retirement() -> None:
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    model, _base, binding, adapter = fixture(torch.float32)
+    dispatch_base: Any = TorchDispatchMode
+
+    class FailAdapterMM(dispatch_base):  # type: ignore[misc]
+        def __init__(self, pointer: int) -> None:
+            super().__init__()
+            self.pointer = pointer
+
+        def __torch_dispatch__(
+            self, func: Any, types: Any, args: Any = (), kwargs: Any = None
+        ) -> Any:
+            if func == torch.ops.aten.mm.default and any(
+                isinstance(value, torch.Tensor)
+                and value.untyped_storage().data_ptr() == self.pointer
+                for value in args
+            ):
+                raise RuntimeError("injected native adapter dispatch refusal")
+            return func(*args, **(kwargs or {}))
+
+    held_error = None
+    try:
+        with scope(binding, adapter):
+            pointer = model[0].lora_A["request_0"].weight.untyped_storage().data_ptr()
+            with FailAdapterMM(pointer):
+                model(torch.ones(2, 4))
+    except RuntimeError as exc:
+        held_error = exc
+    assert held_error is not None
+    tb = held_error.__traceback__
+    retained: list[Any] = []
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "__torch_dispatch__":
+            retained.extend(
+                value
+                for value in tb.tb_frame.f_locals["args"]
+                if isinstance(value, torch.Tensor) and value.untyped_storage().data_ptr() == pointer
+            )
+        tb = tb.tb_next
+    assert retained  # Actual operands remain valid; cleanup did not resize aliases.
+    assert all(value.untyped_storage().nbytes() > 0 for value in retained)
+    with pytest.raises(AdapterRefusal, match="closed or poisoned"):
+        binding.check_ready()
+    with pytest.raises(AdapterRefusal, match="closed or poisoned"), scope(binding, adapter):
+        pass
+    binding.close()

@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from types import MappingProxyType
+from types import MappingProxyType, MethodType
 from typing import Any
 
 from cozy_runtime.author._context import AdapterRef
@@ -77,6 +77,23 @@ class _Observed:
         attempt = self.binding._active.get()
         if attempt is not None and attempt.terms.get(self.site):
             attempt.calls += 1
+
+
+def _peft_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+    """An entered PEFT execution owns any failure from its base/A/B operations.
+
+    Pre-hook admission errors happen before this function; user post-hook errors
+    happen after it. A native inner failure may retain factor operands in its
+    traceback, so the generation must be retired rather than reused.
+    """
+    gate = next(hook for hook in self._forward_pre_hooks.values() if isinstance(hook, _Gate))
+    attempt = gate.binding._active.get()
+    try:
+        return type(self).forward(self, *args, **kwargs)
+    except BaseException:
+        if attempt is not None and attempt.terms.get(gate.site):
+            gate.binding._poisoned = True
+        raise
 
 
 def prequantized_input_allowed(module: Any) -> bool:
@@ -214,6 +231,7 @@ class LinearAdapters:
                 self._handles.append(
                     layer.register_forward_hook(_Observed(self, site), prepend=True)
                 )
+                layer.forward = MethodType(_peft_forward, layer)
         except BaseException:
             self.close()
             raise
