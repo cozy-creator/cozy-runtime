@@ -23,6 +23,12 @@ Runtime wheel digest; package admission uses the declared range and selects the 
 active Runtime/profile. The protobuf package major and additive wire minor remain their own
 worker-control compatibility contract.
 
+Published dependency declarations allow patch upgrades, including optional extras.
+Minimum versions (`>=`) are preferred; major/minor compatibility ranges are permitted.
+Exact development and CI versions belong in `uv.lock`; worker images retain their exact
+wheel and image digests. The Python ABI bound is independent of dependency version
+policy. The `dependency-version-ranges` architecture fence holds this boundary.
+
 **One end-to-end test suite, no mocks.** `uv run pytest` runs against
 `examples/marco-polo` through the public CLI installed from a freshly built wheel into a venv
 that has nothing else: describe, an exact byte-identical package interface replay, the exit-code
