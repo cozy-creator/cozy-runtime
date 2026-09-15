@@ -165,8 +165,12 @@ def select(
     return selected
 
 
-def materialize(worker: Worker, rows: list[dict[str, Any]], access: ExitStack) -> None:
-    """Hold native read leases through preparation until the child owns durable pins."""
+def materialize(worker: Worker, rows: list[dict[str, Any]], access: ExitStack | None) -> None:
+    """Verify exact sources; lease bytes only when the preparer will read them.
+
+    A reused placement consumes its registered binding document. Its fresh child
+    admission still verifies and retains every checkpoint before submission.
+    """
     if not rows:
         return
     assert worker.workspace is not None
@@ -193,7 +197,8 @@ def materialize(worker: Worker, rows: list[dict[str, Any]], access: ExitStack) -
                 store.verify_checkpoint_source(
                     row["repository"], manifest["digest"], manifest["length"]
                 )
-            access.enter_context(store.acquire_cozytensors(manifest["digest"]))
+            if access is not None:
+                access.enter_context(store.acquire_cozytensors(manifest["digest"]))
         except tensorfs.errors.Refusal as error:
             raise WorkspaceRefusal(
                 "captured Model default materialization refused: " + str(error.code)
