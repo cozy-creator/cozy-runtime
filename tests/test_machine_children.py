@@ -802,6 +802,25 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
             assert not worker.connected.is_set()
             assert worker.workspace is not None
             with worker.workspace.locked() as db:
+                if case == "serving":
+                    logs = [
+                        canonical_json.decode(row["body"])
+                        for row in db.execute("SELECT body FROM execution_events WHERE kind='log'")
+                    ]
+                    invoked = [
+                        log["payload"]["fields"]
+                        for log in logs
+                        if log.get("payload", {}).get("name") == "executor invoke"
+                    ]
+                    released = [
+                        log["payload"]["fields"]
+                        for log in logs
+                        if log.get("payload", {}).get("name") == "executor release"
+                    ]
+                    assert invoked and released
+                    assert all(row["pid"] > 0 and row["started_ticks"] > 0 for row in invoked)
+                    assert all(row["ranks"] and row["reusable"] for row in released)
+                    assert all(not row["reuse_miss_reason"] for row in released)
                 assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == (
                     2
                     if case == "source"

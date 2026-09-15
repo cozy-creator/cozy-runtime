@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any, cast
 
 import torch
@@ -13,6 +14,22 @@ from cozy_runtime.author import ConformanceError
 _SOURCE_ARCHITECTURE = "Qwen3VLForConditionalGeneration"
 _SOURCE_LAYERS = 64
 _RETAINED_LAYERS = 50
+
+
+@contextmanager
+def conditioning_scope(conditioner: Any) -> Iterator[None]:
+    """Release Qwen's autoregressive position cache after H3's complete forward.
+
+    Diffusers requests hidden states with ``use_cache=False``. Qwen3VLModel still
+    stores ``rope_deltas`` on its first image input; no later H3 call consumes it.
+    Its one int64 allocation kept 512 CUDA bytes after the second long-form shot,
+    correctly tripping Runtime's strict ledger and rebuilding the entire group.
+    Clear the unused cache on failures too, without changing any returned tensor.
+    """
+    try:
+        yield
+    finally:
+        conditioner.model.rope_deltas = None
 
 
 def text_conditioner_config() -> dict[str, object]:

@@ -77,11 +77,12 @@ jobs:
       - run: uv python install 3.12
       - run: uv sync --locked
       - run: uv pip install --python .venv/bin/python --index https://download.pytorch.org/whl/cpu "torch==2.13.0"
-      - run: uv pip install --python .venv/bin/python "diffusers==0.40.0" "accelerate==1.14.0"
+      - run: uv pip install --python .venv/bin/python "diffusers==0.40.0" "accelerate==1.14.0" "transformers==5.16.1"
       - run: .venv/bin/python -c "import torch; assert torch.version.cuda is None"
       - run: >-
           .venv/bin/python -m pytest tests/test_parallel_calls.py
           tests/test_job_source_derivation.py tests/test_construction_dtype.py
+          tests/test_h3_conditioner_lifecycle.py
           tests/test_end_to_end.py::test_real_modeled_package_prepare_can_be_acquired_before_model_selection -q -rs
       - name: Cross the real pod executor UID boundary during warmup
         run: |

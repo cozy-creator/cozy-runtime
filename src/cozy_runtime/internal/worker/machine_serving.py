@@ -6,6 +6,8 @@ import base64
 import contextlib
 import hashlib
 import sys
+import time
+from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,6 +105,29 @@ class Serving:
         self.worker = worker
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="machine-prepare")
         self.pending: dict[tuple[str, str], Future[Prepared]] = {}
+
+    @contextlib.contextmanager
+    def phase(self, call: Call, request: pb.ChildCallRequest, name: str) -> Iterator[None]:
+        """Separate immutable preparation and per-child custody in the parent journal."""
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.worker.emit_progress(
+                call.parent_request,
+                request.parent_attempt_ordinal,
+                {
+                    "kind": "log",
+                    "name": "child preparation",
+                    "value": "info",
+                    "at_unix_ms": int(time.time() * 1000),
+                    "fields": {
+                        "child_request": call.child_request,
+                        "phase": name,
+                        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+                    },
+                },
+            )
 
     def close(self) -> None:
         self.pool.shutdown(wait=True, cancel_futures=True)
@@ -277,7 +302,10 @@ class Serving:
             )
             capture = canonical_json.encode(executions.capture(owner, call.parent_request))
             attempts, delay = executions.retry_policy(owner, call.parent_request)
-            with machine_checkpoint_inputs.admission(workspace, owner, offer.request_id):
+            with (
+                self.phase(call, request, "checkpoint_input_admission"),
+                machine_checkpoint_inputs.admission(workspace, owner, offer.request_id),
+            ):
                 catalog = grants.model_inputs(
                     grants.bind(documents.read(raw, pb.InvocationSpec), offer.grant, identity)
                 )
@@ -312,10 +340,12 @@ class Serving:
             return Prepared(dict(prepared), [], contextlib.ExitStack())
         _, model_arguments = arguments(target, request.request_canonical_bytes)
         native: list[pb.NativeModelBinding] = []
-        defaults = machine_model_defaults.select(worker, owner, call, target, model_arguments)
+        with self.phase(call, request, "select_model_defaults"):
+            defaults = machine_model_defaults.select(worker, owner, call, target, model_arguments)
         access = contextlib.ExitStack()
         try:
-            machine_model_defaults.materialize(worker, defaults, access)
+            with self.phase(call, request, "materialize_model_defaults"):
+                machine_model_defaults.materialize(worker, defaults, access)
             for model in target.declaration["models"]:
                 prefix = target.entrypoint + ".models."
                 path = model["path"]
@@ -387,7 +417,7 @@ class Serving:
                 environment_digest=prepared["environment_digest"],
                 python=Path(worker.options.python or sys.executable),
             )
-            with worker.preparation_lock:
+            with self.phase(call, request, "prepare_model_binding"), worker.preparation_lock:
 
                 def verified(digest: str, length: int, path: Path) -> None:
                     worker.verified_artifacts.record(digest, length, path)

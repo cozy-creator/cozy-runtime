@@ -68,7 +68,7 @@ from cozy_runtime.author import (
 )
 
 from .adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
-from .conditioner import build_text_conditioner
+from .conditioner import build_text_conditioner, conditioning_scope
 from .table_layout import TableLayout
 from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK, TurboOverlay, TurboSchedule
 from .vae_tiles import TileBatchedVideoVAE
@@ -1136,7 +1136,8 @@ class OfficialH3Pipeline:
     def condition_text(
         self, task: Task, state: Any, *, checks: NumericalChecks | None = None
     ) -> None:
-        self._run(task, "text_encoder", state, component="text_encoder")
+        with conditioning_scope(self.components["text_encoder"]):
+            self._run(task, "text_encoder", state, component="text_encoder")
         if checks is not None:
             checks.outputs(
                 "condition_text",
