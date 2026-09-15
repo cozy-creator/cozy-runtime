@@ -77,7 +77,10 @@ def test_mismatched_parts_and_authored_forward_refuse_before_weight_mutation() -
     assert module.weight is original
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="native W8A8 requires an owned GPU")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="the candidate native provider is scoped to SM90",
+)
 def test_native_torchao_preserves_existing_operands_bias_and_peft_input() -> None:
     from peft import LoraConfig, get_peft_model
 

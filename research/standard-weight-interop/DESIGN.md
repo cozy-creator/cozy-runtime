@@ -47,14 +47,50 @@ rounding order. Its CPU forward explicitly refuses a weight-only fallback.
 The provider is deliberately **not in `launch_providers` yet**. Qualification
 must run the actual CUDA test, then the native streaming lifecycle and ordinary
 request/clip comparisons. Do not infer GPU proof from CPU tests. The current
-CPU tests cover all638 logical slots of an actual50-block upstream H3 meta
+CPU tests cover all 638 logical slots of an actual 50-block upstream H3 meta
 construction, real PEFT base eviction/reload and exact CPU weight-only output,
 retained external storage aliases, tied Parameter objects, late request-owned
 Parameters, hook handles and deepcopy. Distinct shared views and components
 mixing this standard binding with legacy encoded replacement modules explicitly
 refuse. They are not silently normalized.
 
-The permanent request-level PEFT change is still pending the coordinated modern
-LoRA integration foundation. The existing wire55 qualification cohort already
-has that foundation and can receive a bounded math/lifetime delta for testing;
-that cohort is never a permanent feature branch or production protocol upgrade.
+`internal/lora.py` now implements the native PEFT request primitive. It installs
+upstream Linear/TorchaoLoraLinear wrappers with a meta-only inactive placeholder,
+copies request factors at the base's logical dtype, and lets PEFT perform every
+projection and accumulation. Existing semantic hooks move to the outer wrapper
+with their original handle registries. Request gates preserve ordered selection,
+cancellation and context isolation. Cleanup removes factors even when a failed
+request's traceback or copied context is retained. No merge/unmerge operation is
+used and no custom LoRA matrix multiplication remains in this primitive.
+
+Temporary admission uses the actual activation row count, rank and dtype before
+the base forward, including its output and PEFT's additional full-sequence
+temporaries. The standard binding additionally prices the existing quantizer's
+eager compatibility fallback conservatively. CUDA adapter requests must provide
+the admission callback. A source-to-execution factor cast happens once during
+preparation and reports `degraded_mode`, `factor_tensors_converted` and
+`factor_device_bytes`; already prepared BF16 factors report no conversion.
+
+The independent FP32 reference and the native BF16 primitive were exercised with
+both complete `transformer_blocks.0.attn.to_k` factor pairs (5376→7168). Spatial
+rank16 at0.3 and Wushu rank32 at0.8 had delta-relative RMSE0.361%/0.285%, cosine
+0.9999936/0.9999965. Repeats, switching back, base eviction/reload while PEFT
+parameters remained live, and the final unadapted base output were exact. These
+are one-projection CPU results with generated encoded base data and an explicitly
+weight-only CPU forward; they establish neither GPU performance nor video quality.
+`peft_request_probe.py` reproduces them using the retained SHA-verified factors.
+
+The permanent caller/wire integration is still pending the coordinated modern
+LoRA foundation. The existing wire55 qualification cohort already has that
+foundation and can receive this bounded math/lifetime delta for testing. It must
+replace the old `TILE_ROWS` pricing/reporting rather than invent a zero-tile
+compatibility constant. That cohort is never a permanent feature branch or
+production protocol upgrade. Native W8A8, streamed fill/restage and ordinary H3
+request/clip comparisons remain promotion gates.
+
+For prepared BF16 checkpoint lanes, reuse the existing public derivation pipeline
+(`prepare_bf16`, `bf16_targets`, `write_bf16`, TensorFS derivation and ordinary
+upload/release). Its current planner intentionally converts only F32, preserving
+F16; therefore Spatial needs an explicit planner selection for F16. Do not change
+that global default or create a separate H3 producer. No prepared BF16 adapter
+manifest has yet been produced by this task.
