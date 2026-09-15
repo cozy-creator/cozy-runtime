@@ -105,14 +105,14 @@ def reopen(
         if len(placements) != 1:
             return None
         placement = placements[0]
-        development = dict(placement["development"])
-        development.pop("project_wheel")
-        if development != documents.body(request.package):
-            return None
         interface = placement["package_interface"]
         package_prepare._verify_local_revision(
             request.package, (interface["digest"], interface["length"]), request.wheels
         )
+        development = dict(placement["development"])
+        development.pop("project_wheel")
+        if development != documents.body(request.package):
+            return None
         installed = package_environment.open_generation(
             root,
             receipt_digest=value["receipt_digest"],
@@ -156,6 +156,5 @@ def reopen(
         documents.DocumentError,
         package_environment.EnvironmentRefusal,
         package_interface.StalePackageInterface,
-        package_prepare.PreparationRefusal,
     ):
         return None

@@ -115,7 +115,7 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers() -> 
                 worker.prepare_local_package(changed)
             changed.CopyFrom(request)
             changed.wheels[0].length += 1
-            with pytest.raises(PreparationRefusal, match="local_package_reuse_unavailable"):
+            with pytest.raises(PreparationRefusal, match="local_package_revision_mismatch"):
                 worker.prepare_local_package(changed)
 
             # Current base identity is part of reopening an installation.
