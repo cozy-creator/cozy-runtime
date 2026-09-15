@@ -722,7 +722,6 @@ class Acquirer:
                         adapters=adapter_selections,
                         adapter_compatibility=adapter_geometry.compatibility,
                         adapter_device_bytes=adapter_geometry.device_bytes,
-                        adapter_scratch_bytes=adapter_geometry.scratch_bytes,
                         # The manifest is identity; lane remains the human repo pointer the
                         # desired download set carried beside it.
                         model=str(reference["repo"])

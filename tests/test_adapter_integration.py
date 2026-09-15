@@ -112,8 +112,39 @@ def test_snapshot_fit_stage_apply_and_same_base_independent_slots(tmp_path: Path
         finally:
             attempt.close()
         assert torch.equal(first(x), baseline) and torch.equal(second(x), baseline)
-    assert 112 + geometry.scratch_bytes in capacity  # factors + static scratch at admission
-    assert geometry.scratch_bytes in capacity  # same bound enforced at every actual target
+    assert 112 in capacity  # all request-owned factors before allocation
+    assert 5 * (3 * 3 + 2) * 4 in capacity  # actual full-sequence target before forward
+
+
+def test_inner_forward_poison_propagates_through_executor_adapter_cleanup(tmp_path: Path) -> None:
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    root, base, ref, model, _, _ = _fixture(tmp_path)
+    selection = adapters.AdapterSelection("dit", ref, "adapter", "1")
+    geometry = adapters.inspect(root, [selection], {"dit": base})
+    controller = AdapterModel({"dit": model}, {"dit": base}, geometry.compatibility, str(root))
+    attempt = AdapterAttempt(
+        {"model": controller},
+        {"model": [selection.document()]},
+        device="cpu",
+        check_cancelled=lambda: None,
+        check_capacity=lambda _nbytes: None,
+    )
+    dispatch_base: Any = TorchDispatchMode
+
+    class RefuseMM(dispatch_base):  # type: ignore[misc]
+        def __torch_dispatch__(
+            self, func: Any, types: Any, args: Any = (), kwargs: Any = None
+        ) -> Any:
+            if func == torch.ops.aten.mm.default:
+                raise RuntimeError("native execution refusal")
+            return func(*args, **(kwargs or {}))
+
+    with RefuseMM(), pytest.raises(RuntimeError, match="native execution refusal"):
+        model(torch.ones(2, 4))
+    with pytest.raises(AdapterRefusal, match="closed or poisoned"):
+        attempt.close()
+    assert not attempt.refs and list(model[0].lora_A) == ["_inactive"]
 
 
 def test_coalesced_model_slots_refuse_even_when_only_one_is_adapted(tmp_path: Path) -> None:
@@ -196,7 +227,9 @@ def test_scale_refuses_noncanonical_or_nonfinite_wire_values(spelling: str) -> N
         adapters.parse_scale(spelling)
 
 
-def test_placement_reserves_factors_and_static_tile_scratch(tmp_path: Path) -> None:
+def test_placement_reserves_factors_and_defers_sequence_scratch_to_actual_input(
+    tmp_path: Path,
+) -> None:
     import os
 
     from cozy_runtime.internal.worker.ledger import Ledger
@@ -223,7 +256,6 @@ def test_placement_reserves_factors_and_static_tile_scratch(tmp_path: Path) -> N
         adapters=(selection, selection),
         adapter_compatibility=geometry.compatibility,
         adapter_device_bytes=geometry.device_bytes,
-        adapter_scratch_bytes=geometry.scratch_bytes,
     )
     declared = DeclaredBinding(
         "sha256:" + "0" * 64,
@@ -259,7 +291,6 @@ def test_placement_reserves_factors_and_static_tile_scratch(tmp_path: Path) -> N
                 adapters=(),
                 adapter_compatibility=(),
                 adapter_device_bytes=0,
-                adapter_scratch_bytes=0,
             ),
         ),
     )
@@ -269,18 +300,18 @@ def test_placement_reserves_factors_and_static_tile_scratch(tmp_path: Path) -> N
     with_adapters = chooser.walks[-1]
     assert (
         with_adapters["rungs"][0]["needs_bytes"] - without["rungs"][0]["needs_bytes"]
-        == geometry.device_bytes + geometry.scratch_bytes
+        == geometry.device_bytes
     )
-    assert adapted.headroom_bytes == geometry.scratch_bytes
-    assert dict(adapted.scope_headroom_bytes)["forward"] == geometry.scratch_bytes
-    assert declared.group_weight_bytes() == 4096 + geometry.device_bytes + geometry.scratch_bytes
+    assert adapted.headroom_bytes == 0
+    assert dict(adapted.scope_headroom_bytes)["forward"] == 0
+    assert declared.group_weight_bytes() == 4096 + geometry.device_bytes
 
 
 def test_zero_strength_source_is_charged_before_any_host_allocation(tmp_path: Path) -> None:
     root, base, ref, model, _, _ = _fixture(tmp_path)
     selection = adapters.AdapterSelection("dit", ref, "adapter", "0")
     geometry = adapters.inspect(root, [selection], {"dit": base})
-    assert geometry.device_bytes == geometry.scratch_bytes == 0
+    assert geometry.device_bytes == 0
     controller = AdapterModel({"dit": model}, {"dit": base}, geometry.compatibility, str(root))
     with pytest.raises(AdapterRefusal) as error:
         AdapterAttempt(

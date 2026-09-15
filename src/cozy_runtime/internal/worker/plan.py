@@ -344,7 +344,6 @@ class ModelBinding:
     adapters: tuple[AdapterSelection, ...] = ()
     adapter_compatibility: tuple[Mapping[str, Any], ...] = ()
     adapter_device_bytes: int = 0
-    adapter_scratch_bytes: int = 0
 
     def snapshot_for(self, component: str) -> str:
         return self.snapshots.get(component, self.reference_snapshot)
@@ -487,11 +486,7 @@ class DeclaredBinding:
             if self.staged_weight_bytes is None
             else self.staged_weight_bytes
         )
-        return (
-            base
-            + sum(model.adapter_device_bytes for model in self.model_bindings())
-            + max((model.adapter_scratch_bytes for model in self.model_bindings()), default=0)
-        )
+        return base + sum(model.adapter_device_bytes for model in self.model_bindings())
 
     def snapshot_for(self, component: str) -> str:
         """This component's snapshot, or the binding's own when the map omits it."""
@@ -754,9 +749,6 @@ class PlanChooser:
         largest = max([max(sizes.values(), default=declared.model_weight_bytes), *scoped])
         activations = terms["activations"]
         adapter_bytes = sum(model.adapter_device_bytes for model in declared.model_bindings())
-        adapter_scratch = max(
-            (model.adapter_scratch_bytes for model in declared.model_bindings()), default=0
-        )
         free = self.ledger.device_free
         # WHAT MAY DENY A RUNG, AND WHAT MAY ONLY DESCRIBE ONE (cr-100).
         #
@@ -850,7 +842,7 @@ class PlanChooser:
             else:
                 headroom = max(scope_demands.values(), default=planning_headroom + largest)
                 capacity = allocatable + sum(resident.values())
-            headroom += adapter_bytes + adapter_scratch
+            headroom += adapter_bytes
             fits = (allocatable < 0 or capacity >= headroom) and not denied
             row = {
                 "rung": placement,
@@ -874,10 +866,9 @@ class PlanChooser:
         # Estimates can select a conservative strategy without becoming a required
         # allocation. In particular, the uncalibrated 1 GiB reserve must not refuse
         # a small staged model. Actual component/block checks still run in the executor.
-        admitted_headroom = (activations.value if activations.enforceable else 0) + adapter_scratch
+        admitted_headroom = activations.value if activations.enforceable else 0
         scope_headrooms = {
-            method: measured_scopes.get(method, admitted_headroom - adapter_scratch)
-            + adapter_scratch
+            method: measured_scopes.get(method, admitted_headroom)
             for method in self.ledger.declared_scopes
         }
         walk = {
@@ -898,7 +889,6 @@ class PlanChooser:
             # they part company exactly when it may not — which is the fact a reader needs
             # in front of them rather than one they have to reconstruct.
             "adapter_device_bytes": adapter_bytes,
-            "adapter_scratch_bytes": adapter_scratch,
             "enforceable_headroom_bytes": admitted_headroom,
             "resident_headroom_bytes": resident_headroom,
             "headroom_basis": headroom_basis,
@@ -959,9 +949,7 @@ class PlanChooser:
         weights = walk["declared_bytes"] or declared.model_weight_bytes
         scope_headrooms = walk["scope_headroom_bytes"]
         if not chosen:
-            required_adapter = int(walk["adapter_device_bytes"]) + int(
-                walk["adapter_scratch_bytes"]
-            )
+            required_adapter = int(walk["adapter_device_bytes"])
             capacity = max(
                 (int(row.get("capacity_bytes", -1)) for row in walk["rungs"]), default=-1
             )

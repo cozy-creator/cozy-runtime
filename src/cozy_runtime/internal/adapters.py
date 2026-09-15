@@ -15,7 +15,7 @@ from typing import Any
 from cozy_runtime.author._model_bindings import scale_string as _scale_string
 from cozy_runtime.internal.encoding import SPEC_PLAIN, TORCH_DTYPES
 from cozy_runtime.internal.fill import Checkpoint, PlanRow
-from cozy_runtime.internal.lora import TILE_ROWS, AdapterInput, AdapterRefusal
+from cozy_runtime.internal.lora import AdapterInput, AdapterRefusal
 from cozy_runtime.protocol import documents
 
 _DECIMAL = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?\Z")
@@ -81,7 +81,6 @@ class AdapterGeometry:
     compatibility: tuple[Mapping[str, Any], ...]
     source_bytes: int
     device_bytes: int
-    scratch_bytes: int
     host_scratch_bytes: int
 
 
@@ -98,7 +97,7 @@ def inspect(
     bases: dict[str, dict[str, PlanRow]] = {}
     targets: dict[str, set[str]] = {}
     compatible: dict[tuple[str, str], dict[str, Any]] = {}
-    source_bytes = device_bytes = scratch_bytes = host_scratch_bytes = 0
+    source_bytes = device_bytes = host_scratch_bytes = 0
     for selection in selections:
         parse_scale(selection.scale)
         component = selection.component
@@ -170,18 +169,14 @@ def inspect(
             }
             if parse_scale(selection.scale) != 0:
                 elements = math.prod(a.shape) + math.prod(b.shape)
-                width = 4
+                width = 4 if base_row.dtype == "f32" else 2
                 device_bytes += elements * width
-                scratch_bytes = max(
-                    scratch_bytes, TILE_ROWS * (a.shape[1] + a.shape[0] + 2 * b.shape[0]) * width
-                )
     return AdapterGeometry(
         tuple(selections),
         {component: tuple(sorted(paths)) for component, paths in sorted(targets.items())},
         tuple(compatible[key] for key in sorted(compatible)),
         source_bytes,
         device_bytes,
-        scratch_bytes,
         host_scratch_bytes,
     )
 

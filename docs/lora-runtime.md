@@ -1,17 +1,55 @@
-# Generic per-slot LoRA execution
+# Generic model-slot LoRA execution
 
-The wire57 serving path binds an ordered adapter list to each model slot, including native retained bases with separately fetched ordinary adapter checkpoints. Each entry selects one base component, an ordinary TensorFS adapter snapshot/component, and a finite decimal strength. The source converter owns ecosystem key normalization; no model-package LoRA loader is called. Unadapted bindings retain the wire44 floor and their previous canonical spelling.
+The serving wire binds an ordered adapter stack to a model slot: base component,
+ordinary checkpoint/component, and finite decimal strength. Creator uses ordinary
+checkpoint references; authored calls use the existing retained-artifact
+`with_adapters` wrapper. Model packages do not implement LoRA loading or math.
+The source converter owns ecosystem key normalization.
 
-Canonical tensors are `<module>.lora_A.weight` `[rank,input]`, `<module>.lora_B.weight` `[output,rank]`, and optional scalar `<module>.alpha` (default rank). Every key must be consumed. Runtime proves target containment against the selected component/base snapshot and constructed linear geometry, reads factors under ordinary verified TensorFS leases, scans finite values, and losslessly promotes FP16/BF16 factors to private FP32 copies while keeping FP32 factors unchanged. Strengths are independent additive coefficients, including negative values. Zero strength still validates source tensors in admitted host memory and owns no device factor allocations. Nonempty adapter configs/assets refuse until their inference-contract semantics are supported; training-task provenance alone does not establish or refute structural fit.
+Canonical tensors are `<module>.lora_A.weight` `[rank,input]`,
+`<module>.lora_B.weight` `[output,rank]`, and optional scalar `<module>.alpha`
+(default rank). Runtime validates every tensor against the selected base snapshot
+and target geometry, reads verified TensorFS data, checks finite values and owns
+independent request copies. Zero strength validates the source but allocates no
+device factors. Nonempty configs/assets refuse until their semantics are supported.
 
-The construction identity contains the exact base/target geometry and adapter implementation digest. Preparation sends only adapter selections and a compatibility digest; each executor rederives the target table locally from admitted headers so large LoRAs do not overflow the control frame. Different adapter payloads, ranks or strengths with the same target set can reuse that construction. Hooks are installed once, before fusion, and survive encoded-leaf restaging through Runtime's existing registry transfer. Active LoRAs require the original floating input; inactive hooks preserve the original fused FP8 activation path. Base parameters and encoded payloads never change.
+Native PEFT owns projection, scaling and accumulation. Supported targets are
+ordinary Linear modules, including real TorchAO quantized weights. Factors use
+the base's logical floating dtype; a one-time preparation cast reports degraded
+mode. Prepared BF16 lanes avoid that cast. Base weights remain immutable; no
+rounded merge/unmerge is used. Construction identity includes target geometry and
+implementation identity, while ordered checkpoints and strengths identify requests.
 
-Low-rank GEMMs run in 4,096-row FP32 tiles, including padded final tiles. Runtime accumulates the base output and every ordered adapter in FP32, then rounds back to the base output dtype once. This follows an FP32 PEFT-style stack; it does not claim byte parity with arbitrary mixed-dtype/autocast PEFT configurations. Hooks run before other local output hooks; wrapped/global/preceding hooks, aliases to input/base storage, unsupported module types and noncontiguous input/output layouts refuse. This avoids sequence-sized copies. Static scratch is bounded by `tile_rows * (input + max_rank + 2 * output) * 4`, independent of sequence length and stack count. Placement reserves all FP32 factor sets plus maximum tile scratch; every rank checks its actual available capacity before allocation. Source copies and validation scratch are checked against the minimum host/current/ancestor cgroup availability, including zero-strength sources. A group leader checks aggregate host copies before any rank begins loading; each rank also rechecks its own budget. These are live preflight checks, not a global RAM reservation against unrelated processes.
+Header inspection prices factor residency and source/validation memory. Actual
+projection inputs determine full-sequence temporary admission before forward;
+there is no fixed 4,096-row scratch estimate. CUDA checks include both physically
+available and authorized free bytes. Host checks include effective cgroup limits.
+Standard quantized binding preserves the previous activation quantizer, fast
+accumulation and separate bias addition while delegating GEMM to TorchAO.
 
-Each attempt owns its CPU copies, device factors and leases. Cancellation/error cleanup clears references even if diagnostics retain an exception/context. Closed or poisoned bindings refuse reuse, including unadapted requests. Per-model `RequestView.adapters` reports the selected stack. Independent model slots may use the same base checkpoint with different stacks; aliases to one constructed root refuse before allocation. Native-base custody remains guarded by the existing workspace claim and retention. The leader opens the same exact stack on every Ulysses rank, verifies digests, includes that identity on mirrored calls, and closes every rank's scope after the attempt.
+Base residency tracks original logical parameter slots across PEFT nesting.
+Eviction/reload touches base-owned parameters, while request factors remain live
+until cleanup. Physical storage census and H3 finite checks flatten quantized
+parts without expanding a dense weight. Current standard bindings support whole
+component residency; the paging planner excludes encoded GEMM routes.
 
-CPU tests cover real TensorFS reads, arithmetic, independent slots, cleanup, static admission and measured live tensor scratch. They do not qualify GPU behavior. Fixed GEMM shapes do not universally guarantee numerical identity: CPU FP32 partition tests showed small reduction differences; BF16 and actual H100 output require their own evidence. H100 1/2/4-GPU parity, peak memory, tile overhead, zero/no-adapter parity with H3 NumericalChecks and generated adapter quality remain qualification gates.
+Existing semantic hooks stay outside native PEFT and retain their handles. H3
+fusion gives active or unowned adapters the original floating input. Request
+gates reject alternate PEFT selection arguments, changed strengths, escaped or
+expired contexts and concurrent use. Failed teardown preserves gates and poisons
+the binding. A failure inside native PEFT may retain operands in a traceback;
+cleanup propagates poison so the executor generation is retired. A script error
+after successful inference can still clean up and reuse a healthy model.
 
-The qualification driver leaves global attention selection automatic. A global BF16 FA3 pin is invalid for complete H3 generation because audio_vae attention uses FP32 activations with head dimension256. Retain the Runtime boot attention line or the placement's triage `plan.attention.hosts` map and verify the actual selected DiT and auxiliary-component kernels across all parity runs; the final execution call-count record alone does not prove that map. Scoped private DiT experiments must restore their processor selections after each request.
+CPU tests cover actual PEFT, TensorFS custody and caller paths. Isolated H100
+projection results are recorded under `research/standard-weight-interop`; they
+do not establish full-video quality, every tensor shape or cross-GPU byte identity.
+The native standard provider remains gated by explicit qualification. Full streamed
+fill/restaging and ordinary 15-second baseline/Spatial/Wushu video comparisons
+remain promotion requirements.
 
-This change remains coordinated with worker-protocol87, Creator's adapter transport and Tensorhub's nested-download support. No partial wire rollout is valid. Ordinary CLI GPU qualification is pending, and model-free job adapter selections explicitly refuse rather than being silently dropped. Bare authored `ModelArtifact` child calls have no adapter-selection wrapper yet; that separate platform follow-up is h3a-042 (tracker PR150). The ordinary CLI qualification path is direct serving; pending native-root migrations are not assumed. Retained Runtime observations report actual degree, matmul precision and executed LoRA call count. No Runtime version bump or PyPI publication is introduced by this work.
+This source is coordinated with refreshed wire57, Creator adapter transport and
+Tensorhub nested model closure. No partial protocol deployment or PyPI release
+is implied. The experimental wire55 qualification branch is never a production
+merge base. Current local-installation reuse capability and newer native custody
+behavior remain part of the refreshed protocol and Runtime.

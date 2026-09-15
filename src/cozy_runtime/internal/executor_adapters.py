@@ -86,9 +86,7 @@ def check_host_capacity(
         (row.host_scratch_bytes for row in rows), default=0
     )
     if str(device).split(":", 1)[0] == "cpu":
-        required += sum(row.device_bytes for row in rows) + max(
-            (row.scratch_bytes for row in rows), default=0
-        )
+        required += sum(row.device_bytes for row in rows)
     required *= copies
     if required == 0:
         return 0
@@ -116,6 +114,7 @@ class AdapterAttempt:
         host_available: Callable[[], int] = proctree.available_host_bytes,
     ) -> None:
         self.stack = ExitStack()
+        self._models = tuple(models[name] for name in selections if name in models)
         self.refs: dict[str, tuple[AdapterRef, ...]] = {}
         self.digest = canonical.digest(selections) if selections else ""
         self.source_bytes = self.device_bytes = 0
@@ -127,9 +126,7 @@ class AdapterAttempt:
             self.host_bytes = check_host_capacity(
                 geometry.values(), device=device, available=host_available
             )
-            check_capacity(
-                self.device_bytes + max((row.scratch_bytes for row in geometry.values()), default=0)
-            )
+            check_capacity(self.device_bytes)
             for name, row in geometry.items():
                 model = models[name]
                 loaded = self.stack.enter_context(
@@ -156,5 +153,10 @@ class AdapterAttempt:
     def close(self) -> None:
         try:
             self.stack.close()
+            # The primitive can retain an operand in an inner native-failure
+            # traceback. Propagate its poison through adapter_end so the executor
+            # generation is retired rather than left cached and reusable.
+            for model in self._models:
+                model.linear.check_ready()
         finally:
             self.refs.clear()

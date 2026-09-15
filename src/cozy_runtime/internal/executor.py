@@ -86,7 +86,7 @@ from cozy_runtime.internal.executor_adapters import (
     validate_slots,
 )
 from cozy_runtime.internal.exits import Exit
-from cozy_runtime.internal.lora import TILE_ROWS, AdapterRefusal
+from cozy_runtime.internal.lora import AdapterRefusal
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup, RankSpec, join_rank
 from cozy_runtime.internal.parallel.mirror import mirror_component
@@ -2431,14 +2431,14 @@ class Executor:
                             device=self._device(),
                             cancel=lambda: _cancelled(self.root, command["request_id"]),
                             models=self.models,
-                            model_adapters=self._adapter_attempt.refs if self._adapter_attempt else {},
+                            model_adapters=self._adapter_attempt.refs
+                            if self._adapter_attempt
+                            else {},
                             progress=progress,
                             # cr-012: the inputs the WORKER already fetched, verified and spooled.
-                            # Every value is a path inside this attempt's own spool: this process is
-                            # never HANDED an address, and `main` installs `sandbox.refuse_network` so a
-                            # handler that dials one anyway is refused rather than merely unexpected.
-                            # That fence is Python-level (cr-042) — it bounds a buggy package, not a
-                            # hostile one, and there is no netns or seccomp under it.
+                            # Each input is an admitted local spool path. The Python
+                            # network fence bounds buggy package code, without claiming
+                            # a netns or seccomp boundary for hostile code.
                             trees={
                                 ref: (Path(root), digest)
                                 for ref, (root, digest) in (command.get("trees") or {}).items()
@@ -2460,8 +2460,13 @@ class Executor:
                             outcome.terminal,
                             degree=self.world,
                             matmul_precision=torch.get_float32_matmul_precision(),
-                            lora_dtype="float32" if held else "none",
-                            lora_tile_rows=TILE_ROWS if held else 0,
+                            lora_backend="peft" if held else "none",
+                            lora_preparation=canonical.write(
+                                {
+                                    name: controllers[name].linear.preparation_facts()
+                                    for name in selected_adapters
+                                }
+                            ).decode(),
                             lora_calls=calls,
                             lora_digest=held.digest if held else "",
                             lora_source_bytes=held.source_bytes if held else 0,
@@ -2674,6 +2679,12 @@ class Executor:
 
     def _adapter_capacity(self, needed: int) -> None:
         if self.device_kind != "cuda" or self.torch is None:
+            available = proctree.available_host_bytes()
+            if needed > available:
+                raise AdapterRefusal(
+                    "adapter_host_shortfall",
+                    f"adapter temporaries need {needed} bytes; available {available}",
+                )
             return
         memory = accel.allocation(self.torch, self.device_kind, self._rank_device(self.torch))
         allocatable = memory["driver_free_bytes"] + max(
