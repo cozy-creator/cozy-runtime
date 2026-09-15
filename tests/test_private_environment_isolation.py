@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import io
 import os
+import shutil
+import stat
 import subprocess
+import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -278,3 +284,242 @@ def test_separate_package_roots_share_uv_payload_inodes_and_safe_cleanup(tmp_pat
     remaining = second.stat()
     assert (remaining.st_ino, remaining.st_mode) == (after.st_ino, after.st_mode)
     assert second.read_bytes().startswith(b"#")
+
+
+@pytest.mark.parametrize("installer", ["locked", "wheel", "fetch"])
+@pytest.mark.parametrize("snapshot_first", [False, True])
+def test_installers_and_snapshots_share_private_cache_root(
+    tmp_path: Path, installer: str, snapshot_first: bool
+) -> None:
+    from cozy_runtime.internal import _installed_dependencies as dependencies
+    from test_installed_dependencies import _distribution, _venv
+    from test_publish_derivation import _SimpleIndex
+
+    cache = tmp_path / "local-packages" / "dependency-objects"
+    source = tmp_path / "source"
+    _distribution(_venv(source), "captured", {"captured.py": b"VALUE=73\n"})
+    snapshots: list[tuple[Path, bytes]] = []
+
+    def capture(target: Path) -> None:
+        manifest = dependencies.snapshot(source / "bin/python", target, set(), cache=cache)
+        snapshots.append((target, manifest))
+
+    if snapshot_first:
+        first = tmp_path / "first-snapshot"
+        _venv(first)
+        capture(first)
+    wheel = _wheel(tmp_path, "cache_client", (), b"VALUE=91\n")
+    index = _SimpleIndex(tmp_path / "index", [wheel])
+    uv_path = shutil.which("uv")
+    assert uv_path is not None
+    uv, python = Path(uv_path), Path(sys.executable)
+    target = tmp_path / "installed"
+    raw = (
+        f"cache-client @ {index.url}cache-client/{wheel.name} "
+        f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}\n"
+    ).encode()
+    rows = environment.read_locked_requirements(raw).rows
+    try:
+        if installer == "locked":
+            environment._install_locked(
+                uv,
+                python,
+                target,
+                tmp_path / "requirements",
+                (index.url,),
+                rows,
+                dependencies=capture,
+                cache_root=cache,
+            )
+        else:
+            if installer == "fetch":
+                inspected = environment.fetch_locked_wheels(
+                    rows, tmp_path / "fetch", environment.observe_base(), cache_root=cache
+                )
+            else:
+                item, _ = environment._measure_inspected_wheel(
+                    wheel, "custom", environment.observe_base()
+                )
+                inspected = [item]
+            environment._install_with_uv(
+                uv, python, target, inspected, dependencies=capture, cache_root=cache
+            )
+    finally:
+        index.close()
+    later = tmp_path / "later-snapshot"
+    _venv(later)
+    capture(later)
+    for root in (cache, cache / "uv-cache"):
+        info = root.lstat()
+        assert stat.S_ISDIR(info.st_mode)
+        assert stat.S_IMODE(info.st_mode) == 0o700
+        assert info.st_uid == os.geteuid()
+        assert root.resolve() == root
+    payloads = []
+    for path, manifest in snapshots:
+        dependencies.verify_files(path, manifest)
+        payloads.append(next(path.glob("lib/python*/site-packages/captured.py")))
+    assert all(path.samefile(payloads[0]) for path in payloads)
+    result = subprocess.run(
+        [
+            str(target / "bin/python"),
+            "-I",
+            "-c",
+            "import cache_client, captured; "
+            "assert (cache_client.VALUE, captured.VALUE) == (91, 73)",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "include-system-site-packages = false" in (target / "pyvenv.cfg").read_text()
+
+
+@pytest.mark.parametrize("kind", ["permissions", "symlink", "file", "relative"])
+def test_dependency_cache_rejects_existing_unsafe_roots_without_repair(
+    tmp_path: Path, kind: str
+) -> None:
+    cache = tmp_path / "cache"
+    if kind == "permissions":
+        cache.mkdir(mode=0o755)
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.mkdir(mode=0o700)
+        cache.symlink_to(target, target_is_directory=True)
+    elif kind == "file":
+        cache.write_text("user-owned")
+    else:
+        cache = Path("relative-dependency-cache")
+    before = cache.lstat() if kind != "relative" else None
+    with pytest.raises(environment.EnvironmentRefusal, match="dependency_cache_invalid"):
+        environment._install_with_uv(
+            Path("/must-not-run"), Path(sys.executable), tmp_path / "staging", [], cache_root=cache
+        )
+    if before is not None:
+        after = cache.lstat()
+        assert (before.st_ino, before.st_mode, before.st_uid) == (
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+        )
+        assert not (cache / "uv-cache").exists()
+
+
+def test_verified_wheel_hook_runs_in_private_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import builtins
+
+    poison = tmp_path / "ambient"
+    poison.mkdir()
+    (poison / "declared_hook.py").write_text("raise RuntimeError('ambient hook')\n")
+    monkeypatch.setenv("PYTHONPATH", str(poison))
+    hook = _wheel(
+        tmp_path,
+        "declared_hook",
+        (),
+        b"import builtins; builtins.cozy_declared_hook_origin = __file__\n",
+        resources={"declared_hook.pth": b"import declared_hook\n"},
+    )
+    project = _wheel(tmp_path, "hook_client", ("declared-hook==1.0",), b"VALUE=47\n")
+    base = environment.observe_base()
+    source = _material(project, (hook,), base)
+    assert not hasattr(builtins, "cozy_declared_hook_origin")
+    installed = environment.materialize(
+        source, tmp_path / "private", base=base, exact_dependencies=True
+    )
+    result = subprocess.run(
+        [
+            str(installed.python),
+            "-I",
+            "-c",
+            "import builtins,sys; from pathlib import Path; import hook_client; "
+            "assert Path(builtins.cozy_declared_hook_origin).is_relative_to(sys.prefix); "
+            "assert hook_client.VALUE == 47",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not hasattr(builtins, "cozy_declared_hook_origin")
+    assert (installed.site_packages / "declared_hook.pth").read_bytes() == b"import declared_hook\n"
+
+
+@pytest.mark.parametrize("damage", ["changed", "unrecorded"])
+def test_wheel_hooks_require_recorded_verified_bytes(tmp_path: Path, damage: str) -> None:
+    wheel = _wheel(
+        tmp_path,
+        "declared_hook",
+        (),
+        b"VALUE=1\n",
+        resources={"declared_hook.pth": b"import declared_hook\n"},
+    )
+    with zipfile.ZipFile(wheel) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    if damage == "changed":
+        members["declared_hook.pth"] = b"import altered_hook_\n"
+    else:
+        record = "declared_hook-1.0.dist-info/RECORD"
+        members[record] = b"".join(
+            line
+            for line in members[record].splitlines(keepends=True)
+            if not line.startswith(b"declared_hook.pth,")
+        )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, body in members.items():
+            archive.writestr(name, body)
+    wheel.write_bytes(output.getvalue())
+    with pytest.raises(environment.EnvironmentRefusal, match="wheel_record_"):
+        environment.measure_wheel(wheel, "custom", environment.observe_base())
+
+
+@pytest.mark.parametrize("purelib", ["true", "false"])
+@pytest.mark.parametrize("scheme", ["root", "platlib"])
+def test_platform_shared_library_wheels_need_no_cpython_abi(
+    tmp_path: Path, purelib: str, scheme: str
+) -> None:
+    tag = "py3-none-manylinux_2_17_x86_64"
+    prefix = "" if scheme == "root" else "ffi_payload-1.0.data/platlib/"
+    wheel = _wheel(
+        tmp_path,
+        "ffi_payload",
+        (),
+        b"VALUE=1\n",
+        resources={
+            prefix + "ffi_payload/libffi.so": b"\x7fELFverified platform library",
+            "ffi_payload-1.0.data/data/share/doc/ffi_payload/LICENSE": b"license\n",
+            "ffi_payload-1.0.dist-info/WHEEL": (
+                f"Wheel-Version: 1.0\nRoot-Is-Purelib: {purelib}\nTag: {tag}\n"
+            ).encode(),
+        },
+    )
+    wheel = wheel.rename(wheel.with_name(f"ffi_payload-1.0-{tag}.whl"))
+    item, _ = environment._measure_inspected_wheel(wheel, "custom", environment.observe_base())
+    assert item.native_members == ("ffi_payload/libffi.so",)
+
+
+@pytest.mark.parametrize("platform", ["any", "manylinux_2_17_aarch64"])
+def test_shared_libraries_still_require_a_matching_concrete_platform(
+    tmp_path: Path, platform: str
+) -> None:
+    tag = f"py3-none-{platform}"
+    wheel = _wheel(
+        tmp_path,
+        "ffi_payload",
+        (),
+        b"VALUE=1\n",
+        resources={
+            "ffi_payload/libffi.so": b"\x7fELFverified platform library",
+            "ffi_payload-1.0.dist-info/WHEEL": (
+                f"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: {tag}\n"
+            ).encode(),
+        },
+    )
+    wheel = wheel.rename(wheel.with_name(f"ffi_payload-1.0-{tag}.whl"))
+    base = environment.observe_base()
+    with pytest.raises(
+        environment.EnvironmentRefusal, match=r"(tag_not_concrete|platform_incompatible)"
+    ):
+        item, _ = environment._measure_inspected_wheel(wheel, "custom", base)
+        environment._require_compatible_tags(item.wheel, base)

@@ -882,6 +882,22 @@ def materialize_locked(
     return installed
 
 
+def _require_dependency_cache_root(cache: Path) -> None:
+    if not cache.is_absolute() or cache.resolve() != cache:
+        raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(cache))
+    try:
+        cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+        info = cache.lstat()
+    except OSError as exc:
+        raise EnvironmentRefusal(
+            "package_environment_dependency_cache_invalid", str(cache)
+        ) from exc
+    if not stat.S_ISDIR(info.st_mode) or (
+        os.name == "posix" and (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700)
+    ):
+        raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(cache))
+
+
 def _install_locked(
     uv: Path,
     python: Path,
@@ -901,6 +917,8 @@ def _install_locked(
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     requirements = cache / "locked-requirements.txt"
     requirements.write_text("".join(row.text + "\n" for row in install_rows))
+    if cache_root is not None:
+        _require_dependency_cache_root(cache_root)
     shared_cache = (cache_root or staging.parent) / "uv-cache"
     shared_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     scoped = ["--cache-dir", str(shared_cache)]
@@ -1011,6 +1029,7 @@ def fetch_locked_wheels(
             # Local package install roots differ. Retain each exact archive only once
             # under the machine cache, independently of the project's full closure.
             if cache_root is not None:
+                _require_dependency_cache_root(cache_root)
                 expected = cache_root / ".stage" / row.hashes[0].removeprefix("sha256:") / filename
             path, length = _fetch_local_locked_wheel(expected, row)
         if path != expected:
@@ -1597,8 +1616,6 @@ def _inspect(
                 mode = member.external_attr >> 16
                 if stat.S_ISLNK(mode):
                     raise EnvironmentRefusal("package_environment_wheel_symlink", name)
-                if not member.is_dir() and PurePosixPath(name).suffix == ".pth":
-                    raise EnvironmentRefusal("package_environment_pth_forbidden", name)
                 if member.is_dir():
                     continue
                 installed = _install_path(name)
@@ -1673,24 +1690,12 @@ def _inspect(
                 raise EnvironmentRefusal(
                     "package_environment_project_wheel_not_pure", "Root-Is-Purelib is not true"
                 )
-            if native_members and root_is_pure != "false":
-                raise EnvironmentRefusal(
-                    "package_environment_native_wheel_metadata_invalid",
-                    f"{wheel.filename} carries native members but Root-Is-Purelib is not false",
-                )
-            if native_members and any(
-                tag.interpreter.startswith("py") or tag.abi == "none" or tag.platform == "any"
-                for tag in declared_tags
-            ):
+            # FFI libraries can be ABI-neutral and installed into purelib (NVIDIA's
+            # wheels use both). Native bytes still require a concrete target platform.
+            if native_members and any(tag.platform == "any" for tag in declared_tags):
                 raise EnvironmentRefusal(
                     "package_environment_native_wheel_tag_not_concrete",
-                    f"{wheel.filename}: native custom wheels require concrete CPython ABI and "
-                    "platform tags",
-                )
-            if native_members and any(".data/" in name for name in names):
-                raise EnvironmentRefusal(
-                    "package_environment_native_install_scheme_forbidden",
-                    f"{wheel.filename}: native wheels may not use a .data install scheme",
+                    f"{wheel.filename}: native custom wheels require concrete platform tags",
                 )
             record_name = dist_infos[0].removesuffix("METADATA") + "RECORD"
             if record_name not in names:
@@ -2006,6 +2011,8 @@ def _install_with_uv(
     dependencies: Callable[[Path], None] | None = None,
     cache_root: Path | None = None,
 ) -> None:
+    if cache_root is not None:
+        _require_dependency_cache_root(cache_root)
     cache = (cache_root or staging.parent) / "uv-cache"
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     commands = [

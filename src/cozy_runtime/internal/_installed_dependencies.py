@@ -35,6 +35,7 @@ from cozy_runtime.internal.package_environment import (
     _fsync_dir,
     _hash_file,
     _name,
+    _require_dependency_cache_root,
     _sha,
     normalized_distribution,
     valid_wheel_version,
@@ -429,16 +430,7 @@ def snapshot(
     if os.name != "posix":
         cache = None
     if cache is not None:
-        cache.mkdir(parents=True, exist_ok=True, mode=0o700)
-        cache_info = cache.lstat()
-        if (
-            not cache.is_absolute()
-            or cache.resolve() != cache
-            or not stat.S_ISDIR(cache_info.st_mode)
-            or cache_info.st_uid != os.geteuid()
-            or stat.S_IMODE(cache_info.st_mode) != 0o700
-        ):
-            raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(cache))
+        _require_dependency_cache_root(cache)
     target_site = target_sites[0]
     distributions: list[dict[str, Any]] = []
     copied: set[Path] = set()
