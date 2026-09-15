@@ -302,6 +302,14 @@ def _prepare_published(
     )
     if installed_environment is not None:
         installed = installed_environment
+        from cozy_runtime.internal import package_requirements
+
+        try:
+            package_requirements.validate(
+                installed.site_packages, python, base or package_environment.observe_base(python)
+            )
+        except package_environment.EnvironmentRefusal as exc:
+            raise PreparationRefusal(exc.code, exc.detail) from exc
     else:
         if inventory is None and dependency_python is None:
             raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")

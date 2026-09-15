@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -144,12 +145,23 @@ def _selection(slot: str, manifest: str) -> dict[str, Any]:
 
 
 def _installed(tmp_path: Path) -> package_environment.InstalledEnvironment:
+    """A metadata-backed tenant overlay using the real test interpreter and SDK."""
     generation = tmp_path / "generation"
     (generation / "bin").mkdir(parents=True)
+    python = generation / "bin" / "python"
+    python.symlink_to(sys.executable)
+    site_packages = generation / "lib"
+    metadata = site_packages / "tenant-1.0.0.dist-info"
+    metadata.mkdir(parents=True)
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.3\nName: tenant\nVersion: 1.0.0\n"
+        "Requires-Python: >=3.12\nRequires-Dist: cozy-runtime\nRequires-Dist: msgspec\n"
+    )
+    (site_packages / "tenant_job.py").write_text((TENANT / "tiny_tenant.py").read_text() + JOB)
     return package_environment.InstalledEnvironment(
         generation=generation,
-        site_packages=generation / "lib",
-        python=generation / "bin" / "python",
+        site_packages=site_packages,
+        python=python,
         receipt_bytes=b"{}",
         receipt_digest="sha256:" + "0" * 64,
         content_digest="sha256:" + "1" * 64,
@@ -201,7 +213,7 @@ def test_a_job_shaped_selection_prepares(
         artifact_cache=tmp_path / "artifacts",
         tensorfs_root=store_root,
         install_root=tmp_path / "install",
-        python=Path("/usr/bin/python3"),
+        python=Path(sys.executable),
         describe=lambda _installed, _distribution: raw,
         verified=lambda _digest, _length, _path: None,
         job_plan_root=tmp_path / "job-plans",
@@ -272,7 +284,7 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
         install_root=tmp_path / "environment",
         selection_root=tmp_path / "selection",
         tensorfs_root=store_root,
-        python=Path("/usr/bin/python3"),
+        python=Path(sys.executable),
         base=base_observation.current(),
     )
     model_rows = tuple(documents.body(row) for row in models)
@@ -366,7 +378,7 @@ def test_an_entrypoints_only_facts_request_refuses_and_names_the_gap(
             artifact_cache=tmp_path / "artifacts",
             tensorfs_root=store_root,
             install_root=tmp_path / "install",
-            python=Path("/usr/bin/python3"),
+            python=Path(sys.executable),
             describe=lambda _installed, _distribution: raw,
             verified=lambda _digest, _length, _path: None,
             job_plan_root=tmp_path / "job-plans",
