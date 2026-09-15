@@ -87,7 +87,7 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
         torch.cuda.set_device(device)
         assert torch.cuda.get_device_capability(device) == (9, 0)
     dist.init_process_group(
-        "nccl" if device_kind == "cuda" else "gloo",
+        "nccl" if device_kind == "cuda" else "cpu:gloo",
         init_method=(root / "rendezvous").as_uri(),
         rank=rank,
         world_size=degree,
@@ -192,6 +192,8 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
                         "output_bytes_equal": True,
                     }
                 )
+        if device_kind == "cpu":
+            assert not torch.cuda.is_initialized(), "CPU Gloo proof initialized CUDA"
         (root / f"rank-{rank}.json").write_text(json.dumps(results))
     finally:
         dist.destroy_process_group()
