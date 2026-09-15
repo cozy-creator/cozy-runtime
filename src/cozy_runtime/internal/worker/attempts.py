@@ -1301,13 +1301,16 @@ class AttemptEngine:
         # freshly installed baseline.
         supervision = self.supervision_for(attempt)
         ledger = self.ledger_for(attempt)
+        processes: list[dict[str, Any]] = []
         with supervision.hold(executor) as owned:
             if not owned:
                 return self._unavailable_reconciliation(attempt, key)
             if not executor.poisoned and attempt.spool:
                 try:
                     with executor.watched("probe"):
-                        ledger.observe_probe(executor.call({"cmd": "probe"}, timeout=None))
+                        probe = executor.call({"cmd": "probe"}, timeout=None)
+                        ledger.observe_probe(probe)
+                        processes = list(probe.get("processes") or [])
                     ledger.device_process = self.device_process(executor.pid)
                 except ExecutorGone:
                     ledger.device_unreadable("the executor died before the ledger was read")
@@ -1336,6 +1339,25 @@ class AttemptEngine:
             # which is the difference between a typed answer before acceptance and an OOM
             # halfway through somebody's VAE decode (cl-003).
             supervision.invalidate(executor, f"ledger_unreconciled: {record['leaks'][0][:160]}")
+        reuse_miss_reason = executor.poisoned or ("" if executor.alive() else "executor_gone")
+        self.progress(
+            attempt.request_id,
+            attempt.attempt,
+            {
+                "kind": "log",
+                "name": "executor release",
+                "value": "info",
+                "at_unix_ms": int(time.time() * 1000),
+                "fields": {
+                    "epoch": executor.epoch,
+                    "pid": executor.pid,
+                    "started_ticks": executor.process.started_ticks,
+                    "ranks": processes,
+                    "reusable": not bool(reuse_miss_reason),
+                    "reuse_miss_reason": reuse_miss_reason,
+                },
+            },
+        )
         return record
 
     def _unavailable_reconciliation(self, attempt: AttemptRecord, key: str) -> dict[str, Any]:
@@ -1626,6 +1648,21 @@ class AttemptEngine:
         seconds = deadline_ms / 1000 - time.time() if deadline_ms else None
         attempt.dispatched_at = time.perf_counter()
         key = f"{attempt.request_id}#{attempt.attempt}"
+        self.progress(
+            attempt.request_id,
+            attempt.attempt,
+            {
+                "kind": "log",
+                "name": "executor invoke",
+                "value": "info",
+                "at_unix_ms": int(time.time() * 1000),
+                "fields": {
+                    "epoch": executor.epoch,
+                    "pid": executor.pid,
+                    "started_ticks": executor.process.started_ticks,
+                },
+            },
+        )
         # The WORKER's own rows. They are the half of the narrative that cannot be lost
         # to the executor's death, because the process that writes them is the one that
         # outlives it — which is exactly what a killed-executor postmortem is made of.

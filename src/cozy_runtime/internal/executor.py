@@ -66,6 +66,7 @@ from cozy_runtime.internal import (
     child_env,
     model_config,
     package_interface,
+    proctree,
     sandbox,
 )
 from cozy_runtime.internal.config import seal_snapshot
@@ -3101,9 +3102,23 @@ class Executor:
                 return self._group_refusal(exc, closing=False)
         return {**self.probe(), "restored": restored}
 
+    def process_incarnations(self) -> list[dict[str, Any]]:
+        """The actual rank births, including a follower that vanished before this probe."""
+        ranks = [(self.rank, os.getpid())]
+        if self.group is not None:
+            ranks.extend((follower.rank, follower.pid) for follower in self.group.followers)
+        rows: list[dict[str, Any]] = []
+        for rank, pid in ranks:
+            row: dict[str, Any] = {"rank": rank, "pid": pid, "started_ticks": None}
+            with contextlib.suppress(OSError, proctree.ProcessTreeUnsupported):
+                row["started_ticks"] = proctree.process_identity(pid).started_ticks
+            rows.append(row)
+        return rows
+
     def probe(self) -> dict[str, Any]:
+        processes = self.process_incarnations()
         if self.torch is None:
-            return {"ok": True, "torch": False, "rss_bytes": _rss()}
+            return {"ok": True, "torch": False, "rss_bytes": _rss(), "processes": processes}
         memory = accel.allocation(self.torch, self.device_kind)
         return {
             "ok": True,
@@ -3115,6 +3130,7 @@ class Executor:
             "residency": self.residency.document() if self.residency else {},
             "rss_bytes": _rss(),
             "attempts": self.attempts,
+            "processes": processes,
             "ready": self.ready,
             "poisoned": self.poisoned,
             **_env_document(),

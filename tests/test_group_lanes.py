@@ -930,6 +930,12 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
         assert [f.hello["rank"] for f in group.followers] == [1, 2]
         assert all(f.hello["world"] == 3 for f in group.followers)
         assert all(f.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1,2" for f in group.followers)
+        # Probe the actual followers before Torch is loaded: rank identity is a
+        # process fact, available even for a weightless executor or failed prepare.
+        for follower, probe in zip(group.followers, group.call({"cmd": "probe"}), strict=True):
+            (process,) = probe["processes"]
+            assert process["rank"] == follower.rank and process["pid"] == follower.pid
+            assert process["started_ticks"] > 0
         assert group.port == 0, "no store exists before formation"
         group.form(torch, {"NCCL_NVLS_ENABLE": "0"})
         assert group.port > 1024, group.port
