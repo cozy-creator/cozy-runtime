@@ -31,7 +31,8 @@ Base residency tracks original logical parameter slots across PEFT nesting.
 Eviction/reload touches base-owned parameters, while request factors remain live
 until cleanup. Physical storage census and H3 finite checks flatten quantized
 parts without expanding a dense weight. Current standard bindings support whole
-component residency; the paging planner excludes encoded GEMM routes.
+component residency for plain and encoded weights. Adapter components that use
+block paging refuse before wrapping.
 
 Existing semantic hooks stay outside native PEFT and retain their handles. H3
 fusion gives active or unowned adapters the original floating input. Request
@@ -44,9 +45,10 @@ after successful inference can still clean up and reuse a healthy model.
 CPU tests cover actual PEFT, TensorFS custody and caller paths. Isolated H100
 projection results are recorded under `research/standard-weight-interop`; they
 do not establish full-video quality, every tensor shape or cross-GPU byte identity.
-The native standard provider remains gated by explicit qualification. Full streamed
-fill/restaging and ordinary 15-second baseline/Spatial/Wushu video comparisons
-remain promotion requirements.
+The standard provider is registered when TorchAO is installed and admitted by its
+current-device native oracle. Streamed CUDA fill/restaging and active PEFT FP8
+dispatch now pass on SM89; see `qualification/tensorfs-torch-consumer.md`. H100 and
+ordinary 15-second baseline/Spatial/Wushu video comparisons remain promotion gates.
 
 This source is coordinated with refreshed wire57, Creator adapter transport and
 Tensorhub nested model closure. No partial protocol deployment or PyPI release

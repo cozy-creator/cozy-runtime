@@ -87,8 +87,8 @@ def test_mismatched_parts_and_authored_forward_refuse_before_weight_mutation() -
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
-    reason="the candidate native provider is scoped to SM90",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="native FP8 requires CUDA SM89 or newer",
 )
 def test_native_torchao_preserves_existing_operands_bias_and_peft_input() -> None:
     from peft import LoraConfig, get_peft_model

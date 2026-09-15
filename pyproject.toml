@@ -109,6 +109,12 @@ implicit_reexport = false
 # papered over: the two modules that touch torch are checked without unused-ignore warnings
 # and with torch itself untyped. `checks/architecture.py::torch-free-import` is what actually
 # holds the packaging rule; mypy never could.
+# Excluding generated stubs from discovery does not exclude imports of them.
+# Keep their useful signatures without checking protoc's unparameterized Mapping.
+[[tool.mypy.overrides]]
+module = ["cozy.worker.v1.worker_pb2"]
+ignore_errors = true
+
 [[tool.mypy.overrides]]
 module = ["torch.*", "torchao.*", "peft.*", "triton.*", "numpy.*", "transformers.*"]
 ignore_missing_imports = true

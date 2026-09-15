@@ -2,8 +2,8 @@
 
 The activation recipe and separate bias addition preserve the existing Runtime
 route. TorchAO owns quantized Tensor dispatch and the GEMM; PEFT can wrap the real
-Linear and retain its original floating input. This binding is not selected by
-the provider registry until native qualification is complete.
+Linear and retain its original floating input. The provider oracle must qualify
+this binding on the execution device.
 """
 
 from __future__ import annotations
@@ -125,7 +125,7 @@ def bind_rowwise_weight(module: Any, payload: Any, scale: Any, *, spec: Tensor) 
 
 @dataclass(frozen=True, slots=True)
 class TorchaoRowwiseLeaf(RowwiseNativeLeaf):
-    """Candidate provider; its own native probe must qualify every execution record."""
+    """Standard weight provider, admitted only by its native device probe."""
 
     @property
     def name(self) -> str:
@@ -133,7 +133,7 @@ class TorchaoRowwiseLeaf(RowwiseNativeLeaf):
 
     @property
     def device_predicate(self) -> str:
-        return "cuda.sm90"
+        return "cuda.sm89+"
 
     def leaf(self, torch: Any, parts: Any, replaced: Any, out_dtype: Any) -> Any:
         module = torch.nn.Linear(

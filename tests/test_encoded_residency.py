@@ -97,8 +97,9 @@ def test_native_tensorfs_encoded_component_lifecycle(tmp_path: Path) -> None:
         ],
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    assert child.returncode == 0, child.stdout + child.stderr
     result = json.loads(child.stdout.splitlines()[-1])
     assert result["phase"] == "passed", child.stdout + child.stderr
     assert result["staging_peak_bytes"] == result["staging_bound_bytes"]

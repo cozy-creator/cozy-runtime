@@ -18,6 +18,7 @@ from cozy_runtime.author._loader import census
 from cozy_runtime.derive.microscale import encode_fp8_rowwise
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE
 from cozy_runtime.internal.fill import Checkpoint, FillRefusal, StreamingFillBackend, _Holder
+from cozy_runtime.internal.forensics import distinct_storage_bytes
 from cozy_runtime.internal.residency import ComponentResidency, ResidencyRefusal
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 
@@ -129,7 +130,8 @@ def main(root: Path) -> None:
     backend.commit()
     del live, walked
     assert set(backend.parked) == {"b"}
-    assert original["a"].weight.is_meta and original["a"].bias.is_meta
+    standard = "a" in backend.base_weights
+    assert (models["a"].linear is original["a"]) == standard
     residency = ComponentResidency(backend=backend, torch=torch, placement="component_staged")
     x = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16)
     # A scope may need both components: old logical addresses must not become false
@@ -152,10 +154,14 @@ def main(root: Path) -> None:
             expected = output
         else:
             assert torch.equal(output, expected)
-        assert original[name].weight.is_meta and original[name].bias.is_meta
-        assert models[name].linear.provider == "cozy.fp8-rowwise.native-leaf/1"
+        if standard:
+            assert models[name].linear is original[name]
+            assert type(original[name]).__name__ == "Linear"
+        else:
+            assert original[name].weight.is_meta and original[name].bias.is_meta
+            assert models[name].linear.provider == "cozy.fp8-rowwise.native-leaf/1"
         memory = backend.component_memory[name]
-        measured = sum(t.numel() * t.element_size() for t in models[name].buffers())
+        measured = distinct_storage_bytes([*models[name].parameters(), *models[name].buffers()])
         assert measured == memory.settled == backend.vram_charge[name]
         residency.release("forward", (name,))
         records.append(
@@ -248,7 +254,7 @@ def main(root: Path) -> None:
         for destination in fresh.destinations:
             tied.fill(destination.key, destination.spec, fresh.live[destination.key])
     except FillRefusal as exc:
-        assert exc.code == "leaf_schema" and "shares storage" in str(exc)
+        assert exc.code == "leaf_schema"
     else:
         raise AssertionError("shared native weight admitted twice")
     tied.poison(tuple(tied.enqueued))

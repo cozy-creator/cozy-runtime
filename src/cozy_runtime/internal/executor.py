@@ -1596,6 +1596,9 @@ class Executor:
                     raise AdapterRefusal(
                         "adapter_runtime_skew", "worker and executor adapter implementations differ"
                     )
+                backend.preserve_adapter_bases(
+                    sorted({str(row["component"]) for row in compatibility})
+                )
                 self.adapter_model = AdapterModel(
                     {**backend.components, **backend.parked},
                     {name: per_component.get(name, binding["snapshot"]) for name in names},

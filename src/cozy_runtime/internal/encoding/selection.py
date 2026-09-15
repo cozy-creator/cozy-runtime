@@ -27,6 +27,7 @@ from __future__ import annotations
 import platform
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from importlib.util import find_spec
 from typing import Any, NoReturn
 
 from cozy_runtime.internal import accel, canonical
@@ -564,6 +565,11 @@ def launch_providers() -> dict[str, tuple[Any, ...]]:
     candidates is `resolution.py`'s joint plan decision over records that exist only where a
     probe measured.
     """
+    from cozy_runtime.internal.encoding.torchao_rowwise import TorchaoRowwiseLeaf
+
+    # The execution extra owns TorchAO. When present, keep ordinary Linear weight
+    # slots so the same native FP8 base supports both bare and PEFT calls.
+    rowwise = TorchaoRowwiseLeaf if find_spec("torchao") is not None else RowwiseNativeLeaf
     known = registry_digests()
     out: dict[str, list[Any]] = {}
     declared: list[tuple[str, str]] = []
@@ -571,7 +577,7 @@ def launch_providers() -> dict[str, tuple[Any, ...]]:
         Verbatim,
         ScaledScalarDequant,
         RowwiseDequant,
-        RowwiseNativeLeaf,
+        rowwise,
         MicroScaledDequant,
         MicroScaledNativeLeaf,
     ):

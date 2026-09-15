@@ -2065,6 +2065,33 @@ class StreamingFillBackend:
 
     # -- component staging (cr-008b) ---------------------------------------------
 
+    def preserve_adapter_bases(self, names: Sequence[str]) -> None:
+        """Capture plain base slots before PEFT changes their module paths.
+
+        Encoded standard slots were captured before fill. Plain components need
+        the same ownership when a request adapter can outlive base residency.
+        """
+        for name in names:
+            if name in self.paging:
+                raise _refuse(
+                    "adapter_paging_unsupported", "PEFT requires whole-component residency", [name]
+                )
+            if name in self.base_weights:
+                continue
+            member = self.components.get(name, self.parked.get(name))
+            if member is None or any(
+                row.contract_key.startswith(f"{name}.") for row in self.replaced.values()
+            ):
+                raise _refuse(
+                    "adapter_base_unsupported",
+                    "PEFT requires ordinary base parameter slots",
+                    [name],
+                )
+            try:
+                self.base_weights[name] = BaseWeights(name, member, census(_Holder({name: member})))
+            except ValueError as exc:
+                raise _refuse("adapter_base_unsupported", f"{name}: {exc}", [name]) from exc
+
     def evict(self, name: str) -> int:
         """FREE one component's device bytes. Returns what came back.
 

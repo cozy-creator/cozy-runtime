@@ -1,42 +1,59 @@
-# TensorFS Torch API consumer
+# TensorFS Torch and PEFT qualification
 
-This branch is stacked on the refreshed native PEFT integration at `4f2d8c3d`,
-including Runtime master `cab0c8eb`. It requires the new TensorFS 0.3.44 API;
-the lock now resolves the published release. No worker, CLI, database, checkpoint changes
-as part of this source patch.
+The current integration combines Runtime #523/#528 with master `a7976db2`.
+It consumes public TensorFS 0.3.44 and the exact wire57 adapter contract from
+worker-protocol `b6e56391`; no storage schema or additional wire fields changed.
 
-Stored weights now go through `tensorfs.from_parts`, with the checkpoint's exact
-logical dtype, shape, encoding ID and physical role specifications. Flat and
-keepdim scale encodings stay distinct. Unsupported contracts refuse before the
-Linear weight changes. TensorFS adopts the actual buffers; Runtime assigns the
-Parameter and retains ownership of base eviction, request factors and admission.
+Stored rowwise FP8 uses `tensorfs.from_parts` and an ordinary `nn.Linear.weight`
+Parameter. Codes and scales remain the physical storage; Runtime retains the
+activation quantizer and separate bias addition. When TorchAO is installed, the
+provider registry registers the standard TorchAO candidate instead of the legacy
+module leaf. Its real native oracle must pass on the current CUDA SM89+ device.
+A stored FP8 checkpoint alone never establishes a native execution route.
 
-Runtime still owns ephemeral activation quantization and its rank-dependent
-wrapper, `KernelPreference.TORCH`, fast accumulation, and separate bias addition.
-The change does not select another numerical recipe, enable a provider, merge a
-LoRA or convert weights during a forward pass.
+Before PEFT wraps a component, Runtime retains its original base parameter slots.
+This now covers plain BF16 components as well as encoded ones, so eviction and
+restaging preserve request-owned factors and canonical checkpoint names. Adapter
+components using block paging refuse before wrapping; whole-component staged
+residency is qualified. Physical storage accounting uses `physical_tensors`.
 
-Storage accounting, fusion identity checks and H3 finite checks now ask TensorFS
-for `physical_tensors`. The built-in H3 fence allows only that inspection function,
-not Store access. No full-weight dequantization is needed to count or scan parts.
+## Local evidence
 
-The native CPU regression writes and reads real rowwise checkpoints in both
-layouts. It checks zero-copy binding, the provider probe, native reread version
-invalidation, PEFT factor ownership across base eviction/restaging, and refusal
-before mutation for mismatched declarations. Existing PEFT, H3 finite-check,
-activation, model-reader and adapter-custody tests are also rerun.
+The owned environment uses Torch 2.13.0+cu130, TensorFS 0.3.44, PyPI TorchAO 0.18.0,
+PEFT 0.20.0, Accelerate 1.15.0, Transformers 5.16.1 and Diffusers 0.40.0. TensorFS
+0.3.44 intentionally refuses TorchAO `0.18.0+cu130`; do not substitute that wheel.
+No shared CLI, daemon, rental or worker image was changed.
 
-Initial paired qualification uses TensorFS source
-`b262ff85755f617bea13fe667cadb1cf938b6063`, its exact local Linux wheel SHA256
-`a6b890b9234f1d3b540c3a4b0d9ef9f183af0b00a4774f48ca651e2457fed451`,
-Torch 2.13 CPU, PEFT 0.20.0 and TorchAO 0.18.0. This is a source integration proof;
-full Runtime streamed CUDA fill and full H3 serving still require their own
-coherent worker qualification. Earlier isolated H100 measurements belong to the
-frozen pre-consumer artifacts, not this new source.
+On an RTX 4070 Laptop (SM89):
 
-TensorFS 0.3.44 is published from source `87f972a9`. The portable wheel SHA256 is
-`5879f3e065753415ddd24955ec57009d68520954ab4910f5336ccec09e315238`.
-The regenerated lock uses the ordinary registry artifact. No qualification wheel
-is vendored in Git and no machine-local path override is committed. Final source
-CI and Runtime streamed CUDA qualification remain separate gates; the user ended
-the paid qualification window before the latter probe ran.
+- 61 tensor, PEFT, fusion, custody and binding tests pass, including the actual
+  CUDA projection equivalence test.
+- Eight streamed/native-residency tests pass. Real TensorFS stores fill plain
+  BF16 and both rowwise scale layouts; active PEFT survives three evict/restage
+  cycles with identical outputs, factor identity and physical base accounting.
+- Active PEFT dispatch records `aten::_scaled_mm` with two E4M3 operands. CUDA
+  traces contain the SM89 CUTLASS E4M3 tensor-core base GEMM and BF16 adapter GEMMs.
+- The existing two-component native lifecycle proof passes with standard weights,
+  repeated identical allocation, admission refusal and poisoned-generation checks.
+  Its measured staging peak equals the admitted 3,153,920 bytes.
+- Full mypy (481 source files), Ruff (486 files), and all 20 architecture fences
+  pass. Focused authored-adapter, custody and registry checks also pass; GPU-only
+  warm checks skip in the separate base-only checking environment.
+
+Logs, dependency inventory, source identity and native profiler traces are retained
+in `outputs/h3a080-peft-finish-20260915` in the workspace.
+
+## Full H3 gate
+
+These small native projections and streamed components do not establish H3 video
+quality, memory at full sequence geometry or H100 behavior. Before promotion,
+qualify the exact reviewed image cohort on H100, then use ordinary `cozy` with
+default `~/.cozy` for the prepared 15-second fight comparison: baseline, Spatial
+0.3, and Wushu 0.8; seed 7381 and 30 steps stay fixed. Existing FP16 Spatial and
+FP32 Wushu storage lanes require an explicit preparation cast to BF16 factors.
+
+Require actual `encoded_gemm`/`torchao.fp8-rowwise.native/1` for every eligible
+base projection and native FP8 dispatch evidence while adapters are active.
+Keep the selected BF16 Sol attention policy identical across comparison arms.
+Refuse unexplained floating fallback; inspect completed video and audio, exact
+adapter echo/call counts, timing, peak memory and spend before calling it qualified.
