@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -112,23 +113,54 @@ def test_scoped_prepare_pin_preserves_other_components_and_rejects_typos() -> No
             attention.plan(_device(), roots, pin)
 
 
-def test_multi_model_scope_and_restore_cover_all_children(tmp_path: Path) -> None:
-    children = [Executor(None, tmp_path / str(i)) for i in range(2)]  # type: ignore[arg-type]
-    all_roots = {}
+@pytest.mark.parametrize(
+    "model_count,aggregate,aliases",
+    [(1, False, False), (1, True, False), (2, True, False), (1, False, True)],
+)
+def test_model_scope_and_restore_use_actual_executor_roots(
+    tmp_path: Path, model_count: int, aggregate: bool, aliases: bool
+) -> None:
+    children = [Executor(None, tmp_path / str(i)) for i in range(model_count)]  # type: ignore[arg-type]
     for i, child in enumerate(children):
         roots = _roots()
         attention.install(_ready("sdpa"), roots)
         child.attention_defaults = attention.snapshot(roots)
-        all_roots.update({f"model{i}/{name}": root for name, root in roots.items()})
-    assert len(attention.plan(_device(), all_roots, "model0/dit=sdpa").sites) == 1
-    assert len(attention.plan(_device(), all_roots, "dit=sdpa").sites) == 2
-    assert len(attention.plan(_device(), all_roots, "sdpa").sites) == 4
-    parent = Executor(None, tmp_path / "parent")  # type: ignore[arg-type]
-    parent.model_executors = children
+        child.models[f"model{i}"] = roots["dit"]
+        if aliases:
+            child.models["alternate"] = roots["dit"]
+        child.device_facts = _device()
+        # Only the component registry is needed here; no storage operations are
+        # substituted. Selection and execution use actual Diffusers processors.
+        child.backend = SimpleNamespace(
+            components={"dit": roots["dit"]}, parked={"vae": roots["vae"]}
+        )
+    parent = children[0]
+    if aggregate:
+        parent = Executor(None, tmp_path / "parent")  # type: ignore[arg-type]
+        parent.model_executors = children
+    all_roots = parent._attention_roots()
+    assert len(parent._attention_plan("model0/dit=sdpa").sites) == 1
+    assert len(parent._attention_plan("dit=sdpa").sites) == model_count
+    assert len(parent._attention_plan("sdpa").sites) == 2 * model_count
+    if aliases:
+        assert len(parent._attention_plan("alternate/dit=sdpa").sites) == 1
+    with pytest.raises(attention.AttentionRefusal, match="matches no"):
+        parent._attention_check("absent/dit=sdpa")
+    parent._attention_check("model0/dit=sdpa")
+    swap = parent._attention_plan("model0/dit=sdpa")
+    with attention.override(
+        parent._attention_snapshot(), all_roots, swap, "model0/dit=sdpa"
+    ) as applied:
+        component = "alternate+model0/dit" if aliases else "model0/dit"
+        assert applied.hosts[component] == {"sdpa": 1}
+        import torch
+
+        with torch.no_grad():
+            assert all_roots[component][0](torch.ones(1, 2, 8)).isfinite().all()
     for _, _, processor in attention._sites(all_roots):
         processor._attention_backend = "stale-request"
     parent._restore_attention()
-    assert _choices(all_roots) == ("native",) * 4
+    assert _choices(all_roots) == ("native",) * (2 * model_count)
 
 
 def test_scoped_pin_preserves_compiled_and_parallel_fences() -> None:

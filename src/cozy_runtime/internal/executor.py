@@ -2461,7 +2461,9 @@ class Executor:
         for executor in executors:
             if executor.backend is None:
                 continue
-            prefix = "+".join(sorted(executor.models)) + "/" if len(executors) > 1 else ""
+            # A qualified request names its model even when it is the only one.
+            # Component-only pins still match through attention._matches.
+            prefix = "+".join(sorted(executor.models)) + "/" if executor.models else ""
             for name, root in {**executor.backend.components, **executor.backend.parked}.items():
                 roots[prefix + name] = root
         return roots
