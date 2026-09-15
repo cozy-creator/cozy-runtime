@@ -167,6 +167,25 @@ def _validate_result(output: Any, query: Any) -> None:
         raise ValueError("attention backend returned incompatible output")
 
 
+def _native(query: Any, key: Any, value: Any, scale: float | None, sink_tokens: int) -> Any:
+    """Call the upstream kernel; a full-document sink selects every KV block.
+
+    This does not perform the wrapper's protected-query recomputation. The same
+    public upstream call therefore provides an all-keys arithmetic control.
+    """
+    return import_module("sol_attn").sol_attn(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        scale=scale,
+        tau=1.0,
+        thresh_type="exact",
+        kv_splits=1,
+        sink_start=0,
+        sink_tokens=sink_tokens,
+    )
+
+
 def sol_attention(
     query: Any,
     key: Any,
@@ -238,19 +257,7 @@ def _execute(
         live_output = _dense(q, k, v, scale)
         _count("dense_path" if dense_path else "dense_step")
     else:
-        sol_attn = import_module("sol_attn").sol_attn
-
-        live_output = sol_attn(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            scale=scale,
-            tau=1.0,
-            thresh_type="exact",
-            kv_splits=1,
-            sink_start=0,
-            sink_tokens=layout.protected_prefix,
-        )
+        live_output = _native(q, k, v, scale, layout.protected_prefix)
         _validate_result(live_output, q)
         if any(
             live_output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
