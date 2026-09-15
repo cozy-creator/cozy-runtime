@@ -25,4 +25,9 @@ def run(config: RuntimeConfig, full: bool = False) -> Result:
     return Result(
         rows=rows,
         next=("cozy-runtime new <name> — scaffold a package",),
+        document={
+            **dict(rows),
+            "supports_guarded_restart": True,
+            "next": ["cozy-runtime new <name> — scaffold a package"],
+        },
     )

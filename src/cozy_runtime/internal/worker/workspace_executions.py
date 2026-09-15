@@ -383,6 +383,16 @@ class Executions:
                 is not None
             )
 
+    def active_count(self) -> int:
+        """All durable roots that could execute, including work with no connected observer."""
+        with self.workspace.locked() as db:
+            return int(
+                db.execute(
+                    "SELECT count(*) FROM executions "
+                    "WHERE state IN ('queued','running','pausing','canceling','retrying')"
+                ).fetchone()[0]
+            )
+
     def preparation(self, owner: str, request: str) -> dict[str, Any]:
         with self.workspace.locked() as db:
             raw = self._row(db, owner, request)["preparation"]

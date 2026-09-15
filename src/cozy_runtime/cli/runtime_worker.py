@@ -167,7 +167,13 @@ def _run(config: WorkerHostConfig) -> int:
     def restart_signal(_signum: int, _frame: object) -> None:
         # Only the root operator can signal this process. The supervisor watcher
         # closes transport outside the signal handler after noticing the stop event.
-        worker.request_restart()
+        try:
+            worker.request_idle_restart()
+        except Exception as exc:
+            # An unreadable activity journal cannot turn an idle-only update into a crash.
+            worker.note(
+                "restart_refused", f"idle restart check failed: {type(exc).__name__}: {exc}"
+            )
 
     signal.signal(signal.SIGTERM, stop_signal)
     signal.signal(signal.SIGINT, stop_signal)

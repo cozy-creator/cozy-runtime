@@ -1120,6 +1120,7 @@ class Worker:
         self.preparation_lock = threading.Lock()
         self.model_source_operations: set[str] = set()
         self.restart_requested = False
+        self.restart_sequence = 0
         if options.owns_tensorfs_store:
             try:
                 self.model_source_operations.update(
@@ -2121,6 +2122,8 @@ class Worker:
     ) -> workspace_executions.Receipt:
         """Authenticated root intake; accepted execution never depends on the caller's stream."""
         with self.control_lock:
+            if self.stop.is_set():
+                raise WorkspaceRefusal("worker is stopping; root admission is closed")
             executions, owner = self._execution_service(claim)
             if publication_authorization_id and self.options.publication_tls is None:
                 raise WorkspaceRefusal("worker has no independent publication authority configured")
@@ -2204,6 +2207,8 @@ class Worker:
         if action not in ("pause", "resume", "cancel"):
             raise ValueError("unknown execution control")
         with self.control_lock:
+            if action == "resume" and self.stop.is_set():
+                raise WorkspaceRefusal("worker is stopping; execution resume is closed")
             executions, owner = self._execution_service(claim)
             state = executions.control(
                 owner,
@@ -2230,6 +2235,8 @@ class Worker:
         if self.executions is None or not self.fence.record_owner_recorded:
             return
         with self.control_lock:
+            if self.stop.is_set():
+                return
             owner = self.fence.record_owner_id
             if self.machine_effects is not None:
                 self.machine_effects.drive(owner)
@@ -3651,6 +3658,44 @@ class Worker:
         if not self.stop.is_set():
             self.restart_requested = True
             self.stop.set()
+
+    def request_idle_restart(self) -> bool:
+        """An operator update cannot interrupt work admitted by a detached client."""
+        with self.control_lock:
+            active_executions = self.executions.active_count() if self.executions is not None else 0
+            active_attempts = sum(
+                attempt.state in (*self.engine.ON_DEVICE, "released")
+                for attempt in self.engine.history.values()
+            )
+            preparing = self.preparation_lock.locked()
+            accepted = not (active_executions or active_attempts or preparing)
+            self.restart_sequence += 1
+            document = {
+                "worker_boot_id": self.fence.worker_boot_id,
+                "pid": os.getpid(),
+                "sequence": self.restart_sequence,
+                "status": "accepted" if accepted else "busy",
+                "active_executions": active_executions,
+                "active_attempts": active_attempts,
+                "preparing": preparing,
+            }
+            path = self.root / "restart-status.json"
+            staged = self.root / f".restart-status-{os.getpid()}"
+            try:
+                with staged.open("wb") as handle:
+                    handle.write(canonical.write(document))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                staged.chmod(0o400)
+                os.replace(staged, path)
+            except OSError as exc:
+                self.note("restart_refused", f"could not record the restart verdict: {exc}")
+                return False
+            if accepted:
+                self.request_restart()
+            else:
+                self.note("restart_refused", "worker update refused while execution is active")
+            return accepted
 
     def shutdown_from_stream(self) -> None:
         self.request_stop()
@@ -6038,6 +6083,14 @@ class Worker:
         # THE ADMISSION FENCE FIRST (§6), because it is the cheapest deterministic verdict
         # and because a stale epoch means the RecordOwner dispatched against a picture
         # of this worker that no longer holds.
+        if self.stop.is_set():
+            self.refuse(
+                offered,
+                "worker_stopping",
+                "the worker is stopping and admits no new attempts",
+                CAUSE.CAUSE_CODE_NO_CAPACITY,
+            )
+            return
         if offered.admission_epoch != self.admission_epoch:
             self.refuse(
                 offered,

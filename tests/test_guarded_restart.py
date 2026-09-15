@@ -1,0 +1,112 @@
+"""Operator restart and durable root admission share one authoritative worker lock."""
+
+from __future__ import annotations
+
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal.worker.control import InMemoryControlHost
+from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.protocol import WIRE_MINOR
+from cozy_runtime.protocol import worker_pb2 as pb
+from test_machine_execution import complete, offer
+
+
+def _worker(root: Path) -> tuple[Worker, pb.Claim]:
+    worker = Worker(
+        RuntimeConfig(
+            cozy_home=root / "home", credentials=Credentials(), bootstrap_credential="proof"
+        ),
+        WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
+        InMemoryControlHost(),
+    )
+    claim = pb.Claim(
+        record_owner_id="owner", record_owner_epoch=1, wire_minor=WIRE_MINOR, proof=b"proof"
+    )
+    assert worker.accept_claim(claim, lambda frame: None)[0] == 1
+    return worker, claim
+
+
+def test_queued_detached_root_refuses_update_then_can_finish(tmp_path: Path) -> None:
+    worker, claim = _worker(tmp_path)
+    try:
+        receipt = worker.submit_execution(claim, "root", b"c" * 32, offer(job=False))
+        # No Control stream/snapshot acknowledgement. Queued work is absent from held_attempts.
+        assert not worker.snapshot_body().held_attempts
+        assert not worker.request_idle_restart()
+        verdict = json.loads((worker.root / "restart-status.json").read_bytes())
+        assert verdict["status"] == "busy" and verdict["active_executions"] == 1
+        assert not worker.stop.is_set()
+        worker.drive_executions()
+        assert worker.execution_status(claim, receipt.request_id).state == "failed"
+        outcome = worker.collect_execution(claim, receipt.request_id)
+        assert worker.request_idle_restart()
+        assert worker.restart_requested and worker.stop.is_set()
+        verdict2 = json.loads((worker.root / "restart-status.json").read_bytes())
+        assert verdict2["status"] == "accepted" and verdict2["sequence"] == verdict["sequence"] + 1
+        assert worker.collect_execution(claim, receipt.request_id) == outcome
+        with pytest.raises(WorkspaceRefusal, match="stopping"):
+            worker.submit_execution(claim, "later", b"d" * 32, offer("later", job=False))
+        worker.drive_executions()  # Cannot reopen admission after a successful guard.
+        assert worker.stop.is_set()
+    finally:
+        worker.shutdown()
+
+
+def test_retry_wait_is_active_and_preparation_is_busy(tmp_path: Path) -> None:
+    worker, claim = _worker(tmp_path)
+    try:
+        assert worker.executions is not None
+        worker.submit_execution(
+            claim, "root", b"c" * 32, offer(job=False), max_attempts=2, retry_delay_ms=60000
+        )
+        complete(
+            worker.executions,
+            "root",
+            status=pb.OUTCOME_STATUS_FAILED,
+            cause=pb.CAUSE_CODE_EXECUTOR_FAULT,
+        )
+        assert worker.executions.status("owner", "root").state == "retrying"
+        assert not worker.request_idle_restart()
+        worker.control_execution(claim, "root", "cancel", 1, "cancel")
+        worker.drive_executions()
+        with worker.preparation_lock:
+            assert not worker.request_idle_restart()
+            assert json.loads((worker.root / "restart-status.json").read_bytes())["preparing"]
+    finally:
+        worker.shutdown()
+
+
+@pytest.mark.parametrize("iteration", range(8))
+def test_restart_and_root_admission_have_exactly_one_winner(tmp_path: Path, iteration: int) -> None:
+    worker, claim = _worker(tmp_path / str(iteration))
+    barrier = threading.Barrier(2)
+
+    def submit() -> bool:
+        barrier.wait()
+        try:
+            worker.submit_execution(claim, "root", b"c" * 32, offer(job=False))
+        except WorkspaceRefusal as exc:
+            assert "stopping" in str(exc)
+            return False
+        return True
+
+    def restart() -> bool:
+        barrier.wait()
+        return worker.request_idle_restart()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            admitted = pool.submit(submit)
+            stopped = pool.submit(restart)
+            assert admitted.result(timeout=10) != stopped.result(timeout=10)
+        assert worker.executions is not None
+        assert bool(worker.executions.active_count()) != worker.stop.is_set()
+    finally:
+        worker.shutdown()
