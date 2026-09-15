@@ -44,3 +44,18 @@ def test_gpu_job_refuses_cuda_initialized_outside_runtime(tmp_path: Path) -> Non
     result = probe("early", tmp_path)
     assert result["code"] == "cuda_initialized_before_runtime"
     assert result["executions"] == 0 and not result["result_written"]
+
+
+@pytest.mark.skipif(not REAL_GPU, reason="requires an allocated CUDA worker with Diffusers/TorchAO")
+@pytest.mark.parametrize("mode", ["preload", "prepare"])
+def test_gpu_prepare_import_order(tmp_path: Path, mode: str) -> None:
+    pytest.importorskip("diffusers")
+    # Importing TorchAO/Diffusers in this process could hide the very cold-import
+    # behavior being tested. The fresh interpreter loads the actual libraries.
+    run = subprocess.run(
+        [sys.executable, str(PROBE.with_name("gpu_prepare_imports.py")), mode, str(tmp_path)],
+        text=True,
+        capture_output=True,
+        timeout=90,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
