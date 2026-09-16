@@ -55,6 +55,29 @@ def test_disjoint_namespace_packages_import_and_reopen(tmp_path: Path) -> None:
     assert reopened.reused and reopened.generation == installed.generation
 
 
+def test_type_stubs_do_not_claim_runtime_module_ownership(tmp_path: Path) -> None:
+    base = environment.observe_base()
+    library = _wheel(
+        tmp_path, "implementation", (), b"", resources={"shared/__init__.py": b"VALUE=42\n"}
+    )
+    stubs = _wheel(
+        tmp_path, "annotations", (), b"", resources={"shared/__init__.pyi": b"VALUE: int\n"}
+    )
+    project = _wheel(
+        tmp_path, "typed_client", ("implementation==1.0", "annotations==1.0"), b"import shared\n"
+    )
+    source = _material(project, (library, stubs), base)
+    installed = environment.materialize(
+        source, tmp_path / "installed", base=base, exact_dependencies=True
+    )
+    subprocess.run(
+        [str(installed.python), "-I", "-c", "import typed_client,shared; assert shared.VALUE==42"],
+        check=True,
+        capture_output=True,
+    )
+    assert (installed.site_packages / "shared/__init__.pyi").is_file()
+
+
 @pytest.mark.parametrize(
     ("first", "second", "code"),
     [
