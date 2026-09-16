@@ -80,6 +80,11 @@ def test_disjoint_namespace_packages_import_and_reopen(tmp_path: Path) -> None:
             {"second-1.0.data/data/lib/python3.12/site-packages/shared/part.py": b"VALUE=2"},
             "resource_collision",
         ),
+        (
+            {"shared/__init__.py": b"VALUE=1"},
+            {"second-1.0.data/data/lib/python3.12/site-packages/shared/other.py": b"VALUE=2"},
+            "import_root_duplicate",
+        ),
     ],
 )
 @pytest.mark.parametrize("reverse", [False, True])
