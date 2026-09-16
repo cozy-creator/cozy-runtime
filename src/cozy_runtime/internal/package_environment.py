@@ -1581,11 +1581,7 @@ def _import_ownership(item: _Inspected, site_packages: PurePosixPath) -> dict[Pu
             resource = _prefix_resource(member.filename)
             if resource is not None and resource.is_relative_to(site_packages):
                 path = resource.relative_to(site_packages)
-        if (
-            member.is_dir()
-            or path is None
-            or not path.name.endswith((".py", *_NATIVE_SUFFIXES))
-        ):
+        if member.is_dir() or path is None or not path.name.endswith((".py", *_NATIVE_SUFFIXES)):
             continue
         name = path.name.partition(".")[0]
         module = path.parent if name == "__init__" else path.with_name(name)
