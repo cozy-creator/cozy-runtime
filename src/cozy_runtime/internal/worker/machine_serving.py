@@ -110,8 +110,14 @@ class Serving:
     def phase(self, call: Call, request: pb.ChildCallRequest, name: str) -> Iterator[None]:
         """Separate immutable preparation and per-child custody in the parent journal."""
         started = time.perf_counter()
+        label = self.worker.calls.progress_label(
+            call.parent_request, request.parent_attempt_ordinal, call.call_index
+        )
+        stage = f"{label} / {name}"[:120] if label else name
         self.worker.emit_progress(
-            call.parent_request, request.parent_attempt_ordinal, {"kind": "progress", "stage": name}
+            call.parent_request,
+            request.parent_attempt_ordinal,
+            {"kind": "progress", "stage": stage},
         )
         succeeded = False
         try:

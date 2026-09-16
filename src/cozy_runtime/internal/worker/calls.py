@@ -36,6 +36,7 @@ class _Pending:
     spool: Path | None = None
     forgotten: bool = False
     local: bool = False
+    progress_label: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +125,16 @@ class Calls:
                     if pending is None:
                         if sum(k[:2] == key[:2] for k in self.pending) >= MAX_ACTIVE_CALLS:
                             raise ValueError("active parent call bound exceeded")
-                        pending = self.pending[key] = _Pending(request, self.stream())
+                        label = frame.get("progress_label", "")
+                        if (
+                            not isinstance(label, str)
+                            or len(label) > 120
+                            or not label.isprintable()
+                        ):
+                            label = ""
+                        pending = self.pending[key] = _Pending(
+                            request, self.stream(), progress_label=label
+                        )
                         local = (
                             self.local(attempt, request, "call") if self.local is not None else None
                         )
@@ -186,7 +196,16 @@ class Calls:
                         + 128
                         > MAX_FRAME
                     ):
-                        raise ValueError("child result and native grants exceed the control frame")
+                        # Optional narration cannot turn a valid child result into a refusal.
+                        answer.pop("progress", None)
+                        if (
+                            len(json.dumps(answer, separators=(",", ":"), sort_keys=True).encode())
+                            + 128
+                            > MAX_FRAME
+                        ):
+                            raise ValueError(
+                                "child result and native grants exceed the control frame"
+                            )
                     return answer
                 return {
                     "ok": False,
@@ -237,6 +256,11 @@ class Calls:
             document = json.loads(row["body"])
             answer["progress"] = {"sequence": row["sequence"], "payload": document["payload"]}
         return answer
+
+    def progress_label(self, parent: str, ordinal: int, index: int) -> str:
+        with self.lock:
+            pending = self.pending.get((parent, ordinal, index))
+            return pending.progress_label if pending is not None else ""
 
     def _request(
         self, attempt: AttemptRecord, frame: Mapping[str, Any], index: int

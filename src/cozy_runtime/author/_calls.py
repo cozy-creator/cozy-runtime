@@ -365,6 +365,7 @@ class _Broker:
             "module": call.binding.module,
             "export": call.binding.export,
             "payload": call.payload.decode(),
+            **({"progress_label": call.progress_scope.name} if call.progress_scope else {}),
             **({"capture": call.capture.document()} if call.capture is not None else {}),
         }
 
