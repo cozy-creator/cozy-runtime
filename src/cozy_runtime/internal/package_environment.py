@@ -1584,7 +1584,7 @@ def _import_ownership(item: _Inspected, site_packages: PurePosixPath) -> dict[Pu
         if (
             member.is_dir()
             or path is None
-            or not path.name.endswith((".py", ".pyi", *_NATIVE_SUFFIXES))
+            or not path.name.endswith((".py", *_NATIVE_SUFFIXES))
         ):
             continue
         name = path.name.partition(".")[0]
