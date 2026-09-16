@@ -12,14 +12,16 @@ outputs exposed detail loss despite passing its numerical smoke test.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from importlib import import_module, metadata
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.internal import attention_fp8, attention_sol, attention_upstream
@@ -207,6 +209,7 @@ class Ready:
     """A baked kernel's variant directory; empty otherwise."""
     admission: dict[str, Any] | None = None
     """Retained arithmetic/contract checks; never a model-quality qualification."""
+    artifact: dict[str, Any] | None = None
 
     @property
     def name(self) -> str:
@@ -304,9 +307,65 @@ def _declared_archs(variant: Path) -> list[str]:
     return [str(arch) for arch in archs] if isinstance(archs, list) else []
 
 
+def _snapshot_location(candidate: Candidate) -> Path:
+    """Prefer an ordinary dependency wheel; never hide a broken installed candidate."""
+    distribution = "cozy-kernel-" + candidate.baked
+    try:
+        installed = metadata.distribution(distribution)
+    except metadata.PackageNotFoundError:
+        return IMAGE_KERNELS_DIR / candidate.baked
+    package = distribution.replace("-", "_")
+    files = installed.files or ()
+    if not any(str(file).startswith(package + "/build/") for file in files):
+        raise AttentionRefusal(
+            "attention_kernel_absent", f"{distribution} carries no recorded kernel snapshot"
+        )
+    return Path(str(installed.locate_file(package)))
+
+
+def _artifact(distribution: str) -> dict[str, Any]:
+    """Identify installed bytes using the wheel inventory already retained by the closure."""
+    installed = metadata.distribution(distribution)
+    record = installed.read_text("RECORD")
+    if not record:
+        raise AttentionRefusal(
+            "attention_kernel_absent", f"{distribution} has no installed wheel RECORD"
+        )
+    result: dict[str, Any] = {
+        "distribution": installed.metadata["Name"],
+        "version": installed.version,
+        "record_digest": "sha256:" + hashlib.sha256(record.encode()).hexdigest(),
+    }
+    direct = installed.read_text("direct_url.json")
+    if direct:
+        try:
+            origin = json.loads(direct)
+            archive = origin.get("archive_info", {})
+            digest = archive.get("hashes", {}).get("sha256")
+            if not digest and str(archive.get("hash", "")).startswith("sha256="):
+                digest = archive["hash"].removeprefix("sha256=")
+            if not digest:
+                # uv can retain a hash-qualified wheel URL with empty archive_info.
+                digest = parse_qs(urlsplit(origin.get("url", "")).fragment).get("sha256", [""])[0]
+            if (
+                isinstance(digest, str)
+                and len(digest) == 64
+                and all(char in "0123456789abcdef" for char in digest.lower())
+            ):
+                result["wheel_digest"] = "sha256:" + digest.lower()
+        except (ValueError, TypeError, AttributeError):
+            pass
+    urls = installed.metadata.get_all("Project-URL") or []
+    for url in urls:
+        label, _, value = url.partition(",")
+        if label.strip().lower() == "source":
+            result["source"] = value.strip()
+    return result
+
+
 def _baked_archs(candidate: Candidate) -> dict[str, list[str]]:
     """Every baked variant of this candidate, and the architectures each one declares."""
-    builds = IMAGE_KERNELS_DIR / candidate.baked / "build" if candidate.baked else None
+    builds = _snapshot_location(candidate) / "build" if candidate.baked else None
     if builds is None or not builds.is_dir():
         return {}
     return {
@@ -336,8 +395,8 @@ def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: Devic
         "the attempt is not survivable: FlashAttention-3's launcher prints `no kernel image is "
         "available for execution on the device` and exits the process from C++, so neither the "
         "numeric self-check nor auto-selection's own fallback would ever run (h3a-022 measured "
-        "it on an sm_120 RTX PRO 6000 with this exact snapshot). Only a worker image baking a "
-        "build that carries this architecture changes the answer",
+        "it on an sm_120 RTX PRO 6000 with this exact snapshot). A worker image or "
+        "installed dependency wheel carrying this architecture changes the answer",
     )
 
 
@@ -348,7 +407,7 @@ def _load_baked(candidate: Candidate, device: DeviceFacts) -> tuple[Any, str]:
             "attention_kernel_absent",
             f"{candidate.name} loads through the `kernels` distribution, which {KERNELS_ABSENT}",
         )
-    location = IMAGE_KERNELS_DIR / candidate.baked
+    location = _snapshot_location(candidate)
     builds = location / "build"
     variants = (
         sorted(p for p in builds.iterdir() if (p / "metadata.json").is_file())
@@ -358,8 +417,9 @@ def _load_baked(candidate: Candidate, device: DeviceFacts) -> tuple[Any, str]:
     if not variants:
         raise AttentionRefusal(
             "attention_kernel_absent",
-            f"{candidate.name} is not baked under {builds}; the worker image bakes it there "
-            "and this executor has no network to fetch it",
+            f"{candidate.name} has no snapshot under {builds}; install the ordinary "
+            f"cozy-kernel-{candidate.baked} dependency before preparation. "
+            "This executor has no network to fetch it",
         )
     try:
         module = get_local_kernel(location)
@@ -370,7 +430,17 @@ def _load_baked(candidate: Candidate, device: DeviceFacts) -> tuple[Any, str]:
             "attention_kernel_absent",
             f"{candidate.name} does not load from {location}: {type(exc).__name__}: {exc}",
         ) from exc
-    loaded = Path(str(getattr(module, "__file__", ""))).resolve().parent
+    module_path = Path(str(getattr(module, "__file__", ""))).resolve()
+    # kernels supports both build/<variant>/__init__.py and a nested package.
+    loaded = next(
+        (parent for parent in module_path.parents if parent.parent == builds.resolve()), None
+    )
+    if loaded is None or not (loaded / "metadata.json").is_file():
+        raise AttentionRefusal(
+            "attention_kernel_absent",
+            f"{candidate.name} resolved outside its selected snapshot: {module_path}; "
+            f"expected a variant under {builds}",
+        )
     _admit_arch(candidate, {loaded.name: _declared_archs(loaded)}, device)
     if candidate.backend == attention_fp8.BACKEND:
         # The fp8 path binds the snapshot's forward to ITS OWN backend and leaves the bf16
@@ -576,7 +646,11 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
         )
     if candidate.baked:
         loaded_member, location = _load_baked(candidate, device)
-        ready = Ready(candidate, loaded_member, location)
+        try:
+            artifact = _artifact("cozy-kernel-" + candidate.baked)
+        except metadata.PackageNotFoundError:
+            artifact = None
+        ready = Ready(candidate, loaded_member, location, artifact=artifact)
         return replace(ready, admission=_computes(ready, device))
     if candidate.distribution:
         try:
@@ -585,7 +659,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
             raise AttentionRefusal(
                 "attention_kernel_absent",
                 f"{candidate.name} needs the {candidate.distribution} distribution, which "
-                "this image does not install",
+                "this environment does not install",
             ) from exc
         try:
             import_module(candidate.import_name or candidate.distribution.replace("-", "_"))
@@ -607,7 +681,11 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
         attention_sol.bind_dense(
             registry._backends[dense.member], dense.name + ":" + dense.location
         )
-    ready = Ready(candidate, member)
+    ready = Ready(
+        candidate,
+        member,
+        artifact=_artifact(candidate.distribution) if candidate.distribution else None,
+    )
     return replace(ready, admission=_computes(ready, device))
 
 
@@ -842,6 +920,7 @@ class Applied:
     #: set when the caller PINNED one through the execution-path override (cr-125).
     pin: str = ""
     admission: dict[str, dict[str, Any]] | None = None
+    artifacts: dict[str, dict[str, Any]] | None = None
 
     def totals(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -858,6 +937,7 @@ class Applied:
             "locations": dict(self.locations),
             "pin": self.pin,
             **({"admission": self.admission} if self.admission else {}),
+            **({"artifacts": self.artifacts} if self.artifacts else {}),
             # RENDERED HERE, not by the worker: one renderer for the one line, in the module
             # that knows what it means.
             "line": self.line(),
@@ -894,6 +974,7 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
     locations: dict[str, str] = {}
     pins: set[str] = set()
     admission: dict[str, Any] = {}
+    artifacts: dict[str, Any] = {}
     for parameter, row in documents.items():
         for component, chosen in (row.get("hosts") or {}).items():
             hosts[f"{parameter}/{component}"] = dict(chosen)
@@ -907,6 +988,8 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
             pins.add(str(row["pin"]))
         if row.get("admission"):
             admission[parameter] = row["admission"]
+        if row.get("artifacts"):
+            artifacts[parameter] = row["artifacts"]
     if not kernels:
         return None
     pin = "+".join(sorted(pins))
@@ -917,6 +1000,7 @@ def merge(documents: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
         "locations": locations,
         "pin": pin,
         **({"admission": admission} if admission else {}),
+        **({"artifacts": artifacts} if artifacts else {}),
         "line": line(kernels, hosts, offered, pin),
     }
 
@@ -1082,7 +1166,8 @@ def install(
     for _component, _path, _module, processor, entry in assignments:
         processor._attention_backend = entry.member
     proofs = {name: entry.admission for name, entry in resolved.items() if entry.admission}
-    return Applied(hosts, locations, tuple(resolved), pin, proofs or None)
+    artifacts = {name: entry.artifact for name, entry in resolved.items() if entry.artifact}
+    return Applied(hosts, locations, tuple(resolved), pin, proofs or None, artifacts or None)
 
 
 def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
@@ -1113,7 +1198,19 @@ def observed(roots: Mapping[str, Any], pin: str = "") -> Applied:
         name = names.get(value, value)
         hosts.setdefault(component, {})
         hosts[component][name] = hosts[component].get(name, 0) + 1
-    return Applied(hosts, {}, (), pin)
+    artifacts: dict[str, dict[str, Any]] = {}
+    for name in {name for kernels in hosts.values() for name in kernels}:
+        candidate = BY_NAME.get(name)
+        if candidate is None:
+            continue
+        distribution = (
+            "cozy-kernel-" + candidate.baked if candidate.baked else candidate.distribution
+        )
+        if distribution:
+            # The image compatibility snapshot has no wheel distribution.
+            with suppress(metadata.PackageNotFoundError):
+                artifacts[name] = _artifact(distribution)
+    return Applied(hosts, {}, (), pin, artifacts=artifacts or None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1153,7 +1250,16 @@ def override(
         if swap is not None:
             applied = swap.apply()
         facts = observed(roots, pin)
-        yield replace(facts, admission=applied.admission) if applied is not None else facts
+        yield (
+            replace(
+                facts,
+                locations=applied.locations,
+                admission=applied.admission,
+                artifacts={**(facts.artifacts or {}), **(applied.artifacts or {})} or None,
+            )
+            if applied is not None
+            else facts
+        )
     finally:
         try:
             for component, path, module in temporary_sites:
@@ -1201,7 +1307,10 @@ class Swap:
             hosts[component][self.entry.name] = hosts[component].get(self.entry.name, 0) + 1
         locations = {self.entry.name: self.entry.location} if self.entry.location else {}
         proofs = {self.entry.name: self.entry.admission} if self.entry.admission else None
-        return Applied(hosts, locations, (self.entry.name,), self.pin or self.entry.name, proofs)
+        artifacts = {self.entry.name: self.entry.artifact} if self.entry.artifact else None
+        return Applied(
+            hosts, locations, (self.entry.name,), self.pin or self.entry.name, proofs, artifacts
+        )
 
 
 def _is_selected(defaults: Snapshot, roots: Mapping[str, Any], pin: str) -> bool:
@@ -1231,7 +1340,10 @@ def check(device: DeviceFacts, roots: Mapping[str, Any], name: str, frozen: str 
     blocked = frozen or _baked_in(selected)
     if blocked:
         raise AttentionRefusal(
-            "attention_kernel_frozen", f"{name} cannot be pinned per request: {blocked}"
+            "attention_kernel_frozen",
+            f"{name} cannot be pinned per request: {blocked}. "
+            "Prepare a new generation with this choice in the model attention policy "
+            "before compilation or parallel-group construction",
         )
     unsupported = _device_admits(candidate, device)
     if unsupported:
