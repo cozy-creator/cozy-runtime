@@ -18,6 +18,7 @@ from cozy_runtime.author._capture import ActivationCapture, ExecutionObservation
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
+from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -149,6 +150,8 @@ class PendingCall[R](Awaitable[R]):
         self.task: asyncio.Task[R] | None = None
         self.capture: ActivationCapture | None = None
         self.observation: ExecutionObservation | None = None
+        self.progress_scope = _progress_scope.get()
+        self.progress_sequence = 0
 
     def __await__(self) -> Generator[Any, None, R]:
         if self.task is None:
@@ -189,11 +192,13 @@ class _Broker:
         self.activated: set[int] = set()
         self.context: Context | None = None
         self.grant_token = object()
+        self.telemetry: Telemetry | None = None
 
-    def bind(self, ctx: Context) -> None:
+    def bind(self, ctx: Context, telemetry: Telemetry | None = None) -> None:
         if self.closed or self.context is not None or ctx.request_id != self.request_id:
             raise CapabilityError("package broker escaped its attempt", code="escaped_handle")
         self.context = ctx
+        self.telemetry = telemetry
 
     def reserve(
         self,
@@ -325,6 +330,19 @@ class _Broker:
                     "child_identity_changed", "child request identity changed", call.index
                 )
             call.request_id = child_id
+        progress = answer.get("progress")
+        if (
+            isinstance(progress, dict)
+            and type(progress.get("sequence")) is int
+            and progress["sequence"] > call.progress_sequence
+            and isinstance(progress.get("payload"), dict)
+        ):
+            call.progress_sequence = progress["sequence"]
+            scope = call.progress_scope
+            if scope is None and call.broker.telemetry is not None:
+                scope = _ProgressScope(call.broker.telemetry, call.binding.export, None)
+            if scope is not None:
+                scope.telemetry._child_progress(progress["payload"], scope)
         if answer.get("observation") is None:
             return
         try:

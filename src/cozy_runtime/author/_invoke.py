@@ -331,7 +331,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
 
     attempt.entered = True
     if inv.calls is not None:
-        inv.calls.bind(ctx)
+        inv.calls.bind(ctx, Telemetry(record, ctx))
     token = _current.set(inv.calls)
     try:
         result = _call(surface, kwargs)

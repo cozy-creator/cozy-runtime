@@ -110,20 +110,26 @@ class Serving:
     def phase(self, call: Call, request: pb.ChildCallRequest, name: str) -> Iterator[None]:
         """Separate immutable preparation and per-child custody in the parent journal."""
         started = time.perf_counter()
+        self.worker.emit_progress(
+            call.parent_request, request.parent_attempt_ordinal, {"kind": "progress", "stage": name}
+        )
+        succeeded = False
         try:
             yield
+            succeeded = True
         finally:
             self.worker.emit_progress(
                 call.parent_request,
                 request.parent_attempt_ordinal,
                 {
                     "kind": "log",
-                    "name": "child preparation",
+                    "name": name,
                     "value": "info",
                     "at_unix_ms": int(time.time() * 1000),
                     "fields": {
                         "child_request": call.child_request,
                         "phase": name,
+                        "completed": succeeded,
                         "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
                     },
                 },
@@ -303,7 +309,7 @@ class Serving:
             capture = canonical_json.encode(executions.capture(owner, call.parent_request))
             attempts, delay = executions.retry_policy(owner, call.parent_request)
             with (
-                self.phase(call, request, "checkpoint_input_admission"),
+                self.phase(call, request, "Checking model inputs"),
                 machine_checkpoint_inputs.admission(workspace, owner, offer.request_id),
             ):
                 catalog = grants.model_inputs(
@@ -340,7 +346,7 @@ class Serving:
             return Prepared(dict(prepared), [], contextlib.ExitStack())
         _, model_arguments = arguments(target, request.request_canonical_bytes)
         native: list[pb.NativeModelBinding] = []
-        with self.phase(call, request, "select_model_defaults"):
+        with self.phase(call, request, "Selecting model"):
             defaults = machine_model_defaults.select(worker, owner, call, target, model_arguments)
         access = contextlib.ExitStack()
         try:
@@ -411,9 +417,12 @@ class Serving:
                 } == expected:
                     matched = candidate
                     break
-            with self.phase(call, request, "materialize_model_defaults"):
+            with self.phase(call, request, "Preparing model files"):
                 machine_model_defaults.materialize(
-                    worker, defaults, access if matched is None else None
+                    worker,
+                    defaults,
+                    access if matched is None else None,
+                    downloading=lambda: self.phase(call, request, "Downloading model"),
                 )
             if matched is not None:
                 return Prepared(matched, defaults, access)
@@ -423,7 +432,7 @@ class Serving:
                 environment_digest=prepared["environment_digest"],
                 python=Path(worker.options.python or sys.executable),
             )
-            with self.phase(call, request, "prepare_model_binding"), worker.preparation_lock:
+            with self.phase(call, request, "Checking model compatibility"), worker.preparation_lock:
 
                 def verified(digest: str, length: int, path: Path) -> None:
                     worker.verified_artifacts.record(digest, length, path)

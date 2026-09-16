@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from contextlib import ExitStack
+from collections.abc import Callable
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -165,7 +166,13 @@ def select(
     return selected
 
 
-def materialize(worker: Worker, rows: list[dict[str, Any]], access: ExitStack | None) -> None:
+def materialize(
+    worker: Worker,
+    rows: list[dict[str, Any]],
+    access: ExitStack | None,
+    *,
+    downloading: Callable[[], AbstractContextManager[None]] = nullcontext,
+) -> None:
     """Verify exact sources; lease bytes only when the preparer will read them.
 
     A reused placement consumes its registered binding document. Its fresh child
@@ -186,14 +193,15 @@ def materialize(worker: Worker, rows: list[dict[str, Any]], access: ExitStack | 
                     row["repository"], manifest["digest"], manifest["length"]
                 )
             except tensorfs.errors.Refusal:
-                tensorfs.pull(
-                    store,
-                    row["public_origin"],
-                    row["repository"] + "@" + manifest["digest"],
-                    allowed_hosts=worker.config.object_storage_hosts,
-                    allow_local=bool(worker.config.bootstrap_credential)
-                    and local_origin(row["public_origin"]),
-                )
+                with downloading():
+                    tensorfs.pull(
+                        store,
+                        row["public_origin"],
+                        row["repository"] + "@" + manifest["digest"],
+                        allowed_hosts=worker.config.object_storage_hosts,
+                        allow_local=bool(worker.config.bootstrap_credential)
+                        and local_origin(row["public_origin"]),
+                    )
                 store.verify_checkpoint_source(
                     row["repository"], manifest["digest"], manifest["length"]
                 )

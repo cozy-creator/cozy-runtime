@@ -20,6 +20,7 @@ import stat
 import time
 from collections.abc import Buffer, Callable, Iterator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -82,6 +83,16 @@ class ProgressFrame:
     total: int | None = None
     overall_fraction: float | None = None
     step_ms: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class _ProgressScope:
+    telemetry: Telemetry
+    name: str
+    bounds: tuple[float, float] | None
+
+
+_progress_scope: ContextVar[_ProgressScope | None] = ContextVar("cozy_progress_scope", default=None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -900,6 +911,85 @@ class Telemetry(_Bound):
         self._attempt.emit("log", message, level, **fields)
 
     @contextmanager
+    def scope(
+        self, name: str, *, overall_range: tuple[float, float] | None = None
+    ) -> Iterator[None]:
+        """Compose local or managed child progress inside a named work range.
+
+        Ranges describe planned work, not elapsed time. Unknown child progress stays
+        unknown. Ordinary timing stages retain their existing range semantics.
+        """
+        self._attempt.check_open("Telemetry.scope")
+        stage = self._stage_name(name)
+        bounds = self._overall_range(overall_range)
+        if stage is None:
+            yield
+            return
+        parent = _progress_scope.get()
+        if parent is not None and parent.telemetry._attempt is self._attempt:
+            stage = f"{parent.name} / {stage}"[:120]
+            if bounds is not None and parent.bounds is not None:
+                start, end = parent.bounds
+                bounds = (start + bounds[0] * (end - start), start + bounds[1] * (end - start))
+            elif parent.bounds is None:
+                bounds = None
+        self._progress_frame(
+            stage, overall_fraction=self._overall(bounds[0], scoped=False) if bounds else None
+        )
+        token = _progress_scope.set(_ProgressScope(self, stage, bounds))
+        succeeded = False
+        try:
+            yield
+            succeeded = True
+        finally:
+            _progress_scope.reset(token)
+            if succeeded and bounds is not None:
+                self._progress_frame(stage, overall_fraction=self._overall(bounds[1], scoped=False))
+
+    def _child_progress(self, payload: Mapping[str, Any], scope: _ProgressScope) -> None:
+        """Relay measured child coordinates without making child completion parent completion."""
+        self._attempt.check_open("Telemetry.child_progress")
+        stage = self._stage_name(payload.get("stage"))
+        if stage is None:
+            return
+        fraction = (
+            self._fraction(payload["stage_fraction"], "stage_fraction")
+            if "stage_fraction" in payload
+            else None
+        )
+        overall = None
+        if scope.bounds is not None and "overall_fraction" in payload:
+            child = self._fraction(payload["overall_fraction"], "overall_fraction")
+            if child is not None:
+                start, end = scope.bounds
+                overall = self._overall(start + child * (end - start), scoped=False)
+        position, total = payload.get("position"), payload.get("total")
+        if not (
+            type(position) is int
+            and type(total) is int
+            and 0 <= position <= total <= 1_000_000_000
+            and total > 0
+        ):
+            position = total = None
+        step_ms = payload.get("step_ms", 0.0)
+        if (
+            isinstance(step_ms, bool)
+            or not isinstance(step_ms, (int, float))
+            or not math.isfinite(step_ms)
+            or step_ms < 0
+        ):
+            step_ms = 0.0
+        self._progress_frame(
+            f"{scope.name} / {stage}"[:120],
+            stage_fraction=fraction,
+            position=position,
+            total=total,
+            overall_fraction=overall,
+            step_ms=step_ms,
+            scoped=False,
+        )
+
+    @contextmanager
     def stage(
         self, name: str, *, overall_range: tuple[float, float] | None = None
     ) -> Iterator[None]:
@@ -959,10 +1049,19 @@ class Telemetry(_Bound):
         total: int | None = None,
         overall_fraction: float | None = None,
         step_ms: float = 0.0,
+        scoped: bool = True,
     ) -> None:
         name = self._stage_name(stage)
         if name is None:
             return
+        scope = _progress_scope.get() if scoped else None
+        if (
+            scope is not None
+            and scope.telemetry._attempt is self._attempt
+            and name != scope.name
+            and not name.startswith(scope.name + " / ")
+        ):
+            name = f"{scope.name} / {name}"[:120]
         attempt = self._attempt
         attempt.signal(
             ProgressFrame(
@@ -996,12 +1095,18 @@ class Telemetry(_Bound):
             return None
         return round(number, 6)
 
-    def _overall(self, value: object | None) -> float | None:
+    def _overall(self, value: object | None, *, scoped: bool = True) -> float | None:
         if value is None:
             return None
         overall = self._fraction(value, "overall_fraction")
         if overall is None:
             return None
+        scope = _progress_scope.get() if scoped else None
+        if scope is not None and scope.telemetry._attempt is self._attempt:
+            if scope.bounds is None:
+                return None
+            start, end = scope.bounds
+            overall = round(start + overall * (end - start), 6)
         previous = self._attempt._overall_fraction
         if previous is not None and overall < previous:
             self._diagnose("overall_fraction must not move backward")
