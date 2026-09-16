@@ -1532,12 +1532,19 @@ def _verify_grants(
                 allow_base_owned=allow_base_owned,
             )
         )
-    root_owners: dict[str, str] = {}
+    import_owners: dict[PurePosixPath, tuple[str, bool]] = {}
     resource_files: set[PurePosixPath] = set()
     resource_directories: set[PurePosixPath] = set()
+    python_major, python_minor = _target_python(base)
+    site_packages = PurePosixPath("lib", f"python{python_major}.{python_minor}", "site-packages")
     for item in inspected:
         for member in item.members:
-            resource = _prefix_resource(member.filename)
+            installed = _install_path(member.filename)
+            resource = (
+                site_packages / installed
+                if installed is not None
+                else _prefix_resource(member.filename)
+            )
             if member.is_dir() or resource is None:
                 continue
             if (
@@ -1548,15 +1555,39 @@ def _verify_grants(
                 raise EnvironmentRefusal("package_environment_resource_collision", str(resource))
             resource_files.add(resource)
             resource_directories.update(resource.parents)
-        for root in item.import_roots:
-            prior = root_owners.get(root)
-            if prior is not None:
-                raise EnvironmentRefusal(
-                    "package_environment_import_root_duplicate",
-                    f"root={root} distributions={prior},{item.wheel.distribution}",
-                )
-            root_owners[root] = item.wheel.distribution
+        for prefix, concrete in _import_ownership(item).items():
+            prior = import_owners.get(prefix)
+            if prior is not None and prior[0] != item.wheel.distribution:
+                if concrete or prior[1]:
+                    raise EnvironmentRefusal(
+                        "package_environment_import_root_duplicate",
+                        f"module={prefix} distributions={prior[0]},{item.wheel.distribution}",
+                    )
+            else:
+                import_owners[prefix] = (item.wheel.distribution, concrete)
     return tuple(inspected)
+
+
+def _import_ownership(item: _Inspected) -> dict[PurePosixPath, bool]:
+    """Separate additive PEP 420 directories from modules and regular packages."""
+    ownership: dict[PurePosixPath, bool] = {}
+    for member in item.members:
+        path = _install_path(member.filename)
+        if (
+            member.is_dir()
+            or path is None
+            or not path.name.endswith((".py", ".pyi", *_NATIVE_SUFFIXES))
+        ):
+            continue
+        name = path.name.partition(".")[0]
+        module = path.parent if name == "__init__" else path.with_name(name)
+        if not module.parts or module.parts[0] not in item.import_roots:
+            continue
+        ownership[module] = True
+        for parent in module.parents:
+            if parent.parts:
+                ownership.setdefault(parent, False)
+    return ownership
 
 
 def _inspect(
