@@ -278,7 +278,7 @@ def test_a_static_ceiling_refuses_the_card_by_name_instead_of_reaching_the_kerne
     assert "sageattention serves sm90 only" in str(refused)
     assert "sm120" in str(refused)
     # The refusal is also the discoverability (cr-125): it says what this card CAN run.
-    assert "This image runs" in str(refused)
+    assert "This environment runs" in str(refused)
     # And the same entry on the card it does claim gets past the device gate, so the ceiling
     # is a bound and not a blanket refusal — sm90 reaches resolution and fails on absence.
     assert _refusal(lambda: attention.pinned("sageattention", _device(90))).code == (
@@ -799,7 +799,7 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     assert "sdpa" in out["image_kernels"]
     # A device refusal names what this image and card DO run, so the developer who pinned a
     # kernel that cannot serve here is not left guessing (cr-125's discoverability rule).
-    assert "This image runs" in out["too_old"]["detail"]
+    assert "This environment runs" in out["too_old"]["detail"]
     # h3a-022, through the real registry: the range is bounded ABOVE as well as below, and the
     # card above the ceiling is refused by name rather than probed.
     assert out["too_new"]["code"] == "attention_kernel_unsupported"
