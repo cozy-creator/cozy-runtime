@@ -206,7 +206,7 @@ class Ready:
     candidate: Candidate
     member: Any
     location: str = ""
-    """A baked kernel's variant directory; empty otherwise."""
+    """The selected local snapshot variant directory; empty for ordinary modules."""
     admission: dict[str, Any] | None = None
     """Retained arithmetic/contract checks; never a model-quality qualification."""
     artifact: dict[str, Any] | None = None
@@ -364,7 +364,7 @@ def _artifact(distribution: str) -> dict[str, Any]:
 
 
 def _baked_archs(candidate: Candidate) -> dict[str, list[str]]:
-    """Every baked variant of this candidate, and the architectures each one declares."""
+    """Every installed or image variant, and the architectures each one declares."""
     builds = _snapshot_location(candidate) / "build" if candidate.baked else None
     if builds is None or not builds.is_dir():
         return {}
@@ -390,7 +390,7 @@ def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: Devic
         return
     raise AttentionRefusal(
         "attention_kernel_unsupported",
-        f"{candidate.name} is baked as {archs} and none of those builds carries device code "
+        f"{candidate.name} declares {archs} and none of those builds carries device code "
         f"for {device.name} (sm{device.sm}). This is a REFUSAL rather than an attempt because "
         "the attempt is not survivable: FlashAttention-3's launcher prints `no kernel image is "
         "available for execution on the device` and exits the process from C++, so neither the "
@@ -401,7 +401,7 @@ def _admit_arch(candidate: Candidate, archs: dict[str, list[str]], device: Devic
 
 
 def _load_baked(candidate: Candidate, device: DeviceFacts) -> tuple[Any, str]:
-    """Load the image's baked snapshot into diffusers' Hub slot so nothing is fetched."""
+    """Load the selected local snapshot into Diffusers' Hub slot without fetching."""
     if KERNELS_ABSENT:
         raise AttentionRefusal(
             "attention_kernel_absent",
@@ -724,7 +724,7 @@ def for_device(device: DeviceFacts) -> list[Candidate]:
 
 
 def available(device: DeviceFacts) -> list[Ready]:
-    """The RANKED kernels this device and this image can actually run, fastest first.
+    """The ranked kernels this device and environment can actually run, fastest first.
 
     Never raises: the floor takes everything, so auto-selection has no refusal arm. A ranked
     kernel this image does not ship is simply not in the answer, and an environment with no
@@ -766,7 +766,7 @@ def pinned(name: str, device: DeviceFacts) -> list[Ready]:
         # imports (cr-127) so the answer never points at another trap.
         raise AttentionRefusal(
             "attention_kernel_unsupported",
-            f"{unsupported}. This image runs {image_kernels(device)} on {device.name}",
+            f"{unsupported}. This environment runs {image_kernels(device)} on {device.name}",
         )
     return [_resolve(candidate, device)]
 
@@ -915,7 +915,7 @@ class Applied:
     hosts: dict[str, dict[str, int]]
     #: kernel name -> the baked variant directory it loaded from, when it loaded from one.
     locations: dict[str, str]
-    #: the ranked kernels this image and device offered, fastest first.
+    #: the ranked kernels this environment and device offered, fastest first.
     offered: tuple[str, ...]
     #: set when the caller PINNED one through the execution-path override (cr-125).
     pin: str = ""
@@ -1399,7 +1399,7 @@ def select(
 
 
 def image_kernels(device: DeviceFacts) -> str:
-    """What this image and device can actually RUN, for a refusal message (cr-125)."""
+    """What this environment and device can run, for a refusal message (cr-125)."""
     shipped: list[str] = []
     for candidate in (*CANDIDATES, *PINNABLE):
         if _device_admits(candidate, device):
