@@ -90,10 +90,15 @@ def test_exact_downloaded_wheel_installs_with_uv_offline(
     monkeypatch.setattr(storage, "enabled", lambda: True)
     monkeypatch.setattr(storage, "fetch_wheel", lambda *args: (wheel, wheel.stat().st_size))
 
-    def unexpected_rehash(_path: Path) -> NoReturn:
-        pytest.fail("Runtime rehashed a supervisor-verified wheel")
+    original_hash = environment._hash_file
+    checked: list[Path] = []
 
-    monkeypatch.setattr(environment, "_hash_file", unexpected_rehash)
+    def verify_new_archive(path: Path) -> str:
+        assert path != wheel, "Runtime rehashed the supervisor-verified acquisition"
+        checked.append(path)
+        return original_hash(path)
+
+    monkeypatch.setattr(environment, "_hash_file", verify_new_archive)
     admitted: list[storage.Write] = []
 
     @contextmanager
@@ -105,7 +110,10 @@ def test_exact_downloaded_wheel_installs_with_uv_offline(
     environment._install_locked_bounded(
         environment._uv_binary(), Path(sys.executable), staging, [row]
     )
-    assert len(admitted) == 1
+    assert len(admitted) == 2
+    assert admitted[1].path == root / "wheel-cache"
+    assert admitted[1].bytes >= wheel.stat().st_size
+    assert checked and all(path.is_relative_to(root / "wheel-cache") for path in checked)
     result = subprocess.run(
         [
             str(staging / "bin/python"),

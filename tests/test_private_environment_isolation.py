@@ -269,12 +269,23 @@ def test_separate_package_roots_share_uv_payload_inodes_and_safe_cleanup(tmp_pat
     environments = []
     for name in ("first", "second"):
         project = _wheel(tmp_path, name, ("shared-dependency==1.0",), b"import shared_dependency\n")
-        source = _material(project, (dependency,), base)
+        # Each operation receives a different grant path for identical bytes. uv
+        # otherwise keys archive extraction by the input path, duplicating payloads.
+        grant = tmp_path / (name + "-grant") / dependency.name
+        grant.parent.mkdir()
+        shutil.copyfile(dependency, grant)
+        grant.chmod(0o444)
+        source = _material(project, (grant,), base)
         environments.append(
             environment.materialize(
                 source, tmp_path / name, base=base, exact_dependencies=True, dependency_cache=cache
             )
         )
+    digest = hashlib.sha256(dependency.read_bytes()).hexdigest()
+    archive = cache / ".stage" / digest / dependency.name
+    original_grant = tmp_path / "first-grant" / dependency.name
+    assert archive.stat().st_ino == original_grant.stat().st_ino
+    assert stat.S_IMODE(original_grant.stat().st_mode) == 0o444
     first, second = (item.site_packages / "shared_dependency.py" for item in environments)
     before = first.stat()
     after = second.stat()
@@ -523,3 +534,58 @@ def test_shared_libraries_still_require_a_matching_concrete_platform(
     ):
         item, _ = environment._measure_inspected_wheel(wheel, "custom", base)
         environment._require_compatible_tags(item.wheel, base)
+
+
+def test_seeded_archive_reuses_exact_bytes_without_download_broker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import socket
+
+    from cozy_runtime.internal import storage_admission
+
+    wheel = _wheel(tmp_path, "seeded_dependency", (), b"VALUE=92\n")
+    base = environment.observe_base()
+    item, _ = environment._measure_inspected_wheel(wheel, "custom", base)
+    cache = tmp_path / "machine-dependencies"
+    environment._require_dependency_cache_root(cache)
+    archive = environment._cache_wheel_archive(cache, item)
+    assert archive.stat().st_ino != wheel.stat().st_ino  # Mutable source was copied.
+    raw = (
+        f"seeded-dependency @ https://invalid.example/{wheel.name} --hash={item.wheel.digest}\n"
+    ).encode()
+    rows = environment.read_locked_requirements(raw).rows
+    # A real inherited channel makes this take the rental branch. No downloader
+    # is serving it: any accidental fetch fails instead of escaping to the web.
+    host, worker = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with host, worker:
+        worker.settimeout(0.05)
+        host.settimeout(0.05)
+        monkeypatch.setattr(storage_admission, "_channel", worker)
+        fetched = environment.fetch_locked_wheels(rows, tmp_path / "other", base, cache_root=cache)
+        assert fetched[0].path == archive
+        with pytest.raises(TimeoutError):
+            host.recv(1)
+    assert fetched[0].wheel.digest == item.wheel.digest
+
+
+@pytest.mark.parametrize("damage", ["contents", "symlink", "writable"])
+def test_shared_archive_damage_refuses_without_replacing_it(tmp_path: Path, damage: str) -> None:
+    wheel = _wheel(tmp_path, "seeded_dependency", (), b"VALUE=92\n")
+    item, _ = environment._measure_inspected_wheel(wheel, "custom", environment.observe_base())
+    cache = tmp_path / "machine-dependencies"
+    environment._require_dependency_cache_root(cache)
+    archive = environment._cache_wheel_archive(cache, item)
+    if damage == "contents":
+        archive.chmod(0o644)
+        archive.write_bytes(b"changed")
+        archive.chmod(0o444)
+    elif damage == "symlink":
+        archive.unlink()
+        archive.symlink_to(wheel)
+    else:
+        archive.chmod(0o644)
+    before = archive.lstat()
+    with pytest.raises(environment.EnvironmentRefusal, match="wheel_invalid"):
+        environment._cache_wheel_archive(cache, item)
+    assert archive.lstat() == before

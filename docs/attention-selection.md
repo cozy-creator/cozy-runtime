@@ -85,3 +85,55 @@ report an installed backend for them. Model policies receive an empty `eligible`
 and `recommended` context explaining this limitation. Explicit matching pins or
 policy choices refuse, including components mixing managed and legacy processors;
 Runtime never creates an unused processor attribute to claim partial coverage.
+
+## Optional wheels on an existing worker
+
+Optional kernels are ordinary dependencies of the Python package's complete,
+locked environment. Add a prebuilt wheel to that package and prepare its new
+immutable generation on the same worker. Existing uv cache/hardlink reuse applies;
+changing this closure replaces the affected executor generation, not the worker
+image or Runtime service. Never install into a running generation or the worker's
+system Python. No request runs pip, a shell, or a downloader.
+
+SageAttention, Sol, Kitchen and FlashInfer use their existing distributions.
+FA3/FA4 kernel-builder snapshots can be packaged without compiling or downloading:
+
+```sh
+uv run --no-project --with packaging python scripts/build-attention-wheel.py ./snapshot \
+  --kernel flash-attn3 --version 0.1.0 \
+  --revision FULL_UPSTREAM_COMMIT --source-url https://huggingface.co/kernels-community/flash-attn3 \
+  --license BSD-3-Clause --requirement 'torch==EXACT_BUILD_VERSION' \
+  --requirement 'kernels==EXACT_LOADER_VERSION' --out dist
+```
+
+Use the real immutable upstream revision, license and exact build dependency
+versions; include every additional upstream dependency with `--requirement`.
+The input must already contain `build/<variant>/metadata.json`, native/source
+payload and upstream licenses. The wrapper conservatively tags CPython 3.12 on
+Linux x86-64; a Torch extension is not advertised as abi3. Version each candidate
+and lock the resulting wheel digest through the ordinary package dependency path.
+
+Runtime discovers `cozy-kernel-flash-attn3` or `cozy-kernel-flash-attn4` from the
+active environment's installed distribution metadata. The installed wheel takes
+precedence over `/opt/cozy/kernels`; a broken installed candidate refuses rather
+than loading different baked bytes. `kernels.get_local_kernel` still selects the
+Torch/CUDA variant. Native architecture metadata and numerical admission still
+apply. The wheel packaging step does not establish ABI compatibility, numerical
+correctness or model quality. A JIT source kernel can still compile its device
+code during normal upstream preparation.
+
+Select with the existing `kernel.attention=dit=flash-attn3` or
+`--attention-kernel=dit=flash-attn3` Creator argument. Eager requests restore the
+prepared selection after success or failure, so an unpinned A / pinned B / unpinned
+A sequence shares its prepared executor. Compiled or context-parallel changes
+require preparing a new model generation whose `choose_attention` policy selects
+that backend before warm-up; the request refuses a frozen change and does not
+silently rebuild it. Changing kernel wheel bytes likewise requires a new ordinary
+dependency generation, allowing rollback by selecting the prior package revision.
+
+Preparation facts and request `attention.artifact` observations identify installed
+distribution/version, SHA256 of its installed RECORD, immutable source URL when
+provided, and the original wheel SHA256 when the installer retains it in standard
+`direct_url.json`. The request's captured dependency closure remains authoritative
+for exact bytes when that optional origin field is absent. An installed RECORD
+digest is an inventory identity, not a signature or an additional integrity scan.

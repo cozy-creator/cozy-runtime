@@ -2656,6 +2656,14 @@ class Executor:
 
     @staticmethod
     def _emit_attention(record: AuthorAttempt, choices: attention.Applied, name: str) -> None:
+        for kernel, artifact in (choices.artifacts or {}).items():
+            record.emit(
+                "confession",
+                "attention.artifact",
+                kernel,
+                selection=name,
+                **artifact,
+            )
         for component, kernels in choices.hosts.items():
             for kernel, sites in kernels.items():
                 record.emit(

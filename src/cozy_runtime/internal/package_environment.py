@@ -22,6 +22,7 @@ import sys
 import uuid
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
@@ -386,7 +387,12 @@ def materialize(
                 _verify_installed_requirements(installed.site_packages, inspected, observed)
             return installed
     reused = final.exists()
-    with storage_admission.admit(_wheel_write_bound(root, inspected, reused=reused)):
+    with storage_admission.admit(
+        _wheel_write_bound(root, inspected, reused=reused),
+        _wheel_archive_write_bound(
+            dependency_cache or root / "wheel-cache", inspected, reused=reused
+        ),
+    ):
         _require_owned_root(root)
         _remove_dead_staging(root)
         contents.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -478,6 +484,19 @@ def _wheel_write_bound(
         root,
         2 * sum(member.file_size for member in members) + (count * (128 << 10)) + (1 << 20),
         2 * count + 128,
+    )
+
+
+def _wheel_archive_write_bound(
+    cache: Path, inspected: Sequence[_Inspected], *, reused: bool = False
+) -> storage_admission.Write:
+    missing = [
+        item
+        for item in inspected
+        if not reused and not _wheel_archive_path(cache, item.wheel).exists()
+    ]
+    return storage_admission.Write(
+        cache, sum(item.wheel.length for item in missing) + (1 << 20), 3 * len(missing) + 8
     )
 
 
@@ -997,8 +1016,11 @@ def _install_locked_bounded(
     cache_root: Path | None = None,
 ) -> None:
     observed = observe_base(python)
-    inspected = fetch_locked_wheels(rows, staging.parent, observed)
-    with storage_admission.admit(_wheel_write_bound(staging.parent, inspected)):
+    inspected = fetch_locked_wheels(rows, staging.parent, observed, cache_root=cache_root)
+    with storage_admission.admit(
+        _wheel_write_bound(staging.parent, inspected),
+        _wheel_archive_write_bound(cache_root or staging.parent / "wheel-cache", inspected),
+    ):
         _install_with_uv(
             uv, python, staging, inspected, dependencies=dependencies, cache_root=cache_root
         )
@@ -1022,7 +1044,22 @@ def fetch_locked_wheels(
             )
         filename = unquote(Path(urlsplit(row.url).path).name)
         expected = root / ".stage" / operation / "wheels" / filename
-        if storage_admission.enabled():
+        cached = (
+            cache_root / ".stage" / row.hashes[0].removeprefix("sha256:") / filename
+            if cache_root is not None
+            else None
+        )
+        if (
+            cache_root is not None
+            and cached is not None
+            and (cached.exists() or cached.is_symlink())
+        ):
+            _require_dependency_cache_root(cache_root)
+            _require_wheel_archive_directory(cached.parent.parent)
+            _require_wheel_archive_directory(cached.parent)
+            length = _verify_wheel_archive(cached, row.hashes[0])
+            path = expected = cached
+        elif storage_admission.enabled():
             path, length = storage_admission.fetch_wheel(
                 operation, filename, row.hashes[0], row.url
             )
@@ -2060,6 +2097,91 @@ def _observed_uv_version(uv: Path) -> str:
     return version.split()[1]
 
 
+def _wheel_archive_path(cache: Path, wheel: Wheel) -> Path:
+    return cache / ".stage" / wheel.digest.removeprefix("sha256:") / wheel.filename
+
+
+def _require_wheel_archive_directory(directory: Path) -> None:
+    # Older local downloads created intermediate parents with the caller's umask.
+    # Group-writable parents are safe only beneath an owned 0700 directory.
+    if not directory.is_absolute() or directory.resolve() != directory:
+        raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(directory))
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = directory.lstat()
+    parent = directory.parent.stat()
+    private_parent = parent.st_uid == os.geteuid() and stat.S_IMODE(parent.st_mode) == 0o700
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or (info.st_mode & 0o022 and not private_parent)
+    ):
+        raise EnvironmentRefusal("package_environment_dependency_cache_invalid", str(directory))
+
+
+def _verify_wheel_archive(path: Path, digest: str, length: int | None = None) -> int:
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or path.resolve() != path
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o222
+            or (length is not None and info.st_size != length)
+            or not 0 < info.st_size <= MAX_WHEEL_BYTES
+            or _hash_file(path) != digest
+        ):
+            raise OSError("cached archive differs from the verified wheel")
+    except OSError as exc:
+        raise EnvironmentRefusal("package_environment_wheel_invalid", str(path)) from exc
+    return info.st_size
+
+
+def _cache_wheel_archive(cache: Path, item: _Inspected) -> Path:
+    """Give uv a stable input path across closures; never modify its cache internals."""
+    target = _wheel_archive_path(cache, item.wheel)
+    for directory in (cache / ".stage", target.parent):
+        _require_wheel_archive_directory(directory)
+
+    if target.exists() or target.is_symlink():
+        _verify_wheel_archive(target, item.wheel.digest, item.wheel.length)
+        return target
+    temporary = target.parent / (".archive-" + uuid.uuid4().hex)
+    try:
+        source_info = item.path.lstat()
+        linked = False
+        if (
+            stat.S_ISREG(source_info.st_mode)
+            and source_info.st_uid == os.geteuid()
+            and not source_info.st_mode & 0o222
+            and item.path.resolve() == item.path
+        ):
+            try:
+                os.link(item.path, temporary)
+                linked = True
+            except OSError as exc:
+                if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EACCES, errno.EMLINK}:
+                    raise
+        if not linked:
+            with item.path.open("rb") as source, temporary.open("xb") as destination:
+                shutil.copyfileobj(source, destination, 4 << 20)
+                destination.flush()
+                os.fsync(destination.fileno())
+            temporary.chmod(0o444)
+        if (
+            temporary.stat().st_size != item.wheel.length
+            or _hash_file(temporary) != item.wheel.digest
+        ):
+            raise EnvironmentRefusal("package_environment_wheel_invalid", str(item.path))
+        # A concurrent exact publisher may win; verify its file before using it.
+        with suppress(FileExistsError):
+            os.link(temporary, target)
+        _verify_wheel_archive(target, item.wheel.digest, item.wheel.length)
+        _fsync_dir(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
 def _install_with_uv(
     uv: Path,
     python: Path,
@@ -2072,6 +2194,12 @@ def _install_with_uv(
 ) -> None:
     if cache_root is not None:
         _require_dependency_cache_root(cache_root)
+    archive_cache = cache_root or staging.parent / "wheel-cache"
+    _require_dependency_cache_root(archive_cache)
+    archives = [
+        _cache_wheel_archive(archive_cache, item)
+        for item in sorted(inspected, key=lambda item: item.wheel.digest)
+    ]
     cache = (cache_root or staging.parent) / "uv-cache"
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     commands = [
@@ -2101,7 +2229,7 @@ def _install_with_uv(
             "hardlink",
             "--python",
             str(staging / "bin" / "python"),
-            *(str(item.path) for item in sorted(inspected, key=lambda item: item.wheel.digest)),
+            *(str(path) for path in archives),
         ],
     ]
     if supplements:
