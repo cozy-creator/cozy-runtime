@@ -123,6 +123,51 @@ def test_invalid_or_regressing_progress_is_omitted_and_diagnosed(tmp_path: Path)
     }
 
 
+def test_composition_scope_maps_nested_stage_once_and_never_completes_failure(
+    tmp_path: Path,
+) -> None:
+    telemetry, emitted = _telemetry(tmp_path)
+    with (
+        telemetry.scope("Shot 2 of 4", overall_range=(0.25, 0.5)),
+        telemetry.stage("denoise", overall_range=(0.2, 0.8)),
+    ):
+        telemetry.step_callback(4, stage="denoise", overall_range=(0.2, 0.8))(1)
+    frames = [row for row in emitted if isinstance(row, ProgressFrame)]
+    assert [(row.stage, row.overall_fraction) for row in frames] == [
+        ("Shot 2 of 4", 0.25),
+        ("Shot 2 of 4 / denoise", 0.3),
+        ("Shot 2 of 4 / denoise", 0.375),
+        ("Shot 2 of 4 / denoise", 0.45),
+        ("Shot 2 of 4", 0.5),
+    ]
+    with pytest.raises(RuntimeError), telemetry.scope("Shot 3 of 4", overall_range=(0.5, 0.75)):
+        telemetry.progress(0.2, stage="denoise", overall_fraction=0.2)
+        raise RuntimeError("failed shot")
+    frames = [row for row in emitted if isinstance(row, ProgressFrame)]
+    assert frames[-1].overall_fraction == 0.55
+    with telemetry.scope("Partial video", overall_range=(0.5, 0.51)):
+        telemetry.progress(1.0, stage="assemble", overall_fraction=1.0)
+    assert (
+        max(row.overall_fraction or 0 for row in emitted if isinstance(row, ProgressFrame)) == 0.55
+    )
+
+
+def test_nested_scope_and_unweighted_children_keep_whole_work_unknown(tmp_path: Path) -> None:
+    telemetry, emitted = _telemetry(tmp_path)
+    with (
+        telemetry.scope("Video", overall_range=(0.0, 0.8)),
+        telemetry.scope("Shot 1", overall_range=(0.0, 0.5)),
+    ):
+        telemetry.progress(0.5, stage="denoise", overall_fraction=0.5)
+    frames = [row for row in emitted if isinstance(row, ProgressFrame)]
+    assert frames[2].stage == "Video / Shot 1 / denoise"
+    assert frames[2].overall_fraction == 0.2
+    telemetry, emitted = _telemetry(tmp_path / "unknown")
+    with telemetry.scope("Unknown plan"):
+        telemetry.progress(0.5, stage="denoise", overall_fraction=0.5)
+    assert all(row.overall_fraction is None for row in emitted if isinstance(row, ProgressFrame))
+
+
 def test_author_observation_details_cross_the_real_executor_seam(tmp_path: Path) -> None:
     left, right = socket.socketpair()
     with left, right:
