@@ -151,3 +151,30 @@ Tracking: [epic #202](https://github.com/cozy-creator/tracker-v2/issues/202),
 [Runtime #546](https://github.com/cozy-creator/cozy-runtime/issues/546),
 [Creator #590](https://github.com/cozy-creator/cozy/issues/590),
 [Hub #648](https://github.com/cozy-creator/tensorhub-v2/issues/648).
+
+### Stable wheel inputs for uv reuse
+
+Runtime 0.18.11 retains verified dependency archives at
+`<dependency-cache>/.stage/<wheel-sha256>/<filename>` and always supplies that
+stable path to uv. Supplying identical wheel bytes from different operation paths
+otherwise gives uv different extraction-cache entries; `--link-mode hardlink`
+alone does not establish sharing across package closures. Source archives that
+are already owned and read-only are linked when possible; mutable or cross-device
+inputs are copied under the existing storage admission, verified and sealed.
+Publication never overwrites an existing archive. Changed bytes, symlinks,
+foreign ownership and writable cached files refuse.
+
+A shared image can seed both these exact archives and its uv cache using these
+same absolute paths. Fetch checks the retained wheel digest before contacting the
+local network or remote download broker. An image's unrelated direct-URL uv cache
+alone is insufficient. The dependency closure still owns version selection;
+seeding is an optional acceleration, not package inheritance or another image
+profile. A missing artifact follows the existing bounded download path. Runtime
+never edits uv's internal cache layout.
+
+The regression installs different project closures from different grant paths and
+verifies that the shared dependency's installed payload inode is identical. It
+then removes one generation and checks that the other remains intact. A separate
+real socket-channel test verifies that an exact seeded archive causes no remote
+fetch, and damaged cache entries are refused without replacement. These are
+local installation tests, not a full Torch or remote video measurement.
