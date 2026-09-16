@@ -916,8 +916,8 @@ class Telemetry(_Bound):
     ) -> Iterator[None]:
         """Compose local or managed child progress inside a named work range.
 
-        Ranges describe planned work, not elapsed time. Unknown child progress stays
-        unknown. Ordinary timing stages retain their existing range semantics.
+        Ranges describe ordered planned work, not elapsed time. Concurrent operations
+        should leave the range unknown. Ordinary timing stages keep their semantics.
         """
         self._attempt.check_open("Telemetry.scope")
         stage = self._stage_name(name)
@@ -972,12 +972,16 @@ class Telemetry(_Bound):
         ):
             position = total = None
         step_ms = payload.get("step_ms", 0.0)
-        if (
-            isinstance(step_ms, bool)
-            or not isinstance(step_ms, (int, float))
-            or not math.isfinite(step_ms)
-            or step_ms < 0
-        ):
+        try:
+            valid_timing = (
+                not isinstance(step_ms, bool)
+                and isinstance(step_ms, (int, float))
+                and math.isfinite(step_ms)
+                and step_ms >= 0
+            )
+        except OverflowError:
+            valid_timing = False
+        if not valid_timing:
             step_ms = 0.0
         self._progress_frame(
             f"{scope.name} / {stage}"[:120],
