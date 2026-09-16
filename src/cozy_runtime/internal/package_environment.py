@@ -1555,7 +1555,11 @@ def _verify_grants(
                 raise EnvironmentRefusal("package_environment_resource_collision", str(resource))
             resource_files.add(resource)
             resource_directories.update(resource.parents)
-        for prefix, concrete in _import_ownership(item).items():
+        for prefix, concrete in _import_ownership(item, site_packages).items():
+            if len(prefix.parts) == 1:
+                providers = base.root_providers.get(prefix.name)
+                if providers is not None and "python-stdlib" in providers:
+                    raise _base_import_collision(item.wheel, prefix.name, providers)
             prior = import_owners.get(prefix)
             if prior is not None and prior[0] != item.wheel.distribution:
                 if concrete or prior[1]:
@@ -1568,11 +1572,15 @@ def _verify_grants(
     return tuple(inspected)
 
 
-def _import_ownership(item: _Inspected) -> dict[PurePosixPath, bool]:
+def _import_ownership(item: _Inspected, site_packages: PurePosixPath) -> dict[PurePosixPath, bool]:
     """Separate additive PEP 420 directories from modules and regular packages."""
     ownership: dict[PurePosixPath, bool] = {}
     for member in item.members:
         path = _install_path(member.filename)
+        if path is None:
+            resource = _prefix_resource(member.filename)
+            if resource is not None and resource.is_relative_to(site_packages):
+                path = resource.relative_to(site_packages)
         if (
             member.is_dir()
             or path is None
@@ -1581,7 +1589,7 @@ def _import_ownership(item: _Inspected) -> dict[PurePosixPath, bool]:
             continue
         name = path.name.partition(".")[0]
         module = path.parent if name == "__init__" else path.with_name(name)
-        if not module.parts or module.parts[0] not in item.import_roots:
+        if not module.parts or not valid_import_root(module.parts[0]):
             continue
         ownership[module] = True
         for parent in module.parents:
