@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import msgspec
@@ -8,6 +9,7 @@ import pytest
 
 from cozy_runtime.author import CapabilityError
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_INDEX, _Broker, _CallType
+from cozy_runtime.author._services import Attempt, ProgressFrame, Telemetry
 from cozy_runtime.author.fakes import fake_context
 
 
@@ -73,3 +75,45 @@ def test_call_index_refuses_overflow_without_reusing_an_accepted_index() -> None
 
     asyncio.run(run())
     assert not broker.calls
+
+
+def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path: Path) -> None:
+    key = ("sha256:" + "11" * 32, "fixture", "measure")
+    frames: list[Any] = []
+    ctx = fake_context(request_id="parent")
+    telemetry = Telemetry(Attempt("parent", tmp_path, sink=frames.append), ctx)
+    broker = _Broker("parent", {key: _CallType(*key, Arguments, Result)}, lambda *a: {})
+    broker.bind(ctx, telemetry)
+    with telemetry.scope("Shot 2 of 7", overall_range=(0.2, 0.4)):
+        first = broker.reserve(*key, {"value": 1})
+        update = {
+            "child_request_id": "child-1",
+            "progress": {
+                "sequence": 10,
+                "payload": {
+                    "stage": "denoise",
+                    "stage_fraction": 0.375,
+                    "overall_fraction": 0.5,
+                    "position": 3,
+                    "total": 8,
+                    "step_ms": 100,
+                },
+            },
+        }
+        broker._observe(first, update)
+        measured = frames[-1]
+        assert isinstance(measured, ProgressFrame)
+        assert (measured.stage, measured.overall_fraction, measured.position, measured.total) == (
+            "Shot 2 of 7 / denoise",
+            0.3,
+            3,
+            8,
+        )
+        count = len(frames)
+        broker._observe(first, update)
+        assert len(frames) == count
+    with telemetry.scope("Shot 3 of 7", overall_range=(0.4, 0.6)):
+        second = broker.reserve(*key, {"value": 2})
+        broker._observe(second, {**update, "child_request_id": "child-2"})
+        assert frames[-1].stage == "Shot 3 of 7 / denoise"
+        assert frames[-1].overall_fraction == 0.5

@@ -36,6 +36,7 @@ class _Pending:
     spool: Path | None = None
     forgotten: bool = False
     local: bool = False
+    progress_label: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +125,16 @@ class Calls:
                     if pending is None:
                         if sum(k[:2] == key[:2] for k in self.pending) >= MAX_ACTIVE_CALLS:
                             raise ValueError("active parent call bound exceeded")
-                        pending = self.pending[key] = _Pending(request, self.stream())
+                        label = frame.get("progress_label", "")
+                        if (
+                            not isinstance(label, str)
+                            or len(label) > 120
+                            or not label.isprintable()
+                        ):
+                            label = ""
+                        pending = self.pending[key] = _Pending(
+                            request, self.stream(), progress_label=label
+                        )
                         local = (
                             self.local(attempt, request, "call") if self.local is not None else None
                         )
@@ -164,7 +174,7 @@ class Calls:
                     self.send(pb.WorkerFrame(child_call_request=pending.request))
                 result = pending.result
                 if result is None or result.state == pb.CHILD_CALL_STATE_PENDING:
-                    return {"ok": True, "state": "pending"}
+                    return {"ok": True, "state": "pending", **self._progress(pending)}
                 if result.state == pb.CHILD_CALL_STATE_SUCCEEDED:
                     if pending.byte_grants is None:
                         pending.byte_grants = self._materialize(attempt, pending)
@@ -174,6 +184,7 @@ class Calls:
                         "child_request_id": result.child_request_id,
                         "result": result.result_canonical_bytes.decode(),
                         "byte_grants": pending.byte_grants,
+                        **self._progress(pending),
                         **(
                             {"observation": observation_document(result.observation)}
                             if result.HasField("observation")
@@ -185,10 +196,20 @@ class Calls:
                         + 128
                         > MAX_FRAME
                     ):
-                        raise ValueError("child result and native grants exceed the control frame")
+                        # Optional narration cannot turn a valid child result into a refusal.
+                        answer.pop("progress", None)
+                        if (
+                            len(json.dumps(answer, separators=(",", ":"), sort_keys=True).encode())
+                            + 128
+                            > MAX_FRAME
+                        ):
+                            raise ValueError(
+                                "child result and native grants exceed the control frame"
+                            )
                     return answer
                 return {
                     "ok": False,
+                    **self._progress(pending),
                     **(
                         {"observation": observation_document(result.observation)}
                         if result.HasField("observation")
@@ -206,6 +227,40 @@ class Calls:
                 documents.DocumentError,
             ) as exc:
                 return {"ok": False, "code": "child_call_refused", "detail": str(exc)[:1024]}
+
+    def _progress(self, pending: _Pending) -> dict[str, Any]:
+        """Reuse the child's existing journal; polling progress does not change call identity."""
+        result, workspace = pending.result, self.workspace
+        if result is None or not result.child_request_id:
+            return {}
+        answer: dict[str, Any] = {"child_request_id": result.child_request_id}
+        if not pending.local or workspace is None:
+            return answer
+        with workspace.locked() as db:
+            row = db.execute(
+                "SELECT p.sequence,p.body FROM execution_events p "
+                "JOIN executions e ON e.owner=p.owner AND e.request=p.request "
+                "AND e.ordinal=p.ordinal "
+                "JOIN execution_calls c ON c.owner=e.owner AND c.child_request=e.request "
+                "WHERE e.owner=? AND e.request=? AND c.parent_request=? AND c.parent_ordinal=? "
+                "AND c.call_index=? AND p.kind='progress' ORDER BY p.sequence DESC LIMIT 1",
+                (
+                    self.owner(),
+                    result.child_request_id,
+                    pending.request.parent_request_id,
+                    pending.request.parent_attempt_ordinal,
+                    pending.request.call_index,
+                ),
+            ).fetchone()
+        if row is not None:
+            document = json.loads(row["body"])
+            answer["progress"] = {"sequence": row["sequence"], "payload": document["payload"]}
+        return answer
+
+    def progress_label(self, parent: str, ordinal: int, index: int) -> str:
+        with self.lock:
+            pending = self.pending.get((parent, ordinal, index))
+            return pending.progress_label if pending is not None else ""
 
     def _request(
         self, attempt: AttemptRecord, frame: Mapping[str, Any], index: int
