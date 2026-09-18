@@ -10,6 +10,7 @@ import re
 import stat
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -966,6 +967,7 @@ def prepare_package(
                     f"{row.filename} installs no importable module",
                 )
         facts.append((wheel, path, receipt))
+    image_seeds = set()
     with contextlib.ExitStack() as downloaded:
         locked_dependencies = None
         if dependency_requirements:
@@ -987,12 +989,17 @@ def prepare_package(
                     install_root,
                     observed_base,
                     cache_root=dependency_cache,
+                    python=python,
                 ):
+                    if item.image_seed:
+                        image_seeds.add(item.wheel.digest)
                     facts.append(
                         (
                             item.wheel,
                             item.path,
-                            package_environment.VerifiedFile.record(
+                            None
+                            if item.image_seed
+                            else package_environment.VerifiedFile.record(
                                 item.path, item.wheel.digest, item.wheel.length
                             ),
                         )
@@ -1029,6 +1036,13 @@ def prepare_package(
                 wheel_paths=wheel_paths,
                 verified_wheels=receipts,
             )
+            source = replace(
+                source,
+                grants=tuple(
+                    replace(grant, image_seed=True) if grant.digest in image_seeds else grant
+                    for grant in source.grants
+                ),
+            )
             installed = package_environment.materialize(
                 source,
                 install_root,
@@ -1043,7 +1057,8 @@ def prepare_package(
             detail = getattr(exc, "detail", type(exc).__name__)
             raise PreparationRefusal(str(code), str(detail)) from exc
         for wheel, path, _receipt in facts:
-            verified(wheel.digest, wheel.length, path)
+            if wheel.digest not in image_seeds:
+                verified(wheel.digest, wheel.length, path)
         if materialized is not None:
             materialized(installed)
 
