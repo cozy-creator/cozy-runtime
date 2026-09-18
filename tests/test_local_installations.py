@@ -39,11 +39,29 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers(snaps
         environment, request = package(root, "retained")
         _, other_request = package(root, "another")
         if not snapshot:
+            # The wire lane transfers the complete wheel closure. It cannot borrow
+            # Runtime from the image through system site-packages.
+            runtime_wheel = next(
+                image_python().parent.parent.parent.glob("wheels/cozy_runtime-*.whl")
+            )
+            sdk_wheels = root / "sdk-wheels"
+            _run(
+                str(image_python()),
+                "-m",
+                "pip",
+                "download",
+                "--only-binary=:all:",
+                "--dest",
+                str(sdk_wheels),
+                str(runtime_wheel),
+            )
             _, dependency = package(root, "dependency")
             dependency_path = Path(dependency.wheels[0].path)
             for closure in (request, other_request):
                 retained_wheels = Path(closure.wheels[0].path).parent
                 shutil.copyfile(dependency_path, retained_wheels / dependency_path.name)
+                for wheel in sdk_wheels.glob("*.whl"):
+                    shutil.copyfile(wheel, retained_wheels / wheel.name)
                 closure.ClearField("wheels")
                 closure.wheels.extend(_wheel_rows(list(retained_wheels.glob("*.whl"))))
         dependency_python = None
@@ -174,13 +192,16 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers(snaps
                 # supplied dependency. Its valid receipt must not cross-bind either.
                 original_inventory = installation_path.read_bytes()
                 placement = inventory["placement_set"]["placements"][0]
-                placement["environment"] = {"local_wheels": []}
+                placement["environment"]["local_wheels"] = [
+                    row
+                    for row in placement["environment"]["local_wheels"]
+                    if row["distribution"] != "prepare-dependency"
+                ]
                 placement["environment_digest"] = documents.spell(
                     documents.embedded_document_digest(
                         placement["environment"], "cozy.worker.v1.Environment"
                     )
                 )
-                project_digest = placement["development"]["project_wheel"]["ref"]["digest"]
                 material = placement_materialization.package_environment_input(
                     package_name=request.package.package,
                     release=request.package.release,
@@ -188,11 +209,7 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers(snaps
                     environment=placement["environment"],
                     environment_digest=placement["environment_digest"],
                     wheel_paths={
-                        project_digest: next(
-                            Path(row.path)
-                            for row in request.wheels
-                            if documents.spell(row.digest) == project_digest
-                        )
+                        documents.spell(row.digest): Path(row.path) for row in request.wheels
                     },
                 )
                 missing_dependency = package_environment.materialize(
