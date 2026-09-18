@@ -14,6 +14,12 @@ import stat
 import subprocess
 import tempfile
 import zipfile
+from typing import TYPE_CHECKING
+
+from cozy_runtime.internal.config import package_install_environment
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal import base_observation, package_environment
 from dataclasses import asdict
 from pathlib import Path
 
@@ -27,7 +33,7 @@ INDEXES = (
 )
 
 
-def record(path, base):
+def record(path: Path, base: base_observation.Observation) -> None:
     """Build-only admission of an original, hash-verified wheel before discarding it."""
     from cozy_runtime.internal import package_environment as pe
 
@@ -52,7 +58,7 @@ def record(path, base):
     target.chmod(0o444)
 
 
-def read(digest, base):
+def read(digest: str, base: base_observation.Observation) -> package_environment._Inspected | None:
     from cozy_runtime.internal import package_environment as pe
 
     pe._require_digest(digest, "seed.digest")
@@ -95,7 +101,7 @@ def read(digest, base):
         raise pe.EnvironmentRefusal("package_environment_image_seed_invalid", str(path)) from exc
 
 
-def command(uv, python, requirements):
+def command(uv: Path | str, python: Path | str, requirements: Path) -> list[str]:
     return [
         str(uv),
         "pip",
@@ -121,11 +127,11 @@ def command(uv, python, requirements):
     ]
 
 
-def requirement(item):
+def requirement(item: package_environment._Inspected) -> str:
     return f"{item.wheel.distribution}=={item.wheel.version} --hash={item.wheel.digest}\n"
 
 
-def available(item, python, cache_root):
+def available(item: package_environment._Inspected, python: Path, cache_root: Path) -> bool:
     """Ask uv itself to prove exact cached bytes, including after cache eviction.
 
     A dry run is insufficient: uv reports success even when it would need to
@@ -151,7 +157,7 @@ def available(item, python, cache_root):
             [*command(pe._uv_binary(), python, req), "--target", str(root / "site")],
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            env=pe.package_install_environment(),
+            env=package_install_environment(),
             check=False,
         )
         return result.returncode == 0

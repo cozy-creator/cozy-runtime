@@ -929,7 +929,9 @@ def prepare_package(
         raise PreparationRefusal(exc.code, exc.detail) from exc
     if not wheel_root.is_absolute():
         raise PreparationRefusal("package_prepare_file_path_invalid", str(wheel_root))
-    facts: list[tuple[package_environment.Wheel, Path, package_environment.VerifiedFile]] = []
+    facts: list[
+        tuple[package_environment.Wheel, Path, package_environment.VerifiedFile | None]
+    ] = []
     prior = b""
     for row in rows:
         if len(row.digest) != 32 or row.digest <= prior or not 0 < row.length <= MAX_FILE_BYTES:
@@ -1025,7 +1027,7 @@ def prepare_package(
             documents.embedded_document_digest(environment_body, "cozy.worker.v1.Environment")
         )
         wheel_paths = {wheel.digest: path for wheel, path, _receipt in facts}
-        receipts = {wheel.digest: receipt for wheel, _path, receipt in facts}
+        receipts = {wheel.digest: receipt for wheel, _path, receipt in facts if receipt is not None}
         try:
             source = placement_materialization.package_environment_input(
                 package_name=package_name,
