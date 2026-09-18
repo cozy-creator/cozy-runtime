@@ -19,7 +19,6 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import Version
 
 from cozy_runtime._interpreter import supported_minors as supported_minors
-from cozy_runtime._interpreter import supported_range as supported_range
 from cozy_runtime.internal.config import package_install_environment, package_python_paths
 
 
@@ -70,7 +69,11 @@ def probe(python: Path) -> Interpreter:
 def available(default: Path = Path(sys.executable)) -> tuple[Interpreter, ...]:
     """Return supported, installed interpreters in deterministic lowest-version order."""
     configured = package_python_paths()
-    candidates = [Path(item) for item in configured.split(os.pathsep)] if configured else [default]
+    candidates = (
+        [Path(item) for item in configured.split(os.pathsep)]
+        if configured is not None
+        else [default]
+    )
     if configured is None:
         uv = shutil.which("uv")
         if uv:

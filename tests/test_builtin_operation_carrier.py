@@ -21,7 +21,7 @@ def carrier(path: Path, *, change: str = "", version: str = "0.16.8") -> Path:
     root = f"cozy_runtime_operations-{version}.dist-info/"
     metadata = (
         f"Metadata-Version: 2.4\nName: cozy-runtime-operations\nVersion: {version}\n"
-        "Requires-Python: >=3.12,<3.13\nRequires-Dist: cozy-runtime>=0.16.8,<1\n"
+        "Requires-Python: >=3.12\nRequires-Dist: cozy-runtime>=0.16.8,<1\n"
         "Requires-Dist: numpy>=1.26\nCozy-Builtin: operations\nCozy-Builtin-Interface: "
         + builtin_operations.digest()
         + "\n"

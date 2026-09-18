@@ -2,7 +2,7 @@
 name = "h3-glue-bench"
 version = "0.1.0"
 description = "h3a-015 yardstick: eager vs fused (AOT Triton) vs regional torch.compile, one MiniMax-H3 block at the served shape"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12"
 dependencies = [
     "cozy-runtime>=0.4.2,<1",
     "diffusers==0.40.0",

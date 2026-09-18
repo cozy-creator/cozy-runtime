@@ -87,7 +87,12 @@ def read(digest: str, base: base_observation.Observation) -> package_environment
         wheel = pe.Wheel(**row)
         if wheel.digest != digest or wheel.owner != "custom":
             raise ValueError("image seed wheel identity changed")
-        pe._require_compatible_tags(wheel, base)
+        try:
+            pe._require_compatible_tags(wheel, base)
+        except pe.EnvironmentRefusal as exc:
+            if exc.code == "package_environment_wheel_platform_incompatible":
+                return None
+            raise
         members = []
         if not isinstance(value["members"], list) or len(value["members"]) > pe.MAX_WHEEL_MEMBERS:
             raise ValueError("invalid image seed member count")

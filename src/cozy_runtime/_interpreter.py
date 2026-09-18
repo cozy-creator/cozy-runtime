@@ -11,12 +11,6 @@ def supported_minors() -> tuple[str, ...]:
     return tuple(policy["minors"])
 
 
-def supported_range() -> str:
-    minors = supported_minors()
-    major, minor = (int(part) for part in minors[-1].split("."))
-    return f">={minors[0]},<{major}.{minor + 1}"
-
-
 # Requires-Python cannot distinguish implementation or free-threaded ABI. The packaged
 # policy is also consumed by worker admission, local Creator selection and image builds.
 if (

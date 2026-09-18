@@ -158,3 +158,23 @@ def test_invalid_image_facts_refuse(
             item.path.chmod(0o444)
     with pytest.raises(pe.EnvironmentRefusal, match="image_seed_invalid"):
         seed.read(item.wheel.digest, base)
+
+
+def test_other_python_abi_is_a_seed_miss(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    root = tmp_path / "image"
+    root.mkdir(mode=0o755)
+    monkeypatch.setattr(seed, "ROOT", root)
+    wheel = _wheel(tmp_path, "abi_dependency", (), b"VALUE=1\n")
+    base = pe.observe_base()
+    seed.record(wheel, base)
+    digest = "sha256:" + hashlib.sha256(wheel.read_bytes()).hexdigest()
+    facts = root / "facts" / (digest.removeprefix("sha256:") + ".json")
+    value = json.loads(facts.read_bytes())
+    value["wheel"]["tags"] = ["cp312-cp312-linux_x86_64"]
+    facts.chmod(0o644)
+    facts.write_text(json.dumps(value))
+    facts.chmod(0o444)
+    other = replace(base, python_abi="cp313", python_full_version="3.13.11")
+    assert seed.read(digest, other) is None

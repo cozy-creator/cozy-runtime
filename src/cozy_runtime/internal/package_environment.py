@@ -1303,6 +1303,7 @@ def open_existing_environment(python: Path, content_digest: str) -> InstalledEnv
     _require_digest(content_digest, "content_digest")
     if not python.is_absolute() or python.parent.name != "bin" or not python.is_file():
         raise EnvironmentRefusal("package_environment_python_invalid", str(python))
+    _require_observed_interpreter(python, observe_base(python))
     generation = python.parent.parent
     if not (generation / "pyvenv.cfg").is_file():
         raise EnvironmentRefusal("package_environment_venv_invalid", str(generation))

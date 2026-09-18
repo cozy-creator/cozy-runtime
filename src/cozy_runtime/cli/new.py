@@ -28,7 +28,7 @@ def _pyproject(name: str, pkg: str) -> str:
     return f"""[project]
 name = "{name}"
 version = "0.1.0"
-requires-python = "{python_interpreters.supported_range()}"
+requires-python = ">={python_interpreters.supported_minors()[0]}"
 dependencies = ["cozy-runtime>={__version__},<1.0.0"]
 
 [project.entry-points."cozy.application"]
