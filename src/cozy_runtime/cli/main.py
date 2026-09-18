@@ -41,6 +41,7 @@ PRIVATE = (
     "interface-wheel",
     "image-prepare",
     "image-preparation-profile",
+    "python-interpreters",
 )
 HELP = """cozy-runtime — everything a single package venv can do alone
 
@@ -263,6 +264,19 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 Exit.usage,
             )
         return describe_verb.run(args[0] if args else None, opts)
+    if verb == "python-interpreters":
+        from cozy_runtime.internal import python_interpreters
+
+        if args:
+            raise CliError(
+                "usage",
+                "python-interpreters takes no arguments",
+                "cozy-runtime --json python-interpreters",
+            )
+        try:
+            return Result(document=python_interpreters.document())
+        except python_interpreters.InterpreterRefusal as exc:
+            raise CliError(exc.code, exc.detail, "install a supported Python interpreter") from exc
     if verb == "version":
         return version_verb.run(config, opts.full, opts.fields)
     if verb == "new":

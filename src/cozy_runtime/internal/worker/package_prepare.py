@@ -23,6 +23,7 @@ from cozy_runtime.internal import (
     package_environment,
     package_interface,
     placement_materialization,
+    python_interpreters,
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import acquire
@@ -39,6 +40,45 @@ class PreparationRefusal(Exception):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+
+
+def _select_python(
+    python: Path, requires: str, version: str, base: base_observation.Observation | None = None
+) -> tuple[Path, base_observation.Observation | None]:
+    try:
+        if not requires and not version:
+            actual = python_interpreters.probe(python)
+            if (
+                ".".join(actual.version.split(".")[:2])
+                not in python_interpreters.supported_minors()
+            ):
+                raise python_interpreters.InterpreterRefusal(actual.version)
+            return python, base
+        selected = python_interpreters.select(requires, version, default=python)
+        if selected.executable == python:
+            return python, base
+        return selected.executable, package_environment.observe_base(selected.executable)
+    except (python_interpreters.InterpreterRefusal, package_environment.EnvironmentRefusal) as exc:
+        raise PreparationRefusal(exc.code, exc.detail) from exc
+
+
+def _verify_control_inventory(
+    inventory: image_inventory.Inventory | None,
+    python: Path,
+    base: base_observation.Observation | None,
+) -> None:
+    if inventory is not None:
+        observed = base or package_environment.observe_base(python)
+        lie = image_inventory.disagreement(inventory, observed.distribution_versions)
+        if lie is not None:
+            raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
+
+
+def _verify_inventory_python(inventory: image_inventory.Inventory | None, python: Path) -> None:
+    if inventory is not None and inventory.interpreters:
+        actual = python_interpreters.probe(python)
+        if (actual.version, actual.abi) not in inventory.interpreters:
+            raise PreparationRefusal("package_prepare_image_python_disagrees", actual.version)
 
 
 def prepare_package_set(
@@ -91,6 +131,9 @@ def prepare_package_set(
     application, slot_paths, inventory, locked = _request_facts(
         request, models, preinstalled=preinstalled_python is not None
     )
+    _verify_control_inventory(inventory, python, base)
+    python, base = _select_python(python, request.python_requires, request.python_version, base)
+    _verify_inventory_python(inventory, python)
     return _prepare_published(
         package_name=package_name,
         release=release,
@@ -194,6 +237,7 @@ def _request_facts(
                 request.image_inventory.profile,
                 request.image_inventory.python,
                 request.image_inventory.distributions,
+                request.image_inventory.interpreters,
             )
         except image_inventory.ImageInventoryRefusal as exc:
             raise PreparationRefusal("package_prepare_image_inventory_invalid", exc.detail) from exc
@@ -286,7 +330,7 @@ def _prepare_published(
 
         lie = (
             image_inventory.disagreement(inventory, observed_base.distribution_versions)
-            if inventory is not None
+            if inventory is not None and inventory.python == observed_base.python_full_version
             else None
         )
         if lie is not None:
@@ -422,6 +466,9 @@ def check_package_set_compatibility(
     application, slot_paths, inventory, locked = _request_facts(request, models)
     if inventory is None:
         raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
+    _verify_control_inventory(inventory, python, base)
+    python, base = _select_python(python, request.python_requires, request.python_version, base)
+    _verify_inventory_python(inventory, python)
     installed = _compatibility_environment(
         package_name=package_name,
         release=release,
@@ -522,7 +569,11 @@ def _compatibility_environment(
         observed = base or package_environment.observe_base(python)
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal(exc.code, exc.detail) from exc
-    lie = image_inventory.disagreement(inventory, observed.distribution_versions)
+    lie = (
+        image_inventory.disagreement(inventory, observed.distribution_versions)
+        if inventory.python == observed.python_full_version
+        else None
+    )
     if lie is not None:
         raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
     platform = (
@@ -740,6 +791,8 @@ def prepare_local_package(
         dependency_cache=dependency_cache,
         materialized=materialized,
         dependency_requirements=bytes(request.dependency_requirements),
+        python_requires=request.python_requires,
+        python_version=request.python_version,
     )
 
 
@@ -897,6 +950,8 @@ def prepare_package(
     job_plan_root: Path | None = None,
     development: pb.DevelopmentPackage | None = None,
     dependency_requirements: bytes = b"",
+    python_requires: str = "",
+    python_version: str = "",
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact local package revision.
@@ -918,6 +973,7 @@ def prepare_package(
 
     if development is None:
         raise PreparationRefusal("package_prepare_development_absent", package_name)
+    python, base = _select_python(python, python_requires, python_version, base)
     rows = list(wheels)
     if not 1 <= len(rows) <= weights_limits.MAX_LOCAL_PACKAGE_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
@@ -1055,7 +1111,14 @@ def prepare_package(
         except package_interface.StalePackageInterface as exc:
             raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
         interface_ref = _stage(artifact_cache, interface_raw)
-        _verify_local_revision(development, interface_ref, rows, dependency_requirements)
+        _verify_local_revision(
+            development,
+            interface_ref,
+            rows,
+            dependency_requirements,
+            python_requires,
+            python_version,
+        )
         _stage_job_plans(
             interface_body,
             root=job_plan_root,
@@ -1133,8 +1196,12 @@ def _verify_local_revision(
     interface_ref: tuple[str, int],
     wheels: Sequence[pb.LocalPackageWheel],
     dependency_requirements: bytes = b"",
+    python_requires: str = "",
+    python_version: str = "",
 ) -> None:
     revision = pb.LocalPackageRevision(
+        python_requires=python_requires,
+        python_version=python_version,
         package=development.package,
         release=development.release,
         source_digest=development.source_digest,

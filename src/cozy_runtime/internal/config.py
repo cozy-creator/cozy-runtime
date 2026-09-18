@@ -557,3 +557,8 @@ def package_install_environment(environ: Mapping[str, str] | None = None) -> dic
         if not name.startswith(("UV_", "PIP_", "PYTHON"))
         and name not in {"VIRTUAL_ENV", "CONDA_PREFIX"}
     }
+
+
+def package_python_paths() -> str | None:
+    """Operator-configured finite interpreter set; absent means installed discovery."""
+    return os.environ.get("COZY_PACKAGE_PYTHONS")

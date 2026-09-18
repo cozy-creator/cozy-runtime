@@ -326,6 +326,7 @@ def materialize(
     _require_digest(source.environment_digest, "environment_digest")
     _require_digest(source.project_wheel_digest, "project_wheel_digest")
     if dependency_python is not None:
+        _require_same_interpreter(python, dependency_python)
         if storage_admission.enabled():
             raise EnvironmentRefusal(
                 "package_environment_dependency_snapshot_local_only",
@@ -340,6 +341,7 @@ def materialize(
             dependency_cache=dependency_cache,
         )
     observed = base or observe_base(python)
+    _require_observed_interpreter(python, observed)
     wheels = _verify_inventory(source, observed, venv_precedence=True)
     uv = _uv_binary()
     current_uv = _observed_uv_version(uv)
@@ -767,6 +769,9 @@ def materialize_locked(
             "the export names no --index-url/--extra-index-url",
         )
     observed = base or observe_base(python)
+    _require_observed_interpreter(python, observed)
+    if dependency_python is not None:
+        _require_same_interpreter(python, dependency_python)
     uv = _uv_binary()
     current_uv = _observed_uv_version(uv)
     if current_uv != observed.uv_version:
@@ -1234,6 +1239,33 @@ def _interpreter_layout(python: Path) -> dict[str, str]:
     return observed
 
 
+def _require_observed_interpreter(python: Path, observed: base_observation.Observation) -> None:
+    from cozy_runtime.internal import python_interpreters
+
+    actual = python_interpreters.probe(python)
+    if (actual.abi, actual.version) != (observed.python_abi, observed.python_full_version):
+        raise EnvironmentRefusal(
+            "package_environment_python_changed",
+            f"observed {observed.python_full_version}/{observed.python_abi}; "
+            f"actual {actual.version}/{actual.abi}",
+        )
+    if ".".join(actual.version.split(".")[:2]) not in python_interpreters.supported_minors():
+        raise EnvironmentRefusal("package_environment_python_unsupported", actual.version)
+
+
+def _require_same_interpreter(python: Path, dependency_python: Path) -> None:
+    from cozy_runtime.internal import python_interpreters
+
+    selected = python_interpreters.probe(python)
+    source = python_interpreters.probe(dependency_python)
+    if (selected.abi, selected.version) != (source.abi, source.version):
+        raise EnvironmentRefusal(
+            "package_environment_dependency_python_mismatch",
+            f"selected Python {selected.version}/{selected.abi} cannot copy dependency "
+            f"environment {source.version}/{source.abi}",
+        )
+
+
 def is_base_interpreter(python: Path) -> bool:
     """Identify the control interpreter independently of a private package venv."""
     layout = _interpreter_layout(python)
@@ -1336,6 +1368,15 @@ def open_generation(
     environment_python = generation / "bin" / "python"
     if not site_packages.is_dir() or not environment_python.is_file():
         raise EnvironmentRefusal("package_environment_incomplete", str(generation))
+    from cozy_runtime.internal import python_interpreters
+
+    actual = python_interpreters.probe(environment_python)
+    if actual.abi != python_abi or actual.version != identity["interpreter"].get(
+        "python_full_version"
+    ):
+        raise EnvironmentRefusal("package_environment_python_changed", str(environment_python))
+    if ".".join(actual.version.split(".")[:2]) not in python_interpreters.supported_minors():
+        raise EnvironmentRefusal("package_environment_python_unsupported", actual.version)
     owner = os.geteuid()
     boundaries = (root, root / "contents", root / "receipts")
     if (
@@ -2334,7 +2375,8 @@ def _content_matches_receipt(identity: object, receipt: Mapping[str, Any]) -> bo
             == {"format", "interpreter", "locked_requirements_digest", "uv_version"}
             and identity.get("format") == LOCKED_CONTENT_FORMAT
             and isinstance(identity.get("interpreter"), dict)
-            and set(identity["interpreter"]) == {"libc", "os_arch", "python_abi"}
+            and set(identity["interpreter"])
+            == {"libc", "os_arch", "python_abi", "python_full_version"}
             and all(isinstance(v, str) and v for v in identity["interpreter"].values())
             and isinstance(identity.get("uv_version"), str)
             and bool(identity["uv_version"])
@@ -2375,7 +2417,7 @@ def _content_matches_receipt(identity: object, receipt: Mapping[str, Any]) -> bo
         )
         and identity.get("format") == "cozy.runtime.PackageEnvironment/2"
         and isinstance(identity.get("interpreter"), dict)
-        and set(identity["interpreter"]) == {"libc", "os_arch", "python_abi"}
+        and set(identity["interpreter"]) == {"libc", "os_arch", "python_abi", "python_full_version"}
         and all(isinstance(value, str) and value for value in identity["interpreter"].values())
         and isinstance(identity.get("uv_version"), str)
         and bool(identity["uv_version"])
@@ -2525,6 +2567,7 @@ def _materialize_dependency_snapshot(
     from cozy_runtime.internal import _installed_dependencies
 
     observed = base or observe_base(python)
+    _require_observed_interpreter(python, observed)
     wheels = _verify_inventory(source, observed, venv_precedence=True)
     inspected = _verify_grants(source, wheels, observed)
     supplements: tuple[str, ...] = ()
