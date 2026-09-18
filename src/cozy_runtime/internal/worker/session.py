@@ -115,7 +115,7 @@ from cozy_runtime.internal.worker.lanes import (
     fold_memory,
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
-from cozy_runtime.internal.worker.machine_publication import PublicationTLS
+from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
 from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding, PreparedModel
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
@@ -304,8 +304,8 @@ class WorkerOptions:
     """
     environment_python: Path | None = None
     """An already-complete local package venv; mutually exclusive with materialization root."""
-    publication_tls: PublicationTLS | None = None
-    """Privileged worker mTLS configuration, never an executor or captured-code value."""
+    publication_authority: PublicationAuthority | None = None
+    """Privileged worker publication authority, never an executor or captured-code value."""
     tensorfs_root: Path | None = None
     """The one host-local executable TensorFS Store."""
     artifact_cache: Path | None = None
@@ -1259,7 +1259,7 @@ class Worker:
 
         self.machine_sources = MachineSources(self)
         self.machine_effects = (
-            Effects(self.workspace, self.executions, options.publication_tls)
+            Effects(self.workspace, self.executions, options.publication_authority)
             if self.workspace is not None and self.executions is not None
             else None
         )
@@ -2140,7 +2140,7 @@ class Worker:
             if self.stop.is_set():
                 raise WorkspaceRefusal("worker is stopping; root admission is closed")
             executions, owner = self._execution_service(claim)
-            if publication_authorization_id and self.options.publication_tls is None:
+            if publication_authorization_id and self.options.publication_authority is None:
                 raise WorkspaceRefusal("worker has no independent publication authority configured")
             result_schema, memoize = b"", False
             spec = documents.read(offer.invocation_spec_canonical_bytes, pb.InvocationSpec)

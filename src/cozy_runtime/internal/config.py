@@ -22,7 +22,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -124,8 +124,8 @@ class WorkerHostConfig:
     child_base_env: tuple[tuple[str, str], ...]
     storage_admission_fd: int | None = None
     tensorhub_origin: str = ""
-    tensorhub_ca_der: bytes = b""
-    """Operator-owned mTLS edge metadata; never inherited by a job executor."""
+    tensorhub_worker_token: str = field(default="", repr=False)
+    """Worker-only Hub capability; never inherited by a job executor."""
     object_storage_hosts: tuple[str, ...] = ()
     lease_expiry_unix: int = 0
     """What the supervisor SAID the lease expires at, or 0 for no lease. Carried, never
@@ -465,13 +465,15 @@ def read_worker_host_config(
         raise ConfigError(
             "worker_host_config", "storage admission must use inherited fd 4", "fix host launch"
         )
-    hub_origin, ca_der = _machine_publication_authority(publication_authority_path)
+    hub_origin, worker_token = _machine_publication_authority(
+        publication_authority_path, bounded("COZY_WORKER_ID")
+    )
     parsed = WorkerHostConfig(
         object_storage_hosts=parse_object_storage_hosts(
             env.get("TENSORHUB_OBJECT_STORAGE_HOSTS", "")
         ),
         tensorhub_origin=hub_origin,
-        tensorhub_ca_der=ca_der,
+        tensorhub_worker_token=worker_token,
         storage_admission_fd=4 if storage_fd == "4" else None,
         worker_id=bounded("COZY_WORKER_ID"),
         worker_internal_port=worker_port,
@@ -492,32 +494,41 @@ def read_worker_host_config(
     return parsed
 
 
-def _machine_publication_authority(path: Path) -> tuple[str, bytes]:
-    """Read the fixed boot document once, alongside the worker's other config."""
+def _machine_publication_authority(path: Path, worker_id: str) -> tuple[str, str]:
+    """Read the privileged boot document once, alongside other worker config."""
     try:
         with path.open("rb") as source:
             raw = source.read((32 << 10) + 1)
     except FileNotFoundError:
-        return "", b""  # Older Hosts confer no independent publication authority.
+        return "", ""  # Hosts without a handoff confer no publication authority.
     try:
         if len(raw) > 32 << 10:
             raise ValueError("authority metadata exceeds its bound")
         value = json.loads(raw)
-        if not isinstance(value, dict) or set(value) != {"version", "origin", "ca_der_base64url"}:
+        if not isinstance(value, dict) or set(value) != {
+            "version",
+            "origin",
+            "worker_id",
+            "worker_token",
+        }:
             raise ValueError("authority metadata is not closed")
-        origin, ca = value["origin"], value["ca_der_base64url"]
+        origin, token = value["origin"], value["worker_token"]
         if (
             type(value["version"]) is not int
-            or value["version"] != 1
+            or value["version"] != 2
             or not isinstance(origin, str)
-            or not isinstance(ca, str)
+            or not isinstance(token, str)
+            or value["worker_id"] != worker_id
         ):
             raise ValueError("invalid authority metadata")
         parse_tensorhub_origin(origin)
-        der = base64.b64decode(ca + "=" * (-len(ca) % 4), altchars=b"-_", validate=True)
-        if len(der) > 16 << 10 or base64.urlsafe_b64encode(der).decode("ascii").rstrip("=") != ca:
-            raise ValueError("invalid authority CA")
-        return origin, der
+        decoded = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True)
+        if (
+            len(decoded) != 32
+            or base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != token
+        ):
+            raise ValueError("invalid worker capability")
+        return origin, token
     except (ValueError, binascii.Error) as exc:
         raise ConfigError(
             "worker_host_config", "Hub authority handoff is invalid", "fix host launch"

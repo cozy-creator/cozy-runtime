@@ -1,6 +1,6 @@
 """Acquire the exact bytes selected by one PlacementSet/1.
 
-The PlacementSet is the complete statement of WHAT to run. Tensorhub's mTLS response contains
+The PlacementSet is the complete statement of WHAT to run. Tensorhub's authenticated HTTPS response contains
 only short-lived locations for the closure the Hub derives from that accepted set. This module
 never reads a file role from the download plan and never reconstructs the deleted bundle,
 environment-specification, object-set, or binding documents.
