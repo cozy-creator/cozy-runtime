@@ -126,6 +126,7 @@ class BlobGrant:
     length: int
     path: Path
     verified: VerifiedFile | None = None
+    image_seed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +202,7 @@ class _Inspected:
     requires_python: str | None
     requirements: tuple[Requirement, ...]
     native_members: tuple[str, ...]
+    image_seed: bool = False
 
 
 def wheel_name_version(filename: str) -> tuple[str, str] | None:
@@ -482,9 +484,15 @@ def _wheel_write_bound(
     members = [member for wheel in inspected for member in wheel.members] if not reused else []
     nodes = {str(parent) for member in members for parent in PurePosixPath(member.filename).parents}
     count = len(members) + len(nodes)
+    expanded = sum(
+        member.file_size
+        for item in inspected
+        if not item.image_seed and not reused
+        for member in item.members
+    )
     return storage_admission.Write(
         root,
-        2 * sum(member.file_size for member in members) + (count * (128 << 10)) + (1 << 20),
+        2 * expanded + (count * (128 << 10)) + (1 << 20),
         2 * count + 128,
     )
 
@@ -495,7 +503,9 @@ def _wheel_archive_write_bound(
     missing = [
         item
         for item in inspected
-        if not reused and not _wheel_archive_path(cache, item.wheel).exists()
+        if not reused
+        and not item.image_seed
+        and not _wheel_archive_path(cache, item.wheel).exists()
     ]
     return storage_admission.Write(
         cache, sum(item.wheel.length for item in missing) + (1 << 20), 3 * len(missing) + 8
@@ -1021,7 +1031,9 @@ def _install_locked_bounded(
     cache_root: Path | None = None,
 ) -> None:
     observed = observe_base(python)
-    inspected = fetch_locked_wheels(rows, staging.parent, observed, cache_root=cache_root)
+    inspected = fetch_locked_wheels(
+        rows, staging.parent, observed, cache_root=cache_root, python=python
+    )
     with storage_admission.admit(
         _wheel_write_bound(staging.parent, inspected),
         _wheel_archive_write_bound(cache_root or staging.parent / "wheel-cache", inspected),
@@ -1037,6 +1049,7 @@ def fetch_locked_wheels(
     observed: base_observation.Observation,
     *,
     cache_root: Path | None = None,
+    python: Path = Path(sys.executable),
 ) -> list[_Inspected]:
     """Fetch exact dependency artifacts through the existing bounded storage owner."""
     inspected: list[_Inspected] = []
@@ -1047,6 +1060,18 @@ def fetch_locked_wheels(
                 "package_environment_lock_wheels_required",
                 "refresh preparation facts from Tensorhub to obtain the exact selected wheels",
             )
+        if cache_root is not None:
+            from cozy_runtime.internal import _image_wheel_cache
+
+            _require_dependency_cache_root(cache_root)
+            seeded = _image_wheel_cache.read(row.hashes[0], observed)
+            if (
+                seeded is not None
+                and (seeded.wheel.distribution, seeded.wheel.version) == (row.name, row.version)
+                and _image_wheel_cache.available(seeded, python, cache_root)
+            ):
+                inspected.append(seeded)
+                continue
         filename = unquote(Path(urlsplit(row.url).path).name)
         expected = root / ".stage" / operation / "wheels" / filename
         cached = (
@@ -1582,6 +1607,14 @@ def _verify_grants(
         grant = grants[wheel.digest]
         if grant.length != wheel.length:
             raise EnvironmentRefusal("package_environment_grant_length_mismatch", wheel.digest)
+        if grant.image_seed:
+            from cozy_runtime.internal import _image_wheel_cache
+
+            seeded = _image_wheel_cache.read(wheel.digest, base)
+            if seeded is None or seeded.wheel != wheel or seeded.path != grant.path:
+                raise EnvironmentRefusal("package_environment_image_seed_invalid", wheel.digest)
+            inspected.append(seeded)
+            continue
         try:
             info = grant.path.lstat()
         except OSError as exc:
@@ -2240,6 +2273,7 @@ def _install_with_uv(
     archives = [
         _cache_wheel_archive(archive_cache, item)
         for item in sorted(inspected, key=lambda item: item.wheel.digest)
+        if not item.image_seed
     ]
     cache = (cache_root or staging.parent) / "uv-cache"
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2273,6 +2307,17 @@ def _install_with_uv(
             *(str(path) for path in archives),
         ],
     ]
+    if not archives:
+        commands.pop()
+    seeded = [item for item in inspected if item.image_seed]
+    if seeded:
+        from cozy_runtime.internal import _image_wheel_cache
+
+        requirements = staging.parent / (".seed-requirements-" + uuid.uuid4().hex)
+        requirements.write_text("".join(_image_wheel_cache.requirement(item) for item in seeded))
+        # One command handles public image payloads; archives/private packages keep
+        # their ordinary hardlink cache and are installed into the same isolated venv.
+        commands.append(_image_wheel_cache.command(uv, staging / "bin/python", requirements))
     if supplements:
         # Only the fixed built-in local capture can request a numpy supplement.
         # Private package closures are complete and never reach this compatibility lane.
@@ -2292,8 +2337,13 @@ def _install_with_uv(
             ]
         )
     for command in commands:
-        command.extend(["--cache-dir", str(cache)])
-    _run_install_commands(commands, staging, dependencies)
+        if "--cache-dir" not in command:
+            command.extend(["--cache-dir", str(cache)])
+    try:
+        _run_install_commands(commands, staging, dependencies)
+    finally:
+        if seeded:
+            requirements.unlink(missing_ok=True)
 
 
 def _run_install_commands(
@@ -2321,6 +2371,9 @@ def _run_install_commands(
                 detail or f"uv exited {result.returncode}",
             )
 
+    from cozy_runtime.internal import _image_wheel_cache
+
+    _image_wheel_cache.private_metadata(staging)
     _rewrite_installed_launchers(staging)
     # uv must finish before immutable shared dependency inodes enter the venv.
     # Installation cannot overwrite a prior capture through a shared payload.
