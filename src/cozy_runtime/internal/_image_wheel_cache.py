@@ -63,16 +63,22 @@ def read(digest: str, base: base_observation.Observation) -> package_environment
 
     pe._require_digest(digest, "seed.digest")
     path = ROOT / "facts" / (digest.removeprefix("sha256:") + ".json")
-    if not path.exists():
+    if not path.exists() and not path.is_symlink():
         return None
     try:
         for target in (ROOT, ROOT / "facts", path):
             info = target.lstat()
             if target.resolve() != target or info.st_uid != os.geteuid() or info.st_mode & 0o022:
                 raise ValueError("image seed is not owned immutable image content")
-        if not stat.S_ISREG(info.st_mode) or info.st_size > pe.MAX_METADATA_BYTES:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_mode & 0o222
+            or not 0 < info.st_size <= pe.MAX_METADATA_BYTES
+        ):
             raise ValueError("invalid image seed facts")
         value = json.loads(path.read_bytes())
+        if not isinstance(value, dict):
+            raise ValueError("image seed facts must be an object")
         if value["uv_version"] != base.uv_version:
             return None
         row = value["wheel"]
@@ -83,7 +89,16 @@ def read(digest: str, base: base_observation.Observation) -> package_environment
             raise ValueError("image seed wheel identity changed")
         pe._require_compatible_tags(wheel, base)
         members = []
+        if not isinstance(value["members"], list) or len(value["members"]) > pe.MAX_WHEEL_MEMBERS:
+            raise ValueError("invalid image seed member count")
         for name, size in value["members"]:
+            if (
+                not isinstance(name, str)
+                or not name
+                or type(size) is not int
+                or not 0 <= size <= pe.MAX_WHEEL_BYTES
+            ):
+                raise ValueError("invalid image seed member")
             member = zipfile.ZipInfo(name)
             member.file_size = size
             members.append(member)
@@ -141,8 +156,17 @@ def available(item: package_environment._Inspected, python: Path, cache_root: Pa
     from cozy_runtime.internal import package_environment as pe
     from cozy_runtime.internal import storage_admission
 
-    if not (ROOT / "uv-cache").is_dir():
+    cache = ROOT / "uv-cache"
+    if not cache.exists() and not cache.is_symlink():
         return False
+    info = cache.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or cache.resolve() != cache
+        or info.st_uid != os.geteuid()
+        or info.st_mode & 0o022
+    ):
+        raise pe.EnvironmentRefusal("package_environment_image_seed_invalid", str(cache))
     count = len(item.members)
     with (
         storage_admission.admit(
