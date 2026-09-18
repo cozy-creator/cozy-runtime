@@ -16,9 +16,9 @@ from cozy_runtime.internal import effect_interfaces, fill
 from cozy_runtime.internal.worker import machine_models
 from cozy_runtime.internal.worker.machine_artifacts import model_retention
 from cozy_runtime.internal.worker.machine_publication import (
+    PublicationAuthority,
     PublicationClient,
     PublicationRefusal,
-    PublicationTLS,
     apply_release,
     attach_assessment,
     prepare_release,
@@ -32,8 +32,10 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 
 class Effects:
-    def __init__(self, workspace: Workspace, executions: Executions, tls: PublicationTLS | None):
-        self.workspace, self.executions, self.tls = workspace, executions, tls
+    def __init__(
+        self, workspace: Workspace, executions: Executions, authority: PublicationAuthority | None
+    ):
+        self.workspace, self.executions, self.authority = workspace, executions, authority
         self.journal = Calls(workspace)
         self.lock = threading.Lock()
         self.thread_ids: set[int] = set()
@@ -87,7 +89,7 @@ class Effects:
                 return
         for call in self.journal.pending_effects(owner):
             self.schedule(owner, call)
-        if self.tls is None:
+        if self.authority is None:
             return
         with self.lock:
             key = owner, "cleanup"
@@ -113,7 +115,7 @@ class Effects:
             if pure is None or pure["memoize"]:
                 raise PublicationRefusal("publication.impure_call_forbidden")
             grant = self.executions.publication_authorization(owner, call.parent_request)
-            if not grant or self.tls is None:
+            if not grant or self.authority is None:
                 raise PublicationRefusal("publication.authority_absent", status=403)
             intent = canonical_json.decode(call.intent)
             if (
@@ -121,7 +123,7 @@ class Effects:
                 or intent["interface_digest"] != effect_interfaces.DIGEST
             ):
                 raise PublicationRefusal("publication.interface_changed")
-            client = self.tls.client(grant)
+            client = self.authority.client(grant)
             operation = intent["export"]
             if operation == "publish_release":
                 request = msgspec.convert(

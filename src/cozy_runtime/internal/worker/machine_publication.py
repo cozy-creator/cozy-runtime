@@ -15,9 +15,8 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
@@ -44,18 +43,19 @@ class PublicationClient(Protocol):
 
 
 @dataclass(frozen=True)
-class PublicationTLS:
+class PublicationAuthority:
     origin: str
-    certificate: Path
-    private_key: Path
-    ca_der: bytes = b""
+    worker_id: str
+    worker_token: str = field(repr=False)
 
     def client(self, authorization_id: str) -> MachinePublicationClient:
-        context = ssl.create_default_context()
-        if self.ca_der:
-            context.load_verify_locations(cadata=self.ca_der)
-        context.load_cert_chain(self.certificate, self.private_key)
-        return MachinePublicationClient(self.origin, authorization_id, context)
+        return MachinePublicationClient(
+            self.origin,
+            authorization_id,
+            ssl.create_default_context(),
+            worker_id=self.worker_id,
+            worker_token=self.worker_token,
+        )
 
 
 def _object(raw: bytes) -> dict[str, Any]:
@@ -83,10 +83,10 @@ def destination_path(destination: str) -> str:
 
 
 class MachinePublicationClient:
-    """One root's bounded AuthKit grant on the operator-configured mTLS edge.
+    """One root's bounded AuthKit grant over verified public HTTPS.
 
-    The SSL context contains only the existing worker certificate. Python job
-    executors never receive this instance, its token, or its certificate key.
+    The independent worker capability authenticates renewal and binds publication
+    to this worker. Python job executors never receive either credential.
     HTTP redirects are not followed and each connection is closed after use.
     """
 
@@ -96,6 +96,8 @@ class MachinePublicationClient:
         authorization_id: str,
         context: ssl.SSLContext,
         *,
+        worker_id: str,
+        worker_token: str,
         clock: Callable[[], float] = time.time,
     ) -> None:
         parsed = parse_tensorhub_origin(origin)
@@ -108,6 +110,14 @@ class MachinePublicationClient:
             context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED,
             "publication.tls_verification_required",
         )
+        _require(
+            bool(worker_id)
+            and len(worker_id) <= 256
+            and all(33 <= ord(c) <= 126 for c in worker_id)
+            and re.fullmatch(r"[A-Za-z0-9_-]{43}", worker_token) is not None,
+            "publication.worker_authority_invalid",
+        )
+        self.worker_id, self.worker_token = worker_id, worker_token
         self.origin = parsed
         self.authorization_id, self.context, self.clock = authorization_id, context, clock
         self._token, self._expires = "", 0.0
@@ -116,7 +126,11 @@ class MachinePublicationClient:
     def _exchange(
         self, method: str, path: str, body: bytes | None, token: str = ""
     ) -> tuple[int, bytes]:
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "X-Cozy-Worker-ID": self.worker_id,
+            "X-Cozy-Worker-Token": self.worker_token,
+        }
         if token:
             headers["Authorization"] = "Bearer " + token
         if body is not None:

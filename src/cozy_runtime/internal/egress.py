@@ -11,7 +11,7 @@ th-132, taking `blocked()` with it. The `one-address-predicate` fence in
 `checks/architecture.py` reddens if any other urllib/http.client chain appears beside this
 module — a second network byte mover in this runtime is the defect above, restated.
 The bounded machine-publication metadata request also lives here: it uses the
-operator-configured HTTPS control origin and mTLS context, and never follows redirects.
+operator-configured HTTPS control origin and verified TLS context, and never follows redirects.
 
 **A stream may not exceed its declared size.** `copy_bounded` stops at the declared length
 and refuses before writing the over-bound chunk; it never buffers the body in memory. A body that

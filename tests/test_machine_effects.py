@@ -7,7 +7,7 @@ from pathlib import Path
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import effect_interfaces
 from cozy_runtime.internal.worker.machine_effects import Effects
-from cozy_runtime.internal.worker.machine_publication import PublicationTLS
+from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
@@ -57,7 +57,7 @@ def test_failed_effect_remains_reconcilable_after_parent_stops(tmp_path: Path) -
     assert not calls.has_unsettled_effects("owner", "parent")
 
 
-def test_credential_io_failure_is_visible_and_background_threads_are_pollers(
+def test_invalid_worker_authority_is_visible_and_background_threads_are_pollers(
     tmp_path: Path,
 ) -> None:
     workspace = Workspace(tmp_path / "store")
@@ -86,10 +86,10 @@ def test_credential_io_failure_is_visible_and_background_threads_are_pollers(
     effects = Effects(
         workspace,
         executions,
-        PublicationTLS(
+        PublicationAuthority(
             "https://example.test",
-            tmp_path / "missing.crt",
-            tmp_path / "missing.key",
+            "worker-test",
+            "",
         ),
     )
     try:
@@ -99,7 +99,7 @@ def test_credential_io_failure_is_visible_and_background_threads_are_pollers(
             assert time.monotonic() < until
             time.sleep(0.01)
         observed = calls.get("owner", "parent", 0)
-        assert observed.safe_code == "publication.adapter_failed.FileNotFoundError"
+        assert observed.safe_code == "publication.worker_authority_invalid"
         assert not observed.sent and not observed.result
         assert effects.pollers
     finally:
