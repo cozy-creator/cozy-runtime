@@ -531,6 +531,41 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
             )
             assert verdict.refusal_code == "" and verdict.refusal_detail == ""
 
+            # A local controller can run a different CPython than the release.
+            # Its preinstalled SDK must never supply this published wheel closure.
+            from cozy_runtime.internal import python_interpreters
+
+            for selected in python_interpreters.available():
+                local_root = root / f"local-{selected.version}"
+                local_request = pb.PreparePackageSetRequest(
+                    download_delegation=_download_set("paul/marco-polo", release),
+                    install_root=str(local_root),
+                    application="marco_polo_package:app",
+                    locked_requirements=export,
+                    python_requires=">=3.12",
+                    python_version=selected.version,
+                )
+                held: list[package_environment.InstalledEnvironment] = []
+                for _ in range(2):
+                    prepare_package_set(
+                        local_request,
+                        artifact_cache=root / "artifacts",
+                        tensorfs_root=root / "store",
+                        install_root=local_root,
+                        python=image_python,
+                        preinstalled_python=image_python,
+                        describe=describe_real,
+                        verified=lambda _digest, _length, _path: None,
+                        materialized=held.append,
+                    )
+                assert held[1].reused
+                assert held[0].generation == held[1].generation
+                assert python_interpreters.probe(held[0].python).version == selected.version
+                identity = json.loads(
+                    (held[0].generation / package_environment.CONTENT_IDENTITY_NAME).read_bytes()
+                )
+                assert "dependency_snapshot" not in identity
+
             with pytest.raises(PreparationRefusal) as disagreed:
                 prep("marco_polo_package:other", export)
             assert disagreed.value.code == "package_prepare_application_disagrees"
