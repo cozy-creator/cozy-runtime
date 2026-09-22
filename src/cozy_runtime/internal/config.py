@@ -105,6 +105,13 @@ class RuntimeConfig:
     object_storage_hosts: tuple[str, ...] = ()
     """Deployment-declared TensorFS egress hosts; never inferred from download URLs."""
 
+    python_root: Path | None = None
+    """Host-owned interpreter cache override; local roles share cozy_home/python."""
+
+    @property
+    def managed_python_root(self) -> Path:
+        return self.python_root or self.cozy_home / "python"
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerHostConfig:
@@ -545,6 +552,7 @@ def runtime_config_from_host(host: WorkerHostConfig) -> RuntimeConfig:
         child_base_env=host.child_base_env,
         object_storage_hosts=host.object_storage_hosts,
         dependency_cache=host_paths.DEPENDENCY_CACHE,
+        python_root=host_paths.INSTALL_ROOT / "python",
     )
 
 

@@ -84,6 +84,7 @@ def reopen(
     python: Path,
     base: base_observation.Observation,
     job_plan_root: Path,
+    python_root: Path | None = None,
 ) -> tuple[pb.PreparePackageSetResult, package_environment.InstalledEnvironment] | None:
     """Return live installed code, or a miss; never execute a package to check a hit.
 
@@ -115,7 +116,7 @@ def reopen(
                 request.python_requires,
                 request.python_version,
                 default=python,
-                root=root / "python",
+                root=python_root or root / "python",
             )
             if selected.executable != python:
                 python = selected.executable

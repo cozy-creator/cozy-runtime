@@ -6,9 +6,7 @@ import json
 import os
 import shutil
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +14,7 @@ import pytest
 
 from cozy_runtime.internal import image_inventory, package_environment, storage_admission
 from cozy_runtime.internal import python_interpreters as p
+from cozy_runtime.internal.config import package_install_environment
 from cozy_runtime.internal.worker import package_prepare
 
 
@@ -109,18 +108,16 @@ def test_free_threaded_download_is_not_a_capability(monkeypatch: pytest.MonkeyPa
         p._download_version("/uv", p._constraint(">=3.13", ""))
 
 
-def test_concurrent_requests_share_install_and_keep_owned_paths(
+def test_repeated_requests_reuse_install_and_keep_owned_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     installed: list[p.Interpreter] = []
     calls = []
-    barrier = threading.Barrier(2)
     root = tmp_path / "python"
     monkeypatch.setattr(p, "available", lambda *a, **kw: tuple(installed))
     monkeypatch.setattr(shutil, "which", lambda name: "/uv")
 
     def download(*args: Any) -> str:
-        barrier.wait(timeout=5)
         return "3.13.8"
 
     monkeypatch.setattr(p, "_download_version", download)
@@ -131,16 +128,18 @@ def test_concurrent_requests_share_install_and_keep_owned_paths(
         assert env["UV_CACHE_DIR"] == str(root / "cache")
         assert env["TMPDIR"] == str(root)
         assert "UV_PYTHON_MIRROR" not in env
-        assert "--no-bin" in command
+        assert "--no-bin" in command and "--no-registry" in command
+        assert env["UV_CONCURRENT_DOWNLOADS"] == "1"
+        assert env["UV_CONCURRENT_INSTALLS"] == "1"
+        assert env["UV_CONCURRENT_BUILDS"] == "1"
+        assert env["TEMP"] == env["TMP"] == str(root)
         (root / "managed").mkdir()
-        time.sleep(0.1)
         installed.append(_candidate("3.13.8", root / "managed/python"))
         return ""
 
     monkeypatch.setattr(p, "_run_uv", install)
     monkeypatch.setenv("UV_PYTHON_MIRROR", "https://untrusted.invalid")
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda _: p.ensure(">=3.13", root=root), range(2)))
+    results = [p.ensure(">=3.13", root=root) for _ in range(2)]
     assert len(calls) == 1
     assert results[0] == results[1]
     assert root.stat().st_mode & 0o777 == 0o711
@@ -319,3 +318,242 @@ def test_private_preparation_observes_cancellation_before_wheel_access(tmp_path:
             cancel=lambda: True,
         )
     assert not root.exists()
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_nonlinux_uv_process_completes_and_cancellation_reaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    # The branch runs a real child on Linux, proving it needs neither /proc nor
+    # the Linux trampoline. This is not native macOS/Windows qualification.
+    monkeypatch.setattr(sys, "platform", platform)
+    assert (
+        p._run_uv(
+            [sys.executable, "-c", "print('complete')"], env=dict(os.environ), cancel=None
+        ).strip()
+        == "complete"
+    )
+    test_cancellation_reaps_active_child(tmp_path)
+
+
+def test_windows_inventory_discovers_uv_python_exe_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "python"
+    executable = root / "managed" / "cpython-3.13.8-windows-x86_64-none" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    control = _candidate("3.12.12")
+    selected = _candidate("3.13.8", executable)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+    monkeypatch.delenv("COZY_PACKAGE_PYTHONS", raising=False)
+    monkeypatch.setattr(p, "probe", lambda path: selected if path == executable else control)
+    assert selected in p.available(default=control.executable, root=root)
+
+
+def test_windows_owned_root_does_not_require_posix_uid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "python"
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delattr(os, "geteuid")
+    p._require_owned_root(root)
+    assert root.is_dir()
+
+
+def test_python_inventory_import_does_not_require_posix_modules() -> None:
+    import subprocess
+
+    code = """
+import builtins
+original = builtins.__import__
+def portable_import(name, *args, **kwargs):
+    if name in {'fcntl', 'resource'}:
+        raise ImportError('POSIX-only module unavailable')
+    return original(name, *args, **kwargs)
+builtins.__import__ = portable_import
+from cozy_runtime.internal import python_interpreters, storage_admission
+from cozy_runtime.cli import main
+assert python_interpreters.supported_minors()
+assert not storage_admission.enabled()
+assert main.main(['--json', 'python-interpreters']) == 0
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="real uv POSIX lock proof runs on Linux")
+def test_uv_serializes_concurrent_installers_before_reusing_published_python(
+    tmp_path: Path,
+) -> None:
+    import fcntl
+    import subprocess
+    import sysconfig
+
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv is required")
+    actual = p.probe(Path(sys.executable))
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    lock = (managed / ".lock").open("wb")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    command = [
+        uv,
+        "python",
+        "install",
+        "--offline",
+        "--no-config",
+        "--no-bin",
+        "--no-registry",
+        "--install-dir",
+        str(managed),
+        "--cache-dir",
+        str(tmp_path / "cache"),
+        "cpython@" + actual.version,
+    ]
+    children = [
+        subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=package_install_environment(),
+        )
+        for _ in range(2)
+    ]
+    try:
+        # Each real installer must wait for uv's own shared-directory lock before
+        # checking for/download-deciding an interpreter. An unlocked installer
+        # would immediately fail because the request is offline and absent.
+        for child in children:
+            with pytest.raises(subprocess.TimeoutExpired):
+                child.communicate(timeout=0.3)
+        installation = managed / f"cpython-{actual.version}-linux-x86_64-gnu"
+        binary = installation / "bin" / ("python" + ".".join(actual.version.split(".")[:2]))
+        binary.parent.mkdir(parents=True)
+        binary.symlink_to(Path(sys.executable))
+        (installation / "lib" / ("python" + ".".join(actual.version.split(".")[:2]))).mkdir(
+            parents=True
+        )
+        config_source = next(Path(sysconfig.get_path("stdlib")).glob("_sysconfigdata_*.py"))
+        shutil.copyfile(
+            config_source,
+            installation
+            / "lib"
+            / ("python" + ".".join(actual.version.split(".")[:2]))
+            / config_source.name,
+        )
+        original = binary.lstat().st_ino
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+        for child in children:
+            _, stderr = child.communicate(timeout=15)
+            assert child.returncode == 0, stderr
+        assert binary.lstat().st_ino == original
+        assert {path.resolve() for path in managed.glob("cpython-*")} == {installation}
+    finally:
+        lock.close()
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.communicate()
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_nonlinux_ensure_installs_once_and_reuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    root = tmp_path / "python"
+    installed: list[p.Interpreter] = []
+    commands: list[list[str]] = []
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(shutil, "which", lambda _: "/uv")
+    monkeypatch.setattr(p, "available", lambda *a, **kw: tuple(installed))
+    monkeypatch.setattr(p, "_download_version", lambda *a: "3.13.8")
+
+    def install(command: list[str], **kw: Any) -> str:
+        commands.append(command)
+        managed = root / "managed"
+        managed.mkdir()
+        installed.append(_candidate("3.13.8", managed / "python"))
+        return ""
+
+    monkeypatch.setattr(p, "_run_uv", install)
+    first = p.ensure(">=3.13", "3.13.8", root=root)
+    assert p.ensure(">=3.13", "3.13.8", root=root) == first
+    assert root.is_dir() and len(commands) == 1
+    assert "--no-registry" in commands[0] and "--no-bin" in commands[0]
+
+
+def test_cli_and_local_worker_share_one_managed_interpreter_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dataclasses
+    import threading
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from typing import cast
+
+    from cozy_runtime.cli import main
+    from cozy_runtime.cli.io import Options
+    from cozy_runtime.internal.config import Credentials, RuntimeConfig
+    from cozy_runtime.internal.worker.session import Worker
+    from cozy_runtime.protocol import worker_pb2 as pb
+
+    config = RuntimeConfig(cozy_home=tmp_path / "cozy", credentials=Credentials())
+    install_root = config.cozy_home / "runtime" / "environments"
+    calls: list[Path] = []
+
+    def installed(*a: Any, root: Path | None = None) -> tuple[p.Interpreter, ...]:
+        assert root is not None
+        binary = root / "managed" / "cpython-3.13.10-linux-x86_64-gnu" / "bin" / "python3.13"
+        return (_candidate("3.13.10", binary),) if binary.exists() else ()
+
+    def download(command: list[str], *, env: dict[str, str], **kw: Any) -> str:
+        managed = Path(env["UV_PYTHON_INSTALL_DIR"])
+        calls.append(managed)
+        binary = managed / "cpython-3.13.10-linux-x86_64-gnu" / "bin" / "python3.13"
+        binary.parent.mkdir(parents=True)
+        binary.touch()
+        return ""
+
+    observed = dataclasses.replace(
+        package_environment.observe_base(), python_full_version="3.13.10", python_abi="cp313"
+    )
+    monkeypatch.setattr(p, "available", installed)
+    monkeypatch.setattr(p, "_download_version", lambda *a: "3.13.10")
+    monkeypatch.setattr(p, "_run_uv", download)
+    monkeypatch.setattr(shutil, "which", lambda _: "/uv")
+    monkeypatch.setattr(package_environment, "observe_base", lambda path: observed)
+    selected = main.dispatch("python-ensure", [">=3.13", "3.13.10"], Options(json=True), config)
+    assert selected.document is not None
+
+    def check(
+        request: pb.PreparePackageSetRequest, **kwargs: Any
+    ) -> pb.CheckPackageSetCompatibilityResult:
+        python, _ = package_prepare._select_python(
+            kwargs["python"], ">=3.13", "3.13.10", root=kwargs["python_root"]
+        )
+        assert p.Interpreter(python, "3.13.10", "cp313").document() == selected.document
+        return pb.CheckPackageSetCompatibilityResult()
+
+    monkeypatch.setattr(package_prepare, "check_package_set_compatibility", check)
+    worker = SimpleNamespace(
+        config=config,
+        preparation_lock=nullcontext(),
+        base=observed,
+        options=SimpleNamespace(
+            tensorfs_root=str(tmp_path / "tfs"),
+            install_root=str(install_root),
+            python=sys.executable,
+        ),
+        stop=threading.Event(),
+        note=lambda *a: None,
+    )
+    result = Worker.check_package_set_compatibility(
+        cast(Worker, worker), pb.PreparePackageSetRequest()
+    )
+    assert not result.refusal_code
+    assert calls == [config.managed_python_root / "managed"]
+    assert not (install_root / "python").exists()

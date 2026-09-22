@@ -6,14 +6,13 @@ policy through ``cozy-runtime --json python-interpreters``.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -133,7 +132,8 @@ def available(
                 if found.returncode == 0:
                     candidates.append(Path(found.stdout.strip()))
     if root is not None:
-        candidates.extend(sorted((root / "managed").glob("cpython-*/bin/python*.*")))
+        pattern = "cpython-*/python.exe" if sys.platform == "win32" else "cpython-*/bin/python*.*"
+        candidates.extend(sorted((root / "managed").glob(pattern)))
     observed: dict[str, Interpreter] = {}
     for path in candidates:
         if path.name.endswith("-config"):
@@ -205,28 +205,29 @@ def _check_cancel(cancel: Callable[[], bool] | None) -> None:
 
 
 def _run_uv(command: list[str], *, env: dict[str, str], cancel: Callable[[], bool] | None) -> str:
-    """Drain both pipes while observing cancellation; no child outlives this operation."""
+    """Drain both pipes and reap the child on cooperative cancellation."""
     _check_cancel(cancel)
-    # Reuse the exec-first parent-death trampoline. A killed CLI or worker cannot
-    # leave a downloader writing after the admission lease has been released.
-    command = [
-        sys.executable,
-        "-I",
-        "-c",
-        "import sys; from cozy_runtime.internal.trampoline import main; main(sys.argv[1:])",
-        "--expect-parent",
-        str(os.getpid()),
-        "--oom-adj",
-        str(max(500, int(Path("/proc/self/oom_score_adj").read_text()))),
-        "--uid",
-        "-1",
-        "--gid",
-        "-1",
-        "--scope-backend",
-        "inherit",
-        "--",
-        *command,
-    ]
+    # Linux retains parent-death containment. Other platforms use ordinary process
+    # launch with the same cooperative cancellation and child reaping below.
+    if sys.platform.startswith("linux"):
+        command = [
+            sys.executable,
+            "-I",
+            "-c",
+            "import sys; from cozy_runtime.internal.trampoline import main; main(sys.argv[1:])",
+            "--expect-parent",
+            str(os.getpid()),
+            "--oom-adj",
+            str(max(500, int(Path("/proc/self/oom_score_adj").read_text()))),
+            "--uid",
+            "-1",
+            "--gid",
+            "-1",
+            "--scope-backend",
+            "inherit",
+            "--",
+            *command,
+        ]
     with subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
@@ -308,7 +309,7 @@ def ensure(
     seal. Python is shared under the host's install root, while Torch and every
     other dependency still belong to the existing exact package closure cache.
     """
-    from cozy_runtime.internal import package_environment, storage_admission
+    from cozy_runtime.internal import storage_admission
 
     constraint = _constraint(requires, version)
     _check_cancel(cancel)
@@ -324,53 +325,61 @@ def ensure(
     # Reserve archive + extraction + cache before creating any owned directories.
     # CPython's stripped standalone build fits well below this conservative bound.
     with storage_admission.admit(storage_admission.Write(root, 1 << 30, 20000)):
-        package_environment._require_owned_root(root)
-        descriptor = os.open(
-            root / ".provision.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+        _require_owned_root(root)
+        # Recheck after admission. uv itself locks its managed directory across
+        # the installed-version check and atomic publication, including races here.
+        for candidate in available(default, root=root):
+            if constraint.contains(candidate.version):
+                return candidate
+        if progress is not None:
+            progress(f"Installing CPython {selected}")
+        managed = root / "managed"
+        cache = root / "cache"
+        env = {
+            **package_install_environment(),
+            "UV_PYTHON_INSTALL_DIR": str(managed),
+            "UV_CACHE_DIR": str(cache),
+            "TMPDIR": str(root),
+            "TEMP": str(root),
+            "TMP": str(root),
+            "UV_CONCURRENT_DOWNLOADS": "1",
+            "UV_CONCURRENT_INSTALLS": "1",
+            "UV_CONCURRENT_BUILDS": "1",
+        }
+        _run_uv(
+            [
+                uv,
+                "python",
+                "install",
+                "--no-config",
+                "--no-bin",
+                "--no-registry",
+                "--install-dir",
+                str(managed),
+                "--cache-dir",
+                str(cache),
+                "cpython@" + selected,
+            ],
+            env=env,
+            cancel=cancel,
         )
-        try:
-            while True:
-                _check_cancel(cancel)
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    time.sleep(0.2)
-            # A concurrent request may already have published the same interpreter.
-            for candidate in available(default, root=root):
-                if constraint.contains(candidate.version):
-                    return candidate
-            if progress is not None:
-                progress(f"Installing CPython {selected}")
-            managed = root / "managed"
-            cache = root / "cache"
-            env = {
-                **package_install_environment(),
-                "UV_PYTHON_INSTALL_DIR": str(managed),
-                "UV_CACHE_DIR": str(cache),
-                "TMPDIR": str(root),
-            }
-            _run_uv(
-                [
-                    uv,
-                    "python",
-                    "install",
-                    "--no-config",
-                    "--no-bin",
-                    "--install-dir",
-                    str(managed),
-                    "--cache-dir",
-                    str(cache),
-                    "cpython@" + selected,
-                ],
-                env=env,
-                cancel=cancel,
-            )
-            # A package executor may traverse/read its interpreter but never write it.
+        # A package executor may traverse/read its interpreter but never write it.
+        if sys.platform != "win32":
             managed.chmod(0o711)
-            installed = select(requires, selected, default=default, root=root)
-            if progress is not None:
-                progress(f"CPython {installed.version} ready")
-            return installed
-        finally:
-            os.close(descriptor)
+        installed = select(requires, selected, default=default, root=root)
+        if progress is not None:
+            progress(f"CPython {installed.version} ready")
+        return installed
+
+
+def _require_owned_root(root: Path) -> None:
+    # POSIX ownership is checked explicitly. Windows uses the caller-owned user
+    # directory ACL; do not pretend st_uid or Unix mode bits represent that ACL.
+    if not root.is_absolute() or root.is_symlink() or root.is_junction():
+        raise InterpreterRefusal(f"invalid managed Python root: {root}")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or (sys.platform != "win32" and info.st_uid != os.geteuid()):
+        raise InterpreterRefusal(f"managed Python root owner mismatch: {root}")
+    if sys.platform != "win32":
+        root.chmod(0o711)

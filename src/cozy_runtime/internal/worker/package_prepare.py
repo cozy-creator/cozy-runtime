@@ -111,6 +111,7 @@ def prepare_package_set(
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
     cancel: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
+    python_root: Path | None = None,
 ) -> pb.PreparePackageSetResult:
     """Parse the desired download set plus the request's release facts (wire 30) and prepare.
 
@@ -154,7 +155,7 @@ def prepare_package_set(
         request.python_requires,
         request.python_version,
         base,
-        root=install_root / "python",
+        root=python_root or install_root / "python",
         cancel=cancel,
         progress=progress,
     )
@@ -453,6 +454,7 @@ def check_package_set_compatibility(
     base: base_observation.Observation | None = None,
     cancel: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
+    python_root: Path | None = None,
 ) -> pb.CheckPackageSetCompatibilityResult:
     """Fit package code against headers while tensor bodies are still downloading.
 
@@ -491,7 +493,7 @@ def check_package_set_compatibility(
         request.python_requires,
         request.python_version,
         base,
-        root=install_root / "python",
+        root=python_root or install_root / "python",
         cancel=cancel,
         progress=progress,
     )
@@ -781,6 +783,7 @@ def prepare_local_package(
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
     cancel: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
+    python_root: Path | None = None,
 ) -> pb.PreparePackageSetResult:
     """Prepare one exact local wheel revision without inventing Hub provenance."""
 
@@ -801,6 +804,7 @@ def prepare_local_package(
     ):
         raise PreparationRefusal("local_package_identity_invalid", request.operation_id)
     return prepare_package(
+        python_root=python_root,
         cancel=cancel,
         progress=progress,
         package_name=package.package,
@@ -985,6 +989,7 @@ def prepare_package(
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
     cancel: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
+    python_root: Path | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact local package revision.
 
@@ -1013,7 +1018,7 @@ def prepare_package(
         python_requires,
         python_version,
         base,
-        root=install_root / "python",
+        root=python_root or install_root / "python",
         cancel=cancel,
         progress=progress,
     )

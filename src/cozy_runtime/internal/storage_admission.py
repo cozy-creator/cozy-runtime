@@ -20,8 +20,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from weakref import WeakValueDictionary
 
-from cozy_runtime.internal import fill
-
 
 class StorageRefusal(Exception):
     code = "insufficient_storage"
@@ -88,6 +86,8 @@ def native_write(path: Path | None, payload: int = 0, objects: int = 1) -> Write
         return Write(path or Path("/"), 0, 0)
     if path is None:
         raise StorageRefusal("native writer has no configured Store root")
+    from cozy_runtime.internal import fill
+
     metadata = int(fill.tensorfs_module().manifest_max_bytes())
     blocks = (payload + (1 << 20) - 1) >> 20
     return Write(path, payload + 4 * metadata, 3 * (objects + blocks) + 16)
