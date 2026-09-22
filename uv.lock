@@ -367,15 +367,15 @@ wheels = [
 
 [[package]]
 name = "cozy-eval"
-version = "0.7.1"
+version = "0.7.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "msgspec" },
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/67/96/98191e01285e92280caf99e90e0a867e3904b412d27aa4f1293ab11591d6/cozy_eval-0.7.1.tar.gz", hash = "sha256:039b34da4b8e84206e7d68d3f8c3b63c77b7e1d69852a4b1827ba21d2444d091", size = 1896212, upload-time = "2026-09-14T03:23:50.892Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/33/3a/7f9794473f5d5761274578504dabe98b1c56fb2234730c5d38a352b415d7/cozy_eval-0.7.2.tar.gz", hash = "sha256:499a180ae62f251629c3be6f7dd010692abd6ebd40637890947aed1207e8642d", size = 1976939, upload-time = "2026-09-18T05:38:39.181Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/50/87da578d6744dd8e3f3fef723802c32b00e71f1a3e7fee1757b25b24ad20/cozy_eval-0.7.1-py3-none-any.whl", hash = "sha256:9e8aaba171b003a5b2f8f2b8c89bddba3a799ea412d7acce1e9a43a7fce6ffc2", size = 381935, upload-time = "2026-09-14T03:23:49.004Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/da/3c8599bb3262ffb6888e76c4591419674d5e0f314a45a4e7bc875a3982dc/cozy_eval-0.7.2-py3-none-any.whl", hash = "sha256:861aa3ed160ae69f56a9a00090b75b980ee9939ac1aa6e58585926c7b873fc83", size = 381943, upload-time = "2026-09-18T05:38:37.552Z" },
 ]
 
 [[package]]
@@ -461,7 +461,7 @@ provides-extras = ["minimax-h3", "assessment", "derive", "corpus", "media", "mod
 [package.metadata.requires-dev]
 dev = [
     { name = "av", specifier = ">=18.1,<19" },
-    { name = "cozy-eval", specifier = "==0.7.1" },
+    { name = "cozy-eval", specifier = "==0.7.2" },
     { name = "mypy", specifier = ">=1.13" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=8.4" },

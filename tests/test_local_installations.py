@@ -60,8 +60,8 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers(snaps
             for closure in (request, other_request):
                 retained_wheels = Path(closure.wheels[0].path).parent
                 shutil.copyfile(dependency_path, retained_wheels / dependency_path.name)
-                for wheel in sdk_wheels.glob("*.whl"):
-                    shutil.copyfile(wheel, retained_wheels / wheel.name)
+                for wheel_path in sdk_wheels.glob("*.whl"):
+                    shutil.copyfile(wheel_path, retained_wheels / wheel_path.name)
                 closure.ClearField("wheels")
                 closure.wheels.extend(_wheel_rows(list(retained_wheels.glob("*.whl"))))
         dependency_python = None

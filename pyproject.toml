@@ -29,7 +29,7 @@ dev = [
     "mypy>=1.13",
     "pytest>=8.4",
     # The public capture reader validates the writer contract in tests.
-    "cozy-eval==0.7.1",
+    "cozy-eval==0.7.2",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
     "tensorfs>=0.3.43,<0.4",

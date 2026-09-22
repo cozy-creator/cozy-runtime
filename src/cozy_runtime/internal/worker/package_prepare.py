@@ -974,10 +974,10 @@ def prepare_package(
 
     if development is None:
         raise PreparationRefusal("package_prepare_development_absent", package_name)
-    python, base = _select_python(python, python_requires, python_version, base)
     rows = list(wheels)
     if not 1 <= len(rows) <= weights_limits.MAX_LOCAL_PACKAGE_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
+    python, base = _select_python(python, python_requires, python_version, base)
     expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     try:
         observed_base = base or package_environment.observe_base(python)

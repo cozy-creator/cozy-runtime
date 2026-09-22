@@ -173,7 +173,13 @@ def test_manifest_binds_bytes_and_detects_wheel_overwrite(tmp_path: Path, change
 
 def test_failed_final_observation_publishes_no_receipt(tmp_path: Path) -> None:
     source = tmp_path / "source"
-    source_site = _venv(source)
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(source)], check=True)
+    source_site = next(source.glob("lib/python*/site-packages"))
+    # Interpreter identity must be observed without loading mutable SDK startup hooks.
+    marker = source / "bin/executed"
+    (source_site / "mutable.pth").write_text(
+        f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n"
+    )
     _distribution(source_site, "dependency", {"dependency.py": b"value=1\n"})
     wheel_root = tmp_path / "wheel"
     wheel_root.mkdir()

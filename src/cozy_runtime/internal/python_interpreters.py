@@ -46,6 +46,7 @@ def probe(python: Path) -> Interpreter:
         [
             str(python),
             "-I",
+            "-S",
             "-c",
             "import json,platform,sys,sysconfig; "
             "print(json.dumps([platform.python_version(),sys.implementation.cache_tag,"
