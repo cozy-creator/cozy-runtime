@@ -330,6 +330,13 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
             "COZY_DEPENDENCY_CACHE must be an absolute path",
             "provide the Creator-owned local dependency cache path",
         )
+    python_root = env.get("COZY_PYTHON_ROOT", "").strip()
+    if python_root and not Path(python_root).is_absolute():
+        raise ConfigError(
+            "config",
+            "COZY_PYTHON_ROOT must be an absolute path",
+            "pass the managed_root reported by python-interpreters",
+        )
     _read = True
     return RuntimeConfig(
         cozy_home=home,
@@ -344,6 +351,7 @@ def read_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
         ),
         fill_forensics_dir=env.get(child_env.FILL_FORENSICS_DIR, "").strip(),
         dependency_cache=Path(dependency_cache) if dependency_cache else None,
+        python_root=Path(python_root) if python_root else None,
         object_storage_hosts=parse_object_storage_hosts(
             env.get("TENSORHUB_OBJECT_STORAGE_HOSTS", "")
         ),

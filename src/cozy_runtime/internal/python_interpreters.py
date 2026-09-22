@@ -177,6 +177,7 @@ def select(
 def document(*, root: Path | None = None) -> dict[str, object]:
     return {
         "format": "cozy.python-interpreters/1",
+        **({"managed_root": str(root)} if root is not None else {}),
         "supported_minors": list(supported_minors()),
         "interpreters": [item.document() for item in available(root=root)],
         "provisionable_minors": list(provisionable_minors()),
