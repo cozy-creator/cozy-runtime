@@ -779,6 +779,8 @@ def prepare_local_package(
     dependency_python: Path | None = None,
     dependency_cache: Path | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
+    cancel: Callable[[], bool] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Prepare one exact local wheel revision without inventing Hub provenance."""
 
@@ -799,6 +801,8 @@ def prepare_local_package(
     ):
         raise PreparationRefusal("local_package_identity_invalid", request.operation_id)
     return prepare_package(
+        cancel=cancel,
+        progress=progress,
         package_name=package.package,
         release=package.release,
         wheels=request.wheels,

@@ -2008,6 +2008,8 @@ class Worker:
             materialized: list[package_environment.InstalledEnvironment] = []
             result = package_prepare.prepare_local_package(
                 request,
+                cancel=self.stop.is_set,
+                progress=lambda message: self.note("python", message),
                 artifact_cache=Path(self.options.artifact_cache or ""),
                 install_root=Path(self.options.install_root or ""),
                 python=Path(self.options.python or sys.executable),
@@ -2023,7 +2025,7 @@ class Worker:
 
             installed = materialized[0]
             local_installations.record(
-                Path(self.options.install_root or ""), request, result, installed, self.base
+                Path(self.options.install_root or ""), request, result, installed
             )
             return self._register_local_package(request, result, installed)
         assert isinstance(request, pb.PreparePackageSetRequest)

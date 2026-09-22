@@ -112,6 +112,26 @@ def available(
                 )
             except (ValueError, KeyError, TypeError) as exc:
                 raise InterpreterRefusal(f"invalid uv installed Python inventory: {exc}") from exc
+            # Preserve installed PATH/system discovery as well as all managed patches.
+            for minor in supported_minors():
+                found = subprocess.run(
+                    [
+                        uv,
+                        "python",
+                        "find",
+                        "--no-project",
+                        "--no-config",
+                        "--no-python-downloads",
+                        minor,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=package_install_environment(),
+                )
+                if found.returncode == 0:
+                    candidates.append(Path(found.stdout.strip()))
     if root is not None:
         candidates.extend(sorted((root / "managed").glob("cpython-*/bin/python*.*")))
     observed: dict[str, Interpreter] = {}

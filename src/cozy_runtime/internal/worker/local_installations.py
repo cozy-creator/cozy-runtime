@@ -15,6 +15,7 @@ from cozy_runtime.internal import (
     package_environment,
     package_interface,
     placement_materialization,
+    python_interpreters,
 )
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.protocol import documents
@@ -32,7 +33,6 @@ def record(
     request: pb.PrepareLocalPackageRequest,
     result: pb.PreparePackageSetResult,
     installed: package_environment.InstalledEnvironment,
-    base: base_observation.Observation,
 ) -> None:
     """Publish the installed entrypoint inventory beside its immutable environment receipt."""
     path = _path(root, request)
@@ -46,7 +46,7 @@ def record(
     raw = canonical.write(
         {
             "format": "cozy.runtime.LocalInstallation/2",
-            "base_digest": canonical.digest(dict(base.interpreter_identity)),
+            "base_digest": canonical.digest(identity["interpreter"]),
             "placement_set": documents.read(
                 result.placement_set.placement_set_canonical_bytes, pb.PlacementSet
             ),
@@ -108,6 +108,18 @@ def reopen(
             return None
         raw = package_prepare._read_file(path, canonical.DOC_MAX_BYTES)
         value = canonical.parse_canonical(raw)
+        if request.python_requires or request.python_version:
+            # Reopening is read-only. Its receipt belongs to the captured executor,
+            # not the worker controller that happened to handle this request.
+            selected = python_interpreters.select(
+                request.python_requires,
+                request.python_version,
+                default=python,
+                root=root / "python",
+            )
+            if selected.executable != python:
+                python = selected.executable
+                base = package_environment.observe_base(python)
         if (
             not isinstance(value, dict)
             or value.get("format") != "cozy.runtime.LocalInstallation/2"
@@ -253,6 +265,7 @@ def reopen(
         canonical.CanonicalError,
         documents.DocumentError,
         package_environment.EnvironmentRefusal,
+        python_interpreters.InterpreterRefusal,
         package_interface.StalePackageInterface,
         LaunchRefusal,
     ):
