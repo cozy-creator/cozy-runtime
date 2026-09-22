@@ -154,7 +154,6 @@ def prepare_package_set(
         verified=verified,
         job_plan_root=job_plan_root,
         base=base,
-        dependency_python=preinstalled_python,
         dependency_cache=dependency_cache,
         materialized=materialized,
     )
@@ -256,12 +255,7 @@ def _filtered_rows(
     inventory: image_inventory.Inventory | None,
     platform_versions: Mapping[str, str],
 ) -> list[package_environment.LockedRow]:
-    """The export minus immutable image and physically inherited framework providers.
-
-    A development image can inventory only its frozen heavy base. Its actual inherited
-    Runtime/TensorFS pair still owns those names; a package lock cannot shadow them.
-    The package's own pin remains required and always installs.
-    """
+    """Validate the exact project pin and retain the complete locked wheel closure."""
 
     expected = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     projects = [row for row in locked.rows if row.name == expected]
@@ -292,16 +286,17 @@ def _prepare_published(
     job_plan_root: Path | None,
     base: base_observation.Observation | None,
     installed_environment: package_environment.InstalledEnvironment | None = None,
-    dependency_python: Path | None = None,
     dependency_cache: Path | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Install from the exact export, derive the interface, and author the PlacementSet.
 
-    On the wire path the request's two facts cross-check the derived interface and the
-    image inventory filters the export. On the local path (`installed_environment`) the
+    On the wire path the request's facts cross-check the derived interface and the
+    image inventory verifies the controller. On the local path (`installed_environment`) the
     venv already exists from the same export and Creator compares the derived interface
     against the committed release itself, so the facts are adopted from the derivation.
+    Both local and rented preparation materialize the complete locked closure; the
+    controller SDK never supplies package dependencies or interpreter-specific wheels.
     """
 
     environment = pb.Environment(
@@ -322,8 +317,6 @@ def _prepare_published(
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
     else:
-        if inventory is None and dependency_python is None:
-            raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
         try:
             observed_base = base or package_environment.observe_base(python)
         except package_environment.EnvironmentRefusal as exc:
@@ -338,7 +331,7 @@ def _prepare_published(
             raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
         platform = (
             observed_base.distribution_versions
-            if dependency_python is not None or package_environment.is_base_interpreter(python)
+            if package_environment.is_base_interpreter(python)
             else {}
         )
         install_rows = _filtered_rows(package_name, release, locked, inventory, platform)
@@ -350,7 +343,6 @@ def _prepare_published(
                 environment_digest=environment_digest,
                 python=python,
                 base=observed_base,
-                dependency_python=dependency_python,
                 dependency_cache=dependency_cache,
             )
         except package_environment.EnvironmentRefusal as exc:
