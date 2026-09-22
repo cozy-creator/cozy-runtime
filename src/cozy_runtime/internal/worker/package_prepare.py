@@ -10,6 +10,7 @@ import re
 import stat
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -928,7 +929,9 @@ def prepare_package(
         raise PreparationRefusal(exc.code, exc.detail) from exc
     if not wheel_root.is_absolute():
         raise PreparationRefusal("package_prepare_file_path_invalid", str(wheel_root))
-    facts: list[tuple[package_environment.Wheel, Path, package_environment.VerifiedFile]] = []
+    facts: list[
+        tuple[package_environment.Wheel, Path, package_environment.VerifiedFile | None]
+    ] = []
     prior = b""
     for row in rows:
         if len(row.digest) != 32 or row.digest <= prior or not 0 < row.length <= MAX_FILE_BYTES:
@@ -966,6 +969,7 @@ def prepare_package(
                     f"{row.filename} installs no importable module",
                 )
         facts.append((wheel, path, receipt))
+    image_seeds = set()
     with contextlib.ExitStack() as downloaded:
         locked_dependencies = None
         if dependency_requirements:
@@ -987,12 +991,17 @@ def prepare_package(
                     install_root,
                     observed_base,
                     cache_root=dependency_cache,
+                    python=python,
                 ):
+                    if item.image_seed:
+                        image_seeds.add(item.wheel.digest)
                     facts.append(
                         (
                             item.wheel,
                             item.path,
-                            package_environment.VerifiedFile.record(
+                            None
+                            if item.image_seed
+                            else package_environment.VerifiedFile.record(
                                 item.path, item.wheel.digest, item.wheel.length
                             ),
                         )
@@ -1018,7 +1027,7 @@ def prepare_package(
             documents.embedded_document_digest(environment_body, "cozy.worker.v1.Environment")
         )
         wheel_paths = {wheel.digest: path for wheel, path, _receipt in facts}
-        receipts = {wheel.digest: receipt for wheel, _path, receipt in facts}
+        receipts = {wheel.digest: receipt for wheel, _path, receipt in facts if receipt is not None}
         try:
             source = placement_materialization.package_environment_input(
                 package_name=package_name,
@@ -1028,6 +1037,13 @@ def prepare_package(
                 environment_digest=environment_digest,
                 wheel_paths=wheel_paths,
                 verified_wheels=receipts,
+            )
+            source = replace(
+                source,
+                grants=tuple(
+                    replace(grant, image_seed=True) if grant.digest in image_seeds else grant
+                    for grant in source.grants
+                ),
             )
             installed = package_environment.materialize(
                 source,
@@ -1043,7 +1059,8 @@ def prepare_package(
             detail = getattr(exc, "detail", type(exc).__name__)
             raise PreparationRefusal(str(code), str(detail)) from exc
         for wheel, path, _receipt in facts:
-            verified(wheel.digest, wheel.length, path)
+            if wheel.digest not in image_seeds:
+                verified(wheel.digest, wheel.length, path)
         if materialized is not None:
             materialized(installed)
 
