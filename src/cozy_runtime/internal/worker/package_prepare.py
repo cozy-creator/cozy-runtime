@@ -255,12 +255,7 @@ def _filtered_rows(
     inventory: image_inventory.Inventory | None,
     platform_versions: Mapping[str, str],
 ) -> list[package_environment.LockedRow]:
-    """The export minus immutable image and physically inherited framework providers.
-
-    A development image can inventory only its frozen heavy base. Its actual inherited
-    Runtime/TensorFS pair still owns those names; a package lock cannot shadow them.
-    The package's own pin remains required and always installs.
-    """
+    """Validate the exact project pin and retain the complete locked wheel closure."""
 
     expected = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     projects = [row for row in locked.rows if row.name == expected]
