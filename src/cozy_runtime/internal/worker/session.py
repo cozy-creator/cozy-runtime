@@ -1737,6 +1737,8 @@ class Worker:
             try:
                 return package_prepare.check_package_set_compatibility(
                     request,
+                    cancel=self.stop.is_set,
+                    progress=lambda message: self.note("python", message),
                     tensorfs_root=Path(self.options.tensorfs_root or ""),
                     install_root=Path(self.options.install_root or ""),
                     python=Path(self.options.python or sys.executable),
@@ -2028,6 +2030,8 @@ class Worker:
         published: list[package_environment.InstalledEnvironment] = []
         result = package_prepare.prepare_package_set(
             request,
+            cancel=self.stop.is_set,
+            progress=lambda message: self.note("python", message),
             artifact_cache=Path(self.options.artifact_cache or ""),
             tensorfs_root=Path(self.options.tensorfs_root or ""),
             install_root=Path(self.options.install_root or ""),

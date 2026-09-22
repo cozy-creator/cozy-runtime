@@ -44,7 +44,14 @@ class PreparationRefusal(Exception):
 
 
 def _select_python(
-    python: Path, requires: str, version: str, base: base_observation.Observation | None = None
+    python: Path,
+    requires: str,
+    version: str,
+    base: base_observation.Observation | None = None,
+    *,
+    root: Path | None = None,
+    cancel: Callable[[], bool] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[Path, base_observation.Observation | None]:
     try:
         if not requires and not version:
@@ -55,7 +62,13 @@ def _select_python(
             ):
                 raise python_interpreters.InterpreterRefusal(actual.version)
             return python, base
-        selected = python_interpreters.select(requires, version, default=python)
+        selected = (
+            python_interpreters.ensure(
+                requires, version, default=python, root=root, cancel=cancel, progress=progress
+            )
+            if root is not None
+            else python_interpreters.select(requires, version, default=python)
+        )
         if selected.executable == python:
             return python, base
         return selected.executable, package_environment.observe_base(selected.executable)
@@ -96,6 +109,8 @@ def prepare_package_set(
     preinstalled_python: Path | None = None,
     dependency_cache: Path | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
+    cancel: Callable[[], bool] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Parse the desired download set plus the request's release facts (wire 30) and prepare.
 
@@ -133,8 +148,16 @@ def prepare_package_set(
         request, models, preinstalled=preinstalled_python is not None
     )
     _verify_control_inventory(inventory, python, base)
-    python, base = _select_python(python, request.python_requires, request.python_version, base)
     _verify_inventory_python(inventory, python)
+    python, base = _select_python(
+        python,
+        request.python_requires,
+        request.python_version,
+        base,
+        root=install_root / "python",
+        cancel=cancel,
+        progress=progress,
+    )
     return _prepare_published(
         package_name=package_name,
         release=release,
@@ -428,6 +451,8 @@ def check_package_set_compatibility(
     install_root: Path,
     python: Path,
     base: base_observation.Observation | None = None,
+    cancel: Callable[[], bool] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> pb.CheckPackageSetCompatibilityResult:
     """Fit package code against headers while tensor bodies are still downloading.
 
@@ -460,8 +485,16 @@ def check_package_set_compatibility(
     if inventory is None:
         raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
     _verify_control_inventory(inventory, python, base)
-    python, base = _select_python(python, request.python_requires, request.python_version, base)
     _verify_inventory_python(inventory, python)
+    python, base = _select_python(
+        python,
+        request.python_requires,
+        request.python_version,
+        base,
+        root=install_root / "python",
+        cancel=cancel,
+        progress=progress,
+    )
     installed = _compatibility_environment(
         package_name=package_name,
         release=release,
@@ -946,6 +979,8 @@ def prepare_package(
     python_requires: str = "",
     python_version: str = "",
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
+    cancel: Callable[[], bool] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Inspect, install, import, and describe one exact local package revision.
 
@@ -969,7 +1004,15 @@ def prepare_package(
     rows = list(wheels)
     if not 1 <= len(rows) <= weights_limits.MAX_LOCAL_PACKAGE_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
-    python, base = _select_python(python, python_requires, python_version, base)
+    python, base = _select_python(
+        python,
+        python_requires,
+        python_version,
+        base,
+        root=install_root / "python",
+        cancel=cancel,
+        progress=progress,
+    )
     expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
     try:
         observed_base = base or package_environment.observe_base(python)

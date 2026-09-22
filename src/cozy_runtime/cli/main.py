@@ -42,6 +42,7 @@ PRIVATE = (
     "image-prepare",
     "image-preparation-profile",
     "python-interpreters",
+    "python-ensure",
 )
 HELP = """cozy-runtime — everything a single package venv can do alone
 
@@ -274,9 +275,30 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 "cozy-runtime --json python-interpreters",
             )
         try:
-            return Result(document=python_interpreters.document())
+            return Result(document=python_interpreters.document(root=config.cozy_home / "python"))
         except python_interpreters.InterpreterRefusal as exc:
             raise CliError(exc.code, exc.detail, "install a supported Python interpreter") from exc
+    if verb == "python-ensure":
+        from cozy_runtime.internal import python_interpreters, storage_admission
+
+        if not 1 <= len(args) <= 2:
+            raise CliError(
+                "usage",
+                "python-ensure takes a requirement and optional version",
+                "cozy-runtime --json python-ensure '<requires-python>' [<version>]",
+            )
+        try:
+            selected = python_interpreters.ensure(
+                args[0],
+                args[1] if len(args) == 2 else "",
+                root=config.cozy_home / "python",
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
+            )
+            return Result(document=selected.document())
+        except (python_interpreters.InterpreterRefusal, storage_admission.StorageRefusal) as exc:
+            raise CliError(
+                exc.code, exc.detail, "check Python requirements and uv availability"
+            ) from exc
     if verb == "version":
         return version_verb.run(config, opts.full, opts.fields)
     if verb == "new":

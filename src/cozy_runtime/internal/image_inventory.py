@@ -11,6 +11,7 @@ falsifies the inventory rather than silently rewiring the pod.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +34,7 @@ class Inventory:
     python: str
     distributions: tuple[tuple[str, str], ...]
     interpreters: tuple[tuple[str, str], ...] = ()
+    provisionable_minors: tuple[str, ...] = ()
 
     @property
     def versions(self) -> dict[str, str]:
@@ -46,7 +48,7 @@ def read_bytes(raw: bytes) -> Inventory:
         value: Any = json.loads(raw)
     except ValueError as exc:
         raise ImageInventoryRefusal(f"not JSON: {exc}") from exc
-    if not isinstance(value, dict) or set(value) - {"interpreters"} != {
+    if not isinstance(value, dict) or set(value) - {"interpreters", "provisionable_minors"} != {
         "distributions",
         "format",
         "profile",
@@ -89,6 +91,7 @@ def read_bytes(raw: bytes) -> Inventory:
         python=str(python),
         distributions=tuple(distributions),
         interpreters=_interpreters(value.get("interpreters", [])),
+        provisionable_minors=_provisionable_minors(value.get("provisionable_minors", [])),
     )
 
 
@@ -161,3 +164,15 @@ def disagreement(inventory: Inventory, observed_versions: dict[str, str]) -> str
         if not agreed:
             return f"distribution={name} inventory={version} image={observed}"
     return None
+
+
+def _provisionable_minors(rows: Any) -> tuple[str, ...]:
+    if (
+        not isinstance(rows, list)
+        or len(rows) > 3
+        or any(not isinstance(row, str) or not re.fullmatch(r"3\.[0-9]+", row) for row in rows)
+    ):
+        raise ImageInventoryRefusal("invalid provisionable Python minors")
+    if rows != sorted(set(rows), key=Version):
+        raise ImageInventoryRefusal("provisionable Python minors must be sorted and unique")
+    return tuple(rows)
