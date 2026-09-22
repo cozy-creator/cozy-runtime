@@ -209,7 +209,9 @@ def test_installed_revision_reopens_after_runtime_restart_without_carriers(snaps
                     environment=placement["environment"],
                     environment_digest=placement["environment_digest"],
                     wheel_paths={
-                        documents.spell(row.digest): Path(row.path) for row in request.wheels
+                        documents.spell(row.digest): Path(row.path)
+                        for row in request.wheels
+                        if row.filename != dependency_path.name
                     },
                 )
                 missing_dependency = package_environment.materialize(
