@@ -83,7 +83,12 @@ class Observation:
 
     @property
     def interpreter_identity(self) -> dict[str, str]:
-        return {"libc": self.libc, "os_arch": self.os_arch, "python_abi": self.python_abi}
+        return {
+            "libc": self.libc,
+            "os_arch": self.os_arch,
+            "python_abi": self.python_abi,
+            "python_full_version": self.python_full_version,
+        }
 
 
 @lru_cache(maxsize=1)
@@ -200,6 +205,46 @@ def from_python(python: Path) -> Observation:
         check=False,
     )
     if result.returncode != 0:
+        bare = subprocess.run(
+            [
+                str(python),
+                "-I",
+                "-c",
+                "import importlib.metadata,json,platform,sys; "
+                "print(json.dumps({'version':platform.python_version(),"
+                "'tag':sys.implementation.cache_tag,'machine':platform.machine(),"
+                "'libc':platform.libc_ver(),'distributions':"
+                "[d.metadata['Name'] for d in importlib.metadata.distributions()]}))",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        try:
+            measured = json.loads(bare.stdout)
+            if (
+                bare.returncode == 0
+                and set(measured["distributions"]) <= {"pip"}
+                and measured["machine"] in {"x86_64", "amd64"}
+                and measured["libc"][0] == "glibc"
+                and re.fullmatch(r"cpython-[0-9]{3}", measured["tag"])
+            ):
+                return Observation(
+                    python_abi=measured["tag"].replace("cpython-", "cp"),
+                    python_full_version=measured["version"],
+                    os_arch="linux/amd64",
+                    libc="glibc" + measured["libc"][1],
+                    accelerator_backend="none",
+                    accelerator_build="cpu",
+                    torch_release="none",
+                    cuda_version="none",
+                    uv_version=_uv_version(),
+                    distributions=(),
+                    import_roots=(),
+                )
+        except (ValueError, KeyError, TypeError):
+            pass
         raise ObservationRefusal(
             result.stderr.strip()[-2000:] or f"base observation exited {result.returncode}"
         )

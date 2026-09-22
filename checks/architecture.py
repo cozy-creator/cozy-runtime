@@ -663,6 +663,7 @@ STATIC_READER_IMPORTS = frozenset(
     {
         "cozy_runtime",
         "cozy_runtime.author",
+        "cozy_runtime._interpreter",  # packaged policy reader; no authored code is imported
         "cozy_runtime.internal.package_interface",
         "cozy_runtime.internal.bindings",
         "cozy_runtime.internal.canonical",

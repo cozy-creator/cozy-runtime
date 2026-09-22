@@ -1,11 +1,11 @@
 [project]
 name = "cozy-runtime"
-version = "0.18.11"
+version = "0.18.12"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
 license-files = ["native/LICENSE", "native/NOTICE"]
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12"
 # The worker speaks `cozy.worker.v1` (worker-protocol/01), so the bindings' two runtimes are
 # ordinary dependencies of the runtime package. The BINDINGS themselves are copied into
 # `src/cozy/worker/v1/` VERBATIM — protoc's own output, byte-for-byte, under the proto
@@ -29,7 +29,7 @@ dev = [
     "mypy>=1.13",
     "pytest>=8.4",
     # The public capture reader validates the writer contract in tests.
-    "cozy-eval==0.7.1",
+    "cozy-eval==0.7.2",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
     "tensorfs>=0.3.43,<0.4",

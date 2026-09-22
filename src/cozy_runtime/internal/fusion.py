@@ -83,7 +83,7 @@ else:
 #: as its other non-wheel artifacts. Neither is committed; `fusion_build.py` writes them.
 KERNELS_DIR = Path(__file__).resolve().parent.parent / "_kernels" / "fusion"
 IMAGE_KERNELS_DIR = Path("/opt/cozy/fusion")
-TRITON_VERSION = "3.7.1"
+TRITON_VERSION = "3.8.0"
 WARP_SIZE = 32
 MANIFEST = "manifest.json"
 

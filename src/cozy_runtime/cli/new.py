@@ -8,7 +8,7 @@ from pathlib import Path
 from cozy_runtime import __version__
 from cozy_runtime.cli import describe as describe_verb
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.internal import package_interface
+from cozy_runtime.internal import package_interface, python_interpreters
 from cozy_runtime.internal.exits import Exit
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -28,7 +28,7 @@ def _pyproject(name: str, pkg: str) -> str:
     return f"""[project]
 name = "{name}"
 version = "0.1.0"
-requires-python = ">=3.12,<3.13"
+requires-python = ">={python_interpreters.supported_minors()[0]}"
 dependencies = ["cozy-runtime>={__version__},<1.0.0"]
 
 [project.entry-points."cozy.application"]
@@ -54,7 +54,7 @@ build-backend = "hatchling.build"
 packages = ["src/{pkg}"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "{python_interpreters.supported_minors()[0]}"
 files = ["src"]
 strict = true
 warn_unreachable = true

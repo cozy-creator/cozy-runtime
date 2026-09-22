@@ -125,6 +125,8 @@ def reopen(
             (interface["digest"], interface["length"]),
             request.wheels,
             bytes(request.dependency_requirements),
+            request.python_requires,
+            request.python_version,
         )
         development = dict(placement["development"])
         development.pop("project_wheel")

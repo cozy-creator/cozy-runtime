@@ -32,6 +32,7 @@ class Inventory:
     profile: str
     python: str
     distributions: tuple[tuple[str, str], ...]
+    interpreters: tuple[tuple[str, str], ...] = ()
 
     @property
     def versions(self) -> dict[str, str]:
@@ -45,7 +46,7 @@ def read_bytes(raw: bytes) -> Inventory:
         value: Any = json.loads(raw)
     except ValueError as exc:
         raise ImageInventoryRefusal(f"not JSON: {exc}") from exc
-    if not isinstance(value, dict) or set(value) != {
+    if not isinstance(value, dict) or set(value) - {"interpreters"} != {
         "distributions",
         "format",
         "profile",
@@ -83,10 +84,15 @@ def read_bytes(raw: bytes) -> Inventory:
             raise ImageInventoryRefusal(f"{name} version {version!r}") from exc
         prior = name
         distributions.append((name, version))
-    return Inventory(profile=profile, python=str(python), distributions=tuple(distributions))
+    return Inventory(
+        profile=profile,
+        python=str(python),
+        distributions=tuple(distributions),
+        interpreters=_interpreters(value.get("interpreters", [])),
+    )
 
 
-def from_wire(profile: str, python: str, rows: Any) -> Inventory:
+def from_wire(profile: str, python: str, rows: Any, interpreters: Any = ()) -> Inventory:
     """Admit the request-carried inventory rows (wire 30); same rules as the staged document."""
 
     if not isinstance(profile, str) or not profile:
@@ -108,7 +114,33 @@ def from_wire(profile: str, python: str, rows: Any) -> Inventory:
             raise ImageInventoryRefusal(f"{name} version {version!r}") from exc
         prior = name
         distributions.append((name, version))
-    return Inventory(profile=profile, python=str(python), distributions=tuple(distributions))
+    return Inventory(
+        profile=profile,
+        python=str(python),
+        distributions=tuple(distributions),
+        interpreters=_interpreters(
+            [{"version": row.version, "abi": row.abi} for row in interpreters]
+        ),
+    )
+
+
+def _interpreters(rows: Any) -> tuple[tuple[str, str], ...]:
+    if not isinstance(rows, list) or len(rows) > 3:
+        raise ImageInventoryRefusal("interpreter inventory must contain at most three versions")
+    result = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"version", "abi"}:
+            raise ImageInventoryRefusal("interpreter inventory row fields")
+        try:
+            version = Version(row["version"])
+        except (InvalidVersion, TypeError) as exc:
+            raise ImageInventoryRefusal("interpreter version is invalid") from exc
+        if len(version.release) != 3 or row["abi"] != "cp" + "".join(map(str, version.release[:2])):
+            raise ImageInventoryRefusal("interpreter version and ABI disagree")
+        result.append((str(version), row["abi"]))
+    if result != sorted(set(result), key=lambda row: Version(row[0])):
+        raise ImageInventoryRefusal("interpreters must be sorted and unique")
+    return tuple(result)
 
 
 def disagreement(inventory: Inventory, observed_versions: dict[str, str]) -> str | None:

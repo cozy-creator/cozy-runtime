@@ -36,6 +36,7 @@ import importlib
 import json
 import math
 import os
+import platform
 import resource
 import socket
 import sys
@@ -3522,6 +3523,9 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": True,
                     "pid": os.getpid(),
                     "ppid": os.getppid(),
+                    "python_version": platform.python_version(),
+                    "python_abi": (sys.implementation.cache_tag or "").replace("cpython-", "cp"),
+                    "python_executable": sys.executable,
                     "pgid": os.getpgrp(),
                     "no_new_privs": _proc_status("NoNewPrivs"),
                     "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),

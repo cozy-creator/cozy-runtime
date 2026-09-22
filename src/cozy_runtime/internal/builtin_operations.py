@@ -15,6 +15,7 @@ from typing import Any
 from packaging.requirements import Requirement
 from packaging.version import InvalidVersion, Version
 
+from cozy_runtime._interpreter import supported_minors
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal.package_interface import canonical_bytes
 from cozy_runtime.internal.static_interface import build_builtin
@@ -36,7 +37,7 @@ def carrier(version: str) -> tuple[str, bytes]:
     directory = f"cozy_runtime_operations-{version}.dist-info"
     metadata = (
         f"Metadata-Version: 2.4\nName: {NAME}\nVersion: {version}\n"
-        f"Requires-Python: >=3.12,<3.13\nRequires-Dist: cozy-runtime>={FLOOR},<1\n"
+        f"Requires-Python: >={supported_minors()[0]}\nRequires-Dist: cozy-runtime>={FLOOR},<1\n"
         "Requires-Dist: numpy>=1.26\nCozy-Builtin: operations\n"
         f"Cozy-Builtin-Interface: {digest()}\n"
     ).encode()
@@ -86,7 +87,7 @@ def validate_metadata(metadata: bytes, wheel: bytes, entry: bytes, version: str)
         "Metadata-Version": "2.4",
         "Name": NAME,
         "Version": version,
-        "Requires-Python": ">=3.12,<3.13",
+        "Requires-Python": ">=" + supported_minors()[0],
         "Cozy-Builtin": "operations",
         "Cozy-Builtin-Interface": digest(),
     }

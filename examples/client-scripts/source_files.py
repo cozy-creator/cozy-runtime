@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.12,<3.13"
+# requires-python = ">=3.12"
 # dependencies = ["cozy-runtime>=0.12.0,<1"]
 # ///
 """Run with `cozy run ./examples/client-scripts/source_files.py`.

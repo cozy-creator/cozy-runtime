@@ -35,7 +35,7 @@ jobs:
       # build stage runs `fusion_build` for its architecture. This proves, with no GPU,
       # that two builds of the sm90 artifact agree byte for byte and that every entry's key
       # is the one the runtime loader recomputes from the kernel sources.
-      - run: uv run --with "triton==3.7.1" python -m cozy_runtime.internal.fusion_build --check --arch 90
+      - run: uv run --with "triton==3.8.0" python -m cozy_runtime.internal.fusion_build --check --arch 90
 
   # THE BEHAVIOUR GATE: two real runs against a real build, no mocks. The public CLI is
   # installed from a freshly built wheel into a venv that has nothing else, then describes,
@@ -76,7 +76,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12
       - run: uv sync --locked
-      - run: uv pip install --python .venv/bin/python --index https://download.pytorch.org/whl/cpu "torch==2.13.0"
+      - run: uv pip install --python .venv/bin/python --index https://download.pytorch.org/whl/cpu "torch==2.14.0"
       - run: uv pip install --python .venv/bin/python "diffusers==0.40.0" "accelerate==1.14.0" "transformers==5.16.1"
       - run: .venv/bin/python -c "import torch; assert torch.version.cuda is None"
       - run: >-
@@ -97,7 +97,7 @@ jobs:
           uv build --wheel --out-dir "$proof_root/wheels"
           uv venv --python 3.12 "$proof_root/.venv"
           UV_LINK_MODE=copy uv pip install --python "$proof_root/.venv/bin/python" "$proof_root"/wheels/*.whl pytest
-          UV_LINK_MODE=copy uv pip install --python "$proof_root/.venv/bin/python" --index https://download.pytorch.org/whl/cpu "torch==2.13.0"
+          UV_LINK_MODE=copy uv pip install --python "$proof_root/.venv/bin/python" --index https://download.pytorch.org/whl/cpu "torch==2.14.0"
           cp -a tests "$proof_root/"
           cd "$proof_root"
           sudo -E .venv/bin/python -m pytest tests/test_warm_isolation.py -q -rs

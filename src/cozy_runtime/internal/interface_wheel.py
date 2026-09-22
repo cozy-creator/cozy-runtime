@@ -18,7 +18,7 @@ from packaging.version import Version
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical, invocable_interface, package_interface
 
-GENERATOR_ABI = "cozy.interface-generator/6"
+GENERATOR_ABI = "cozy.interface-generator/7"
 MAX_IMPLEMENTATION_WHEEL = 256 << 20
 _DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
@@ -349,7 +349,7 @@ def build(
     files = generate(interface)
     metadata = (
         "Metadata-Version: 2.4\n" + f"Name: {distribution}\nVersion: {version}\n"
-        "Requires-Python: >=3.12,<3.13\nRequires-Dist: cozy-runtime>=0.4.0\n"
+        "Requires-Python: >=3.12\nRequires-Dist: cozy-runtime>=0.4.0\n"
     ).encode()
     if implementation_wheel is not None:
         files, metadata = _overlay(interface, implementation_wheel, distribution, version)

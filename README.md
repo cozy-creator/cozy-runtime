@@ -11,10 +11,21 @@ Package code uses `cozy_runtime.author`, the shared numerical helpers under
 modules, Runtime `internal`/`cli`/`protocol`, and administrative TensorFS Store operations
 are not package APIs. Package ranges must be requalified for coordinated author API cuts.
 
-Runtime targets CPython 3.12. The native writer cut requires TensorFS 0.3.41; model readback additionally requires
+Runtime executes packages on the installed standard CPython 3.12, 3.13 and 3.14 window.
+The control process and different package executors may use different versions. The native writer cut requires TensorFS 0.3.41; model readback additionally requires
 the scoped reader API under TensorFS PR170 (currently qualified with a source-identified dev wheel).
 accepted executions receive scoped source/output descriptors while the worker owns Store
 access, admission, epochs and the execution journal.
+
+`cozy-runtime --json python-interpreters` reports the packaged rolling policy and actual
+installed interpreters. By default discovery uses `uv python find --no-python-downloads`;
+operators may set `COZY_PACKAGE_PYTHONS` to a colon-separated finite list of absolute
+interpreter paths. Preparation selects the lowest compatible installed version from the
+package's `requires-python` range and optional exact captured version before installing its
+complete private dependency closure. No Python download occurs during preparation. Content
+identity records the actual Python patch and ABI, and retained environments stop reopening
+when their Python minor leaves the supported window. Package `requires-python` declarations
+may remain broader than this execution policy.
 
 The distribution major is the Python compatibility major: compatible additions remain in the
 current range, breaking author changes require a new major, and candidate base worker images must
