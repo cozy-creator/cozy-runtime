@@ -8,15 +8,6 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 
-from cozy_runtime.cli import describe as describe_verb
-from cozy_runtime.cli import host as host_verbs
-from cozy_runtime.cli import hostfacts as hostfacts_verb
-from cozy_runtime.cli import image_prepare as image_prepare_verb
-from cozy_runtime.cli import interface_wheel as interface_wheel_verb
-from cozy_runtime.cli import new as new_verb
-from cozy_runtime.cli import package_prepare as package_prepare_verbs
-from cozy_runtime.cli import run as run_verb
-from cozy_runtime.cli import version as version_verb
 from cozy_runtime.cli.io import CliError, Options, Result, emit, emit_error
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
@@ -42,6 +33,7 @@ PRIVATE = (
     "image-prepare",
     "image-preparation-profile",
     "python-interpreters",
+    "python-ensure",
 )
 HELP = """cozy-runtime — everything a single package venv can do alone
 
@@ -255,6 +247,8 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             Exit.usage,
         )
     if verb == "describe":
+        from cozy_runtime.cli import describe as describe_verb
+
         if len(args) > 1:
             raise CliError(
                 "usage",
@@ -274,9 +268,40 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 "cozy-runtime --json python-interpreters",
             )
         try:
-            return Result(document=python_interpreters.document())
+            return Result(document=python_interpreters.document(root=config.managed_python_root))
         except python_interpreters.InterpreterRefusal as exc:
             raise CliError(exc.code, exc.detail, "install a supported Python interpreter") from exc
+    if verb == "python-ensure":
+        from cozy_runtime.internal import python_interpreters, storage_admission
+
+        if not 1 <= len(args) <= 2:
+            raise CliError(
+                "usage",
+                "python-ensure takes a requirement and optional version",
+                "cozy-runtime --json python-ensure '<requires-python>' [<version>]",
+            )
+        try:
+            selected = python_interpreters.ensure(
+                args[0],
+                args[1] if len(args) == 2 else "",
+                root=config.managed_python_root,
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
+            )
+            return Result(document=selected.document())
+        except (python_interpreters.InterpreterRefusal, storage_admission.StorageRefusal) as exc:
+            raise CliError(
+                exc.code, exc.detail, "check Python requirements and uv availability"
+            ) from exc
+    # Interpreter plumbing stays portable without importing executor-only modules.
+    from cozy_runtime.cli import host as host_verbs
+    from cozy_runtime.cli import hostfacts as hostfacts_verb
+    from cozy_runtime.cli import image_prepare as image_prepare_verb
+    from cozy_runtime.cli import interface_wheel as interface_wheel_verb
+    from cozy_runtime.cli import new as new_verb
+    from cozy_runtime.cli import package_prepare as package_prepare_verbs
+    from cozy_runtime.cli import run as run_verb
+    from cozy_runtime.cli import version as version_verb
+
     if verb == "version":
         return version_verb.run(config, opts.full, opts.fields)
     if verb == "new":
@@ -342,6 +367,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return int(Exit.ok)
         config = read_config()
         if verb == "serve":
+            from cozy_runtime.cli import host as host_verbs
+
             # `serve` never returns a Result: it IS the process, and it runs until the
             # RecordOwner closes the session.
             return host_verbs.serve(config, args)

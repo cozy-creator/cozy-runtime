@@ -10,8 +10,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,7 +69,9 @@ def probe(python: Path) -> Interpreter:
         raise InterpreterRefusal(f"cannot observe supported CPython at {python}: {exc}") from exc
 
 
-def available(default: Path = Path(sys.executable)) -> tuple[Interpreter, ...]:
+def available(
+    default: Path = Path(sys.executable), *, root: Path | None = None
+) -> tuple[Interpreter, ...]:
     """Return supported, installed interpreters in deterministic lowest-version order."""
     configured = package_python_paths()
     candidates = (
@@ -78,6 +82,36 @@ def available(default: Path = Path(sys.executable)) -> tuple[Interpreter, ...]:
     if configured is None:
         uv = shutil.which("uv")
         if uv:
+            found = subprocess.run(
+                [
+                    uv,
+                    "python",
+                    "list",
+                    "--only-installed",
+                    "--managed-python",
+                    "--output-format",
+                    "json",
+                    "--no-config",
+                    "--offline",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=package_install_environment(),
+            )
+            try:
+                rows = json.loads(found.stdout) if found.returncode == 0 else []
+                candidates.extend(
+                    Path(row["path"])
+                    for row in rows
+                    if row.get("implementation") == "cpython"
+                    and row.get("variant") == "default"
+                    and row.get("path")
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                raise InterpreterRefusal(f"invalid uv installed Python inventory: {exc}") from exc
+            # Preserve installed PATH/system discovery as well as all managed patches.
             for minor in supported_minors():
                 found = subprocess.run(
                     [
@@ -97,8 +131,13 @@ def available(default: Path = Path(sys.executable)) -> tuple[Interpreter, ...]:
                 )
                 if found.returncode == 0:
                     candidates.append(Path(found.stdout.strip()))
+    if root is not None:
+        pattern = "cpython-*/python.exe" if sys.platform == "win32" else "cpython-*/bin/python*.*"
+        candidates.extend(sorted((root / "managed").glob(pattern)))
     observed: dict[str, Interpreter] = {}
     for path in candidates:
+        if path.name.endswith("-config"):
+            continue
         interpreter = probe(path)
         minor = ".".join(interpreter.version.split(".")[:2])
         if minor not in supported_minors():
@@ -115,16 +154,16 @@ def available(default: Path = Path(sys.executable)) -> tuple[Interpreter, ...]:
 
 
 def select(
-    requires: str, version: str = "", *, default: Path = Path(sys.executable)
+    requires: str,
+    version: str = "",
+    *,
+    default: Path = Path(sys.executable),
+    root: Path | None = None,
 ) -> Interpreter:
-    try:
-        constraint = SpecifierSet(requires)
-        pin = SpecifierSet("==" + version if version else "")
-    except InvalidSpecifier as exc:
-        raise InterpreterRefusal(f"invalid Python requirement: {exc}") from exc
-    choices = available(default)
+    constraint = _constraint(requires, version)
+    choices = available(default, root=root)
     for candidate in choices:
-        if constraint.contains(candidate.version) and pin.contains(candidate.version):
+        if constraint.contains(candidate.version):
             return candidate
     raise InterpreterRefusal(
         f"requires Python {requires or 'any'}"
@@ -135,9 +174,212 @@ def select(
     )
 
 
-def document() -> dict[str, object]:
+def document(*, root: Path | None = None) -> dict[str, object]:
     return {
         "format": "cozy.python-interpreters/1",
         "supported_minors": list(supported_minors()),
-        "interpreters": [item.document() for item in available()],
+        "interpreters": [item.document() for item in available(root=root)],
+        "provisionable_minors": list(provisionable_minors()),
     }
+
+
+def provisionable_minors() -> tuple[str, ...]:
+    """Policy, not installed facts. Discovery never creates a managed installation."""
+    return supported_minors() if shutil.which("uv") else ()
+
+
+def _constraint(requires: str, version: str) -> SpecifierSet:
+    if version and not re.fullmatch(r"3\.[0-9]+(?:\.[0-9]+)?", version):
+        raise InterpreterRefusal(f"invalid stable CPython version: {version}")
+    if version and version.count(".") == 1:
+        version += ".*"
+    try:
+        return SpecifierSet(",".join(filter(None, (requires, "==" + version if version else ""))))
+    except InvalidSpecifier as exc:
+        raise InterpreterRefusal(f"invalid Python requirement: {exc}") from exc
+
+
+def _check_cancel(cancel: Callable[[], bool] | None) -> None:
+    if cancel is not None and cancel():
+        raise InterpreterRefusal("Python provisioning cancelled")
+
+
+def _run_uv(command: list[str], *, env: dict[str, str], cancel: Callable[[], bool] | None) -> str:
+    """Drain both pipes and reap the child on cooperative cancellation."""
+    _check_cancel(cancel)
+    # Linux retains parent-death containment. Other platforms use ordinary process
+    # launch with the same cooperative cancellation and child reaping below.
+    if sys.platform.startswith("linux"):
+        command = [
+            sys.executable,
+            "-I",
+            "-c",
+            "import sys; from cozy_runtime.internal.trampoline import main; main(sys.argv[1:])",
+            "--expect-parent",
+            str(os.getpid()),
+            "--oom-adj",
+            str(max(500, int(Path("/proc/self/oom_score_adj").read_text()))),
+            "--uid",
+            "-1",
+            "--gid",
+            "-1",
+            "--scope-backend",
+            "inherit",
+            "--",
+            *command,
+        ]
+    with subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    ) as child:
+        try:
+            while True:
+                _check_cancel(cancel)
+                try:
+                    stdout, stderr = child.communicate(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            child.kill()
+            child.communicate()
+            raise
+        if child.returncode:
+            raise InterpreterRefusal(stderr.strip()[-2000:] or f"uv exited {child.returncode}")
+        return stdout
+
+
+def _download_version(
+    uv: str, constraint: SpecifierSet, cancel: Callable[[], bool] | None = None
+) -> str:
+    # uv's bundled catalogue is read offline. Filter every patch, so <3.13.5 does
+    # not download the latest 3.13 only to discover that an older patch was needed.
+    raw = _run_uv(
+        [
+            uv,
+            "python",
+            "list",
+            "--only-downloads",
+            "--all-versions",
+            "--output-format",
+            "json",
+            "--no-config",
+            "--offline",
+        ],
+        env=package_install_environment(),
+        cancel=cancel,
+    )
+    try:
+        versions = {
+            Version(row["version"])
+            for row in json.loads(raw)
+            if row.get("implementation") == "cpython"
+            and row.get("variant") == "default"
+            and not Version(row["version"]).is_prerelease
+            and ".".join(row["version"].split(".")[:2]) in supported_minors()
+            and constraint.contains(row["version"])
+        }
+    except (ValueError, KeyError, TypeError) as exc:
+        raise InterpreterRefusal(f"invalid uv Python catalogue: {exc}") from exc
+    if not versions:
+        raise InterpreterRefusal(
+            f"requires Python {constraint}; supported window: {', '.join(supported_minors())}; "
+            "no matching stable CPython download in uv's catalogue"
+        )
+    minor = min((v.major, v.minor) for v in versions)
+    return str(max(v for v in versions if (v.major, v.minor) == minor))
+
+
+def ensure(
+    requires: str,
+    version: str = "",
+    *,
+    root: Path,
+    default: Path = Path(sys.executable),
+    cancel: Callable[[], bool] | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> Interpreter:
+    """Reuse installed CPython, otherwise provision one owned interpreter with uv.
+
+    Only the trusted preparation parent calls this; executors retain their network
+    seal. Python is shared under the host's install root, while Torch and every
+    other dependency still belong to the existing exact package closure cache.
+    """
+    from cozy_runtime.internal import storage_admission
+
+    constraint = _constraint(requires, version)
+    _check_cancel(cancel)
+    choices = available(default, root=root)
+    for candidate in choices:
+        if constraint.contains(candidate.version):
+            return candidate
+    uv = shutil.which("uv")
+    if uv is None:
+        raise InterpreterRefusal("uv is required to provision a supported Python interpreter")
+    selected = _download_version(uv, constraint, cancel)
+    _check_cancel(cancel)
+    # Reserve archive + extraction + cache before creating any owned directories.
+    # CPython's stripped standalone build fits well below this conservative bound.
+    with storage_admission.admit(storage_admission.Write(root, 1 << 30, 20000)):
+        _require_owned_root(root)
+        # Recheck after admission. uv itself locks its managed directory across
+        # the installed-version check and atomic publication, including races here.
+        for candidate in available(default, root=root):
+            if constraint.contains(candidate.version):
+                return candidate
+        if progress is not None:
+            progress(f"Installing CPython {selected}")
+        managed = root / "managed"
+        cache = root / "cache"
+        env = {
+            **package_install_environment(),
+            "UV_PYTHON_INSTALL_DIR": str(managed),
+            "UV_CACHE_DIR": str(cache),
+            "TMPDIR": str(root),
+            "TEMP": str(root),
+            "TMP": str(root),
+            "UV_CONCURRENT_DOWNLOADS": "1",
+            "UV_CONCURRENT_INSTALLS": "1",
+            "UV_CONCURRENT_BUILDS": "1",
+        }
+        _run_uv(
+            [
+                uv,
+                "python",
+                "install",
+                "--no-config",
+                "--no-bin",
+                "--no-registry",
+                "--install-dir",
+                str(managed),
+                "--cache-dir",
+                str(cache),
+                "cpython@" + selected,
+            ],
+            env=env,
+            cancel=cancel,
+        )
+        # A package executor may traverse/read its interpreter but never write it.
+        if sys.platform != "win32":
+            managed.chmod(0o711)
+        installed = select(requires, selected, default=default, root=root)
+        if progress is not None:
+            progress(f"CPython {installed.version} ready")
+        return installed
+
+
+def _require_owned_root(root: Path) -> None:
+    # POSIX ownership is checked explicitly. Windows uses the caller-owned user
+    # directory ACL; do not pretend st_uid or Unix mode bits represent that ACL.
+    if not root.is_absolute() or root.is_symlink() or root.is_junction():
+        raise InterpreterRefusal(f"invalid managed Python root: {root}")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or (sys.platform != "win32" and info.st_uid != os.geteuid()):
+        raise InterpreterRefusal(f"managed Python root owner mismatch: {root}")
+    if sys.platform != "win32":
+        root.chmod(0o711)

@@ -138,16 +138,25 @@ def test_private_dependency_transport_rejects_unselected_or_credential_rows(row:
         environment.read_dependency_requirements(row.encode())
 
 
-def test_prepared_private_revision_reopens_without_dependency_carriers(tmp_path: Path) -> None:
+@pytest.mark.parametrize("alternate", [False, True], ids=["controller-python", "other-python"])
+def test_prepared_private_revision_reopens_without_dependency_carriers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alternate: bool
+) -> None:
     import hashlib
     import sys
 
-    from cozy_runtime.internal import canonical
+    from cozy_runtime.internal import canonical, python_interpreters
     from cozy_runtime.internal.worker import local_installations, package_prepare
     from cozy_runtime.protocol import documents
     from cozy_runtime.protocol import worker_pb2 as pb
     from test_publish_derivation import _SimpleIndex
 
+    captured = python_interpreters.probe(Path(sys.executable))
+    if alternate:
+        choices = [item for item in python_interpreters.available() if item.abi != captured.abi]
+        if not choices:
+            pytest.skip("another installed supported CPython is required")
+        captured = choices[0]
     root = tmp_path / "environments"
     wheel_root = root / ".stage" / "prepare" / "wheels"
     wheel_root.mkdir(parents=True)
@@ -185,6 +194,8 @@ def test_prepared_private_revision_reopens_without_dependency_carriers(tmp_path:
         files=[pb.LocalPackageFileRef(filename=row.filename, digest=row.digest, length=row.length)],
         dependency_requirements=pb.Ref(digest=documents.digest_of(raw), length=len(raw)),
     )
+    revision.python_requires = ">=3.12"
+    revision.python_version = captured.version
     _, revision_digest = documents.identity(revision)
     request = pb.PrepareLocalPackageRequest(
         operation_id="prepare",
@@ -197,6 +208,8 @@ def test_prepared_private_revision_reopens_without_dependency_carriers(tmp_path:
         wheels=[row],
         install_root=str(root),
         dependency_requirements=raw,
+        python_requires=revision.python_requires,
+        python_version=revision.python_version,
     )
     base = environment.observe_base()
     held: list[environment.InstalledEnvironment] = []
@@ -231,7 +244,13 @@ def test_prepared_private_revision_reopens_without_dependency_carriers(tmp_path:
         )
     finally:
         index.close()
-    local_installations.record(root, request, result, held[0], base)
+    local_installations.record(root, request, result, held[0])
+    assert python_interpreters.probe(held[0].python).version == captured.version
+    monkeypatch.setattr(
+        python_interpreters,
+        "ensure",
+        lambda *a, **kw: pytest.fail("warm reopen must not provision"),
+    )
     # Warm reopen has neither uploaded carriers nor a live dependency source.
     project.unlink()
     warmed = local_installations.reopen(

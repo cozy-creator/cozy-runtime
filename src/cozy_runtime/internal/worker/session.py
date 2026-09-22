@@ -1737,6 +1737,9 @@ class Worker:
             try:
                 return package_prepare.check_package_set_compatibility(
                     request,
+                    python_root=self.config.managed_python_root,
+                    cancel=self.stop.is_set,
+                    progress=lambda message: self.note("python", message),
                     tensorfs_root=Path(self.options.tensorfs_root or ""),
                     install_root=Path(self.options.install_root or ""),
                     python=Path(self.options.python or sys.executable),
@@ -1871,6 +1874,7 @@ class Worker:
                 retained = local_installations.reopen(
                     Path(self.options.install_root or ""),
                     request,
+                    python_root=self.config.managed_python_root,
                     artifact_cache=Path(self.options.artifact_cache or ""),
                     python=Path(self.options.python or sys.executable),
                     base=self.base,
@@ -2006,6 +2010,9 @@ class Worker:
             materialized: list[package_environment.InstalledEnvironment] = []
             result = package_prepare.prepare_local_package(
                 request,
+                python_root=self.config.managed_python_root,
+                cancel=self.stop.is_set,
+                progress=lambda message: self.note("python", message),
                 artifact_cache=Path(self.options.artifact_cache or ""),
                 install_root=Path(self.options.install_root or ""),
                 python=Path(self.options.python or sys.executable),
@@ -2021,13 +2028,16 @@ class Worker:
 
             installed = materialized[0]
             local_installations.record(
-                Path(self.options.install_root or ""), request, result, installed, self.base
+                Path(self.options.install_root or ""), request, result, installed
             )
             return self._register_local_package(request, result, installed)
         assert isinstance(request, pb.PreparePackageSetRequest)
         published: list[package_environment.InstalledEnvironment] = []
         result = package_prepare.prepare_package_set(
             request,
+            python_root=self.config.managed_python_root,
+            cancel=self.stop.is_set,
+            progress=lambda message: self.note("python", message),
             artifact_cache=Path(self.options.artifact_cache or ""),
             tensorfs_root=Path(self.options.tensorfs_root or ""),
             install_root=Path(self.options.install_root or ""),
