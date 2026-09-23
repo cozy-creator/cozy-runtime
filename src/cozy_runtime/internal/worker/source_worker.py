@@ -142,8 +142,6 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
         header = fill.tensorfs_module().parse_header(
             store.manifest(converted["manifest_digest"])["header"]
         )
-        if header["assets"]:
-            raise ValueError("metadata-only model adoption needs explicit asset inheritance")
         components = header["components"]
         targets = {
             name: {"source": "converted", "source_component": name, "drop": [], "add": {}}
@@ -165,6 +163,18 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
             work_fingerprint=command["computation_digest"],
         )
         receipt = writer.commit()
+        if header["assets"]:
+            inherited = store.inherit_model_assets(
+                receipt["manifest"]["sha256"],
+                receipt["manifest"]["length"],
+                converted["manifest_digest"],
+                converted["manifest_length"],
+                sorted(header["assets"]),
+            )
+            receipt["manifest"] = {
+                "sha256": inherited["manifest_id"].removeprefix("sha256:"),
+                "length": inherited["manifest_length"],
+            }
     native_receipt = canonical_json.encode(receipt)
     result = {
         "producer_request_id": command["service_id"],
