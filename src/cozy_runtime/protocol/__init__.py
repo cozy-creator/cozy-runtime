@@ -31,6 +31,7 @@ from cozy.worker.v1.wire_version import (
     PUBLISHED_MACHINE_CAPTURE_WIRE_MINOR,
     RETAINED_MODEL_RESULTS_WIRE_MINOR,
     WIRE_MINOR,
+    WORKSPACE_FENCED_EXECUTION_WIRE_MINOR,
 )
 from cozy_runtime.protocol import documents
 
@@ -41,6 +42,7 @@ __all__ = [
     "PUBLISHED_MACHINE_CAPTURE_WIRE_MINOR",
     "RETAINED_MODEL_RESULTS_WIRE_MINOR",
     "WIRE_MINOR",
+    "WORKSPACE_FENCED_EXECUTION_WIRE_MINOR",
     "documents",
     "weights_limits",
     "worker_pb2",

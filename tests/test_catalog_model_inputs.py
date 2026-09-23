@@ -49,7 +49,13 @@ def test_catalog_root_survives_repository_removal_restart_and_collection(tmp_pat
         for table in ("weights", "native_calls", "holds", "execution_model_holds"):
             assert db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
     executions = Executions(workspace)
-    receipt = executions.submit("owner", "catalog-submit", b"x" * 32, offer)
+    receipt = executions.submit(
+        "owner",
+        "catalog-submit",
+        b"x" * 32,
+        offer,
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     store.remove_local(store.repo_get("local", "catalog"), "catalog")
     tensorfs.gc(store.root)
     restored = Workspace(Path(store.root))
@@ -64,7 +70,16 @@ def test_catalog_root_survives_repository_removal_restart_and_collection(tmp_pat
     assert released is not None and released["released"]
     # A lost submission reply can be replayed after collection without resurrecting custody.
     machine_model_inputs.retain(restored, "owner", offer, {"source"})
-    assert recovered.submit("owner", "catalog-submit", b"x" * 32, offer) == receipt
+    assert (
+        recovered.submit(
+            "owner",
+            "catalog-submit",
+            b"x" * 32,
+            offer,
+            expected_execution_workspace_id=receipt.execution_workspace_id,
+        )
+        == receipt
+    )
     tensorfs.gc(store.root)
     with pytest.raises(tensorfs.errors.Refusal):
         store.manifest(native["manifest_digest"])
@@ -158,7 +173,13 @@ def test_failed_unaccepted_intake_releases_only_its_pin_and_can_retry(tmp_path: 
     native = store.checkpoint_root(str(previous["native_owner"]))
     assert native is not None and native["released"]
     executions = Executions(workspace)
-    executions.submit("owner", "catalog-retry", b"x" * 32, offer)
+    executions.submit(
+        "owner",
+        "catalog-retry",
+        b"x" * 32,
+        offer,
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     with (
         pytest.raises(WorkspaceRefusal, match="already accepted"),
         machine_checkpoint_inputs.admission(workspace, "owner", offer.request_id),
@@ -176,7 +197,14 @@ def test_abort_and_accept_have_one_native_custody_outcome(tmp_path: Path, index:
     def submit() -> bool:
         barrier.wait()
         try:
-            Executions(workspace).submit("owner", "race", b"x" * 32, offer)
+            executions = Executions(workspace)
+            executions.submit(
+                "owner",
+                "race",
+                b"x" * 32,
+                offer,
+                expected_execution_workspace_id=executions.workspace_id,
+            )
             return True
         except WorkspaceRefusal:
             return False

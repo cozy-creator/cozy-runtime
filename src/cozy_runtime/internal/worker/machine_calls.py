@@ -204,6 +204,7 @@ class Calls:
     def drive(self) -> None:
         owner, executions = self.worker.fence.record_owner_id, self.worker.executions
         assert executions is not None
+        workspace_id = executions.workspace_id
         self.serving.sweep(owner)
         self._stop_descendants(owner)
         with self.lock:
@@ -394,6 +395,7 @@ class Calls:
                     call.child_request,
                     hashlib.sha256(capture).digest(),
                     offer,
+                    expected_execution_workspace_id=workspace_id,
                     result_schema=canonical_json.encode(target.declaration["result"]),
                     worker_boot=self.worker.fence.worker_boot_id,
                     memoize=memoized,

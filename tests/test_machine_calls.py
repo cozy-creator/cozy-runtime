@@ -56,7 +56,13 @@ def test_call_replay_preserves_send_marker_and_fences_prior_parent_generation(
 ) -> None:
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
-    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     first = request(running(executions))
     calls = Calls(workspace)
     accepted = calls.accept("owner", first)
@@ -92,10 +98,22 @@ def test_child_progress_poll_reuses_journal_and_fences_owner_parent_and_attempt(
     root = tmp_path / "store"
     workspace = Workspace(root)
     executions = Executions(workspace)
-    executions.submit("owner", "parent", b"p" * 32, offer("parent"))
+    executions.submit(
+        "owner",
+        "parent",
+        b"p" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     incoming = request(running(executions))
     child = Calls(workspace).accept("owner", incoming)
-    executions.submit("owner", child.child_request, b"c" * 32, offer(child.child_request))
+    executions.submit(
+        "owner",
+        child.child_request,
+        b"c" * 32,
+        offer(child.child_request),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     running(executions, child.child_request)
     document = {
         "type": "progress",
@@ -195,7 +213,13 @@ def test_optional_child_progress_cannot_turn_a_valid_result_into_failure(
 def test_cancel_before_send_performs_no_write_or_forged_completion(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
-    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     calls = Calls(workspace)
     accepted = calls.accept("owner", request(running(executions)))
     executions.control("owner", "parent", "cancel", 1, "cancel")
@@ -211,7 +235,13 @@ def test_cancel_before_send_performs_no_write_or_forged_completion(tmp_path: Pat
 def test_release_baseline_freezes_before_send_and_survives_reopen(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
-    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     calls = Calls(workspace)
     accepted = calls.accept("owner", request(running(executions)))
     prepared = b'{"baseline_revision":1,"desired":{"bf16":"checkpoint"}}'
@@ -230,7 +260,13 @@ def test_release_baseline_freezes_before_send_and_survives_reopen(tmp_path: Path
 def test_read_only_convergence_does_not_fabricate_a_send(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
-    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     calls = Calls(workspace)
     accepted = calls.accept("owner", request(running(executions)))
     calls.observe_result("owner", accepted, b'{"observation":"observed_convergence"}')
@@ -245,10 +281,22 @@ def test_root_cancel_fences_descendant_writes_and_retains_uncertain_effect(tmp_p
 
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
-    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     calls = Calls(workspace)
     child = calls.accept("owner", request(running(executions))).child_request
-    executions.submit("owner", child, b"d" * 32, offer(child))
+    executions.submit(
+        "owner",
+        child,
+        b"d" * 32,
+        offer(child),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     effect = calls.accept("owner", request(running(executions, child), module=MODULE))
     effect = calls.freeze("owner", effect, b'{"baseline_revision":0}')
     calls.before_write("owner", effect)
@@ -269,21 +317,36 @@ def test_accepted_publication_authority_is_immutable_and_survives_reopen(tmp_pat
     executions = Executions(workspace)
     grant = "019aaaab-0000-7000-8000-000000000003"
     accepted = executions.submit(
-        "owner", "parent", b"c" * 32, offer("parent"), publication_authorization_id=grant
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        publication_authorization_id=grant,
+        expected_execution_workspace_id=executions.workspace_id,
     )
     assert accepted.publication_authorization_id == grant
     reopened = Executions(Workspace(tmp_path / "store"))
     assert reopened.publication_authorization("owner", "parent") == grant
     assert (
         reopened.submit(
-            "owner", "parent", b"c" * 32, offer("parent"), publication_authorization_id=grant
+            "owner",
+            "parent",
+            b"c" * 32,
+            offer("parent"),
+            publication_authorization_id=grant,
+            expected_execution_workspace_id=reopened.workspace_id,
         )
         == accepted
     )
     for changed in ("", "019aaaab-0000-7000-8000-000000000004"):
         with pytest.raises(WorkspaceRefusal, match="identity changed"):
             reopened.submit(
-                "owner", "parent", b"c" * 32, offer("parent"), publication_authorization_id=changed
+                "owner",
+                "parent",
+                b"c" * 32,
+                offer("parent"),
+                publication_authorization_id=changed,
+                expected_execution_workspace_id=reopened.workspace_id,
             )
     with pytest.raises(WorkspaceRefusal, match="not held"):
         reopened.publication_authorization("another-owner", "parent")
@@ -295,14 +358,30 @@ def test_descendant_cannot_borrow_or_broaden_another_publication_grant(tmp_path:
     grant = "019aaaab-0000-7000-8000-000000000003"
     other_grant = "019aaaab-0000-7000-8000-000000000004"
     executions.submit(
-        "owner", "root", b"c" * 32, offer("parent"), publication_authorization_id=grant
+        "owner",
+        "root",
+        b"c" * 32,
+        offer("parent"),
+        publication_authorization_id=grant,
+        expected_execution_workspace_id=executions.workspace_id,
     )
     calls = Calls(workspace)
     child = calls.accept("owner", request(running(executions))).child_request
-    executions.submit("owner", child, b"d" * 32, offer(child))
+    executions.submit(
+        "owner",
+        child,
+        b"d" * 32,
+        offer(child),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     assert executions.publication_authorization("owner", child) == grant
     executions.submit(
-        "owner", "other", b"e" * 32, offer("other"), publication_authorization_id=other_grant
+        "owner",
+        "other",
+        b"e" * 32,
+        offer("other"),
+        publication_authorization_id=other_grant,
+        expected_execution_workspace_id=executions.workspace_id,
     )
     assert executions.publication_authorization("owner", child) != other_grant
 
@@ -310,7 +389,13 @@ def test_descendant_cannot_borrow_or_broaden_another_publication_grant(tmp_path:
 def test_refusal_cannot_overwrite_an_accepted_child_or_uncertain_send(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
-    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     calls = Calls(workspace)
     call = calls.accept("owner", request(running(executions)))
     calls.before_write("owner", call)

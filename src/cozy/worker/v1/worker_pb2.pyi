@@ -635,8 +635,24 @@ class MachineCallableBinding(_message.Message):
     entrypoint: str
     def __init__(self, caller_revision_digest: _Optional[bytes] = ..., interface_digest: _Optional[bytes] = ..., module: _Optional[str] = ..., export: _Optional[str] = ..., callee_revision_digest: _Optional[bytes] = ..., entrypoint: _Optional[str] = ...) -> None: ...
 
+class MachineExecutionWorkspaceQuery(_message.Message):
+    __slots__ = ("claim",)
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
+
+class MachineExecutionWorkspace(_message.Message):
+    __slots__ = ("worker_id", "worker_boot_id", "execution_workspace_id")
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    worker_id: str
+    worker_boot_id: str
+    execution_workspace_id: str
+    def __init__(self, worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ...) -> None: ...
+
 class MachineExecutionSubmit(_message.Message):
-    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "max_attempts", "retry_delay_ms", "prepared_state", "payload_canonical_bytes", "publication_authorization_id")
+    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "max_attempts", "retry_delay_ms", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -647,6 +663,7 @@ class MachineExecutionSubmit(_message.Message):
     PREPARED_STATE_FIELD_NUMBER: _ClassVar[int]
     PAYLOAD_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     PUBLICATION_AUTHORIZATION_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_EXECUTION_WORKSPACE_ID_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     submission_id: str
     capture_digest: bytes
@@ -657,7 +674,8 @@ class MachineExecutionSubmit(_message.Message):
     prepared_state: DesiredWorkerState
     payload_canonical_bytes: bytes
     publication_authorization_id: str
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ...) -> None: ...
+    expected_execution_workspace_id: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionReceipt(_message.Message):
     __slots__ = ("request_id", "submission_id", "capture_digest", "invocation_spec_digest", "accepted_at_ms", "worker_id", "worker_boot_id", "execution_workspace_id", "publication_authorization_id")

@@ -35,6 +35,11 @@ class WorkerControlStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.GetMachineExecutionWorkspace = channel.unary_unary(
+                '/cozy.worker.v1.WorkerControl/GetMachineExecutionWorkspace',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspaceQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspace.FromString,
+                _registered_method=True)
         self.SubmitMachineExecution = channel.unary_unary(
                 '/cozy.worker.v1.WorkerControl/SubmitMachineExecution',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionSubmit.SerializeToString,
@@ -80,6 +85,14 @@ class WorkerControlStub(object):
 class WorkerControlServicer(object):
     """The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
     """
+
+    def GetMachineExecutionWorkspace(self, request, context):
+        """MINOR59. Discover Runtime's durable journal lifetime before freezing a submit.
+        Authenticated like the other machine calls; no continuing Control stream needed.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def SubmitMachineExecution(self, request, context):
         """MINOR51. Runtime owns accepted work independently of the caller connection.
@@ -144,6 +157,11 @@ class WorkerControlServicer(object):
 
 def add_WorkerControlServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'GetMachineExecutionWorkspace': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMachineExecutionWorkspace,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspaceQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspace.SerializeToString,
+            ),
             'SubmitMachineExecution': grpc.unary_unary_rpc_method_handler(
                     servicer.SubmitMachineExecution,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionSubmit.FromString,
@@ -195,6 +213,33 @@ def add_WorkerControlServicer_to_server(servicer, server):
 class WorkerControl(object):
     """The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
     """
+
+    @staticmethod
+    def GetMachineExecutionWorkspace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.WorkerControl/GetMachineExecutionWorkspace',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspaceQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspace.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def SubmitMachineExecution(request,
@@ -1838,6 +1883,11 @@ class PodHostStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.GetMachineExecutionWorkspace = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/GetMachineExecutionWorkspace',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspaceQuery.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspace.FromString,
+                _registered_method=True)
         self.SubmitMachineExecution = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/SubmitMachineExecution',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionSubmit.SerializeToString,
@@ -2032,6 +2082,12 @@ class PodHostServicer(object):
     Locally PodHost is not a service: the daemon calls the same host functions in-process.
     ---------------------------------------------------------------------------
     """
+
+    def GetMachineExecutionWorkspace(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def SubmitMachineExecution(self, request, context):
         """Authenticated forwarding only. Runtime is the sole execution journal/owner.
@@ -2238,6 +2294,11 @@ class PodHostServicer(object):
 
 def add_PodHostServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'GetMachineExecutionWorkspace': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMachineExecutionWorkspace,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspaceQuery.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspace.SerializeToString,
+            ),
             'SubmitMachineExecution': grpc.unary_unary_rpc_method_handler(
                     servicer.SubmitMachineExecution,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionSubmit.FromString,
@@ -2438,6 +2499,33 @@ class PodHost(object):
     Locally PodHost is not a service: the daemon calls the same host functions in-process.
     ---------------------------------------------------------------------------
     """
+
+    @staticmethod
+    def GetMachineExecutionWorkspace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/GetMachineExecutionWorkspace',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspaceQuery.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspace.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def SubmitMachineExecution(request,

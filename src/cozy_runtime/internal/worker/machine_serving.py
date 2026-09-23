@@ -170,6 +170,7 @@ class Serving:
     def drive(self, owner: str, call: Call, target: Target, request: pb.ChildCallRequest) -> None:
         workspace, executions = self.worker.workspace, self.worker.executions
         assert workspace is not None and executions is not None
+        workspace_id = executions.workspace_id
         if target.declaration.get("invocable", {}).get("memoize"):
             raise WorkspaceRefusal("inference calls cannot enter the memo index")
         journal = JournalCalls(workspace)
@@ -329,6 +330,7 @@ class Serving:
                     call.child_request,
                     hashlib.sha256(capture).digest(),
                     offer,
+                    expected_execution_workspace_id=workspace_id,
                     result_schema=canonical_json.encode(target.declaration["result"]),
                     worker_boot=self.worker.fence.worker_boot_id,
                     memoize=False,

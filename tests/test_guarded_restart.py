@@ -105,7 +105,13 @@ def test_real_hup_cannot_reenter_main_thread_admission(
             os.kill(os.getpid(), signal.SIGHUP)
             assert entered.wait(5)
             assert not worker.stop.is_set()
-            worker.submit_execution(claim, "root", b"c" * 32, offer(job=False))
+            worker.submit_execution(
+                claim,
+                "root",
+                b"c" * 32,
+                offer(job=False),
+                expected_execution_workspace_id=worker._execution_service(claim)[0].workspace_id,
+            )
         with worker.control_lock:
             pass
         worker.request_stop()
@@ -126,7 +132,13 @@ def test_real_hup_cannot_reenter_main_thread_admission(
 def test_queued_detached_root_refuses_update_then_can_finish(tmp_path: Path) -> None:
     worker, claim = _worker(tmp_path)
     try:
-        receipt = worker.submit_execution(claim, "root", b"c" * 32, offer(job=False))
+        receipt = worker.submit_execution(
+            claim,
+            "root",
+            b"c" * 32,
+            offer(job=False),
+            expected_execution_workspace_id=worker._execution_service(claim)[0].workspace_id,
+        )
         # No Control stream/snapshot acknowledgement. Queued work is absent from held_attempts.
         assert not worker.snapshot_body().held_attempts
         assert not worker.request_idle_restart()
@@ -142,7 +154,13 @@ def test_queued_detached_root_refuses_update_then_can_finish(tmp_path: Path) -> 
         assert verdict2["status"] == "accepted" and verdict2["sequence"] == verdict["sequence"] + 1
         assert worker.collect_execution(claim, receipt.request_id) == outcome
         with pytest.raises(WorkspaceRefusal, match="stopping"):
-            worker.submit_execution(claim, "later", b"d" * 32, offer("later", job=False))
+            worker.submit_execution(
+                claim,
+                "later",
+                b"d" * 32,
+                offer("later", job=False),
+                expected_execution_workspace_id=worker._execution_service(claim)[0].workspace_id,
+            )
         worker.drive_executions()  # Cannot reopen admission after a successful guard.
         assert worker.stop.is_set()
     finally:
@@ -154,7 +172,13 @@ def test_retry_wait_is_active_and_preparation_is_busy(tmp_path: Path) -> None:
     try:
         assert worker.executions is not None
         worker.submit_execution(
-            claim, "root", b"c" * 32, offer(job=False), max_attempts=2, retry_delay_ms=60000
+            claim,
+            "root",
+            b"c" * 32,
+            offer(job=False),
+            max_attempts=2,
+            retry_delay_ms=60000,
+            expected_execution_workspace_id=worker._execution_service(claim)[0].workspace_id,
         )
         complete(
             worker.executions,
@@ -181,7 +205,13 @@ def test_restart_and_root_admission_have_exactly_one_winner(tmp_path: Path, iter
     def submit() -> bool:
         barrier.wait()
         try:
-            worker.submit_execution(claim, "root", b"c" * 32, offer(job=False))
+            worker.submit_execution(
+                claim,
+                "root",
+                b"c" * 32,
+                offer(job=False),
+                expected_execution_workspace_id=worker._execution_service(claim)[0].workspace_id,
+            )
         except WorkspaceRefusal as exc:
             assert "stopping" in str(exc)
             return False

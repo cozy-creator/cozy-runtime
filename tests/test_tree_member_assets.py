@@ -319,6 +319,7 @@ def test_projection_terminal_replays_after_retained_collection(
                 invocation_spec_digest=spec,
                 invocation_spec_canonical_bytes=raw,
             ),
+            expected_execution_workspace_id=executions.workspace_id,
         )
         workspace.mark_running(
             "owner",

@@ -63,6 +63,14 @@ class StaleExecutionGeneration(WorkspaceRefusal):
     code = "execution_generation_stale"
 
 
+class ExecutionWorkspaceRefusal(WorkspaceRefusal):
+    """The expected journal is absent/changed; this is never proof of nonacceptance."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(detail)
+        self.code = code
+
+
 @dataclass(frozen=True)
 class Receipt:
     request_id: str
@@ -72,6 +80,7 @@ class Receipt:
     accepted_at_ms: int
     worker_id: str
     worker_boot_id: str
+    execution_workspace_id: str
     publication_authorization_id: str = ""
 
 
@@ -145,10 +154,42 @@ class Executions:
     @property
     def workspace_id(self) -> str:
         with self.workspace.locked() as db:
-            return str(
+            return self._workspace_id_in(db)
+
+    @staticmethod
+    def _workspace_id_in(db: Journal) -> str:
+        return str(
+            db.execute(
+                "SELECT execution_workspace_id FROM workspace_state WHERE singleton=1"
+            ).fetchone()[0]
+        )
+
+    @classmethod
+    def require_workspace_in(cls, db: Journal, expected: str) -> str:
+        if not expected:
+            raise ExecutionWorkspaceRefusal(
+                "execution_workspace_required", "execution requires its pinned workspace identity"
+            )
+        actual = cls._workspace_id_in(db)
+        if expected != actual:
+            raise ExecutionWorkspaceRefusal(
+                "execution_workspace_changed", "execution workspace was replaced or does not match"
+            )
+        return actual
+
+    def require_workspace(self, expected: str) -> None:
+        with self.workspace.locked() as db:
+            self.require_workspace_in(db, expected)
+
+    def submission_absent(self, owner: str, request: str, expected: str) -> bool:
+        """Only the pinned journal can establish that this submission was not accepted."""
+        with self.workspace.locked() as db:
+            self.require_workspace_in(db, expected)
+            return (
                 db.execute(
-                    "SELECT execution_workspace_id FROM workspace_state WHERE singleton=1"
-                ).fetchone()[0]
+                    "SELECT 1 FROM executions WHERE owner=? AND request=?", (owner, request)
+                ).fetchone()
+                is None
             )
 
     @staticmethod
@@ -174,7 +215,7 @@ class Executions:
         )
 
     @staticmethod
-    def _receipt(row: Row) -> Receipt:
+    def _receipt(row: Row, workspace_id: str) -> Receipt:
         offer = pb.AttemptOffer.FromString(row["offer"])
         return Receipt(
             row["request"],
@@ -184,6 +225,7 @@ class Executions:
             row["accepted_ms"],
             row["worker_id"],
             row["accepted_boot"],
+            workspace_id,
             row["publication_authorization_id"],
         )
 
@@ -227,6 +269,7 @@ class Executions:
         capture_digest: bytes,
         offer: pb.AttemptOffer,
         *,
+        expected_execution_workspace_id: str,
         result_schema: bytes = b"",
         worker_boot: str = "",
         memoize: bool = False,
@@ -238,6 +281,7 @@ class Executions:
         publication_authorization_id: str = "",
     ) -> Receipt:
         """Atomically accept a verified capture/root and its first existing attempt."""
+        self.require_workspace(expected_execution_workspace_id)
         Workspace.owner(owner)
         _id(submission_id)
         if publication_authorization_id:
@@ -256,6 +300,7 @@ class Executions:
         self.workspace.recover(owner)
         raw = _offer_bytes(offer)
         with self.workspace.locked() as db, transaction(db):
+            workspace_id = self.require_workspace_in(db, expected_execution_workspace_id)
             old = db.execute(
                 "SELECT * FROM executions WHERE owner=? AND (submission=? OR request=?)",
                 (owner, submission_id, offer.request_id),
@@ -284,7 +329,7 @@ class Executions:
                     publication_authorization_id,
                 ):
                     raise WorkspaceRefusal("execution submission identity changed")
-                return self._receipt(row)
+                return self._receipt(row, workspace_id)
             if db.execute(
                 "SELECT 1 FROM attempts WHERE owner=? AND request=?", (owner, offer.request_id)
             ).fetchone():
@@ -326,7 +371,7 @@ class Executions:
             )
             row = self._row(db, owner, offer.request_id)
             self._event(db, row, "accepted", canonical_json.encode({"generation": 1}))
-            return self._receipt(row)
+            return self._receipt(row, workspace_id)
 
     def publication_authorization(self, owner: str, request: str) -> str:
         with self.workspace.locked() as db:

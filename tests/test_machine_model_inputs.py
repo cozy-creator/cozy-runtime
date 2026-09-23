@@ -59,7 +59,13 @@ def test_root_input_survives_source_release_gc_and_workspace_restart(tmp_path: P
     selected = model_offer(receipt.artifact.manifest.digest, receipt.artifact.manifest.length)
     machine_model_inputs.retain(workspace, "owner", selected, {"source"})
     executions = Executions(workspace)
-    executions.submit("owner", "root-input", b"x" * 32, selected)
+    executions.submit(
+        "owner",
+        "root-input",
+        b"x" * 32,
+        selected,
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     release_original(workspace, completed(workspace, receipt), receipt)
     tensorfs.gc(str(store.root))
     restored = Workspace(Path(store.root))

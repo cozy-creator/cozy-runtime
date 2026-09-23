@@ -99,13 +99,28 @@ def test_exact_results_survive_lost_replies_collection_and_native_release(
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
     submitted = offer()
-    receipt = executions.submit("owner", "submission", b"c" * 32, submitted)
+    receipt = executions.submit(
+        "owner",
+        "submission",
+        b"c" * 32,
+        submitted,
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     # A reconnect's stamps are not another semantic request.
     submitted.record_owner_epoch = 7
     submitted.control_stream_epoch = 9
     submitted.worker_boot_id = "later-stream"
     submitted.admission_epoch = 11
-    assert executions.submit("owner", "submission", b"c" * 32, submitted) == receipt
+    assert (
+        executions.submit(
+            "owner",
+            "submission",
+            b"c" * 32,
+            submitted,
+            expected_execution_workspace_id=executions.workspace_id,
+        )
+        == receipt
+    )
     terminal = complete(executions, "root", value)
     executions.progress("owner", "root", 1, {"type": "progress", "payload": {"position": 100}})
     reopened = Executions(Workspace(tmp_path / "store"))
@@ -127,29 +142,49 @@ def test_exact_results_survive_lost_replies_collection_and_native_release(
 def test_submission_conflicts_do_not_rebind_root_or_an_existing_attempt(tmp_path: Path) -> None:
     e = Executions(Workspace(tmp_path / "store"))
     original = offer()
-    e.submit("owner", "submission", b"c" * 32, original)
+    e.submit(
+        "owner", "submission", b"c" * 32, original, expected_execution_workspace_id=e.workspace_id
+    )
     for submission, capture, changed in [
         ("submission", b"d" * 32, original),
         ("submission", b"c" * 32, offer("other")),
         ("different", b"c" * 32, original),
     ]:
         with pytest.raises(WorkspaceRefusal, match="identity changed"):
-            e.submit("owner", submission, capture, changed)
+            e.submit(
+                "owner",
+                submission,
+                capture,
+                changed,
+                expected_execution_workspace_id=e.workspace_id,
+            )
     original.placement_id = "another-semantic-target"
     with pytest.raises(WorkspaceRefusal, match="identity changed"):
-        e.submit("owner", "submission", b"c" * 32, original)
+        e.submit(
+            "owner",
+            "submission",
+            b"c" * 32,
+            original,
+            expected_execution_workspace_id=e.workspace_id,
+        )
     with pytest.raises(WorkspaceRefusal, match="this owner"):
         e.status("foreign", "root")
     e.workspace.accept("owner", offer("legacy"))
     with pytest.raises(WorkspaceRefusal, match="another execution path"):
-        e.submit("owner", "legacy", b"c" * 32, offer("legacy"))
+        e.submit(
+            "owner",
+            "legacy",
+            b"c" * 32,
+            offer("legacy"),
+            expected_execution_workspace_id=e.workspace_id,
+        )
 
 
 def test_controls_fence_generation_and_replay_commands_without_another_attempt(
     tmp_path: Path,
 ) -> None:
     e = Executions(Workspace(tmp_path / "store"))
-    e.submit("owner", "s", b"c" * 32, offer())
+    e.submit("owner", "s", b"c" * 32, offer(), expected_execution_workspace_id=e.workspace_id)
     terminal = complete(e, "root", status=pb.OUTCOME_STATUS_FAILED)
     assert e.acknowledge_collection("owner", ack(terminal)).collected
     assert e.retention_required("owner")  # reading an error does not abandon interrupted work
@@ -196,7 +231,7 @@ def test_progress_compaction_reports_gaps_but_preserves_logs_and_days_of_retenti
 ) -> None:
     now = [1_000]
     e = Executions(Workspace(tmp_path / "store"), clock_ms=lambda: now[0])
-    e.submit("owner", "s", b"c" * 32, offer())
+    e.submit("owner", "s", b"c" * 32, offer(), expected_execution_workspace_id=e.workspace_id)
     e.progress("owner", "root", 1, {"type": "log", "payload": "durable author log"})
     for index in range(300):
         e.progress("owner", "root", 1, {"type": "progress", "payload": {"position": index}})
@@ -224,7 +259,7 @@ from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import worker_pb2 as pb
 e=Executions(Workspace(Path(sys.argv[1])))
-e.submit('owner','submission',b'c'*32,pb.AttemptOffer.FromString(base64.b64decode(sys.argv[2])),max_attempts=2)
+e.submit('owner','submission',b'c'*32,pb.AttemptOffer.FromString(base64.b64decode(sys.argv[2])),max_attempts=2,expected_execution_workspace_id=e.workspace_id)
 print('accepted',flush=True)
 sys.stdin.readline()
 """
@@ -262,7 +297,15 @@ def test_actual_process_death_recovers_without_duplicate_execution(tmp_path: Pat
             == pb.OUTCOME_STATUS_ABANDONED
         )
         assert (
-            e.submit("owner", "submission", b"c" * 32, offer(), max_attempts=2).request_id == "root"
+            e.submit(
+                "owner",
+                "submission",
+                b"c" * 32,
+                offer(),
+                max_attempts=2,
+                expected_execution_workspace_id=e.workspace_id,
+            ).request_id
+            == "root"
         )
         assert e.status("owner", "root").attempt_ordinal == 1
         e.retry_due("owner")
@@ -300,7 +343,7 @@ def test_native_result_has_separate_collection_and_consumer_custody(
         invocation_spec_canonical_bytes=invocation,
     )
     e = Executions(Workspace(tmp_path / "store"))
-    e.submit("owner", "native", b"c" * 32, offered)
+    e.submit("owner", "native", b"c" * 32, offered, expected_execution_workspace_id=e.workspace_id)
     store, workspace, receipt = produced(tmp_path)
     independent = workspace.retain("owner", retention(receipt, 42))
     reference, _, _ = protocol_receipt(
@@ -391,7 +434,13 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
         assert worker.accept_claim(claim, frames.append)[0] == 1
         # No Control stream or watcher is running. Real admission produces a typed terminal.
         submitted = offer("refused", job=False)
-        receipt = worker.submit_execution(claim, "refused", b"c" * 32, submitted)
+        receipt = worker.submit_execution(
+            claim,
+            "refused",
+            b"c" * 32,
+            submitted,
+            expected_execution_workspace_id=worker._execution_service(claim)[0].workspace_id,
+        )
         worker.drive_executions()
         assert receipt.request_id == "refused"
         assert json.loads((tmp_path / "activity").read_bytes())["execution_retention_required"]
@@ -401,12 +450,27 @@ def test_worker_intake_and_terminal_are_durable_without_an_observer(tmp_path: Pa
             "safe_message"
         ]
         assert worker.engine.history[("refused", 1)].state == "closed"
-        assert worker.submit_execution(claim, "refused", b"c" * 32, submitted) == receipt
+        assert (
+            worker.submit_execution(
+                claim,
+                "refused",
+                b"c" * 32,
+                submitted,
+                expected_execution_workspace_id=worker._execution_service(claim)[0].workspace_id,
+            )
+            == receipt
+        )
         # Exercise the real engine's successful terminal path independently of its compute phase.
         assert worker.executions is not None
         submitted = offer("scalar", job=False)
         submitted.grant.invocation_spec_digest = submitted.invocation_spec_digest
-        worker.executions.submit("owner", "scalar", b"d" * 32, submitted)
+        worker.executions.submit(
+            "owner",
+            "scalar",
+            b"d" * 32,
+            submitted,
+            expected_execution_workspace_id=worker.executions.workspace_id,
+        )
         attempt = worker.engine.offer(submitted)
         worker.engine.hold(attempt)
         terminal = worker.engine.outcome(
@@ -472,7 +536,9 @@ def test_schema_upgrade_preserves_existing_custody_rows(tmp_path: Path) -> None:
     assert len(e.workspace_id) == 32
     assert Executions(Workspace(tmp_path / "store")).workspace_id == e.workspace_id
     assert Executions(Workspace(tmp_path / "other-store")).workspace_id != e.workspace_id
-    e.submit("owner", "new", b"c" * 32, offer("new"))
+    e.submit(
+        "owner", "new", b"c" * 32, offer("new"), expected_execution_workspace_id=e.workspace_id
+    )
     with workspace.locked() as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 11
         assert db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 2
@@ -488,7 +554,15 @@ def test_retry_policy_never_retries_authored_errors_or_user_cancellation(tmp_pat
         ("canceled", pb.OUTCOME_STATUS_CANCELED, pb.CAUSE_CODE_CLIENT_CANCEL),
         ("structural", pb.OUTCOME_STATUS_REFUSED, pb.CAUSE_CODE_LOCAL_SAFETY),
     ]:
-        e.submit("owner", request, b"c" * 32, offer(request), max_attempts=2, retry_delay_ms=500)
+        e.submit(
+            "owner",
+            request,
+            b"c" * 32,
+            offer(request),
+            max_attempts=2,
+            retry_delay_ms=500,
+            expected_execution_workspace_id=e.workspace_id,
+        )
         complete(e, request, status=status, cause=cause)
     e.retry_due("owner")
     assert e.status("owner", "transient").attempt_ordinal == 1
@@ -514,7 +588,13 @@ def test_retry_policy_never_retries_authored_errors_or_user_cancellation(tmp_pat
 
 def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path: Path) -> None:
     e = Executions(Workspace(tmp_path / "store"), clock_ms=lambda: 2000)
-    e.submit("owner", "cancel", b"c" * 32, offer("cancel"))
+    e.submit(
+        "owner",
+        "cancel",
+        b"c" * 32,
+        offer("cancel"),
+        expected_execution_workspace_id=e.workspace_id,
+    )
     e.control("owner", "cancel", "cancel", 1, "cancel")
     e.stop_queued("owner", "cancel")
     assert e.status("owner", "cancel").state == "canceled"
@@ -531,7 +611,9 @@ def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path
     submitted.invocation_spec_canonical_bytes, submitted.invocation_spec_digest = (
         documents.identity(spec)
     )
-    e.submit("owner", "expired", b"c" * 32, submitted)
+    e.submit(
+        "owner", "expired", b"c" * 32, submitted, expected_execution_workspace_id=e.workspace_id
+    )
     complete(e, "expired", status=pb.OUTCOME_STATUS_FAILED)
     with pytest.raises(WorkspaceRefusal, match="deadline"):
         e.control("owner", "expired", "resume", 1, "resume")
@@ -825,6 +907,9 @@ def serve(payload: Request) -> Result:
                     offer=message.attempt_offer,
                     prepared_state=generator._desired_state(),
                     payload_canonical_bytes=canonical_json.encode(generator.request.payload),
+                    expected_execution_workspace_id=client.GetMachineExecutionWorkspace(
+                        pb.MachineExecutionWorkspaceQuery(claim=claim)
+                    ).execution_workspace_id,
                 )
                 # Remove the old transport payload before intake: only the inline captured
                 # arguments are available when the queued executor eventually starts.
@@ -860,6 +945,9 @@ def serve(payload: Request) -> Result:
                                 offer=internal_offer.attempt_offer,
                                 prepared_state=internal_generator._desired_state(),
                                 payload_canonical_bytes=canonical_json.encode({"n": 7}),
+                                expected_execution_workspace_id=client.GetMachineExecutionWorkspace(
+                                    pb.MachineExecutionWorkspaceQuery(claim=claim)
+                                ).execution_workspace_id,
                             ),
                             timeout=30,
                         )
@@ -877,9 +965,9 @@ def serve(payload: Request) -> Result:
                         dict(denied.value.trailing_metadata())["cozy-error-code"]
                         == "execution_submission_refused"
                     )
-                    authority_cases = [(51, "wire52"), (54, "no independent publication")]
+                    authority_cases = [(58, "wire59"), (WIRE_MINOR, "no independent publication")]
                     if origin != "private":
-                        authority_cases.append((53, "wire54"))
+                        authority_cases.append((53, "wire59"))
                     for minor, detail in authority_cases:
                         assert worker.executions is not None
                         invalid.CopyFrom(submission)
@@ -1071,6 +1159,9 @@ def serve(payload: Request) -> Result:
                                 posture=pb.POSTURE_ACCEPTING,
                                 placement_set=placements["offline"],
                             ),
+                            expected_execution_workspace_id=client.GetMachineExecutionWorkspace(
+                                pb.MachineExecutionWorkspaceQuery(claim=claim)
+                            ).execution_workspace_id,
                         ),
                         timeout=30,
                     )
@@ -1212,7 +1303,13 @@ def test_workspace_handoff_fences_dispatch_without_stopping_the_watchdog(tmp_pat
     def transfer() -> Iterator[pb.WorkspaceImportFrame]:
         yield incoming[0]
         with pytest.raises(WorkspaceInactive):
-            executions.submit("owner", "refused", b"c" * 32, offer("refused"))
+            executions.submit(
+                "owner",
+                "refused",
+                b"c" * 32,
+                offer("refused"),
+                expected_execution_workspace_id=executions.workspace_id,
+            )
         Worker.drive_executions(worker)
         assert executions.retention_required("owner")
         yield incoming[-1]
@@ -1230,5 +1327,11 @@ def test_workspace_handoff_fences_dispatch_without_stopping_the_watchdog(tmp_pat
     )
     Worker.drive_executions(worker)
     assert not executions.retention_required("owner")
-    executions.submit("owner", "accepted", b"c" * 32, offer("accepted"))
+    executions.submit(
+        "owner",
+        "accepted",
+        b"c" * 32,
+        offer("accepted"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     assert executions.pending("owner") == ("accepted",)
