@@ -490,6 +490,16 @@ class WriterBroker:
         with self.lock:
             self.writers[key] = live
 
+        def record_receipt(facts: dict[str, Any]) -> None:
+            receipt_recorder(attempt, transaction, binding, facts)
+            # TensorFS sends the successful receipt after this callback. Release
+            # writer ownership here so immediate replay cannot race the serving
+            # thread's later cleanup. An active or unrecorded writer still excludes
+            # another opener; a completed output reopens through native custody.
+            with self.lock:
+                if self.writers.get(key) is live:
+                    self.writers.pop(key)
+
         @contextlib.contextmanager
         def admit(operation: str, native_bound: int) -> Iterator[None]:
             self._current(attempt, transaction, binding)
@@ -518,9 +528,7 @@ class WriterBroker:
                         replay,
                         server.detach(),
                         check_current=lambda: self._current(attempt, transaction, binding),
-                        record_receipt=lambda facts: receipt_recorder(
-                            attempt, transaction, binding, facts
-                        ),
+                        record_receipt=record_receipt,
                     )
                 else:
                     assert writer is not None
@@ -535,9 +543,7 @@ class WriterBroker:
                         record_checkpoint=lambda facts: checkpoint_recorder(
                             attempt, transaction, binding, facts
                         ),
-                        record_receipt=lambda facts: receipt_recorder(
-                            attempt, transaction, binding, facts
-                        ),
+                        record_receipt=record_receipt,
                     )
             except Exception:
                 # TensorFS sends the typed refusal on this same channel before raising.
