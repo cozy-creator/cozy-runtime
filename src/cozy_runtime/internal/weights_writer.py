@@ -180,6 +180,7 @@ class WriterBroker:
         self.bindings: dict[tuple[str, int, str], _Binding] = {}
         self.lock = threading.RLock()
         self.writers: dict[tuple[str, int, str], _LiveWriter] = {}
+        self.completed_channels: dict[tuple[str, int, str], set[socket.socket]] = {}
         self.sources: dict[tuple[str, int], set[socket.socket]] = {}
 
     @staticmethod
@@ -439,6 +440,10 @@ class WriterBroker:
         with self.lock:
             if key in self.writers:
                 raise CapabilityError("writer is already open", code="weights_writer_closed")
+            if len(self.completed_channels.get(key, ())) >= 16:
+                raise CapabilityError(
+                    "too many pending receipt deliveries", code="weights_writer_closed"
+                )
         checkpoint_recorder, receipt_recorder = self.record_checkpoint, self.record_receipt
         if checkpoint_recorder is None or receipt_recorder is None:
             raise CapabilityError(
@@ -490,6 +495,19 @@ class WriterBroker:
         with self.lock:
             self.writers[key] = live
 
+        def record_receipt(facts: dict[str, Any]) -> None:
+            receipt_recorder(attempt, transaction, binding, facts)
+            # TensorFS sends the successful receipt after this callback. Release
+            # writer ownership here so immediate replay cannot race the serving
+            # thread's later cleanup. An active or unrecorded writer still excludes
+            # another opener; a completed output reopens through native custody.
+            with self.lock:
+                if self.writers.get(key) is live:
+                    # Keep terminal delivery interruptible if its peer stops
+                    # reading; replay admission and channel lifetime are separate.
+                    self.completed_channels.setdefault(key, set()).add(live.stop_socket)
+                    self.writers.pop(key)
+
         @contextlib.contextmanager
         def admit(operation: str, native_bound: int) -> Iterator[None]:
             self._current(attempt, transaction, binding)
@@ -518,9 +536,7 @@ class WriterBroker:
                         replay,
                         server.detach(),
                         check_current=lambda: self._current(attempt, transaction, binding),
-                        record_receipt=lambda facts: receipt_recorder(
-                            attempt, transaction, binding, facts
-                        ),
+                        record_receipt=record_receipt,
                     )
                 else:
                     assert writer is not None
@@ -535,9 +551,7 @@ class WriterBroker:
                         record_checkpoint=lambda facts: checkpoint_recorder(
                             attempt, transaction, binding, facts
                         ),
-                        record_receipt=lambda facts: receipt_recorder(
-                            attempt, transaction, binding, facts
-                        ),
+                        record_receipt=record_receipt,
                     )
             except Exception:
                 # TensorFS sends the typed refusal on this same channel before raising.
@@ -548,6 +562,11 @@ class WriterBroker:
                 with self.lock:
                     if self.writers.get(key) is live:
                         self.writers.pop(key)
+                    channels = self.completed_channels.get(key)
+                    if channels is not None:
+                        channels.discard(live.stop_socket)
+                        if not channels:
+                            self.completed_channels.pop(key)
                 live.stop_socket.close()
 
         try:
@@ -635,6 +654,10 @@ class WriterBroker:
         with self.lock:
             self.bindings.pop(key, None)
             live = self.writers.pop(key, None)
+            completed = self.completed_channels.pop(key, set())
+        for channel in completed:
+            with contextlib.suppress(OSError):
+                channel.shutdown(socket.SHUT_RDWR)
         if live is not None:
             with contextlib.suppress(OSError):
                 live.stop_socket.shutdown(socket.SHUT_RDWR)
