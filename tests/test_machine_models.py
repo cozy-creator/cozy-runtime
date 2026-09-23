@@ -24,7 +24,14 @@ def test_borrowed_model_root_collection_retains_bytes_and_rejects_a_copied_journ
     store, workspace, receipt = produced(tmp_path)
     value = msgspec.to_builtins(receipt.artifact)
     executions = Executions(workspace)
-    executions.submit("owner", "root", b"c" * 32, offer(), result_schema=b'{"input":"model"}')
+    executions.submit(
+        "owner",
+        "root",
+        b"c" * 32,
+        offer(),
+        result_schema=b'{"input":"model"}',
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     machine_models.retain_result(
         workspace, "owner", "root", "call.0.result", value, {"input": "model"}
     )

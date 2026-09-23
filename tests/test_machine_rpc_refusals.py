@@ -9,6 +9,7 @@ import pytest
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionRPC
 from cozy_runtime.internal.worker.session import Worker
+from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
 
 
@@ -34,7 +35,7 @@ def test_noncanonical_execution_payload_is_a_known_refusal() -> None:
 
     with pytest.raises(Aborted):
         rpc._call(
-            pb.Claim(wire_minor=56),
+            pb.Claim(wire_minor=WIRE_MINOR),
             SimpleNamespace(abort=abort),
             lambda: canonical.parse_canonical(b'{ "value": 7 }'),
         )
@@ -44,5 +45,5 @@ def test_noncanonical_execution_payload_is_a_known_refusal() -> None:
         raise RuntimeError("private error contents")
 
     with pytest.raises(Aborted):
-        rpc._call(pb.Claim(wire_minor=56), SimpleNamespace(abort=abort), unexpected)
+        rpc._call(pb.Claim(wire_minor=WIRE_MINOR), SimpleNamespace(abort=abort), unexpected)
     assert observed[1] == (grpc.StatusCode.UNAVAILABLE, "machine execution operation failed")

@@ -1,5 +1,13 @@
 # cozy-runtime (v2)
 
+Machine execution requires worker wire 59. Before first submission, the authenticated
+RecordOwner reads `GetMachineExecutionWorkspace` and durably pins its workspace ID
+with the exact request. `expected_execution_workspace_id` is required on every submit
+and replay. Runtime compares it inside the existing journal acceptance transaction;
+the returned receipt carries that same transaction's identity. A replacement journal
+refuses as `execution_workspace_changed` even when worker/boot identity is unchanged.
+Clients must retain unresolved work rather than replace the pinned ID and resubmit.
+
 The worker runtime: author surface (`cozy_runtime.author`), worker, disposable device
 executor, and the single-package CLI. Design authority: [tracker-v2](https://github.com/cozy-creator/tracker-v2)
 `cozy-runtime.md` + `cozy-runtime-cli.md`; issues in `tracker/cozy-runtime/`.

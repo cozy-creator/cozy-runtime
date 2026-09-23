@@ -632,6 +632,9 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 prepared_state=state,
                 payload_canonical_bytes=canonical_json.encode({}),
                 max_attempts=2 if case == "loss" else 1,
+                expected_execution_workspace_id=client.GetMachineExecutionWorkspace(
+                    pb.MachineExecutionWorkspaceQuery(claim=claim)
+                ).execution_workspace_id,
             )
             if case == "internal_root":
                 with pytest.raises(grpc.RpcError, match="internal_callable") as refused:
@@ -893,7 +896,13 @@ def test_managed_depth_counts_the_prospective_child(tmp_path: Path) -> None:
     selected = "root"
     parents = []
     for _ in range(32):
-        executions.submit("owner", selected, b"c" * 32, offer(selected))
+        executions.submit(
+            "owner",
+            selected,
+            b"c" * 32,
+            offer(selected),
+            expected_execution_workspace_id=executions.workspace_id,
+        )
         parent = running(executions, selected)
         parents.append(selected)
         selected = calls.accept("owner", request(parent)).child_request
@@ -927,9 +936,17 @@ def test_canceling_root_also_abandons_failed_descendants(tmp_path: Path) -> None
 
     workspace = Workspace(tmp_path / "store")
     executions, calls = Executions(workspace), Calls(workspace)
-    executions.submit("owner", "root", b"c" * 32, offer())
+    executions.submit(
+        "owner", "root", b"c" * 32, offer(), expected_execution_workspace_id=executions.workspace_id
+    )
     call = calls.accept("owner", request(running(executions, "root")))
-    executions.submit("owner", "child", b"c" * 32, offer(call.child_request))
+    executions.submit(
+        "owner",
+        "child",
+        b"c" * 32,
+        offer(call.child_request),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     complete(executions, call.child_request, status=pb.OUTCOME_STATUS_FAILED)
     complete(executions, "root", status=pb.OUTCOME_STATUS_FAILED)
     executions.control("owner", "root", "cancel-root", 1, "cancel")

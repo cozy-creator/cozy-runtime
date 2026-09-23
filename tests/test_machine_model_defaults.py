@@ -199,7 +199,13 @@ def test_serving_default_uses_real_catalog_input_pin_without_derived_provenance(
             for entry in entries.values():
                 machine_checkpoint_inputs.retain(workspace, "owner", offer, entry)
             executions = Executions(workspace)
-            executions.submit("owner", "serving-input", b"x" * 32, offer)
+            executions.submit(
+                "owner",
+                "serving-input",
+                b"x" * 32,
+                offer,
+                expected_execution_workspace_id=executions.workspace_id,
+            )
     with workspace.locked() as db:
         pin = db.execute(
             "SELECT * FROM execution_checkpoint_inputs WHERE recipient='serving-child'"
@@ -259,7 +265,12 @@ def test_registered_serving_binding_skips_read_lease_but_rechecks_native_source(
         }
     ]
     worker.executions.submit(
-        "owner", "parent", b"c" * 32, offer(), capture_document=canonical_json.encode(capture)
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer(),
+        capture_document=canonical_json.encode(capture),
+        expected_execution_workspace_id=worker.executions.workspace_id,
     )
     document = {
         "development": {"local_revision_digest": REVISION},

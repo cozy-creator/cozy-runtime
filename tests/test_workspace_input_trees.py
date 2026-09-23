@@ -268,7 +268,13 @@ def test_root_acceptance_and_intake_abort_have_one_durable_order(
         ),
     )
     if accept_first:
-        receipt = executions.submit("owner", "submission", b"c" * 32, submitted)
+        receipt = executions.submit(
+            "owner",
+            "submission",
+            b"c" * 32,
+            submitted,
+            expected_execution_workspace_id=executions.workspace_id,
+        )
     receive(
         workspace,
         "owner",
@@ -277,7 +283,16 @@ def test_root_acceptance_and_intake_abort_have_one_durable_order(
     )
     tensorfs.gc(str(tmp_path))
     if accept_first:
-        assert executions.submit("owner", "submission", b"c" * 32, submitted) == receipt
+        assert (
+            executions.submit(
+                "owner",
+                "submission",
+                b"c" * 32,
+                submitted,
+                expected_execution_workspace_id=executions.workspace_id,
+            )
+            == receipt
+        )
         read(workspace, own, data)
         dispatch = executions.offer("owner", header.request_id)
         machine_byte_inputs.bind_root_grant("owner", dispatch)
@@ -285,7 +300,13 @@ def test_root_acceptance_and_intake_abort_have_one_durable_order(
         assert submitted.grant.inputs[0].native_tree.retention_id == imported.retention_id
     else:
         with pytest.raises(WorkspaceRefusal, match="aborted"):
-            executions.submit("owner", "submission", b"c" * 32, submitted)
+            executions.submit(
+                "owner",
+                "submission",
+                b"c" * 32,
+                submitted,
+                expected_execution_workspace_id=executions.workspace_id,
+            )
         with workspace.locked() as db:
             held = db.execute("SELECT state FROM holds WHERE id=?", (own.retention_id,)).fetchone()
             assert held["state"] == "released"

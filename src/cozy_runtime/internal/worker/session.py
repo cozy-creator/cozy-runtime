@@ -2138,6 +2138,7 @@ class Worker:
         capture_digest: bytes,
         offer: pb.AttemptOffer,
         *,
+        expected_execution_workspace_id: str,
         max_attempts: int = 1,
         retry_delay_ms: int = 0,
         capture_document: bytes = b"",
@@ -2150,6 +2151,7 @@ class Worker:
             if self.stop.is_set():
                 raise WorkspaceRefusal("worker is stopping; root admission is closed")
             executions, owner = self._execution_service(claim)
+            executions.require_workspace(expected_execution_workspace_id)
             if publication_authorization_id and self.options.publication_authority is None:
                 raise WorkspaceRefusal("worker has no independent publication authority configured")
             result_schema, memoize = b"", False
@@ -2198,6 +2200,7 @@ class Worker:
                     submission_id,
                     capture_digest,
                     offer,
+                    expected_execution_workspace_id=expected_execution_workspace_id,
                     result_schema=result_schema,
                     worker_boot=self.fence.worker_boot_id,
                     memoize=memoize,

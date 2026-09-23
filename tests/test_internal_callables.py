@@ -98,7 +98,13 @@ def test_child_authority_survives_reopen_but_cannot_be_reused_by_roots_or_other_
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
     parent = offer("parent")
-    executions.submit("owner", "parent", b"c" * 32, parent)
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        parent,
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     calls = Calls(workspace)
     call = calls.accept("owner", request(running(executions)))
     revision = "sha256:" + "11" * 32
@@ -108,7 +114,13 @@ def test_child_authority_survives_reopen_but_cannot_be_reused_by_roots_or_other_
         canonical_json.encode({"revision": revision, "entrypoint": "segment"}),
     )
     child = offer(call.child_request)
-    executions.submit("owner", call.child_request, b"c" * 32, child)
+    executions.submit(
+        "owner",
+        call.child_request,
+        b"c" * 32,
+        child,
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     reopened = Workspace(tmp_path / "store")
     require_child(reopened, "owner", child, revision, "segment", machine_owned=True)
     for selected, owner, requested_revision, name, machine_owned in (
@@ -137,7 +149,13 @@ def test_child_authority_survives_reopen_but_cannot_be_reused_by_roots_or_other_
         canonical_json.encode({"revision": foreign_revision, "entrypoint": "segment"}),
     )
     foreign_child = offer(foreign_call.child_request)
-    executions.submit("owner", foreign_call.child_request, b"c" * 32, foreign_child)
+    executions.submit(
+        "owner",
+        foreign_call.child_request,
+        b"c" * 32,
+        foreign_child,
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     with pytest.raises(WorkspaceRefusal, match="internal_callable"):
         require_child(
             reopened,

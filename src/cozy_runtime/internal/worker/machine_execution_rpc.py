@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import dataclasses
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -16,8 +15,15 @@ from cozy_runtime.internal.package_environment import EnvironmentRefusal
 from cozy_runtime.internal.worker import machine_capture
 from cozy_runtime.internal.worker.plan import PlanRefusal
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
-from cozy_runtime.internal.worker.workspace_executions import StaleExecutionGeneration
-from cozy_runtime.protocol import MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR, documents
+from cozy_runtime.internal.worker.workspace_executions import (
+    ExecutionWorkspaceRefusal,
+    StaleExecutionGeneration,
+)
+from cozy_runtime.protocol import (
+    MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR,
+    WORKSPACE_FENCED_EXECUTION_WIRE_MINOR,
+    documents,
+)
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
@@ -30,12 +36,15 @@ class MachineExecutionRPC:
 
     def _call(self, claim: pb.Claim, context: Any, operation: Callable[[], Any]) -> Any:
         try:
-            if claim.wire_minor < 51:
-                raise WorkspaceRefusal("machine execution requires wire51")
+            if claim.wire_minor < WORKSPACE_FENCED_EXECUTION_WIRE_MINOR:
+                raise WorkspaceRefusal("workspace-fenced machine execution requires wire59")
             if self.worker.executions is None:
                 raise WorkspaceRefusal("machine execution workspace is unavailable")
             self.worker.authorize_workspace(claim)
             return operation()
+        except ExecutionWorkspaceRefusal as exc:
+            context.set_trailing_metadata((("cozy-error-code", exc.code),))
+            return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
         except StaleExecutionGeneration as exc:
             context.set_trailing_metadata((("cozy-error-code", exc.code),))
             return context.abort(grpc.StatusCode.ABORTED, str(exc))
@@ -60,8 +69,22 @@ class MachineExecutionRPC:
 
     def _query(self, query: pb.MachineExecutionQuery) -> None:
         executions = self.worker.executions
-        if executions is None or query.expected_execution_workspace_id != executions.workspace_id:
-            raise WorkspaceRefusal("execution workspace was replaced or does not match the receipt")
+        if executions is None:
+            raise WorkspaceRefusal("machine execution workspace is unavailable")
+        executions.require_workspace(query.expected_execution_workspace_id)
+
+    def GetMachineExecutionWorkspace(
+        self, request: pb.MachineExecutionWorkspaceQuery, context: Any
+    ) -> Any:
+        def get() -> pb.MachineExecutionWorkspace:
+            assert self.worker.executions is not None
+            return pb.MachineExecutionWorkspace(
+                worker_id=self.worker.options.worker_id,
+                worker_boot_id=self.worker.fence.worker_boot_id,
+                execution_workspace_id=self.worker.executions.workspace_id,
+            )
+
+        return self._call(request.claim, context, get)
 
     def _state(self, state: Any) -> pb.MachineExecutionState:
         assert self.worker.executions is not None
@@ -74,6 +97,8 @@ class MachineExecutionRPC:
 
     def SubmitMachineExecution(self, request: pb.MachineExecutionSubmit, context: Any) -> Any:
         def submit() -> pb.MachineExecutionReceipt:
+            assert self.worker.executions is not None
+            self.worker.executions.require_workspace(request.expected_execution_workspace_id)
             if (
                 request.publication_authorization_id
                 and request.claim.wire_minor < MACHINE_PUBLICATION_AUTHORITY_WIRE_MINOR
@@ -109,6 +134,7 @@ class MachineExecutionRPC:
                     request.submission_id,
                     request.capture_digest,
                     offered,
+                    expected_execution_workspace_id=request.expected_execution_workspace_id,
                     max_attempts=request.max_attempts or 1,
                     retry_delay_ms=request.retry_delay_ms,
                     capture_document=request.capture_canonical_bytes,
@@ -122,6 +148,7 @@ class MachineExecutionRPC:
                     request.submission_id,
                     request.capture_digest,
                     offered,
+                    expected_execution_workspace_id=request.expected_execution_workspace_id,
                     max_attempts=request.max_attempts or 1,
                     retry_delay_ms=request.retry_delay_ms,
                     capture_document=request.capture_canonical_bytes,
@@ -130,25 +157,30 @@ class MachineExecutionRPC:
                     arguments=value,
                 )
             assert self.worker.executions is not None
-            return pb.MachineExecutionReceipt(
-                **dataclasses.asdict(receipt),
-                execution_workspace_id=self.worker.executions.workspace_id,
-            )
+            return pb.MachineExecutionReceipt(**dataclasses.asdict(receipt))
 
         def checked_submit() -> pb.MachineExecutionReceipt:
             try:
                 return submit()
+            except ExecutionWorkspaceRefusal:
+                raise
             except Exception:
                 # A lost reply after commit stays ambiguous. Only an actual
                 # journal read proving absence permits the client to stop replay.
-                with contextlib.suppress(Exception):
+                try:
                     executions = self.worker.executions
-                    if executions is not None and not executions.owns(
-                        request.claim.record_owner_id, request.offer.request_id
+                    if executions is not None and executions.submission_absent(
+                        request.claim.record_owner_id,
+                        request.offer.request_id,
+                        request.expected_execution_workspace_id,
                     ):
                         context.set_trailing_metadata(
                             (("cozy-error-code", "execution_submission_refused"),)
                         )
+                except ExecutionWorkspaceRefusal:
+                    raise
+                except Exception:
+                    pass  # Failed readback is ambiguous, never definitive nonacceptance.
                 raise
 
         return self._call(request.claim, context, checked_submit)

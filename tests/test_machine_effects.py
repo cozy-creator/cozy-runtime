@@ -19,7 +19,13 @@ from test_machine_execution import offer
 def test_ungranted_effect_is_durably_refused_without_external_send(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
-    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     calls = Calls(workspace)
     calls.accept("owner", request(running(executions), module=effect_interfaces.MODULE))
     effects = Effects(workspace, executions, None)
@@ -41,7 +47,13 @@ def test_ungranted_effect_is_durably_refused_without_external_send(tmp_path: Pat
 def test_failed_effect_remains_reconcilable_after_parent_stops(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "store")
     executions = Executions(workspace)
-    executions.submit("owner", "parent", b"c" * 32, offer("parent"))
+    executions.submit(
+        "owner",
+        "parent",
+        b"c" * 32,
+        offer("parent"),
+        expected_execution_workspace_id=executions.workspace_id,
+    )
     calls = Calls(workspace)
     call = calls.accept("owner", request(running(executions), module=effect_interfaces.MODULE))
     calls.before_write("owner", call)
@@ -68,6 +80,7 @@ def test_invalid_worker_authority_is_visible_and_background_threads_are_pollers(
         b"c" * 32,
         offer("parent"),
         publication_authorization_id="019aaaab-0000-7000-8000-000000000003",
+        expected_execution_workspace_id=executions.workspace_id,
     )
     call = request(running(executions), module=effect_interfaces.MODULE)
     call.interface_digest = documents.raw(effect_interfaces.DIGEST)
