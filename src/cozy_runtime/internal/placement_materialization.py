@@ -139,8 +139,6 @@ def package_environment_input(
     project = _wheel(project_wheel, "project", import_roots=True, nested_ref=True)
     if project.distribution != package_name.split("/", 1)[1] or project.version != release:
         raise LaunchRefusal("project_wheel_mismatch", "project wheel differs from package release")
-    if project.tags != ("py3-none-any",) or not project.filename.endswith("-py3-none-any.whl"):
-        raise LaunchRefusal("project_wheel_not_pure", "project wheel must be exactly py3-none-any")
     wheels = [project]
     custom_wheels = _wheels(
         environment.get("local_wheels", []), "environment", import_roots=True, nested_ref=True

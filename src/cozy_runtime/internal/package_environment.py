@@ -31,7 +31,7 @@ from urllib.parse import unquote, urlsplit
 
 from packaging.markers import default_environment
 from packaging.requirements import InvalidRequirement, Requirement
-from packaging.tags import Tag, parse_tag
+from packaging.tags import Tag, compatible_tags, cpython_tags, parse_tag
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
@@ -59,36 +59,6 @@ _IMPORT_ROOT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _WHEEL_TAG = re.compile(r"^[a-z0-9][a-z0-9._]*-[a-z0-9][a-z0-9._]*-[a-z0-9][a-z0-9._]*$")
 _SAFE_MEMBER = re.compile(r"^[^/][^\x00]*$")
 _NATIVE_SUFFIXES = frozenset({".dll", ".dylib", ".pyd", ".so"})
-_BUILD_SOURCE_SUFFIXES = frozenset(
-    {
-        ".a",
-        ".asm",
-        ".c",
-        ".cc",
-        ".cpp",
-        ".cu",
-        ".cuh",
-        ".cxx",
-        ".h",
-        ".hip",
-        ".hpp",
-        ".o",
-        ".obj",
-        ".rs",
-    }
-)
-_BUILD_INPUT_NAMES = frozenset(
-    {
-        "build.ninja",
-        "cargo.toml",
-        "cmakelists.txt",
-        "makefile",
-        "meson.build",
-        "pyproject.toml",
-        "setup.cfg",
-        "setup.py",
-    }
-)
 
 
 class EnvironmentRefusal(Exception):
@@ -1117,6 +1087,7 @@ def fetch_locked_wheels(
             raise EnvironmentRefusal(
                 "package_environment_wheel_invalid", "wheel differs from exact lock"
             )
+        _require_compatible_tags(item.wheel, observed)
         inspected.append(item)
     return inspected
 
@@ -1560,11 +1531,6 @@ def _verify_inventory(
             or wheel.owner not in {"project", "custom"}
         ):
             raise EnvironmentRefusal("package_environment_wheel_invalid", wheel.filename)
-        if wheel.owner == "project" and wheel.tags != ("py3-none-any",):
-            raise EnvironmentRefusal(
-                "package_environment_project_wheel_not_pure",
-                f"{wheel.filename} tags={','.join(wheel.tags)}; project must be py3-none-any",
-            )
         if wheel.import_roots != tuple(sorted(set(wheel.import_roots))) or not all(
             valid_import_root(root) for root in wheel.import_roots
         ):
@@ -1772,28 +1738,12 @@ def _inspect(
                     raise EnvironmentRefusal(
                         "package_environment_wheel_install_scheme_forbidden", name
                     )
-                basename = posix.name.lower()
                 suffix = posix.suffix.lower()
-                project_metadata = (
-                    wheel.owner == "project"
-                    and len(posix.parts) == 1
-                    and basename in {"pyproject.toml", "uv.lock"}
-                )
-                # Prebuilt dependency wheels may ship inert source/header resources
-                # (grpcio, SciPy, NumPy). Installation never runs a build. Authored
-                # project wheels still cannot carry native code or build inputs.
-                if (
-                    wheel.owner == "project"
-                    and (basename in _BUILD_INPUT_NAMES or suffix in _BUILD_SOURCE_SUFFIXES)
-                    and not project_metadata
-                ):
-                    raise EnvironmentRefusal(
-                        "package_environment_native_build_input_forbidden", name
-                    )
-                magic = archive.open(member).read(4)
+                # Prebuilt wheels may carry inert source/header resources. Every
+                # installation uses --no-build; these files never trigger a build.
+                with archive.open(member) as body:
+                    magic = body.read(4)
                 native = suffix in _NATIVE_SUFFIXES or magic == b"\x7fELF"
-                if wheel.owner == "project" and native:
-                    raise EnvironmentRefusal("package_environment_project_wheel_native", name)
                 if native:
                     native_path = installed if installed is not None else prefix_resource
                     assert native_path is not None
@@ -1831,16 +1781,16 @@ def _inspect(
                     "package_environment_wheel_metadata_mismatch", wheel.filename
                 )
             root_is_pure = parsed_wheel.get("Root-Is-Purelib", "").strip().lower()
-            if wheel.owner == "project" and root_is_pure != "true":
+            if root_is_pure not in {"true", "false"}:
                 raise EnvironmentRefusal(
-                    "package_environment_project_wheel_not_pure", "Root-Is-Purelib is not true"
+                    "package_environment_wheel_metadata_mismatch", "invalid Root-Is-Purelib"
                 )
             # FFI libraries can be ABI-neutral and installed into purelib (NVIDIA's
             # wheels use both). Native bytes still require a concrete target platform.
             if native_members and any(tag.platform == "any" for tag in declared_tags):
                 raise EnvironmentRefusal(
                     "package_environment_native_wheel_tag_not_concrete",
-                    f"{wheel.filename}: native custom wheels require concrete platform tags",
+                    f"{wheel.filename}: native wheels require concrete platform tags",
                 )
             record_name = dist_infos[0].removesuffix("METADATA") + "RECORD"
             if record_name not in names:
@@ -1989,7 +1939,7 @@ def _target_platforms(base: base_observation.Observation) -> frozenset[str]:
             "package_environment_base_invalid", f"Linux/x86 base has unsupported libc {libc!r}"
         )
     minor = int(match.group(2))
-    platforms = {"any", "linux_x86_64"}
+    platforms = {"linux_x86_64"}
     platforms.update(f"manylinux_2_{floor}_x86_64" for floor in range(5, minor + 1))
     if minor >= 17:
         platforms.add("manylinux2014_x86_64")
@@ -2003,15 +1953,9 @@ def _target_platforms(base: base_observation.Observation) -> frozenset[str]:
 def _compatible_tags(base: base_observation.Observation) -> frozenset[Tag]:
     major, minor = _target_python(base)
     interpreter = f"cp{major}{minor}"
-    platforms = _target_platforms(base)
-    tags: set[Tag] = set()
-    for platform in platforms:
-        tags.add(Tag(interpreter, interpreter, platform))
-        tags.add(Tag(interpreter, "none", platform))
-        for stable_minor in range(2, minor + 1):
-            tags.add(Tag(f"cp{major}{stable_minor}", "abi3", platform))
-        tags.add(Tag(f"py{major}{minor}", "none", platform))
-        tags.add(Tag(f"py{major}", "none", platform))
+    platforms = sorted(_target_platforms(base))
+    tags = set(cpython_tags((major, minor), abis=[interpreter], platforms=platforms))
+    tags.update(compatible_tags((major, minor), interpreter=interpreter, platforms=platforms))
     return frozenset(tags)
 
 
