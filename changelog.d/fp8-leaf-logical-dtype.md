@@ -1,0 +1,1 @@
+Preserve the logical compute dtype of native encoded linear adapters during framework dtype introspection. Diffusers H3 previously mistook FP8 storage for an activation dtype and refused warmup before inference. The adapter retains encoded payload/scales unchanged and exposes its existing output dtype through a nonpersistent zero-byte buffer.

@@ -85,6 +85,7 @@ jobs:
           tests/test_job_source_derivation.py tests/test_construction_dtype.py
           tests/test_h3_conditioner_lifecycle.py tests/test_gpu_job_device.py
           tests/test_prepare_diagnostics.py
+          tests/test_encoded_leaf_dtype.py
           tests/test_h3_sol_prefix.py tests/test_h3_sol_turbo.py
           tests/test_end_to_end.py::test_real_modeled_package_prepare_can_be_acquired_before_model_selection -q -rs
       - name: Cross the real pod executor UID boundary during warmup
