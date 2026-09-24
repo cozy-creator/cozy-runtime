@@ -445,22 +445,18 @@ Each package environment contains exactly one project wheel and at most 128 depe
 129 total package-owned wheels, counting the project; 129 custom rows plus the project refuses
 before any grant or ZIP is opened.
 
-The project wheel is exactly `py3-none-any`: Runtime checks its Tensorhub fact, filename tags,
-`WHEEL` tags, `Root-Is-Purelib`, members, and native magic. A project `.so` or a platform-specific
-project tag refuses. Every dependency wheel remains a separate exact prebuilt subject selected from
-the publisher's lock. Runtime accepts no build request and rejects C/C++/CUDA/Rust sources, build manifests,
-headers/objects/static archives, and wheel install schemes that would inject scripts or data. It
-never invokes pip, a resolver, PEP 517, or a compiler.
+Releases may offer multiple project wheels; each environment installs one selected variant.
+Project and dependency wheels can contain precompiled native code. Runtime checks filename and
+`WHEEL` tags against the selected interpreter and host's actual Linux x86-64/glibc compatibility,
+including CPython-specific and stable `abi3` tags. An incompatible interpreter or platform refuses;
+native bytes labeled with an `any` platform also refuse. `Root-Is-Purelib` determines the normal
+wheel install location and does not assert that every member is Python source.
 
-The ordinary package lane admits only pure dependency wheels. A dependency wheel containing ELF,
-`.so`, `.pyd`, or another native member refuses as
-`package_environment_custom_wheel_native_unsupported` before
-installation. Shared native libraries belong in the base worker image. A package-specific native
-wheel lane remains absent until a real package requires it and can justify actual loader, SM/PTX,
-operator, and isolation checks. `internal/native_wheel.py` and its
-`cozy-native-wheel-proof REQUEST.json EVIDENCE.json` door are that lane's inspection and
-host-qualification half, built and DORMANT: nothing calls them until the lane opens, and they
-are not publication authority.
+The same local and remote package installer retains bounded archive expansion, safe paths, exact
+name/version/tag identity, import ownership, and per-member `RECORD` SHA-256 validation. Inert
+source files and headers may accompany prebuilt wheels; installation always passes `--no-build`
+and never invokes a compiler or PEP 517 backend. The remote supervisor still owns downloads and
+storage admission, and receives one exact selected URL/hash for each distribution.
 
 PyTorch, Triton, and the CUDA driver continue to own JIT cache keys and byte validation, but those
 keys are never treated as a same-UID security boundary. Runtime scopes cache reuse by unpredictable

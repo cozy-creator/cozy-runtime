@@ -304,12 +304,14 @@ def test_prebuilt_dependency_source_resources_are_installed_without_building(
 @pytest.mark.parametrize(
     "member", ["kernel.c", "include.h", "nested/setup.py", "nested/pyproject.toml"]
 )
-def test_project_native_build_resources_still_refuse(tmp_path: Path, member: str) -> None:
+def test_project_build_resources_remain_inert(tmp_path: Path, member: str) -> None:
     base = environment.observe_base(Path(sys.executable))
-    project = _wheel(tmp_path, "unsafe_project", (), b"VALUE=1\n", resources={member: b"data\n"})
-    with pytest.raises(environment.EnvironmentRefusal) as caught:
-        environment.measure_wheel(project, "project", base)
-    assert caught.value.code == "package_environment_native_build_input_forbidden"
+    content = b"raise RuntimeError('build must never run')\n"
+    project = _wheel(tmp_path, "inert_project", (), b"VALUE=1\n", resources={member: content})
+    installed = environment.materialize(
+        _material(project, (), base), tmp_path / "installed", base=base, exact_dependencies=True
+    )
+    assert (installed.site_packages / member).read_bytes() == content
 
 
 @pytest.mark.parametrize(
