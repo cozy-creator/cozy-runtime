@@ -45,7 +45,6 @@ try:
         _apply_rotary_emb,
     )
     from triton.compiler import compiler
-    from triton.runtime.cache import get_cache_manager
 except ImportError as _absent:
     CARD_ABSENT = f"torch, triton and diffusers must be importable: {_absent}"
 else:
@@ -324,8 +323,7 @@ def test_loader_never_compiles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     fusion.warm(
         device, hidden=HIDDEN, ffn=FFN, heads=HEADS, head_dim=HEAD_DIM, rotary=ROTARY, fp8=True
     )
-    manifest = json.loads((fusion.KERNELS_DIR / fusion.MANIFEST).read_text())
-    utils = Path(get_cache_manager(manifest["utils"]).cache_dir).name
+    utils = fusion.utils_cache_dir().name
     entries = sorted(path.name for path in tmp_path.iterdir())
     assert entries == [utils], "only Triton's launcher module was placed; no kernel compiled"
 
