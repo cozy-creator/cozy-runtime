@@ -3223,5 +3223,5 @@ class AttemptEngine:
 
     def in_flight(self) -> int:
         """How many attempts this worker holds — `active()`'s set, counted without building
-        its rows. It is what the pod supervisor's release decision reads, every tick."""
+        its rows. This includes unacknowledged outcomes; it is not an idle signal."""
         return sum(1 for a in self.history.values() if a.state in self.HELD)

@@ -438,6 +438,21 @@ class Executions:
                 ).fetchone()[0]
             )
 
+    def work_in_progress(self) -> bool:
+        """Started work, including parents awaiting children or cooperative stop.
+
+        Queued requests and delayed retries do not keep an otherwise idle rental
+        alive. Model preparation and admitted attempts are observed separately.
+        """
+        with self.workspace.locked(allow_frozen=True) as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM executions "
+                    "WHERE state IN ('running','pausing','canceling') LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+
     def preparation(self, owner: str, request: str) -> dict[str, Any]:
         with self.workspace.locked() as db:
             raw = self._row(db, owner, request)["preparation"]
