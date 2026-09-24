@@ -140,15 +140,9 @@ def test_a_group_pin_refuses_typed_then_fuses() -> None:
     # 1. envelope and occupancy
     assert refused((0, 3)).code == "device_pin_infeasible"
     occupied = refused((0, 1))
-    assert occupied.code == "device_pin_infeasible" and "holds for ['t']" in occupied.detail
+    assert occupied.code == "device_pin_infeasible" and "{'lane-1': ['t']}" in occupied.detail
     assert refused((1, 0)).code == "device_pin_infeasible"  # sorted unique only
-    # 2. the declared degree: the worker never chooses one the author did not declare
-    undeclared = refused((0, 2), degrees=())
-    assert undeclared.code == "device_group_unsupported"
-    assert "declares no sequence-parallel degree" in undeclared.detail
-    wrong = refused((0, 2), degrees=(4,))
-    assert wrong.code == "device_group_unsupported" and "[4]" in wrong.detail
-    # 3. readable capacity: every rank must receive a measured prepare ceiling
+    # 2. readable capacity: every rank must receive a measured prepare ceiling
     unreadable = refused((0, 2))
     assert unreadable.code == "device_group_infeasible"
     assert "ordinal 2 ('2') free bytes unreadable" in unreadable.detail
@@ -178,6 +172,61 @@ def test_a_group_pin_refuses_typed_then_fuses() -> None:
     lanes_.release("g")
     assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0", "lane-1", "lane-2"]
     assert lanes_.revision == 2
+
+
+def _pin(
+    envelope: str, pin: tuple[int, ...] | None, degrees: tuple[int, ...]
+) -> tuple[lanes.LaneSet, lanes.DeviceLane]:
+    lanes_ = lanes.LaneSet.from_envelope(envelope, worker_pid=os.getpid())
+    measured = {
+        ordinal: accel.DeviceMemory("measured", 6 * GiB, 8 * GiB)
+        for ordinal in range(len(lanes_.entries))
+    }
+    lane = lanes_.assign(
+        "p", model_bearing=True, declared_bytes=GiB, measured=measured, pin=pin, degrees=degrees
+    )
+    return lanes_, lane
+
+
+def test_a_pin_wider_than_every_declared_degree_runs_at_the_largest_that_fits() -> None:
+    """Owner ruling: any GPU count may be rented. A K-device pin runs at the largest
+    declared degree <= K; the devices it leaves out stay free device lanes, and a note says
+    so. Only a pin that matches a declared degree is noteless."""
+    lanes_, lane = _pin("0,1,2", (0, 1, 2), (2, 4))
+    assert lane.ordinals == (0, 1) and lane.placements == {"p"}
+    assert [other.lane_id for other in lanes_.lanes] == ["lane-0+1", "lane-2"]
+    assert not lanes_.lanes[1].placements
+    note = lanes_.notes["p"]
+    assert "degree 2 on GPUs [0, 1] of pin [0, 1, 2]" in note and "[2, 4]" in note
+    assert "1 GPU(s) unused" in note
+    other = lanes_.assign(
+        "q",
+        model_bearing=True,
+        declared_bytes=GiB,
+        measured={2: accel.DeviceMemory("measured", 6 * GiB, 8 * GiB)},
+        pin=(2,),
+    )
+    assert other.lane_id == "lane-2", "the left-out device serves another placement"
+    lanes_.release("p")
+    assert "p" not in lanes_.notes
+    assert [lane.lane_id for lane in lanes_.lanes] == ["lane-0", "lane-1", "lane-2"]
+
+    lanes_, lane = _pin("0,1,2", (0, 1, 2), ())
+    assert lane.ordinals == (0,) and not lane.group
+    assert "degree 1 on GPUs [0]" in lanes_.notes["p"] and "declares none" in lanes_.notes["p"]
+    assert all(not other.group for other in lanes_.lanes) and lanes_.revision == 0
+
+    lanes_, lane = _pin("0,1,2,3", (0, 1, 2, 3), (2,))
+    assert lane.ordinals == (0, 1)
+    assert [other.lane_id for other in lanes_.lanes] == ["lane-0+1", "lane-2", "lane-3"]
+    assert "2 GPU(s) unused" in lanes_.notes["p"]
+
+    lanes_, lane = _pin("0,1", (0, 1), (2,))
+    assert lane.ordinals == (0, 1) and lanes_.notes == {}
+
+    # an unpinned placement on an EMPTY wide envelope is placed as pinned to all of it
+    lanes_, lane = _pin("0,1,2", None, (2, 4))
+    assert lane.ordinals == (0, 1) and "of pin [0, 1, 2]" in lanes_.notes["p"]
 
 
 def test_per_device_rows_and_the_min_ceiling() -> None:

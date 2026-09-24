@@ -80,22 +80,23 @@ def device_pins(
     """Place managed model calls within this machine's already authorized envelope.
 
     External owners still supply their own pins. The local owner chooses a declared
-    degree; existing lane assignment validates capacity, topology and occupancy.
+    degree; when none fits it pins the whole envelope and lane assignment degrades it,
+    with a note. Lane assignment validates capacity, topology and occupancy.
     """
     if not models or not lanes.wide:
         return []
     degrees = set.intersection(
         *(set(model.get("sequence_parallel", {}).get("degrees", [1])) for model in models)
     )
+    supported = [degree for degree in degrees if 0 < degree <= len(lanes.entries)]
     current = lanes.lane_of(placement_id)
-    if current is not None:
+    if not supported:
+        ordinals = tuple(range(len(lanes.entries)))
+    elif current is not None:
         ordinals = current.ordinals
         if len(ordinals) not in degrees:
             raise WorkspaceRefusal("retained serving lane has an unsupported device degree")
     else:
-        supported = [degree for degree in degrees if 0 < degree <= len(lanes.entries)]
-        if not supported:
-            raise WorkspaceRefusal("no declared model device degree fits the machine envelope")
         ordinals = tuple(range(max(supported)))
     return [pb.PlacementDevicePin(placement_id=placement_id, device_ordinals=ordinals)]
 

@@ -263,8 +263,8 @@ def sequence_parallel(*, degrees: Sequence[int]) -> Callable[[type[ModelT]], typ
     The author's statement, and only the author can make it: at each degree K the class's
     attention heads divide by K, its quantization is shard-invariant (rowwise activation
     scales), and the whole pipeline is built identically on every rank. The runtime reads
-    it into the interface slot (`sequence_parallel.degrees`); a RecordOwner pins a
-    placement to K devices only at a declared K, and the worker never chooses a degree.
+    it into the interface slot (`sequence_parallel.degrees`); a placement pinned to K
+    devices runs at the largest declared degree <= K, or on one device when none fits.
     "Qualified" is the measured half, recorded per device class like any other proof.
     """
     if not degrees:

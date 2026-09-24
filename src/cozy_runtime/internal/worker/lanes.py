@@ -29,14 +29,14 @@ immutable, nothing is copied out) and the vacated tenant re-stages on its own ne
 attempt through the ordinary demand-pull admission. No timer and no idleness clock
 decides anything here; a tenant that fits beside its neighbours is never moved.
 
-A GROUP lane is a lane whose `ordinals` has K > 1 entries (cr-068): ONE executor sealed to
-all K devices, one seat, one ledger with one `DeviceFacts` row per device. The RecordOwner
-assigns it by PINNING a placement to K ordinals; `assign` validates the pin against the
-envelope, occupancy (a group never steals a device), the package's declared degrees and
-readable device capacity, then FUSES K empty device lanes into one. The lane stays a group
-while its placement holds it and SPLITS back when the placement leaves. `revision` moves on
-every fuse and split, which is the worker's cue to bump `admission_epoch`: the seat count
-changed meaning. The worker never chooses a degree.
+A GROUP lane is a lane whose `ordinals` has d > 1 entries (cr-068): ONE executor sealed to
+all d devices, one seat, one ledger with one `DeviceFacts` row per device. The RecordOwner
+PINS a model-bearing placement to K ordinals; the worker runs it at the largest declared
+sequence-parallel degree d <= K (or on one device when none fits), FUSES d empty device
+lanes into one, leaves the other K-d as device lanes and records a note saying so. The lane
+stays a group while its placement holds it and SPLITS back when the placement leaves.
+`revision` moves on every fuse and split, which is the worker's cue to bump
+`admission_epoch`: the seat count changed meaning.
 """
 
 from __future__ import annotations
@@ -68,6 +68,11 @@ LANE_RELEASED = 1
 
 #: The lane name a job's executor is sealed under: the whole envelope, one seat.
 ENVELOPE_LANE = "envelope"
+
+
+def effective_degree(width: int, degrees: tuple[int, ...]) -> int:
+    """The largest declared degree that `width` devices can form, or 1."""
+    return max((degree for degree in degrees if 1 < degree <= width), default=1)
 
 
 class LaneRefusal(Exception):
@@ -328,6 +333,8 @@ class LaneSet:
     composition: dict[str, DeviceLane] = field(default_factory=dict)
     #: moves on every fuse and split: the seat set changed meaning (`admission_epoch`)
     revision: int = 0
+    #: placement id -> why it runs on fewer devices than it was pinned to
+    notes: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_envelope(cls, devices: str, *, worker_pid: int) -> LaneSet:
@@ -370,6 +377,7 @@ class LaneSet:
 
     def release(self, placement_id: str) -> None:
         """A placement leaves: its rows go, and a group it held alone SPLITS."""
+        self.notes.pop(placement_id, None)
         for lane in list(self.lanes):
             lane.placements.discard(placement_id)
             lane.forget(placement_id)
@@ -490,20 +498,19 @@ class LaneSet:
            the measured prepare ceiling and actual construction/residency working set
            still decide whether the model can run.
 
-        A pin of K > 1 ordinals is a GROUP (cr-068): every named lane must be empty, the
-        package must declare degree K, and every device must report readable capacity —
-        then the K lanes FUSE. Like a single-device lane, a group permits bounded
-        preparation when header weight sizes exceed VRAM: construction may discover
-        block paging, and the common plan is priced against the tightest rank.
-        Refusals move no other placement: `device_pin_infeasible` (envelope, occupancy),
-        `device_group_unsupported` (no construction declared at K), `device_group_infeasible`
-        (a device unreadable). A model-bearing placement with NO pin on a WIDE
-        envelope refuses `device_group_unsupported`: the RecordOwner chose neither a device
-        nor a degree, and the worker will not idle K-1 paid cards silently by picking one
-        (ruling 3). The alternative — assign by fit to one device lane and idle the rest —
-        is the paid-idle defect cr-066 fenced, so it is not built. A weightless placement
-        holds no device memory and goes to the device lane with the fewest placements (or
-        its pinned lane), so its attempts do not all queue behind one seat.
+        A pin of K > 1 ordinals is a GROUP pin (cr-068), placed at d = `effective_degree`:
+        d == K fuses the whole pin; 1 < d < K fuses the first d empty pinned ordinals and
+        leaves the rest as device lanes; d == 1 places by fit over the pinned device lanes.
+        Either shortfall records a note in `notes`. Every fused device must report readable
+        capacity; like a single-device lane, a group permits bounded preparation when header
+        weight sizes exceed VRAM. Refusals move no other placement: `device_pin_infeasible`
+        (envelope, occupancy), `device_group_unsupported` (a weightless group pin),
+        `device_group_infeasible` (a fused device unreadable). A model-bearing placement with
+        NO pin on a WIDE envelope is placed as if pinned to the whole envelope when every
+        device is empty, and refuses `device_group_unsupported` otherwise: the worker does
+        not choose among devices other placements hold. A weightless placement holds no
+        device memory and goes to the device lane with the fewest placements (or its
+        pinned lane), so its attempts do not all queue behind one seat.
         """
         current = self.lane_of(placement_id)
         if current is not None:
@@ -514,8 +521,17 @@ class LaneSet:
                 f"placement {placement_id!r}: a pin is >= 1 sorted unique ordinals; "
                 f"got {list(pin)}",
             )
+        if (
+            pin is None
+            and model_bearing
+            and self.wide
+            and all(not lane.group and not lane.placements for lane in self.lanes)
+        ):
+            pin = tuple(range(len(self.entries)))
         if pin is not None and len(pin) > 1:
-            return self._assign_group(placement_id, pin, model_bearing, measured, degrees)
+            return self._assign_group(
+                placement_id, pin, model_bearing, declared_bytes, measured, degrees
+            )
         if not model_bearing:
             if pin is None:
                 pool = [lane for lane in self.lanes if not lane.group] or list(self.lanes)
@@ -532,7 +548,7 @@ class LaneSet:
                     f"{len(self.entries)}-device envelope and declares "
                     + (f"degrees {list(degrees)}" if degrees else "no sequence-parallel degree")
                     + "; the RecordOwner pins a placement to its devices and this worker "
-                    "never idles a card by choosing one (ruling 3)",
+                    "does not choose among devices other placements hold",
                 )
             candidates = list(self.lanes)
         else:
@@ -612,22 +628,24 @@ class LaneSet:
         placement_id: str,
         pin: tuple[int, ...],
         model_bearing: bool,
+        declared_bytes: int,
         measured: Mapping[int, DeviceMemory],
         degrees: tuple[int, ...],
     ) -> DeviceLane:
-        """Validate topology and readable capacity before bounded group preparation.
+        """Place a K-device pin at its effective degree, noting any device it leaves out.
 
         Header weight bytes cannot describe the working set of Runtime block paging.
         Preparation assigns one measured ceiling to every rank; construction and the
         attempt planner remain responsible for the actual simultaneous working set.
         """
-        degree = len(pin)
+        width = len(pin)
         if not model_bearing:
             raise LaneRefusal(
                 "device_group_unsupported",
-                f"placement {placement_id!r} is weightless and pinned to {degree} devices; "
+                f"placement {placement_id!r} is weightless and pinned to {width} devices; "
                 "a group shards a model's attention and there is no model",
             )
+        holders: list[DeviceLane] = []
         for ordinal in pin:
             holder = self.holder_of(ordinal)
             if ordinal >= len(self.entries) or holder is None:
@@ -636,35 +654,68 @@ class LaneSet:
                     f"placement {placement_id!r} is pinned to ordinal {ordinal}, outside this "
                     f"worker's envelope of {len(self.entries)} device(s)",
                 )
-            if holder.group or holder.placements:
+            holders.append(holder)
+        degree = effective_degree(width, degrees)
+        if degree == 1:
+            candidates = [holder for holder in holders if not holder.group]
+            if not candidates:
                 raise LaneRefusal(
                     "device_pin_infeasible",
-                    f"placement {placement_id!r} is pinned to ordinal {ordinal}, which "
-                    f"{holder.lane_id} holds for {sorted(holder.placements)}; a group takes "
-                    "only empty devices and moves no other placement",
+                    f"placement {placement_id!r} is pinned to {list(pin)}, every one held by "
+                    f"a group ({sorted({holder.lane_id for holder in holders})})",
                 )
-        if degree not in degrees:
-            raise LaneRefusal(
-                "device_group_unsupported",
-                f"placement {placement_id!r} is pinned to {degree} devices and its package "
-                + (
-                    f"declares sequence-parallel degrees {list(degrees)}"
-                    if degrees
-                    else "declares no sequence-parallel degree"
-                )
-                + "; the worker never chooses a degree the author did not declare",
+            lane = self._assign_by_fit(
+                placement_id, candidates, declared_bytes, measured, pinned=True
             )
-        short: list[str] = []
-        for ordinal in pin:
-            memory = measured.get(ordinal)
-            if memory is None or memory.state != "measured":
-                short.append(f"ordinal {ordinal} ({self.entries[ordinal]!r}) free bytes unreadable")
+            self._note_degree(placement_id, pin, degrees, lane.ordinals)
+            return lane
+        empty = [
+            ordinal
+            for ordinal, holder in zip(pin, holders, strict=True)
+            if not holder.group and not holder.placements
+        ]
+        if len(empty) < degree:
+            held = {
+                holder.lane_id: sorted(holder.placements)
+                for holder in holders
+                if holder.group or holder.placements
+            }
+            raise LaneRefusal(
+                "device_pin_infeasible",
+                f"placement {placement_id!r} is pinned to {list(pin)} and runs at degree "
+                f"{degree}, but only {empty} are empty ({held} hold the rest); a group takes "
+                "only empty devices and moves no other placement",
+            )
+        taken = tuple(empty[:degree])
+        short = [
+            f"ordinal {ordinal} ({self.entries[ordinal]!r}) free bytes unreadable"
+            for ordinal in taken
+            if (memory := measured.get(ordinal)) is None or memory.state != "measured"
+        ]
         if short:
             raise LaneRefusal(
                 "device_group_infeasible",
                 f"placement {placement_id!r} cannot form a {degree}-device group: "
                 + "; ".join(short),
             )
-        fused = self.fuse(pin)
+        fused = self.fuse(taken)
         fused.placements.add(placement_id)
+        self._note_degree(placement_id, pin, degrees, taken)
         return fused
+
+    def _note_degree(
+        self,
+        placement_id: str,
+        pin: tuple[int, ...],
+        degrees: tuple[int, ...],
+        used: tuple[int, ...],
+    ) -> None:
+        left = len(pin) - len(used)
+        if not left:
+            return
+        declared = f"package declares {list(degrees)}" if degrees else "package declares none"
+        self.notes[placement_id] = (
+            f"running at sequence-parallel degree {len(used)} on GPUs {list(used)} of pin "
+            f"{list(pin)} ({declared}); {left} GPU(s) unused - rent a GPU count matching a "
+            f"declared degree for full parallelism; placement {placement_id!r}"
+        )
