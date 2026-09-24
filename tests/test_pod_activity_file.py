@@ -38,7 +38,8 @@ from cozy_runtime.internal import child_env, liveness
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker import activity
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+from cozy_runtime.internal.worker.session import HostedPlacement, Placement, Worker, WorkerOptions
+from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
 
 DRIVER = Path(podactivity_driver.__file__).resolve()
@@ -132,6 +133,7 @@ def test_the_published_document_is_the_shape_the_supervisor_parses() -> None:
     # An unclaimed worker with nothing running is a pod nobody is holding.
     assert published["owner_attached"] is False
     assert published["attempts_in_flight"] == 0
+    assert published["active_work"] is False
     assert published["sequence"] == 1
 
 
@@ -141,10 +143,132 @@ def test_each_publish_replaces_the_file_atomically_and_advances_the_tick() -> No
     with _short_tmp() as root:
         published = activity.ActivityFile(root / "activity")
         for expected in (1, 2, 3):
-            published.publish(owner_attached=False, attempts_in_flight=0, meter="0:0")
+            published.publish(
+                owner_attached=False, attempts_in_flight=0, active_work=False, meter="0:0"
+            )
             document = json.loads((root / "activity").read_bytes())
             assert document["sequence"] == expected
         assert [p.name for p in root.iterdir() if p.name.startswith(".activity")] == []
+
+
+def test_active_work_excludes_connected_owners_and_retained_outcomes() -> None:
+    from cozy_runtime.internal.worker.attempts import AttemptRecord
+
+    with _short_tmp() as root:
+        worker = Worker(
+            _config(root / "home"),
+            WorkerOptions(root=root / "worker", activity_path=root / "activity"),
+            InMemoryControlHost(),
+        )
+        worker.attached_streams.add(1)
+        attempt = AttemptRecord("request", 1, b"digest", {}, state="outcome")
+        worker.engine.history[attempt.key()] = attempt
+        try:
+            worker.publish_activity()
+            published = json.loads((root / "activity").read_bytes())
+            assert published["owner_attached"] is True
+            assert published["attempts_in_flight"] == 1
+            assert published["active_work"] is False
+            # A retained outcome differs from real input preparation and the post phase.
+            for state in ("preparing", "running", "released"):
+                attempt.state = state
+                assert activity.active_work(worker)
+            attempt.state = "outcome"
+            with worker.preparation_lock:
+                assert activity.active_work(worker)
+            assert not activity.active_work(worker)
+        finally:
+            worker.supervision.close()
+
+
+def test_model_warmup_is_active_but_a_resident_model_is_idle() -> None:
+    with _short_tmp() as root:
+        worker = Worker(
+            _config(root / "home"), WorkerOptions(root=root / "worker"), InMemoryControlHost()
+        )
+        placement = Placement(
+            placement_id="model",
+            placement_set_digest=b"",
+            package={},
+            development={},
+            environment_digest=b"",
+            package_interface=("", 0),
+            bindings_digest=b"",
+            models=(),
+            entrypoints=(),
+            environment={},
+            document={},
+            serving=pb.SERVING_STATE_ACTIVATING,
+        )
+        try:
+            worker.placement = placement
+            assert activity.active_work(worker)
+            placement.serving = pb.SERVING_STATE_DISPATCHABLE
+            assert not activity.active_work(worker)
+            worker.placement = None
+            worker.hosted["model"] = HostedPlacement(placement, worker.supervision)
+            placement.serving = pb.SERVING_STATE_ACTIVATING
+            assert activity.active_work(worker)
+            placement.serving = pb.SERVING_STATE_DISPATCHABLE
+            assert not activity.active_work(worker)
+        finally:
+            worker.supervision.close()
+
+
+def test_running_parent_is_active_but_paused_and_completed_roots_are_not() -> None:
+    from test_machine_execution import complete, offer
+
+    with _short_tmp() as root:
+        worker = Worker(
+            _config(root / "home"),
+            WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
+            InMemoryControlHost(),
+        )
+        executions = worker.executions
+        assert executions is not None
+        try:
+            selected = offer("parent")
+            executions.submit(
+                "owner",
+                "submission",
+                b"c" * 32,
+                selected,
+                expected_execution_workspace_id=executions.workspace_id,
+            )
+            assert not activity.active_work(worker)  # accepted queue has not started
+            executions.observe(
+                "owner",
+                pb.WorkerFrame(
+                    attempt_accepted=pb.AttemptAccepted(
+                        request_id="parent",
+                        attempt_ordinal=1,
+                    )
+                ),
+            )
+            # The parent has no device attempt here: waiting for children remains work.
+            assert activity.active_work(worker)
+            executions.control("owner", "parent", "pause", 1, "pause")
+            assert activity.active_work(worker)  # cooperative stopping is still work
+            executions.stop_queued("owner", "parent")
+            assert executions.status("owner", "parent").state == "paused"
+            assert executions.retention_required("owner")
+            assert not activity.active_work(worker)
+            executions.control("owner", "parent", "resume", 2, "resume")
+            executions.observe(
+                "owner",
+                pb.WorkerFrame(
+                    attempt_accepted=pb.AttemptAccepted(
+                        request_id="parent",
+                        attempt_ordinal=2,
+                    )
+                ),
+            )
+            assert activity.active_work(worker)
+            complete(executions, "parent", {"finished": True})
+            assert executions.retention_required("owner")  # uncollected output
+            assert not activity.active_work(worker)
+        finally:
+            worker.supervision.close()
 
 
 def test_an_unreadable_meter_is_absent_and_never_a_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -192,6 +316,7 @@ def test_a_real_run_publishes_an_attached_owner_and_a_moving_meter() -> None:
 
     attached = [s for s in samples if s["owner_attached"]]
     assert attached, "no sample saw the local RecordOwner attached"
+    assert any(s["active_work"] for s in attached), "execution was never reported as active"
 
     # The meter moved: work, observed, not assumed.
     meters = [s["meter"] for s in attached]

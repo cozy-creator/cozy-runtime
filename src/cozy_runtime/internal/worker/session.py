@@ -6918,6 +6918,7 @@ class Worker:
             self.activity_file.publish(
                 owner_attached=bool(self.attached_streams),
                 attempts_in_flight=self.engine.in_flight(),
+                active_work=activity.active_work(self),
                 execution_retention_required=(
                     self.executions is not None
                     and self.fence.record_owner_recorded

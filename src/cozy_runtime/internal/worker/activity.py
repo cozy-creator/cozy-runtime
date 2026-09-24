@@ -1,9 +1,8 @@
 """Runtime lifecycle facts for the fixed Host that supervises this worker.
 
-The reporter publishes observer attachment, active attempts and required execution
-retention independently. Accepted work and uncollected results remain owned when
-no client is connected; a quiet progress meter does not relinquish that retention.
-The Host still enforces its external rental allowance and shutdown authority.
+The reporter separates active work from observer attachment and result retention.
+Only work in progress protects a rental from idle release. Retained results,
+paused work and connected clients do not renew its idle deadline.
 
 The versioned file is atomically replaced in the Host's bootstrap directory. Its
 sequence identifies a fresh reporter sample. The opaque meter and timing fields
@@ -21,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime.internal import liveness, proctree
+from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from cozy_runtime.internal.worker.session import Worker
@@ -28,7 +28,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: The document's shape. The pod supervisor parses these exact keys
 #: (tensorhub `pod-supervisor/activity.go`); a change here is a change there, and the
 #: fixture in each repo is what catches a drift in one of them.
-VERSION = 1
+VERSION = 2
 
 
 class ActivityFile:
@@ -52,6 +52,7 @@ class ActivityFile:
         owner_attached: bool,
         attempts_in_flight: int,
         meter: str | None,
+        active_work: bool,
         execution_retention_required: bool = False,
     ) -> None:
         self.sequence += 1
@@ -64,6 +65,7 @@ class ActivityFile:
             "sequence": self.sequence,
             "owner_attached": owner_attached,
             "attempts_in_flight": attempts_in_flight,
+            "active_work": active_work,
             "execution_retention_required": execution_retention_required,
             "meter": meter,
             "still_factor": liveness.STILL_FACTOR,
@@ -82,6 +84,26 @@ class ActivityFile:
             with contextlib.suppress(OSError):
                 os.unlink(staged)
             raise
+
+
+def active_work(worker: Worker) -> bool:
+    """Work executing here, including detached parents waiting for their children.
+
+    Do not take the control lock: model preparation can hold it for minutes while
+    the reporter must keep telling the supervisor that preparation is active.
+    An unacknowledged outcome remains in ``in_flight`` but is not active work.
+    """
+    if worker.preparation_lock.locked():
+        return True
+    placements = [worker.placement, *(h.placement for h in tuple(worker.hosted.values()))]
+    if any(p and p.serving == pb.SERVING_STATE_ACTIVATING for p in placements):
+        return True
+    if any(
+        attempt.state in (*worker.engine.ON_DEVICE, "preparing", "released")
+        for attempt in tuple(worker.engine.history.values())
+    ):
+        return True
+    return worker.executions is not None and worker.executions.work_in_progress()
 
 
 def meter(worker: Worker) -> str | None:

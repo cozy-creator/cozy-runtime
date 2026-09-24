@@ -1,0 +1,1 @@
+Publish explicit active work separately from retained results and client attachment so the worker's fixed idle shutdown protects actual execution and model preparation without holding idle rentals indefinitely.

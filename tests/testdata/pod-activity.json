@@ -1,4 +1,5 @@
 {
+  "active_work": true,
   "attempts_in_flight": 1,
   "execution_retention_required": false,
   "meter": "5482930715:19b4dd2f0c5a7e63",
@@ -6,5 +7,5 @@
   "sequence": 137,
   "still_factor": 8.0,
   "still_floor_seconds": 240.0,
-  "version": 1
+  "version": 2
 }
