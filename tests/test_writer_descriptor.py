@@ -10,6 +10,19 @@ import pytest
 from cozy_runtime.internal.seam import Channel, SeamError
 
 
+def _descriptor_count(fd: int) -> int:
+    """Count this capability's aliases, independently of unrelated async cleanup."""
+    identity = os.fstat(fd)
+    count = 0
+    for path in Path("/proc/self/fd").iterdir():
+        try:
+            observed = path.stat()
+        except FileNotFoundError:
+            continue  # Another thread closed an unrelated descriptor.
+        count += (observed.st_dev, observed.st_ino) == (identity.st_dev, identity.st_ino)
+    return count
+
+
 def test_descriptor_handoff_preserves_control_frames_and_connected_custody() -> None:
     left, right = socket.socketpair()
     producer, owner = socket.socketpair()
@@ -35,7 +48,7 @@ def test_descriptor_count_refuses_without_leaking_received_fds(count: int) -> No
     left, right = socket.socketpair()
     producer, owner = socket.socketpair()
     with left, right, producer, owner:
-        before = len(list(Path("/proc/self/fd").iterdir()))
+        before = _descriptor_count(producer.fileno())
         rights = (
             [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [producer.fileno()] * count))]
             if count
@@ -44,27 +57,28 @@ def test_descriptor_count_refuses_without_leaking_received_fds(count: int) -> No
         left.sendmsg([b"\0"], rights)
         with pytest.raises(SeamError):
             Channel(right).recv_descriptor()
-        assert len(list(Path("/proc/self/fd").iterdir())) == before
+        assert _descriptor_count(producer.fileno()) == before
 
 
 def test_descriptor_rejects_regular_files_and_unconnected_sockets(tmp_path: Path) -> None:
     left, right = socket.socketpair()
     with left, right, (tmp_path / "private").open("wb") as source:
-        before = len(list(Path("/proc/self/fd").iterdir()))
+        before = _descriptor_count(source.fileno())
         left.sendmsg(
             [b"\0"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [source.fileno()]))]
         )
         with pytest.raises(SeamError):
             Channel(right).recv_descriptor()
-        assert len(list(Path("/proc/self/fd").iterdir())) == before
+        assert _descriptor_count(source.fileno()) == before
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unconnected:
+            before = _descriptor_count(unconnected.fileno())
             left.sendmsg(
                 [b"\0"],
                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [unconnected.fileno()]))],
             )
             with pytest.raises(SeamError):
                 Channel(right).recv_descriptor()
-        assert len(list(Path("/proc/self/fd").iterdir())) == before
+            assert _descriptor_count(unconnected.fileno()) == before
 
 
 def test_descriptor_peer_loss_is_typed() -> None:
