@@ -569,6 +569,28 @@ class ProtocolInfoRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
 
+class KeepRentalAliveRequest(_message.Message):
+    __slots__ = ("claim", "request_id")
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    claim: Claim
+    request_id: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request_id: _Optional[str] = ...) -> None: ...
+
+class KeepRentalAliveResult(_message.Message):
+    __slots__ = ("request_id", "worker_id", "worker_boot_id", "acknowledged_at_unix_ms", "idle_deadline_unix_ms")
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    ACKNOWLEDGED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    IDLE_DEADLINE_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    request_id: str
+    worker_id: str
+    worker_boot_id: str
+    acknowledged_at_unix_ms: int
+    idle_deadline_unix_ms: int
+    def __init__(self, request_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., acknowledged_at_unix_ms: _Optional[int] = ..., idle_deadline_unix_ms: _Optional[int] = ...) -> None: ...
+
 class MachineExecutionCapture(_message.Message):
     __slots__ = ("root_revision_digest", "revisions", "bindings", "published_revisions", "model_defaults")
     ROOT_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -868,18 +890,20 @@ class WorkspaceActivationCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ...) -> None: ...
 
 class ProtocolInfoResult(_message.Message):
-    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery", "supports_local_installation_reuse")
+    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery", "supports_local_installation_reuse", "supports_rental_keepalive")
     WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     MINIMUM_WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_MIXED_MODEL_INPUTS_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_MODEL_MATERIALIZATION_RECOVERY_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_LOCAL_INSTALLATION_REUSE_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_RENTAL_KEEPALIVE_FIELD_NUMBER: _ClassVar[int]
     wire_minor: int
     minimum_wire_minor: int
     supports_mixed_model_inputs: bool
     supports_model_materialization_recovery: bool
     supports_local_installation_reuse: bool
-    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ..., supports_local_installation_reuse: bool = ...) -> None: ...
+    supports_rental_keepalive: bool
+    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ..., supports_local_installation_reuse: bool = ..., supports_rental_keepalive: bool = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
     __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "supports_model_materialization_recovery", "python_requires", "python_version")

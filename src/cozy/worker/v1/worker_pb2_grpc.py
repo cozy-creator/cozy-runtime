@@ -1883,6 +1883,11 @@ class PodHostStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.KeepRentalAlive = channel.unary_unary(
+                '/cozy.worker.v1.PodHost/KeepRentalAlive',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.KeepRentalAliveRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.KeepRentalAliveResult.FromString,
+                _registered_method=True)
         self.GetMachineExecutionWorkspace = channel.unary_unary(
                 '/cozy.worker.v1.PodHost/GetMachineExecutionWorkspace',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspaceQuery.SerializeToString,
@@ -2082,6 +2087,13 @@ class PodHostServicer(object):
     Locally PodHost is not a service: the daemon calls the same host functions in-process.
     ---------------------------------------------------------------------------
     """
+
+    def KeepRentalAlive(self, request, context):
+        """Explicit owner action only. Connection traffic and status reads do not renew idle time.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def GetMachineExecutionWorkspace(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -2294,6 +2306,11 @@ class PodHostServicer(object):
 
 def add_PodHostServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'KeepRentalAlive': grpc.unary_unary_rpc_method_handler(
+                    servicer.KeepRentalAlive,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.KeepRentalAliveRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.KeepRentalAliveResult.SerializeToString,
+            ),
             'GetMachineExecutionWorkspace': grpc.unary_unary_rpc_method_handler(
                     servicer.GetMachineExecutionWorkspace,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.MachineExecutionWorkspaceQuery.FromString,
@@ -2499,6 +2516,33 @@ class PodHost(object):
     Locally PodHost is not a service: the daemon calls the same host functions in-process.
     ---------------------------------------------------------------------------
     """
+
+    @staticmethod
+    def KeepRentalAlive(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.PodHost/KeepRentalAlive',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.KeepRentalAliveRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.KeepRentalAliveResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def GetMachineExecutionWorkspace(request,
