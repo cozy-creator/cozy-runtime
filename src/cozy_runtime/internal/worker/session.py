@@ -2366,6 +2366,8 @@ class Worker:
         if (
             placement is None
             or placement.placement_id != attempt.placement_id
+            or len(placement.environment_digest) != 32
+            or len(placement.bindings_digest) != 32
             or documents.spell(placement.environment_digest)
             != attempt.spec.get("environment_digest")
             or documents.spell(placement.bindings_digest) != serving.get("bindings_digest")

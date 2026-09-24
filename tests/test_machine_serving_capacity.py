@@ -95,7 +95,8 @@ def test_failed_machine_preparation_is_not_an_endless_capacity_wait() -> None:
 
 @pytest.mark.parametrize("hosted", [False, True])
 @pytest.mark.parametrize(
-    "fault_kind", ["selected", "sibling", "old-environment", "old-bindings", "preparing"]
+    "fault_kind",
+    ["selected", "sibling", "old-environment", "old-bindings", "absent-identity", "preparing"],
 )
 def test_queued_child_receives_only_its_exact_preparation_failure(
     hosted: bool, fault_kind: str
@@ -173,6 +174,9 @@ def test_queued_child_receives_only_its_exact_preparation_failure(
                 invocation_spec_digest=digest,
                 grant=pb.DeliveryGrant(invocation_spec_digest=digest),
             )
+            if fault_kind == "absent-identity":
+                placement.environment_digest = b""
+                placement.bindings_digest = b""
             executions.submit(
                 "owner",
                 "child",
