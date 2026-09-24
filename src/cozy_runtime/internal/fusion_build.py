@@ -83,6 +83,7 @@ def build(out: Path, archs: tuple[int, ...], *, utils: bool = True) -> dict[str,
             for path in built.iterdir():
                 if path.is_file() and path.name != "lock":
                     shutil.copy2(path, destination / path.name)
+            fusion._utils_artifact(out, utils_key)
     manifest: dict[str, Any] = {
         "triton": fusion.TRITON_VERSION,
         "kernels": fusion.source_digest(),

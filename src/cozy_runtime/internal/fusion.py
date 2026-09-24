@@ -43,6 +43,7 @@ import hashlib
 import inspect
 import json
 import shutil
+import sysconfig
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,8 +62,7 @@ try:
     import triton
     import triton.language as tl
     from triton.backends.compiler import GPUTarget
-    from triton.backends.nvidia.driver import CudaUtils
-    from triton.backends.nvidia.driver import __file__ as _driver_file
+    from triton.backends.nvidia import driver as _cuda_driver
     from triton.compiler import ASTSource
     from triton.compiler.compiler import (
         CompiledKernel,
@@ -70,8 +70,8 @@ try:
         make_backend,
     )
     from triton.language.extra import libdevice
-    from triton.runtime.build import platform_key
-    from triton.runtime.cache import get_cache_key, get_cache_manager
+    from triton.runtime.build import _get_cache_manager, platform_key
+    from triton.runtime.cache import get_cache_key
 except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal arm
     TRITON_ABSENT = f"triton does not import ({_absent})"
 else:
@@ -480,17 +480,53 @@ def cache_key(spec: Spec, arch: int) -> str:
 
 
 def utils_key() -> str:
-    """The cache key of Triton's launcher module (`cuda_utils`), platform-bound."""
+    """Portable artifact identity of the launcher source and target platform.
+
+    This is not Triton's cache key: that also includes compiler options and the
+    machine's library/include paths, which differ between image build and use.
+    """
     _require_triton()
-    source = (Path(_driver_file).parent / "driver.c").read_text()
+    source = (Path(_cuda_driver.__file__).parent / "driver.c").read_text()
     return hashlib.sha256((source + platform_key()).encode("utf-8")).hexdigest()
 
 
+def _utils_options() -> dict[str, Any]:
+    """The options CudaUtils passes to Triton's native extension builder."""
+    return {
+        "library_dirs": _cuda_driver.library_dirs(),
+        "include_dirs": _cuda_driver.include_dirs,
+        "libraries": _cuda_driver.libraries,
+    }
+
+
 def build_utils() -> Path:
-    """Compile Triton's launcher module into the current cache scope; its entry directory."""
+    """Build the launcher with Triton and return its actual cache directory."""
     _require_triton()
-    CudaUtils()
-    return Path(get_cache_manager(utils_key()).cache_dir)
+    module = _cuda_driver.compile_module_from_file(
+        src_path=str(Path(_cuda_driver.__file__).parent / "driver.c"),
+        name="cuda_utils",
+        **_utils_options(),
+    )
+    return Path(module.__file__).parent
+
+
+def utils_cache_dir() -> Path:
+    """Ask Triton where this host's CudaUtils call will look for the module."""
+    _require_triton()
+    source = (Path(_cuda_driver.__file__).parent / "driver.c").read_bytes()
+    options = {"language": ["c"], **_utils_options(), "ccflags": None}
+    return Path(_get_cache_manager(source, config=options).cache_dir)
+
+
+def _utils_artifact(directory: Path, key: str) -> Path:
+    """Require the ABI-specific launcher that the compiler actually emits."""
+    module = directory / "utils" / key / f"cuda_utils{sysconfig.get_config_var('EXT_SUFFIX')}"
+    if not module.is_file() or module.stat().st_size == 0:
+        raise FusionUnavailable(
+            "fusion_kernels_corrupt",
+            f"the artifact names launcher module {key[:12]} but {module} is missing or empty",
+        )
+    return module
 
 
 # ------------------------------------------------------------------------- loader
@@ -564,6 +600,7 @@ def check_artifact(directory: Path, arch: int) -> dict[str, Any]:
             "fusion_kernels_absent",
             f"the artifact at {directory} holds {sorted(targets)} and this device is sm{arch}",
         )
+    _utils_artifact(directory, str(manifest["utils"]))
     for profile in PROFILES.values():
         for spec in specs(**profile):
             expected = cache_key(spec, arch)
@@ -626,20 +663,10 @@ def load(device: Any, directory: Path | None = None) -> _Loaded:
 
 def _place_utils(directory: Path, manifest: dict[str, Any]) -> None:
     """Triton's launcher module goes into the imposed cache scope before the driver wakes."""
-    key = str(manifest["utils"])
-    target = Path(get_cache_manager(key).cache_dir)
-    source = directory / "utils" / key
-    if not source.is_dir():
-        # `check_artifact` already agreed the manifest's key is this platform's, so an
-        # artifact without the module it names was built wrong (a `--check`-shaped build,
-        # or a `build_utils()` whose `cuda_utils` never linked against `libcuda.so.1`).
-        raise FusionUnavailable(
-            "fusion_kernels_corrupt",
-            f"the artifact names launcher module {key[:12]} and {source} is not there",
-        )
-    for path in source.iterdir():
-        if path.is_file() and not (target / path.name).exists():
-            shutil.copy2(path, target / path.name)
+    source = _utils_artifact(directory, str(manifest["utils"]))
+    target = utils_cache_dir() / source.name
+    if not target.exists():
+        shutil.copy2(source, target)
 
 
 def available(device: Any) -> str:
