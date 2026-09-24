@@ -91,3 +91,114 @@ def test_failed_machine_preparation_is_not_an_endless_capacity_wait() -> None:
         finally:
             worker.supervision.close()
             worker.weights.close()
+
+
+@pytest.mark.parametrize("hosted", [False, True])
+@pytest.mark.parametrize(
+    "fault_kind", ["selected", "sibling", "old-environment", "old-bindings", "preparing"]
+)
+def test_queued_child_receives_only_its_exact_preparation_failure(
+    hosted: bool, fault_kind: str
+) -> None:
+    from dataclasses import replace
+
+    from cozy_runtime.internal.worker.session import HostedPlacement
+    from cozy_runtime.protocol import WIRE_MINOR, documents
+    from test_machine_calls import request, running
+    from test_machine_execution import offer
+
+    with _workspace() as root:
+        worker = Worker(
+            replace(_config(root / "home"), bootstrap_credential="test-bootstrap"),
+            WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
+            InMemoryControlHost(),
+        )
+        claim = pb.Claim(
+            record_owner_id="owner",
+            record_owner_epoch=1,
+            wire_minor=WIRE_MINOR,
+            proof=b"test-bootstrap",
+        )
+        try:
+            assert worker.accept_claim(claim, lambda frame: None)[0] == 1
+            executions, calls = worker.executions, worker.machine_calls
+            assert executions is not None and calls is not None
+            executions.submit(
+                "owner",
+                "parent",
+                b"p" * 32,
+                offer("parent"),
+                expected_execution_workspace_id=executions.workspace_id,
+                worker_boot=worker.fence.worker_boot_id,
+            )
+            incoming = request(running(executions))
+            child = calls.journal.accept("owner", incoming)
+            placement = _placement("gpu")
+            placement.environment_digest = b"e" * 32
+            placement.bindings_digest = b"b" * 32
+            placement.materialization = pb.MATERIALIZATION_STATE_STAGED
+            placement.serving = pb.SERVING_STATE_OFFLINE
+            if hosted:
+                worker.hosted["gpu"] = HostedPlacement(placement, worker.supervision)
+                failed = worker.hosted["gpu"].failed_bindings
+            else:
+                worker.placement = placement
+                failed = worker.failed_bindings
+            selected = documents.spell(b"s" * 32)
+            if fault_kind != "preparing":
+                failed[selected if fault_kind != "sibling" else documents.spell(b"x" * 32)] = (
+                    "fusion_kernels_corrupt: the artifact launcher module is absent"
+                )
+            raw, digest = documents.identity(
+                pb.InvocationSpec(
+                    environment_digest=documents.spell(
+                        b"o" * 32
+                        if fault_kind == "old-environment"
+                        else placement.environment_digest
+                    ),
+                    serving=pb.ServingInvocationSpec(
+                        entrypoint_binding_digest=selected,
+                        attempt_binding_id=selected,
+                        bindings_digest=documents.spell(
+                            b"o" * 32 if fault_kind == "old-bindings" else placement.bindings_digest
+                        ),
+                    ),
+                )
+            )
+            offered = pb.AttemptOffer(
+                request_id=child.child_request,
+                attempt_ordinal=1,
+                placement_id="gpu",
+                invocation_spec_canonical_bytes=raw,
+                invocation_spec_digest=digest,
+                grant=pb.DeliveryGrant(invocation_spec_digest=digest),
+            )
+            executions.submit(
+                "owner",
+                "child",
+                b"c" * 32,
+                offered,
+                expected_execution_workspace_id=executions.workspace_id,
+                worker_boot=worker.fence.worker_boot_id,
+            )
+            # There is no executor or available GPU seat. A known refusal must still
+            # become a durable outcome; ordinary waiting must not become failure.
+            worker.drive_executions()
+            if fault_kind != "selected":
+                assert executions.status("owner", child.child_request).state == "queued"
+                return
+            assert executions.status("owner", child.child_request).state == "failed"
+            terminal = worker.collect_execution(claim, child.child_request)
+            body = documents.read(terminal.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+            assert body["status"] == pb.OUTCOME_STATUS_REFUSED
+            assert "binding_faulted" in body["safe_message"]
+            assert "fusion_kernels_corrupt" in body["safe_message"]
+            assert not body.get("execution_started", False)
+            reply = calls.result("owner", child, incoming)
+            assert reply.state == pb.CHILD_CALL_STATE_FAILED
+            assert "fusion_kernels_corrupt" in reply.safe_detail
+            # Repeated watchdog passes/reconnects return the same recorded outcome.
+            worker.drive_executions()
+            assert worker.collect_execution(claim, child.child_request) == terminal
+        finally:
+            worker.shutdown()

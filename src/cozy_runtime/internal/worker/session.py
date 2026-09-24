@@ -2337,11 +2337,42 @@ class Worker:
                     offered.admission_epoch = self.admission_epoch
                     self.on_offer(offered, machine_owned=True)
                     continue
+                if fault := self._failed_execution_binding(attempt):
+                    self.refuse(
+                        offered,
+                        "binding_faulted",
+                        f"Model preparation failed: {fault}",
+                        pb.CAUSE_CODE_EXECUTOR_FAULT,
+                    )
+                    continue
                 lane = self._offer_lane(offered.placement_id, attempt)
                 if self._lane_slots(lane, machine_owned=True) < 1:
                     continue
                 offered.admission_epoch = self.admission_epoch
                 self.on_offer(offered, machine_owned=True)
+
+    def _failed_execution_binding(self, attempt: AttemptRecord) -> str | None:
+        """A known construction refusal is terminal before waiting for a GPU seat.
+
+        STAGED/OFFLINE alone is waitable. Only the exact selected binding on the current
+        placement and environment owns this failure; other bindings and replaced
+        placements must not poison a queued request.
+        """
+        serving = attempt.spec.get("serving")
+        if serving is None:
+            return None
+        hosted = self.hosted.get(attempt.placement_id)
+        placement = hosted.placement if hosted is not None else self.placement
+        if (
+            placement is None
+            or placement.placement_id != attempt.placement_id
+            or documents.spell(placement.environment_digest)
+            != attempt.spec.get("environment_digest")
+            or documents.spell(placement.bindings_digest) != serving.get("bindings_digest")
+        ):
+            return None
+        failed = hosted.failed_bindings if hosted is not None else self.failed_bindings
+        return failed.get(serving.get("entrypoint_binding_digest", ""))
 
     def _prepare_execution(self, preparation: dict[str, Any], request_id: str = "") -> bool:
         """Reuse the existing preparation/convergence engine without replacing live work."""
