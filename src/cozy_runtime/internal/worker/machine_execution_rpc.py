@@ -30,6 +30,10 @@ if TYPE_CHECKING:
     from .session import Worker
 
 
+class _ExecutionNotFound(WorkspaceRefusal):
+    """Authenticated lookup proved absence in the selected execution workspace."""
+
+
 class MachineExecutionRPC:
     def __init__(self, worker: Worker):
         self.worker = worker
@@ -42,6 +46,8 @@ class MachineExecutionRPC:
                 raise WorkspaceRefusal("machine execution workspace is unavailable")
             self.worker.authorize_workspace(claim)
             return operation()
+        except _ExecutionNotFound as exc:
+            return context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
         except ExecutionWorkspaceRefusal as exc:
             context.set_trailing_metadata((("cozy-error-code", exc.code),))
             return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
@@ -188,6 +194,9 @@ class MachineExecutionRPC:
     def GetMachineExecution(self, request: pb.MachineExecutionQuery, context: Any) -> Any:
         def get() -> pb.MachineExecutionState:
             self._query(request)
+            assert self.worker.executions is not None
+            if not self.worker.executions.owns(request.claim.record_owner_id, request.request_id):
+                raise _ExecutionNotFound("execution is not held by this owner")
             return self._state(self.worker.execution_status(request.claim, request.request_id))
 
         return self._call(request.claim, context, get)

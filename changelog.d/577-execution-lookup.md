@@ -1,0 +1,1 @@
+Return typed NOT_FOUND from authenticated machine execution lookup only after validating the workspace, allowing Host idle admission to distinguish a new request from a replay without interpreting error text.
