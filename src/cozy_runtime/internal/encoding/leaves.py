@@ -247,6 +247,15 @@ def _leaf_class(torch: Any) -> Any:
             out_features: int,
         ) -> None:
             super().__init__()
+            # Upstream projections inspect the first floating parameter/buffer
+            # before casting activations. Encoded storage is not that logical
+            # dtype; preserve the replaced projection's compute contract without
+            # adding a parameter, persisted weight, or resident payload bytes.
+            self.register_buffer(
+                "_logical_dtype",
+                next(iter(roles.values())).new_empty(0, dtype=out_dtype),
+                persistent=False,
+            )
             self._cozy_forward = forward_fn
             self._cozy_roles = tuple(sorted(roles))
             for role, tensor in sorted(roles.items()):
