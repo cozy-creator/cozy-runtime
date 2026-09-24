@@ -22,9 +22,11 @@ def test_managed_h3_degree_joins_existing_lane_admission() -> None:
     lanes = LaneSet.from_envelope("0,1", worker_pid=os.getpid())
     models = [{"sequence_parallel": {"degrees": [2, 4]}}]
     measured = {index: accel.DeviceMemory("measured", 6 << 30, 8 << 30) for index in range(2)}
-    # The former managed path omitted this pin and failed at the real lane boundary.
-    with pytest.raises(LaneRefusal, match="carries no device pin"):
-        lanes.assign("h3", model_bearing=True, declared_bytes=1, measured=measured, degrees=(2, 4))
+    unpinned = lanes.assign(
+        "h3", model_bearing=True, declared_bytes=1, measured=measured, degrees=(2, 4)
+    )
+    assert unpinned.ordinals == (0, 1) and not lanes.notes
+    lanes.release("h3")
     pins = device_pins(lanes, "h3", models)
     lane = lanes.assign(
         "h3",
@@ -54,8 +56,9 @@ def test_managed_degrees_intersect_and_preserve_single_device_models() -> None:
     assert list(device_pins(lanes, "pair", models)[0].device_ordinals) == [0, 1]
     assert list(device_pins(lanes, "single", [{}])[0].device_ordinals) == [0]
     assert device_pins(lanes, "weightless", []) == []
-    with pytest.raises(WorkspaceRefusal, match="no declared"):
-        device_pins(lanes, "unsupported", [{"sequence_parallel": {"degrees": [8]}}])
+    # no declared degree fits: pin the whole envelope and let lane assignment degrade it
+    wide = device_pins(lanes, "unsupported", [{"sequence_parallel": {"degrees": [8]}}])
+    assert list(wide[0].device_ordinals) == [0, 1, 2, 3]
 
 
 def test_failed_machine_preparation_is_not_an_endless_capacity_wait() -> None:

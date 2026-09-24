@@ -1483,8 +1483,8 @@ class Worker:
             kind = accel.host_backend_family()
             for ordinal, entry in enumerate(self.lanes.entries):
                 measured[ordinal] = accel.device_memory(entry, kind)
-        # THE PIN (cr-068): the RecordOwner's placement of this placement on THIS worker,
-        # validated here and never chosen here. The declared degrees are the package's.
+        # THE PIN (cr-068): the RecordOwner's placement of this placement on THIS worker;
+        # the lane set runs it at the largest declared degree the pin can form.
         pin = placement.device_pin
         if pin is not None and len(pin) > 1:
             declared = max(
@@ -1519,6 +1519,8 @@ class Worker:
             self.note("materialization", f"{placement.placement_id!r} refused: {exc}"[:256])
             return False
         placement.lane_id = lane.lane_id
+        if warning := self.lanes.notes.get(placement.placement_id):
+            self.note("warning", warning)
         row = lane.row(placement.placement_id)
         row.model_bearing = model_bearing
         row.supervision = supervision
@@ -4010,8 +4012,7 @@ class Worker:
             # "never advertise capacity it cannot use" rule applied to the silent-GPU-0
             # defect; jobs keep the whole envelope and are untouched. An owner at 22 reads
             # `lanes[]` and pins placements to devices (`DesiredPlacementSet.device_pins`),
-            # and `LaneSet.assign` decides per placement (ruling 3: a model-bearing placement
-            # with no pin on a wide envelope refuses `device_group_unsupported`).
+            # and `LaneSet.assign` decides per placement.
             self.latched = "device_lanes_unsupported"
             self._published_latch = self.latched  # this fault IS the publication
             self.engine.fault(
