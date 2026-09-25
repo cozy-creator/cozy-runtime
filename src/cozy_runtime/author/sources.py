@@ -6,7 +6,7 @@ TensorFS locally or on the private worker and never publish the script or its so
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from typing import Annotated, cast
 
 import msgspec
@@ -76,3 +76,28 @@ async def source_files(source: SourceArtifact) -> Tree:
     """Grant a readonly view of a retained ordinary source, bounded to 64 MiB."""
     result = cast(_SourceFilesResult, await _call("source_files", {"source": source}))
     return result.files
+
+
+async def ingest_huggingface(repository: str, *, revision: str) -> ModelArtifact:
+    """Prepare a complete native model using its reviewed model-owned recipe.
+
+    Each source, conversion and metadata derivation retains its own receipt.
+    Upload and release publication remain explicit separate operations.
+    """
+    from cozy_runtime.derive.operations import prepare_model
+    from cozy_runtime.models.ingestion import require_recipe
+
+    recipe = require_recipe(repository, revision)
+    source = await download_huggingface(
+        recipe.repository, revision=recipe.revision, carriers=recipe.carriers
+    )
+    model = await convert_cozytensors(source, profile=recipe.profile)
+    metadata = await download_huggingface(
+        recipe.repository, revision=recipe.revision, files=tuple(recipe.metadata)
+    )
+    # The managed caller accepts a receipt; the execution signature deliberately
+    # declares the Model that Runtime injects from that receipt at admission.
+    prepare = cast(Callable[..., Awaitable[ModelArtifact]], prepare_model)
+    return await prepare(
+        source=model, metadata=await source_files(metadata), recipe=recipe.name
+    )

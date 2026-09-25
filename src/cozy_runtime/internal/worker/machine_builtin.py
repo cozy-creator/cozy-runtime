@@ -113,11 +113,11 @@ class Builtins:
         }:
             raise WorkspaceRefusal("builtin has no exact accepted SDK snapshot")
         sdk = frozen["sdk"]
-        if (intent["interface_digest"], intent["module"], intent["export"]) != (
+        export = intent["export"]
+        if (intent["interface_digest"], intent["module"]) != (
             sdk["interface_digest"],
             builtin_operations.MODULE,
-            "quantize",
-        ):
+        ) or export not in builtin_operations.EXPORTS:
             raise WorkspaceRefusal("builtin call changed its captured interface")
         prior = canonical_json.decode(call.prepared) if call.prepared else {}
         entry = prior.get("builtin_preparation")
@@ -143,8 +143,8 @@ class Builtins:
         interface = package_interface.read_bytes(
             canonical_json.encode(frozen["package_interface"]), "Runtime builtin"
         )
-        declared = interface["jobs"][0]
-        descriptor = package_interface.job_descriptor_id(interface, "quantize")
+        declared = next(row for row in interface["jobs"] if row["name"] == export)
+        descriptor = package_interface.job_descriptor_id(interface, export)
         binding = JobBinding.read(
             json.loads(
                 job_plan.path(
@@ -157,14 +157,12 @@ class Builtins:
                 "local_revision_digest": revision,
                 "interface_digest": sdk["interface_digest"],
                 "module": builtin_operations.MODULE,
-                "export": "quantize",
-                "entrypoint": "quantize",
+                "export": export,
+                "entrypoint": export,
                 "environment_content_digest": installed.content_digest,
             }
         )
-        return Target(
-            revision, "quantize", sdk["interface_digest"], declared, entry, binding, identity
-        )
+        return Target(revision, export, sdk["interface_digest"], declared, entry, binding, identity)
 
     def _prepare(self, frozen: dict[str, Any]) -> dict[str, Any]:
         worker = self.worker
