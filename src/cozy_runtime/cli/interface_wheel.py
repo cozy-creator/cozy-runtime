@@ -63,6 +63,7 @@ def run(args: list[str]) -> Result:
             version=request["version"],
             implementation_digest=request["implementation_digest"],
             implementation_wheel=implementation,
+            implementation_filename=source.name,
         )
         output = Path(request["output_directory"]).resolve()
         output.mkdir(parents=True, exist_ok=True)

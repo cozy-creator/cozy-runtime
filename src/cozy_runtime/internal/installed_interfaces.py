@@ -59,7 +59,7 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
             modules = {
                 entry["invocable"]["module"]
                 for entry in [*descriptor["entrypoints"], *descriptor["jobs"]]
-                if "invocable" in entry
+                if "invocable" in entry and not entry.get("internal", False)
             }
             available = {
                 candidate
@@ -99,7 +99,7 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
         digest = "sha256:" + hashlib.sha256(body).hexdigest()
         for entry in [*descriptor["entrypoints"], *descriptor["jobs"]]:
             invocable = entry.get("invocable")
-            if invocable is None:
+            if invocable is None or entry.get("internal", False):
                 continue
             key = (invocable["module"], invocable["export"])
             if key in exports:

@@ -209,3 +209,77 @@ def test_queued_child_receives_only_its_exact_preparation_failure(
             assert worker.collect_execution(claim, child.child_request) == terminal
         finally:
             worker.shutdown()
+
+
+def test_managed_child_waits_for_its_new_placement_despite_old_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warm previous package is not readiness for the package being switched in."""
+    from dataclasses import replace
+
+    from cozy_runtime.protocol import WIRE_MINOR, documents
+    from test_machine_calls import request, running
+    from test_machine_execution import offer
+
+    with _workspace() as root:
+        worker = Worker(
+            replace(_config(root / "home"), bootstrap_credential="test-bootstrap"),
+            WorkerOptions(root=root / "worker", tensorfs_root=root / "store"),
+            InMemoryControlHost(),
+        )
+        claim = pb.Claim(
+            record_owner_id="owner",
+            record_owner_epoch=1,
+            wire_minor=WIRE_MINOR,
+            proof=b"test-bootstrap",
+        )
+        try:
+            worker.accept_claim(claim, lambda frame: None)
+            executions, calls = worker.executions, worker.machine_calls
+            assert executions is not None and calls is not None
+            executions.submit(
+                "owner",
+                "parent",
+                b"p" * 32,
+                offer("parent"),
+                expected_execution_workspace_id=executions.workspace_id,
+                worker_boot=worker.fence.worker_boot_id,
+            )
+            child = calls.journal.accept("owner", request(running(executions)))
+            old = _placement("old-package")
+            old.serving = pb.SERVING_STATE_DISPATCHABLE
+            old.materialization = pb.MATERIALIZATION_STATE_STAGED
+            worker.placement = old
+            worker.accepted.mode = "serving"
+            monkeypatch.setattr(worker, "_lane_slots", lambda *_args, **_kwargs: 1)
+            raw, digest = documents.identity(
+                pb.InvocationSpec(
+                    environment_digest=documents.spell(b"e" * 32),
+                    serving=pb.ServingInvocationSpec(
+                        entrypoint_binding_digest=documents.spell(b"s" * 32),
+                        attempt_binding_id=documents.spell(b"s" * 32),
+                        bindings_digest=documents.spell(b"b" * 32),
+                    ),
+                )
+            )
+            offered = pb.AttemptOffer(
+                request_id=child.child_request,
+                attempt_ordinal=1,
+                placement_id="new-package",
+                invocation_spec_canonical_bytes=raw,
+                invocation_spec_digest=digest,
+                grant=pb.DeliveryGrant(invocation_spec_digest=digest),
+            )
+            executions.submit(
+                "owner",
+                "child",
+                b"c" * 32,
+                offered,
+                expected_execution_workspace_id=executions.workspace_id,
+                worker_boot=worker.fence.worker_boot_id,
+            )
+            worker.drive_executions()
+            assert executions.status("owner", child.child_request).state == "queued"
+            assert (child.child_request, 1) not in worker.engine.history
+        finally:
+            worker.shutdown()
