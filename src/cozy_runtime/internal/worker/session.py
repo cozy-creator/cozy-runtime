@@ -3344,10 +3344,21 @@ class Worker:
         )
         if self.placement is not None:
             body.placements.append(self.placement_status())
-        body.held_attempts.extend(self.engine.snapshot_entries())
+        # Machine executions own their attempts and collection through the execution API.
+        # The legacy RecordOwner never assigned those ordinals and cannot reconcile them.
+        body.held_attempts.extend(
+            entry
+            for entry in self.engine.snapshot_entries()
+            if self.executions is None
+            or not self.executions.owns(self.fence.record_owner_id, entry.request_id)
+        )
         if self.workspace is not None:
             known = {(entry.request_id, entry.attempt_ordinal) for entry in body.held_attempts}
             for outcome in self.workspace.retained_outcomes(self.fence.record_owner_id):
+                if self.executions is not None and self.executions.owns(
+                    self.fence.record_owner_id, outcome.request_id
+                ):
+                    continue
                 if (outcome.request_id, outcome.attempt_ordinal) not in known:
                     body.held_attempts.append(
                         pb.HeldAttempt(
