@@ -2145,6 +2145,11 @@ class Executor:
         if refused is not None:
             return refused
         stage("install")
+        # Warm-up may stage components one scope at a time even on a roomy card.
+        # Preserve what the construction actually fitted before those temporary moves:
+        # the worker must restore that set, not treat warm's last scope as a capacity floor.
+        constructed_resident = dict(backend.vram_charge)
+        construction_parked = sorted(set(backend.parked) | set(backend.paging))
         # THE AUTHOR'S ONE WARM MOMENT (cr-110, model-lifecycle.md): after the fill, its
         # verification, the execution plan, the residency install and the group mirror;
         # before this generation is Ready, so a placement is never DISPATCHABLE over a cold
@@ -2221,7 +2226,8 @@ class Executor:
             "allocator_bytes": memory["allocated_bytes"],
             "reserved_bytes": memory["reserved_bytes"],
             "resident": dict(backend.vram_charge),
-            "parked": sorted(set(backend.parked) | set(backend.paging)),
+            "constructed": constructed_resident,
+            "parked": construction_parked,
             "paging": {name: layout.document() for name, layout in backend.paging.items()},
             # WITH THEIR SIZES, like the residency document's `evicted`: a parked component
             # is a component the next attempt may have to bring back, and a chooser that
@@ -2513,6 +2519,11 @@ class Executor:
             "allocator_bytes": int(last.get("allocator_bytes", -1)),
             "reserved_bytes": int(last.get("reserved_bytes", -1)),
             "resident": resident,
+            "constructed": {
+                f"{parameter}/{component}": int(size)
+                for parameter, facts in facts_rows
+                for component, size in facts.get("constructed", facts.get("resident", {})).items()
+            },
             "parked": parked,
             "evicted": evicted,
             "paging": paging,
