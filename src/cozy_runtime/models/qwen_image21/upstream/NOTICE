@@ -1,0 +1,4 @@
+Copyright 2026 Qwen-Image Team and The HuggingFace Team.
+Apache-2.0 source from huggingface/diffusers commit4295ee3ec58efa6577bc459e9b84ca3f63aa9a96.
+Three files retain upstream algorithms; imports are relocated to installed Diffusers core and sibling modules.
+Model weights are separately licensed under the Qwen Research License.

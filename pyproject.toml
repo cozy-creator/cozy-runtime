@@ -156,6 +156,15 @@ module = ["cozy_runtime.internal.derive"]
 warn_unused_ignores = false
 
 [project.optional-dependencies]
+qwen-image21 = [
+    "diffusers>=0.40.0",
+    "transformers>=5.17",
+    "torch>=2.14",
+    "torchvision>=0.29",
+    "numpy>=1.26",
+    "safetensors>=0.8",
+    "tokenizers>=0.23.1",
+]
 # Builtins are imported only on explicit use. Worker images keep ownership of the
 # compatible Torch/CUDA family; this extra does not pin a CUDA wheel or index.
 minimax-h3 = [
