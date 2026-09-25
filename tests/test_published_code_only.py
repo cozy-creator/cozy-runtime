@@ -283,7 +283,10 @@ async def generate(payload: Request, model: Reference) -> Reply:
             bindings, count = acquirer._bindings(retained)
             assert bindings == {} and count == 1
             assert worker.prepare_package_set(request).placement_set == result.placement_set
-            assert worker.prepared_revisions[key].installed == retained.installed
+            repeated = worker.prepared_revisions[key].installed
+            assert repeated is not None and repeated.reused
+            assert repeated.receipt_digest == retained.installed.receipt_digest
+            assert repeated.content_digest == retained.installed.content_digest
         finally:
             worker.shutdown()
             index.close()
