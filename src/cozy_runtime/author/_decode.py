@@ -1176,6 +1176,15 @@ def image_target_size(
     return target_width, target_height
 
 
+def image_decoded_bytes(path: Path) -> int:
+    """Header-only RGB8 size of an encoded image: what a decoded bound promises."""
+    with pil_open(path) as header:
+        width, height = header.size
+    if width <= 0 or height <= 0:
+        raise MediaDecodeError("image has invalid frame geometry", code="media_geometry")
+    return width * height * 3
+
+
 def image_source_geometry(
     path: Path, limits: DecodeLimits, preparation: ImagePreparation
 ) -> tuple[int, int]:
