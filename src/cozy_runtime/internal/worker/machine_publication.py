@@ -336,12 +336,14 @@ def upload_checkpoint(
             for key, size in objects.items()
         )
     )
-    try:
-        raw = client.request("GET", destination + "/checkpoints/" + manifest.digest)
-    except PublicationRefusal as exc:
-        if exc.status != 404:
-            raise
-    else:
+
+    def observe() -> CheckpointRef | None:
+        try:
+            raw = client.request("GET", destination + "/checkpoints/" + manifest.digest)
+        except PublicationRefusal as exc:
+            if exc.status != 404:
+                raise
+            return None
         _require(
             len(raw) == manifest.length
             and "sha256:" + hashlib.sha256(raw).hexdigest() == manifest.digest
@@ -350,21 +352,53 @@ def upload_checkpoint(
             checkpoint.destination, manifest.digest, manifest, operation, "observed_convergence"
         )
 
+    observed_checkpoint = observe()
+    if observed_checkpoint is not None:
+        return observed_checkpoint
     path = destination + "/publications/" + quote(operation, safe="")
     before_write()
-    opened = _object(
-        client.request(
-            "PUT",
-            path,
-            canonical_json.encode(
-                {
-                    "objects": [
-                        {"object_id": key, "length": size} for key, size in sorted(objects.items())
-                    ]
-                }
-            ),
+    try:
+        opened = _object(
+            client.request(
+                "PUT",
+                path,
+                canonical_json.encode(
+                    {
+                        "objects": [
+                            {"object_id": key, "length": size}
+                            for key, size in sorted(objects.items())
+                        ]
+                    }
+                ),
+            )
         )
-    )
+    except PublicationRefusal as exc:
+        if exc.status == 409:
+            # Async finalization can commit between the initial read and the
+            # open/claim transaction. Only exact public readback proves success.
+            observed_checkpoint = observe()
+            if observed_checkpoint is not None:
+                return observed_checkpoint
+            try:
+                finalization = _object(client.request("GET", path + "/finalization"))
+            except PublicationRefusal as status_error:
+                if status_error.status != 404:
+                    raise
+            else:
+                _require(
+                    finalization.get("operation") == operation
+                    and finalization.get("status_url") == path + "/finalization",
+                    "publication.checkpoint_changed",
+                )
+                if finalization.get("state") in {"queued", "running"}:
+                    raise PublicationRefusal(
+                        "publication.finalization_pending", status=503
+                    ) from exc
+                if finalization.get("state") == "completed":
+                    observed_checkpoint = observe()
+                    if observed_checkpoint is not None:
+                        return observed_checkpoint
+        raise
     publication = opened.get("publication")
     if not isinstance(publication, dict):
         raise PublicationRefusal("publication.response_invalid")
@@ -456,6 +490,21 @@ def upload_checkpoint(
             ),
         )
     )
+    if "operation" in result:
+        _require(
+            result.get("operation") == operation
+            and result.get("status_url") == path + "/finalization"
+            and result.get("state") in {"queued", "running", "completed"},
+            "publication.checkpoint_changed",
+        )
+        if result["state"] != "completed":
+            # Hub owns a durable finalization job. Yield to the existing effect
+            # reconciler; its next exact checkpoint read proves completion.
+            raise PublicationRefusal("publication.finalization_pending", status=503)
+        completed = result.get("result")
+        if not isinstance(completed, dict):
+            raise PublicationRefusal("publication.checkpoint_changed")
+        result = completed
     _require(
         result.get("publish_id") == operation
         and result.get("checkpoint_id") == manifest.digest
