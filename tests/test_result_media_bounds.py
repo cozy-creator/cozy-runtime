@@ -15,8 +15,15 @@ from cozy_runtime.author._decode import MediaDecoder
 from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
 from cozy_runtime.author._invoke import asset_inputs
 from cozy_runtime.author._services import Attempt
-from cozy_runtime.internal import interface_wheel, package_interface, schema, static_interface
+from cozy_runtime.internal import (
+    canonical,
+    interface_wheel,
+    package_interface,
+    schema,
+    static_interface,
+)
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.executor import Executor
 
 SOURCE = """from typing import Annotated
 import msgspec
@@ -58,6 +65,11 @@ def test_returned_image_keeps_bounds_and_request_interface_identity(
     assert request_fields[0]["asset_bound"] == {"max_bytes": 1000}
     result_schema = interface["jobs"][0]["result"]
     assert result_schema["fields"][0]["asset_bound"]["max_decoded_bytes"] == 36
+    executor = object.__new__(Executor)
+    executor.schema_digests = {}
+    assert executor._result_schema_digest(source.app.get("segment").surface) == canonical.digest(
+        result_schema
+    )
     result_type = source.Result
     if generated:
         module = ModuleType("generated_native_result_media")

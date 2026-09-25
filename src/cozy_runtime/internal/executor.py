@@ -3139,7 +3139,7 @@ class Executor:
         cached = self.schema_digests.get(surface.name)
         if cached is None:
             cached = self.schema_digests[surface.name] = canonical.digest(
-                schema.render(surface.result_type)
+                schema.render(surface.result_type, decoded_bounds=True)
             )
         return cached
 

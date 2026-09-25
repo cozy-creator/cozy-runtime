@@ -10,3 +10,7 @@ exact dependency wheels. No model source bytes are discarded or reacquired.
 The regression uses an installed Runtime wheel, real Worker and descriptor-four
 storage transport, and verifies that edits to controller code after SDK capture
 cannot change the admitted implementation. Native build inputs are unchanged.
+
+Completed outcomes now hash the declared result schema with decoded-media bounds,
+matching static and imported package interfaces. This lets a successfully produced
+bounded PNG or video pass ordinary result collection without rerunning inference.
