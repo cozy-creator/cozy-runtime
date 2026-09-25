@@ -433,6 +433,7 @@ def test_caller_overlay_preserves_helpers_assets_and_dependencies(tmp_path: Path
         version="0.1.0",
         implementation_digest="sha256:" + "11" * 32,
         implementation_wheel=original.getvalue(),
+        implementation_filename="serving_fixture-0.1.0-py3-none-any.whl",
     )
     assert interface_wheel.build(
         raw,
@@ -440,6 +441,7 @@ def test_caller_overlay_preserves_helpers_assets_and_dependencies(tmp_path: Path
         version="0.1.0",
         implementation_digest="sha256:" + "11" * 32,
         implementation_wheel=original.getvalue(),
+        implementation_filename="serving_fixture-0.1.0-py3-none-any.whl",
     ) == (filename, wheel)
     with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
         archive.extractall(tmp_path / "overlay")
@@ -521,6 +523,7 @@ def secret(ctx: Context, payload: Request) -> Result:
         version="0.1.0",
         implementation_digest=source_digest,
         implementation_wheel=original.getvalue(),
+        implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
     )
     _, repeated = interface_wheel.build(
         raw,
@@ -528,6 +531,7 @@ def secret(ctx: Context, payload: Request) -> Result:
         version="0.1.0",
         implementation_digest=source_digest,
         implementation_wheel=wheel,
+        implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
     )
     assert repeated == wheel
     _, captured = interface_wheel.build(
@@ -536,6 +540,7 @@ def secret(ctx: Context, payload: Request) -> Result:
         version="0.1.0",
         implementation_digest="sha256:" + "33" * 32,
         implementation_wheel=wheel,
+        implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
     )
     with zipfile.ZipFile(io.BytesIO(captured)) as archive:
         assert archive.read("dual_fixture.py").count(b"from _cozy_callers_") == 1
@@ -556,6 +561,7 @@ def secret(ctx: Context, payload: Request) -> Result:
             version="0.1.0",
             implementation_digest=source_digest,
             implementation_wheel=corrupted.getvalue(),
+            implementation_filename="dual_fixture-0.1.0-py3-none-any.whl",
         )
     with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
         archive.extractall(tmp_path / "sealed")
@@ -628,3 +634,60 @@ assert lib.app.get("generate").fn(ctx, lib.Request(8)).value==24
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("tag", "purelib"),
+    [("cp312-abi3-manylinux_2_28_x86_64", "false"), ("py3-none-win_amd64", "true")],
+)
+def test_source_overlay_preserves_platform_build_metadata_and_native_bytes(
+    tmp_path: Path, tag: str, purelib: str
+) -> None:
+    root = project(tmp_path)
+    raw = package_interface.canonical_bytes(static_interface.build(root))
+    filename = f"serving_fixture-0.1.0-2native-{tag}.whl"
+    wheel_metadata = (
+        "Wheel-Version: 1.0\r\nGenerator: original-native-builder\r\n"
+        f"Root-Is-Purelib: {purelib}\r\nBuild: 2native\r\nTag: {tag}\r\n"
+    ).encode()
+    native = b"opaque native payload\x00\xff\x01"
+    script = zipfile.ZipInfo("serving_fixture-0.1.0.data/scripts/native-helper")
+    script.external_attr = 0o100755 << 16
+    original = io.BytesIO()
+    with zipfile.ZipFile(original, "w") as archive:
+        archive.writestr("serving_fixture.py", SOURCE)
+        archive.writestr("serving_fixture_native.abi3.so", native)
+        archive.writestr(script, native)
+        archive.writestr(
+            "serving_fixture-0.1.0.dist-info/METADATA",
+            "Metadata-Version: 2.4\nName: serving-fixture\nVersion: 0.1.0\n",
+        )
+        archive.writestr("serving_fixture-0.1.0.dist-info/WHEEL", wheel_metadata)
+    options = dict(
+        distribution="serving-fixture",
+        version="0.1.0",
+        implementation_digest="sha256:" + "11" * 32,
+        implementation_filename=filename,
+    )
+    actual_filename, overlay = interface_wheel.build(
+        raw, implementation_wheel=original.getvalue(), **options
+    )
+    assert actual_filename == filename
+    with zipfile.ZipFile(io.BytesIO(overlay)) as archive:
+        assert archive.read("serving_fixture-0.1.0.dist-info/WHEEL") == wheel_metadata
+        assert archive.read("serving_fixture_native.abi3.so") == native
+        assert archive.read(script.filename) == native
+        assert archive.getinfo(script.filename).external_attr == script.external_attr
+    assert interface_wheel.build(raw, implementation_wheel=overlay, **options) == (
+        filename,
+        overlay,
+    )
+    with pytest.raises(ConformanceError, match="filename and WHEEL metadata disagree"):
+        interface_wheel.build(
+            raw,
+            distribution="serving-fixture",
+            version="0.1.0",
+            implementation_digest="sha256:" + "11" * 32,
+            implementation_filename="serving_fixture-0.1.0-py3-none-any.whl",
+            implementation_wheel=original.getvalue(),
+        )

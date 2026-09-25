@@ -13,6 +13,8 @@ import zipfile
 from collections import defaultdict
 from typing import Any
 
+from packaging.tags import parse_tag
+from packaging.utils import canonicalize_name, parse_wheel_filename
 from packaging.version import Version
 
 from cozy_runtime.author import ConformanceError
@@ -336,6 +338,7 @@ def build(
     version: str,
     implementation_digest: str,
     implementation_wheel: bytes | None = None,
+    implementation_filename: str | None = None,
 ) -> tuple[str, bytes]:
     """Package deterministic source and its exact implementation join into one wheel."""
     if (
@@ -347,12 +350,22 @@ def build(
     normalized = re.sub(r"[-_.]+", "_", distribution).lower()
     dist = f"{normalized}-{version}.dist-info"
     files = generate(interface)
+    attributes: dict[str, int] = {}
+    filename = f"{normalized}-{version}-py3-none-any.whl"
     metadata = (
         "Metadata-Version: 2.4\n" + f"Name: {distribution}\nVersion: {version}\n"
         "Requires-Python: >=3.12\nRequires-Dist: cozy-runtime>=0.4.0\n"
     ).encode()
     if implementation_wheel is not None:
-        files, metadata = _overlay(interface, implementation_wheel, distribution, version)
+        if implementation_filename is None:
+            raise ConformanceError(
+                "implementation wheel filename is required", code="interface_binding"
+            )
+        files, metadata, attributes = _overlay(
+            interface, implementation_wheel, distribution, version
+        )
+        _wheel_identity(implementation_filename, files[dist + "/WHEEL"], distribution, version)
+        filename = implementation_filename
     files[dist + "/package-interface.json"] = interface
     layout = "overlay" if implementation_wheel is not None else "generated"
     header, _, description = metadata.partition(b"\n\n")
@@ -365,9 +378,11 @@ def build(
         ).encode()
         + description
     )
-    files[dist + "/WHEEL"] = (
-        b"Wheel-Version: 1.0\nGenerator: cozy-runtime\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
-    )
+    if implementation_wheel is None:
+        files[dist + "/WHEEL"] = (
+            b"Wheel-Version: 1.0\nGenerator: cozy-runtime\n"
+            b"Root-Is-Purelib: true\nTag: py3-none-any\n"
+        )
     rows = [
         [
             path,
@@ -386,14 +401,14 @@ def build(
         for path, data in sorted(files.items()):
             info = zipfile.ZipInfo(path, date_time=(2000, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o100644 << 16
+            info.external_attr = attributes.get(path, 0o100644 << 16)
             archive.writestr(info, data)
-    return f"{normalized}-{version}-py3-none-any.whl", output.getvalue()
+    return filename, output.getvalue()
 
 
 def _overlay(
     interface: bytes, implementation: bytes, distribution: str, version: str
-) -> tuple[dict[str, bytes], bytes]:
+) -> tuple[dict[str, bytes], bytes, dict[str, int]]:
     """Retain library code/data/dependencies and replace only managed callable exports."""
     if len(implementation) > MAX_IMPLEMENTATION_WHEEL:
         raise ConformanceError("implementation wheel exceeds its bound", code="interface_binding")
@@ -404,6 +419,7 @@ def _overlay(
                 "implementation contents exceed their bound", code="interface_binding"
             )
         files = {}
+        attributes = {}
         for row in members:
             path = row.filename
             if row.is_dir():
@@ -419,6 +435,7 @@ def _overlay(
                     "implementation wheel has invalid members", code="interface_binding"
                 )
             files[path] = archive.read(row)
+            attributes[path] = row.external_attr
     metadata_paths = [name for name in files if name.endswith(".dist-info/METADATA")]
     if len(metadata_paths) != 1:
         raise ConformanceError(
@@ -431,12 +448,9 @@ def _overlay(
         raise ConformanceError(
             "implementation metadata directory differs", code="interface_binding"
         )
-    wheel_headers = email.parser.BytesParser().parsebytes(files.get(expected_dist + "/WHEEL", b""))
-    if wheel_headers.get("Root-Is-Purelib") != "true" or wheel_headers.get_all("Tag") != [
-        "py3-none-any"
-    ]:
+    if expected_dist + "/WHEEL" not in files:
         raise ConformanceError(
-            "caller overlay needs a pure Python project wheel", code="interface_binding"
+            "implementation wheel has no WHEEL metadata", code="interface_binding"
         )
     headers = email.parser.BytesParser().parsebytes(metadata)
 
@@ -498,7 +512,33 @@ def _overlay(
             "RECORD.p7s",
         }:
             del files[name]
-    return files, metadata
+    return files, metadata, attributes
+
+
+def _wheel_identity(filename: str, raw: bytes, distribution: str, version: str) -> None:
+    """An overlay cannot change an implementation's platform or optional build tag."""
+    if "/" in filename or "\\" in filename:
+        raise ConformanceError("implementation wheel filename is invalid", code="interface_binding")
+    try:
+        name, release, build, filename_tags = parse_wheel_filename(filename)
+        headers = email.parser.BytesParser().parsebytes(raw)
+        tags = set().union(*(parse_tag(value) for value in headers.get_all("Tag", [])))
+        if (
+            name != canonicalize_name(distribution)
+            or release != Version(version)
+            or tags != filename_tags
+            or headers.get_all("Root-Is-Purelib") not in (["true"], ["false"])
+            or not str(headers.get("Wheel-Version", "")).startswith("1.")
+            or (
+                headers.get("Build") is not None
+                and (not build or headers.get("Build") != filename.split("-")[-4])
+            )
+        ):
+            raise ValueError("filename and WHEEL metadata disagree")
+    except ValueError as exc:
+        raise ConformanceError(
+            f"implementation wheel identity differs: {exc}", code="interface_binding"
+        ) from exc
 
 
 def overlay_sources(interface: bytes, available: set[str]) -> dict[str, tuple[str, bytes, bytes]]:
