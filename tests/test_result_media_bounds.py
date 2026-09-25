@@ -116,7 +116,7 @@ def test_returned_image_keeps_bounds_and_request_interface_identity(
 
 def test_generated_only_job_can_request_decoder_without_payload_assets(tmp_path: Path) -> None:
     """Generated child results supply decode capabilities after the parent starts."""
-    source = '''import msgspec
+    source = """import msgspec
 from cozy_runtime.author import App, Context, MediaDecoder
 app = App()
 class Request(msgspec.Struct):
@@ -126,7 +126,7 @@ class Result(msgspec.Struct):
 @app.job
 async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result:
     raise RuntimeError("discovery only")
-'''
+"""
     (tmp_path / "pyproject.toml").write_text('[project]\nname="generated-only"\nversion="0.1.0"\n')
     (tmp_path / "package.toml").write_text('[application]\nobject="generated_only:app"\n')
     (tmp_path / "generated_only.py").write_text(source)
@@ -141,7 +141,7 @@ def test_generated_job_does_not_waive_explicit_input_decode_bounds(tmp_path: Pat
     from cozy_runtime.author import ConformanceError
 
     (tmp_path / "package.toml").write_text('[application]\nobject="unbounded_decode:app"\n')
-    (tmp_path / "unbounded_decode.py").write_text('''import msgspec
+    (tmp_path / "unbounded_decode.py").write_text("""import msgspec
 from cozy_runtime.author import App, Context, ImageAsset, MediaDecoder
 app = App()
 class Request(msgspec.Struct):
@@ -151,6 +151,6 @@ class Result(msgspec.Struct):
 @app.job
 async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result:
     raise RuntimeError("discovery only")
-''')
+""")
     with pytest.raises(ConformanceError, match="asset_decode_unbounded"):
         package_interface.build(discover(tmp_path))

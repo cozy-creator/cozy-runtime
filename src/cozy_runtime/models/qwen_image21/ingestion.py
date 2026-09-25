@@ -6,17 +6,8 @@ import base64
 import hashlib
 import json
 import zlib
+from pathlib import Path
 from typing import Any
-
-from tensorfs.derived import Config, Derivation, Target, derive
-
-from cozy_runtime.author import (
-    Context,
-    Model,
-    ModelArtifact,
-    Tree,
-    canonical_json,
-)
 
 REPOSITORY = "Qwen/Qwen-Image-2.1"
 REVISION = "790c92633540aa0cb11d9abf19eb46d861714758"
@@ -163,14 +154,10 @@ def configuration(root: Any) -> dict[str, Any]:
     return result
 
 
-async def prepare(
-    ctx: Context,
-    *,
-    source: Model[object],
-    metadata: Tree,
-) -> ModelArtifact:
-    capability = ctx.tensorfs_source(source)
-    inspection = capability.inspect()
+def preparation(
+    inspection: Any, root: Path
+) -> tuple[dict[str, Any], tuple[tuple[str, str], ...], dict[str, bytes]]:
+    """Validate a source census and prepare immutable configuration/file values."""
     census = json.loads(zlib.decompress(base64.urlsafe_b64decode(_CENSUS)))
     expected = {(c, k): (tuple(shape), dtype) for c, k, shape, dtype in census}
     actual = {(c, k): t for c, rows in inspection.components.items() for k, t in rows.items()}
@@ -190,7 +177,7 @@ async def prepare(
             or tuple(part.shape) != shape
         ):
             raise ValueError(f"Source differs from the reviewed native checkpoint: {pair}")
-    config = configuration(metadata.path)
+    config = configuration(root)
     provenance: dict[str, str] = {
         "source_repository": REPOSITORY,
         "source_revision": REVISION,
@@ -205,24 +192,12 @@ async def prepare(
         "license_sha256": FILES["LICENSE"][1],
     }
     config["provenance"] = provenance
-    definition = Derivation(
-        sources={"source": capability},
-        targets={c: Target(source="source", source_component=c) for c in inspection.components},
-        configs={"model": Config("add")},
-        order=tuple((c, k) for c, k, _shape, _dtype in census),
-        files={
-            "LICENSE": (metadata.path / "LICENSE").read_bytes(),
+    return (
+        config,
+        tuple((c, k) for c, k, _shape, _dtype in census),
+        {
+            "LICENSE": (root / "LICENSE").read_bytes(),
             "Notice": (provenance["notice"] + "\n").encode(),
             "CHANGES.txt": (provenance["conversion"] + "\n").encode(),
         },
     )
-    with derive(ctx.output("model"), definition) as transaction:
-        if transaction.receipt is not None:
-            return ctx.adopt_model(transaction.receipt)
-        completed = set(transaction.completed_configs())
-        for name, value in (("model", config),):
-            ctx.raise_if_cancelled()
-            if name not in completed:
-                transaction.add_config(name, canonical_json.normalize(json.dumps(value).encode()))
-                transaction.checkpoint()
-        return ctx.adopt_model(transaction.commit())

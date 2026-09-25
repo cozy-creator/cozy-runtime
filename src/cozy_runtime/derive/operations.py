@@ -201,9 +201,28 @@ async def prepare_model(
     """Attach reviewed model-owned metadata to an exact native source census."""
     if recipe != "qwen-image-2.1/original/1":
         raise UnsupportedInput("Unknown model preparation recipe", code="model_ingestion_recipe")
-    from cozy_runtime.models.qwen_image21.ingestion import prepare
+    from tensorfs.derived import Config, Derivation, Target, derive
 
-    return await prepare(ctx, source=source, metadata=metadata)
+    from cozy_runtime.models.qwen_image21.ingestion import preparation
+
+    capability = ctx.tensorfs_source(source)
+    inspection = capability.inspect()
+    config, order, files = preparation(inspection, metadata.path)
+    definition = Derivation(
+        sources={"source": capability},
+        targets={c: Target(source="source", source_component=c) for c in inspection.components},
+        configs={"model": Config("add")},
+        order=order,
+        files=files,
+    )
+    with derive(ctx.output("model"), definition) as transaction:
+        if transaction.receipt is not None:
+            return ctx.adopt_model(transaction.receipt)
+        ctx.raise_if_cancelled()
+        if "model" not in set(transaction.completed_configs()):
+            transaction.add_config("model", canonical_json.encode(config))
+            transaction.checkpoint()
+        return ctx.adopt_model(transaction.commit())
 
 
 app.job(prepare_model, weights=(WeightsOutput("model", max_new_bytes=8 << 20),))

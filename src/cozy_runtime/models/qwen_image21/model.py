@@ -31,6 +31,12 @@ from .upstream.pipeline_qwenimage21 import QwenImage21Pipeline
 from .upstream.transformer_qwenimage21 import QwenImage21Transformer2DModel
 
 
+def _section(value: object, name: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Qwen Image {name} configuration must be a mapping")
+    return dict(value)
+
+
 class QwenImage21Graph:
     """One native construction census, with source checkpoint precision preserved."""
 
@@ -39,19 +45,20 @@ class QwenImage21Graph:
         with transformer_init.no_init_weights():
             self.components: dict[str, Any] = {
                 "transformer": QwenImage21Transformer2DModel.from_config(
-                    dict(mapping["transformer"])
+                    _section(mapping["transformer"], "transformer")
                 ).to(dtype=torch.bfloat16),
                 # Construction dtype leaves derived RoPE buffers in upstream F32.
                 # Casting the completed module would round those frequencies to BF16.
                 "text_encoder": AutoModelForImageTextToText.from_config(
-                    Qwen3VLConfig(**dict(mapping["text_encoder"])), dtype=torch.bfloat16
+                    Qwen3VLConfig(**_section(mapping["text_encoder"], "text_encoder")),
+                    dtype=torch.bfloat16,
                 ),
-                "vae": AutoencoderKLQwenImage21.from_config(dict(mapping["vae"])).to(
+                "vae": AutoencoderKLQwenImage21.from_config(_section(mapping["vae"], "vae")).to(
                     dtype=torch.float32
                 ),
             }
-        self.scheduler_config = dict(mapping["scheduler"])
-        self.processor_config = dict(mapping.get("processor", {}))
+        self.scheduler_config = _section(mapping["scheduler"], "scheduler")
+        self.processor_config = _section(mapping.get("processor", {}), "processor")
 
 
 def build_qwen_image21(config: Config) -> QwenImage21Graph:
