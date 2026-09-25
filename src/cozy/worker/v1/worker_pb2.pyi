@@ -906,7 +906,7 @@ class ProtocolInfoResult(_message.Message):
     def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ..., supports_local_installation_reuse: bool = ..., supports_rental_keepalive: bool = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
-    __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "supports_model_materialization_recovery", "python_requires", "python_version")
+    __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "supports_model_materialization_recovery", "python_requires", "python_version", "package_interface")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
     APPLICATION_FIELD_NUMBER: _ClassVar[int]
@@ -916,6 +916,7 @@ class PreparePackageSetCall(_message.Message):
     SUPPORTS_MODEL_MATERIALIZATION_RECOVERY_FIELD_NUMBER: _ClassVar[int]
     PYTHON_REQUIRES_FIELD_NUMBER: _ClassVar[int]
     PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     package_set: DesiredPackageSet
     application: str
@@ -925,7 +926,8 @@ class PreparePackageSetCall(_message.Message):
     supports_model_materialization_recovery: bool
     python_requires: str
     python_version: str
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., supports_model_materialization_recovery: bool = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ...) -> None: ...
+    package_interface: bytes
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., supports_model_materialization_recovery: bool = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ...) -> None: ...
 
 class PrepareLocalPackageCall(_message.Message):
     __slots__ = ("claim", "local_package_set")
@@ -1276,7 +1278,7 @@ class WeightsTransferCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., request: _Optional[_Union[WeightsTransferRequest, _Mapping]] = ...) -> None: ...
 
 class PreparePackageSetRequest(_message.Message):
-    __slots__ = ("download_delegation", "application", "model_slot_paths", "image_inventory", "locked_requirements", "install_root", "download_delegation_signature", "python_requires", "python_version")
+    __slots__ = ("download_delegation", "application", "model_slot_paths", "image_inventory", "locked_requirements", "install_root", "download_delegation_signature", "python_requires", "python_version", "package_interface")
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     APPLICATION_FIELD_NUMBER: _ClassVar[int]
     MODEL_SLOT_PATHS_FIELD_NUMBER: _ClassVar[int]
@@ -1286,6 +1288,7 @@ class PreparePackageSetRequest(_message.Message):
     DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     PYTHON_REQUIRES_FIELD_NUMBER: _ClassVar[int]
     PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
     download_delegation: bytes
     application: str
     model_slot_paths: _containers.RepeatedScalarFieldContainer[str]
@@ -1295,7 +1298,8 @@ class PreparePackageSetRequest(_message.Message):
     download_delegation_signature: bytes
     python_requires: str
     python_version: str
-    def __init__(self, download_delegation: _Optional[bytes] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., install_root: _Optional[str] = ..., download_delegation_signature: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ...) -> None: ...
+    package_interface: bytes
+    def __init__(self, download_delegation: _Optional[bytes] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., install_root: _Optional[str] = ..., download_delegation_signature: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ...) -> None: ...
 
 class ImageInventory(_message.Message):
     __slots__ = ("profile", "python", "distributions", "interpreters")
@@ -1330,14 +1334,6 @@ class PreparePackageSetResult(_message.Message):
     PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
     placement_set: DesiredPlacementSet
     def __init__(self, placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ...) -> None: ...
-
-class CheckPackageSetCompatibilityResult(_message.Message):
-    __slots__ = ("refusal_code", "refusal_detail")
-    REFUSAL_CODE_FIELD_NUMBER: _ClassVar[int]
-    REFUSAL_DETAIL_FIELD_NUMBER: _ClassVar[int]
-    refusal_code: str
-    refusal_detail: str
-    def __init__(self, refusal_code: _Optional[str] = ..., refusal_detail: _Optional[str] = ...) -> None: ...
 
 class PrepareLocalPackageRequest(_message.Message):
     __slots__ = ("operation_id", "package", "wheels", "install_root", "dependency_requirements", "python_requires", "python_version")
@@ -2476,7 +2472,7 @@ class DeviceLane(_message.Message):
     def __init__(self, lane_id: _Optional[str] = ..., device_ordinals: _Optional[_Iterable[int]] = ..., available_attempt_slots: _Optional[int] = ..., placement_ids: _Optional[_Iterable[str]] = ..., resident_placement_ids: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class PlacementStatus(_message.Message):
-    __slots__ = ("placement_id", "executor_epoch", "dispatchable_binding_digests", "materializable_binding_digests", "faults", "accelerator", "placement_set_digest", "materialization", "serving", "retained_fallback_placement_set_digest", "acquisition", "environment_digest", "device_lane_id")
+    __slots__ = ("placement_id", "executor_epoch", "dispatchable_binding_digests", "materializable_binding_digests", "faults", "accelerator", "placement_set_digest", "materialization", "serving", "retained_fallback_placement_set_digest", "acquisition", "environment_digest", "device_lane_id", "loaded_binding_digests")
     PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTOR_EPOCH_FIELD_NUMBER: _ClassVar[int]
     DISPATCHABLE_BINDING_DIGESTS_FIELD_NUMBER: _ClassVar[int]
@@ -2490,6 +2486,7 @@ class PlacementStatus(_message.Message):
     ACQUISITION_FIELD_NUMBER: _ClassVar[int]
     ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     DEVICE_LANE_ID_FIELD_NUMBER: _ClassVar[int]
+    LOADED_BINDING_DIGESTS_FIELD_NUMBER: _ClassVar[int]
     placement_id: str
     executor_epoch: int
     dispatchable_binding_digests: _containers.RepeatedScalarFieldContainer[bytes]
@@ -2503,7 +2500,8 @@ class PlacementStatus(_message.Message):
     acquisition: PlacementAcquisitionObservation
     environment_digest: str
     device_lane_id: str
-    def __init__(self, placement_id: _Optional[str] = ..., executor_epoch: _Optional[int] = ..., dispatchable_binding_digests: _Optional[_Iterable[bytes]] = ..., materializable_binding_digests: _Optional[_Iterable[bytes]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_set_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_placement_set_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ..., environment_digest: _Optional[str] = ..., device_lane_id: _Optional[str] = ...) -> None: ...
+    loaded_binding_digests: _containers.RepeatedScalarFieldContainer[bytes]
+    def __init__(self, placement_id: _Optional[str] = ..., executor_epoch: _Optional[int] = ..., dispatchable_binding_digests: _Optional[_Iterable[bytes]] = ..., materializable_binding_digests: _Optional[_Iterable[bytes]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_set_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_placement_set_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ..., environment_digest: _Optional[str] = ..., device_lane_id: _Optional[str] = ..., loaded_binding_digests: _Optional[_Iterable[bytes]] = ...) -> None: ...
 
 class PlacementAcquisitionObservation(_message.Message):
     __slots__ = ("package", "model")
@@ -3864,7 +3862,7 @@ class OutputEntry(_message.Message):
     def __init__(self, output_id: _Optional[str] = ..., digest: _Optional[bytes] = ..., length: _Optional[int] = ..., mime_type: _Optional[str] = ..., native_tree: _Optional[_Union[NativeByteTreeRef, _Mapping]] = ...) -> None: ...
 
 class AttemptMetrics(_message.Message):
-    __slots__ = ("runtime_ms", "queue_ms", "peak_device_memory_bytes", "rss_at_end_bytes", "output_count", "input_tokens", "output_tokens", "device_lease_ms", "device_count", "handler_ms", "finalization_ms", "unverified_fields", "post_ms")
+    __slots__ = ("runtime_ms", "queue_ms", "peak_device_memory_bytes", "rss_at_end_bytes", "output_count", "input_tokens", "output_tokens", "device_lease_ms", "device_count", "handler_ms", "finalization_ms", "unverified_fields", "post_ms", "working_peak_device_bytes", "shape_cell")
     RUNTIME_MS_FIELD_NUMBER: _ClassVar[int]
     QUEUE_MS_FIELD_NUMBER: _ClassVar[int]
     PEAK_DEVICE_MEMORY_BYTES_FIELD_NUMBER: _ClassVar[int]
@@ -3878,6 +3876,8 @@ class AttemptMetrics(_message.Message):
     FINALIZATION_MS_FIELD_NUMBER: _ClassVar[int]
     UNVERIFIED_FIELDS_FIELD_NUMBER: _ClassVar[int]
     POST_MS_FIELD_NUMBER: _ClassVar[int]
+    WORKING_PEAK_DEVICE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    SHAPE_CELL_FIELD_NUMBER: _ClassVar[int]
     runtime_ms: int
     queue_ms: int
     peak_device_memory_bytes: int
@@ -3891,7 +3891,9 @@ class AttemptMetrics(_message.Message):
     finalization_ms: int
     unverified_fields: _containers.RepeatedScalarFieldContainer[str]
     post_ms: int
-    def __init__(self, runtime_ms: _Optional[int] = ..., queue_ms: _Optional[int] = ..., peak_device_memory_bytes: _Optional[int] = ..., rss_at_end_bytes: _Optional[int] = ..., output_count: _Optional[int] = ..., input_tokens: _Optional[int] = ..., output_tokens: _Optional[int] = ..., device_lease_ms: _Optional[int] = ..., device_count: _Optional[int] = ..., handler_ms: _Optional[int] = ..., finalization_ms: _Optional[int] = ..., unverified_fields: _Optional[_Iterable[str]] = ..., post_ms: _Optional[int] = ...) -> None: ...
+    working_peak_device_bytes: int
+    shape_cell: str
+    def __init__(self, runtime_ms: _Optional[int] = ..., queue_ms: _Optional[int] = ..., peak_device_memory_bytes: _Optional[int] = ..., rss_at_end_bytes: _Optional[int] = ..., output_count: _Optional[int] = ..., input_tokens: _Optional[int] = ..., output_tokens: _Optional[int] = ..., device_lease_ms: _Optional[int] = ..., device_count: _Optional[int] = ..., handler_ms: _Optional[int] = ..., finalization_ms: _Optional[int] = ..., unverified_fields: _Optional[_Iterable[str]] = ..., post_ms: _Optional[int] = ..., working_peak_device_bytes: _Optional[int] = ..., shape_cell: _Optional[str] = ...) -> None: ...
 
 class TriageBundleRef(_message.Message):
     __slots__ = ("subject_id", "write_receipt_digest", "length")

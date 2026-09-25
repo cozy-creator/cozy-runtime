@@ -136,7 +136,7 @@ def test_numerical_environment_rpc_refuses_unproven_identity_without_detail_leak
 
     server = grpc.server(ThreadPoolExecutor(max_workers=2))
     rpc.add_RuntimePreparationServicer_to_server(
-        _PreparationServicer(None, None, None, None, None, numerical_environment=unproven), server
+        _PreparationServicer(None, None, None, None, numerical_environment=unproven), server
     )
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()

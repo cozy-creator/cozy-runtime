@@ -149,7 +149,7 @@ class HeldManifests:
     verified walk (`acquire_cozytensors`, the walk the model leg already ends on) admits
     every object of its runtime closure, whether or not a current placement uses it.
 
-    Two writers: `observe`, when a placement's model leg settles a manifest, and `rebuild`
+    Two writers: `hold`, when a placement's model leg settles a manifest, and `rebuild`
     at boot, which re-walks the store without a network. A manifest leaves the set when a
     walk finds it incomplete (the bytes went); nothing here removes bytes.
     """
@@ -163,19 +163,27 @@ class HeldManifests:
         with self._lock:
             return sorted(self._held)
 
-    def observe(self, store: Any, digest: str) -> bool:
-        """Re-ask the store whether `digest` is complete and verified; record the answer."""
+    def hold(self, store: Any, digest: str) -> tuple[tuple[str, int], ...]:
+        """One verified walk of `digest`'s runtime closure: record the answer and return the
+        closure's objects, or re-raise the store's refusal after recording the absence."""
         try:
-            store.acquire_cozytensors(digest).release()
-            held = True
+            lease = store.acquire_cozytensors(digest)
         except Exception:
-            held = False
+            self._record(digest, False)
+            raise
+        try:
+            objects = tuple((str(ref), int(length)) for ref, length in lease.objects)
+        finally:
+            lease.release()
+        self._record(digest, True)
+        return objects
+
+    def _record(self, digest: str, held: bool) -> None:
         with self._lock:
             before = digest in self._held
             (self._held.add if held else self._held.discard)(digest)
         if held != before and self._on_change is not None:
             self._on_change()
-        return held
 
     def rebuild(self, store: Any) -> int:
         """Replace the index from TensorFS's verified complete-CozyTensors census."""
@@ -188,20 +196,12 @@ class HeldManifests:
             self._on_change()
         return len(held)
 
-    @staticmethod
-    def _complete(store: Any, digest: str) -> bool:
-        try:
-            store.acquire_cozytensors(digest).release()
-        except Exception:
-            return False
-        return True
-
 
 @dataclass(frozen=True, slots=True)
 class AcquiredPlacement:
     installed: package_environment.InstalledEnvironment | None
     bindings: Mapping[str, DeclaredBinding]
-    model_objects: int
+    manifests: int
     documents: int
     wheels: int
     fetched_bytes: int
@@ -321,7 +321,7 @@ def preinstalled_development(
     return AcquiredPlacement(
         None,
         bindings,
-        len(placement.models),
+        len({str(model["manifest"]["digest"]) for model in placement.models}),
         1,
         0,
         0,
@@ -361,6 +361,7 @@ class Acquirer:
         self._new_digests: set[str] = set()
         self._metric_digests: set[str] = set()
         self._observed_digests: dict[LegName, set[str]] = {"package": set(), "model": set()}
+        self._manifest_bytes: dict[str, int] = {}
         self._thread = local()
         self.observation = AcquisitionObservation(on_observation)
 
@@ -426,12 +427,11 @@ class Acquirer:
             model_future = pool.submit(self._run_model, placement)
             package_future = pool.submit(self._run_package, placement, model_future)
             installed, bindings, documents_count = package_future.result()
-            model_objects = model_future.result()
-        self._verify_model_refs(bindings)
+            manifests = model_future.result()
         return AcquiredPlacement(
             installed=installed,
             bindings=bindings,
-            model_objects=model_objects,
+            manifests=manifests,
             documents=documents_count,
             wheels=self.wheels,
             fetched_bytes=self.fetched_bytes,
@@ -531,31 +531,26 @@ class Acquirer:
             ) from exc
 
     def _models(self, placement: Any) -> int:
+        """Hold every distinct selected manifest with ONE verified walk each; returns the
+        number of manifests held. The walk's object list prices the bindings."""
         if not placement.models:
             return 0
         try:
             tensorfs = fill.tensorfs_module()
             store = fill.open_store(tensorfs, self.tensorfs_root)
-            count = 0
-            for model in placement.models:
-                manifest_digest, manifest_length = _ref(model["manifest"], "model.manifest")
+            manifests = {_ref(model["manifest"], "model.manifest") for model in placement.models}
+            for manifest_digest, manifest_length in sorted(manifests):
                 # TensorFS owns model materialization. A cache miss asks the owner to
                 # ensure this exact selection again, including manifest and header.
                 manifest_raw = bytes(store.manifest(manifest_digest)["manifest"])
                 _verify_bytes(manifest_raw, manifest_digest, manifest_length)
-                reached = {
-                    (str(row["id"]), int(row["length"]))
-                    for row in store.walk_cozytensors(manifest_digest)
-                }
-                closure = {(manifest_digest, manifest_length), *reached}
                 # This worker moves no model bytes (cr-090): the store is filled by
                 # TensorFS's one transport before the placement is acquired. The leg ends
                 # on TensorFS's verified walk over the manifest's runtime closure; the
                 # same walk is the residency fact `held_manifests` reports.
-                if not self.held_manifests.observe(store, manifest_digest):
-                    store.acquire_cozytensors(manifest_digest).release()
-                count += len(closure)
-            return count
+                objects = self.held_manifests.hold(store, manifest_digest)
+                self._manifest_bytes[manifest_digest] = sum(length for _ref_, length in objects)
+            return len(manifests)
         except AcquisitionRefusal:
             raise
         except fill.FillRefusal as exc:
@@ -574,6 +569,16 @@ class Acquirer:
                 else "tensorfs_refused",
                 f"{type(exc).__name__}: {exc}",
             ) from exc
+
+    def _closure_bytes(self, digest: str) -> int:
+        """The manifest's runtime-closure bytes from the model leg's one verified walk;
+        listed (not verified) only when that leg did not run."""
+        if digest not in self._manifest_bytes:
+            store = fill.open_store(fill.tensorfs_module(), self.tensorfs_root)
+            self._manifest_bytes[digest] = sum(
+                int(row["length"]) for row in store.walk_cozytensors(digest)
+            )
+        return self._manifest_bytes[digest]
 
     def _bindings(self, placement: Any) -> tuple[Mapping[str, DeclaredBinding], int]:
         interface_digest, interface_length = placement.package_interface
@@ -648,8 +653,6 @@ class Acquirer:
                 )
             members: list[ModelBinding] = []
             staged_weights: list[int] = []
-            tensorfs = fill.tensorfs_module()
-            store = fill.open_store(tensorfs, self.tensorfs_root)
             for slot in slots:
                 path = f"{name}.models.{slot['slot']}"
                 declared = described_by_path.get(path)
@@ -673,9 +676,7 @@ class Acquirer:
                     for row in slot.get("components", [])
                 }
                 try:
-                    model_weight_bytes = sum(
-                        int(row["length"]) for row in store.walk_cozytensors(reference_manifest)
-                    )
+                    model_weight_bytes = self._closure_bytes(reference_manifest)
                     staged_weights.append(
                         _model_group_weight_bytes(
                             self.tensorfs_root,
@@ -760,22 +761,6 @@ class Acquirer:
                 "PlacementSet/1 does not select the required interface entrypoints",
             )
         return bindings, count
-
-    def _verify_model_refs(self, bindings: Mapping[str, DeclaredBinding]) -> None:
-        if not any(not binding.weightless for binding in bindings.values()):
-            return
-        try:
-            store = fill.open_store(fill.tensorfs_module(), self.tensorfs_root)
-            for binding in bindings.values():
-                for model in binding.model_bindings():
-                    for digest in {model.reference_snapshot, *model.snapshots.values()}:
-                        store.acquire_cozytensors(digest).release()
-        except Exception as exc:
-            raise AcquisitionRefusal(
-                pb.FaultKind.FAULT_KIND_ARTIFACT_DIGEST_MISMATCH,
-                "selected_model_manifest_unavailable",
-                f"{type(exc).__name__}: {exc}",
-            ) from exc
 
     def _stage(self, digest: str, raw: bytes) -> Path:
         self.selection_root.mkdir(parents=True, exist_ok=True, mode=0o755)

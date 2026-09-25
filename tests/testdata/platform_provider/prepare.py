@@ -19,7 +19,13 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import base_observation, canonical, package_environment
+from cozy_runtime.internal import (
+    base_observation,
+    canonical,
+    package_environment,
+    package_interface,
+    static_interface,
+)
 from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package_set
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -90,26 +96,15 @@ class Fixture:
                 ],
             ),
             locked_requirements=locked,
+            package_interface=package_interface.canonical_bytes(
+                static_interface.build(Path(__file__).resolve().parent / "app")
+            ),
         )
 
     def close(self) -> None:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
-
-    @staticmethod
-    def describe(installed: package_environment.InstalledEnvironment, distribution: str) -> bytes:
-        code = (
-            "from cozy_runtime.internal import package_interface; "
-            "from cozy_runtime.internal.discovery import discover_distribution; "
-            f"found=discover_distribution({distribution!r}); "
-            "print(package_interface.canonical_bytes(package_interface.build(found)).decode())"
-        )
-        result = subprocess.run(
-            [str(installed.python), "-I", "-c", code], cwd="/", capture_output=True, text=True
-        )
-        assert result.returncode == 0, result.stderr
-        return result.stdout.strip().encode()
 
     def prepare(self) -> pb.PreparePackageSetResult:
         for name in ("artifacts", "store"):
@@ -120,7 +115,6 @@ class Fixture:
             tensorfs_root=self.root / "store",
             install_root=self.install,
             python=Path(sys.executable),
-            describe=self.describe,
             verified=lambda _digest, _length, _path: None,
             base=self.base,
         )

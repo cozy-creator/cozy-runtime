@@ -176,9 +176,6 @@ class GrpcControlHost:
         tls_cert: Path | None = None,
         tls_key: Path | None = None,
         on_bound: Callable[[str], None] | None = None,
-        compatibility_checker: (
-            Callable[[pb.PreparePackageSetRequest], pb.CheckPackageSetCompatibilityResult] | None
-        ) = None,
         preparer: Callable[[pb.PreparePackageSetRequest], pb.PreparePackageSetResult] | None = None,
         model_source_preparer: (
             Callable[[pb.PrepareModelSourceRequest], pb.PrepareModelSourceResult] | None
@@ -216,7 +213,6 @@ class GrpcControlHost:
         self.tls_cert = tls_cert
         self.tls_key = tls_key
         self.on_bound = on_bound
-        self.compatibility_checker = compatibility_checker
         self.preparer = preparer
         self.model_source_preparer = model_source_preparer
         self.model_source_releaser = model_source_releaser
@@ -246,7 +242,6 @@ class GrpcControlHost:
         pb_grpc.add_WorkerControlServicer_to_server(control, self.server)
         loopback_services = (
             self.workspace_service is not None
-            or self.compatibility_checker is not None
             or self.preparer is not None
             or self.model_source_preparer is not None
             or self.model_source_releaser is not None
@@ -267,7 +262,6 @@ class GrpcControlHost:
         # without optional preparation handlers. Absent handlers still refuse calls.
         pb_grpc.add_RuntimePreparationServicer_to_server(
             _PreparationServicer(
-                self.compatibility_checker,
                 self.preparer,
                 self.model_source_preparer,
                 self.local_package_preparer,
@@ -388,9 +382,6 @@ def _refuse(context: Any, exc: BaseException) -> Any:
 class _PreparationServicer(WorkspaceRPC):
     def __init__(
         self,
-        compatibility_handler: (
-            Callable[[pb.PreparePackageSetRequest], pb.CheckPackageSetCompatibilityResult] | None
-        ),
         package_handler: (
             Callable[[pb.PreparePackageSetRequest], pb.PreparePackageSetResult] | None
         ),
@@ -424,7 +415,6 @@ class _PreparationServicer(WorkspaceRPC):
         store_collector: Callable[[], pb.CollectStoreGarbageResult] | None = None,
         workspace_service: WorkspaceService | None = None,
     ) -> None:
-        self.compatibility_handler = compatibility_handler
         self.package_handler = package_handler
         self.model_source_handler = model_source_handler
         self.local_package_handler = local_package_handler
@@ -488,19 +478,6 @@ class _PreparationServicer(WorkspaceRPC):
                 grpc.StatusCode.UNIMPLEMENTED, "source checkpoint transfer unavailable"
             )
         return self.checkpoint_transfer(request)
-
-    def CheckPackageSetCompatibility(
-        self, request: pb.PreparePackageSetRequest, context: Any
-    ) -> Any:
-        handler = self.compatibility_handler
-        if handler is None:
-            return context.abort(
-                grpc.StatusCode.UNIMPLEMENTED, "package compatibility checking is unavailable"
-            )
-        try:
-            return handler(request)
-        except Exception as exc:
-            return _refuse(context, exc)
 
     def PreparePackageSet(self, request: pb.PreparePackageSetRequest, context: Any) -> Any:
         handler = self.package_handler

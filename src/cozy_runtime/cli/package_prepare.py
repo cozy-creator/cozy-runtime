@@ -91,13 +91,6 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
                 Exit.usage,
             )
         models.append(row)
-    seed = canonical.write(
-        {
-            "package": package,
-            "release": release,
-            "locked_requirements_digest": locked.digest,
-        }
-    )
     # Linux caps Unix socket paths at 108 bytes. The generation/cache path is
     # user-selectable and may be much longer, so disposable executor control
     # belongs in a private short system-temporary directory.
@@ -138,7 +131,6 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             release=release,
             locked=locked,
             models=models,
-            placement_seed=seed,
             artifact_cache=artifact_cache,
             tensorfs_root=tensorfs_root,
             install_root=installed_environment.generation,

@@ -1728,33 +1728,6 @@ class Worker:
 
     # ------------------------------------------------------------------ plumbing
 
-    def check_package_set_compatibility(
-        self, request: pb.PreparePackageSetRequest
-    ) -> pb.CheckPackageSetCompatibilityResult:
-        """Cold metadata-only CPU/meta fit; no device lane or executor is acquired."""
-
-        from cozy_runtime.internal.worker import package_prepare
-
-        with self.preparation_lock:
-            try:
-                return package_prepare.check_package_set_compatibility(
-                    request,
-                    python_root=self.config.managed_python_root,
-                    cancel=self.stop.is_set,
-                    progress=lambda message: self.note("python", message),
-                    tensorfs_root=Path(self.options.tensorfs_root or ""),
-                    install_root=Path(self.options.install_root or ""),
-                    python=Path(self.options.python or sys.executable),
-                    base=self.base,
-                )
-            except package_prepare.PreparationRefusal as exc:
-                return pb.CheckPackageSetCompatibilityResult(
-                    refusal_code=exc.code,
-                    refusal_detail="".join(
-                        character if " " <= character <= "~" else "?" for character in exc.detail
-                    )[:1024],
-                )
-
     def prepare_package_set(
         self, request: pb.PreparePackageSetRequest
     ) -> pb.PreparePackageSetResult:
@@ -1890,12 +1863,16 @@ class Worker:
                         "local_package_reuse_unavailable",
                         "the installed local revision is absent or changed; upload a new operation",
                     )
+            if not local:
+                assert isinstance(request, pb.PreparePackageSetRequest)
+                return self._prepare_published(request)
             # Preparation never borrows execution authority. Even an apparently
             # idle primary slot can be admitted by a concurrent desired-state
             # transition while describe is importing the new package.
             supervision = self._new_preparation_supervision()
             try:
-                return self._prepare_package_in(request, supervision, local=local)
+                assert isinstance(request, pb.PrepareLocalPackageRequest)
+                return self._prepare_local_in(request, supervision)
             finally:
                 executor = supervision.current
                 if executor is not None:
@@ -1906,10 +1883,10 @@ class Worker:
                 supervision.close()
 
     def _new_preparation_supervision(self) -> ExecutorSupervision:
-        """The preparation-scoped executor slot. Package describe needs an isolated
-        executor (package code never gets worker authority), and borrowing the primary
-        slot while placements serve would replace a serving executor with the prepared
-        package's environment."""
+        """The preparation-scoped executor slot for a LOCAL revision's describe. Package
+        describe needs an isolated executor (package code never gets worker authority), and
+        borrowing the primary slot while placements serve would replace a serving executor
+        with the prepared package's environment. Published sets carry their interface."""
 
         # Keep preparation's socket shorter than the boot-validated primary
         # socket, independent of placement and operation identifiers. Its state
@@ -1933,14 +1910,10 @@ class Worker:
             self.note("recovery", f"preparation: reclaimed {len(killed)} prior executor(s)")
         return supervision
 
-    def _prepare_package_in(
-        self,
-        request: pb.PreparePackageSetRequest | pb.PrepareLocalPackageRequest,
-        supervision: ExecutorSupervision,
-        *,
-        local: bool,
+    def _prepare_local_in(
+        self, request: pb.PrepareLocalPackageRequest, supervision: ExecutorSupervision
     ) -> pb.PreparePackageSetResult:
-        from cozy_runtime.internal.worker import package_prepare
+        from cozy_runtime.internal.worker import local_installations, package_prepare
 
         def describe(
             installed: package_environment.InstalledEnvironment, distribution: str
@@ -2007,33 +1980,40 @@ class Worker:
         def mark_verified(digest: str, length: int, path: Path) -> None:
             self.verified_artifacts.record(digest, length, path)
 
-        if local:
-            assert isinstance(request, pb.PrepareLocalPackageRequest)
-            materialized: list[package_environment.InstalledEnvironment] = []
-            result = package_prepare.prepare_local_package(
-                request,
-                python_root=self.config.managed_python_root,
-                cancel=self.stop.is_set,
-                progress=lambda message: self.note("python", message),
-                artifact_cache=Path(self.options.artifact_cache or ""),
-                install_root=Path(self.options.install_root or ""),
-                python=Path(self.options.python or sys.executable),
-                describe=describe,
-                verified=mark_verified,
-                job_plan_root=self.config.cozy_home / "job-plans",
-                base=self.base,
-                materialized=materialized.append,
-                dependency_python=self.options.environment_python,
-                dependency_cache=self.config.dependency_cache,
-            )
-            from cozy_runtime.internal.worker import local_installations
+        materialized: list[package_environment.InstalledEnvironment] = []
+        result = package_prepare.prepare_local_package(
+            request,
+            python_root=self.config.managed_python_root,
+            cancel=self.stop.is_set,
+            progress=lambda message: self.note("python", message),
+            artifact_cache=Path(self.options.artifact_cache or ""),
+            install_root=Path(self.options.install_root or ""),
+            python=Path(self.options.python or sys.executable),
+            describe=describe,
+            verified=mark_verified,
+            job_plan_root=self.config.cozy_home / "job-plans",
+            base=self.base,
+            materialized=materialized.append,
+            dependency_python=self.options.environment_python,
+            dependency_cache=self.config.dependency_cache,
+        )
+        installed = materialized[0]
+        local_installations.record(
+            Path(self.options.install_root or ""), request, result, installed
+        )
+        return self._register_local_package(request, result, installed)
 
-            installed = materialized[0]
-            local_installations.record(
-                Path(self.options.install_root or ""), request, result, installed
-            )
-            return self._register_local_package(request, result, installed)
-        assert isinstance(request, pb.PreparePackageSetRequest)
+    def _prepare_published(
+        self, request: pb.PreparePackageSetRequest
+    ) -> pb.PreparePackageSetResult:
+        """Install the release's locked environment and bind models from its wire interface;
+        no executor is spawned (proto-061 C)."""
+
+        from cozy_runtime.internal.worker import package_prepare
+
+        def mark_verified(digest: str, length: int, path: Path) -> None:
+            self.verified_artifacts.record(digest, length, path)
+
         published: list[package_environment.InstalledEnvironment] = []
         result = package_prepare.prepare_package_set(
             request,
@@ -2044,7 +2024,6 @@ class Worker:
             tensorfs_root=Path(self.options.tensorfs_root or ""),
             install_root=Path(self.options.install_root or ""),
             python=Path(self.options.python or sys.executable),
-            describe=describe,
             verified=mark_verified,
             job_plan_root=self.config.cozy_home / "job-plans",
             base=self.base,
@@ -4757,18 +4736,14 @@ class Worker:
             acquired = acquirer.acquire(placement)
             self.note(
                 "materialization",
-                f"revision {revision} acquired {acquired.wheels} wheel(s), "
-                f"{acquired.documents} selected document(s), hydrated "
-                f"{acquired.model_objects} model object(s) — "
-                f"{acquired.fetched_bytes} new byte(s) — and published "
+                f"revision {revision}: {acquired.manifests} manifest(s) held; "
+                f"{acquired.fetched_bytes} byte(s) new; "
                 + (
-                    f"content {acquired.installed.content_digest} at "
-                    f"{acquired.installed.generation}; "
+                    f"environment {acquired.installed.content_digest} at "
+                    f"{acquired.installed.generation}"
                     if acquired.installed is not None
-                    else "source-checkout content; "
-                )
-                + f"verified {acquired.verified_bytes} byte(s), "
-                f"trusted same-boot reuse {acquired.trusted_reuse_bytes} byte(s)",
+                    else "source-checkout environment"
+                ),
             )
             return acquired
         except acquire.AcquisitionRefusal as exc:
@@ -7458,7 +7433,6 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     )
     worker = Worker(config, options, host)
     if _loopback_preparation_listener(listen):
-        host.compatibility_checker = worker.check_package_set_compatibility
         host.preparer = worker.prepare_package_set
         host.local_package_preparer = worker.prepare_local_package
         host.unpublished_placement_preparer = worker.prepare_unpublished_placement

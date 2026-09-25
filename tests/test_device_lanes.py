@@ -198,23 +198,23 @@ def _owner_below_lanes(owner: LocalRecordOwner) -> None:
 
 
 @needs_executor
-def test_wire59_owner_runs_inference_on_wire60_worker() -> None:
-    def wire59(owner: LocalRecordOwner) -> None:
+def test_previous_minor_owner_runs_inference_on_current_worker() -> None:
+    def previous(owner: LocalRecordOwner) -> None:
         queued = owner.host.inbound.get_nowait()
         assert queued is not None and queued.WhichOneof("msg") == "claim"
-        queued.claim.wire_minor = 59
+        queued.claim.wire_minor = 60
         owner.host.deliver(queued)
         make_desired = owner._desired_state
 
         def desired() -> pb.DesiredWorkerState:
             directive = make_desired()
-            directive.wire_minor = 59
+            directive.wire_minor = 60
             return directive
 
         owner._desired_state = desired  # type: ignore[method-assign]
 
     with _workspace() as root:
-        outcome, seals = _slice(root, devices="0", kind="entrypoint", owner_hook=wire59)
+        outcome, seals = _slice(root, devices="0", kind="entrypoint", owner_hook=previous)
     assert outcome.result == {"message": "polo"}, (outcome.error, outcome.faults)
     assert seals == ["0"]
 

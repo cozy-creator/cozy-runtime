@@ -1,52 +1,26 @@
-"""Placement identity is the content prepared, never a credential.
+"""Placement and model identity are stable as a package's model set grows (wire 61).
 
-xs-014 finding 1: the seed used to be the raw document bytes — whose per-signing
-expiry and worker pins re-identified the SAME package on every re-signed converge,
-defeating ledger reuse and (pre co-tenancy fix) making one package's identity depend
-on its neighbors. Those fields are deleted (owner ruling 2026-09-03), so a download
-set is now a pure function of its content; identity still derives from the named
-facts, because that is what identity means.
+One placement per package release: `placement_id = "package-" + sha256(package \\0 release)`,
+never the bound model rows, so adding a slot never retires the process that serves the
+others. A Model's id is a function of its slot path alone, so every other slot's binding
+digest survives the addition.
 """
 
 from __future__ import annotations
 
-from cozy_runtime.internal.worker.package_prepare import placement_identity
+import hashlib
 
-_MODELS = [
-    {
-        "manifest": "sha256:aa",
-        "model": "paul/anima",
-        "package": "paul/anima",
-        "release": "1.0.0",
-        "slot": "generate.models.model",
-    },
-    {
-        "manifest": "sha256:bb",
-        "model": "paul/sdxl",
-        "package": "paul/anima",
-        "release": "1.0.0",
-        "slot": "generate.models.refiner",
-    },
-]
+from cozy_runtime.internal.worker.package_prepare import model_id, placement_id
 
 
-def test_identity_ignores_credential_clocks() -> None:
-    # Two download sets for the same content are identical bytes now, and even a
-    # document that still carried an expiry or worker pins could not reach the
-    # derivation: it reads named facts, never the bytes.
-    first = placement_identity("paul/anima", "1.0.0", "sha256:cc", _MODELS)
-    second = placement_identity("paul/anima", "1.0.0", "sha256:cc", list(_MODELS))
-    assert first == second
+def test_placement_id_is_the_package_release() -> None:
+    expected = "package-" + hashlib.sha256(b"paul/minimax-h3\x001.2.0").hexdigest()[:24]
+    assert placement_id("paul/minimax-h3", "1.2.0") == expected
+    assert placement_id("paul/minimax-h3", "1.2.1") != expected
+    assert placement_id("paul/minimax-h3-tools", "1.2.0") != expected
 
 
-def test_identity_ignores_model_row_order() -> None:
-    assert placement_identity(
-        "paul/anima", "1.0.0", "sha256:cc", list(reversed(_MODELS))
-    ) == placement_identity("paul/anima", "1.0.0", "sha256:cc", _MODELS)
-
-
-def test_identity_tracks_the_selection() -> None:
-    base = placement_identity("paul/anima", "1.0.0", "sha256:cc", _MODELS)
-    assert placement_identity("paul/anima", "1.0.0", "sha256:cc", _MODELS[:1]) != base
-    assert placement_identity("paul/anima", "1.0.1", "sha256:cc", _MODELS) != base
-    assert placement_identity("paul/anima", "1.0.0", "sha256:dd", _MODELS) != base
+def test_model_id_is_the_slot_path() -> None:
+    slot = "fl2va.models.model"
+    assert model_id(slot) == "model-" + hashlib.sha256(slot.encode()).hexdigest()[:16]
+    assert model_id(slot) != model_id("ref2va_turbo.models.base_model")

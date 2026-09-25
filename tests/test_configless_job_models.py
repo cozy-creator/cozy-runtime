@@ -9,7 +9,9 @@ import pytest
 import tensorfs
 from tensorfs.derived import Config, Derivation, Part, Target, Tensor
 
+from cozy_runtime.internal import base_observation, census_cache
 from cozy_runtime.internal.encoding import SPEC_PLAIN
+from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
     _entrypoints,
@@ -88,7 +90,7 @@ def test_configless_job_source_prepares_without_a_constructor_or_fabricated_conf
         selections=[selection(manifest, "main.models.source")],
         tensorfs_root=root,
         verified=lambda *_args: None,
-        derive=None,
+        census=None,
     )
     assert entrypoints == [] and len(models) == 1
     assert documents.spell(models[0].manifest.digest) == manifest
@@ -121,7 +123,7 @@ def test_same_configless_manifest_still_refuses_when_bound_for_serving(
             selections=selected,
             tensorfs_root=root,
             verified=lambda *_args: None,
-            derive=None,
+            census=None,
         )
 
 
@@ -129,9 +131,12 @@ def test_shared_configured_manifest_derives_only_its_serving_slot(tmp_path: Path
     root, manifest, _length, _payload = checkpoint(tmp_path, config=True)
     observed = []
 
-    def derive(path: str, config: bytes, assets: Any, dtypes: Any) -> tuple[str, ...]:
-        observed.append((path, config, assets, dtypes))
-        return ("adapter",)
+    def census(wanted: Any) -> dict[str, census_cache.Census]:
+        for path, (model, _declared) in wanted.items():
+            observed.append(
+                (path, model["config_bytes"], model["assets"](), model["tensor_dtypes"])
+            )
+        return {path: census_cache.Census(("adapter",), (), True, "") for path in wanted}
 
     selected = [
         selection(manifest, slot) for slot in ("main.models.source", "generate.models.model")
@@ -142,7 +147,7 @@ def test_shared_configured_manifest_derives_only_its_serving_slot(tmp_path: Path
         selections=selected,
         tensorfs_root=root,
         verified=lambda *_args: None,
-        derive=derive,
+        census=census,
     )
     assert len(models) == 2 and [entry.name for entry in entries] == ["generate"]
     assert observed == [
@@ -158,20 +163,16 @@ def test_shared_configured_manifest_derives_only_its_serving_slot(tmp_path: Path
     ]
 
 
-@pytest.mark.parametrize("failure", ["length", "closure", "undeclared"])
+@pytest.mark.parametrize("failure", ["length", "undeclared"])
 def test_job_source_retains_manifest_closure_and_declared_slot_guards(
     tmp_path: Path, failure: str
 ) -> None:
-    root, manifest, length, payload = checkpoint(tmp_path)
+    root, manifest, length, _payload = checkpoint(tmp_path)
     chosen = selection(manifest, "main.models.source", manifest_length=length)
     if failure == "length":
         chosen["manifest_length"] = length + 1
-    elif failure == "undeclared":
-        chosen["slot"] = "missing.models.source"
     else:
-        stored = next(root.rglob(payload))
-        stored.chmod(stored.stat().st_mode | 0o200)
-        stored.write_bytes(b"x" * stored.stat().st_size)
+        chosen["slot"] = "missing.models.source"
     with pytest.raises(PreparationRefusal):
         _entrypoints(
             interface(),
@@ -179,5 +180,38 @@ def test_job_source_retains_manifest_closure_and_declared_slot_guards(
             selections=[chosen],
             tensorfs_root=root,
             verified=lambda *_args: None,
-            derive=None,
+            census=None,
         )
+
+
+def test_a_corrupt_closure_is_refused_by_the_one_acquisition_walk(tmp_path: Path) -> None:
+    """Preparation takes no closure lease; the placement's acquisition walk is the verifier."""
+
+    root, manifest, length, payload = checkpoint(tmp_path)
+    models, _ = _entrypoints(
+        interface(),
+        package_name="example/convert",
+        selections=[selection(manifest, "main.models.source", manifest_length=length)],
+        tensorfs_root=root,
+        verified=lambda *_args: None,
+        census=None,
+    )
+    stored = next(root.rglob(payload))
+    stored.chmod(stored.stat().st_mode | 0o200)
+    stored.write_bytes(b"x" * stored.stat().st_size)
+    for name in ("cache", "environment", "selection"):
+        (tmp_path / name).mkdir()
+    acquirer = Acquirer(
+        cache_root=tmp_path / "cache",
+        install_root=tmp_path / "environment",
+        selection_root=tmp_path / "selection",
+        tensorfs_root=root,
+        python=Path("/usr/bin/python3"),
+        base=base_observation.current(),
+    )
+    placement: Any = type(
+        "P", (), {"models": [{"manifest": {"digest": manifest, "length": length}}]}
+    )()
+    assert len(models) == 1
+    with pytest.raises(AcquisitionRefusal):
+        acquirer._models(placement)
