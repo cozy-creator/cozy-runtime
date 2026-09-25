@@ -424,6 +424,69 @@ def materialize(
         return installed
 
 
+def materialize_captured_builtin(
+    source: Input,
+    root: Path,
+    *,
+    captured: InstalledEnvironment,
+    python: Path,
+    base: base_observation.Observation | None = None,
+    dependency_cache: Path | None = None,
+) -> InstalledEnvironment:
+    """Rebind only the sealed Runtime builtin closure to its ordinary placement.
+
+    This trusted worker path has already captured SDK bytes and the numerical
+    supplement. Arbitrary rented packages still require exact dependency wheels.
+    """
+    from cozy_runtime.internal import _installed_dependencies, builtin_operations
+
+    if _sha(captured.receipt_bytes) != captured.receipt_digest:
+        raise EnvironmentRefusal("builtin_snapshot_mismatch", "captured receipt differs")
+    receipt = parse_environment_receipt(captured.receipt_bytes)
+    if (
+        len(source.wheels) != 1
+        or source.wheels[0].distribution != builtin_operations.NAME
+        or source.wheels[0].owner != "project"
+        or receipt["project_wheel_digest"] != source.project_wheel_digest
+        or receipt["package_wheels"]
+        != _receipt(source, source.wheels, captured.content_digest)["package_wheels"]
+    ):
+        raise EnvironmentRefusal("builtin_snapshot_mismatch", "captured carrier differs")
+    held = open_generation(
+        captured.generation.parent.parent,
+        receipt_digest=captured.receipt_digest,
+        environment_digest=receipt["environment_digest"],
+        python=python,
+    )
+    if held.generation != captured.generation or held.content_digest != captured.content_digest:
+        raise EnvironmentRefusal("builtin_snapshot_mismatch", "captured SDK generation differs")
+    _require_same_interpreter(python, held.python)
+    identity = canonical.parse_canonical((held.generation / CONTENT_IDENTITY_NAME).read_bytes())
+    manifest = _installed_dependencies.read_manifest(
+        held.generation, identity["dependency_snapshot"]
+    )
+    observed = base or observe_base(python)
+    wheels = _verify_inventory(source, observed, venv_precedence=True)
+    inspected = _verify_grants(source, wheels, observed)
+    # Reserve copied payloads plus directories/metadata even without shared inodes.
+    files = manifest["files"]
+    nodes = {str(parent) for row in files for parent in PurePosixPath(row["path"]).parents}
+    count = len(files) + len(nodes)
+    payload = sum(row["length"] for row in files)
+    own = _wheel_write_bound(root, inspected)
+    with storage_admission.admit(
+        storage_admission.Write(
+            root, own.bytes + 2 * payload + count * (128 << 10), own.inodes + 2 * count
+        ),
+        storage_admission.Write(
+            dependency_cache or root / "wheel-cache", 2 * payload + (1 << 20), 2 * count + 128
+        ),
+    ):
+        return _materialize_dependency_snapshot(
+            source, root, python, held.python, observed, dependency_cache=dependency_cache
+        )
+
+
 def accelerator_warnings(
     versions: Mapping[str, str], base: base_observation.Observation
 ) -> tuple[str, ...]:

@@ -277,7 +277,7 @@ class Builtins:
             verified=verified,
             job_plan_root=worker.config.cozy_home / "job-plans",
             base=worker.base,
-            dependency_python=numerical_environment.python,
+            builtin_snapshot=numerical_environment,
             dependency_cache=worker.config.dependency_cache,
             materialized=materialized.append,
         )
