@@ -116,7 +116,7 @@ def test_parent_writer_checks_admission_before_creating_native_writer(
     )
 
     def refuse(*writes: storage.Write) -> NoReturn:
-        raise storage.StorageRefusal("native capacity exhausted")
+        raise storage.StorageRefusal("native capacity exhausted", code="insufficient_storage")
 
     with monkeypatch.context() as scoped:
         scoped.setattr(storage, "acquire", refuse)

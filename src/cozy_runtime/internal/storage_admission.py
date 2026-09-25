@@ -22,15 +22,26 @@ from weakref import WeakValueDictionary
 
 
 class StorageRefusal(Exception):
-    code = "insufficient_storage"
+    """A Runtime write or wheel transfer that storage admission did not grant.
 
-    def __init__(self, detail: str, facts: dict[str, int] | None = None) -> None:
+    `code` is the owner's stable reason, `facts` its measured budget, if any. A refusal
+    that carries a budget and names no other code is a capacity refusal.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        facts: dict[str, int] | None = None,
+        *,
+        code: str | None = None,
+    ) -> None:
         super().__init__(detail)
         self.facts = facts or {}
+        self.code = code or ("insufficient_storage" if self.facts else "storage_admission_refused")
         counts = ", ".join(
             f"{key}={value}" for key, value in sorted(self.facts.items()) if type(value) is int
         )
-        self.detail = detail + (": " + counts if counts else "")
+        self.detail = detail + (" [" + counts + "]" if counts else "")
         self.args = (self.detail,)
 
 
@@ -208,7 +219,10 @@ def _recover(writes: tuple[Write, ...], facts: dict[str, int]) -> bool:
                 matched = True
         return matched
     except OSError as exc:
-        raise StorageRefusal("reclamation filesystem identity is unavailable") from exc
+        raise StorageRefusal(
+            f"reclamation filesystem identity is unavailable: {exc}",
+            code="storage_capacity_unavailable",
+        ) from exc
     finally:
         _reclaiming.reset(token)
 
@@ -228,11 +242,18 @@ def admit(*writes: Write) -> Iterator[None]:
 
 
 @contextmanager
-def _exchange(body: bytes, directories: tuple[Path, ...] = ()) -> Iterator[dict[str, object]]:
+def _exchange(
+    body: bytes, directories: tuple[Path, ...] = (), *, subject: str = "Runtime disk write"
+) -> Iterator[dict[str, object]]:
     if _channel is None or _held.get():
-        raise StorageRefusal("supervisor storage channel is unavailable or already held")
+        raise StorageRefusal(
+            "supervisor storage channel is unavailable or already held",
+            code="storage_admission_unavailable",
+        )
     if len(body) > 4096:
-        raise StorageRefusal("Runtime write admission exceeds its control bound")
+        raise StorageRefusal(
+            "Runtime write admission exceeds its control bound", code="storage_request_invalid"
+        )
     client, host = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     with client, host:
         try:
@@ -271,11 +292,31 @@ def _exchange(body: bytes, directories: tuple[Path, ...] = ()) -> Iterator[dict[
                 raise ValueError("invalid admission response")
             answer = json.loads(raw)
             if not isinstance(answer, dict) or answer.get("ok") is not True:
-                facts = answer.get("facts", {}) if isinstance(answer, dict) else {}
-                raise StorageRefusal("supervisor refused Runtime disk write", facts)
+                raise _refusal(subject, answer)
         except (OSError, ValueError) as exc:
-            raise StorageRefusal("supervisor storage admission is unavailable") from exc
+            raise StorageRefusal(
+                f"supervisor storage admission is unavailable for {subject}: "
+                f"{type(exc).__name__}: {exc}",
+                code="storage_admission_unavailable",
+            ) from exc
         yield answer
+
+
+def _refusal(subject: str, answer: object) -> StorageRefusal:
+    """The supervisor's own code and reason; a reasonless answer says that it was one."""
+    fields = answer if isinstance(answer, dict) else {}
+    code, reason, facts = fields.get("code"), fields.get("reason"), fields.get("facts")
+    if not isinstance(code, str) or not code:
+        code = None
+    if not isinstance(reason, str) or not reason:
+        reason = "the supervisor gave no reason"
+    return StorageRefusal(
+        f"supervisor refused {subject}: {reason}",
+        {key: value for key, value in facts.items() if type(value) is int}
+        if isinstance(facts, dict)
+        else None,
+        code=code,
+    )
 
 
 def fetch_wheel(operation: str, filename: str, digest: str, url: str) -> tuple[Path, int]:
@@ -284,14 +325,20 @@ def fetch_wheel(operation: str, filename: str, digest: str, url: str) -> tuple[P
         {"operation": operation, "filename": filename, "digest": digest, "url": url},
         separators=(",", ":"),
     ).encode()
-    with _exchange(body) as answer:
+    with _exchange(body, subject=f"locked wheel {filename}") as answer:
         path, length = answer.get("path"), answer.get("length")
         if not isinstance(path, str) or type(length) is not int or not 0 < length <= 2 << 30:
-            raise StorageRefusal("supervisor returned an invalid wheel file")
+            raise StorageRefusal(
+                f"supervisor returned an invalid file for locked wheel {filename}",
+                code="wheel_download_failed",
+            )
         return Path(path), length
 
 
 def release_wheels(operation: str) -> None:
     """A completed immutable install releases its existing wheel staging operation."""
-    with _exchange(json.dumps({"operation": operation, "release": True}).encode()):
+    with _exchange(
+        json.dumps({"operation": operation, "release": True}).encode(),
+        subject=f"wheel staging release {operation}",
+    ):
         pass
