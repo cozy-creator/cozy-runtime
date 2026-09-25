@@ -22,6 +22,7 @@ from cozy_runtime.internal.static_interface import build_builtin
 
 NAME = "cozy-runtime-operations"
 MODULE = "cozy_runtime.derive.operations"
+EXPORTS = ("quantize", "prepare_model")
 APPLICATION = MODULE + ":app"
 FLOOR = "0.16.8"
 WHEEL = (
@@ -163,9 +164,10 @@ def rows() -> list[dict[str, Any]]:
         {
             "interface_digest": digest(),
             "module": MODULE,
-            "export": "quantize",
+            "export": export,
             "builtin": "operations",
         }
+        for export in EXPORTS
     ]
 
 
@@ -202,5 +204,5 @@ def supports_environment(python: str) -> bool:
 
 
 def validate_binding(interface: str, module: str, export: str) -> None:
-    if (interface, module, export) != (digest(), MODULE, "quantize"):
+    if (interface, module) != (digest(), MODULE) or export not in EXPORTS:
         raise _refuse()

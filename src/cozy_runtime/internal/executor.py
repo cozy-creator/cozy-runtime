@@ -3006,7 +3006,7 @@ class Executor:
                 from cozy_runtime.derive.operations import app
 
                 describe(app)
-                builtin_surface = app.get("quantize").surface
+                builtin_surface = app.get(export).surface
                 request_type, result_type = (
                     builtin_surface.payload_type,
                     builtin_surface.result_type,

@@ -76,3 +76,25 @@ async def source_files(source: SourceArtifact) -> Tree:
     """Grant a readonly view of a retained ordinary source, bounded to 64 MiB."""
     result = cast(_SourceFilesResult, await _call("source_files", {"source": source}))
     return result.files
+
+
+async def ingest_huggingface(repository: str, *, revision: str) -> ModelArtifact:
+    """Prepare a complete native model using its reviewed model-owned recipe.
+
+    Each source, conversion and metadata derivation retains its own receipt.
+    Upload and release publication remain explicit separate operations.
+    """
+    from cozy_runtime.derive.operations import prepare_model
+    from cozy_runtime.models.ingestion import require_recipe
+
+    recipe = require_recipe(repository, revision)
+    source = await download_huggingface(
+        recipe.repository, revision=recipe.revision, carriers=recipe.carriers
+    )
+    model = await convert_cozytensors(source, profile=recipe.profile)
+    metadata = await download_huggingface(
+        recipe.repository, revision=recipe.revision, files=tuple(recipe.metadata)
+    )
+    return await prepare_model(
+        source=model, metadata=await source_files(metadata), recipe=recipe.name
+    )

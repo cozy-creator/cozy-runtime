@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import msgspec
 
@@ -11,11 +11,13 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author import (
     MAX_WEIGHTS_NEW_BYTES,
     App,
+    AssetBound,
     Context,
     Loader,
     Model,
     ModelArtifact,
     Telemetry,
+    Tree,
     UnsupportedInput,
     WeightsOutput,
     invocable,
@@ -186,3 +188,22 @@ async def quantize(
 
 
 app.job(quantize, weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),))
+
+
+@invocable(memoize=True)
+async def prepare_model(
+    ctx: Context,
+    *,
+    source: QuantizationSource,
+    metadata: Annotated[Tree, AssetBound(max_bytes=64 << 20)],
+    recipe: str,
+) -> ModelArtifact:
+    """Attach reviewed model-owned metadata to an exact native source census."""
+    if recipe != "qwen-image-2.1/original/1":
+        raise UnsupportedInput("Unknown model preparation recipe", code="model_ingestion_recipe")
+    from cozy_runtime.models.qwen_image21.ingestion import prepare
+
+    return await prepare(ctx, source=source, metadata=metadata)
+
+
+app.job(prepare_model, weights=(WeightsOutput("model", max_new_bytes=8 << 20),))
