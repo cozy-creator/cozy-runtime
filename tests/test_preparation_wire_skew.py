@@ -15,9 +15,12 @@ from cozy_runtime.internal import (
     canonical,
     package_environment,
     package_interface,
+    proctree,
     static_interface,
 )
+from cozy_runtime.internal.worker.child import Executor, ExecutorSupervision
 from cozy_runtime.internal.worker.control import InMemoryControlHost, _PreparationServicer
+from cozy_runtime.internal.worker.package_prepare import PreparationRefusal
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions, read_placement_set
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
@@ -39,12 +42,33 @@ def serve(ctx: Context, payload: Request) -> Result:
 
 class ObservedWorker(Worker):
     descriptions: list[str]
+    describe_executors: list[Executor]
+    describe_supervisions: list[ExecutorSupervision]
+
+    def _new_preparation_supervision(self) -> ExecutorSupervision:
+        supervision = super()._new_preparation_supervision()
+        self.describe_supervisions.append(supervision)
+
+        def observe(executor: Executor | None) -> None:
+            if executor is not None:
+                self.describe_executors.append(executor)
+
+        supervision.on_change = observe
+        return supervision
 
     def _describe_installed(
         self, installed: package_environment.InstalledEnvironment, distribution: str
     ) -> bytes:
         self.descriptions.append(installed.content_digest)
         return super()._describe_installed(installed, distribution)
+
+    def assert_describes_reaped(self) -> None:
+        for executor in self.describe_executors:
+            assert executor.exit_status is not None
+            assert proctree.process_state(executor.process) is None  # no live process or zombie
+        for supervision in self.describe_supervisions:
+            assert supervision.current is None and supervision._read_owner() is None
+            assert not Path(supervision.socket_path).exists()
 
 
 @needs_executor
@@ -93,6 +117,8 @@ def test_wire60_absent_interface_and_wire61_interface_share_preparation(metadata
             InMemoryControlHost(),
         )
         worker.descriptions = []
+        worker.describe_executors = []
+        worker.describe_supervisions = []
         rows = sorted(
             [
                 *_closure_rows(uv),
@@ -143,6 +169,7 @@ def test_wire60_absent_interface_and_wire61_interface_share_preparation(metadata
                         repeated = client.PreparePackageSet(request)
                         assert legacy == repeated == modern
                         assert len(worker.descriptions) == (0 if metadata else 1)
+                        worker.assert_describes_reaped()
                         assert len(list((root / "installs/contents").iterdir())) == 1
                         assert len(list((root / "artifacts/installed-interfaces").iterdir())) == 1
                         (placement,) = read_placement_set(legacy.placement_set)
@@ -165,6 +192,12 @@ def test_wire60_absent_interface_and_wire61_interface_share_preparation(metadata
                         with pytest.raises(grpc.RpcError, match="interface_invalid"):
                             client.PreparePackageSet(request)
                         assert len(worker.descriptions) == (0 if metadata else 1)
+                        # Failure also returns only after the dedicated executor is reaped.
+                        installed = next(iter(worker.prepared_revisions.values())).installed
+                        assert installed is not None
+                        with pytest.raises(PreparationRefusal, match="interface_failed"):
+                            worker._describe_installed(installed, "absent-distribution")
+                        worker.assert_describes_reaped()
                 finally:
                     server.stop(0).wait()
         finally:
