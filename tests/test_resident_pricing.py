@@ -129,6 +129,66 @@ def _walk(ledger: Ledger) -> tuple[str, dict[str, Any]]:
     return chosen, walk
 
 
+def test_staged_warm_does_not_become_a_permanent_construction_floor() -> None:
+    ledger = _resident_ledger(free=17 * GiB)
+    facts = {
+        "constructed": dict(WEIGHTS),
+        "resident": {"vae": WEIGHTS["vae"]},
+        "evicted": {name: size for name, size in WEIGHTS.items() if name != "vae"},
+        "parked": [],
+        "allocator_bytes": WEIGHTS["vae"],
+        "reserved_bytes": WEIGHTS["vae"],
+        "device_free_bytes": 23 * GiB,
+        "device_total_bytes": 24 * GiB,
+    }
+    ledger.observe_construction(facts)
+    assert ledger.missing_resident() == facts["evicted"]
+    assert not ledger.parked
+    # The worker's ordinary restore can now request what warming temporarily evicted.
+    ledger.observe_restore(
+        {
+            "allocator_bytes": sum(WEIGHTS.values()),
+            "reserved_bytes": sum(WEIGHTS.values()),
+            "device_free_bytes": 17 * GiB,
+            "device_total_bytes": 24 * GiB,
+            "residency": {"resident": dict(WEIGHTS), "evicted": {}},
+            "restored": {"restored_bytes": sum(facts["evicted"].values())},
+        },
+        "after staged warm",
+    )
+    for _ in range(5):
+        assert ledger.missing_resident() == {}
+        chosen, _ = _walk(ledger)
+        assert chosen == "all_resident"
+    # A tight device still selects staging from actual headroom, even when initial
+    # construction fitted. Correcting the construction facts does not force residency.
+    ledger.device_process = ledger.device_allocated
+    ledger.observe_device_free(GiB // 2, 8 * GiB)
+    chosen, _ = _walk(ledger)
+    assert chosen == "component_staged"
+
+
+def test_initial_construction_parking_remains_a_capacity_floor_after_warm() -> None:
+    ledger = _resident_ledger()
+    constructed = {name: size for name, size in WEIGHTS.items() if name != "unet"}
+    ledger.observe_construction(
+        {
+            "constructed": constructed,
+            "resident": {"vae": WEIGHTS["vae"]},
+            "evicted": {name: size for name, size in WEIGHTS.items() if name != "vae"},
+            "parked": ["unet"],
+            "device_free_bytes": 17 * GiB,
+            "device_total_bytes": 24 * GiB,
+        }
+    )
+    assert ledger.missing_resident() == {
+        name: size for name, size in constructed.items() if name != "vae"
+    }
+    chosen, walk = _walk(ledger)
+    assert chosen == "component_staged"
+    assert walk["rungs"][0]["verdict"] == "construction_parked"
+
+
 def _row(walk: dict[str, Any], rung: str) -> dict[str, Any]:
     return next(row for row in walk["rungs"] if row["rung"] == rung)
 
