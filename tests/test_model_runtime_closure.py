@@ -17,13 +17,13 @@ from tensorfs.errors import RepositoryAbsent
 from cozy_runtime.author import Artifact, CapabilityError, Config, Loader
 from cozy_runtime.author._loader import loading
 from cozy_runtime.internal import base_observation, canonical, fill, package_interface
+from cozy_runtime.internal.census_cache import CensusRefusal
 from cozy_runtime.internal.encoding import SPEC_PLAIN, launch_providers
 from cozy_runtime.internal.worker import grants
 from cozy_runtime.internal.worker.acquire import Acquirer, AcquisitionRefusal, HeldManifests
 from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRefusal
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
-    _compatibility_models,
     _selected_models,
 )
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -109,7 +109,7 @@ def test_model_prep_ignores_absent_snapshot_siblings(tmp_path: Path) -> None:
 
     count = _acquirer(tmp_path, store_root)._models(placement)
 
-    assert count == 3  # Manifest, CozyTensors header, tokenizer asset.
+    assert count == 1  # One manifest held; its closure is the header and tokenizer asset.
     assert {row["kind"] for row in store.walk_cozytensors(manifest_id)} == {
         "header",
         "model_asset",
@@ -176,25 +176,32 @@ def test_worker_prepare_reads_tensorfs_03_logical_dtype(tmp_path: Path) -> None:
     assert SPEC_PLAIN in launch_providers()
 
 
-def test_cold_fit_reads_manifest_header_and_model_assets_from_the_store(tmp_path: Path) -> None:
-    """Wire 30: the cold check receives no files. The host admits the manifest, the
-    CozyTensors header and the header-declared assets to the local Store; the check reads
-    them through an explicit partial object-set lease while tensor bodies are still in
-    flight, and an absent small object is a resumable refusal, not a verdict."""
+def _prepared(root: Path, selection: dict[str, Any]) -> dict[str, Any]:
+    return _selected_models(
+        "example/package",
+        [dict(selection, package="example/package")],
+        root,
+        lambda *_args: None,
+        construction_slots={selection["slot"]},
+    )[selection["slot"]]
+
+
+def test_prepare_reads_header_and_assets_without_a_closure_lease(tmp_path: Path) -> None:
+    """Preparation reads the manifest, the CozyTensors header and -- only when the census
+    misses -- the header-declared assets through a lease on those segments alone, never the
+    tensor closure; an absent asset is a resumable refusal."""
 
     store_root, manifest_id, _manifest_length, _store = _snapshot(tmp_path, include_asset=True)
-    selected = [
-        {
-            "slot": "generate.models.model",
-            "manifest": manifest_id,
-            "model": "example/model",
-            "release": "1",
-            "lane": "main",
-        }
-    ]
-    candidate = _compatibility_models(selected, tensorfs_root=store_root)["generate.models.model"]
-    assert candidate["config"] == _CONFIG
-    assert candidate["assets"] == {"tokenizer/vocab.txt": _ASSET}
+    selected = {
+        "slot": "generate.models.model",
+        "manifest": manifest_id,
+        "model": "example/model",
+        "release": "",
+        "lane": "",
+    }
+    candidate = _prepared(store_root, selected)
+    assert candidate["config_bytes"] == _CONFIG
+    assert candidate["assets"]() == {"tokenizer/vocab.txt": _ASSET}
     assert candidate["tensor_dtypes"] == {"unet.weight": "f32"}
 
     mismatch = tensorfs.fit(
@@ -205,13 +212,13 @@ def test_cold_fit_reads_manifest_header_and_model_assets_from_the_store(tmp_path
     )
     assert not mismatch["ok"] and mismatch["code"] == "shape_mismatch"
 
-    # The asset object was never admitted: the partial lease refuses resumably.
+    # The asset object was never admitted: the header still reads, the asset lease refuses.
     cold_root, cold_manifest, _cold_length, _cold_store = _snapshot(
         tmp_path / "cold", include_asset=False
     )
-    cold = [dict(selected[0], manifest=cold_manifest)]
-    with pytest.raises(PreparationRefusal, match="model_asset_unavailable"):
-        _compatibility_models(cold, tensorfs_root=cold_root)
+    cold = _prepared(cold_root, dict(selected, manifest=cold_manifest))
+    with pytest.raises(CensusRefusal, match="model_asset_unavailable"):
+        cold["assets"]()
 
 
 def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -> None:
@@ -267,6 +274,7 @@ def test_binding_reads_config_only_from_the_cozytensors_header(tmp_path: Path) -
         environment_digest=b"\x33" * 32,
     )
 
+    assert acquirer._models(placement) == 1
     bindings, documents_count = acquirer._bindings(placement)
 
     (model,) = bindings[binding_digest].model_bindings()
@@ -299,8 +307,6 @@ def test_exact_checkpoint_prepares_and_streams_without_any_release(
         # invent such an alias, even when all bytes are already warm locally.
         with pytest.raises(RepositoryAbsent):
             store.resolve_release("example", "model", "1", "main")
-        compatible = _compatibility_models([selection], tensorfs_root=root)
-        assert compatible[selection["slot"]]["config"] == _CONFIG
         prepared = _selected_models(
             "example/package",
             [selection],
@@ -310,7 +316,7 @@ def test_exact_checkpoint_prepares_and_streams_without_any_release(
         )
         assert prepared[selection["slot"]]["manifest_length"] == length
         assert prepared[selection["slot"]]["config_bytes"] == _CONFIG
-        assert prepared[selection["slot"]]["assets"] == {"tokenizer/vocab.txt": _ASSET}
+        assert prepared[selection["slot"]]["assets"]() == {"tokenizer/vocab.txt": _ASSET}
         assert prepared[selection["slot"]]["tensor_dtypes"] == {"unet.weight": "f32"}
         checkpoint = fill.Checkpoint(root, manifest)
         plan = checkpoint.read_plan([("unet", "weight")], 64, ["unet"])
@@ -345,8 +351,6 @@ def test_checkpoint_selection_refuses_partial_release_or_incomplete_model(
     root, manifest, _length, _store = _snapshot(tmp_path, include_asset=True, checkpoint_only=True)
     selection = _checkpoint_selection(manifest, **fields)
     with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
-        _compatibility_models([selection], tensorfs_root=root)
-    with pytest.raises(PreparationRefusal, match="model_selection_mismatch"):
         _selected_models(
             "example/package",
             [selection],
@@ -378,8 +382,6 @@ def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path)
         )
     missing = dict(selection, manifest="sha256:" + "f" * 64)
     with pytest.raises(PreparationRefusal):
-        _compatibility_models([missing], tensorfs_root=root)
-    with pytest.raises(PreparationRefusal):
         _selected_models(
             "example/package",
             [missing],
@@ -387,7 +389,7 @@ def test_checkpoint_selection_keeps_identity_and_geometry_checks(tmp_path: Path)
             lambda *_args: None,
             construction_slots={selection["slot"]},
         )
-    candidate = _compatibility_models([selection], tensorfs_root=root)[selection["slot"]]
+    candidate = _prepared(root, selection)
     mismatch = tensorfs.fit(
         [tensorfs.TensorRequirement("unet", "weight", [2], "f32")],
         candidate["header"],
@@ -405,8 +407,6 @@ def test_checkpoint_selection_refuses_corrupt_header(tmp_path: Path) -> None:
     stored.write_bytes(b"x" * len(_HEADER))
     selection = _checkpoint_selection(manifest, release="", lane="")
     with pytest.raises(PreparationRefusal):
-        _compatibility_models([selection], tensorfs_root=root)
-    with pytest.raises(PreparationRefusal):
         _selected_models(
             "example/package",
             [selection],
@@ -420,7 +420,7 @@ def test_evicted_preparation_rechecks_native_bytes(tmp_path: Path) -> None:
     root, manifest, length, _native = _snapshot(tmp_path, include_asset=True)
     placement = SimpleNamespace(models=({"manifest": {"digest": manifest, "length": length}},))
     acquirer = _acquirer(tmp_path, root)
-    assert acquirer._models(placement) == 3
+    assert acquirer._models(placement) == 1
     # These are unowned cached bytes. An earlier preparation is not a root.
     assert tensorfs.gc(str(root))["reclaimed_bytes"] > 0
     with pytest.raises(AcquisitionRefusal) as missing:

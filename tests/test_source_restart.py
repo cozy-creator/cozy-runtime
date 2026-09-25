@@ -111,7 +111,7 @@ def test_loopback_release_settles_only_the_named_native_operation(tmp_path: Path
     server = grpc.server(ThreadPoolExecutor(max_workers=1))
     rpc.add_RuntimePreparationServicer_to_server(
         _PreparationServicer(
-            None, None, None, None, None, model_source_releaser=worker.release_model_source
+            None, None, None, None, model_source_releaser=worker.release_model_source
         ),
         server,
     )

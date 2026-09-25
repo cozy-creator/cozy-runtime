@@ -184,6 +184,7 @@ def test_preparation_rpc_preserves_requirement_facts(tmp_path: Path) -> None:
                 pb.ImageDistribution(distribution=n, version=v) for n, v in base.distributions
             ],
         ),
+        package_interface=b"{}",
         locked_requirements=(
             f"--index-url {index.url}\n"
             + "\n".join(row.text for row in _locked(index, [wheel, runtime]).rows)
@@ -192,16 +193,12 @@ def test_preparation_rpc_preserves_requirement_facts(tmp_path: Path) -> None:
     )
 
     def prepare(value: pb.PreparePackageSetRequest) -> pb.PreparePackageSetResult:
-        def describe(*args: object) -> bytes:
-            pytest.fail("incompatible package reached describe")
-
         return prepare_package_set(
             value,
             artifact_cache=tmp_path / "artifacts",
             tensorfs_root=tmp_path / "store",
             install_root=root,
             python=Path(sys.executable),
-            describe=describe,
             verified=lambda *args: None,
             base=base,
         )
@@ -210,7 +207,7 @@ def test_preparation_rpc_preserves_requirement_facts(tmp_path: Path) -> None:
         with ThreadPoolExecutor(max_workers=1) as pool:
             server = grpc.server(pool)
             rpc.add_RuntimePreparationServicer_to_server(
-                _PreparationServicer(None, prepare, None, None, None), server
+                _PreparationServicer(prepare, None, None, None), server
             )
             port = server.add_insecure_port("127.0.0.1:0")
             server.start()

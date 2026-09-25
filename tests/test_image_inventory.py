@@ -135,12 +135,12 @@ def test_lying_inventory_refuses_before_any_install() -> None:
                 ),
                 locked_requirements=b"--index-url https://pypi.org/simple\n"
                 b"ranged-marco==1.0.4 --hash=sha256:" + b"a" * 64 + b"\n",
+                package_interface=b"{}",
             ),
             artifact_cache=Path("/tmp/unused-artifacts"),
             tensorfs_root=Path("/tmp/unused-store"),
             install_root=Path("/tmp/unused-environment"),
             python=Path(sys.executable),
-            describe=lambda installed, distribution: b"{}",
             verified=lambda _digest, _length, _path: None,
             base=base,
         )

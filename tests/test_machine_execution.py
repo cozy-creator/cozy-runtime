@@ -623,7 +623,7 @@ def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path
 @pytest.mark.parametrize("origin", ["private", "published", "published-sdk"])
 def test_real_executor_and_next_queued_root_finish_without_control_stream(origin: str) -> None:
     from conftest import image_python
-    from cozy_runtime.internal import child_env
+    from cozy_runtime.internal import child_env, package_interface, static_interface
     from cozy_runtime.internal.config import Credentials, RuntimeConfig
     from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
     from cozy_runtime.internal.worker.control import GrpcControlHost
@@ -726,6 +726,12 @@ def serve(payload: Request) -> Result:
                         f"{package_name.split('/')[1]}==1.0.0 "
                         f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}\n"
                     ).encode()
+                    project_root = root / ("project_" + current_preparation.operation_id)
+                    (project_root / "package.toml").write_text(
+                        '[application]\nobject="prepare_'
+                        + current_preparation.operation_id
+                        + ':app"\n'
+                    )
                     prepared = worker.prepare_package_set(
                         pb.PreparePackageSetRequest(
                             download_delegation=_download_set(package_name, "1.0.0"),
@@ -744,8 +750,13 @@ def serve(payload: Request) -> Result:
                                 ],
                             ),
                             locked_requirements=locked,
+                            package_interface=package_interface.canonical_bytes(
+                                static_interface.build(project_root)
+                            ),
                         )
                     )
+                    # proto-061 C: a published prepare spawns no describe executor.
+                    assert not (root / "worker" / "placements" / "prepare").exists()
                 placement_body = documents.read(
                     prepared.placement_set.placement_set_canonical_bytes, pb.PlacementSet
                 )["placements"][0]

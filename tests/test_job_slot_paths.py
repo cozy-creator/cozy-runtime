@@ -31,7 +31,7 @@ from typing import Any
 import pytest
 import tensorfs
 
-from cozy_runtime.internal import package_environment, package_interface
+from cozy_runtime.internal import census_cache, package_environment, package_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
@@ -218,12 +218,11 @@ def test_a_job_shaped_selection_prepares(
             b"--index-url https://pypi.org/simple\ntenant==1 --hash=sha256:" + b"a" * 64 + b"\n"
         ),
         models=[selection],
-        placement_seed=b"job-shaped",
         artifact_cache=tmp_path / "artifacts",
         tensorfs_root=store_root,
         install_root=tmp_path / "install",
         python=Path(sys.executable),
-        describe=lambda _installed, _distribution: raw,
+        interface=lambda _installed, _distribution: raw,
         verified=lambda _digest, _length, _path: None,
         job_plan_root=tmp_path / "job-plans",
         base=None,
@@ -256,11 +255,14 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
     raw = package_interface.canonical_bytes(interface)
     constructed: list[str] = []
 
-    def derive(path: str, _config: bytes, _assets: Any, _dtypes: Any) -> tuple[str, ...]:
+    def census(wanted: Any) -> dict[str, census_cache.Census]:
         # The one process seam: a real derive runs inside the installed venv's own
         # interpreter. Everything the guards read is real.
-        constructed.append(path)
-        return ("text_encoder", "unet", "vae")
+        constructed.extend(wanted)
+        return {
+            path: census_cache.Census(("text_encoder", "unet", "vae"), (), True, "")
+            for path in wanted
+        }
 
     selection = _selection(ENTRYPOINT_SLOT, manifest)
     if checkpoint_only:
@@ -272,7 +274,7 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
         selections=[selection],
         tensorfs_root=store_root,
         verified=lambda _digest, _length, _path: None,
-        derive=derive,
+        census=census,
     )
     assert [row.name for row in entrypoints] == ["touch"]
     assert [slot.slot for slot in entrypoints[0].slots] == ["model"]
@@ -313,6 +315,7 @@ def test_an_entrypoint_shaped_selection_still_prepares_while_more_is_declared(
         environment={},
         document={},
     )
+    assert acquired._models(placement) == 1
     bindings, _ = acquired._bindings(placement)
     assert len(bindings) == 1
     selected = next(iter(bindings.values())).models[0]
@@ -327,8 +330,9 @@ def test_a_job_slot_is_never_constructed_at_preparation(
 
     store_root, manifest, _length = released
 
-    def derive(path: str, _config: bytes, _assets: Any, _dtypes: Any) -> tuple[str, ...]:
-        raise AssertionError(f"a job slot was constructed at preparation: {path}")
+    def census(wanted: Any) -> dict[str, census_cache.Census]:
+        assert not wanted, f"a job slot was constructed at preparation: {sorted(wanted)}"
+        return {}
 
     models, entrypoints = _entrypoints(
         package_interface.read_bytes(package_interface.canonical_bytes(interface)),
@@ -336,7 +340,7 @@ def test_a_job_slot_is_never_constructed_at_preparation(
         selections=[_selection(JOB_SLOT, manifest)],
         tensorfs_root=store_root,
         verified=lambda _digest, _length, _path: None,
-        derive=derive,
+        census=census,
     )
     assert entrypoints == []
     # The bytes still reach the placement: the selection exists to admit them to this pod.
@@ -357,7 +361,7 @@ def test_a_selection_no_callable_declares_still_refuses(
             selections=[_selection("no_such.models.source", manifest)],
             tensorfs_root=store_root,
             verified=lambda _digest, _length, _path: None,
-            derive=lambda _path, _config, _assets, _dtypes: (),
+            census=lambda _wanted: {},
         )
     assert refusal.value.code == "package_prepare_model_selection_mismatch"
     assert "no_such.models.source" in refusal.value.detail
@@ -383,19 +387,18 @@ def test_an_entrypoints_only_facts_request_refuses_and_names_the_gap(
                 b"--index-url https://pypi.org/simple\ntenant==1 --hash=sha256:" + b"a" * 64 + b"\n"
             ),
             models=[_selection(JOB_SLOT, manifest)],
-            placement_seed=b"stale-hub",
             artifact_cache=tmp_path / "artifacts",
             tensorfs_root=store_root,
             install_root=tmp_path / "install",
             python=Path(sys.executable),
-            describe=lambda _installed, _distribution: raw,
+            interface=lambda _installed, _distribution: raw,
             verified=lambda _digest, _length, _path: None,
             job_plan_root=tmp_path / "job-plans",
             base=None,
             installed_environment=_installed(tmp_path),
         )
     assert refusal.value.code == "package_prepare_model_slots_disagree"
-    assert f"derived-only=['{JOB_SLOT}']" in refusal.value.detail
+    assert f"interface-only=['{JOB_SLOT}']" in refusal.value.detail
 
 
 def _facts_request(slot_paths: list[str]) -> pb.PreparePackageSetRequest:
@@ -409,13 +412,8 @@ def _facts_request(slot_paths: list[str]) -> pb.PreparePackageSetRequest:
 
 
 def test_the_bound_slots_are_a_subset_of_the_declared_ones() -> None:
-    """The relation the pod actually enforces on every prepare and every compatibility
-    check. An invocation binds SOME of what the release declares; only a slot the release
-    does not declare is a refusal.
-
-    This is the gate `check_package_set_compatibility`'s own guard now agrees with -- it
-    ran an equality, which refused every release declaring more than one invocation binds.
-    """
+    """The relation the pod enforces on every prepare. An invocation binds SOME of what the
+    release declares; only a slot the release does not declare is a refusal."""
 
     # sorted unique: the wire bound the hub already honours.
     declared = sorted([ENTRYPOINT_SLOT, RETOUCH_SLOT, JOB_SLOT])
