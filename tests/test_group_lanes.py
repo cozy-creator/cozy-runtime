@@ -88,8 +88,8 @@ def test_fuse_and_split_are_typed_and_bump_the_revision() -> None:
     assert lanes_.by_id["lane-0+1"] is fused and "lane-0" not in lanes_.by_id
     assert lanes_.holder_of(1) is fused and lanes_.revision == 1
     assert lanes_.envelope.ordinals == (0, 1, 2), "the job's envelope lane is untouched"
-    # a group is ONE seat regardless of K (cr-066's per-lane constant, K-independent)
-    assert lanes.LANE_SEATS == 1
+    # a group is ONE device seat and ONE staged seat regardless of K (per-lane constants)
+    assert (lanes.LANE_RUNNING, lanes.LANE_STAGED) == (1, 1)
     with pytest.raises(lanes.LaneRefusal) as nested:
         lanes_.fuse((1, 2))
     assert nested.value.code == "device_pin_infeasible" and "held by group" in nested.value.detail
@@ -404,7 +404,7 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             )
             worker.lanes.lanes[0].placements.add("p0")
             worker.lanes.lanes[1].placements.add("p1")
-            assert worker.available_attempt_slots() == 2
+            assert worker.available_attempt_slots() == 4
             before = worker.observed_state()
             assert [row["lane_id"] for row in worker.lane_documents()] == ["lane-0", "lane-1"]
             assert _lane_rows(before) == worker.lane_documents()
@@ -420,13 +420,13 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             group = worker.lanes.fuse((0, 1))
             group.placements.add("p0")
             primary.lane_id = group.lane_id
-            assert worker.available_attempt_slots() == 1
+            assert worker.available_attempt_slots() == 2
             documents = worker.lane_documents()
             assert documents == [
                 {
                     "lane_id": "lane-0+1",
                     "device_ordinals": [0, 1],
-                    "available_attempt_slots": 1,
+                    "available_attempt_slots": 2,
                     "placement_ids": ["p0"],
                     "resident_placement_ids": [],
                 }
@@ -436,15 +436,26 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             held.lane_id = group.lane_id
             held.state = "running"
             worker.engine.history[held.key()] = held
-            assert worker.available_attempt_slots() == 0, "one attempt at a time across K"
+            assert worker.available_attempt_slots() == 1, "one on the device across K"
+            staged = AttemptRecord(request_id="s", attempt=1, digest=b"", spec={})
+            staged.placement_id = "p0"
+            staged.lane_id = group.lane_id
+            staged.state = "staged"
+            worker.engine.history[staged.key()] = staged
+            assert worker.available_attempt_slots() == 0, "and one staged behind it"
             taken = worker.observed_state()
             assert _lane_rows(taken) == [dict(documents[0], available_attempt_slots=0)]
             assert taken.available_attempt_slots == 0
+            queued = {row.request_id: row for row in taken.held_attempts}
+            assert queued["s"].state == pb.AttemptState.ATTEMPT_STATE_QUEUED
+            assert queued["s"].executor_epoch == 0 and queued["s"].lane_id == group.lane_id
+            assert queued["r"].state == pb.AttemptState.ATTEMPT_STATE_RUNNING
             del worker.engine.history[held.key()]
+            del worker.engine.history[staged.key()]
             assert lane_wire.lanes_on_wire(worker.fence.wire_minor)
             observed = worker.observed_state()
             assert _lane_rows(observed) == documents
-            assert observed.available_attempt_slots == 1
+            assert observed.available_attempt_slots == 2
             (status,) = observed.placements
             assert status.device_lane_id == "lane-0+1"
             assert worker.admission_epoch == epoch, "fusing by hand bumps nothing; assign does"
@@ -537,31 +548,31 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
                 {
                     "lane_id": "lane-0",
                     "device_ordinals": [0],
-                    "available_attempt_slots": 1,
+                    "available_attempt_slots": 2,
                     "placement_ids": ["p0"],
                     "resident_placement_ids": [],
                 },
                 {
                     "lane_id": "lane-1",
                     "device_ordinals": [1],
-                    "available_attempt_slots": 1,
+                    "available_attempt_slots": 2,
                     "placement_ids": ["p1"],
                     "resident_placement_ids": [],
                 },
             ]
-            assert body.available_attempt_slots == 2
+            assert body.available_attempt_slots == 4
             canonical_bytes, digest = documents_.identity(body)
             document = documents_.read(canonical_bytes, pb.WorkerSnapshotBody)
             assert document["format"] == "cozy.worker.v1.WorkerSnapshotBody/1"
             assert document["lanes"] == [
                 {
-                    "available_attempt_slots": 1,
+                    "available_attempt_slots": 2,
                     "device_ordinals": [0],
                     "lane_id": "lane-0",
                     "placement_ids": ["p0"],
                 },
                 {
-                    "available_attempt_slots": 1,
+                    "available_attempt_slots": 2,
                     "device_ordinals": [1],
                     "lane_id": "lane-1",
                     "placement_ids": ["p1"],
@@ -600,7 +611,7 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
                 {
                     "lane_id": "lane-0",
                     "device_ordinals": [0],
-                    "available_attempt_slots": 1,
+                    "available_attempt_slots": 2,
                     "placement_ids": ["p0"],
                     "resident_placement_ids": [],
                 }
