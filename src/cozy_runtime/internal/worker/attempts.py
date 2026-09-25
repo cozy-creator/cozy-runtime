@@ -765,6 +765,7 @@ class AttemptEngine:
             reply = executor.call(
                 {
                     "cmd": "prepare_request",
+                    "construction": declared.construction_key(),
                     "request_id": f"{attempt.request_id}#{attempt.attempt}",
                     "entrypoint": declared.entrypoint,
                     "payload": attempt.payload,
@@ -1780,6 +1781,7 @@ class AttemptEngine:
         assert attempt.declared is not None and attempt.plan is not None
         return {
             "cmd": "invoke",
+            "construction": attempt.declared.construction_key(),
             **({"capture": attempt.spec["capture"]} if "capture" in attempt.spec else {}),
             **_attention_pin(attempt.spec),
             "request_id": key,

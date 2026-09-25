@@ -41,7 +41,7 @@ from cozy_runtime.internal.worker.session import (
     Tenant,
     Worker,
     WorkerOptions,
-    executor_prepare_command,
+    executor_load_command,
 )
 from cozy_runtime.protocol import documents as documents_
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -232,7 +232,7 @@ def test_a_pin_wider_than_every_declared_degree_runs_at_the_largest_that_fits() 
 def test_per_device_rows_and_the_min_ceiling() -> None:
     """A group's ledger holds one `DeviceFacts` row per device and prices against the MIN:
     the lane's reading is the tightest card's, an unreadable card makes the lane
-    unreadable, and `authorize` hands every rank the MIN headroom."""
+    unreadable, and the process ceiling every rank is handed is the MIN capacity."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
     group = lanes_.fuse((0, 1))
     assert lanes.fold_memory({0: MEASURED[0], 1: MEASURED[1]}) == accel.DeviceMemory(
@@ -247,8 +247,7 @@ def test_per_device_rows_and_the_min_ceiling() -> None:
     assert ledger.device_free == 4 * GiB and ledger.device_total == 8 * GiB
     assert sorted(ledger.rows()["devices"]) == ["0", "1"]
     assert ledger.rows()["devices"]["0"]["free"] == 6 * GiB
-    granted = group.authorize("g", lanes.fold_memory({0: MEASURED[0], 1: MEASURED[1]}).free_bytes)
-    assert granted == 4 * GiB and ledger.authorized_device_limit_bytes == 4 * GiB
+    assert lanes.fold_memory({0: MEASURED[0], 1: MEASURED[1]}).total_bytes == 8 * GiB
     # The chooser consumes the already-folded ledger; it needs no second copy of degree.
     assert group.row("g").chooser.ledger is ledger
     # a generation change clears the rows with everything else
@@ -646,17 +645,29 @@ def test_device_pins_are_read_as_sent() -> None:
     assert [lane.lane_id for lane in lane_set.lanes] == ["lane-0", "lane-1"]
 
 
-def test_the_prepare_command_carries_the_degree_only_above_one() -> None:
-    """A plain executor's prepare is byte-identical: the degree rides only when > 1."""
+def test_the_load_command_carries_the_degree_only_above_one() -> None:
+    """A plain executor's load is byte-identical: the degree rides only when > 1."""
     binding = _binding()
-    plain = executor_prepare_command(binding, devices="0", authorized_device_limit_bytes=7)
-    one = executor_prepare_command(
-        binding, devices="0", authorized_device_limit_bytes=7, sequence_parallel_degree=1
+    key = binding.construction_key()
+    plain = executor_load_command(
+        binding, construction=key, devices="0", authorized_device_limit_bytes=7
+    )
+    one = executor_load_command(
+        binding,
+        construction=key,
+        devices="0",
+        authorized_device_limit_bytes=7,
+        sequence_parallel_degree=1,
     )
     assert canonical.write(plain) == canonical.write(one)
     assert "sequence_parallel_degree" not in plain
-    group = executor_prepare_command(
-        binding, devices="0,1", authorized_device_limit_bytes=7, sequence_parallel_degree=2
+    assert plain["cmd"] == "load" and plain["construction"] == key
+    group = executor_load_command(
+        binding,
+        construction=key,
+        devices="0,1",
+        authorized_device_limit_bytes=7,
+        sequence_parallel_degree=2,
     )
     assert group["sequence_parallel_degree"] == 2 and group["devices"] == "0,1"
 
@@ -769,17 +780,12 @@ def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
 # ------------------------------------------------------------------- the seal (real)
 
 
-def _weightless_prepare(body: dict[str, Any], interface: Path, **extra: Any) -> dict[str, Any]:
+def _weightless_start(body: dict[str, Any], interface: Path, **extra: Any) -> dict[str, Any]:
     return {
-        "cmd": "prepare",
-        "binding": {
-            "application": str(body["application"]),
-            "package_interface": str(interface),
-            "development_project": str(PACKAGE),
-            "model_class": "",
-        },
-        "budgets": {},
-        "authorized_device_limit_bytes": 0,
+        "cmd": "start",
+        "application": str(body["application"]),
+        "package_interface": str(interface),
+        "development_project": str(PACKAGE),
         **extra,
     }
 
@@ -795,13 +801,13 @@ def test_package_describe_executor_is_replaced_when_its_placement_takes_a_group(
         try:
             single = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
             described = worker.supervision.spawn(imposed=worker.imposed(single))
-            assert not described.ready_bindings and described.prepared_model is None
+            assert not described.ready_bindings and not described.loaded
             assert described.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0"
             group = worker.lanes.fuse((0, 1))
             tenant = Tenant(
                 _placement("candidate"), worker.supervision, {}, {}, {}, group, "candidate"
             )
-            prepared = worker._own_executor(tenant, [])
+            prepared = worker._own_executor(tenant)
             assert not isinstance(prepared, str), prepared
             assert prepared is not described, (
                 "the package-describe process retained its single-GPU seal"
@@ -809,9 +815,7 @@ def test_package_describe_executor_is_replaced_when_its_placement_takes_a_group(
             assert not described.alive()
             assert prepared.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1"
             assert worker.supervision.devices == group.entries
-            assert worker._own_executor(tenant, []) is prepared, (
-                "unchanged seals should still reuse"
-            )
+            assert worker._own_executor(tenant) is prepared, "unchanged seals should still reuse"
         finally:
             worker.supervision.close()
 
@@ -821,7 +825,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
     """THE K-DEVICE SEAL, read from the child's own `/proc` environment: a group lane's
     executor carries `CUDA_VISIBLE_DEVICES=0,1` and `NCCL_NVLS_ENABLE=0`; a device lane's
     carries no NVLS row. The degree is checked against the seal before any weight moves;
-    a weightless construction refuses to shard; degree 1 is a plain prepare. Retirement
+    a weightless package refuses to shard; degree 1 is a plain start. Retirement
     proves absence for EVERY device of the lane: two rows, one per entry, beside the merged
     proof — and the card that does not exist is UNREADABLE, never absent by omission."""
     with _workspace() as root:
@@ -854,7 +858,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
             assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1"
             assert executor.hello["rank"] == 0 and executor.hello["world"] == 1
             assert worker.supervision.devices == ("0", "1")
-            command = _weightless_prepare(body, interface, devices="0,1")
+            command = _weightless_start(body, interface, devices="0,1")
             # the seal fences the devices before the degree is even read
             other = executor.call({**command, "devices": "0"}, timeout=60.0)
             assert other["code"] == "env_seal_broken", other
@@ -867,7 +871,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
         assert evidence.devices["1"].state == "unreadable", (
             "the second card does not exist here: the driver's honest answer, never absent"
         )
-        # degree checks, each on a fresh executor (a refused prepare poisons its epoch)
+        # degree checks, each on a fresh executor (a refused start poisons its epoch)
         for extra, code in (
             ({"sequence_parallel_degree": 3}, "sequence_parallel_degree_mismatch"),
             ({"sequence_parallel_degree": 2}, "sequence_parallel_unsupported"),
@@ -875,7 +879,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
             executor = worker.supervision.spawn(imposed=worker.imposed(group))
             try:
                 reply = executor.call(
-                    _weightless_prepare(body, interface, devices="0,1", **extra), timeout=60.0
+                    _weightless_start(body, interface, devices="0,1", **extra), timeout=60.0
                 )
                 assert reply["code"] == code, reply
                 if code == "sequence_parallel_degree_mismatch":
@@ -888,7 +892,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
 @needs_executor
 def test_degree_one_is_a_plain_executor() -> None:
     """A degenerate group on one card is byte-identical in behaviour to a plain executor:
-    the same weightless prepare with `sequence_parallel_degree: 1` and without it answers
+    the same weightless start with `sequence_parallel_degree: 1` and without it answers
     the same reply (timing aside), and neither spawns a rank."""
     with _workspace() as root:
         config = _config(root / "home")
@@ -907,7 +911,7 @@ def test_degree_one_is_a_plain_executor() -> None:
             executor = worker.supervision.spawn(imposed=worker.imposed(worker.lanes.lanes[0]))
             try:
                 reply = executor.call(
-                    _weightless_prepare(body, interface, devices="0", **extra), timeout=120.0
+                    _weightless_start(body, interface, devices="0", **extra), timeout=120.0
                 )
                 assert reply["ok"], reply
                 children = subprocess.run(
@@ -920,12 +924,13 @@ def test_degree_one_is_a_plain_executor() -> None:
         worker.supervision.close()
 
     def stable(reply: dict[str, Any]) -> dict[str, Any]:
-        facts = {k: v for k, v in reply.get("facts", {}).items() if not k.endswith("_ms")}
-        facts.pop("rss_bytes", None)
-        return {**{k: v for k, v in reply.items() if k != "facts"}, "facts": facts}
+        return {
+            **{k: v for k, v in reply.items() if k not in ("stages", "rss_bytes")},
+            "stages": [name for name, _ms in reply["stages"]],
+        }
 
     assert stable(replies[0]) == stable(replies[1])
-    assert "sequence_parallel" not in replies[1].get("facts", {})
+    assert replies[1]["follower_pids"] == [] and not replies[1]["torch"]
 
 
 # ---------------------------------------------------------------------- gloo (torch)

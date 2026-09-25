@@ -13,11 +13,11 @@ byte-identical on the wire to the worker before lanes existed. The ENVELOPE lane
 whole envelope as one group lane with one seat: it is the shape a job takes (cr-018's
 door), never a serving placement's.
 
-Residence ceilings are ASSIGNED here, not derived in the executor (cr-025's
-`authorized_device_limit_bytes`): the worker measures the lane's free device bytes and
-subtracts what other executors on the lane were authorized but have not yet settled, so
-two executors preparing on one device cannot both be handed the same headroom. Every
-input is a measurement; nothing here is configured.
+Residence ceilings are ASSIGNED by the worker, not derived in the executor (cr-025's
+`authorized_device_limit_bytes`): a process ceiling is the lane's measured capacity less
+what its co-tenants hold, and loads on a lane are serialized by its device lock, so two
+executors on one device cannot both be handed the same headroom. Every input is a
+measurement; nothing here is configured.
 
 Two model-bearing placements on ONE lane share it by RESIDENCY ARBITRATION, never by
 concurrency (cr-022, the owner's "one gets to use it first, then the next gets to use it
@@ -98,9 +98,6 @@ class LaneRow:
 
     ledger: Ledger
     chooser: PlanChooser
-    #: the ceiling this generation was ASSIGNED for its prepare and has not yet settled
-    #: under a construction reply; -1 is nothing outstanding
-    outstanding: int = -1
     #: TRUE for a slot whose executor holds device memory (a model-bearing placement); a
     #: weightless executor never reaches the device and prices nothing on it
     model_bearing: bool = False
@@ -227,8 +224,8 @@ class DeviceLane:
 
     def holding(self) -> list[tuple[str, LaneRow]]:
         """Every slot whose executor holds device bytes NOW: a model-bearing row with
-        resident components and a live, unpoisoned executor. A row mid-prepare (outstanding
-        authorization, no construction facts yet) holds nothing the driver has settled."""
+        resident components and a live, unpoisoned executor. A row mid-load (no
+        construction facts yet) holds nothing the driver has settled."""
         return [
             (key, row)
             for key, row in self.rows.items()
@@ -256,36 +253,6 @@ class DeviceLane:
         lane whose executor holds device bytes now, sorted — `holding()` as a SET of names.
         Membership only; the bytes stay on the row."""
         return sorted(key for key, _row in self.holding() if key in self.placements)
-
-    # ------------------------------------------------------------- assigned ceilings
-
-    def authorize(self, slot: str, measured_free: int) -> int:
-        """ASSIGN `slot`'s residence ceiling from the lane's MEASURED free bytes.
-
-        `measured_free` is the driver's view of the lane's device right now, which already
-        counts every executor whose fill has settled. What it cannot see is a ceiling this
-        lane handed out that has not settled yet — an executor mid-prepare — so those are
-        subtracted, and the same headroom can never be authorized twice. The executor still
-        measures its own allocatable and takes the smaller of the two (cr-025: predictions
-        authorize, observations verify).
-        """
-        outstanding = sum(
-            row.outstanding for key, row in self.rows.items() if key != slot and row.outstanding > 0
-        )
-        granted = max(int(measured_free) - outstanding, 0)
-        row = self.row(slot)
-        row.outstanding = granted
-        row.ledger.authorized_device_limit_bytes = granted
-        return granted
-
-    def settle(self, slot: str) -> None:
-        """The prepare under this slot's authorization replied: the driver sees it now."""
-        row = self.rows.get(slot)
-        if row is not None:
-            row.outstanding = -1
-
-    def outstanding_bytes(self) -> int:
-        return sum(row.outstanding for row in self.rows.values() if row.outstanding > 0)
 
     def summary(self) -> dict[str, object]:
         return {
@@ -484,9 +451,8 @@ class LaneSet:
         step, over its CANDIDATE lanes — the pinned lane, or every device lane of a
         one-device envelope — and every number is the driver's:
 
-        1. a lane holding no other model-bearing placement whose measured free bytes, less
-           the ceilings the lane has outstanding, cover the declared weight bytes — the
-           placement has the device to itself (cr-066);
+        1. a lane holding no other model-bearing placement whose measured free bytes cover
+           the declared weight bytes — the placement has the device to itself (cr-066);
         2. a lane whose measured headroom still covers the declared bytes BESIDE its
            tenants — co-residency, no swap will ever be needed unless the measurements
            move (cr-022's co-fit arm);
@@ -597,7 +563,7 @@ class LaneSet:
             readable.append((lane, memory))
 
         def headroom(lane: DeviceLane, memory: DeviceMemory) -> int:
-            return memory.free_bytes - lane.outstanding_bytes()
+            return memory.free_bytes
 
         alone = [
             lane

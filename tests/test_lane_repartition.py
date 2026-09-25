@@ -69,9 +69,8 @@ def test_split_lanes_execute_after_worker_started_on_a_group() -> None:
 def test_fused_lane_dispatches_a_real_executor_after_boot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cozy_runtime.internal.worker import lanes, session
+    from cozy_runtime.internal.worker import lanes
 
-    prepare = session.executor_prepare_command
     workers: list[Worker] = []
     consumers: list[tuple[threading.Thread, ...]] = []
 
@@ -81,10 +80,6 @@ def test_fused_lane_dispatches_a_real_executor_after_boot(
         group = self.fuse(tuple(kwargs["pin"]))
         group.placements.add(placement_id)
         return group
-
-    def weightless_prepare(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        kwargs["sequence_parallel_degree"] = 1
-        return prepare(*args, **kwargs)
 
     def owner_hook(owner: LocalRecordOwner) -> None:
         desired = owner._desired_state
@@ -138,7 +133,6 @@ def test_fused_lane_dispatches_a_real_executor_after_boot(
         owner._on_observed_state = report  # type: ignore[method-assign]
 
     monkeypatch.setattr(lanes.LaneSet, "assign", form_test_group)
-    monkeypatch.setattr(session, "executor_prepare_command", weightless_prepare)
     with _workspace() as root:
         outcome, seals = _slice(
             root, devices="0,1", kind="entrypoint", hook=workers.append, owner_hook=owner_hook
@@ -162,11 +156,10 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
     import shutil
 
     import test_device_lanes
-    from cozy_runtime.internal.worker import lanes, session
+    from cozy_runtime.internal.worker import lanes
     from cozy_runtime.protocol import documents
 
     assign = lanes.LaneSet.assign
-    prepare = session.executor_prepare_command
     workers: list[Worker] = []
     completed: list[str] = []
     overlap: list[set[str]] = []
@@ -179,10 +172,6 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
             group.placements.add(placement_id)
             return group
         return assign(self, placement_id, **kwargs)
-
-    def prepare_fixture(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        kwargs["sequence_parallel_degree"] = 1
-        return prepare(*args, **kwargs)
 
     def owner_hook(owner: LocalRecordOwner) -> None:
         desired = owner._desired_state
@@ -360,7 +349,6 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
         owner._on_accepted = accepted  # type: ignore[method-assign]
 
     monkeypatch.setattr(lanes.LaneSet, "assign", assign_fixture)
-    monkeypatch.setattr(session, "executor_prepare_command", prepare_fixture)
     with _workspace() as root:
         barrier = root / "barrier"
         barrier.mkdir()
