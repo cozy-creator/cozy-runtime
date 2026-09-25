@@ -52,6 +52,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.author._assets import GrantedInput, InputMetadata
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import Device
@@ -3982,6 +3983,7 @@ def main(argv: list[str] | None = None) -> int:
                     "python_version": platform.python_version(),
                     "python_abi": (sys.implementation.cache_tag or "").replace("cpython-", "cp"),
                     "python_executable": sys.executable,
+                    "runtime_version": RUNTIME_VERSION,
                     "pgid": os.getpgrp(),
                     "no_new_privs": _proc_status("NoNewPrivs"),
                     "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),
