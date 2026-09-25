@@ -7,7 +7,7 @@ pytest.importorskip("diffusers")
 pytest.importorskip("transformers")
 
 
-def test_staged_qwen_image21_matches_upstream_and_preserves_scopes():
+def test_staged_qwen_image21_matches_upstream_and_preserves_scopes() -> None:
     import base64
     import zlib
 
@@ -158,6 +158,7 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes():
         cancel=lambda: None,
     )
     actual = model.decode(latents, width=32, height=32)
+    model.harness.assert_scopes("encode", "denoise", "decode")
     pipe = QwenImage21Pipeline(
         **graph.components,
         processor=processor,
