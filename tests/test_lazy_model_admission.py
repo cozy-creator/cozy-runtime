@@ -3,16 +3,17 @@
 import base64
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from cozy_runtime.internal.worker.attempts import AttemptRefusal
+from cozy_runtime.internal.worker.attempts import AttemptRecord, AttemptRefusal, AttemptSlot
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.plan import DeclaredBinding
+from cozy_runtime.internal.worker.plan import DeclaredBinding, PreparedRequest
 from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
-from test_device_lanes import _config
+from test_device_lanes import _config, _slice, _workspace, needs_executor
 
 BINDING = "sha256:" + "b" * 64
 ENVIRONMENT = "sha256:" + "e" * 64
@@ -126,3 +127,32 @@ def test_cold_model_queue_validates_without_loading_or_losing_faults(tmp_path: P
         assert "model_asset_missing" in failure.value.detail
     finally:
         worker.shutdown()
+
+
+@needs_executor
+def test_real_request_resolution_precedes_residency_arbitration_once() -> None:
+    order: list[str] = []
+
+    def observe(worker: Worker) -> None:
+        resolve = worker.engine._prepare_request
+        arbitrate = worker._arbitrate_residency
+
+        def resolved(
+            attempt: AttemptRecord, executor: Any, declared: DeclaredBinding
+        ) -> PreparedRequest:
+            value = resolve(attempt, executor, declared)
+            order.append("resolved")
+            return value
+
+        def arbitrated(attempt: AttemptRecord, slot: AttemptSlot) -> None:
+            assert attempt.prepared is not None and attempt.executor is not None
+            order.append("arbitrated")
+            arbitrate(attempt, slot)
+
+        worker.engine._prepare_request = resolved  # type: ignore[method-assign]
+        worker._arbitrate_residency = arbitrated  # type: ignore[method-assign]
+
+    with _workspace() as root:
+        result, _ = _slice(root, devices="", kind="entrypoint", hook=observe)
+    assert result.result == {"message": "polo"}, (result.error, result.faults)
+    assert order == ["resolved", "arbitrated"]

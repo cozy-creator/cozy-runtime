@@ -1114,7 +1114,9 @@ class AttemptEngine:
             raise
         return self._accepted(attempt)
 
-    def prepare_and_accept(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
+    def prepare_and_accept(
+        self, attempt: AttemptRecord, *, before_plan: Callable[[], None] | None = None
+    ) -> pb.AttemptAccepted:
         """Stage and enter in one step: the path of an attempt whose lane has no queue ahead
         of it (a job, or a caller that holds the device already)."""
         if attempt.spec.get("job") is not None:
@@ -1126,7 +1128,7 @@ class AttemptEngine:
                 "the staged attempt was cancelled before it could enter the device",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
-        self.enter(attempt)
+        self.enter(attempt, before_plan=before_plan)
         return accepted
 
     def stage(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
@@ -1240,7 +1242,9 @@ class AttemptEngine:
             attempt.state = "entering"
             return True
 
-    def enter(self, attempt: AttemptRecord) -> None:
+    def enter(
+        self, attempt: AttemptRecord, *, before_plan: Callable[[], None] | None = None
+    ) -> None:
         """DEVICE ENTRY for a claimed staged attempt, under the lane's device lock: bind the
         executor, resolve the request in it, choose the plan, journal the binding.
 
@@ -1292,6 +1296,8 @@ class AttemptEngine:
 
         prepared = self._prepare_request(attempt, executor, declared)
         attempt.prepared = prepared
+        if before_plan is not None:
+            before_plan()
         try:
             plan = slot.chooser.choose(declared, prepared_model, prepared)
         except PlanRefusal as exc:
