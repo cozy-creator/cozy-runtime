@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
     UNCALIBRATED_ACTIVATION_BYTES,
@@ -187,6 +189,36 @@ def test_initial_construction_parking_remains_a_capacity_floor_after_warm() -> N
     chosen, walk = _walk(ledger)
     assert chosen == "component_staged"
     assert walk["rungs"][0]["verdict"] == "construction_parked"
+
+
+@pytest.mark.parametrize("free, grade", [(818_282_496, "measured"), (816_185_344, "bound")])
+def test_staged_success_cannot_promote_restored_weights_after_driver_free_drift(
+    free: int, grade: str
+) -> None:
+    # Local SDXL972 staged successfully, then973 had only2MiB less driver-free
+    # memory. Treating its staged activation peak as a waived bound selected
+    # all_resident with zero headroom and OOMed in decode.
+    ledger = _resident_ledger(free=818_282_496)
+    scopes = {"encode_prompt": 16 << 20, "denoise": 400 << 20, "decode": 2 * GiB}
+    ledger.observe_attempt(
+        {"activation_peaks": scopes}, resident_moved=True, cell=CELL, succeeded=True
+    )
+    ledger.observe_device_free(free, 8 * GiB)
+    assert ledger.resident_sufficiency(CELL) == 0
+    chosen, walk = _walk(ledger)
+    assert walk["coefficients"][1]["provenance"] == grade
+    assert chosen == "component_staged"
+    assert _row(walk, "all_resident")["needs_bytes"] == 2 * GiB
+    assert _row(walk, "all_resident")["verdict"] == "short"
+    # Several successful staged requests do not turn into evidence of a successful
+    # fully resident request. A roomier device can still fit the measured demand.
+    for _ in range(5):
+        ledger.observe_attempt(
+            {"activation_peaks": scopes}, resident_moved=True, cell=CELL, succeeded=True
+        )
+        assert _walk(ledger)[0] == "component_staged"
+    ledger.observe_device_free(17 * GiB, 24 * GiB)
+    assert _walk(ledger)[0] == "all_resident"
 
 
 def _row(walk: dict[str, Any], rung: str) -> dict[str, Any]:

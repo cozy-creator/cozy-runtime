@@ -775,9 +775,17 @@ class PlanChooser:
         #   * a SUFFICIENCY — this cell already COMPLETED, with its resident set standing
         #     still, on a card with no more room than this one. That is the outcome the
         #     rung is trying to predict, already observed, so it outranks an envelope.
-        resident_headroom = planning_headroom if absent_bytes == 0 else activations.value
-        headroom_basis = activations.provenance if resident_headroom else "already_resident"
         sufficiency = self.ledger.resident_sufficiency(cell)
+        # Restoring weights does not prove that the request can run beside them. A
+        # successful staged request measured scratch after freeing other components;
+        # even a tiny driver-free change can classify that measurement as a bound.
+        # Only prior nonmoving execution can justify waiving that bound for residency.
+        resident_headroom = (
+            planning_headroom
+            if absent_bytes == 0 and (activations.provenance != "bound" or sufficiency)
+            else activations.value
+        )
+        headroom_basis = activations.provenance if resident_headroom else "already_resident"
         if absent_bytes == 0 and sufficiency and free >= 0 and sufficiency <= free:
             resident_headroom = 0
             headroom_basis = "completed_resident"
