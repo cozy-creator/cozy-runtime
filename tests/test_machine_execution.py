@@ -1287,7 +1287,7 @@ def test_queued_offer_prevents_preparation_switch_before_lane_accepts() -> None:
         accepted=SimpleNamespace(accepted_desired_state_revision=1, desired_state_body=b"first"),
         engine=SimpleNamespace(
             history={("first", 1): SimpleNamespace(state="queued", lane_id="")},
-            ON_DEVICE=AttemptEngine.ON_DEVICE,
+            PRE_RELEASE=AttemptEngine.PRE_RELEASE,
             HELD=AttemptEngine.HELD,
         ),
     )

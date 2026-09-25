@@ -30,9 +30,10 @@ attempt through the ordinary demand-pull admission. No timer and no idleness clo
 decides anything here; a tenant that fits beside its neighbours is never moved.
 
 A GROUP lane is a lane whose `ordinals` has d > 1 entries (cr-068): ONE executor sealed to
-all d devices, one seat, one ledger with one `DeviceFacts` row per device. The RecordOwner
-PINS a model-bearing placement to K ordinals; the worker runs it at the largest declared
-sequence-parallel degree d <= K (or on one device when none fits), FUSES d empty device
+all d devices, one device seat and one staged, one ledger with one `DeviceFacts` row per
+device. The RecordOwner PINS a model-bearing placement to K ordinals; the worker runs it
+at the largest declared sequence-parallel degree d <= K (or on one device when none fits),
+FUSES d empty device
 lanes into one, leaves the other K-d as device lanes and records a note saying so. The lane
 stays a group while its placement holds it and SPLITS back when the placement leaves.
 `revision` moves on every fuse and split, which is the worker's cue to bump
@@ -53,17 +54,20 @@ from cozy_runtime.internal.worker.attempts import AttemptRecord, Released
 from cozy_runtime.internal.worker.ledger import DeviceFacts, Ledger
 from cozy_runtime.internal.worker.plan import PlanChooser
 
-#: The seats one lane advertises. ONE, by #451/law 8: a lane is a physical device (or one
-#: group of devices under one attempt), and a second held attempt on it could only wait in a
-#: state the wire cannot spell. This is the structural fact `ADMISSION_WINDOW` used to hold
-#: for the whole worker; the worker-level count is now the SUM over its lanes.
+#: The seats one serving lane advertises: ONE attempt on the device (#451/law 8) and ONE
+#: staged behind it (proto-061 G). The staged attempt is accepted, hydrated and journaled
+#: while the device runs the one ahead of it, and enters the device the moment that one
+#: releases — so the device never waits on an offer round trip or an input download. It is
+#: on the wire as QUEUED (proto-026): bound to no executor and no plan until device entry.
+#: A job lane stages nothing (one bounded attempt per build) and advertises LANE_RUNNING.
 #:
-#: THE SEAT IS THE DEVICE SEAT (cr-079 D3): it is held from the offer's hold to DEVICE
-#: RELEASE — the executor's reply — and not through the ack. The post phase (encode, write,
-#: outcome, hold to ack) is bounded structurally instead: one released attempt per lane may
-#: be unacknowledged while the device takes its next occupant, so an owner that stops
-#: acking idles its own device rather than growing this worker's held set.
-LANE_SEATS = 1
+#: A seat is held from the offer's hold to DEVICE RELEASE (cr-079 D3) — the executor's
+#: reply — and not through the ack. The post phase (encode, write, outcome, hold to ack) is
+#: bounded structurally instead: while more than LANE_RELEASED released attempts on a lane
+#: are unacknowledged the lane advertises nothing, so an owner that stops acking idles its
+#: own device rather than growing this worker's held set.
+LANE_RUNNING = 1
+LANE_STAGED = 1
 LANE_RELEASED = 1
 
 #: The lane name a job's executor is sealed under: the whole envelope, one seat.
@@ -144,6 +148,10 @@ class DeviceLane:
         self.rows: dict[str, LaneRow] = {}
         #: placement ids assigned to this lane, whether or not they are dispatchable yet
         self.placements: set[str] = set()
+        #: STAGING (proto-061 G): serving offers, in arrival order, to be accepted beside
+        #: the device. Never takes `device`: staging touches no executor.
+        self.stage: queue.Queue[AttemptRecord | None] = queue.Queue()
+        #: the DEVICE queue: staged attempts, job offers and executor deaths, in order
         self.work: queue.Queue[AttemptRecord | ExecutorDeath | None] = queue.Queue()
         #: the POST PHASE (cr-079): released attempts, one thread per lane, in release
         #: order. It never takes `device`: everything it reads left the executor at release.

@@ -106,7 +106,8 @@ from cozy_runtime.internal.worker.control import (
 )
 from cozy_runtime.internal.worker.lanes import (
     LANE_RELEASED,
-    LANE_SEATS,
+    LANE_RUNNING,
+    LANE_STAGED,
     DeviceLane,
     ExecutorDeath,
     LaneRefusal,
@@ -139,30 +140,16 @@ RECYCLE_EXIT = 75
 REBUILD_SAMPLE_SECONDS = REPORT_SECONDS
 
 #: The worker's accepted-attempt WINDOW behind `available_attempt_slots` (#472e/#494f) is
-#: `lanes.LANE_SEATS` PER LANE, summed over the lanes with a dispatchable placement — ONE on
-#: the one-device worker every deployment produces today, byte-identical on the wire.
-#:
-#: It was 2 per worker, on the claim that attempt N+1's CPU phase overlaps attempt N's device
-#: phase. That overlap does not exist: a lane is a single thread that admits, executes and
-#: reconciles one attempt at a time, so a second admitted attempt could only WAIT — and it
-#: waited in a state (`queued`) the wire cannot spell, invisible to the snapshot and to the
-#: held-attempt set. A worker holding work the RecordOwner cannot see breaks the
-#: snapshot-is-complete law, so the false state is DELETED rather than surfaced: an offer
-#: arriving while its placement's lane already holds one is a JOURNALED REFUSED outcome the
-#: RecordOwner reads, never a silent hold.
-#:
-#: rev-2 makes the SHAPE of the bound structural rather than advisory (§6): per-placement
-#: `attempt_credits` are gone — N counters over ONE serialized device advertised N x the real
-#: capacity. The principle is one counter per SERIALIZED RESOURCE, and with cr-066 that
-#: resource is the device LANE: one seat per lane, consumed from the offer's hold to DEVICE
-#: RELEASE (cr-079 D3: the executor's reply; the encode is the post thread's). A released
-#: attempt holds no seat, but the post phase is bounded one-per-lane: while more than
-#: `LANE_RELEASED` released attempts on a lane await `AttemptOutcomeAck`, the lane advertises
-#: nothing, so a RecordOwner that stops acking idles its own device instead of growing this
-#: worker's held set. The dual defect — one count of N
-#: over N lanes, where an offer can use only its placement's — is why a multi-lane worker
-#: REFUSES to serve a RecordOwner whose negotiated minor cannot read `lanes[]`
-#: (`device_lanes_unsupported`, proto-024 minor 22).
+#: each lane's seats summed over the lanes with a dispatchable placement: one counter per
+#: SERIALIZED RESOURCE, and that resource is the device LANE (cr-066). A serving lane has
+#: `LANE_RUNNING + LANE_STAGED` seats (proto-061 G): one attempt on the device and one
+#: STAGED behind it — accepted, hydrated and journaled while the device runs, visible to the
+#: RecordOwner as QUEUED, entering the device at the running one's release. A seat is held
+#: from the offer's hold to DEVICE RELEASE (cr-079 D3); a released attempt holds none, but
+#: while more than `LANE_RELEASED` released attempts on a lane await `AttemptOutcomeAck` the
+#: lane advertises nothing. An offer over its lane's seats is a JOURNALED REFUSED outcome,
+#: never a silent hold. A multi-lane worker REFUSES a RecordOwner whose negotiated minor
+#: cannot read `lanes[]` (`device_lanes_unsupported`, proto-024 minor 22).
 
 
 def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
@@ -1694,16 +1681,24 @@ class Worker:
             lane.row(placement_id).ledger.begin_generation(executor.pid if executor else 0)
 
     def _lane_phases(self, lane: DeviceLane) -> tuple[int, int]:
-        """(attempts holding the device, released attempts awaiting ack) on ONE lane."""
-        on_device = released = 0
+        """(attempts queued for or on the device, released attempts awaiting ack) on ONE
+        lane."""
+        seated = released = 0
         for held in list(self.engine.history.values()):
             if held.lane_id != lane.lane_id:
                 continue
-            if held.state in self.engine.ON_DEVICE:
-                on_device += 1
+            if held.state in self.engine.PRE_RELEASE:
+                seated += 1
             elif held.state in self.engine.RELEASED:
                 released += 1
-        return on_device, released
+        return seated, released
+
+    def _lane_capacity(self, lane: DeviceLane) -> int:
+        """The seats `lane` has: one running plus one staged on a serving device lane, one
+        on a job lane (the envelope, a CPU slot, orchestration), which stages nothing."""
+        if self.accepted.mode == "serving" and lane in self.lanes.lanes:
+            return LANE_RUNNING + LANE_STAGED
+        return LANE_RUNNING
 
     def _lane_dispatchable(self, lane: DeviceLane) -> bool:
         """Whether THIS lane has a placement that takes offers (job mode: the envelope)."""
@@ -1717,7 +1712,8 @@ class Worker:
         return any(self._placement_dispatchable(placement_id) for placement_id in lane.placements)
 
     def _lane_slots(self, lane: DeviceLane, *, machine_owned: bool = False) -> int:
-        """Free seats on ONE lane, now: `LANE_SEATS` less what holds its device, NONE while
+        """Free seats on ONE lane, now: its capacity less what is queued for or on its
+        device, NONE while
         more than `LANE_RELEASED` released attempts await their ack (cr-079 D3), and NONE
         while the worker's admission is CLOSED — that is one structural fact per worker,
         and `lanes[]` must never show a seat the worker-level count denies."""
@@ -1728,10 +1724,10 @@ class Worker:
             return 0
         if not self._lane_dispatchable(lane):
             return 0
-        on_device, released = self._lane_phases(lane)
+        seated, released = self._lane_phases(lane)
         if released > LANE_RELEASED:
             return 0
-        return max(0, LANE_SEATS - on_device)
+        return max(0, self._lane_capacity(lane) - seated)
 
     def _hosted_set_serving(self, placement_id: str, state: pb.ServingState, why: str = "") -> None:
         hosted = self.hosted.get(placement_id)
@@ -2306,7 +2302,7 @@ class Worker:
                     if held is None:
                         self.executions.stop_queued(owner, request)
                     else:
-                        self.engine.cancel(
+                        self.cancel(
                             pb.CancelAttempt(
                                 request_id=request,
                                 attempt_ordinal=state.attempt_ordinal,
@@ -2466,7 +2462,7 @@ class Worker:
                         raise WorkspaceRefusal(f"model preparation failed: {detail}")
             return True
         if any(
-            (attempt.state in self.engine.ON_DEVICE or attempt.state in self.engine.HELD)
+            (attempt.state in self.engine.PRE_RELEASE or attempt.state in self.engine.HELD)
             and not (
                 (
                     desired.WhichOneof("mode") == "placement_set"
@@ -3604,7 +3600,7 @@ class Worker:
                     ordinal=inner.attempt_ordinal,
                     spec=inner.invocation_spec_digest,
                 )
-            self.note("cancel", self.engine.cancel(inner))
+            self.note("cancel", self.cancel(inner))
         elif kind == "outcome_ack":
             self.on_outcome_ack(inner)
         elif kind == "checkpoint_receipt":
@@ -3752,6 +3748,7 @@ class Worker:
         self.stop.set()
         self.outbound.put(None)
         for lane in self.lanes:
+            lane.stage.put(None)
             lane.work.put(None)
             lane.post.put(None)
 
@@ -3766,7 +3763,7 @@ class Worker:
         with self.control_lock:
             active_executions = self.executions.active_count() if self.executions is not None else 0
             active_attempts = sum(
-                attempt.state in (*self.engine.ON_DEVICE, "released")
+                attempt.state in (*self.engine.PRE_RELEASE, "released")
                 for attempt in self.engine.history.values()
             )
             preparing = self.preparation_lock.locked()
@@ -5124,7 +5121,7 @@ class Worker:
             if not gpu_same and self._job_lane_busy(self.lanes.envelope):
                 raise ValueError("stop the active ordinary job before replacing or removing it")
             if any(
-                attempt.kind != "job" and attempt.state in self.engine.ON_DEVICE
+                attempt.kind != "job" and attempt.state in self.engine.PRE_RELEASE
                 for attempt in self.engine.history.values()
             ):
                 raise ValueError(
@@ -5194,7 +5191,7 @@ class Worker:
 
     def _job_lane_busy(self, lane: DeviceLane) -> bool:
         return any(
-            attempt.lane_id == lane.lane_id and attempt.state in self.engine.ON_DEVICE
+            attempt.lane_id == lane.lane_id and attempt.state in self.engine.PRE_RELEASE
             for attempt in self.engine.history.values()
         )
 
@@ -6597,11 +6594,19 @@ class Worker:
         if attempt.state == "queued":
             self.note(
                 "attempt",
-                "duplicate AttemptOffer for the attempt currently crossing to the device "
-                "lane: it is held, and its acceptance publishes when the lane admits it",
+                "duplicate AttemptOffer for the attempt currently crossing to its lane's "
+                "stage: it is held, and its acceptance publishes when the lane stages it",
             )
             return
-        if attempt.state in ("accepted", "running", "reclaiming", "finalizing", "released"):
+        if attempt.state in (
+            "staged",
+            "entering",
+            "accepted",
+            "running",
+            "reclaiming",
+            "finalizing",
+            "released",
+        ):
             self.note(
                 "attempt",
                 "duplicate AttemptOffer for a held attempt: re-accepting "
@@ -6610,11 +6615,8 @@ class Worker:
             self.send(pb.WorkerFrame(attempt_accepted=self.engine.accepted_message(attempt)))
             return
         # THE SEAT IS THE PLACEMENT'S LANE'S, AND OVER IT THE ANSWER IS A JOURNALED
-        # OUTCOME (#494f/§7). A lane is a single serialized state machine, so a second held
-        # attempt on it could only wait — and it would wait in a state the wire cannot
-        # spell, absent from the snapshot and from the held-attempt set. A refusal the
-        # RecordOwner can read and re-dispatch is strictly more informative than a hold it
-        # cannot see. An attempt for placement P may take P's lane's seat and no other.
+        # OUTCOME (#494f/§7): a refusal the RecordOwner can read and re-dispatch. An attempt
+        # for placement P may take P's lane's seat and no other.
         lane = self._offer_lane(offered.placement_id, attempt)
         if self.admission_state(
             machine_owned=machine_owned
@@ -6636,7 +6638,8 @@ class Worker:
             self.refuse(
                 offered,
                 "no_capacity",
-                f"{lane.lane_id} admits {LANE_SEATS} attempt to its device at a time and "
+                f"{lane.lane_id} admits {self._lane_capacity(lane)} attempt(s) to its "
+                "queue and device at a time and "
                 + (
                     f"holds {other.request_id}#{other.attempt} ({other.state})"
                     if other is not None
@@ -6650,7 +6653,11 @@ class Worker:
             return
         attempt.lane_id = lane.lane_id
         self.engine.hold(attempt)
-        lane.work.put(attempt)
+        (lane.stage if self._stages(attempt) else lane.work).put(attempt)
+
+    def _stages(self, attempt: AttemptRecord) -> bool:
+        """A serving attempt is staged beside the device; a job admits on its lane."""
+        return self.accepted.mode == "serving" and "job" not in attempt.spec
 
     def _offer_lane(self, placement_id: str, attempt: AttemptRecord | None = None) -> DeviceLane:
         """The lane an offer draws its seat from: the placement's, or the envelope for a job.
@@ -6753,6 +6760,7 @@ class Worker:
                 return
             current = set(self.lanes)
             for lane in self._device_consumers.keys() - current:
+                lane.stage.put(None)
                 lane.work.put(None)
                 lane.post.put(None)
                 self._retired_consumers.extend(self._device_consumers.pop(lane))
@@ -6764,6 +6772,7 @@ class Worker:
                         name=name,
                     )
                     for name, target in (
+                        (f"stage-{lane.lane_id}", self.stage_lane),
                         (f"device-{lane.lane_id}", self.device_lane),
                         (f"post-{lane.lane_id}", self.post_lane),
                     )
@@ -6798,13 +6807,19 @@ class Worker:
                     self.rebuild_exited(item.executor, item.placement_id)
                 continue
             attempt = item
+            # A job offer arrives `queued` and admits here; a serving attempt arrives
+            # staged and is claimed for entry — unless a cancel or its deadline took it
+            # off the queue first, and then its terminal is already sent.
+            staged = attempt.state != "queued"
+            if staged and not self.engine.claim_staged(attempt):
+                continue
             self.await_settled(attempt)
-            # THE DEVICE IS HELD from admission to DEVICE RELEASE (cr-022, cr-079): a
+            # THE DEVICE IS HELD from entry to DEVICE RELEASE (cr-022, cr-079): a
             # co-tenant's prepare on this lane waits here rather than vacating an executor
             # whose attempt is on the card. The post phase runs on `post_lane` and never
             # takes this lock: at release the attempt's bytes have left the executor.
             with lane.device:
-                if self.admit(attempt):
+                if self.enter(attempt) if staged else self.admit(attempt):
                     self.execute(attempt, lane)
             # Rebuild on REFUSALS too (#458): a poisoned generation refuses every attempt,
             # so a rebuild gated on admission could never run again.
@@ -6814,6 +6829,118 @@ class Worker:
                 self._rebuild_orchestration()
             else:
                 self.rebuild_if_needed(attempt.placement_id)
+
+    def stage_lane(self, lane: DeviceLane) -> None:
+        """STAGING, one thread per lane (proto-061 G): accept the next serving offer —
+        fetch, hydrate, journal, AttemptAccepted — while the device runs the one ahead of
+        it, then queue it for device entry. It never takes `device` or touches an
+        executor."""
+        while not self.stop.is_set():
+            attempt = lane.stage.get()
+            if attempt is None:
+                return
+            self.await_settled(attempt)
+            if self.stage(attempt):
+                lane.work.put(attempt)
+
+    def stage(self, attempt: AttemptRecord) -> bool:
+        """VALIDATE -> FETCH -> HYDRATE -> JOURNAL -> ACCEPT, or a typed terminal."""
+        key = f"{attempt.request_id}#{attempt.attempt}"
+        with self.control_lock:
+            if self._admission_refused(attempt):
+                return False
+            try:
+                self._bind_attempt_slot(attempt)
+            except AttemptRefusal as exc:
+                self.note("attempt", f"{key} refused: {exc.code}")
+                self.terminate(
+                    attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
+                )
+                return False
+        # Fetch and hydrate move bytes; the control plane keeps answering meanwhile. The
+        # slot bound above is re-bound under the lock at device entry.
+        try:
+            accepted = self.engine.stage(attempt)
+        except AttemptRefusal as exc:
+            self.note("attempt", f"{key} refused: {exc.code}")
+            self.terminate(
+                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
+            )
+            return False
+        self.send(pb.WorkerFrame(attempt_accepted=accepted))
+        if attempt.canceling and self.engine.claim_staged(attempt):
+            # cancelled while it hydrated: nothing reached the device
+            self.terminate(attempt, self.engine.finish_cancel, attempt.canceling)
+        if self.connected.is_set():
+            self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+        return attempt.state == "staged"
+
+    def enter(self, attempt: AttemptRecord) -> bool:
+        """DEVICE ENTRY for a claimed staged attempt: LOAD/ACTIVATE -> RESOLVE -> PLAN, or a
+        typed terminal. The lane's device lock is held by the caller."""
+        key = f"{attempt.request_id}#{attempt.attempt}"
+        with self.control_lock:
+            if self._entry_refused(attempt):
+                return False
+        try:
+            self._ensure_construction(attempt)
+            with self.control_lock:
+                if self._entry_refused(attempt):
+                    return False
+                slot = self._bind_attempt_slot(attempt)
+                self._arbitrate_residency(attempt, slot)
+                self.engine.enter(attempt)
+        except AttemptRefusal as exc:
+            self.note("attempt", f"{key} refused at device entry: {exc.code}")
+            self.terminate(
+                attempt, self.engine.refuse_held, exc.code, exc.detail, exc.cause, exc.origin
+            )
+            return False
+        return True
+
+    def _entry_refused(self, attempt: AttemptRecord) -> bool:
+        """An ACCEPTED attempt's device-entry fences, under the control lock: TRUE once
+        terminated. Acceptance already passed the admission epoch; what can still stop it
+        is a cancel, its own deadline, or its placement leaving this worker."""
+        key = f"{attempt.request_id}#{attempt.attempt}"
+        if attempt.canceling:
+            self.note("cancel", f"{key} was cancelled before device entry")
+            self.terminate(attempt, self.engine.finish_cancel, attempt.canceling)
+            return True
+        deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
+        if deadline_ms and time.time() * 1000 > deadline_ms:
+            self.note("cancel", f"{key} reached device entry past its deadline")
+            self.terminate(attempt, self.engine.finish_cancel, "deadline")
+            return True
+        if self._placement_by_id(attempt.placement_id) is None:
+            self.note("admission", f"refusing staged {key}: placement left this worker")
+            self.terminate(
+                attempt,
+                self.engine.refuse_held,
+                "unknown_placement",
+                f"the staged attempt names placement {attempt.placement_id!r} and this "
+                "worker no longer hosts it",
+                CAUSE.CAUSE_CODE_UNKNOWN_PLACEMENT,
+            )
+            return True
+        return False
+
+    def cancel(self, message: pb.CancelAttempt) -> str:
+        """Mark the cancel; a STAGED attempt has nothing on the device, so its CANCELED
+        terminal is recorded now rather than when the device reaches it."""
+        done = self.engine.cancel(message)
+        held = self.engine.live.get(message.request_id)
+        if (
+            held is not None
+            and held.attempt == message.attempt_ordinal
+            and held.canceling
+            and self.engine.claim_staged(held)
+        ):
+            self.terminate(held, self.engine.finish_cancel, held.canceling)
+            if self.connected.is_set():
+                self.send(pb.WorkerFrame(observed_state=self.observed_state()))
+            return f"cancelled while staged ({held.canceling}); nothing reached the device"
+        return done
 
     def post_lane(self, lane: DeviceLane) -> None:
         """THE POST PHASE, one thread per lane (cr-079 D4): encode, bound, write under the
@@ -7124,11 +7251,25 @@ class Worker:
             f"{self.admission_epoch}",
         )
 
+    def _expire_staged(self, attempt: AttemptRecord) -> None:
+        """A staged attempt whose deadline passed while the device ran the one ahead of it
+        ends CANCELED(deadline) now, not when the device reaches it."""
+        deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))
+        if not deadline_ms or time.time() * 1000 <= deadline_ms:
+            return
+        if not self.engine.claim_staged(attempt):
+            return
+        self.note("cancel", f"deadline expired for staged {attempt.request_id}")
+        self.terminate(attempt, self.engine.finish_cancel, "deadline")
+
     def watchdog(self) -> None:
         """The deadline and the grace clock — both the WORKER's, never author code's."""
         while not self.stop.wait(0.05):
             self.drive_executions()
             for attempt in list(self.engine.live.values()):
+                if attempt.state == "staged":
+                    self._expire_staged(attempt)
+                    continue
                 if attempt.state not in ("running", "reclaiming"):
                     continue
                 deadline_ms = int(attempt.spec.get("deadline_unix_ms", 0))

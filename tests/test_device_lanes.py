@@ -466,8 +466,8 @@ def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
 
 
 def test_one_lane_worker_seats_and_a_two_lane_worker_sum() -> None:
-    """`available_attempt_slots` is the SUM of per-lane seats: one on the one-lane worker,
-    unchanged on the wire; a held attempt takes only its own lane's seat."""
+    """`available_attempt_slots` is the SUM of per-lane seats (one running plus one staged
+    per serving lane); a held attempt takes only its own lane's seat."""
     with _workspace() as root:
         config = _config(root / "home")
         worker = Worker(
@@ -503,15 +503,21 @@ def test_one_lane_worker_seats_and_a_two_lane_worker_sum() -> None:
             primary.lane_id = "lane-0"
             worker.lanes.lanes[1].placements.add("p1")
             hosted.lane_id = "lane-1"
-            assert worker.available_attempt_slots() == 2
+            assert worker.available_attempt_slots() == 4
             held = AttemptRecord(request_id="r", attempt=1, digest=b"", spec={})
             held.placement_id = "p0"
             held.lane_id = "lane-0"
             held.state = "running"
             worker.engine.history[held.key()] = held
+            assert worker._lane_slots(worker.lanes.lanes[0]) == 1  # the staged seat
+            staged = AttemptRecord(request_id="q", attempt=1, digest=b"", spec={})
+            staged.placement_id = "p0"
+            staged.lane_id = "lane-0"
+            staged.state = "staged"
+            worker.engine.history[staged.key()] = staged
             assert worker._lane_slots(worker.lanes.lanes[0]) == 0
-            assert worker._lane_slots(worker.lanes.lanes[1]) == 1
-            assert worker.available_attempt_slots() == 1
+            assert worker._lane_slots(worker.lanes.lanes[1]) == 2
+            assert worker.available_attempt_slots() == 2
             # lane B's gate is untouched by lane A rebuilding
             worker._settle()
             assert worker.lanes.lanes[1].settled.is_set()

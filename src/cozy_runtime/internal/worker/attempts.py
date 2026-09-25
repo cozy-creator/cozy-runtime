@@ -600,7 +600,7 @@ class AttemptEngine:
                 # the bind refuses a grant whose subject or id sets disagree)
                 held.grant = self._bind(spec, offered)
                 return held  # idempotent: re-send AttemptAccepted, run once
-            if held.state in ("queued", "accepted", "running", "finalizing"):
+            if held.state in ("queued", "staged", "entering", "accepted", "running", "finalizing"):
                 raise AttemptRefusal(
                     "live_attempt_supersession",
                     f"attempt {offered.attempt_ordinal} arrived while attempt "
@@ -846,8 +846,10 @@ class AttemptEngine:
                 spool=spool,
                 max_bytes=binding.max_inputs_total_bytes if binding else 256 << 20,
             )
+            # A staged serving attempt is bound to no executor yet; `_run` grants the spool
+            # to the executor it enters on.
             supervision = self.supervision_for(attempt)
-            if getattr(supervision, "isolated", False):
+            if getattr(supervision, "isolated", False) and attempt.executor_epoch:
                 supervision.grant_directory(spool, attempt.executor_epoch)
         except grants.GrantRefusal as exc:
             # WHOSE fault decides the terminal. A cap, a media-type disagreement or an
@@ -1114,23 +1116,30 @@ class AttemptEngine:
         return self._accepted(attempt)
 
     def prepare_and_accept(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
-        """The ATOMIC ACCEPTANCE BOUNDARY, in exactly this order:
-
-            resolve binding -> fetch/verify/decode the payload -> derive REAL features from
-            it -> choose the plan -> prepare the executor -> reserve the envelope -> RECORD
-            -> publish AttemptAccepted.
-
-        Everything before the process record either completes or raises a typed pre-accept
-        refusal. The payload is fetched here and not at execution time: a missing, expired
-        or malformed payload
-        must be a refusal the RecordOwner can read, not an accepted attempt that later dies
-        on a thread with no terminal to show for it.
-
-        Features are derived from the DECODED PAYLOAD. Deriving them from the plan id would
-        be inventing the very input the plan is supposed to be chosen against.
-        """
+        """Stage and enter in one step: the path of an attempt whose lane has no queue ahead
+        of it (a job, or a caller that holds the device already)."""
         if attempt.spec.get("job") is not None:
             return self._accept_job(attempt)
+        accepted = self.stage(attempt)
+        if not self.claim_staged(attempt):
+            raise AttemptRefusal(
+                "attempt_left_queue",
+                "the staged attempt was cancelled before it could enter the device",
+                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+        self.enter(attempt)
+        return accepted
+
+    def stage(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
+        """QUEUE ADMISSION (proto-026, proto-061 G): validate -> fetch -> hydrate -> journal.
+
+        Everything an attempt needs that is not the device happens here, while the lane's
+        device may be running the attempt ahead of it: the binding is resolved against the
+        slot, the payload fetched and decoded, the inputs hydrated into the spool, and the
+        acceptance journaled. Neither a plan nor an executor epoch binds here; both bind at
+        DEVICE ENTRY (`enter`), so a staged attempt survives an executor respawn. Everything
+        before the journal record either completes or raises a typed pre-accept refusal.
+        """
         serving = attempt.spec.get("serving")
         if serving is None:
             raise AttemptRefusal(
@@ -1139,6 +1148,34 @@ class AttemptEngine:
                 "names neither; a worker that guessed would run the wrong lifecycle",
                 cause=CAUSE.CAUSE_CODE_PROTOCOL,
             )
+        declared, prepared_model = self._resolve_binding(attempt)
+        attempt.declared = declared
+        attempt.prepared_model = prepared_model
+        attempt.state = "preparing"
+        self._fetch_payload(attempt)
+        # HYDRATE before acceptance (cr-012): an oversized, ungranted, mislabelled or
+        # unreachable input is a refusal the RecordOwner can read, never an accepted attempt
+        # that dies on a thread. It happens off the device, beside the running attempt.
+        self._hydrate_inputs(attempt)
+        self.records.append(
+            "accepted",
+            {
+                "request_id": attempt.request_id,
+                "attempt": attempt.attempt,
+                "worker_boot_id": self.boot_id,
+                "instance_id": self.instance_id,
+                "invocation_spec_digest": documents.spell(attempt.digest),
+                "grant_epoch": attempt.grant.credential_epoch,
+                "placement_id": attempt.placement_id,
+                "lane_id": attempt.lane_id,
+                "entrypoint_binding_digest": serving["entrypoint_binding_digest"],
+            },
+        )
+        return self._accepted(attempt, "staged")
+
+    def _resolve_binding(self, attempt: AttemptRecord) -> tuple[DeclaredBinding, PreparedModel]:
+        """The slot's binding for this serving attempt, or a typed refusal."""
+        serving = attempt.spec["serving"]
         plan_id = serving["entrypoint_binding_digest"]
         slot = self.slot_of(attempt)
         declared = slot.bindings.get(plan_id)
@@ -1169,22 +1206,35 @@ class AttemptEngine:
                 "InvocationSpec does not name the selected Environment",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
+        return declared, prepared_model
+
+    def claim_staged(self, attempt: AttemptRecord) -> bool:
+        """Take a STAGED attempt out of the queue — for device entry or for a cancel. Exactly
+        one caller wins; the loser finds it gone."""
+        with attempt.transition_lock:
+            if attempt.state != "staged":
+                return False
+            attempt.state = "entering"
+            return True
+
+    def enter(self, attempt: AttemptRecord) -> None:
+        """DEVICE ENTRY for a claimed staged attempt, under the lane's device lock: bind the
+        executor, resolve the request in it, choose the plan, journal the binding.
+
+        The slot was re-bound for entry, so the binding is re-resolved against the
+        placement as it stands now. A refusal here is typed and nothing reached the device.
+        """
+        slot = self.slot_of(attempt)
+        declared, prepared_model = self._resolve_binding(attempt)
         attempt.declared = declared
         attempt.prepared_model = prepared_model
-        attempt.state = "preparing"
-
-        self._fetch_payload(attempt)
-
-        # The ExecutorPreparer: when the selected construction is not already ready, prepare
-        # it BEFORE durable acceptance. Serving never accepts-then-cold-loads. It is checked
-        # HERE, ahead of the request preparation below, because that preparation runs in the
-        # executor and there is no sense resolving a request against one that cannot serve.
+        plan_id = declared.entrypoint_binding_digest
         supervision = slot.supervision
         executor = supervision.current
         if executor is None or not executor.alive():
             raise AttemptRefusal(
                 "executor_absent",
-                "no live executor: an online attempt is accepted only against a Ready one",
+                "no live executor: an online attempt enters the device only on a Ready one",
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
         if plan_id not in executor.ready_bindings:
@@ -1202,9 +1252,8 @@ class AttemptEngine:
             raise AttemptRefusal(
                 "executor_not_ready",
                 f"the executor is ready for {sorted(executor.ready_bindings) or 'nothing'}, "
-                f"not {plan_id[:24]}… — the directive prepares an executor before an "
-                "attempt may be accepted against it, and serving never accepts-then-"
-                "cold-loads",
+                f"not {plan_id[:24]}… — serving never enters an attempt on an executor that "
+                "has not prepared its binding",
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
         if executor.poisoned:
@@ -1227,46 +1276,29 @@ class AttemptEngine:
                 exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
             ) from exc
         attempt.plan = plan
-
-        # HYDRATE, after the plan and before acceptance (cr-012, §1.3's launch contract:
-        # validate -> plan -> hydrate -> prepare -> accept -> invoke). After the plan,
-        # because a request that has no plan should download nothing; before acceptance,
-        # because an oversized, ungranted, mislabelled or unreachable input must be a
-        # refusal the RecordOwner can read rather than an accepted attempt that dies on a
-        # thread. And before the lease, which is the ordering that matters most: a slow URL
-        # fetched under a lease would pin staged weights for its whole duration.
-        self._hydrate_inputs(attempt)
-
         attempt.opened = slot.ledger.snapshot()
 
-        plan_digest = plan.digest()
         with supervision.hold(executor) as owned:
             if not owned:
                 raise AttemptRefusal(
-                    "executor_replaced_before_acceptance",
-                    "the prepared executor changed before acceptance could be committed",
+                    "executor_replaced_before_entry",
+                    "the prepared executor changed before device entry could be committed",
                     cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
                 )
             self.records.append(
-                "accepted",
+                "entered",
                 {
                     "request_id": attempt.request_id,
                     "attempt": attempt.attempt,
-                    "worker_boot_id": self.boot_id,
-                    "instance_id": self.instance_id,
-                    "invocation_spec_digest": documents.spell(attempt.digest),
-                    "plan_digest": plan_digest,
+                    "plan_digest": plan.digest(),
                     "constructed_model_digest": plan.constructed_model_digest,
                     "request_features_digest": plan.request_features_digest,
                     "preflight_facts_digest": plan.preflight_facts_digest,
-                    "grant_epoch": attempt.grant.credential_epoch,
-                    "placement_id": attempt.placement_id,
                     "executor_epoch": attempt.executor_epoch,
                     "executor_pid": attempt.executor_pid,
-                    "entrypoint_binding_digest": plan_id,
                 },
             )
-        return self._accepted(attempt)
+        attempt.state = "accepted"
 
     # ------------------------------------------------------------------ execute
 
@@ -2840,9 +2872,10 @@ class AttemptEngine:
             )
             return None
 
-    def _accepted(self, attempt: AttemptRecord) -> pb.AttemptAccepted:
-        """HOLD the accepted attempt and publish it. The one acceptance both lanes make."""
-        attempt.state = "accepted"
+    def _accepted(self, attempt: AttemptRecord, state: str = "accepted") -> pb.AttemptAccepted:
+        """HOLD the accepted attempt and publish it. The one acceptance both lanes make: a
+        job is bound at acceptance ("accepted"), a serving attempt queues ("staged")."""
+        attempt.state = state
         attempt.accepted_at = time.perf_counter()
         self.live[attempt.request_id] = attempt
         self.history[attempt.key()] = attempt
@@ -3182,16 +3215,23 @@ class AttemptEngine:
         """
         row = record or {}
         pending = attempt.state in ("outcome", "closed")
+        queued = attempt.state == "staged"
         held = pb.HeldAttempt(
             request_id=attempt.request_id,
             attempt_ordinal=attempt.attempt,
             kind=_KIND[attempt.kind],
             state=pb.AttemptState.ATTEMPT_STATE_OUTCOME_PENDING_ACK
             if pending
+            else pb.AttemptState.ATTEMPT_STATE_QUEUED
+            if queued
             else pb.AttemptState.ATTEMPT_STATE_RUNNING,
             invocation_spec_digest=attempt.digest,
             placement_id=str(row.get("placement_id", "")) or attempt.placement_id,
-            executor_epoch=int(row.get("executor_epoch", 0)) or attempt.executor_epoch,
+            # A queued attempt is bound to no executor (proto-026): epoch 0 until entry.
+            executor_epoch=0
+            if queued
+            else int(row.get("executor_epoch", 0)) or attempt.executor_epoch,
+            lane_id="" if attempt.kind == "job" else attempt.lane_id,
         )
         if pending:
             # Set IFF the state is OUTCOME_PENDING_ACK, so the RecordOwner can reconcile the
@@ -3204,19 +3244,38 @@ class AttemptEngine:
         return [a for a in self.history.values() if a.state == "outcome"]
 
     #: Every state in which this worker still holds an attempt and owes the owner something.
-    HELD = ("accepted", "running", "reclaiming", "finalizing", "released", "outcome")
-    #: The states that HOLD THE LANE'S DEVICE (cr-079 D3): from the offer's hold to device
-    #: release. A queued offer is the device's next occupant and counts.
-    ON_DEVICE = ("queued", "accepted", "running", "reclaiming", "finalizing")
+    #: `staged` is accepted into its lane's queue (wire QUEUED); `entering` is claimed off
+    #: the queue for device entry or for a cancel.
+    HELD = (
+        "staged",
+        "entering",
+        "accepted",
+        "running",
+        "reclaiming",
+        "finalizing",
+        "released",
+        "outcome",
+    )
+    #: The states that hold a LANE SEAT (cr-079 D3, proto-061 G): from the offer's hold to
+    #: device release — the lane's queue (`queued` on the reader, `staged`) and its device.
+    PRE_RELEASE = (
+        "queued",
+        "staged",
+        "entering",
+        "accepted",
+        "running",
+        "reclaiming",
+        "finalizing",
+    )
     #: Off the device and not yet acknowledged: the post phase and the unacked outcome.
     RELEASED = ("released", "outcome")
 
     def snapshot_entries(self) -> list[pb.HeldAttempt]:
-        """Every attempt this worker still holds — accepted, running, or outcome-pending-ack.
+        """Every attempt this worker still holds — staged, running, or outcome-pending-ack.
 
-        A queued one is deliberately absent
-        (the wire has no state for held-not-admitted; the owner's DISPATCHING-absent rule
-        resends it, and the admission window is one, so there is never a QUEUE of them)."""
+        An offer still crossing to its lane's stage (`queued`, not yet accepted) is absent:
+        acceptance is what makes it a claim, and the owner's DISPATCHING-absent rule
+        resends it."""
         return [self._active_row(a) for a in self.history.values() if a.state in self.HELD]
 
     def active(self) -> list[pb.HeldAttempt]:
@@ -3227,8 +3286,8 @@ class AttemptEngine:
         phase (cr-079 D3). Reading only `live` under-reported exactly those: `close()`
         drops the attempt from `live`, but an outcome nobody acked is still owed.
 
-        A queued one is deliberately absent: acceptance is what makes an attempt a claim,
-        and the wire has no state for "held, not yet admitted".
+        An offer not yet accepted into its lane's queue is absent: acceptance is what makes
+        an attempt a claim.
         """
         return [self._active_row(a) for a in self.history.values() if a.state in self.HELD]
 

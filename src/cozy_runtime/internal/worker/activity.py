@@ -99,7 +99,7 @@ def active_work(worker: Worker) -> bool:
     if any(p and p.serving == pb.SERVING_STATE_ACTIVATING for p in placements):
         return True
     if any(
-        attempt.state in (*worker.engine.ON_DEVICE, "preparing", "released")
+        attempt.state in (*worker.engine.PRE_RELEASE, "preparing", "released")
         for attempt in tuple(worker.engine.history.values())
     ):
         return True
