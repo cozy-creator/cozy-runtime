@@ -17,8 +17,8 @@ from pathlib import Path
 import pytest
 
 import cozy_runtime
-from cozy_runtime.internal import package_requirements
 from cozy_runtime.internal import package_environment as environment
+from cozy_runtime.internal import package_requirements
 from cozy_runtime.internal.worker import lanes
 from cozy_runtime.internal.worker.child import ExecutorRuntimeMismatch
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -57,7 +57,9 @@ def _worker_sdk(root: Path, version: str) -> Path:
     return venv / "bin" / "python"
 
 
-def _fixture(tmp_path: Path, requirement: str) -> tuple[_SimpleIndex, environment.LockedRequirements]:
+def _fixture(
+    tmp_path: Path, requirement: str
+) -> tuple[_SimpleIndex, environment.LockedRequirements]:
     project = _wheel(tmp_path, "sdk_project", (requirement,), b"VALUE='project'\n")
     pinned = _wheel(tmp_path, "cozy_runtime", (), b"VALUE='locked'\n", version="1.0")
     index = _SimpleIndex(tmp_path / "index", [project, pinned])
@@ -158,9 +160,7 @@ def _shadowing_python(root: Path) -> Path:
     info.mkdir()
     (info / "METADATA").write_text("Metadata-Version: 2.3\nName: cozy-runtime\nVersion: 0.0.1\n")
     source = Path(cozy_runtime.__file__).parents[1]
-    (site / "zz_worker_checkout.pth").write_text(
-        f"{source}\n{sysconfig.get_path('purelib')}\n"
-    )
+    (site / "zz_worker_checkout.pth").write_text(f"{source}\n{sysconfig.get_path('purelib')}\n")
     return venv / "bin" / "python"
 
 

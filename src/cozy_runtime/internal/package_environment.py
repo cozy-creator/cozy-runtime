@@ -910,9 +910,7 @@ def materialize_locked(
         _require_same_interpreter(python, dependency_python)
     sdk_source = Path(sys.executable) if sdk_python is None else sdk_python
     locked_names = {row.name: row.version for row in install_rows}
-    sdk = {
-        name: facts for name, facts in worker_sdk(sdk_source).items() if name in locked_names
-    }
+    sdk = {name: facts for name, facts in worker_sdk(sdk_source).items() if name in locked_names}
     install_rows = [row for row in install_rows if row.name not in sdk]
     uv = _uv_binary()
     current_uv = _observed_uv_version(uv)
