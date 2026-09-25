@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -13,7 +14,6 @@ from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, pre
 from cozy_runtime.internal.worker.session import read_placement_set
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_publish_derivation import _SimpleIndex
-from test_published_requirements import _locked
 from test_unpublished_exact_dependencies import _wheel
 
 
@@ -21,8 +21,10 @@ from test_unpublished_exact_dependencies import _wheel
 def test_published_serving_code_prepares_without_models_or_executable_bindings(
     tmp_path: Path, declared: bool
 ) -> None:
-    wheel = _wheel(tmp_path, "serving_child", ("cozy-runtime>=0.1",), b"VALUE=42\n")
-    runtime = _wheel(tmp_path, "cozy_runtime", (), b"VALUE=1\n")
+    wheel = _wheel(
+        tmp_path, "serving_child", ("cozy-runtime>=0.1",), b"VALUE=42\n", version="1.0.0"
+    )
+    runtime = _wheel(tmp_path, "cozy_runtime", (), b"VALUE=1\n", version="1.0.0")
     index = _SimpleIndex(tmp_path / "index", [wheel, runtime])
     base = environments.observe_base()
     root = tmp_path / "installs"
@@ -52,7 +54,19 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
         return interface
 
     try:
-        locked = _locked(index, [wheel, runtime])
+        locked = environments.read_locked_requirements(
+            (
+                f"--index-url {index.url}\n"
+                + "\n".join(
+                    sorted(
+                        f"{item.name.split('-')[0].replace('_', '-')}=={item.name.split('-')[1]} "
+                        f"--hash=sha256:{hashlib.sha256(item.read_bytes()).hexdigest()}"
+                        for item in [wheel, runtime]
+                    )
+                )
+                + "\n"
+            ).encode()
+        )
         request = pb.PreparePackageSetRequest(
             install_root=str(root),
             application="serving_child:app",
@@ -60,7 +74,7 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
             download_delegation=canonical.write(
                 {
                     "format": "cozy.worker.v1.DownloadDelegation/1",
-                    "packages": [{"package": "proof/serving-child", "release": "1.0"}],
+                    "packages": [{"package": "proof/serving-child", "release": "1.0.0"}],
                     "models": [],
                 }
             ),
@@ -97,7 +111,7 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
         result = prepare()
         (placement,) = read_placement_set(result.placement_set)
         assert placement["entrypoints"] == placement["models"] == []
-        assert placement["package"] == {"package": "proof/serving-child", "release": "1.0"}
+        assert placement["package"] == {"package": "proof/serving-child", "release": "1.0.0"}
         assert len(retained) == 1 and retained[0].receipt_digest
         reopened = environments.open_generation(
             root,
@@ -112,13 +126,11 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
 
 
 def test_real_worker_retains_published_serving_only_child_without_loading_model() -> None:
-    import hashlib
     import os
     import shutil
     import tempfile
 
     from conftest import image_python
-
     from cozy_runtime.internal import child_env
     from cozy_runtime.internal.config import Credentials, RuntimeConfig
     from cozy_runtime.internal.worker.acquire import Acquirer
@@ -154,8 +166,11 @@ async def generate(payload: Request, model: Reference) -> Reply:
             "serving_child",
             ("cozy-runtime>=0.18.24",),
             source,
+            version="1.0.0",
             resources={
-                "serving_child-1.0.dist-info/entry_points.txt": b"[cozy.application]\napp = serving_child:app\n"
+                "serving_child-1.0.0.dist-info/entry_points.txt": (
+                    b"[cozy.application]\napp = serving_child:app\n"
+                )
             },
         )
         index = _SimpleIndex(root / "index", [runtime, wheel])
@@ -163,8 +178,10 @@ async def generate(payload: Request, model: Reference) -> Reply:
         rows = sorted(
             [
                 *_closure_rows(uv),
-                f"cozy-runtime=={runtime_version} --hash=sha256:{hashlib.sha256(runtime.read_bytes()).hexdigest()}",
-                f"serving-child==1.0 --hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}",
+                f"cozy-runtime=={runtime_version} "
+                f"--hash=sha256:{hashlib.sha256(runtime.read_bytes()).hexdigest()}",
+                "serving-child==1.0.0 "
+                f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}",
             ]
         )
         locked = (
@@ -204,7 +221,7 @@ async def generate(payload: Request, model: Reference) -> Reply:
                 download_delegation=canonical.write(
                     {
                         "format": "cozy.worker.v1.DownloadDelegation/1",
-                        "packages": [{"package": "proof/serving-child", "release": "1.0"}],
+                        "packages": [{"package": "proof/serving-child", "release": "1.0.0"}],
                         "models": [],
                     }
                 ),
