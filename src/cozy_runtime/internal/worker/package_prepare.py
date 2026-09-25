@@ -408,7 +408,15 @@ def _prepare_published(
         verified=verified,
         derive=_deriver(installed, application),
     )
-    if not entrypoints and not jobs:
+    # A captured serving dependency needs its exact code/interface before its
+    # caller chooses models. Retain that sealed revision without advertising an
+    # executable binding, just as unpublished preparation does.
+    code_only = (
+        not models
+        and bool(interface_body["entrypoints"])
+        and all(row.get("models") for row in interface_body["entrypoints"])
+    )
+    if not entrypoints and not jobs and not code_only:
         raise PreparationRefusal(
             "package_prepare_callable_absent",
             "package has no runnable serving or weightless job callable",

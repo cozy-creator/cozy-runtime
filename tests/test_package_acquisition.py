@@ -192,24 +192,29 @@ def test_empty_selection_cannot_drop_declared_weightless_binding(
     assert refused.value.code == "binding_entrypoint_set_mismatch"
 
 
-def test_empty_development_selection_cannot_hide_selected_models(tmp_path: Path) -> None:
+@pytest.mark.parametrize("development", [False, True])
+def test_empty_selection_cannot_hide_selected_models(tmp_path: Path, development: bool) -> None:
     modeled = {
         **_entrypoint("serve"),
         "models": [{"class": "Model", "path": "serve.models.model", "component_use": {}}],
     }
     with pytest.raises(AcquisitionRefusal) as refused:
-        _bindings(tmp_path, _interface([modeled]), development=True, models=({"id": "selected"},))
+        _bindings(
+            tmp_path, _interface([modeled]), development=development, models=({"id": "selected"},)
+        )
     assert refused.value.code == "binding_entrypoint_set_mismatch"
 
 
-def test_empty_published_modeled_selection_remains_a_refusal(tmp_path: Path) -> None:
+@pytest.mark.parametrize("development", [False, True])
+def test_modeled_code_only_selection_has_no_execution_authority(
+    tmp_path: Path, development: bool
+) -> None:
     modeled = {
         **_entrypoint("serve"),
         "models": [{"class": "Model", "path": "serve.models.model", "component_use": {}}],
     }
-    with pytest.raises(AcquisitionRefusal) as refused:
-        _bindings(tmp_path, _interface([modeled]))
-    assert refused.value.code == "binding_entrypoint_set_mismatch"
+    bindings, count = _bindings(tmp_path, _interface([modeled]), development=development)
+    assert bindings == {} and count == 1
 
 
 def test_code_only_exception_cannot_hide_missing_model_slots(tmp_path: Path) -> None:
