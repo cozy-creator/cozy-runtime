@@ -51,8 +51,9 @@ from __future__ import annotations
 import functools
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.fill import FillRefusal, StreamingFillBackend, block_read_bytes
@@ -888,3 +889,113 @@ class ComponentResidency:
             "log": list(self.backend.stage_log[-16:]),
             "refusals": list(self.refusals[-8:]),
         }
+
+
+# ------------------------------------------------------------ whole constructions (proto-061)
+
+
+class _Residency(Protocol):
+    def vacate(self) -> dict[str, Any]: ...
+
+    def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]: ...
+
+    def document(self) -> dict[str, Any]: ...
+
+
+@dataclass(slots=True)
+class Construction:
+    """One loaded construction as the process arbiter holds it."""
+
+    residency: _Residency | None
+    #: bytes to bring `names` back: their settled sum plus the widest one's fill transient
+    need: Callable[[tuple[str, ...]], int]
+    last_used: int = 0
+    last_used_ns: int = 0
+    #: the resident set a park vacated, restored by `restore`; None while resident
+    parked: tuple[str, ...] | None = None
+
+    def resident_bytes(self) -> int:
+        if self.residency is None or self.parked is not None:
+            return 0
+        return sum(int(size) for size in self.residency.document().get("resident", {}).values())
+
+
+@dataclass(slots=True)
+class ConstructionArbiter:
+    """Whole-construction LRU parking inside ONE executor process.
+
+    Each construction keeps its own `ComponentResidency` (or composite), which evicts only
+    its own components inside an attempt. Across constructions the unit is the whole
+    construction: `park` vacates it (bytes freed, nothing demoted to host memory) and
+    remembers what was resident; `restore` stages exactly that set back. The caller owns
+    measurement: `make_room` parks least-recently-used constructions until its `fits`
+    answers yes or nothing is left to park.
+    """
+
+    rows: dict[str, Construction] = field(default_factory=dict)
+    clock: int = 0
+
+    def add(self, key: str, row: Construction) -> None:
+        self.rows[key] = row
+        self.touch(key)
+
+    def touch(self, key: str) -> None:
+        self.clock += 1
+        self.rows[key].last_used = self.clock
+        self.rows[key].last_used_ns = time.monotonic_ns()
+
+    def remove(self, key: str) -> Construction | None:
+        return self.rows.pop(key, None)
+
+    def victims(self, exclude: str) -> list[str]:
+        """Resident constructions holding bytes, least recently used first."""
+        held = [
+            key
+            for key, row in self.rows.items()
+            if key != exclude and row.parked is None and row.resident_bytes() > 0
+        ]
+        return sorted(held, key=lambda key: self.rows[key].last_used)
+
+    def park(self, key: str) -> dict[str, Any]:
+        row = self.rows[key]
+        if row.residency is None or row.parked is not None:
+            return {"freed": {}, "held": {}, "freed_bytes": 0}
+        report = row.residency.vacate()
+        row.parked = tuple(sorted(report.get("freed", {})))
+        return report
+
+    def make_room(self, exclude: str, fits: Callable[[], bool]) -> list[str]:
+        """Park LRU constructions other than `exclude` until `fits()`; the parked keys."""
+        parked: list[str] = []
+        while not fits():
+            victims = self.victims(exclude)
+            if not victims:
+                break
+            self.park(victims[0])
+            parked.append(victims[0])
+        return parked
+
+    def restore(self, key: str, names: tuple[str, ...] = ()) -> dict[str, Any]:
+        row = self.rows[key]
+        wanted = names or row.parked or ()
+        row.parked = None
+        if row.residency is None or not wanted:
+            return {"restored": {}, "held": {}, "restored_bytes": 0}
+        return row.residency.restore(names=tuple(wanted))
+
+    def need(self, key: str) -> int:
+        row = self.rows[key]
+        return row.need(row.parked or ()) if row.parked is not None else 0
+
+    def document(self, active: str = "") -> list[dict[str, Any]]:
+        return [
+            {
+                "key": key,
+                "state": "resident" if row.parked is None else "parked",
+                "resident_bytes": row.resident_bytes(),
+                "last_used_ns": row.last_used_ns,
+                "active": key == active,
+                **({"parked": list(row.parked)} if row.parked is not None else {}),
+            }
+            for key, row in sorted(self.rows.items(), key=lambda item: -item[1].last_used)
+        ]

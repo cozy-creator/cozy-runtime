@@ -111,7 +111,12 @@ PAYLOAD_MAX_BYTES = seam.MAX_FRAME - 12 * 1024
 #: Fields the worker structurally CANNOT verify, by their WIRE names. Named on every
 #: terminal that carries them, sorted, because a claim printed as a measurement is worse
 #: than no number.
-UNVERIFIABLE = ("input_tokens", "output_tokens", "peak_device_memory_bytes")
+UNVERIFIABLE = (
+    "input_tokens",
+    "output_tokens",
+    "peak_device_memory_bytes",
+    "working_peak_device_bytes",
+)
 
 
 def weights_exchange_bytes(spool: Path, output_slot: str, kind: str, expected_length: int) -> bytes:
@@ -2970,6 +2975,10 @@ class AttemptEngine:
             handler_ms=int(min(float(claim.get("handler_ms", 0.0)), window_ms)),
             finalization_ms=int(max((time.perf_counter() - attempt.resulted_at) * 1000, 0)),
             unverified_fields=list(UNVERIFIABLE),
+            working_peak_device_bytes=int(claim.get("working_peak_vram_bytes", 0)),
+            # The worker's own plan names the cell it priced; the claim only fills a gap.
+            shape_cell=(attempt.plan.shape_cell if attempt.plan is not None else "")
+            or str(claim.get("shape_cell", "")),
         )
 
     # ------------------------------------------------------------------ cancel / abandon
