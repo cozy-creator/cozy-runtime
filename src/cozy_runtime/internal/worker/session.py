@@ -2435,6 +2435,14 @@ class Worker:
             ):
                 machine_capture.restore(self, preparation)
                 return machine_slots.ensure(self, request_id, desired.job, binding)
+        managed_placement = request_id and desired.WhichOneof("mode") == "placement_set"
+        if managed_placement and desired.placement_set.device_pins:
+            from . import machine_lanes
+
+            combined = machine_lanes.compose(self, desired)
+            if combined is None:
+                return False
+            desired = combined
         desired.revision = self.accepted.accepted_desired_state_revision
         same = desired_state_body(desired) == self.accepted.desired_state_body
         if same:
@@ -2461,7 +2469,14 @@ class Worker:
                         )
                         raise WorkspaceRefusal(f"model preparation failed: {detail}")
             return True
-        if any(
+        if (
+            managed_placement
+            and desired.placement_set.device_pins
+            and self.accepted.converged_revision < self.accepted.accepted_desired_state_revision
+        ):
+            # Finish the retained topology transition before adding another replica.
+            return False
+        if not (managed_placement and desired.placement_set.device_pins) and any(
             (attempt.state in self.engine.PRE_RELEASE or attempt.state in self.engine.HELD)
             and not (
                 (
@@ -2476,7 +2491,7 @@ class Worker:
             # on_offer journals the queue before a lane begins accepting it. That queue
             # already owns its preparation and admission epoch, just like a running job.
             return False
-        desired = machine_capture.restore(self, preparation)
+        machine_capture.restore(self, preparation)
         desired.revision = self.accepted.accepted_desired_state_revision + 1
         self._apply_desired_state(desired)
         return self.dispatchable()

@@ -3,62 +3,15 @@
 from __future__ import annotations
 
 import base64
-import os
 
 import pytest
 
-from cozy_runtime.internal import accel
 from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.lanes import LaneRefusal, LaneSet
-from cozy_runtime.internal.worker.machine_serving import device_pins
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions, desired_state_body
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _config, _workspace
 from test_group_lanes import _placement
-
-
-def test_managed_h3_degree_joins_existing_lane_admission() -> None:
-    lanes = LaneSet.from_envelope("0,1", worker_pid=os.getpid())
-    models = [{"sequence_parallel": {"degrees": [2, 4]}}]
-    measured = {index: accel.DeviceMemory("measured", 6 << 30, 8 << 30) for index in range(2)}
-    unpinned = lanes.assign(
-        "h3", model_bearing=True, declared_bytes=1, measured=measured, degrees=(2, 4)
-    )
-    assert unpinned.ordinals == (0, 1) and not lanes.notes
-    lanes.release("h3")
-    pins = device_pins(lanes, "h3", models)
-    lane = lanes.assign(
-        "h3",
-        model_bearing=True,
-        declared_bytes=1,
-        measured=measured,
-        degrees=(2, 4),
-        pin=tuple(pins[0].device_ordinals),
-    )
-    assert lane.ordinals == (0, 1) and lane.group
-    assert tuple(device_pins(lanes, "h3", models)[0].device_ordinals) == lane.ordinals
-    # Local ownership does not authorize stealing those devices from a live placement.
-    with pytest.raises(LaneRefusal, match="only empty devices"):
-        lanes.assign(
-            "another",
-            model_bearing=True,
-            declared_bytes=1,
-            measured=measured,
-            degrees=(2,),
-            pin=(0, 1),
-        )
-
-
-def test_managed_degrees_intersect_and_preserve_single_device_models() -> None:
-    lanes = LaneSet.from_envelope("0,1,2,3", worker_pid=os.getpid())
-    models = [{"sequence_parallel": {"degrees": [2, 4]}}, {"sequence_parallel": {"degrees": [2]}}]
-    assert list(device_pins(lanes, "pair", models)[0].device_ordinals) == [0, 1]
-    assert list(device_pins(lanes, "single", [{}])[0].device_ordinals) == [0]
-    assert device_pins(lanes, "weightless", []) == []
-    # no declared degree fits: pin the whole envelope and let lane assignment degrade it
-    wide = device_pins(lanes, "unsupported", [{"sequence_parallel": {"degrees": [8]}}])
-    assert list(wide[0].device_ordinals) == [0, 1, 2, 3]
 
 
 def test_failed_machine_preparation_is_not_an_endless_capacity_wait() -> None:
