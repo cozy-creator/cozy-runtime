@@ -55,6 +55,7 @@ def complete(
     value: Any = None,
     status: pb.OutcomeStatus = pb.OUTCOME_STATUS_SUCCEEDED,
     cause: pb.CauseCode = pb.CAUSE_CODE_UNSPECIFIED,
+    origin: pb.CauseOrigin = pb.CAUSE_ORIGIN_WORKER,
 ) -> pb.AttemptOutcome:
     selected = executions.offer("owner", request)
     body, digest = documents.identity(
@@ -63,7 +64,7 @@ def complete(
             attempt_ordinal=selected.attempt_ordinal,
             invocation_spec_digest=documents.spell(selected.invocation_spec_digest),
             status=status,
-            cause=pb.OutcomeCause(code=cause, origin=pb.CAUSE_ORIGIN_WORKER),
+            cause=pb.OutcomeCause(code=cause, origin=origin),
             safe_message="finished",
             result=pb.ResultEnvelope(inline_result=canonical_json.encode(value)),
         )
@@ -584,6 +585,75 @@ def test_retry_policy_never_retries_authored_errors_or_user_cancellation(tmp_pat
     assert e.status("owner", "transient").attempt_ordinal == 2
     # An explicit command authorizes another attempt without quietly expanding auto retries.
     assert e.control("owner", "transient", "user-resume", 2, "resume").attempt_ordinal == 3
+
+
+def test_worker_stale_admission_reoffers_within_existing_retry_budget(tmp_path: Path) -> None:
+    now = [1000]
+    executions = Executions(Workspace(tmp_path / "store"), clock_ms=lambda: now[0])
+    executions.submit(
+        "owner",
+        "stale",
+        b"c" * 32,
+        offer("stale"),
+        max_attempts=2,
+        retry_delay_ms=500,
+        expected_execution_workspace_id=executions.workspace_id,
+    )
+    complete(
+        executions,
+        "stale",
+        status=pb.OUTCOME_STATUS_REFUSED,
+        cause=pb.CAUSE_CODE_ADMISSION_EPOCH_STALE,
+    )
+    assert executions.status("owner", "stale").state == "retrying"
+    with pytest.raises(WorkspaceRefusal, match="not terminal"):
+        executions.collect("owner", "stale")
+    executions.retry_due("owner")
+    assert executions.status("owner", "stale").attempt_ordinal == 1
+    now[0] += 500
+    executions.retry_due("owner")
+    assert executions.status("owner", "stale").attempt_ordinal == 2
+    assert (
+        executions.offer("owner", "stale").invocation_spec_digest
+        == offer("stale").invocation_spec_digest
+    )
+    complete(
+        executions,
+        "stale",
+        status=pb.OUTCOME_STATUS_REFUSED,
+        cause=pb.CAUSE_CODE_ADMISSION_EPOCH_STALE,
+    )
+    now[0] += 500
+    executions.retry_due("owner")
+    assert executions.status("owner", "stale").state == "failed"
+    assert executions.status("owner", "stale").attempt_ordinal == 2
+
+
+@pytest.mark.parametrize(
+    "origin", [pb.CAUSE_ORIGIN_CLIENT, pb.CAUSE_ORIGIN_EXECUTOR, pb.CAUSE_ORIGIN_RUNTIME]
+)
+def test_stale_admission_from_another_origin_is_terminal(
+    tmp_path: Path, origin: pb.CauseOrigin
+) -> None:
+    executions = Executions(Workspace(tmp_path / "store"))
+    executions.submit(
+        "owner",
+        "stale",
+        b"c" * 32,
+        offer("stale"),
+        max_attempts=2,
+        expected_execution_workspace_id=executions.workspace_id,
+    )
+    complete(
+        executions,
+        "stale",
+        status=pb.OUTCOME_STATUS_REFUSED,
+        cause=pb.CAUSE_CODE_ADMISSION_EPOCH_STALE,
+        origin=origin,
+    )
+    executions.retry_due("owner")
+    assert executions.status("owner", "stale").state == "failed"
+    assert executions.status("owner", "stale").attempt_ordinal == 1
 
 
 def test_queued_cancellation_and_absolute_deadline_have_exact_terminals(tmp_path: Path) -> None:
