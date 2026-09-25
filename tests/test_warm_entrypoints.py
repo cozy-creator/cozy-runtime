@@ -204,12 +204,18 @@ def test_both_entrypoints_execute_on_the_one_executor(stores: dict[str, TenantSt
             "plc-p",
             LocalRequest(entrypoint=name, payload={"seed": seed}, outputs=(), request_id=rid),
         )
-        for name, seed, rid in (("touch", 1, "t-1"), ("retouch", 2, "r-1"), ("touch", 3, "t-2"))
+        for name, seed, rid in (
+            ("touch", 1, "t-1"),
+            ("retouch", 2, "r-1"),
+            ("touch", 3, "t-2"),
+            ("retouch", 4, "r-2"),
+            ("touch", 5, "t-3"),
+        )
     ]
     with _workspace() as root:
         owner, _worker, notes = _drive(store, turns, root)
     assert owner.ended == "terminal", (owner.ended, owner.error, owner.refusals)
-    assert [turn.outcome["status"] for turn in owner.turns] == [1, 1, 1], [
+    assert [turn.outcome["status"] for turn in owner.turns] == [1] * len(turns), [
         (turn.request.request_id, turn.outcome.get("cause"), turn.outcome.get("safe_message"))
         for turn in owner.turns
     ]

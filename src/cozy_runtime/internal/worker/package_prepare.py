@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import importlib.metadata
 import os
 import re
 import stat
@@ -111,13 +112,15 @@ def prepare_package_set(
     cancel: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
     python_root: Path | None = None,
+    describe: Callable[[package_environment.InstalledEnvironment, str], bytes] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Parse the desired download set plus the request's release facts and prepare.
 
     The request carries the release's PackageInterface (wire 61), `application`, the
     declared model-slot paths, the image inventory and the locked-requirements export.
-    Wheels come from the export's indexes under its own hashes; the interface is the hub's
-    release document, never re-described here; model manifests resolve from the local Store.
+    Wheels come from the export's indexes under its own hashes. Before wire 61, the
+    request omitted the interface: read installed metadata or describe once per immutable
+    installation. Model manifests resolve from the local Store on either path.
     """
 
     if (
@@ -147,11 +150,6 @@ def prepare_package_set(
         request, models, preinstalled=preinstalled_python is not None
     )
     interface_raw = bytes(request.package_interface)
-    if not interface_raw:
-        raise PreparationRefusal(
-            "package_prepare_interface_missing",
-            "a published prepare carries the release PackageInterface (wire 61)",
-        )
     _verify_control_inventory(inventory, python, base)
     _verify_inventory_python(inventory, python)
     python, base = _select_python(
@@ -175,13 +173,78 @@ def prepare_package_set(
         tensorfs_root=tensorfs_root,
         install_root=install_root,
         python=python,
-        interface=lambda _installed, _distribution: interface_raw,
+        interface=lambda installed, distribution: (
+            interface_raw or _installed_interface(installed, distribution, artifact_cache, describe)
+        ),
         verified=verified,
         job_plan_root=job_plan_root,
         base=base,
         dependency_cache=dependency_cache,
         materialized=materialized,
     )
+
+
+def _installed_interface(
+    installed: package_environment.InstalledEnvironment,
+    distribution: str,
+    artifact_cache: Path,
+    describe: Callable[[package_environment.InstalledEnvironment, str], bytes] | None,
+) -> bytes:
+    """The installed package's interface, with one sandbox import only on a cache miss."""
+    identity = canonical.digest(
+        {
+            "environment": installed.content_digest,
+            "distribution": distribution,
+            "schema": package_interface.SCHEMA,
+        }
+    ).removeprefix("sha256:")
+    root = artifact_cache / "installed-interfaces"
+    cached = root / identity
+    if cached.exists():
+        raw = _read_file(cached, canonical.DOC_MAX_BYTES)
+    else:
+        candidates = [
+            item
+            for item in importlib.metadata.distributions(path=[str(installed.site_packages)])
+            if _DISTRIBUTION.sub("-", item.metadata["Name"]).lower() == distribution
+        ]
+        if len(candidates) != 1:
+            raise PreparationRefusal(
+                "package_prepare_interface_missing",
+                f"installed distribution {distribution!r} is absent or ambiguous",
+            )
+        metadata = [
+            Path(str(candidates[0].locate_file(row)))
+            for row in candidates[0].files or ()
+            if str(row).endswith(".dist-info/package-interface.json")
+        ]
+        if len(metadata) > 1:
+            raise PreparationRefusal(
+                "package_prepare_interface_invalid", f"{distribution!r} has multiple interfaces"
+            )
+        if metadata:
+            raw = _read_file(metadata[0], canonical.DOC_MAX_BYTES)
+        elif describe is not None:
+            raw = describe(installed, distribution)
+        else:
+            raise PreparationRefusal(
+                "package_prepare_interface_missing",
+                f"{distribution!r} has no installed interface and no sandbox describe is available",
+            )
+    try:
+        package_interface.read_bytes(raw, "installed package interface")
+    except package_interface.StalePackageInterface as exc:
+        raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
+    if not cached.exists():
+        digest, _length = _stage(artifact_cache, raw)
+        root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        root.chmod(0o755)
+        try:
+            os.link(artifact_cache / digest.removeprefix("sha256:"), cached)
+        except FileExistsError:
+            if _read_file(cached, canonical.DOC_MAX_BYTES) != raw:
+                raise PreparationRefusal("package_prepare_cache_conflict", identity) from None
+    return raw
 
 
 def prepare_published_local(
@@ -216,7 +279,9 @@ def prepare_published_local(
         tensorfs_root=tensorfs_root,
         install_root=install_root,
         python=python,
-        interface=describe,
+        interface=lambda installed, distribution: _installed_interface(
+            installed, distribution, artifact_cache, describe
+        ),
         verified=lambda _digest, _length, _path: None,
         job_plan_root=job_plan_root,
         base=None,

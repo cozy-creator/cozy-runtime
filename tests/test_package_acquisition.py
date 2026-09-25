@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
-import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -475,34 +474,6 @@ def test_a_census_miss_loads_checkpoint_assets_in_the_fenced_child_without_a_wri
     assert {row["id"] for row in body["models"]} == {package_prepare.model_id(TOKENIZED)}
     (census,) = (tmp_path / "artifacts" / "census").glob("*.json")
     assert json.loads(census.read_bytes())["components"] == ["unet"]
-
-
-def test_published_prepare_refuses_a_missing_or_disagreeing_interface(tmp_path: Path) -> None:
-    request = pb.PreparePackageSetRequest(
-        download_delegation=canonical.write(
-            {
-                "format": "cozy.worker.v1.DownloadDelegation/1",
-                "packages": [{"package": MODELED, "release": "1.0.0"}],
-                "models": [],
-            }
-        ),
-        install_root=str(tmp_path / "install"),
-        application="modeled_package:app",
-        image_inventory=pb.ImageInventory(profile="test", python="3.12.0"),
-        locked_requirements=b"--index-url https://pypi.org/simple\nmodeled==1.0.0 "
-        b"--hash=sha256:" + b"a" * 64 + b"\n",
-    )
-    with pytest.raises(package_prepare.PreparationRefusal) as missing:
-        package_prepare.prepare_package_set(
-            request,
-            artifact_cache=tmp_path / "artifacts",
-            tensorfs_root=tmp_path / "store",
-            install_root=tmp_path / "install",
-            python=Path(sys.executable),
-            verified=lambda _digest, _length, _path: None,
-        )
-    assert missing.value.code == "package_prepare_interface_missing"
-    assert not (tmp_path / "install").exists()
 
 
 @pytest.mark.skipif(

@@ -1335,6 +1335,14 @@ class PreparePackageSetResult(_message.Message):
     placement_set: DesiredPlacementSet
     def __init__(self, placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ...) -> None: ...
 
+class CheckPackageSetCompatibilityResult(_message.Message):
+    __slots__ = ("refusal_code", "refusal_detail")
+    REFUSAL_CODE_FIELD_NUMBER: _ClassVar[int]
+    REFUSAL_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    refusal_code: str
+    refusal_detail: str
+    def __init__(self, refusal_code: _Optional[str] = ..., refusal_detail: _Optional[str] = ...) -> None: ...
+
 class PrepareLocalPackageRequest(_message.Message):
     __slots__ = ("operation_id", "package", "wheels", "install_root", "dependency_requirements", "python_requires", "python_version")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
