@@ -38,6 +38,7 @@ def replica(
     loads = [0] * width
     executions = worker.executions
     assert executions is not None
+    charged: set[str] = set()
     for request in executions.pending(owner):
         preparation = executions.preparation(owner, request)
         if not preparation:
@@ -45,10 +46,25 @@ def replica(
         desired = state(preparation)
         if desired.WhichOneof("mode") != "placement_set":
             continue
+        charged.add(request)
         for pin in desired.placement_set.device_pins:
             for ordinal in pin.device_ordinals:
                 if ordinal < width:
                     loads[ordinal] += 1
+    # Direct offers and a prior fenced owner's draining attempts share these same
+    # physical lanes. Do not route onto a busy device merely because its work was
+    # admitted outside this owner's durable execution queue.
+    for attempt in worker.engine.history.values():
+        if attempt.request_id in charged or attempt.state not in (
+            *worker.engine.PRE_RELEASE,
+            *worker.engine.HELD,
+        ):
+            continue
+        lane = worker.lanes.by_id.get(attempt.lane_id)
+        if lane is not None:
+            for ordinal in lane.ordinals:
+                loads[ordinal] += 1
+            charged.add(attempt.request_id)
     ordinals = min(groups, key=lambda group: (sum(loads[index] for index in group), group))
     # The replica is a placement instance, not a new package or binding. Reusing the
     # same immutable code/models on the same devices reuses its supervised executor.

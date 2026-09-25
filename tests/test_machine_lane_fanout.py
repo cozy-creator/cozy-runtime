@@ -86,6 +86,13 @@ def test_eight_durable_children_spread_then_reuse_exact_replicas(
         )
         assert tuple(pins[0].device_ordinals) == tuple(range(width))
         assert group["placement_id"] not in identities
+        # A direct or prior-owner offer is not in this owner's execution journal.
+        # It still occupies a physical device, so the next child uses a free one.
+        external = AttemptRecord("external", 1, b"", {}, lane_id="lane-0", state="running")
+        worker.engine.history[(external.request_id, 1)] = external
+        selected, pins = machine_lanes.replica(worker, "owner", placement, [{}])
+        assert tuple(pins[0].device_ordinals) == (1,)
+        external.state = "closed"
     finally:
         worker.shutdown()
 

@@ -147,8 +147,7 @@ def test_fused_lane_dispatches_a_real_executor_after_boot(
 
 
 @needs_executor
-@pytest.mark.parametrize("supersede_drain", [False, True])
-@pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("managed,supersede_drain", [(False, False), (False, True), (True, False)])
 def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
     monkeypatch: pytest.MonkeyPatch,
     supersede_drain: bool,
@@ -158,8 +157,6 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
     import dataclasses
     import shutil
 
-    if managed and supersede_drain:
-        pytest.skip("managed admission does not start a drain while attempts are active")
     import test_device_lanes
     from cozy_runtime.internal.worker import lanes
     from cozy_runtime.protocol import documents
@@ -168,6 +165,7 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
     workers: list[Worker] = []
     completed: list[str] = []
     overlap: list[set[str]] = []
+    cold_waits: list[int] = []
 
     def assign_fixture(self: lanes.LaneSet, placement_id: str, **kwargs: Any) -> lanes.DeviceLane:
         pin = kwargs.get("pin")
@@ -307,6 +305,17 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
                 for p in report.placements
                 if p.serving == pb.SERVING_STATE_DISPATCHABLE
             }
+            if (
+                managed
+                and stage == 0
+                and report.accepted_desired_state_revision == 1
+                and ready != {"plc-local"}
+            ):
+                # Both cold children are eligible before either executor can accept.
+                # The second cannot replace the first's still-materializing desired set.
+                assert not prepare(single(state(2, False), "hosted"))
+                assert worker.accepted.accepted_desired_state_revision == 1
+                cold_waits.append(1)
             if managed and stage == 0 and ready == {"plc-local"}:
                 stage = 10
                 dispatch("before-0", "plc-local")
@@ -438,5 +447,7 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
     assert not outcome.error, outcome.error
     assert len(completed) == len(set(completed)) == 5
     assert len(overlap) == 2
+    if managed:
+        assert cold_waits, "cold second preparation never exercised the convergence fence"
     assert seals == ["0", "0,1", "0"]
     assert not workers[0]._device_consumers and not workers[0]._retired_consumers
