@@ -476,7 +476,7 @@ def overlay_sources(interface: bytes, available: set[str]) -> dict[str, tuple[st
     modules: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for collection, kind in (("entrypoints", "entrypoint"), ("jobs", "job")):
         for entry in document[collection]:
-            if "invocable" in entry:
+            if "invocable" in entry and not entry.get("internal", False):
                 modules[entry["invocable"]["module"]].append({**entry, "_kind": kind})
     result: dict[str, tuple[str, bytes, bytes]] = {}
     for index, (module, entries) in enumerate(sorted(modules.items())):
