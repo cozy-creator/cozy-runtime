@@ -7,5 +7,5 @@ verification at execution admission.
 
 A real Worker regression installs and describes a serving-only package, reopens
 its sealed receipt, and acquires zero bindings without invoking its model loader
-or handler. Both original refusals reproduce on0.18.24. No model numerical code,
+or handler. Both original refusals reproduce on 0.18.24. No model numerical code,
 protocol fields, or native kernel inputs changed.
