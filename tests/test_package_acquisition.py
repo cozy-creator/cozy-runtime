@@ -267,6 +267,20 @@ class Weights(Model[Pipeline]):
     @uses_components("unet")
     def measure(self) -> int:
         raise AssertionError("preparation cannot execute a handler")
+class Tokenized:
+    def __init__(self, config: Config, vocab: bytes):
+        self.vocab = vocab
+        self.components = {"unet": scalar(1)}
+class TokenizedWeights(Model[Tokenized]):
+    def load(self, loader: Loader) -> None:
+        assert loader.assets.names() == ("tokenizer/vocab.txt",)
+        vocab = loader.assets.read("tokenizer/vocab.txt")
+        assert loader.assets.open("tokenizer/vocab.txt").read() == vocab
+        assert not hasattr(loader.assets, "materialized")
+        self.pipe = loader.construct(Tokenized, factory=lambda config: Tokenized(config, vocab))
+    @uses_components("unet")
+    def measure(self) -> int:
+        raise AssertionError("preparation cannot execute a handler")
 class WideWeights(Model[Wide]):
     def load(self, loader: Loader) -> None:
         self.pipe = loader.construct(Wide, factory=Wide)
@@ -281,6 +295,9 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
 def turbo(ctx: Context, payload: Request, base_model: Weights) -> Result:
     raise AssertionError("preparation cannot execute a handler")
 @app.entrypoint
+def tokenized(ctx: Context, payload: Request, model: TokenizedWeights) -> Result:
+    raise AssertionError("preparation cannot execute a handler")
+@app.entrypoint
 def wide(ctx: Context, payload: Request, model: WideWeights) -> Result:
     raise AssertionError("preparation cannot execute a handler")
 """
@@ -288,6 +305,7 @@ MODELED = "proof/modeled"
 GENERATE = "generate.models.model"
 TURBO = "turbo.models.base_model"
 WIDE = "wide.models.model"
+TOKENIZED = "tokenized.models.model"
 
 
 @dataclass(frozen=True)
@@ -344,7 +362,7 @@ def _prepare_modeled(release: ModeledRelease, root: Path, slots: tuple[str, ...]
         package_name=MODELED,
         release="1.0.0",
         application="modeled_package:app",
-        model_slot_paths=(GENERATE, TURBO, WIDE),
+        model_slot_paths=(GENERATE, TOKENIZED, TURBO, WIDE),
         inventory=None,
         locked=package_environment.read_locked_requirements(
             b"--index-url https://pypi.org/simple\nmodeled==1.0.0 --hash=sha256:"
@@ -445,6 +463,18 @@ def test_census_runs_once_per_content_and_ids_stay_stable_as_the_set_grows(
         assert refused.value.code == "checkpoint_incompatible"
         assert "shape_mismatch" in refused.value.detail
     assert derived == [(GENERATE,), (TURBO,), (WIDE,)]
+
+
+def test_a_census_miss_loads_checkpoint_assets_in_the_fenced_child_without_a_write(
+    modeled: ModeledRelease, tmp_path: Path
+) -> None:
+    """sdxl's tokenizer path: `load` builds from checkpoint asset bytes inside the derive child,
+    whose sandbox refuses every filesystem write, and the census still lands."""
+
+    body = _prepare_modeled(modeled, tmp_path, (TOKENIZED,))
+    assert {row["id"] for row in body["models"]} == {package_prepare.model_id(TOKENIZED)}
+    (census,) = (tmp_path / "artifacts" / "census").glob("*.json")
+    assert json.loads(census.read_bytes())["components"] == ["unet"]
 
 
 def test_published_prepare_refuses_a_missing_or_disagreeing_interface(tmp_path: Path) -> None:

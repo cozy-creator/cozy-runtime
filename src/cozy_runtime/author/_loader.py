@@ -22,13 +22,10 @@ ref, device/dtype override, offload/pin/eviction knob, compile hook or selection
 from __future__ import annotations
 
 import io
-import os
-import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
 
@@ -361,9 +358,10 @@ class ModelFitRefused(ConformanceError):
 class ModelAssets:
     """Verified read-only model files embedded in one CozyTensors artifact.
 
-    Names are header paths, never config values. Reads are bounded and return immutable bytes;
-    ``materialized`` exists only for third-party constructors that insist on a filesystem view.
-    The view is private, read-only, and removed before ``Model.load`` returns.
+    Names are header paths, never config values. Reads are bounded and return immutable bytes
+    straight from the checkpoint; there is no filesystem view. A path-only constructor is fed
+    the parsed bytes instead (e.g. a tokenizer's vocab dict and merges list): model loading
+    writes nothing, and a derivation's sandbox refuses any write.
     """
 
     MAX_BYTES = 64 << 20
@@ -391,55 +389,6 @@ class ModelAssets:
         """An in-memory binary stream over the same immutable verified bytes."""
 
         return io.BytesIO(self.read(name))
-
-    @contextmanager
-    def materialized(self, prefix: str = "") -> Iterator[Path]:
-        """Temporarily expose one asset or a named subtree as read-only files."""
-
-        self._guard("loader.assets.materialized")
-        prefix = prefix.strip("/")
-        selected = {
-            name: raw
-            for name, raw in self._values.items()
-            if not prefix or name == prefix or name.startswith(prefix + "/")
-        }
-        if not selected:
-            self._missing(prefix or "<all>")
-        total = sum(len(raw) for raw in selected.values())
-        if total > self.MAX_BYTES:
-            raise CapabilityError(
-                f"model asset view {prefix or '<all>'!r} is {total} B; the bounded Loader "
-                f"limit is {self.MAX_BYTES} B",
-                code="model_asset_too_large",
-            )
-        with tempfile.TemporaryDirectory(prefix="cozy-model-assets-") as temporary:
-            root = Path(temporary).resolve()
-            directories: set[Path] = set()
-            for name, raw in selected.items():
-                relative = Path(name)
-                target = (root / relative).resolve()
-                if relative.is_absolute() or not target.is_relative_to(root):
-                    raise CapabilityError(
-                        f"model asset name {name!r} is not a relative path",
-                        code="model_asset_name",
-                    )
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(raw)
-                target.chmod(0o444)
-                directories.update((target.parent, *target.parents))
-            for directory in sorted(
-                (path for path in directories if path.is_relative_to(root)),
-                key=lambda path: len(path.parts),
-                reverse=True,
-            ):
-                directory.chmod(0o555)
-            view = root / prefix if prefix else root
-            try:
-                yield view
-            finally:
-                for directory in directories:
-                    with suppress(OSError):
-                        os.chmod(directory, 0o755)
 
     def _get(self, name: str) -> bytes:
         try:
