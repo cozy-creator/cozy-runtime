@@ -22,7 +22,7 @@ import errno
 import hashlib
 import os
 import secrets
-import select
+import selectors
 import signal
 import stat
 import sys
@@ -123,13 +123,16 @@ class ProcessExitObserver:
     descriptor: int
 
     def wait(self) -> None:
-        while True:
-            try:
-                readable, _, _ = select.select([self.descriptor], [], [])
-            except InterruptedError:
-                continue
-            if readable:
-                return
+        # Model preparation can leave descriptors above select's FD_SETSIZE. The kernel
+        # selector has no such limit and still observes exit without reaping the child.
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.descriptor, selectors.EVENT_READ)
+            while True:
+                try:
+                    if selector.select():
+                        return
+                except InterruptedError:
+                    continue
 
     def close(self) -> None:
         if self.descriptor < 0:
