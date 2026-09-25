@@ -198,6 +198,28 @@ def _owner_below_lanes(owner: LocalRecordOwner) -> None:
 
 
 @needs_executor
+def test_wire59_owner_runs_inference_on_wire60_worker() -> None:
+    def wire59(owner: LocalRecordOwner) -> None:
+        queued = owner.host.inbound.get_nowait()
+        assert queued is not None and queued.WhichOneof("msg") == "claim"
+        queued.claim.wire_minor = 59
+        owner.host.deliver(queued)
+        make_desired = owner._desired_state
+
+        def desired() -> pb.DesiredWorkerState:
+            directive = make_desired()
+            directive.wire_minor = 59
+            return directive
+
+        owner._desired_state = desired  # type: ignore[method-assign]
+
+    with _workspace() as root:
+        outcome, seals = _slice(root, devices="0", kind="entrypoint", owner_hook=wire59)
+    assert outcome.result == {"message": "polo"}, (outcome.error, outcome.faults)
+    assert seals == ["0"]
+
+
+@needs_executor
 def test_old_wire_owner_is_refused_before_device_envelope_changes() -> None:
     """The compatibility floor now rejects old peers before ownership or lane changes."""
     workers: list[Worker] = []

@@ -826,17 +826,17 @@
     },
     "protocol_info_result": {
       "bytes": 4,
-      "sha256": "029d0a315dfab59fc9be573853869e5d820162d589e6d879bc53e0ae2b32c699",
+      "sha256": "eb472408277ab0c23ac21da777833cb086e38ff732927ccfdabefc235562488c",
       "type": "cozy.worker.v1.ProtocolInfoResult"
     },
     "protocol_info_result_mixed_model_inputs": {
       "bytes": 6,
-      "sha256": "ac903026dd276d46254ab6326f02b903d2738224a520bf5a4aed0b864bfd7e1c",
+      "sha256": "237eaba49c56d970f82433b56b8cffbb2d15c40d4456d2c59a8ce070afc93a1a",
       "type": "cozy.worker.v1.ProtocolInfoResult"
     },
     "protocol_info_result_rental_keepalive": {
       "bytes": 6,
-      "sha256": "c890f95ed037f14687fb14b0ba196d2ae990c886d7b6eb2900c73233905cb31f",
+      "sha256": "be4c161419d4d3edf6988ef7f0bbecdb2e3f74f1d5334d1a0483b50ea07edec0",
       "type": "cozy.worker.v1.ProtocolInfoResult"
     },
     "runtime_prepare_private_native": {
