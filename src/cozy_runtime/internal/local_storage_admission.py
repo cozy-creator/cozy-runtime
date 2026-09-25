@@ -98,7 +98,10 @@ def acquire(root: Path, writes: Sequence[Write]) -> Iterator[dict[str, object]]:
         try:
             facts = shortfall(writes)
         except OSError as exc:
-            raise StorageRefusal("local filesystem capacity is unavailable") from exc
+            raise StorageRefusal(
+                f"local filesystem capacity is unavailable: {exc}",
+                code="storage_capacity_unavailable",
+            ) from exc
         if facts is not None:
             raise StorageRefusal("local filesystem refused Runtime disk write", facts)
         yield {"ok": True}

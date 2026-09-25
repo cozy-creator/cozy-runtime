@@ -28,6 +28,7 @@ from __future__ import annotations
 import collections
 import os
 import queue
+import re
 import threading
 from collections.abc import Callable, Iterator
 from concurrent import futures
@@ -326,6 +327,9 @@ class GrpcControlHost:
         self.stopped.set()
 
 
+_ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+
+
 def _refuse(context: Any, exc: BaseException) -> Any:
     """Answer one failed preparation call, saying WHICH KIND of failure it was.
 
@@ -374,7 +378,10 @@ def _refuse(context: Any, exc: BaseException) -> Any:
         return context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc)[:1024])
     # The type is part of the diagnosis and was being discarded: `PermissionError` and
     # `FileNotFoundError` send an operator to two different places, and `str(exc)` alone
-    # frequently names neither.
+    # frequently names neither. A typed failure's own stable code rides beside it.
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and _ERROR_CODE.fullmatch(code):
+        context.set_trailing_metadata((("cozy-error-code", code),))
     return context.abort(grpc.StatusCode.INTERNAL, f"{type(exc).__name__}: {exc}"[:1024])
 
 

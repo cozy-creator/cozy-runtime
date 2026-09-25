@@ -1,0 +1,1 @@
+Storage admission refusals carry the supervisor's stable code and reason (for capacity: the requested bytes against available, reserved and reserve) and name what was refused, so a locked-wheel transfer failure is no longer reported as "supervisor refused Runtime disk write". A failed preparation call sends its typed code as the `cozy-error-code` trailer.
