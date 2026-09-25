@@ -569,6 +569,26 @@ def secret(ctx: Context, payload: Request) -> Result:
     assert [(row["export"], row["implementation_digest"]) for row in inventory] == [
         ("generate", source_digest)
     ]
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from cozy_runtime.internal.worker.calls import Calls
+
+    interface_path = tmp_path / "package-interface.json"
+    interface_path.write_bytes(raw)
+    parent = SimpleNamespace(
+        job=SimpleNamespace(
+            call_interfaces=tuple(inventory),
+            python=sys.executable,
+            package_interface=str(interface_path),
+            build_id="sha256:" + "44" * 32,
+        )
+    )
+    bindings = [row for row in Calls.bindings(cast(Any, parent)) if row["module"] == "dual_fixture"]
+    assert [(row["export"], row.get("self", False)) for row in bindings] == [
+        ("generate", False),
+        ("secret", True),
+    ]
     check = """import asyncio, json, sys
 sys.path.insert(0,sys.argv[1])
 import dual_fixture as lib
