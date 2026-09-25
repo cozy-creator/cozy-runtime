@@ -6,6 +6,7 @@ import array
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -86,10 +87,30 @@ try:
         assert exc.code == "package_environment_dependency_snapshot_local_only"
     else:
         raise AssertionError("generic rented snapshot was allowed")
+    # The mutable controller SDK is no longer the implementation owner.
+    original = Path(environments.__file__).parents[1] / "derive/operations.py"
+    original.unlink()  # Do not mutate uv's shared cache inode.
+    original.write_text("raise AssertionError('mutable controller SDK used')\n")
     prepared = builtins._prepare(frozen)
     assert prepared["runtime_builtin"] == frozen
     assert prepared["placement"]["development"]["local_revision_digest"]
     assert prepared["receipt_digest"] and leases
+    installed = environments.open_generation(
+        root / "installs",
+        receipt_digest=prepared["receipt_digest"],
+        environment_digest=prepared["placement"]["environment_digest"],
+    )
+    actual = subprocess.check_output(
+        [
+            str(installed.python),
+            "-I",
+            "-c",
+            "import json; from cozy_runtime.internal.builtin_environment import sdk_identity; "
+            "print(json.dumps(sdk_identity()))",
+        ],
+        text=True,
+    )
+    assert json.loads(actual) == frozen["sdk"]
     print("RENTED BUILTIN PASS", frozen["sdk"], "leases", len(leases))
 finally:
     worker.shutdown()

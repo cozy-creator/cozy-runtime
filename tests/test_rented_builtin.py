@@ -7,7 +7,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 
+
+@pytest.mark.skipif(sys.platform != "linux", reason="supervisor descriptor-four transport is Linux")
 def test_rented_builtin_keeps_frozen_sdk_and_generic_snapshot_refusal(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     wheels = tmp_path / "wheels"
