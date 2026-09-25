@@ -391,7 +391,7 @@ class Ledger:
         self.device_allocated = self.device_baseline
         self.device_reserved = int(facts.get("reserved_bytes", -1))
         self.resident = {k: int(v) for k, v in (facts.get("resident") or {}).items()}
-        self.constructed = dict(self.resident)
+        self.constructed = {k: int(v) for k, v in facts.get("constructed", self.resident).items()}
         self.parked = tuple(str(name) for name in (facts.get("parked") or ()))
         # Parked components WITH their sizes, from the construction that parked them: what
         # the next attempt may have to stage in is priced from the first plan, not from
