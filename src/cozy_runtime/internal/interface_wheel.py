@@ -450,7 +450,39 @@ def _overlay(
         raise ConformanceError("implementation wheel identity differs", code="interface_binding")
     # Description text is a body, not header text. Preserve it after adding bindings.
     if headers.get("Cozy-Interface-Generator") is not None:
-        raise ConformanceError("cannot overlay another caller wheel", code="interface_binding")
+        # A published callable wheel already carries its managed import surface.
+        # Private capture may rebind that same source to a new exact revision. Remove
+        # only code reproduced by this generator, never an arbitrary package suffix.
+        if (
+            headers.get("Cozy-Interface-Generator") != GENERATOR_ABI
+            or headers.get("Cozy-Interface-Layout") != "overlay"
+            or files.get(expected_dist + "/package-interface.json") != interface
+            or not canonical.DIGEST_RE.fullmatch(str(headers.get("Cozy-Implementation-Digest", "")))
+        ):
+            raise ConformanceError("caller wheel provenance changed", code="interface_binding")
+        for target, (generated, source, suffix) in overlay_sources(interface, set(files)).items():
+            if files.get(generated) != source or not files[target].endswith(suffix):
+                raise ConformanceError(
+                    "caller wheel generated source changed", code="interface_binding"
+                )
+            files[target] = files[target][: -len(suffix)]
+            del files[generated]
+        header, _, description = metadata.partition(b"\n\n")
+        metadata = (
+            b"\n".join(
+                row
+                for row in header.split(b"\n")
+                if not row.lower().startswith(
+                    (
+                        b"cozy-interface-generator:",
+                        b"cozy-implementation-digest:",
+                        b"cozy-interface-layout:",
+                    )
+                )
+            )
+            + b"\n\n"
+            + description
+        )
     for target, (generated, source, suffix) in overlay_sources(interface, set(files)).items():
         if generated in files:
             raise ConformanceError(

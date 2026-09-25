@@ -522,6 +522,41 @@ def secret(ctx: Context, payload: Request) -> Result:
         implementation_digest=source_digest,
         implementation_wheel=original.getvalue(),
     )
+    _, repeated = interface_wheel.build(
+        raw,
+        distribution="dual-fixture",
+        version="0.1.0",
+        implementation_digest=source_digest,
+        implementation_wheel=wheel,
+    )
+    assert repeated == wheel
+    _, captured = interface_wheel.build(
+        raw,
+        distribution="dual-fixture",
+        version="0.1.0",
+        implementation_digest="sha256:" + "33" * 32,
+        implementation_wheel=wheel,
+    )
+    with zipfile.ZipFile(io.BytesIO(captured)) as archive:
+        assert archive.read("dual_fixture.py").count(b"from _cozy_callers_") == 1
+    corrupted = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(wheel)) as original_wheel,
+        zipfile.ZipFile(corrupted, "w") as altered,
+    ):
+        for name in original_wheel.namelist():
+            body = original_wheel.read(name)
+            if name.startswith("_cozy_callers_"):
+                body += b"# tampered\n"
+            altered.writestr(name, body)
+    with pytest.raises(ConformanceError, match="generated source changed"):
+        interface_wheel.build(
+            raw,
+            distribution="dual-fixture",
+            version="0.1.0",
+            implementation_digest=source_digest,
+            implementation_wheel=corrupted.getvalue(),
+        )
     with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
         archive.extractall(tmp_path / "sealed")
     from cozy_runtime.internal.installed_interfaces import read
