@@ -48,11 +48,6 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
     )
     retained: list[environments.InstalledEnvironment] = []
 
-    def describe(installed: environments.InstalledEnvironment, distribution: str) -> bytes:
-        assert distribution == "serving-child"
-        assert (installed.site_packages / "serving_child.py").is_file()
-        return interface
-
     try:
         locked = environments.read_locked_requirements(
             (
@@ -70,6 +65,7 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
         request = pb.PreparePackageSetRequest(
             install_root=str(root),
             application="serving_child:app",
+            package_interface=interface,
             model_slot_paths=slots,
             download_delegation=canonical.write(
                 {
@@ -97,7 +93,6 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
                 tensorfs_root=tmp_path / "store",
                 install_root=root,
                 python=Path(sys.executable),
-                describe=describe,
                 verified=lambda *args: None,
                 base=base,
                 materialized=retained.append,
@@ -113,6 +108,7 @@ def test_published_serving_code_prepares_without_models_or_executable_bindings(
         assert placement["entrypoints"] == placement["models"] == []
         assert placement["package"] == {"package": "proof/serving-child", "release": "1.0.0"}
         assert len(retained) == 1 and retained[0].receipt_digest
+        assert (retained[0].site_packages / "serving_child.py").is_file()
         reopened = environments.open_generation(
             root,
             receipt_digest=retained[0].receipt_digest,
@@ -217,6 +213,27 @@ async def generate(payload: Request, model: Reference) -> Reply:
             request = pb.PreparePackageSetRequest(
                 install_root=str(root / "installs"),
                 application="serving_child:app",
+                package_interface=canonical.write(
+                    {
+                        "format": package_interface.SCHEMA,
+                        "application": "serving_child:app",
+                        "entrypoints": [
+                            {
+                                "name": "generate",
+                                "models": [
+                                    {
+                                        "class": "Reference",
+                                        "path": "generate.models.model",
+                                        "component_use": {},
+                                    }
+                                ],
+                                "request": {"fields": [{"name": "text", "type": "str"}]},
+                                "result": {"fields": [{"name": "text", "type": "str"}]},
+                            }
+                        ],
+                        "jobs": [],
+                    }
+                ),
                 model_slot_paths=["generate.models.model"],
                 download_delegation=canonical.write(
                     {
@@ -241,9 +258,18 @@ async def generate(payload: Request, model: Reference) -> Reply:
             retained = worker.prepared_revisions[key]
             assert retained.installed is not None and retained.installed.receipt_digest
             assert retained.models == retained.entrypoints == ()
+            assert (retained.installed.site_packages / "serving_child.py").read_bytes() == source
+            reopened = environments.open_generation(
+                root / "installs",
+                receipt_digest=retained.installed.receipt_digest,
+                environment_digest=placement["environment_digest"],
+                python=python,
+            )
+            assert reopened.content_digest == retained.installed.content_digest
             raw_interface = (
                 root / "artifacts" / documents.raw(placement["package_interface"]["digest"]).hex()
             ).read_bytes()
+            assert raw_interface == request.package_interface
             interface = package_interface.read_bytes(raw_interface)
             assert interface["jobs"] == [] and interface["entrypoints"][0]["name"] == "generate"
             acquirer = Acquirer(
@@ -257,6 +283,10 @@ async def generate(payload: Request, model: Reference) -> Reply:
             bindings, count = acquirer._bindings(retained)
             assert bindings == {} and count == 1
             assert worker.prepare_package_set(request).placement_set == result.placement_set
+            repeated = worker.prepared_revisions[key].installed
+            assert repeated is not None and repeated.reused
+            assert repeated.receipt_digest == retained.installed.receipt_digest
+            assert repeated.content_digest == retained.installed.content_digest
         finally:
             worker.shutdown()
             index.close()
