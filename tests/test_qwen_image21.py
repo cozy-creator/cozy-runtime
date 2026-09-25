@@ -1,5 +1,7 @@
 """Real tiny Qwen modules: staged execution agrees with the upstream pipeline."""
 
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -7,7 +9,7 @@ pytest.importorskip("diffusers")
 pytest.importorskip("transformers")
 
 
-def test_staged_qwen_image21_matches_upstream_and_preserves_scopes() -> None:
+def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Path) -> None:
     import base64
     import zlib
 
@@ -144,6 +146,18 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes() -> None:
     ):
         with pytest.raises(ValueError):
             build_processor(invalid)
+    # Nonpersistent RoPE frequencies are rebuilt by official loading. Saving our exact
+    # tiny weights and reloading them tests the construction boundary independently.
+    encoder = graph.components["text_encoder"]
+    encoder.save_pretrained(tmp_path)
+    upstream_encoder = type(encoder).from_pretrained(
+        tmp_path, dtype=torch.bfloat16, local_files_only=True
+    )
+    actual_buffers = dict(encoder.named_buffers())
+    for name, expected_buffer in upstream_encoder.named_buffers():
+        assert actual_buffers[name].dtype == expected_buffer.dtype == torch.float32
+        torch.testing.assert_close(actual_buffers[name], expected_buffer, rtol=0, atol=0)
+    assert {value.dtype for value in encoder.parameters()} == {torch.bfloat16}
     model = QwenImage21Model.for_test(graph=graph, processor=processor)
     embeds, mask = model.encode("a person in a blue jacket")
     assert embeds.shape[-1] == 16
@@ -160,7 +174,7 @@ def test_staged_qwen_image21_matches_upstream_and_preserves_scopes() -> None:
     actual = model.decode(latents, width=32, height=32)
     model.harness.assert_scopes("encode", "denoise", "decode")
     pipe = QwenImage21Pipeline(
-        **graph.components,
+        **{**graph.components, "text_encoder": upstream_encoder},
         processor=processor,
         scheduler=FlowMatchEulerDiscreteScheduler.from_config(config["scheduler"]),
     )

@@ -15,10 +15,10 @@ from typing import Any
 import torch
 from tokenizers import Tokenizer
 from transformers import (
+    AutoModelForImageTextToText,
     PreTrainedTokenizerFast,
     Qwen2VLImageProcessor,
     Qwen3VLConfig,
-    Qwen3VLForConditionalGeneration,
     Qwen3VLProcessor,
     Qwen3VLVideoProcessor,
 )
@@ -41,9 +41,11 @@ class QwenImage21Graph:
                 "transformer": QwenImage21Transformer2DModel.from_config(
                     dict(mapping["transformer"])
                 ).to(dtype=torch.bfloat16),
-                "text_encoder": Qwen3VLForConditionalGeneration(
-                    Qwen3VLConfig(**dict(mapping["text_encoder"]))
-                ).to(dtype=torch.bfloat16),
+                # Construction dtype leaves derived RoPE buffers in upstream F32.
+                # Casting the completed module would round those frequencies to BF16.
+                "text_encoder": AutoModelForImageTextToText.from_config(
+                    Qwen3VLConfig(**dict(mapping["text_encoder"])), dtype=torch.bfloat16
+                ),
                 "vae": AutoencoderKLQwenImage21.from_config(dict(mapping["vae"])).to(
                     dtype=torch.float32
                 ),
