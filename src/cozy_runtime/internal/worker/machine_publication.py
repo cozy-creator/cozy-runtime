@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
@@ -30,6 +31,8 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 _MAX_METADATA = 8 << 20
+# Bound sockets and issue only grants that can start immediately, below Hub's 128-id limit.
+_PUBLICATION_UPLOADS = 8
 
 
 class PublicationRefusal(Exception):
@@ -381,39 +384,68 @@ def upload_checkpoint(
         observed[key] = length
         if state not in {"accepted", "verifying"}:
             pending.append(key)
-    for key in sorted(pending):
-        before_write()
-        granted = _object(
-            client.request("POST", path + "/grants", canonical_json.encode({"object_ids": [key]}))
-        )
-        grants, held = granted.get("grants"), granted.get("held")
-        # Go's empty slices may be JSON null; they still represent zero rows.
-        grants = [] if grants is None else grants
-        held = [] if held is None else held
-        if not isinstance(grants, list) or not isinstance(held, list):
-            raise PublicationRefusal("publication.response_invalid")
-        _require(len(grants) + len(held) == 1)
-        item = (grants + held)[0]
-        _require(item.get("object_id") == key and item.get("length") == objects[key])
-        if held:
-            _require(item.get("state") in {"accepted", "verifying"})
-            continue
-        headers = item.get("required_headers")
-        required = {
-            "if-none-match": "*",
-            "x-amz-checksum-sha256": base64.b64encode(bytes.fromhex(key[7:])).decode("ascii"),
-        }
-        _require(headers == required and isinstance(item.get("url"), str))
-        now, expires = granted.get("server_time_unix"), item.get("expires_at_unix")
-        _require(
-            type(now) is int and type(expires) is int and expires > now, "publication.grant_expired"
-        )
-        before_write()
-        push(
-            key,
-            objects[key],
-            "\n".join([item["url"], *(f"{name}: {value}" for name, value in required.items())]),
-        )
+    pending.sort()
+    # Every native push finishes before this scope exits, including after a failed
+    # sibling, so the caller's retained native lease outlives all in-flight bytes.
+    with ThreadPoolExecutor(max_workers=_PUBLICATION_UPLOADS) as pool:
+        for offset in range(0, len(pending), _PUBLICATION_UPLOADS):
+            selected = pending[offset : offset + _PUBLICATION_UPLOADS]
+            before_write()
+            granted = _object(
+                client.request(
+                    "POST", path + "/grants", canonical_json.encode({"object_ids": selected})
+                )
+            )
+            grants, held = granted.get("grants"), granted.get("held")
+            # Go's empty slices may be JSON null; they still represent zero rows.
+            grants = [] if grants is None else grants
+            held = [] if held is None else held
+            if not isinstance(grants, list) or not isinstance(held, list):
+                raise PublicationRefusal("publication.response_invalid")
+            seen: set[str] = set()
+            uploads: list[tuple[str, int, str]] = []
+            for item in grants + held:
+                _require(isinstance(item, dict))
+                key = item.get("object_id")
+                _require(isinstance(key, str) and key in selected and key not in seen)
+                _require(item.get("length") == objects[key])
+                seen.add(key)
+            _require(seen == set(selected))
+            for item in held:
+                _require(item.get("state") in {"accepted", "verifying"})
+            for item in grants:
+                key = item["object_id"]
+                required = {
+                    "if-none-match": "*",
+                    "x-amz-checksum-sha256": base64.b64encode(bytes.fromhex(key[7:])).decode(
+                        "ascii"
+                    ),
+                }
+                _require(
+                    item.get("required_headers") == required and isinstance(item.get("url"), str)
+                )
+                now, expires = granted.get("server_time_unix"), item.get("expires_at_unix")
+                _require(
+                    type(now) is int and type(expires) is int and expires > now,
+                    "publication.grant_expired",
+                )
+                uploads.append(
+                    (
+                        key,
+                        objects[key],
+                        "\n".join(
+                            [item["url"], *(f"{name}: {value}" for name, value in required.items())]
+                        ),
+                    )
+                )
+            # Validate the complete response before spending any grant. A failed
+            # push leaves the same frozen operation for ordinary remote readback.
+            futures = []
+            for upload in uploads:
+                before_write()
+                futures.append(pool.submit(push, *upload))
+            for future in futures:
+                future.result()
     before_write()
     result = _object(
         client.request(
