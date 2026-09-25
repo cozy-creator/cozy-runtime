@@ -117,7 +117,12 @@ from cozy_runtime.internal.worker.lanes import (
 )
 from cozy_runtime.internal.worker.ledger import Ledger, read_vmrss
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
-from cozy_runtime.internal.worker.plan import DeclaredBinding, JobBinding, PreparedModel
+from cozy_runtime.internal.worker.plan import (
+    DeclaredBinding,
+    JobBinding,
+    PreparedModel,
+    PreparedRequest,
+)
 from cozy_runtime.internal.worker.records import WorkerRecords
 from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR, documents, weights_limits
@@ -6153,23 +6158,32 @@ class Worker:
         lane.touch(tenant)
         row = lane.row(tenant)
         why = f"attempt {attempt.request_id}#{attempt.attempt}"
+        cell = attempt.prepared.cell() if attempt.prepared is not None else ""
 
         def fits(memory: accel.DeviceMemory) -> bool:
             row.ledger.observe_device_free(memory.free_bytes, memory.total_bytes)
-            return bool(row.chooser.fits(declared))
+            return bool(row.chooser.fits(declared, cell))
 
         # FIRST, TAKE BACK WHAT WAS TAKEN (cr-097). A tenant a co-tenant's prepare emptied
         # is priced, otherwise, against a hole nobody put back — which is how a placement
         # that had 10 GiB of room to itself spent seven consecutive attempts at +118%.
         # This evicts nothing, so it runs before the arbitration below rather than instead
         # of it: what it cannot restore, `_make_room` is still free to make room for.
-        self._restore_residency(lane, tenant, row, why)
+        self._restore_residency(lane, tenant, row, why, declared, attempt.prepared)
         # THEN, THE RETRY RULE. A retry under the residency picture that already produced a
         # device OOM is the same request asked twice and cannot get a different answer.
         self._break_oom_repeat(lane, tenant, row, fits, why)
         self._make_room(lane, tenant, fits, why)
 
-    def _restore_residency(self, lane: DeviceLane, slot: str, row: LaneRow, why: str) -> None:
+    def _restore_residency(
+        self,
+        lane: DeviceLane,
+        slot: str,
+        row: LaneRow,
+        why: str,
+        declared: DeclaredBinding | None = None,
+        prepared: PreparedRequest | None = None,
+    ) -> None:
         """RE-FILL a tenant the lane emptied, when the card has room. Evicts NOBODY (cr-097).
 
         `vacate` had no counterpart, and the gap was the defect: a tenant vacated for a
@@ -6179,13 +6193,11 @@ class Worker:
         unrelated rebuild happened to re-prepare it — with the co-tenant resident and
         untouched throughout, which is the proof the room was there all along.
 
-        It is governed by THE SAME RULE PREPARE USES and by no other. An earlier cut gated
-        each component on the attempt's banked activation envelope; that refused `unet` by
-        1.1 GiB on every attempt and left the tenant at 2x its solo handler time — because
-        the envelope was measured on an empty card, and kernels expand into whatever
-        headroom they are given. Prepare and restore are the same physical act, putting a
-        generation's weights on a card, and a private stricter test for one of them was not
-        a safety measure but the very asymmetry this issue is about.
+        Unknown shapes and shapes that have already completed without moving weights
+        retain prepare's measured-capacity restoration rule. An activation peak from a
+        roomy device alone must not prevent their co-tenant recovery. A shape with only
+        staged execution behind it is different: refilling all weights cannot help when
+        its plan must immediately evict them again to make room for activations.
         """
         missing = row.ledger.missing_resident()
         if not missing:
@@ -6198,6 +6210,12 @@ class Worker:
         if memory.state != "measured":
             return
         row.ledger.observe_device_free(memory.free_bytes, memory.total_bytes)
+        if (
+            declared is not None
+            and prepared is not None
+            and not row.chooser.should_restore(declared, prepared)
+        ):
+            return
         try:
             with executor.watched("restore"):
                 reply = executor.call({"cmd": "restore", "names": sorted(missing)}, timeout=None)
@@ -6890,8 +6908,9 @@ class Worker:
                 if self._entry_refused(attempt):
                     return False
                 slot = self._bind_attempt_slot(attempt)
-                self._arbitrate_residency(attempt, slot)
-                self.engine.enter(attempt)
+                self.engine.enter(
+                    attempt, before_plan=lambda: self._arbitrate_residency(attempt, slot)
+                )
         except AttemptRefusal as exc:
             self.note("attempt", f"{key} refused at device entry: {exc.code}")
             self.terminate(
@@ -6980,8 +6999,9 @@ class Worker:
                 return False
             try:
                 slot = self._bind_attempt_slot(attempt)
-                self._arbitrate_residency(attempt, slot)
-                accepted = self.engine.prepare_and_accept(attempt)
+                accepted = self.engine.prepare_and_accept(
+                    attempt, before_plan=lambda: self._arbitrate_residency(attempt, slot)
+                )
             except AttemptRefusal as exc:
                 self.note("attempt", f"{key} refused: {exc.code}")
                 self.terminate(

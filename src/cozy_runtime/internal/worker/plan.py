@@ -905,6 +905,20 @@ class PlanChooser:
         _terms, _rows, chosen, _walk = self._walk(declared, cell)
         return chosen
 
+    def should_restore(self, declared: DeclaredBinding, prepared: PreparedRequest) -> bool:
+        """Do not refill weights that this request will immediately have to evict again.
+
+        Unknown shapes retain the existing measured-capacity restore path. Prior
+        nonmoving success retains the co-tenant recovery path. A staged-only history
+        must fit its observed activation allowance before a full restore is useful.
+        """
+        cell = prepared.cell()
+        if self.ledger.resident_sufficiency(cell):
+            return True
+        if not self.ledger.carried_activations_by_cell.get(cell, 0):
+            return True
+        return self.fits(declared, cell) == "all_resident"
+
     def choose(
         self,
         declared: DeclaredBinding,
