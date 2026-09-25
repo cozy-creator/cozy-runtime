@@ -261,7 +261,7 @@ def complete_native(
             or not 0 < len(receipt) <= 1 << 20
         ):
             raise WorkspaceRefusal("native byte completion differs from its accepted intent")
-        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        store = fill.store(workspace.store_root)
         observed = db.native(lambda: store.tree_root(root_id))
         if (
             not observed
@@ -453,7 +453,7 @@ def commit(
                                 retained.source.manifest.length,
                             )
                         )
-            store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+            store = fill.store(workspace.store_root)
             # Native holds its writer guard and records each member before import.
             # Separate put_file/create_tree_root calls leave a process-death/GC gap.
             with storage_admission.admit(
@@ -542,7 +542,7 @@ def change_hold(
         ).fetchone()
         if not original and retained is None:
             raise WorkspaceRefusal("ordinary tree is not retained by this owner")
-        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        store = fill.store(workspace.store_root)
         body = db.native(
             lambda: bytes(store.manifest(documents.spell(source.manifest.digest))["manifest"])
         )
@@ -597,7 +597,7 @@ def leased(
 
             if not held():
                 raise WorkspaceRefusal("ordinary artifact has no exact received retention")
-            store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+            store = fill.store(workspace.store_root)
             root = db.native(lambda: store.tree_root(request.retention_id))
             if (
                 not root
@@ -628,13 +628,7 @@ def release(workspace: Workspace, owner: str, root_id: str) -> None:
         if row is None or row["state"] not in ("releasing", "released"):
             raise WorkspaceRefusal("ordinary output release has no durable owner intent")
         try:
-            db.native(
-                lambda: (
-                    fill.tensorfs_module()
-                    .Store.open(str(workspace.store_root))
-                    .release_tree_root(root_id)
-                )
-            )
+            db.native(lambda: fill.store(workspace.store_root).release_tree_root(root_id))
         except Exception as exc:
             # Cancellation can win after intent reservation but before native import.
             # Only this exact absence is already released; integrity errors still refuse.

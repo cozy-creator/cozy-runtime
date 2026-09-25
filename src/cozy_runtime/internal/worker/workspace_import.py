@@ -505,7 +505,7 @@ def _recover_interrupted(db: Journal) -> None:
 
 
 def _native(workspace: Workspace, kind: str, row: dict[str, Any]) -> dict[str, Any]:
-    store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+    store = fill.store(workspace.store_root)
     if kind == "weights":
         transaction = row["transaction_id"]
         found = store.derived_lookup(transaction)

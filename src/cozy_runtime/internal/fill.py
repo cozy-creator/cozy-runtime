@@ -57,6 +57,7 @@ import contextlib
 import ctypes
 import hashlib
 import os
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -328,11 +329,41 @@ def tensorfs_module() -> Any:
     return tensorfs
 
 
-def open_store(tensorfs: Any, root: Path) -> Any:
-    """Open one caller-prepared TensorFS Store without resolving or mutating its layout."""
+_stores: dict[tuple[int, str], Any] = {}
+_stores_lock = threading.Lock()
+
+
+def store(root: str | Path) -> Any:
+    """The process's ONE TensorFS Store handle for `root`.
+
+    TensorFS keeps its trust index and catalog connection alive only while a handle to the
+    root lives, so a fresh `Store.open` per call re-validated and re-loaded the catalog every
+    time. Keyed by pid: a forked child never shares its parent's SQLite connection.
+    """
+    key = (os.getpid(), os.path.abspath(root))
+    with _stores_lock:
+        held = _stores.get(key)
+        if held is None:
+            held = _stores[key] = tensorfs_module().Store.open(key[1])
+        return held
+
+
+def ensure_store(root: str | Path) -> Any:
+    """`store(root)`, first creating the Store when its catalog is absent."""
+    path = os.path.abspath(root)
+    if not os.path.isfile(os.path.join(path, "tensorfs.sqlite")):
+        created = tensorfs_module().Store.ensure(path)
+        with _stores_lock:
+            _stores[(os.getpid(), path)] = created
+        return created
+    return store(path)
+
+
+def open_store(root: Path) -> Any:
+    """The process's Store handle for one caller-prepared root, refusals in fill vocabulary."""
 
     try:
-        return tensorfs.Store.open(str(root))
+        return store(root)
     except Exception as exc:
         raise _refuse(
             "store_unusable",
@@ -485,7 +516,7 @@ class Checkpoint:
         self.root = str(root)
         self.manifest_id = manifest_id
         with store_refusals(f"opening manifest {manifest_id[:23]}"):
-            self.store = tensorfs.Store.open(self.root)
+            self.store = store(self.root)
             manifest = self.store.manifest(manifest_id)
             self.header_bytes: bytes = manifest["header"]
             # Encoding definitions are nested directly in cozytensors/1. TensorFS parses

@@ -75,7 +75,7 @@ def prepare_model_source(
 
         bounded = storage_admission.enabled()
         with storage_admission.admit(write_bound()):
-            store = tensorfs.Store.ensure(str(tensorfs_root))
+            store = fill.ensure_store(tensorfs_root)
             advance = partial(
                 store.prepare_model_source,
                 request.operation_id,
@@ -131,8 +131,7 @@ def release_model_source(*, tensorfs_root: Path, operation_id: str) -> None:
         raise ModelSourceRefusal("model_source_operation_invalid", "operation id is invalid")
     if not tensorfs_root.is_absolute():
         raise ModelSourceRefusal("model_source_store_invalid", "TensorFS store path is invalid")
-    tensorfs = fill.tensorfs_module()
-    tensorfs.Store.open(str(tensorfs_root)).release_model_source(operation_id)
+    fill.store(tensorfs_root).release_model_source(operation_id)
 
 
 def source_operations(*, tensorfs_root: Path) -> list[str]:
@@ -140,7 +139,7 @@ def source_operations(*, tensorfs_root: Path) -> list[str]:
     if not tensorfs_root.is_absolute():
         raise ModelSourceRefusal("model_source_store_invalid", "TensorFS store path is invalid")
     try:
-        return list(fill.tensorfs_module().Store.open(str(tensorfs_root)).model_source_operations())
+        return list(fill.store(tensorfs_root).model_source_operations())
     except Exception as exc:
         raise LaunchRefusal(
             "model_source_inventory_unavailable",

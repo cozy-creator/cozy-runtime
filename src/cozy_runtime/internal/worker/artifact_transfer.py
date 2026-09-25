@@ -105,7 +105,7 @@ class NativeArtifactTransfers:
                 or held["manifest_length"] != command.manifest.length
             ):
                 raise WorkspaceRefusal("native artifact has no matching held owner obligation")
-            store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+            store = fill.store(self.workspace.store_root)
             lease = db.native(lambda: store.acquire_cozytensors(manifest))
             current = db.execute(
                 "SELECT state FROM holds WHERE id=?", (source.retention_id,)
@@ -155,7 +155,7 @@ class NativeArtifactTransfers:
                 manifest = documents.spell(command.manifest.digest)
             else:
                 lease, manifest = self._hold(command)
-                store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+                store = fill.store(self.workspace.store_root)
             held = store.manifest(manifest)
             manifest_bytes = bytes(held["manifest"])
             if (

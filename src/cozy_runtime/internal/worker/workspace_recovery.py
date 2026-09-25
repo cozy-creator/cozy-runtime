@@ -61,7 +61,7 @@ def process_ended(identity: bytes) -> bool:
 
 
 def native_result(workspace: Workspace, row: dict[str, Any]) -> pb.WeightsReceiptFrame | None:
-    store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+    store = fill.store(workspace.store_root)
     found = store.derived_lookup(row["id"])
     if found["state"] == "open":
         epoch = found.get("writer_session_id")

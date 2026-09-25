@@ -193,7 +193,7 @@ def finalize(
         if result.outcome == pb.WEIGHTS_FINALIZE_OUTCOME_ABANDONED and on_abandon is not None:
             on_abandon(transaction_id)
         return result
-    store = fill.tensorfs_module().Store.ensure(str(tensorfs_root))
+    store = fill.ensure_store(tensorfs_root)
     observed = store.derived_lookup(transaction_id)
     committed_receipt = None
     if request.disposition != pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED:

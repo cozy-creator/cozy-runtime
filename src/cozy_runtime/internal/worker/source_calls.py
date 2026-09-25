@@ -332,7 +332,7 @@ class SourceCalls:
         payload, objects = 0, 1
         if operation in ("download_huggingface", "download_civitai"):
             members = command["selection"]["members"]
-            store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+            store = fill.store(self.workspace.store_root)
             # Native presence excludes complete members. Partial prefixes remain
             # conservatively charged until native exposes verified remaining bytes.
             members = [row for row in members if not store.contains(row[1].removeprefix("sha256:"))]
@@ -344,7 +344,7 @@ class SourceCalls:
                 storage_admission.Write(Path(command["file_staging"]), payload, 3),
             )
         elif operation == "convert_cozytensors":
-            store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+            store = fill.store(self.workspace.store_root)
             if store.derived_lookup(command["native_owner"]).get("state") == "committed":
                 return (storage_admission.native_write(self.workspace.store_root),)
             root = store.tree_root(command["source_owner"])
@@ -413,7 +413,7 @@ class SourceCalls:
                     byte_output_spec=view_fact[2] if view_fact else b"",
                 )
                 return
-            store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+            store = fill.store(self.workspace.store_root)
             binding = source_interfaces.bindings()[
                 (source_interfaces.DIGEST, source_interfaces.MODULE, row["operation"])
             ]

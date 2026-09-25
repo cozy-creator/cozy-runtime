@@ -88,7 +88,7 @@ def collect_worker(worker: Worker) -> pb.CollectStoreGarbageResult:
             result = collect(root, keep_manifests=sorted(keep))
             if not result.store_busy:
                 # Routing must stop advertising bytes a successful pressure pass removed.
-                worker.held_manifests.rebuild(fill.open_store(fill.tensorfs_module(), root))
+                worker.held_manifests.rebuild(fill.open_store(root))
             return result
         finally:
             worker.control_lock.release()

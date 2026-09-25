@@ -137,7 +137,7 @@ def _failure(exc: Exception) -> tuple[str, str]:
 def page(request: pb.CheckpointPageRequest, *, tensorfs_root: Path) -> pb.CheckpointPageResult:
     try:
         _identity(request, tensorfs_root)
-        store = fill.tensorfs_module().Store.ensure(str(tensorfs_root))
+        store = fill.ensure_store(tensorfs_root)
         return _page(store, request, request.offset, request.limit)
     except Exception as exc:
         code, detail = _failure(exc)
@@ -204,7 +204,7 @@ def transfer(
             or request.object.ref.length == 0
         ):
             raise ModelSourceRefusal("transfer_invalid", "invalid checkpoint transfer")
-        store = fill.tensorfs_module().Store.ensure(str(tensorfs_root))
+        store = fill.ensure_store(tensorfs_root)
         decision = request.WhichOneof("decision")
         restores_head = (
             decision == "download_url"
