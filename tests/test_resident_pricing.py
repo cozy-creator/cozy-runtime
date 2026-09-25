@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import (
     UNCALIBRATED_ACTIVATION_BYTES,
@@ -187,6 +189,86 @@ def test_initial_construction_parking_remains_a_capacity_floor_after_warm() -> N
     chosen, walk = _walk(ledger)
     assert chosen == "component_staged"
     assert walk["rungs"][0]["verdict"] == "construction_parked"
+
+
+@pytest.mark.parametrize("free, grade", [(818_282_496, "measured"), (816_185_344, "bound")])
+def test_staged_success_cannot_promote_restored_weights_after_driver_free_drift(
+    free: int, grade: str
+) -> None:
+    # Local SDXL 972 staged successfully, then 973 had only 2 MiB less driver-free
+    # memory. Treating its staged activation peak as a waived bound selected
+    # all_resident with zero headroom and OOMed in decode.
+    ledger = _resident_ledger(free=818_282_496)
+    scopes = {"encode_prompt": 16 << 20, "denoise": 400 << 20, "decode": 2 * GiB}
+    ledger.observe_attempt(
+        {"activation_peaks": scopes}, resident_moved=True, cell=CELL, succeeded=True
+    )
+    ledger.observe_device_free(free, 8 * GiB)
+    assert ledger.resident_sufficiency(CELL) == 0
+    chosen, walk = _walk(ledger)
+    assert walk["coefficients"][1]["provenance"] == grade
+    assert chosen == "component_staged"
+    assert _row(walk, "all_resident")["needs_bytes"] == 2 * GiB
+    assert _row(walk, "all_resident")["verdict"] == "short"
+    # Several successful staged requests do not turn into evidence of a successful
+    # fully resident request. A roomier device can still fit the measured demand.
+    for _ in range(5):
+        ledger.observe_attempt(
+            {"activation_peaks": scopes}, resident_moved=True, cell=CELL, succeeded=True
+        )
+        assert _walk(ledger)[0] == "component_staged"
+    ledger.observe_device_free(17 * GiB, 24 * GiB)
+    assert _walk(ledger)[0] == "all_resident"
+
+
+def test_staged_only_history_skips_pointless_full_restore_until_it_fits() -> None:
+    ledger = _resident_ledger(free=818_282_496)
+    ledger.observe_attempt(
+        {"activation_peaks": {"decode": 2 * GiB}},
+        resident_moved=True,
+        cell=CELL,
+        succeeded=True,
+    )
+    ledger.observe_probe(
+        {
+            "allocator_bytes": WEIGHTS["vae"],
+            "reserved_bytes": WEIGHTS["vae"],
+            "device_free_bytes": 7 * GiB,
+            "device_total_bytes": 8 * GiB,
+            "residency": {
+                "resident": {"vae": WEIGHTS["vae"]},
+                "evicted": {name: size for name, size in WEIGHTS.items() if name != "vae"},
+            },
+        }
+    )
+    prepared = PreparedRequest.unresolved("generate", {"height": 1024, "width": 1024})
+    chooser = PlanChooser(ledger)
+    assert ledger.missing_resident()
+    for _ in range(5):
+        assert not chooser.should_restore(_binding(), prepared)
+    # A different request shape has no matching completed history: restore still
+    # follows measured capacity rather than borrowing this shape's scope allowance.
+    assert chooser.should_restore(
+        _binding(), PreparedRequest.unresolved("generate", {"height": 512, "width": 512})
+    )
+    smaller = PreparedRequest.unresolved("generate", {"height": 512, "width": 512})
+    ledger.observe_attempt(
+        {"activation_peaks": {"decode": 256 << 20}},
+        resident_moved=True,
+        cell=smaller.cell(),
+        succeeded=True,
+    )
+    # The same ledger fits the smaller measured shape. An empty-cell fallback
+    # borrows the larger shape's 2 GiB bound and would needlessly stage it.
+    assert chooser.fits(_binding(), smaller.cell()) == "all_resident"
+    assert chooser.fits(_binding()) == "component_staged"
+    assert chooser.should_restore(_binding(), smaller)
+    assert not chooser.should_restore(_binding(), prepared)
+    ledger.observe_device_free(20 * GiB, 24 * GiB)
+    assert chooser.should_restore(_binding(), prepared)
+    ledger.observe_device_free(7 * GiB, 8 * GiB)
+    ledger.carried_resident_free_by_cell[CELL] = SOLO_FREE
+    assert chooser.should_restore(_binding(), prepared)
 
 
 def _row(walk: dict[str, Any], rung: str) -> dict[str, Any]:

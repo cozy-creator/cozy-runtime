@@ -775,9 +775,17 @@ class PlanChooser:
         #   * a SUFFICIENCY — this cell already COMPLETED, with its resident set standing
         #     still, on a card with no more room than this one. That is the outcome the
         #     rung is trying to predict, already observed, so it outranks an envelope.
-        resident_headroom = planning_headroom if absent_bytes == 0 else activations.value
-        headroom_basis = activations.provenance if resident_headroom else "already_resident"
         sufficiency = self.ledger.resident_sufficiency(cell)
+        # Restoring weights does not prove that the request can run beside them. A
+        # successful staged request measured scratch after freeing other components;
+        # even a tiny driver-free change can classify that measurement as a bound.
+        # Only prior nonmoving execution can justify waiving that bound for residency.
+        resident_headroom = (
+            planning_headroom
+            if absent_bytes == 0 and (activations.provenance != "bound" or sufficiency)
+            else activations.value
+        )
+        headroom_basis = activations.provenance if resident_headroom else "already_resident"
         if absent_bytes == 0 and sufficiency and free >= 0 and sufficiency <= free:
             resident_headroom = 0
             headroom_basis = "completed_resident"
@@ -896,6 +904,20 @@ class PlanChooser:
             return ""
         _terms, _rows, chosen, _walk = self._walk(declared, cell)
         return chosen
+
+    def should_restore(self, declared: DeclaredBinding, prepared: PreparedRequest) -> bool:
+        """Do not refill weights that this request will immediately have to evict again.
+
+        Unknown shapes retain the existing measured-capacity restore path. Prior
+        nonmoving success retains the co-tenant recovery path. A staged-only history
+        must fit its observed activation allowance before a full restore is useful.
+        """
+        cell = prepared.cell()
+        if self.ledger.resident_sufficiency(cell):
+            return True
+        if not self.ledger.carried_activations_by_cell.get(cell, 0):
+            return True
+        return self.fits(declared, cell) == "all_resident"
 
     def choose(
         self,
