@@ -38,7 +38,6 @@ from .workspace_calls import Call
 from .workspace_calls import Calls as JournalCalls
 
 if TYPE_CHECKING:
-    from .lanes import LaneSet
     from .session import Worker
 
 
@@ -72,33 +71,6 @@ class Prepared:
     placement: dict[str, Any]
     defaults: list[dict[str, Any]]
     access: contextlib.ExitStack
-
-
-def device_pins(
-    lanes: LaneSet, placement_id: str, models: list[dict[str, Any]]
-) -> list[pb.PlacementDevicePin]:
-    """Place managed model calls within this machine's already authorized envelope.
-
-    External owners still supply their own pins. The local owner chooses a declared
-    degree; when none fits it pins the whole envelope and lane assignment degrades it,
-    with a note. Lane assignment validates capacity, topology and occupancy.
-    """
-    if not models or not lanes.wide:
-        return []
-    degrees = set.intersection(
-        *(set(model.get("sequence_parallel", {}).get("degrees", [1])) for model in models)
-    )
-    supported = [degree for degree in degrees if 0 < degree <= len(lanes.entries)]
-    current = lanes.lane_of(placement_id)
-    if not supported:
-        ordinals = tuple(range(len(lanes.entries)))
-    elif current is not None:
-        ordinals = current.ordinals
-        if len(ordinals) not in degrees:
-            raise WorkspaceRefusal("retained serving lane has an unsupported device degree")
-    else:
-        ordinals = tuple(range(max(supported)))
-    return [pb.PlacementDevicePin(placement_id=placement_id, device_ordinals=ordinals)]
 
 
 class Serving:
@@ -201,7 +173,11 @@ class Serving:
         prepared = None
         try:
             prepared = future.result()
-            placement = prepared.placement
+            from . import machine_lanes
+
+            placement, pins = machine_lanes.replica(
+                self.worker, owner, prepared.placement, target.declaration.get("models", [])
+            )
             journal.check_active(owner, call)
             selected = next(
                 (entry for entry in placement["entrypoints"] if entry["name"] == target.entrypoint),
@@ -293,11 +269,7 @@ class Serving:
                 placement_set=pb.DesiredPlacementSet(
                     placement_set_digest=hashlib.sha256(placement_bytes).digest(),
                     placement_set_canonical_bytes=placement_bytes,
-                    device_pins=device_pins(
-                        self.worker.lanes,
-                        placement["placement_id"],
-                        target.declaration.get("models", []),
-                    ),
+                    device_pins=pins,
                 ),
             )
             preparation = canonical_json.encode(

@@ -147,11 +147,13 @@ def test_fused_lane_dispatches_a_real_executor_after_boot(
 
 
 @needs_executor
-@pytest.mark.parametrize("supersede_drain", [False, True])
+@pytest.mark.parametrize("managed,supersede_drain", [(False, False), (False, True), (True, False)])
 def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
     monkeypatch: pytest.MonkeyPatch,
     supersede_drain: bool,
+    managed: bool,
 ) -> None:
+    import base64
     import dataclasses
     import shutil
 
@@ -163,6 +165,7 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
     workers: list[Worker] = []
     completed: list[str] = []
     overlap: list[set[str]] = []
+    cold_waits: list[int] = []
 
     def assign_fixture(self: lanes.LaneSet, placement_id: str, **kwargs: Any) -> lanes.DeviceLane:
         pin = kwargs.get("pin")
@@ -181,7 +184,7 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
         selected = "plc-local"
         offered: dict[str, str] = {}
         stage = 0
-        group_revision = 4 if supersede_drain else 2
+        group_revision = 4 if supersede_drain else 3 if managed else 2
 
         def release(phase: str, *seals: str) -> None:
             for seal in seals:
@@ -209,10 +212,43 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
                 )
             return result
 
+        def single(selected_state: pb.DesiredWorkerState, identity: str) -> pb.DesiredWorkerState:
+            body = documents.read(
+                selected_state.placement_set.placement_set_canonical_bytes, pb.PlacementSet
+            )
+            chosen = [row for row in body["placements"] if row["placement_id"] == identity]
+            from cozy_runtime import canonical_json
+
+            raw = canonical_json.encode(
+                {"format": "cozy.worker.v1.PlacementSet/1", "placements": chosen}
+            )
+            digest = documents.digest_of(raw)
+            selected_state.placement_set.placement_set_canonical_bytes = raw
+            selected_state.placement_set.placement_set_digest = digest
+            pins = [
+                pin
+                for pin in selected_state.placement_set.device_pins
+                if pin.placement_id == identity
+            ]
+            selected_state.placement_set.ClearField("device_pins")
+            selected_state.placement_set.device_pins.extend(pins)
+            return selected_state
+
+        def prepare(selected_state: pb.DesiredWorkerState) -> bool:
+            with workers[0].control_lock:
+                return workers[0]._prepare_execution(
+                    {
+                        "revisions": {},
+                        "state": base64.b64encode(selected_state.SerializeToString()).decode(),
+                    },
+                    "managed-proof",
+                )
+
         def first() -> pb.DesiredWorkerState:
             nonlocal initial
             initial = desired()
-            return state(1, False)
+            selected_state = state(1, False)
+            return single(selected_state, "plc-local") if managed else selected_state
 
         def routed(frame: pb.RecordOwnerFrame) -> None:
             if frame.HasField("attempt_offer"):
@@ -269,7 +305,27 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
                 for p in report.placements
                 if p.serving == pb.SERVING_STATE_DISPATCHABLE
             }
-            if stage == 0 and ready == {"plc-local", "hosted"}:
+            if (
+                managed
+                and stage == 0
+                and report.accepted_desired_state_revision == 1
+                and ready != {"plc-local"}
+            ):
+                # Both cold children are eligible before either executor can accept.
+                # The second cannot replace the first's still-materializing desired set.
+                assert not prepare(single(state(2, False), "hosted"))
+                assert worker.accepted.accepted_desired_state_revision == 1
+                cold_waits.append(1)
+            if managed and stage == 0 and ready == {"plc-local"}:
+                stage = 10
+                dispatch("before-0", "plc-local")
+            elif managed and stage == 10 and (barrier / "before-0").exists():
+                stage = 11
+                prepare(single(state(2, False), "hosted"))
+            elif managed and stage == 11 and ready == {"plc-local", "hosted"}:
+                stage = 1
+                dispatch("before-1", "hosted")
+            elif stage == 0 and ready == {"plc-local", "hosted"}:
                 stage = 1
                 dispatch("before-0", "plc-local")
                 dispatch("before-1", "hosted")
@@ -285,11 +341,21 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
                 assert sum(a.state == "running" for a in worker.engine.history.values()) == 2
                 overlap.append(pids)
                 if stage == 1:
-                    stage = 2
-                    owner._send(pb.RecordOwnerFrame(desired_state=state(2, True)))
+                    if managed:
+                        assert not prepare(state(group_revision, True))
+                        assert workers[0].accepted.accepted_desired_state_revision == 2
+                        stage = 12
+                        release("before", "0", "1")
+                    else:
+                        stage = 2
+                        owner._send(pb.RecordOwnerFrame(desired_state=state(2, True)))
                 else:
                     stage = 7
                     release("after", "0", "1")
+            elif managed and stage == 12 and len(completed) == 2:
+                # All singleton children are terminal/acked before group convergence.
+                stage = 3
+                prepare(state(group_revision, True))
             elif (
                 stage == 2
                 and worker.placement is not None
@@ -381,5 +447,7 @@ def test_disjoint_attempts_drain_to_group_and_split_without_preemption(
     assert not outcome.error, outcome.error
     assert len(completed) == len(set(completed)) == 5
     assert len(overlap) == 2
+    if managed:
+        assert cold_waits, "cold second preparation never exercised the convergence fence"
     assert seals == ["0", "0,1", "0"]
     assert not workers[0]._device_consumers and not workers[0]._retired_consumers
