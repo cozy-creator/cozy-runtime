@@ -11,6 +11,7 @@ def test_builtin_namespaces_leave_runtime_torch_free() -> None:
             "-c",
             "import sys; import cozy_runtime; import cozy_runtime.author; "
             "import cozy_runtime.models; import cozy_runtime.models.minimax_h3; "
+            "import cozy_runtime.models.qwen_image21; "
             "assert not {'torch', 'diffusers', 'transformers'} & sys.modules.keys()",
         ],
         capture_output=True,

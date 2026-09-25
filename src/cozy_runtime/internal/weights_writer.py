@@ -332,7 +332,7 @@ class WriterBroker:
     def _arguments(self, attempt: Any, slot: str, args: Any) -> tuple[Any, ...]:
         from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 
-        if not isinstance(args, list) or len(args) != 5:
+        if not isinstance(args, list) or len(args) not in (5, 6):
             raise CapabilityError("invalid derivation arguments", code="weights_writer_declaration")
         outputs = {
             row["output_id"]: row.get("max_bytes", 0) for row in attempt.spec.get("outputs", [])

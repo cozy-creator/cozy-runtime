@@ -96,3 +96,41 @@ def test_add_and_derive_configs_land_as_inline_jcs(tmp_path: Path) -> None:
         "copied": _CONFIG,
         "derived": _DERIVED_JCS,
     }
+
+
+def test_companion_files_cross_scoped_writer_and_survive_derivation(tmp_path: Path) -> None:
+    store = tensorfs.Store.init(tmp_path / "companions")
+    files = {"LICENSE": b"Research licence\n", "Notice": b"Exact required attribution\n"}
+    definition = Derivation(
+        {},
+        {"model": Target(add={"w": Tensor("f32", (1,), SPEC_PLAIN, {"value": Part("f32", (1,))})})},
+        {},
+        (("model", "w"),),
+        files=files,
+    )
+    with NativeExecution(store, tmp_path, "documents", {}, {"model": 1024}) as owner:
+        with owner.client.open_output("model", definition) as writer:
+            writer.add_part("model", "w", "value", struct.pack("<f", 1.0))
+            receipt = writer.commit()
+        artifact = owner.client.adopt_model(receipt)
+    output = tmp_path / "first-checkout"
+    store.checkout(artifact.manifest.digest, output, symlink=False)
+    for name, expected in files.items():
+        assert (output / name).read_bytes() == expected
+    inherited = Derivation(
+        {"source": Source(artifact.manifest.digest, artifact.manifest.length)},
+        {"model": Target(source="source", source_component="model")},
+        {},
+        (("model", "w"),),
+    )
+    with NativeExecution(
+        store, tmp_path, "next-operation", {"source": artifact}, {"model": 0}
+    ) as owner:
+        with owner.client.open_output("model", inherited) as writer:
+            receipt = writer.commit()
+        derived = owner.client.adopt_model(receipt)
+    assert receipt["added_objects"] == []
+    output = tmp_path / "derived-checkout"
+    store.checkout(derived.manifest.digest, output, symlink=False)
+    for name, expected in files.items():
+        assert (output / name).read_bytes() == expected

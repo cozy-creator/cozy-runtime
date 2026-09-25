@@ -242,7 +242,9 @@ def _media_decode_bounds(surface: Surface) -> None:
                 code="asset_decode_limit",
                 fields=[path],
             )
-    if not reached:
+    if not reached and surface.kind != "job":
+        # Jobs can decode bounded outputs produced by their managed children. Those
+        # capabilities are granted on child completion, not declared as parent inputs.
         raise ConformanceError(
             f"{surface.name} requests MediaDecoder but its payload contains no image, video "
             "or audio asset field",
