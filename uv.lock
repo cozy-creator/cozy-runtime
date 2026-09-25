@@ -25,7 +25,7 @@ version = "4.14.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/61/cc/a381afa6efea9f496eff839d4a6a1aed3bfafc7b3ab4b0d1b243a12573dd/anyio-4.14.2.tar.gz", hash = "sha256:cfa139f3ed1a23ee8f88a145ddb5ac7605b8bbfd8592baacd7ce3d8bb4313c7f", size = 260176, upload-time = "2026-07-12T20:29:07.082Z" }
 wheels = [
@@ -380,7 +380,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.18.20"
+version = "0.18.21"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -419,6 +419,15 @@ minimax-h3 = [
 model-execution = [
     { name = "tensorfs" },
 ]
+qwen-image21 = [
+    { name = "diffusers" },
+    { name = "numpy" },
+    { name = "safetensors" },
+    { name = "tokenizers" },
+    { name = "torch" },
+    { name = "torchvision" },
+    { name = "transformers" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -439,24 +448,31 @@ requires-dist = [
     { name = "cryptography", specifier = ">=45" },
     { name = "diffusers", marker = "extra == 'corpus'", specifier = ">=0.36" },
     { name = "diffusers", marker = "extra == 'minimax-h3'", specifier = ">=0.40.0" },
+    { name = "diffusers", marker = "extra == 'qwen-image21'", specifier = ">=0.40.0" },
     { name = "grpcio", specifier = ">=1.76" },
     { name = "msgspec", specifier = ">=0.19" },
     { name = "numpy", marker = "extra == 'minimax-h3'", specifier = ">=1.26" },
+    { name = "numpy", marker = "extra == 'qwen-image21'", specifier = ">=1.26" },
     { name = "packaging", specifier = ">=24" },
     { name = "pillow", specifier = ">=12" },
     { name = "protobuf", specifier = ">=6.31" },
     { name = "safetensors", marker = "extra == 'minimax-h3'", specifier = ">=0.8.0" },
-    { name = "tensorfs", specifier = ">=0.3.46" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.46" },
+    { name = "safetensors", marker = "extra == 'qwen-image21'", specifier = ">=0.8" },
+    { name = "tensorfs", specifier = ">=0.3.51" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.51" },
     { name = "tokenizers", marker = "extra == 'minimax-h3'", specifier = ">=0.23.1" },
+    { name = "tokenizers", marker = "extra == 'qwen-image21'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13" },
     { name = "torch", marker = "extra == 'minimax-h3'", specifier = ">=2.13" },
+    { name = "torch", marker = "extra == 'qwen-image21'", specifier = ">=2.13" },
     { name = "torchvision", marker = "extra == 'minimax-h3'", specifier = ">=0.28" },
+    { name = "torchvision", marker = "extra == 'qwen-image21'", specifier = ">=0.28" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40" },
     { name = "transformers", marker = "extra == 'minimax-h3'", specifier = ">=5.16.1" },
+    { name = "transformers", marker = "extra == 'qwen-image21'", specifier = ">=5.17" },
 ]
-provides-extras = ["minimax-h3", "assessment", "derive", "corpus", "media", "model-execution"]
+provides-extras = ["qwen-image21", "minimax-h3", "assessment", "derive", "corpus", "media", "model-execution"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -466,7 +482,7 @@ dev = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=8.4" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.3.46,<0.4" },
+    { name = "tensorfs", specifier = ">=0.3.51,<0.4" },
     { name = "types-protobuf", specifier = ">=6.30" },
 ]
 
@@ -747,7 +763,7 @@ dependencies = [
     { name = "click" },
     { name = "filelock" },
     { name = "fsspec" },
-    { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
+    { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
     { name = "httpx" },
     { name = "packaging" },
     { name = "pyyaml" },
@@ -1734,11 +1750,14 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.3.46"
+version = "0.3.51"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/27/5a/cc99ef56a43a415e52030e82940fe2e6db612b32b76508c5fcd7b70938d0/tensorfs-0.3.46.tar.gz", hash = "sha256:4a1016c8476b40f02f2017cd96188692032587fa907f34f9e6a09f7237fef0bd", size = 770177, upload-time = "2026-09-23T20:42:37.703Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/24/33/3449ac29a84fd2bf2c1524835fa6a23ddfdd53f18fbf88a89e620568abac/tensorfs-0.3.51.tar.gz", hash = "sha256:89b8bbd15e95934e851db2db534cdd70461c3f25313e920d956d443562d7d578", size = 793539, upload-time = "2026-09-25T05:57:08.862Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f5/1e/03f8739e88f68b08f6eb26f5fa68a49d06f614f946fe29d971a489cb6fe0/tensorfs-0.3.46-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:16772dbfc9e81b7794f7ad5d34ae9c29546c80f4bcfefebd98289fb9c2974723", size = 7771182, upload-time = "2026-09-23T20:42:35.624Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/5f/3ee040fbc668618e0ceb0b229de3be72369fdcb94eff7853b0cd35821ba6/tensorfs-0.3.51-cp312-abi3-macosx_10_13_x86_64.whl", hash = "sha256:5e6bd99bd9c0c7d1e8b0df511cfec9b51c14a105d874e1432e1f030fbb483613", size = 7795150, upload-time = "2026-09-25T05:57:00.194Z" },
+    { url = "https://files.pythonhosted.org/packages/68/93/11941746293ea6854d5626e925cb911f650bdf5bb28599ddfb43eac008f6/tensorfs-0.3.51-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:1c32ebb3872ee9fea293916131c2e1fc16fd5d477c1181ffd7eb8dc273afd4d5", size = 7346905, upload-time = "2026-09-25T05:57:02.671Z" },
+    { url = "https://files.pythonhosted.org/packages/47/3d/4dda0e49ed3830f57687733f1f2ac171bb91b811d8e6ec21a02033d5f6a9/tensorfs-0.3.51-cp312-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:be017d095835731aa018ebeb98b12c3b8daac73fe361b75ffc99989e6c0156b4", size = 7644837, upload-time = "2026-09-25T05:57:04.559Z" },
+    { url = "https://files.pythonhosted.org/packages/88/bd/7cfb9a69d9c3414b70dc42347eee9f832f1ff89432c7aae98b304d150fcc/tensorfs-0.3.51-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:68b8631e7177b702bd47892365d4c10fb1c20800e5a605e6fad23c946406761d", size = 7884057, upload-time = "2026-09-25T05:57:06.969Z" },
 ]
 
 [[package]]
@@ -1840,7 +1859,7 @@ name = "tqdm"
 version = "4.70.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/21/3b/6c24bec5be5e743ffd99576daa5cc077722fc7d5bbc00bd133fa0c698dc6/tqdm-4.70.0.tar.gz", hash = "sha256:55b0b0dbd97462d06ebee91e4dac24ed4d4702be82b24f07e6c1d27e08cea220", size = 795438, upload-time = "2026-07-27T11:33:15.271Z" }
 wheels = [
@@ -1849,7 +1868,7 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.16.1"
+version = "5.17.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -1862,9 +1881,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ad/2e/ba418680ab901dae269360bb8642485eae04f1af91ee2ebb8bd6f3607305/transformers-5.16.1.tar.gz", hash = "sha256:17b0eac726ddc55e84ac58946063e0c6d37fd000c456b581f050ea0f4e822869", size = 9650542, upload-time = "2026-08-26T14:48:58.789Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0e/9e/750649904a065007a838981785b2bd8d9ff26154c6c341ac67d0b7f82c68/transformers-5.17.0.tar.gz", hash = "sha256:a153be279169b55b92d8000bf4af294aed684503d091cca7804da2dd8a9de000", size = 9817878, upload-time = "2026-09-09T15:39:56.886Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0d/4d/ee3728674c0bbc637bb4af88ccf0be697f92e4e90b55f5dc110c44d61b61/transformers-5.16.1-py3-none-any.whl", hash = "sha256:2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e", size = 12080592, upload-time = "2026-08-26T14:48:55.083Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/d0/c502b60d684adbd98a8dc7d5bb866842772b816ac4354e4608be240041ae/transformers-5.17.0-py3-none-any.whl", hash = "sha256:78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801", size = 12295140, upload-time = "2026-09-09T15:39:53.746Z" },
 ]
 
 [[package]]
@@ -1888,7 +1907,7 @@ version = "0.27.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
-    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-12-cozy-runtime-corpus' and extra == 'extra-12-cozy-runtime-minimax-h3')" },
     { name = "rich" },
     { name = "shellingham" },
 ]
