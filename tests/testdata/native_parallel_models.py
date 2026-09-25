@@ -37,7 +37,7 @@ from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import PlanChooser, PreparedModel, PreparedRequest
-from cozy_runtime.internal.worker.session import executor_prepare_command
+from cozy_runtime.internal.worker.session import executor_load_command
 
 PACKAGE = Path(__file__).parent / "dual_model_package"
 sys.path.insert(0, str(PACKAGE))
@@ -294,8 +294,9 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         },
     )
     binding = next(iter(staged.declared_bindings.values()))
-    command = executor_prepare_command(
+    command = executor_load_command(
         binding,
+        construction=binding.construction_key(),
         devices=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         sequence_parallel_degree=degree,
         authorized_device_limit_bytes=2 << 30,
@@ -338,8 +339,20 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
             group.dial_back(
                 __import__("cozy_runtime.internal.executor", fromlist=["_SEALED"])._SEALED
             )
-        reply = executor.prepare(command)
+        started = executor.start(
+            {
+                "devices": command["devices"],
+                "sequence_parallel_degree": degree,
+                "application": binding.application,
+                "package_interface": binding.interface_path,
+                "development_project": binding.development_project,
+            }
+        )
+        assert started.get("ok"), started
+        reply = executor.load(command)
         assert reply.get("ok"), reply
+        activated = executor.activate({"construction": command["construction"]})
+        assert activated.get("ok"), activated
         host, executor = executor, executor.constructions[executor.active]
         assert len(executor.model_executors) == 2
         assert set(executor.models) == {"base", "overlay"}

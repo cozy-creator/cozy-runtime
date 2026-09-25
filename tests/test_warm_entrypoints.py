@@ -135,6 +135,17 @@ class _Booted:
             self.worker.latched
         )
 
+    def load(self, entrypoint: str) -> None:
+        """The attempt path's load and activation of one entrypoint's construction."""
+        tenant = self.worker._tenant("plc-p")
+        key = self.binding(entrypoint).construction_key()
+        group = [b for b in tenant.bindings.values() if b.construction_key() == key]
+        executor = self.worker.supervision.current
+        assert executor is not None
+        with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):
+            self.worker._load_construction(tenant, executor, key, group)
+            self.worker._activate_construction(tenant, executor, key)
+
     def steps(self, pattern: str) -> list[str]:
         return [step for _kind, step in self.notes if re.search(pattern, step)]
 
@@ -149,31 +160,36 @@ class _Booted:
 def test_adding_the_second_entrypoint_reuses_the_prepared_executor(
     stores: dict[str, TenantStore],
 ) -> None:
-    """THE SWITCH ARM. The placement is prepared for `touch` alone, then the desired set
-    adds `retouch` over the same construction. The generation is the construction, not the
-    binding set: the executor is kept — same pid, same epoch — and both bindings are ready
-    on it, with nothing filled twice."""
+    """THE SWITCH ARM. The placement starts for `touch` alone and its construction loads;
+    then the desired set adds `retouch` over the same construction. The process is the
+    construction's home, not the binding set's: the executor is kept — same pid, same epoch
+    — both bindings are dispatchable on it, and nothing is filled twice."""
     store = stores["small"]
     with _workspace() as root:
         booted = _Booted(root, store)
         try:
             booted.prepare("touch")
             executor = booted.worker.supervision.current
-            assert executor is not None and executor.alive()
-            assert executor.parameters == {"model"}
-            assert len(booted.steps(r"prepared 1 binding\(s\)")) == 1
+            assert executor is not None and executor.alive() and executor.started
+            booted.load("touch")
+            (loaded,) = executor.loaded.values()
+            assert loaded.parameters == {"model"}
+            assert len(booted.steps(r"construction \w{12} loaded in .*\(1 binding")) == 1
 
             booted.prepare("touch", "retouch")
             assert booted.worker.supervision.current is executor and executor.alive()
             assert executor.epoch == 1
             assert executor.ready_bindings == set(booted.staged.declared_bindings)
-            assert set(booted.worker.prepared_models) == set(booted.staged.declared_bindings)
-            assert booted.steps(r"reused epoch 1 pid \d+ for the same construction \(2 binding"), [
+            assert booted.steps(r"reused started epoch 1 pid \d+ \(2 binding"), [
                 step for _k, step in booted.notes
             ]
+            booted.load("retouch")
+            assert set(booted.worker.prepared_models) == set(booted.staged.declared_bindings)
+            assert executor.loaded_bindings() == set(booted.staged.declared_bindings)
             assert not booted.steps(r"replacing the device executor"), booted.notes
-            # ONE fill for the generation: the second prepare reported none.
-            assert len(booted.steps(r"prepared \d+ binding\(s\)")) == 1
+            # ONE fill for the construction: the second load answered from what was built.
+            fills = booted.steps(r"construction \w{12} loaded in")
+            assert len(fills) == 2 and "reused" in fills[1] and "reused" not in fills[0], fills
         finally:
             booted.close()
 
@@ -197,8 +213,8 @@ def test_both_entrypoints_execute_on_the_one_executor(stores: dict[str, TenantSt
         (turn.request.request_id, turn.outcome.get("cause"), turn.outcome.get("safe_message"))
         for turn in owner.turns
     ]
-    prepared = [step for _k, step in notes if re.search(r"prepared \d+ binding\(s\)", step)]
-    assert len(prepared) == 1 and "prepared 2 binding(s)" in prepared[0], prepared
+    loads = [step for _k, step in notes if re.search(r"construction \w{12} loaded in", step)]
+    assert len(loads) == 1 and "(2 binding(s)" in loads[0], loads
     assert not [step for _k, step in notes if "replacing the device executor" in step]
     for turn in owner.turns:
         assert {row["executor_epoch"] for row in turn.rows.values()} == {1}, turn.rows
@@ -238,10 +254,11 @@ def _drop_page_cache(store: TenantStore) -> None:
 def test_a_parked_component_is_page_warmed_before_its_first_stage(
     stores: dict[str, TenantStore],
 ) -> None:
-    """THE WARM ARM. A neighbour leaves the card room for the small components and not for
-    `unet`, so the prepare PARKS it: its bytes were never read. The worker then reads them
-    through the store in the background — measured cold, at the block layer — and once the
-    neighbour leaves, the executor's restore of `unet` reads from the page cache."""
+    """THE WARM ARM. The worker reads every desired construction's stored bytes through the
+    store in the background once the process starts — measured cold, at the block layer.
+    A neighbour leaves the card room for the small components and not for `unet`, so the
+    load PARKS it; once the neighbour leaves, the executor's restore of `unet` reads from
+    the page cache."""
     store = stores["large"]
     unet = _stored_bytes(store, "unet")
     context = measure_context()
@@ -258,9 +275,10 @@ def test_a_parked_component_is_page_warmed_before_its_first_stage(
             booted = _Booted(root, store)
             try:
                 booted.prepare("touch", "retouch")
-                assert booted.steps(r"parked=\['unet'\]"), [s for _k, s in booted.notes]
                 warm = next(t for t in threading.enumerate() if t.name == "page-warm:plc-p")
                 warm.join()
+                booted.load("touch")
+                assert booted.steps(r"parked=\['unet'\]"), [s for _k, s in booted.notes]
                 warmed = booted.steps(r"page-warmed 'unet'")
                 assert len(warmed) == 1, [s for _k, s in booted.notes]
                 found = re.search(

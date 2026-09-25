@@ -22,9 +22,6 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
     probe     device/host memory facts, for the worker's ledger reconciliation
     shutdown  cooperative exit
 
-`prepare` (start + load + activate) and `preconstruct` remain only for the worker's
-single-construction path until it drives `start`/`load`/`activate` itself.
-
 Cancellation is attempt-keyed: `ctx.cancelled` reads the marker the worker publishes for
 this exact request. A stale cancellation therefore cannot cross into the next attempt.
 The worker owns the grace clock and forcefully reclaims the whole executor scope if author
@@ -430,7 +427,7 @@ class _CompositeResidency:
         }
 
 
-#: The runtime modules a construction imports, named ONCE so `preconstruct` can warm
+#: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
 #: is a missed saving and never a wrong answer: the prepare imports what it needs either
 #: way, and a warm `sys.modules` is the only difference.
@@ -855,95 +852,6 @@ class Executor:
             return warm_generation(model, device=self._device(), cancel=lambda: bool(self.poisoned))
         finally:
             owner._attempt_spool = None
-
-    def preconstruct(self, command: dict[str, Any]) -> dict[str, Any]:
-        """THE DEVICE-FREE HALF OF A CONSTRUCTION, run OFF the lane's device lock (cr-104).
-
-        A prepare's first seconds move no bytes at all: Torch imports, the runtime's own
-        modules import, the package imports, and the package's deferred libraries and
-        dynamic types get built. Measured warm on one host: Torch 1.31 s, the runtime block
-        0.14 s, `import diffusers` 2.77 s -- deferred out of `import anima`, which is 5 ms,
-        so the cost lands INSIDE the construction -- and SDXL's `_hidiffusion_unet_type()`
-        2.69 s on its first call and 0 ms after. None of it touches the card. All of it used
-        to run with the lane's device lock held and a co-tenant ALREADY VACATED for it: the
-        card was emptied, then sat idle for the whole import.
-
-        The worker calls this BEFORE it takes the lock, so the imports overlap whatever is
-        still computing on the card. Everything here is idempotent -- the `prepare` that
-        follows re-executes the same import statements against a warm `sys.modules` and
-        finds `_device_ready` and `discovered` already set -- so a prepare costs what it
-        costs today minus exactly what ran here.
-
-        A GROUP does not preconstruct. Rank 0 forms the group inside `prepare` and every
-        rank's device is made current through that rendezvous; warming one rank early puts
-        an init boundary on the wrong side of it for no gain, since a group holds its whole
-        lane anyway and has no co-tenant to overlap with.
-        """
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        if self.world > 1:
-            return {"ok": True, "skipped": "group", "stages": []}
-        binding = command.get("binding") or {}
-        if not binding:
-            models = command.get("models") or []
-            binding = dict(models[0].get("binding") or {}) if models else {}
-        if not binding.get("model_class"):
-            return {"ok": True, "skipped": "weightless", "stages": []}
-        changed = _env_changes()
-        if changed:
-            return {
-                "ok": False,
-                "code": "env_seal_broken",
-                "detail": "the executor environment changed before Torch import "
-                f"({', '.join(changed)}); no CUDA initialization was attempted",
-            }
-        started = time.perf_counter()
-        stages: list[tuple[str, float]] = []
-        _mark = [started]
-
-        def stage(name: str) -> None:
-            now = time.perf_counter()
-            stages.append((name, round((now - _mark[0]) * 1000, 1)))
-            _mark[0] = now
-
-        import torch
-
-        self.torch = torch
-        stage("torch_import")
-        for name in _CONSTRUCTION_MODULES:
-            importlib.import_module(name)
-        stage("runtime_imports")
-        # NO DEVICE INITIALIZATION HERE, DELIBERATELY. A co-tenant is computing on this card
-        # while this runs, and a CUDA context is a few hundred MiB that no lane ceiling
-        # covers; taking them out from under a neighbour mid-attempt is the OOM this whole
-        # change exists to avoid. `prepare` still opens the runtime's ONE init boundary,
-        # under the lock, in the order it always has -- and `_make_room` measures the card
-        # after this returns, so the incoming tenant is priced against the truth either way.
-        opened = accel.initialized(torch, self.device_kind)
-        if self.discovered is None:
-            self._discover_provisioned(binding)
-        stage("package_import")
-        warmup_error = self._warm_package()
-        stage("package_warmup")
-        adopted = not opened and accel.initialized(torch, self.device_kind)
-        if adopted:
-            # THE PACKAGE OPENED CUDA ITSELF, at import or in its `warmup`. Under the old
-            # shape that happened after the runtime's boundary and was invisible; refusing
-            # `cuda_initialized_before_runtime` now would break a package that works today
-            # over a warmup it never asked for. So the context is ADOPTED -- the seal leaves
-            # this process exactly one visible card and a group never preconstructs, so
-            # there is no wrong device to have picked -- and the worker is told, because it
-            # is still a package defect and the operator is the one who can get it fixed.
-            self._device_ready = True
-            accel.reset_peak(torch, self.device_kind)
-        return {
-            "ok": True,
-            "stages": stages,
-            "warmed": not warmup_error,
-            "warmup_error": warmup_error,
-            "adopted_package_cuda_init": adopted,
-            "rss_bytes": _rss(),
-        }
 
     def _warm_package(self) -> str:
         """Give the package its ONE chance to pay its deferred import cost off the lock.
@@ -1390,6 +1298,7 @@ class Executor:
         self.arbiter.touch(key)
         self.active = key
         return {
+            **self.probe(),
             "ok": True,
             "construction": key,
             "parked": parked,
@@ -1452,7 +1361,12 @@ class Executor:
             self.poisoned = self.poisoned or f"unload: {exc.code}"
             return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
         self.ready = bool(self.constructions)
-        return {"ok": True, "construction": key, "freed_bytes": max(before - after, 0)}
+        return {
+            **self.probe(),
+            "ok": True,
+            "construction": key,
+            "freed_bytes": max(before - after, 0),
+        }
 
     def residency_document(self) -> dict[str, Any]:
         free = -1
@@ -1464,44 +1378,6 @@ class Executor:
             "active": self.active,
             "free_bytes": free,
         }
-
-    def prepare(self, command: dict[str, Any]) -> dict[str, Any]:
-        """The worker's single-construction door: start, load and activate in one call.
-
-        Keyed by the command's own content, so the same prepare twice (a reconnect
-        re-accepting its placement) answers from the loaded construction instead of filling
-        a second generation into the process.
-        """
-        binding = command.get("binding") or {}
-        if not binding and command.get("models"):
-            binding = dict(command["models"][0].get("binding") or {})
-        started = self.start(
-            {
-                "devices": command.get("devices", ""),
-                "sequence_parallel_degree": command.get("sequence_parallel_degree") or 1,
-                "application": binding.get("application", ""),
-                "package_interface": binding.get("package_interface", ""),
-                "development_project": binding.get("development_project", ""),
-            }
-        )
-        if not started.get("ok"):
-            return started
-        # Keyed by WHAT IS CONSTRUCTED: the bindings and the pin, never the seal, the degree
-        # or the ceiling it was assigned.
-        constructed = {k: command.get(k) for k in ("binding", "models", "budgets", "attention_pin")}
-        key = command.get("construction") or (
-            "prepared:"
-            + hashlib.sha256(
-                json.dumps(constructed, sort_keys=True, default=str).encode()
-            ).hexdigest()[:32]
-        )
-        reply = self.load({**command, "construction": key})
-        if not reply.get("ok"):
-            return reply
-        activated = self.activate({"construction": key})
-        if not activated.get("ok"):
-            return activated
-        return reply
 
     def _prepare_first(
         self, command: dict[str, Any], *, optional_attention_scope: bool = False
@@ -4033,7 +3909,7 @@ _FOLLOWER_COMMANDS = frozenset(
 )
 
 #: The commands whose refusals carry the raising traceback to the worker.
-_TRACED_COMMANDS = frozenset({"start", "load", "prepare", "preconstruct", "join"})
+_TRACED_COMMANDS = frozenset({"start", "load", "join"})
 
 #: A follower's refusal codes rank 0 relays as-is; any other refusal is the group not
 #: forming, named with the follower's own detail.
@@ -4130,8 +4006,6 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.run(command)
             elif name == "describe_installed":
                 reply = executor.describe_installed(command)
-            elif name == "preconstruct":
-                reply = executor.preconstruct(command)
             elif name == "start":
                 reply = executor.start(command)
             elif name == "load":
@@ -4142,8 +4016,6 @@ def main(argv: list[str] | None = None) -> int:
                 reply = executor.unload(command)
             elif name == "residency":
                 reply = executor.residency_document()
-            elif name == "prepare":
-                reply = executor.prepare(command)
             elif name == "prepare_request":
                 reply = executor.serve_request(command)
             elif name == "invoke":

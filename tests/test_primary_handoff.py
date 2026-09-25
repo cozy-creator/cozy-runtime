@@ -253,3 +253,84 @@ def test_replacement_waits_for_work_then_retires_before_assignment() -> None:
             for thread in threads:
                 thread.join(20)
             worker.shutdown()
+
+
+@needs_executor
+def test_only_the_process_identity_decides_between_in_place_and_replacement() -> None:
+    """proto-061 D2: a started process is kept for a new document of the same placement,
+    package, environment, device pin and lane shape, and replaced for anything else."""
+    with _workspace() as root:
+        project = root / "project"
+        project.mkdir()
+        (project / "package.toml").write_text('[application]\nobject="identity_fixture:app"\n')
+        (project / "identity_fixture.py").write_text(
+            "import msgspec\nfrom cozy_runtime.author import App, Context\napp=App()\n"
+            "class Request(msgspec.Struct):\n    wait: bool = False\n"
+            "class Result(msgspec.Struct):\n    value: int\n"
+            "@app.entrypoint\ndef serve(ctx: Context, payload: Request) -> Result:\n"
+            "    return Result(7)\n"
+        )
+        config = _config(root / "home")
+        staged = stage_development_placement(
+            config.cozy_home,
+            package_interface.build(discover(project)),
+            package="local/identity",
+            release="0.0.0",
+            source_digest=development_source_digest(project),
+            artifact_cache=root / "artifacts",
+            tensorfs_root=root / "store",
+            project=project,
+        )
+        placement = pb.Placement()
+        placement.CopyFrom(staged.placement)
+        placement.placement_id = "primary"
+        raw, digest = documents.identity(pb.PlacementSet(placements=[placement]))
+        worker = Worker(
+            config,
+            WorkerOptions(
+                root=root / "worker",
+                devices="0",
+                tensorfs_root=staged.tensorfs_root,
+                artifact_cache=staged.artifact_cache,
+                development_project=project,
+                development_package=staged.placement.development.package,
+                development_release=staged.placement.development.release,
+                development_source_digest=documents.spell(
+                    staged.placement.development.source_digest
+                ),
+            ),
+            InMemoryControlHost(),
+        )
+        try:
+            with contextlib.chdir(project):
+                worker._apply_desired_state(
+                    pb.DesiredWorkerState(
+                        revision=1,
+                        wire_minor=49,
+                        posture=pb.POSTURE_ACCEPTING,
+                        placement_set=pb.DesiredPlacementSet(
+                            placement_set_digest=digest, placement_set_canonical_bytes=raw
+                        ),
+                    )
+                )
+                worker.converge_placement(1)
+            outgoing = worker.placement
+            executor = worker.supervision.current
+            assert outgoing is not None and executor is not None and executor.started
+            assert outgoing.serving == pb.SERVING_STATE_DISPATCHABLE
+            # the weightless construction is built with the process, before any attempt
+            assert executor.loaded_bindings() == set(worker.bindings)
+            entry = dict(outgoing.document)
+            same = worker._placement_from_entry(entry, b"next")
+            assert worker._grows_in_place(outgoing, same, worker.bindings)
+            other_env = worker._placement_from_entry(
+                {**entry, "environment_digest": "sha256:" + "e" * 64}, b"next"
+            )
+            assert not worker._grows_in_place(outgoing, other_env, worker.bindings)
+            pinned = worker._placement_from_entry(entry, b"next")
+            pinned.device_pin = (1,)
+            assert not worker._grows_in_place(outgoing, pinned, worker.bindings)
+            renamed = worker._placement_from_entry({**entry, "placement_id": "other"}, b"next")
+            assert not worker._grows_in_place(outgoing, renamed, worker.bindings)
+        finally:
+            worker.shutdown()

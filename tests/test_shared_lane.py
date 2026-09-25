@@ -94,7 +94,9 @@ class TenantStore:
     config: dict[str, int]
 
 
-def write_tenant_store(root: Path, *, blocks: int, scale: int = 1) -> TenantStore:
+def write_tenant_store(
+    root: Path, *, blocks: int, scale: int = 1, twins: tuple[str, ...] = ()
+) -> TenantStore:
     """Write one synthetic checkpoint and publish it as a repository release.
 
     `tfs checkpoint write --plain` objectizes a synthetic tree (tfs-015: `unet` blocks,
@@ -103,6 +105,9 @@ def write_tenant_store(root: Path, *, blocks: int, scale: int = 1) -> TenantStor
     package reads its shapes from — through `tfs checkpoint reproduce`, over the exact same
     tensor blobs. The release is then committed through the facade the worker itself reads
     with. `blocks` sets the size: 48 MiB per block at scale 1, plus a 128 MiB embedding.
+    Each name in `twins` is published too, as `cozytest/<name>@1` over the SAME tensor
+    blobs under a header whose config differs by one marker: another manifest, so another
+    construction, for no second copy of the bytes.
     """
     import tensorfs
 
@@ -140,22 +145,34 @@ def write_tenant_store(root: Path, *, blocks: int, scale: int = 1) -> TenantStor
         json.dumps([[name, row[0]] for name, rows in header["components"] for row in rows])
     )
     (work / "entries.json").write_text(json.dumps([["model.cozytensors", "cozytensors"]]))
-    reproduced = tfs(
-        "checkpoint",
-        "reproduce",
-        str(store),
-        str(work / "header.json"),
-        str(work / "entries.json"),
-        "--order",
-        str(work / "order.json"),
-    )
-    manifest_id, manifest_length = re.search(  # type: ignore[union-attr]
-        r"manifest\s+(sha256:[0-9a-f]{64}) length=(\d+)", reproduced
-    ).groups()
+
+    def publish(model: str, header_file: Path) -> str:
+        reproduced = tfs(
+            "checkpoint",
+            "reproduce",
+            str(store),
+            str(header_file),
+            str(work / "entries.json"),
+            "--order",
+            str(work / "order.json"),
+        )
+        manifest_id, manifest_length = re.search(  # type: ignore[union-attr]
+            r"manifest\s+(sha256:[0-9a-f]{64}) length=(\d+)", reproduced
+        ).groups()
+        opened = tensorfs.Store.open(str(store))
+        operation = opened.begin_operation(f"op-{model}", "cozytest", model)
+        operation.hold_manifest(manifest_id, int(manifest_length))
+        operation.commit_release(None, "1", "bf16", manifest_id, int(manifest_length))
+        return str(manifest_id)
+
+    manifest_id = publish("tenant", work / "header.json")
+    for index, twin in enumerate(twins, start=1):
+        marked = json.dumps({**config, "twin": index}, sort_keys=True, separators=(",", ":"))
+        (work / f"header-{twin}.json").write_text(
+            json.dumps({**header, "configs": [["unet", marked]]})
+        )
+        publish(twin, work / f"header-{twin}.json")
     opened = tensorfs.Store.open(str(store))
-    operation = opened.begin_operation("op-tenant", "cozytest", "tenant")
-    operation.hold_manifest(manifest_id, int(manifest_length))
-    operation.commit_release(None, "1", "bf16", manifest_id, int(manifest_length))
     weight_bytes = sum(int(row["length"]) for row in opened.walk_cozytensors(manifest_id))
     return TenantStore(root=store, weight_bytes=weight_bytes, config=config)
 
@@ -586,9 +603,9 @@ def _restores(notes: list[tuple[str, str]]) -> list[str]:
 def test_two_tenants_that_fit_hold_the_card_together_and_nothing_moves(
     stores: dict[str, TenantStore],
 ) -> None:
-    """THE CO-FIT ARM. Two small tenants on lane 0: both prepare resident, three attempts
-    alternate between them, no vacate is ever issued, both rows keep their weights, and the
-    driver's free bytes stay where two resident tenants leave them."""
+    """THE CO-FIT ARM. Two small tenants on lane 0: each loads on its first attempt, three
+    attempts alternate between them, no vacate is ever issued, every tenant that has
+    loaded keeps its weights, and the attest carries the working peak and shape cell."""
     store = stores["small"]
     turns = [_turn("plc-p", "p-1", 1), _turn("plc-q", "q-1", 2), _turn("plc-p", "p-2", 3)]
     with _workspace() as root:
@@ -598,11 +615,20 @@ def test_two_tenants_that_fit_hold_the_card_together_and_nothing_moves(
         turn.outcome for turn in owner.turns
     ]
     assert _vacates(notes) == [], _vacates(notes)
+    served: set[str] = set()
     for turn in owner.turns:
+        served.add(turn.placement_id)
         assert set(turn.rows) == {"plc-p", "plc-q"}, turn.rows
-        for slot, row in turn.rows.items():
+        for slot in served:
+            row = turn.rows[slot]
             assert sum(row["resident"].values()) >= store.weight_bytes * 0.99, (slot, row)
             assert row["evicted"] == {}, (slot, row)
+        # AttemptMetrics 14/15 (proto-061): what the kernels needed beyond the resident
+        # weights, and the shape cell the plan priced it under.
+        metrics = turn.outcome["metrics"]
+        assert 0 < int(metrics["working_peak_device_bytes"]) < store.weight_bytes, metrics
+        assert metrics["shape_cell"], metrics
+        assert "working_peak_device_bytes" in metrics["unverified_fields"], metrics
     assert worker.lanes.lanes[0].placements == {"plc-p", "plc-q"}
     assigned = [step for kind, step in notes if kind == "materialization" and "assigned" in step]
     assert any(
@@ -658,11 +684,10 @@ def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
         for turn in owner.turns
     ]
     vacates = _vacates(notes)
-    # Q's prepare found P resident with no room beside it: P vacated for the prepare.
-    # Then each attempt evicted the other tenant: Q for p-1, P for q-1, Q for p-2.
+    # Nothing loads at activation (proto-061): P loads for p-1 on an otherwise empty card;
+    # Q's load for q-1 finds P resident with no room beside it, so P vacates for it; p-2
+    # finds Q resident and Q vacates for P's re-stage.
     assert [(victim, whom) for victim, whom, *_ in vacates] == [
-        ("plc-p", "plc-q"),
-        ("plc-q", "plc-p"),
         ("plc-p", "plc-q"),
         ("plc-q", "plc-p"),
     ], vacates
@@ -673,27 +698,25 @@ def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
         assert freed >= weights * 0.99, (victim, freed, weights)
         assert after - before >= freed - (64 << 20), (victim, before, after, freed)
     # After each attempt exactly ONE tenant holds its weights: the one that just ran.
+    loaded: set[str] = set()
     for turn in owner.turns:
+        loaded.add(turn.placement_id)
         resident = {slot: sum(row["resident"].values()) for slot, row in turn.rows.items()}
         evicted = {slot: sum(row["evicted"].values()) for slot, row in turn.rows.items()}
         other = "plc-q" if turn.placement_id == "plc-p" else "plc-p"
         assert resident[turn.placement_id] >= weights * 0.99, (turn.request.request_id, resident)
-        assert resident[other] == 0 and evicted[other] >= weights * 0.99, (
-            turn.request.request_id,
-            resident,
-            evicted,
-        )
+        assert resident.get(other, 0) == 0, (turn.request.request_id, resident)
+        if other in loaded:
+            assert evicted[other] >= weights * 0.99, (turn.request.request_id, evicted)
         # and the driver agrees: one tenant's weights are on the card (two could not be,
         # the target was chosen so — and had both stayed, free would be under zero)
         assert turn.free_bytes <= target - weights, (turn.free_bytes, target, weights)
-    # THE CARD IS TAKEN LATE (cr-104). Q's device-free half — Torch, the runtime's
-    # construction modules, its package and whatever that package defers — is warmed BEFORE
-    # P is asked to give the card up, so P keeps computing through an import that will never
-    # touch it. The proof is the ORDER of the notes: the `preconstruct warmed` line for the
-    # tenant a vacate is FOR must precede that vacate. Under the old shape the whole prepare
-    # held the lane's device lock, so `_make_room` emptied the card first and the import then
-    # ran for seconds on a card nothing was using.
-    warmed = re.compile(r"'([^']+)': preconstruct warmed epoch \d+ in [\d.]+ ms OFF the lane lock")
+    # THE CARD IS TAKEN LATE (cr-104, proto-061). Q's process — Torch, the runtime's
+    # construction modules, its package and whatever that package defers — is STARTED at
+    # activation, long before P is asked to give the card up for Q's first load. The proof
+    # is the ORDER of the notes: the `started` line for the tenant a vacate is FOR must
+    # precede that vacate.
+    warmed = re.compile(r"'([^']+)' started epoch \d+ in [\d.]+ ms")
     vacated_for = re.compile(r"vacated \d+ B in [\d.]+ ms for '([^']+)'")
     sequence: list[tuple[str, str]] = []
     for _kind, step in notes:
@@ -755,10 +778,9 @@ def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
         assert pids == {slot: row["executor_pid"] for slot, row in owner.turns[0].rows.items()}, (
             pids
         )
-    # the re-stage was DECLARED and reconciled, never called a leak
-    for turn in owner.turns[1:]:
-        notes_for = turn.rows[turn.placement_id]["baseline_notes"]
-        assert any("declared residency transition" in note for note in notes_for), notes_for
+    # the re-stage (p-2's, after Q took the card) was DECLARED and reconciled, never a leak
+    notes_for = owner.turns[2].rows["plc-p"]["baseline_notes"]
+    assert any("declared residency transition" in note for note in notes_for), notes_for
     assert all("ledger_unreconciled" not in step for _kind, step in notes), [
         step for _kind, step in notes if "ledger_unreconciled" in step
     ]
@@ -772,10 +794,10 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
     stores: dict[str, TenantStore],
 ) -> None:
     """DIFFERENT LANES (cr-066's item, lifted here). On a two-lane worker the primary
-    tenant prepares for real on lane 0; a second model-bearing placement is assigned to
+    tenant loads for real on lane 0; a second model-bearing placement is assigned to
     lane 1 — the lane with no tenant — and its executor is sealed to `CUDA_VISIBLE_DEVICES=1`.
-    On this box lane 1 names a card that does not exist, so its prepare is refused
-    `device_capacity_unreadable` by the driver's honest answer; lane 0's tenant is never
+    On this box lane 1 names a card that does not exist, so its process refuses to start,
+    typed on its bindings, by the driver's honest answer; lane 0's tenant is never
     asked for anything, keeps its weights, and stays dispatchable. The assignment step is
     fed a measurement for the absent card by the harness (there is no other way to have two
     readable lanes here); everything after it is real."""
@@ -823,10 +845,18 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
             with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):
                 worker.prepare_executor()
             assert primary.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE, worker.latched
-            row_p = worker.lanes.lanes[0].rows["plc-p"]
-            assert sum(row_p.ledger.resident.values()) >= store.weight_bytes * 0.99
             executor_p = worker.supervision.current
             assert executor_p is not None and executor_p.alive()
+            # the attempt path's load: constructions are built on first use (proto-061)
+            tenant_p = worker._tenant("plc-p")
+            first = next(iter(tenant_p.bindings.values()))
+            key = first.construction_key()
+            group = [b for b in tenant_p.bindings.values() if b.construction_key() == key]
+            with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):
+                worker._load_construction(tenant_p, executor_p, key, group)
+                worker._activate_construction(tenant_p, executor_p, key)
+            row_p = worker.lanes.lanes[0].rows["plc-p"]
+            assert sum(row_p.ledger.resident.values()) >= store.weight_bytes * 0.99
 
             hosted_placement = worker._placement_from_entry(
                 {**document, "placement_id": "plc-q"}, b""
@@ -870,8 +900,11 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
                 worker._prepare_hosted_executor(hosted)
             assert seals == ["1"], seals
             assert hosted.latched == "prepare refused: every binding", hosted.latched
-            reasons = [fault.reason for fault in worker.engine.faults]
-            assert "device_capacity_unreadable" in reasons, reasons
+            # the process on the card that does not exist cannot even start: CUDA finds no
+            # device under its seal, and the refusal is typed on its bindings
+            reasons = {fault.reason for fault in worker.engine.faults}
+            assert set(hosted.failed_bindings) == set(hosted.bindings), hosted.failed_bindings
+            assert "accelerator_unavailable" in reasons, reasons
             assert hosted_placement.serving == pb.ServingState.SERVING_STATE_OFFLINE
             # lane 0's tenant was never touched: same process, same weights, still serving
             assert worker.supervision.current is executor_p and executor_p.alive()
@@ -883,3 +916,245 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
             for slot in worker.hosted.values():
                 slot.supervision.close()
             worker.supervision.close()
+
+
+# --------------------------------------------------------------------------- growth (D2)
+
+
+class GrowingOwner(TwoTenantOwner):
+    """The two-tenant owner over ONE placement whose document moves between turns.
+
+    `advance()` (a turn's `after`) sends the next revision's placement and holds dispatch
+    until the worker reports it converged. A turn named in `stale` is dispatched with the
+    SUPERSEDED document's bindings digest, as an offer queued before the update would be.
+    Every report is kept so admission, epochs, pids and loaded digests can be read back.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        revisions: list[pb.Placement],
+        overrides: list[dict[str, str]],
+        stale: set[str],
+        **kwargs: Any,
+    ):
+        super().__init__(*args, placements=[revisions[0]], **kwargs)
+        self.revisions = revisions
+        self.overrides = overrides
+        self.revision = 1
+        self.awaiting = 0
+        self.previous = revisions[0]
+        self.stale = stale
+        self.seen: list[tuple[int, int, int, list[bytes], list[bytes]]] = []
+
+    def _desired_state(self) -> pb.DesiredWorkerState:
+        directive = super()._desired_state()
+        directive.revision = self.revision
+        return directive
+
+    def advance(self) -> None:
+        # The source checkout's selection moves with the owner's document: a development
+        # worker re-derives the placement it admits from its own `--model` overrides.
+        worker = self.worker_ref()
+        worker.options = dataclasses.replace(
+            worker.options, development_binding_overrides=self.overrides[self.revision]
+        )
+        self.previous = self.placements[0]
+        self.revision += 1
+        self.placements = [self.revisions[self.revision - 1]]
+        self.awaiting = self.revision
+        self._send(pb.RecordOwnerFrame(desired_state=self._desired_state()))
+
+    def _next(self) -> None:
+        if not self.awaiting:
+            super()._next()
+
+    def _dispatch_to(self, placement_id: str) -> None:
+        if self.request.request_id not in self.stale:
+            super()._dispatch_to(placement_id)
+            return
+        current, self.placements = self.placements, [self.previous]
+        try:
+            super()._dispatch_to(placement_id)
+        finally:
+            self.placements = current
+
+    def _on_observed_state(self, report: pb.ObservedWorkerState) -> None:
+        status = next((row for row in report.placements if row.placement_id == "plc-p"), None)
+        if status is not None and self.dispatched:
+            self.seen.append(
+                (
+                    report.converged_revision,
+                    report.admission_state,
+                    report.admission_epoch,
+                    sorted(status.dispatchable_binding_digests),
+                    sorted(status.loaded_binding_digests),
+                )
+            )
+        if self.awaiting and report.converged_revision >= self.awaiting:
+            self.reports.append(report)
+            self.admission_epoch = report.admission_epoch
+            self.awaiting = 0
+            if self.current is None and self.pending:
+                self._next()
+            return
+        super()._on_observed_state(report)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TwinStore:
+    """One store holding two tenant manifests: two constructions of `touch`."""
+
+    root: Path
+    first: TenantStore
+
+
+@pytest.fixture(scope="module")
+def twin(tmp_path_factory: pytest.TempPathFactory) -> TwinStore:
+    if NO_TENANT:
+        pytest.skip(NO_TENANT)
+    base = tmp_path_factory.mktemp("twin")
+    first = write_tenant_store(base, blocks=2, scale=4, twins=("tenant2",))
+    return TwinStore(root=first.root, first=first)
+
+
+GROWTH_OVERRIDES: list[dict[str, str]] = [
+    {},
+    {"retouch.models.model": "cozytest/tenant2@1"},
+    {"retouch.models.model": "cozytest/tenant2@1", "touch.models.model": "cozytest/tenant2@1"},
+]
+
+
+def _growth_revisions(
+    twin: TwinStore, config: RuntimeConfig, workspace: Path
+) -> tuple[list[pb.Placement], Any]:
+    """rev 1: both entrypoints over `tenant`; rev 2: `retouch` over `tenant2`; rev 3:
+    both over `tenant2`, which leaves the first construction unreferenced."""
+    found = discover(PACKAGE)
+    body = package_interface.build(found)
+    placements, first = [], None
+    for index, override in enumerate(GROWTH_OVERRIDES):
+        staged = stage_development_placement(
+            config.cozy_home,
+            body,
+            package="local/development-package",
+            release="0.0.0",
+            source_digest=development_source_digest(PACKAGE),
+            artifact_cache=workspace / "artifact-cache",
+            tensorfs_root=twin.root,
+            project=PACKAGE,
+            binding_overrides=override,
+        )
+        first = first or staged
+        placement = pb.Placement()
+        placement.CopyFrom(staged.placement)
+        placement.placement_id = "plc-p"
+        placements.append(placement)
+        assert index == 0 or placement.bindings_digest != placements[index - 1].bindings_digest
+    return placements, first
+
+
+@needs_tenant
+def test_a_growing_placement_keeps_its_process_and_its_admission(twin: TwinStore) -> None:
+    """proto-061 D2. One placement grows a second construction and then drops the first.
+
+    The executor is the same process throughout (one pid, epoch 1), admission never closes
+    and its epoch never moves, an offer queued under the superseded document is still
+    accepted for the binding whose construction did not change, the new construction is
+    DISPATCHABLE before it is loaded and LOADED after its first attempt, and the
+    construction nothing references any more is unloaded."""
+    with _workspace() as root:
+        config = _config(root / "home")
+        workspace = root / "run"
+        workspace.mkdir(parents=True)
+        revisions, staged = _growth_revisions(twin, config, workspace)
+        digests = {b.entrypoint: digest for digest, b in staged.declared_bindings.items()}
+        touch, retouch = documents.raw(digests["touch"]), documents.raw(digests["retouch"])
+        holder: list[Worker] = []
+
+        def request(entrypoint: str, request_id: str, seed: int) -> LocalRequest:
+            return LocalRequest(
+                entrypoint=entrypoint, payload={"seed": seed}, outputs=(), request_id=request_id
+            )
+
+        turns = [
+            Turn("plc-p", request("touch", "t-1", 1)),
+            Turn("plc-p", request("touch", "t-stale", 2)),
+            Turn("plc-p", request("retouch", "r-1", 3)),
+            Turn("plc-p", request("retouch", "r-2", 4)),
+        ]
+        owner = GrowingOwner(
+            turns,
+            dict(staged.bindings),
+            workspace,
+            package_code_digest=documents.spell(staged.placement.development.source_digest),
+            worker=lambda: holder[0],
+            revisions=revisions,
+            overrides=GROWTH_OVERRIDES,
+            stale={"t-stale"},
+        )
+        turns[0].after = owner.advance
+        turns[2].after = owner.advance
+        options = WorkerOptions(
+            root=workspace / "worker",
+            devices=DEVICE,
+            instance_id="ins-growth",
+            tensorfs_root=staged.tensorfs_root,
+            artifact_cache=staged.artifact_cache,
+            development_project=PACKAGE,
+            development_package=staged.placement.development.package,
+            development_release=staged.placement.development.release,
+            development_source_digest=documents.spell(staged.placement.development.source_digest),
+        )
+        worker = Worker(config, options, owner.host)
+        holder.append(worker)
+        notes: list[tuple[str, str]] = []
+        narrate = worker.note
+
+        def note(kind: str, step: str) -> None:
+            notes.append((kind, step))
+            narrate(kind, step)
+
+        worker.note = note  # type: ignore[method-assign]
+        worker.watches.tap = owner.tap_progress
+        owner.watch(worker)
+        with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):
+            worker.run()
+    steps = [step for _kind, step in notes]
+    assert owner.ended == "terminal", (owner.ended, owner.error, owner.refusals, steps[-20:])
+    assert [turn.outcome["status"] for turn in owner.turns] == [1, 1, 1, 1], [
+        (turn.request.request_id, turn.outcome.get("cause"), turn.outcome.get("safe_message"))
+        for turn in owner.turns
+    ]
+    assert not owner.refusals, owner.refusals
+    # ONE PROCESS: one pid, epoch 1, never replaced, never drained.
+    pids = {row["executor_pid"] for turn in owner.turns for row in turn.rows.values()}
+    assert len(pids) == 1, pids
+    assert {row["executor_epoch"] for turn in owner.turns for row in turn.rows.values()} == {1}
+    assert not [s for s in steps if "replacing the device executor" in s or "draining" in s]
+    assert len([s for s in steps if "updated 'plc-p' IN PLACE" in s]) == 2, steps
+    # ADMISSION STAYS OPEN and its epoch does not move once dispatch began.
+    assert {state for _rev, state, *_ in owner.seen} == {pb.AdmissionState.ADMISSION_STATE_OPEN}
+    assert len({epoch for _rev, _state, epoch, *_ in owner.seen}) == 1, owner.seen
+    # THE STALE OFFER was admitted under the superseded bindings digest.
+    stale = owner.turns[1]
+    assert stale.request.request_id == "t-stale" and stale.outcome["status"] == 1
+    # LOADED DIGESTS: rev 1 serves both entrypoints from one construction; rev 2 keeps
+    # `touch` loaded and makes `retouch` dispatchable-not-loaded until r-1 loads it.
+    by_revision: dict[int, list[tuple[list[bytes], list[bytes]]]] = {}
+    for rev, _state, _epoch, dispatchable, loaded in owner.seen:
+        by_revision.setdefault(rev, []).append((dispatchable, loaded))
+    assert any(sorted(loaded) == sorted([touch, retouch]) for _d, loaded in by_revision[1])
+    rev2 = by_revision[2]
+    assert any(
+        sorted(dispatchable) == sorted([touch, retouch]) and loaded == [touch]
+        for dispatchable, loaded in rev2
+    ), rev2
+    assert any(sorted(loaded) == sorted([touch, retouch]) for _d, loaded in rev2), rev2
+    # TWO LOADS, ONE UNLOAD: the first construction leaves once rev 3 references it no more.
+    loads = [s for s in steps if re.search(r"construction \w{12} loaded in", s)]
+    assert len(loads) == 2, loads
+    unloads = [s for s in steps if re.search(r"construction \w{12} unloaded \(freed \d+ B\)", s)]
+    assert len(unloads) == 1, [s for s in steps if "unload" in s]
+    first_key = loads[0].split("construction ", 1)[1][:12]
+    assert first_key in unloads[0], (loads, unloads)

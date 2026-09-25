@@ -30,7 +30,7 @@ from cozy_runtime.internal.executor import main as executor_main
 from cozy_runtime.internal.local import development_source_digest, stage_development_placement
 from cozy_runtime.internal.parallel import group as group_module
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, listener
-from cozy_runtime.internal.worker.session import executor_prepare_command
+from cozy_runtime.internal.worker.session import executor_load_command
 
 TESTDATA = Path(__file__).parent
 DUAL = TESTDATA / "dual_model_package"
@@ -131,13 +131,13 @@ class Driver:
 def _load_command(
     binding: Any, key: str, degree: int, backend: str, authorized: int
 ) -> dict[str, Any]:
-    command = executor_prepare_command(
+    command = executor_load_command(
         binding,
+        construction=key,
         devices=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         sequence_parallel_degree=degree,
         authorized_device_limit_bytes=authorized,
     )
-    command.update(cmd="load", construction=key)
     rows = command.get("models") or [command]
     for row in rows:
         row["binding"].update(window_bytes=4 * MIB, slots=4, readers=2, inflight=2)

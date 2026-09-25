@@ -46,7 +46,7 @@ from cozy_runtime.internal.worker.session import (
     Placement,
     Worker,
     WorkerOptions,
-    executor_prepare_command,
+    executor_load_command,
 )
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
@@ -301,14 +301,10 @@ def test_an_executor_is_sealed_to_exactly_its_lane() -> None:
         try:
             assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "1"
             weightless = {
-                "cmd": "prepare",
-                "binding": {
-                    "application": str(body["application"]),
-                    "package_interface": str(interface),
-                    "development_project": str(PACKAGE),
-                    "model_class": "",
-                },
-                "budgets": {},
+                "cmd": "start",
+                "application": str(body["application"]),
+                "package_interface": str(interface),
+                "development_project": str(PACKAGE),
             }
             refused = executor.call(
                 {**weightless, "devices": worker.lanes.lanes[0].devices}, timeout=60.0
@@ -353,18 +349,30 @@ def test_ceilings_are_measured_and_never_double_booked() -> None:
     assert abs(real.free_bytes - free_mib * (1 << 20)) < (1 << 20), (real, projected)
     assert real.total_bytes == total_mib * (1 << 20), (real, projected)
 
-    lane = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
-    first = lane.authorize("a", real.free_bytes)
-    assert first == real.free_bytes
-    second = lane.authorize("b", real.free_bytes)
-    assert second == 0, "the second executor was handed headroom the first still holds"
-    assert lane.rows["a"].ledger.authorized_device_limit_bytes == first
-    lane.settle("a")
-    assert lane.authorize("b", real.free_bytes) == real.free_bytes
+    # THE PROCESS CEILING: the lane's measured capacity less what its co-tenants hold, so a
+    # second executor on the card is never handed the bytes the first one holds.
+    with _workspace() as root:
+        worker = Worker(
+            _config(root / "home"),
+            WorkerOptions(root=root / "worker", devices="0"),
+            InMemoryControlHost(),
+        )
+        try:
+            lane = worker.lanes.lanes[0]
+            alone = worker._process_ceiling(lane, "a")
+            assert real.total_bytes - (1 << 20) <= alone <= real.total_bytes, (alone, real)
+            neighbour = lane.row("b")
+            neighbour.model_bearing = True
+            neighbour.ledger.resident = {"unet": 3 << 30}
+            beside = worker._process_ceiling(lane, "a")
+            assert beside == alone - (3 << 30), (beside, alone)
+            assert lane.rows["a"].ledger.authorized_device_limit_bytes == beside
+        finally:
+            worker.supervision.close()
 
 
-def test_a_prepare_without_an_assigned_ceiling_is_a_worker_defect() -> None:
-    """The executor's self-derived ceiling path is DELETED, not defaulted: the prepare
+def test_a_load_without_an_assigned_ceiling_is_a_worker_defect() -> None:
+    """The executor's self-derived ceiling path is DELETED, not defaulted: the load
     command always carries the assignment, and the seal it must match."""
     from cozy_runtime.internal.worker.plan import DeclaredBinding
 
@@ -378,8 +386,10 @@ def test_a_prepare_without_an_assigned_ceiling_is_a_worker_defect() -> None:
         application="marco_polo_package:app",
         interface_path="/nowhere",
     )
-    command = executor_prepare_command(binding, devices="1", authorized_device_limit_bytes=7)
-    assert command["devices"] == "1"
+    command = executor_load_command(
+        binding, construction="sha256:" + "1" * 64, devices="1", authorized_device_limit_bytes=7
+    )
+    assert command["devices"] == "1" and command["cmd"] == "load"
     assert command["authorized_device_limit_bytes"] == 7
 
 
@@ -428,10 +438,6 @@ def test_placements_are_assigned_by_measured_fit_or_refused_typed() -> None:
         "huge", model_bearing=True, declared_bytes=32 << 30, measured=measured, pin=(1,)
     )
     assert huge.lane_id == "lane-1"
-    assert huge.outstanding_bytes() == 0
-    granted = huge.authorize("huge", measured[1].free_bytes)
-    assert granted == 16 << 30
-    huge.settle("huge")
     with pytest.raises(lanes.LaneRefusal) as refused:
         lanes_.assign(
             "blind", model_bearing=True, declared_bytes=1 << 20, measured=measured, pin=(2,)
