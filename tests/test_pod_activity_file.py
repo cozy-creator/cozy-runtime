@@ -117,8 +117,11 @@ def test_the_published_document_is_the_shape_the_supervisor_parses() -> None:
             WorkerOptions(root=root / "worker", activity_path=root / "activity"),
             InMemoryControlHost(),
         )
-        worker.publish_activity()
-        published = json.loads((root / "activity").read_bytes())
+        try:
+            worker.publish_activity()
+            published = json.loads((root / "activity").read_bytes())
+        finally:
+            worker.shutdown()
     fixture = json.loads(FIXTURE.read_bytes())
     assert sorted(published) == sorted(fixture), (sorted(published), sorted(fixture))
     for key, sample in fixture.items():
@@ -178,7 +181,7 @@ def test_active_work_excludes_connected_owners_and_retained_outcomes() -> None:
                 assert activity.active_work(worker)
             assert not activity.active_work(worker)
         finally:
-            worker.supervision.close()
+            worker.shutdown()
 
 
 def test_model_warmup_is_active_but_a_resident_model_is_idle() -> None:
@@ -212,7 +215,7 @@ def test_model_warmup_is_active_but_a_resident_model_is_idle() -> None:
             placement.serving = pb.SERVING_STATE_DISPATCHABLE
             assert not activity.active_work(worker)
         finally:
-            worker.supervision.close()
+            worker.shutdown()
 
 
 def test_running_parent_is_active_but_paused_and_completed_roots_are_not() -> None:
@@ -268,7 +271,7 @@ def test_running_parent_is_active_but_paused_and_completed_roots_are_not() -> No
             assert executions.retention_required("owner")  # uncollected output
             assert not activity.active_work(worker)
         finally:
-            worker.supervision.close()
+            worker.shutdown()
 
 
 def test_an_unreadable_meter_is_absent_and_never_a_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -287,13 +290,17 @@ def test_an_unreadable_meter_is_absent_and_never_a_zero(monkeypatch: pytest.Monk
             WorkerOptions(root=root / "worker"),
             InMemoryControlHost(),
         )
-        assert activity.meter(worker) is not None
+        try:
+            assert activity.meter(worker) is not None
 
-        def refuse(_path: str) -> list[str]:
-            raise PermissionError(13, "Permission denied")
+            def refuse(_path: str) -> list[str]:
+                raise PermissionError(13, "Permission denied")
 
-        monkeypatch.setattr(os, "listdir", refuse)
-        assert activity.meter(worker) is None
+            with monkeypatch.context() as patches:
+                patches.setattr(os, "listdir", refuse)
+                assert activity.meter(worker) is None
+        finally:
+            worker.shutdown()
 
 
 # ------------------------------------------------------- the file, over a real run
