@@ -1901,27 +1901,14 @@ class Worker:
             if not local:
                 assert isinstance(request, pb.PreparePackageSetRequest)
                 return self._prepare_published(request)
-            # Preparation never borrows execution authority. Even an apparently
-            # idle primary slot can be admitted by a concurrent desired-state
-            # transition while describe is importing the new package.
-            supervision = self._new_preparation_supervision()
-            try:
-                assert isinstance(request, pb.PrepareLocalPackageRequest)
-                return self._prepare_local_in(request, supervision)
-            finally:
-                executor = supervision.current
-                if executor is not None:
-                    try:
-                        supervision.retire_current(executor, "package preparation finished")
-                    except ExecutorGone as exc:
-                        self.note("recovery", f"preparation executor reclaim failed: {exc}")
-                supervision.close()
+            assert isinstance(request, pb.PrepareLocalPackageRequest)
+            return self._prepare_local_in(request)
 
     def _new_preparation_supervision(self) -> ExecutorSupervision:
-        """The preparation-scoped executor slot for a LOCAL revision's describe. Package
+        """The preparation-scoped executor slot for an installed package's describe. Package
         describe needs an isolated executor (package code never gets worker authority), and
         borrowing the primary slot while placements serve would replace a serving executor
-        with the prepared package's environment. Published sets carry their interface."""
+        with the prepared package's environment. Modern published sets carry their interface."""
 
         # Keep preparation's socket shorter than the boot-validated primary
         # socket, independent of placement and operation identifiers. Its state
@@ -1945,24 +1932,18 @@ class Worker:
             self.note("recovery", f"preparation: reclaimed {len(killed)} prior executor(s)")
         return supervision
 
-    def _prepare_local_in(
-        self, request: pb.PrepareLocalPackageRequest, supervision: ExecutorSupervision
-    ) -> pb.PreparePackageSetResult:
-        from cozy_runtime.internal.worker import local_installations, package_prepare
+    def _describe_installed(
+        self, installed: package_environment.InstalledEnvironment, distribution: str
+    ) -> bytes:
+        """Import package code only inside a dedicated preparation executor."""
+        from cozy_runtime.internal.worker import package_prepare
 
-        def describe(
-            installed: package_environment.InstalledEnvironment, distribution: str
-        ) -> bytes:
-            changed = supervision.use_environment(str(installed.python), installed.content_digest)
-            executor = supervision.current
+        supervision = self._new_preparation_supervision()
+        try:
+            supervision.use_environment(str(installed.python), installed.content_digest)
             lane = self._primary_lane()
             try:
-                if executor is None:
-                    executor = supervision.spawn(imposed=self.imposed(lane))
-                elif changed or not executor.alive():
-                    executor = supervision.replace(
-                        executor, imposed=self.imposed(lane), why="prepared package changed"
-                    )
+                executor = supervision.spawn(imposed=self.imposed(lane))
                 output = supervision.handoff(executor.epoch, INTERFACE_DOCUMENT)
                 # A cold import, torch included: bound by the executor's own measured
                 # work and its death, never by a number of seconds (xs-007 row 8).
@@ -2011,6 +1992,13 @@ class Worker:
                     f"length {reply.get('length')!r} vs {len(raw)}",
                 )
             return raw
+        finally:
+            supervision.close()
+
+    def _prepare_local_in(
+        self, request: pb.PrepareLocalPackageRequest
+    ) -> pb.PreparePackageSetResult:
+        from cozy_runtime.internal.worker import local_installations, package_prepare
 
         def mark_verified(digest: str, length: int, path: Path) -> None:
             self.verified_artifacts.record(digest, length, path)
@@ -2024,7 +2012,7 @@ class Worker:
             artifact_cache=Path(self.options.artifact_cache or ""),
             install_root=Path(self.options.install_root or ""),
             python=Path(self.options.python or sys.executable),
-            describe=describe,
+            describe=self._describe_installed,
             verified=mark_verified,
             job_plan_root=self.config.cozy_home / "job-plans",
             base=self.base,
@@ -2041,8 +2029,7 @@ class Worker:
     def _prepare_published(
         self, request: pb.PreparePackageSetRequest
     ) -> pb.PreparePackageSetResult:
-        """Install the release's locked environment and bind models from its wire interface;
-        no executor is spawned (proto-061 C)."""
+        """Bind the release interface; pre-61 callers describe only on an install cache miss."""
 
         from cozy_runtime.internal.worker import package_prepare
 
@@ -2052,6 +2039,7 @@ class Worker:
         published: list[package_environment.InstalledEnvironment] = []
         result = package_prepare.prepare_package_set(
             request,
+            describe=self._describe_installed,
             python_root=self.config.managed_python_root,
             cancel=self.stop.is_set,
             progress=lambda message: self.note("python", message),

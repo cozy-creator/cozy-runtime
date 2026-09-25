@@ -337,10 +337,6 @@ def test_pod_prep_requires_the_request_facts(tmp_path: Path) -> None:
         )
     assert no_pin.value.code == "package_prepare_project_pin_missing"
 
-    with pytest.raises(PreparationRefusal) as no_interface:
-        prep(interface=b"")
-    assert no_interface.value.code == "package_prepare_interface_missing"
-
 
 class _SimpleIndex:
     """A real PEP 503 index over the exact wheels the test built, served on loopback."""
@@ -503,9 +499,9 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
             # The staged interface IS the wire document, byte for byte.
             staged = root / "artifacts" / placement["package_interface"]["digest"][7:]
             assert staged.read_bytes() == interface
-            # proto-061 C: the metadata-only compatibility RPC no longer exists.
-            assert not hasattr(pb_grpc.RuntimePreparationServicer, "CheckPackageSetCompatibility")
-            assert not hasattr(pb, "CheckPackageSetCompatibilityResult")
+            # Minor 60 callers still have this pre-check while the 60-61 window is supported.
+            assert hasattr(pb_grpc.RuntimePreparationServicer, "CheckPackageSetCompatibility")
+            assert hasattr(pb, "CheckPackageSetCompatibilityResult")
 
             # A local controller can run a different CPython than the release.
             # Its preinstalled SDK must never supply this published wheel closure.
