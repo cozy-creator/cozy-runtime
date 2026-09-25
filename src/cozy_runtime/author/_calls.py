@@ -76,6 +76,10 @@ def invocable[**P, R](
     Calling this exported name always reserves a managed call. App registration keeps
     the implementation privately for ordinary admitted dispatch; importing a module
     never registers it or resolves a package/environment.
+
+    At the call site, a Model parameter takes a retained ModelArtifact from conversion
+    or derivation. The injected Model object itself belongs to its current attempt;
+    it is not a portable artifact receipt and cannot be forwarded to another call.
     """
     if type(memoize) is not bool:
         raise ConformanceError(
@@ -223,6 +227,15 @@ class _Broker:
         try:
 
             def asset_value(value: object) -> object:
+                from cozy_runtime.author._model import Model
+
+                if isinstance(value, Model):
+                    raise CapabilityError(
+                        "managed model calls require a retained ModelArtifact from conversion "
+                        "or derivation; an injected Model belongs to this attempt. Retain it "
+                        "with a zero-byte TensorFS derivation before passing it to a child",
+                        code="child.model_artifact_required",
+                    )
                 if isinstance(value, Assets):
                     return [
                         {"asset": item, "label": item.label, "fidelity": item.fidelity}

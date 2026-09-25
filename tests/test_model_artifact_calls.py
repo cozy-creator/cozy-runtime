@@ -15,6 +15,7 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import (
     App,
+    CapabilityError,
     Context,
     Invocation,
     Loader,
@@ -26,7 +27,9 @@ from cozy_runtime.author import (
     describe,
     invocable,
 )
+from cozy_runtime.author._calls import _Broker, _CallType
 from cozy_runtime.author._model import _derive_model
+from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.cli import describe as describe_cli
 from cozy_runtime.cli.io import Options
 from cozy_runtime.internal import interface_wheel, package_interface
@@ -58,6 +61,30 @@ async def consume(ctx: Context, *, source: Source) -> Result:
 @invocable(memoize=True)
 async def echo(ctx: Context, *, value: ModelArtifact) -> ModelArtifact:
     return value
+
+
+def test_injected_model_refuses_as_model_before_reserving_a_child() -> None:
+    app = App()
+    app.job(consume)
+    surface = describe(app)[0]
+    key = ("sha256:" + "21" * 32, __name__, "consume")
+    exchanges = []
+    broker = _Broker(
+        "parent",
+        {key: _CallType(*key, surface.payload_type, surface.result_type)},
+        lambda *args: exchanges.append(args),
+    )
+    broker.bind(fake_context(request_id="parent"))
+    with pytest.raises(CapabilityError, match="retained ModelArtifact") as error:
+        broker.reserve(*key, {"source": Source.for_test()})
+    assert error.value.code == "child.model_artifact_required"
+    assert not broker.calls and broker.next_index == 0 and not exchanges
+
+    artifact = ModelArtifact(
+        "producer", "result", ObjectRef("sha256:" + "17" * 32, 512), "sha256:" + "18" * 32
+    )
+    call = broker.reserve(*key, {"source": artifact})
+    assert call.index == 0 and json.loads(call.payload)["source"] == msgspec.to_builtins(artifact)
 
 
 @invocable(memoize=True)
