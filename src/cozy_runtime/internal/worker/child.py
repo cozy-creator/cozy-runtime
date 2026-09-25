@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.internal import accel, jit_cache, liveness, proctree, spawn
 from cozy_runtime.internal.child_env import (
     EXECUTOR_SCOPE_ENV,
@@ -101,6 +102,22 @@ class ExecutorGone(Exception):
         super().__init__(detail)
         self.detail = detail
         self.status = status
+
+
+class ExecutorRuntimeMismatch(ExecutorGone):
+    """The executor imported another cozy-runtime than this worker's: their private
+    command protocol is not versioned, so the spawn is refused before any command."""
+
+    code = "executor_runtime_mismatch"
+
+
+def require_same_runtime(hello: dict[str, Any]) -> None:
+    executor = hello.get("runtime_version") or "unknown (its hello predates the handshake)"
+    if executor != RUNTIME_VERSION:
+        raise ExecutorRuntimeMismatch(
+            f"executor_runtime_mismatch: the executor at {hello.get('python_executable')} runs "
+            f"cozy-runtime {executor}; this worker runs {RUNTIME_VERSION}"
+        )
 
 
 @dataclass(slots=True)
@@ -898,6 +915,7 @@ class ExecutorSupervision:
                     f"{spawned.seal_digest}; received pid {executor.hello.get('pid')}, "
                     f"parent {executor.hello.get('ppid')}"
                 )
+            require_same_runtime(executor.hello)
             executor.ready_at = time.perf_counter()
             exit_published = self._start_exit_watcher(executor)
             self.current = executor

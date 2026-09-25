@@ -38,6 +38,20 @@ class DependencyConflict(EnvironmentRefusal):
         )
 
 
+class WorkerSdkOutOfRange(DependencyConflict):
+    """The package's declared range excludes the worker's own SDK, which it must run on."""
+
+    def __init__(self, package: str, requirement: Requirement, worker: str, locked: str) -> None:
+        super().__init__(package, requirement, worker)
+        self.code = "package_environment_worker_sdk_out_of_range"
+        self.detail = (
+            f"{package} requires {requirement}, but this worker runs "
+            f"{requirement.name} {worker} (the release lock pinned {locked}); "
+            "use a worker image whose SDK satisfies the package, or republish the package"
+        )
+        self.args = (f"{self.code}: {self.detail}",)
+
+
 @dataclass(frozen=True)
 class _Distribution:
     version: str
