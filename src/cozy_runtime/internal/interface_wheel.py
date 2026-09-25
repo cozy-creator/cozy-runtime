@@ -18,7 +18,7 @@ from packaging.version import Version
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import canonical, invocable_interface, package_interface
 
-GENERATOR_ABI = "cozy.interface-generator/7"
+GENERATOR_ABI = "cozy.interface-generator/8"
 MAX_IMPLEMENTATION_WHEEL = 256 << 20
 _DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 

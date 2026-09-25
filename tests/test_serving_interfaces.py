@@ -474,3 +474,102 @@ assert "generate" in lib.__cozy_bindings__
     companion.write_bytes(companion.read_bytes() + b"# changed\n")
     with pytest.raises(ConformanceError, match="trusted generator"):
         read(installed)
+
+
+def test_one_published_wheel_keeps_direct_serving_and_imported_callers(tmp_path: Path) -> None:
+    """Publication seals this wheel once; both execution roles consume its same bytes."""
+    source = """import msgspec
+from cozy_runtime.author import App, Context
+app = App()
+FACTOR = 3
+class Request(msgspec.Struct):
+    value: int
+class Result(msgspec.Struct):
+    value: int
+def helper(value):
+    return value * FACTOR
+@app.entrypoint
+def generate(ctx: Context, payload: Request) -> Result:
+    return Result(helper(payload.value))
+@app.entrypoint(internal=True)
+def secret(ctx: Context, payload: Request) -> Result:
+    return Result(payload.value + 100)
+"""
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "pyproject.toml").write_text('[project]\nname="dual-fixture"\nversion="0.1.0"\n')
+    (root / "package.toml").write_text('[application]\nobject="dual_fixture:app"\n')
+    (root / "dual_fixture.py").write_text(source)
+    raw = package_interface.canonical_bytes(static_interface.build(root))
+    original = io.BytesIO()
+    with zipfile.ZipFile(original, "w") as archive:
+        archive.writestr("dual_fixture.py", source)
+        archive.writestr(
+            "dual_fixture-0.1.0.dist-info/METADATA",
+            "Metadata-Version: 2.4\nName: dual-fixture\nVersion: 0.1.0\n",
+        )
+        archive.writestr(
+            "dual_fixture-0.1.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    import hashlib
+
+    source_digest = "sha256:" + hashlib.sha256(original.getvalue()).hexdigest()
+    _, wheel = interface_wheel.build(
+        raw,
+        distribution="dual-fixture",
+        version="0.1.0",
+        implementation_digest=source_digest,
+        implementation_wheel=original.getvalue(),
+    )
+    with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+        archive.extractall(tmp_path / "sealed")
+    from cozy_runtime.internal.installed_interfaces import read
+    from cozy_runtime.internal.package_environment import InstalledEnvironment
+
+    installed = InstalledEnvironment(
+        tmp_path, tmp_path / "sealed", Path(sys.executable), b"", "", "sha256:" + "22" * 32, True
+    )
+    inventory = read(installed)
+    assert [(row["export"], row["implementation_digest"]) for row in inventory] == [
+        ("generate", source_digest)
+    ]
+    check = """import asyncio, json, sys
+sys.path.insert(0,sys.argv[1])
+import dual_fixture as lib
+from cozy_runtime.author import PendingCall
+from cozy_runtime.author._calls import _Broker, _current
+from cozy_runtime.author.fakes import fake_context
+ctx = fake_context()
+assert lib.helper(4) == 12
+raw = lib.app.get("generate").fn(ctx, lib.Request(7))
+assert isinstance(raw, lib.Result) and raw.value == 21
+assert lib.app.get("secret").fn(ctx, lib.Request(7)).value == 107
+assert "secret" not in lib.__cozy_bindings__
+binding=lib.__cozy_bindings__["generate"]
+sent=[]
+def exchange(kind,body):
+    if kind=="child_call":
+        sent.append(json.loads(body["payload"]))
+        return {"ok":True,"child_request_id":"child"}
+    return {"ok":True,"state":"succeeded","result":'{"value":21}'}
+broker=_Broker(ctx.request_id,{(binding.interface_digest,binding.module,binding.export):binding},exchange)
+broker.bind(ctx)
+token=_current.set(broker)
+async def run():
+    pending=lib.generate(value=7)
+    assert isinstance(pending,PendingCall)
+    result=await pending
+    assert result.value==21
+try: asyncio.run(run()); broker.finish()
+finally: _current.reset(token)
+assert len(sent)==1 and sent[0]["payload"]=={"value":7}
+# Calling through the registry still runs the body, not the proxy, after imported use.
+assert lib.app.get("generate").fn(ctx, lib.Request(8)).value==24
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", check, str(tmp_path / "sealed")],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
