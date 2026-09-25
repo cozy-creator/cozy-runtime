@@ -2347,6 +2347,15 @@ class Worker:
                         pb.CAUSE_CODE_EXECUTOR_FAULT,
                     )
                     continue
+                # Desired-state replacement can still expose an older warm placement
+                # while the selected package is materializing or its executor starts.
+                # Capacity on that old placement is not readiness for this exact offer.
+                # Keep the durable child queued; explicit preparation faults above still
+                # fail immediately, and malformed offers were already validated.
+                if "serving" in attempt.spec and not self._placement_dispatchable(
+                    attempt.placement_id
+                ):
+                    continue
                 lane = self._offer_lane(offered.placement_id, attempt)
                 if self._lane_slots(lane, machine_owned=True) < 1:
                     continue

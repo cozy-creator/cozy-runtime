@@ -128,7 +128,15 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
         prepared,
         binding,
         "sha256:" + hashlib.sha256(identity).hexdigest(),
-        binding is None and selected["caller_revision_digest"] != revision,
+        binding is None
+        and (
+            selected["caller_revision_digest"] != revision
+            or any(
+                (row["interface_digest"], row["module"], row["export"])
+                == (intent["interface_digest"], intent["module"], intent["export"])
+                for row in parent.job.call_interfaces
+            )
+        ),
     )
 
 

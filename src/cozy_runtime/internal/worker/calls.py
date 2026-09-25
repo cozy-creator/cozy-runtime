@@ -81,7 +81,13 @@ class Calls:
         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
         for entry in [*interface["jobs"], *interface["entrypoints"]]:
             declaration = entry.get("invocable")
-            if declaration is not None:
+            if declaration is not None and not any(
+                (row["interface_digest"], row["module"], row["export"])
+                == (digest, declaration["module"], declaration["export"])
+                for row in attempt.job.call_interfaces
+            ):
+                # Published SDK wheels already carry their exact generated request
+                # convention. Do not replace that binding with a raw self-call shape.
                 result.append(
                     {
                         "interface_digest": digest,
