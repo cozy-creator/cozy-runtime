@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import struct
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypedDict
@@ -153,15 +154,26 @@ def test_loader_consumes_verified_header_assets(tmp_path: Path) -> None:
         owner=Owner(),
     )
     capability = loader.assets
-    with loading(loader):
-        assert capability.names() == ("tokenizer/vocab.txt",)
-        assert capability.read("tokenizer/vocab.txt") == _ASSET
-        assert capability.open("tokenizer/vocab.txt").read() == _ASSET
-        with capability.materialized("tokenizer") as tokenizer:
-            vocab = tokenizer / "vocab.txt"
-            assert vocab.read_bytes() == _ASSET
-            assert vocab.stat().st_mode & 0o222 == 0
-        assert not tokenizer.exists()
+    writes: list[str] = []
+
+    def record(event: str, args: tuple[Any, ...]) -> None:
+        if watching and event == "open" and any(c in str(args[1] or "r") for c in "wxa+"):
+            writes.append(str(args[0]))
+        elif watching and event in {"os.mkdir", "os.rename", "os.remove", "shutil.rmtree"}:
+            writes.append(f"{event}{args[:1]}")
+
+    watching = False
+    sys.addaudithook(record)
+    watching = True
+    try:
+        with loading(loader):
+            assert capability.names() == ("tokenizer/vocab.txt",)
+            assert capability.read("tokenizer/vocab.txt") == _ASSET
+            assert capability.open("tokenizer/vocab.txt").read() == _ASSET
+    finally:
+        watching = False
+    assert writes == []  # Serving load reads asset bytes; it writes no file.
+    assert not hasattr(capability, "materialized")
     with pytest.raises(CapabilityError, match="outside load/unload"):
         capability.read("tokenizer/vocab.txt")
 
