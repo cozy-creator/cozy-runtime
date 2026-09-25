@@ -98,6 +98,4 @@ async def ingest_huggingface(repository: str, *, revision: str) -> ModelArtifact
     # The managed caller accepts a receipt; the execution signature deliberately
     # declares the Model that Runtime injects from that receipt at admission.
     prepare = cast(Callable[..., Awaitable[ModelArtifact]], prepare_model)
-    return await prepare(
-        source=model, metadata=await source_files(metadata), recipe=recipe.name
-    )
+    return await prepare(source=model, metadata=await source_files(metadata), recipe=recipe.name)
