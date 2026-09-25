@@ -7,6 +7,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("diffusers")
 pytest.importorskip("transformers")
+pytest.importorskip("tokenizers")
 
 
 def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Path) -> None:
