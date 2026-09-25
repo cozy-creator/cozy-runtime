@@ -138,9 +138,7 @@ def _observe(workspace: Workspace, db: Journal, row: Any, observed: dict[str, An
 
 
 def _recover(workspace: Workspace, db: Journal, row: Any) -> Any:
-    observed = db.native(
-        lambda: fill.tensorfs_module().Store.open(str(workspace.store_root)).tree_root(row["id"])
-    )
+    observed = db.native(lambda: fill.store(workspace.store_root).tree_root(row["id"]))
     if observed is not None:
         row = _observe(workspace, db, row, dict(observed))
     return row
@@ -188,13 +186,7 @@ def _abort(workspace: Workspace, db: Journal, row: Any) -> pb.NativeByteRetentio
                 release=True,
                 kind="tree",
             )
-        db.native(
-            lambda: (
-                fill.tensorfs_module()
-                .Store.open(str(workspace.store_root))
-                .release_tree_root(row["id"])
-            )
-        )
+        db.native(lambda: fill.store(workspace.store_root).release_tree_root(row["id"]))
     db.execute("UPDATE input_tree_intakes SET state='released' WHERE id=?", (row["id"],))
     return pb.NativeByteRetentionResult(
         source=source, retention_id=row["intake_hold"], released=True
@@ -211,9 +203,7 @@ def _finish(
         if not row["receipt"]:
             observed = db.native(
                 lambda: dict(
-                    fill.tensorfs_module()
-                    .Store.open(str(workspace.store_root))
-                    .import_tree(
+                    fill.store(workspace.store_root).import_tree(
                         identity, row["manifest_body"], [(name, str(path)) for name, path in files]
                     )
                 )
@@ -238,13 +228,7 @@ def _finish(
         row = _row(db, owner, identity)
         if row["state"] in ("aborting", "released"):
             return _abort(workspace, db, row)
-        db.native(
-            lambda: (
-                fill.tensorfs_module()
-                .Store.open(str(workspace.store_root))
-                .release_tree_root(identity)
-            )
-        )
+        db.native(lambda: fill.store(workspace.store_root).release_tree_root(identity))
         row = _row(db, owner, identity)
         if row["state"] in ("aborting", "released"):
             return _abort(workspace, db, row)

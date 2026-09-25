@@ -1322,7 +1322,7 @@ def _selected_models(
 
     try:
         tensorfs = fill.tensorfs_module()
-        store = fill.open_store(tensorfs, tensorfs_root)
+        store = fill.open_store(tensorfs_root)
         manifests: dict[str, tuple[int, bytes, bytes]] = {}
         for value in selected.values():
             selection = value["selection"]

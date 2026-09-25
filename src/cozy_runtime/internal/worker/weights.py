@@ -815,7 +815,7 @@ class WeightsExchange:
                 raise WeightsExchangeError(
                     "tensorfs_store_unavailable", "this worker has no verified TensorFS Store"
                 )
-            self.store = fill.open_store(fill.tensorfs_module(), self.store_root)
+            self.store = fill.open_store(self.store_root)
         return self.store
 
     def _writer_epoch(self, transaction_id: str) -> int:

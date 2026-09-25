@@ -143,7 +143,7 @@ class Workspace:
         if not store_root.is_absolute() or store_root == Path("/"):
             raise WorkspaceRefusal("workspace requires the configured absolute store root")
         self.store_root = store_root.resolve()
-        fill.tensorfs_module().Store.ensure(str(self.store_root))
+        fill.ensure_store(self.store_root)
         self.directory = self.store_root / ".cozy-workspace"
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.directory.is_symlink() or not self.directory.is_dir():
@@ -473,7 +473,7 @@ class Workspace:
             ):
                 raise WorkspaceRefusal("native model has no exact retained owner obligation")
 
-        store = fill.tensorfs_module().Store.open(str(self.store_root))
+        store = fill.store(self.store_root)
         lease = None
         try:
             with self.locked() as db:
@@ -825,11 +825,7 @@ class Workspace:
             ):
                 raise WorkspaceRefusal("receipt writer is stale or its previous receipt changed")
             observed = db.native(
-                lambda: (
-                    fill.tensorfs_module()
-                    .Store.open(str(self.store_root))
-                    .derived_lookup(frame.weights_transaction_id)
-                )
+                lambda: fill.store(self.store_root).derived_lookup(frame.weights_transaction_id)
             )
             if (
                 observed.get("state") != "committed"
@@ -992,7 +988,7 @@ class Workspace:
     def _validate_checkpoint(
         self, row: sqlite3.Row | Mapping[str, Any], checkpoint: pb.CheckpointRef
     ) -> None:
-        store = fill.tensorfs_module().Store.open(str(self.store_root))
+        store = fill.store(self.store_root)
         page = store.checkpoint_page(
             documents.spell(checkpoint.head.digest),
             checkpoint.head.length,

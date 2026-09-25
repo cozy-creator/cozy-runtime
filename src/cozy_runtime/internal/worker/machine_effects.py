@@ -235,7 +235,7 @@ class Effects:
             digest=documents.raw(artifact.manifest.digest), length=artifact.manifest.length
         )
         with self.workspace.held_model(owner, source, manifest):
-            store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+            store = fill.store(self.workspace.store_root)
             objects = {artifact.manifest.digest: artifact.manifest.length}
             for row in store.walk_cozytensors(artifact.manifest.digest):
                 key, length = str(row["id"]), int(row["length"])

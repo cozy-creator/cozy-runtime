@@ -536,8 +536,7 @@ class Acquirer:
         if not placement.models:
             return 0
         try:
-            tensorfs = fill.tensorfs_module()
-            store = fill.open_store(tensorfs, self.tensorfs_root)
+            store = fill.open_store(self.tensorfs_root)
             manifests = {_ref(model["manifest"], "model.manifest") for model in placement.models}
             for manifest_digest, manifest_length in sorted(manifests):
                 # TensorFS owns model materialization. A cache miss asks the owner to
@@ -574,7 +573,7 @@ class Acquirer:
         """The manifest's runtime-closure bytes from the model leg's one verified walk;
         listed (not verified) only when that leg did not run."""
         if digest not in self._manifest_bytes:
-            store = fill.open_store(fill.tensorfs_module(), self.tensorfs_root)
+            store = fill.open_store(self.tensorfs_root)
             self._manifest_bytes[digest] = sum(
                 int(row["length"]) for row in store.walk_cozytensors(digest)
             )

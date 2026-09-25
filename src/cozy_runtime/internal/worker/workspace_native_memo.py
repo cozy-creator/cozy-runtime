@@ -65,7 +65,7 @@ def change_native_hold(
     )
 
     def change() -> pb.DerivedRetentionResult:
-        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        store = fill.store(workspace.store_root)
         expected = documents.spell(request.tensorfs_receipt_digest)
         own = store.tree_root(request.retention_id)
         donor = None

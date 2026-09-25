@@ -511,6 +511,7 @@ def test_published_prepare_refuses_a_missing_or_disagreeing_interface(tmp_path: 
 def test_a_warm_prepare_and_acquire_walk_each_manifest_once(
     modeled: ModeledRelease, tmp_path: Path
 ) -> None:
+    cold = dict(tensorfs.stats())
     body = _prepare_modeled(modeled, tmp_path, (GENERATE, TURBO))
     before = dict(tensorfs.stats())
     body = _prepare_modeled(modeled, tmp_path, (GENERATE, TURBO))
@@ -531,3 +532,7 @@ def test_a_warm_prepare_and_acquire_walk_each_manifest_once(
     # A census hit takes no closure lease; acquisition walks the one distinct manifest once.
     assert prepared["presence_passes"] == before["presence_passes"]
     assert after["presence_passes"] - prepared["presence_passes"] == 1
+    # One catalog connection per process per root: at most the cold prepare opens it (an
+    # earlier test may already have), and the warm prepare and acquisition reuse it.
+    assert after["catalog_opens"] == before["catalog_opens"]
+    assert after["catalog_opens"] - cold["catalog_opens"] <= 1

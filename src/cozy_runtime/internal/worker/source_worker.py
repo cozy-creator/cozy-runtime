@@ -20,7 +20,7 @@ MAX_COMMAND = 2 << 20
 
 
 def execute(command: dict[str, Any]) -> dict[str, Any]:
-    store = fill.tensorfs_module().Store.open(command["store"])
+    store = fill.store(command["store"])
     operation = command["operation"]
     args = command["arguments"]
     if operation == "commit_file":

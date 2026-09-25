@@ -182,7 +182,7 @@ def materialize(
         return
     assert worker.workspace is not None
     tensorfs = fill.tensorfs_module()
-    store = tensorfs.Store.open(str(worker.workspace.store_root))
+    store = fill.store(worker.workspace.store_root)
     for row in rows:
         manifest = row["manifest"]
         try:

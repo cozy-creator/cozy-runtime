@@ -2753,8 +2753,7 @@ class Worker:
             return
         started = time.perf_counter()
         try:
-            tensorfs = fill.tensorfs_module()
-            store = fill.open_store(tensorfs, Path(root))
+            store = fill.open_store(Path(root))
             held = self.held_manifests.rebuild(store)
         except Exception as exc:
             self.note("boot", f"held_manifests: none — {exc}"[:256])

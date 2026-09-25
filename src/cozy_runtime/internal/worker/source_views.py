@@ -56,7 +56,7 @@ def prepare(
         manifest = artifact["manifest"]
         if not 0 < manifest["length"] <= 1 << 20:
             raise WorkspaceRefusal("source view manifest exceeds its metadata bound")
-        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        store = fill.store(workspace.store_root)
         observed = db.native(lambda: store.tree_root(access))
         if (
             not observed

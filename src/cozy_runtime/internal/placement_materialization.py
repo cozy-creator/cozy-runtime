@@ -65,7 +65,7 @@ def prepare_boot(
     # pod-supervisor already ensured this local Store and prepared its reader permissions
     # through TensorFS. Runtime validates it without creating, chmodding, or reading layout.
     try:
-        fill.open_store(fill.tensorfs_module(), tensorfs_root)
+        fill.open_store(tensorfs_root)
     except fill.FillRefusal as exc:
         raise LaunchRefusal("provision_store_invalid", str(exc)) from exc
     _directory(boot_root)

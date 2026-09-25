@@ -68,13 +68,7 @@ def finalize(
             ]
 
         weights_finalize._authorize(request, attempts(), False)
-        observed = db.native(
-            lambda: (
-                fill.tensorfs_module()
-                .Store.open(str(workspace.store_root))
-                .derived_lookup(transaction)
-            )
-        )
+        observed = db.native(lambda: fill.store(workspace.store_root).derived_lookup(transaction))
         if request.disposition != pb.WEIGHTS_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED:
             if observed.get("state") != "committed":
                 raise weights_finalize.FinalizationRefusal("finalization requires a native receipt")

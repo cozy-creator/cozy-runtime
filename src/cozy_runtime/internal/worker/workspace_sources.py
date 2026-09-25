@@ -222,7 +222,7 @@ def record_complete(
         ).fetchone()
         if row is None or row["state"] in ("releasing", "released"):
             raise WorkspaceRefusal("source completion has no active accepted call")
-        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        store = fill.store(workspace.store_root)
         source = row["operation"] != "convert_cozytensors"
 
         def validate_native() -> None:
@@ -299,7 +299,7 @@ def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -
             "OR a.state IN ('outcome','released')) ORDER BY n.service_id",
             (owner, service_id, current["computation_digest"], current["operation"]),
         ).fetchall()
-        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        store = fill.store(workspace.store_root)
         for candidate in candidates:
             try:
                 db.native(
@@ -340,7 +340,7 @@ def conversion_predecessor(workspace: Workspace, owner: str, service_id: str) ->
             "ORDER BY n.service_id",
             (owner, service_id, current["computation_digest"]),
         ).fetchall()
-        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        store = fill.store(workspace.store_root)
         retained = set(db.native(store.model_source_operations))
         for candidate in candidates:
             if candidate["service_id"] in retained:
@@ -413,7 +413,7 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
     if row["operation"] not in ("source_files", "commit_file"):
         workspace_memo.release_native_result(workspace, owner, service_id)
         workspace_memo.release_native_lookup(workspace, owner, service_id)
-    store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+    store = fill.store(workspace.store_root)
     if row["operation"] == "commit_file":
         from . import workspace_byte_outputs
 

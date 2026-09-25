@@ -1347,7 +1347,7 @@ def _resolve_development_models(
     try:
         if not store_root.is_dir():
             raise FileNotFoundError(store_root)
-        store = tensorfs.Store.open(str(store_root))
+        store = fill.store(store_root)
     except Exception as exc:
         raise RuntimeError(
             f"development_model_store_absent: {store_root}: {type(exc).__name__}: {exc}"

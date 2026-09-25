@@ -964,8 +964,7 @@ class AttemptEngine:
         leases: dict[str, Any] = {}
         models: dict[str, JobModel] = {}
         try:
-            tensorfs = fill.tensorfs_module()
-            store = tensorfs.Store.open(str(self.tensorfs_root))
+            store = fill.store(self.tensorfs_root)
             for parameter in sorted(declared):
                 entry = selected[parameter]
                 manifest = documents.spell(entry.digest)

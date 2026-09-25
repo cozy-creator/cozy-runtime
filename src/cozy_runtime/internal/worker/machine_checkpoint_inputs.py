@@ -87,7 +87,7 @@ def preflight(
     workspace: Workspace, owner: str, offer: pb.AttemptOffer, entries: Mapping[str, BoundInput]
 ) -> None:
     """Validate every new catalog source before any new recipient root is created."""
-    store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+    store = fill.store(workspace.store_root)
     for entry in entries.values():
         with workspace.locked() as db:
             row = _row(db, owner, offer.request_id, entry.input_id)
@@ -127,7 +127,7 @@ def preflight(
 
 
 def retain(workspace: Workspace, owner: str, offer: pb.AttemptOffer, entry: BoundInput) -> None:
-    store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+    store = fill.store(workspace.store_root)
     with workspace.locked() as db:
         row = _row(db, owner, offer.request_id, entry.input_id)
         if row is not None:
@@ -233,7 +233,7 @@ def _release_row(workspace: Workspace, db: Journal, row: Row) -> None:
         "UPDATE execution_checkpoint_inputs SET state='releasing' WHERE native_owner=?",
         (row["native_owner"],),
     )
-    store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+    store = fill.store(workspace.store_root)
     native = _native(
         db,
         partial(

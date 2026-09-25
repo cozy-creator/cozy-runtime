@@ -950,7 +950,7 @@ class Executions:
                 manifests.add(native_tree["manifest"]["digest"])
         if not manifests:
             return
-        store = fill.tensorfs_module().Store.open(str(self.workspace.store_root))
+        store = fill.store(self.workspace.store_root)
         leases = []
         try:
             for manifest in sorted(manifests):

@@ -49,7 +49,7 @@ def adopt(workspace: Workspace, db: Journal, owner: str, transaction: str) -> di
         row = db.execute("SELECT * FROM weights WHERE id=?", (transaction,)).fetchone()
 
     def acquire() -> pb.CheckpointRef:
-        store = fill.tensorfs_module().Store.open(str(workspace.store_root))
+        store = fill.store(workspace.store_root)
         checkpoint = pb.CheckpointRef.FromString(row["adoption_checkpoint"])
         # The captured epoch cannot fence a newer attempt that started while the
         # workspace lock was released. Native adoption also refuses an active writer.

@@ -22,7 +22,7 @@ def change(
         or re.fullmatch(r"sha256:[0-9a-f]{64}", request.retention_id) is None
     ):
         raise ValueError("derived retention requires exact bounded identities")
-    store = fill.tensorfs_module().Store.open(str(tensorfs_root))
+    store = fill.store(tensorfs_root)
     action = store.release_derived_retention if release else store.retain_derived_result
     value = action(
         request.weights_transaction_id,
@@ -60,7 +60,7 @@ def release_result(
         or len(request.tensorfs_receipt_digest) != 32
     ):
         raise ValueError("derived result release requires exact identities")
-    store = fill.tensorfs_module().Store.open(str(tensorfs_root))
+    store = fill.store(tensorfs_root)
     observed = store.derived_lookup(request.weights_transaction_id)
     receipt = observed.get("receipt")
     if (
