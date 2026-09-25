@@ -992,7 +992,8 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
         assert torch.distributed.get_world_size() == 3 and torch.distributed.get_rank() == 0
         # the followers answered `join` only after their own barrier: the group is whole
         command = {
-            "cmd": "prepare",
+            "cmd": "load",
+            "construction": "fixture",
             "devices": "0,1,2",
             "sequence_parallel_degree": 3,
             "authorized_device_limit_bytes": 1,
@@ -1004,16 +1005,9 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
             },
             "budgets": {},
         }
-        plan = GroupPlan(
-            degree=3,
-            devices=("0", "1", "2"),
-            plan_digest="sha256:" + "a" * 64,
-            authorized_device_limit_bytes=1,
-        )
-        assert GroupPlan.read(plan.document()) == plan
         # the hardware half disagrees: refused BEFORE torch is imported on the follower
-        divergent = dataclasses.replace(plan, devices=("0", "1", "7"))
-        replies = group.call({**command, "group": {"plan": divergent.document()}})
+        divergent = {"degree": 3, "devices": ["0", "1", "7"]}
+        replies = group.call({**command, "group": divergent})
         assert [r["code"] for r in replies] == ["rank_divergence"] * 2, replies
         assert "rank 0 broadcast degree 3 over ['0', '1', '7']" in replies[0]["detail"]
         assert replies[0]["rank"] == 1 and replies[1]["rank"] == 2
