@@ -199,7 +199,7 @@ follow_imports = "skip"
 line-length = 100
 src = ["src", "checks", "tests", "examples", "scripts"]
 # Generated bindings: protoc's line lengths and import style are not ours to lint.
-extend-exclude = ["src/cozy/worker/v1/worker_pb2.py",
+extend-exclude = ["src/cozy_runtime/models/qwen_image21/upstream", "src/cozy/worker/v1/worker_pb2.py",
                   "src/cozy/worker/v1/worker_pb2_grpc.py",
                   "src/cozy/worker/v1/worker_pb2.pyi",
                   "src/cozy/worker/v1/wire_version.py"]

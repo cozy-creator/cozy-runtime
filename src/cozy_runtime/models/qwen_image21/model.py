@@ -7,11 +7,21 @@ loader, device placement, or offload hook participates in serving.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import base64
+import zlib
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
-from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from tokenizers import Tokenizer
+from transformers import (
+    PreTrainedTokenizerFast,
+    Qwen2VLImageProcessor,
+    Qwen3VLConfig,
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLProcessor,
+    Qwen3VLVideoProcessor,
+)
 from transformers import initialization as transformer_init
 
 from cozy_runtime.author import Config, Loader, Model, uses_components
@@ -39,10 +49,42 @@ class QwenImage21Graph:
                 ),
             }
         self.scheduler_config = dict(mapping["scheduler"])
+        self.processor_config = dict(mapping.get("processor", {}))
 
 
 def build_qwen_image21(config: Config) -> QwenImage21Graph:
     return QwenImage21Graph(config)
+
+
+def build_processor(config: Mapping[str, Any]) -> Any:
+    """Decode the prepared checkpoint's bounded processor bundle without file/network loading."""
+    expected = {
+        "tokenizer",
+        "tokenizer_config",
+        "image_processor",
+        "video_processor",
+        "chat_template",
+    }
+    if set(config) != expected:
+        raise ValueError("Qwen Image processor config has missing or unknown fields")
+    encoded = config["tokenizer"]
+    if not isinstance(encoded, str) or len(encoded) > 32 << 20:
+        raise ValueError("Qwen Image tokenizer exceeds its encoded size limit")
+    compressed = base64.b64decode(encoded, altchars=b"-_", validate=True)
+    inflater = zlib.decompressobj()
+    raw = inflater.decompress(compressed, (32 << 20) + 1)
+    if len(raw) > 32 << 20 or not inflater.eof or inflater.unused_data:
+        raise ValueError("Qwen Image tokenizer exceeds its size limit or has invalid compression")
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer.from_str(raw.decode("utf-8")),
+        **dict(config["tokenizer_config"]),
+    )
+    return Qwen3VLProcessor(
+        tokenizer=tokenizer,
+        image_processor=Qwen2VLImageProcessor(**dict(config["image_processor"])),
+        video_processor=Qwen3VLVideoProcessor(**dict(config["video_processor"])),
+        chat_template=config["chat_template"],
+    )
 
 
 class _StagedPipeline(QwenImage21Pipeline):
@@ -60,8 +102,7 @@ class QwenImage21Model(Model[QwenImage21Graph]):
 
     def load(self, loader: Loader) -> None:
         self.graph = loader.construct(QwenImage21Graph, factory=build_qwen_image21)
-        with loader.assets.materialized("processor") as root:
-            self.processor = Qwen3VLProcessor.from_pretrained(root, local_files_only=True)
+        self.processor = build_processor(self.graph.processor_config)
 
     def _pipeline(self) -> _StagedPipeline:
         from diffusers import FlowMatchEulerDiscreteScheduler

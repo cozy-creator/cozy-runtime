@@ -112,3 +112,45 @@ def test_returned_image_keeps_bounds_and_request_interface_identity(
     image.write_bytes(data + b"changed")
     with pytest.raises(RuntimeFailure, match="input_changed"):
         decoder.decode_image(asset)  # type: ignore[arg-type]
+
+
+def test_generated_only_job_can_request_decoder_without_payload_assets(tmp_path: Path) -> None:
+    """Generated child results supply decode capabilities after the parent starts."""
+    source = '''import msgspec
+from cozy_runtime.author import App, Context, MediaDecoder
+app = App()
+class Request(msgspec.Struct):
+    prompt: str
+class Result(msgspec.Struct):
+    width: int
+@app.job
+async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result:
+    raise RuntimeError("discovery only")
+'''
+    (tmp_path / "pyproject.toml").write_text('[project]\nname="generated-only"\nversion="0.1.0"\n')
+    (tmp_path / "package.toml").write_text('[application]\nobject="generated_only:app"\n')
+    (tmp_path / "generated_only.py").write_text(source)
+    imported = package_interface.build(discover(tmp_path))
+    assert package_interface.canonical_bytes(imported) == package_interface.canonical_bytes(
+        static_interface.build(tmp_path)
+    )
+    assert imported["jobs"][0]["name"] == "compose"
+
+
+def test_generated_job_does_not_waive_explicit_input_decode_bounds(tmp_path: Path) -> None:
+    from cozy_runtime.author import ConformanceError
+
+    (tmp_path / "package.toml").write_text('[application]\nobject="unbounded_decode:app"\n')
+    (tmp_path / "unbounded_decode.py").write_text('''import msgspec
+from cozy_runtime.author import App, Context, ImageAsset, MediaDecoder
+app = App()
+class Request(msgspec.Struct):
+    image: ImageAsset
+class Result(msgspec.Struct):
+    width: int
+@app.job
+async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result:
+    raise RuntimeError("discovery only")
+''')
+    with pytest.raises(ConformanceError, match="asset_decode_unbounded"):
+        package_interface.build(discover(tmp_path))
