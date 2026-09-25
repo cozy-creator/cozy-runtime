@@ -440,6 +440,8 @@ def materialize_captured_builtin(
     """
     from cozy_runtime.internal import _installed_dependencies, builtin_operations
 
+    if _sha(captured.receipt_bytes) != captured.receipt_digest:
+        raise EnvironmentRefusal("builtin_snapshot_mismatch", "captured receipt differs")
     receipt = parse_environment_receipt(captured.receipt_bytes)
     if (
         len(source.wheels) != 1
