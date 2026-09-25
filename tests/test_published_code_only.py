@@ -1,0 +1,262 @@
+"""A real published environment can be retained before its caller binds a model."""
+
+from __future__ import annotations
+
+import hashlib
+import sys
+from pathlib import Path
+
+import pytest
+
+from cozy_runtime.internal import canonical, package_interface
+from cozy_runtime.internal import package_environment as environments
+from cozy_runtime.internal.worker.package_prepare import PreparationRefusal, prepare_package_set
+from cozy_runtime.internal.worker.session import read_placement_set
+from cozy_runtime.protocol import worker_pb2 as pb
+from test_publish_derivation import _SimpleIndex
+from test_unpublished_exact_dependencies import _wheel
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_published_serving_code_prepares_without_models_or_executable_bindings(
+    tmp_path: Path, declared: bool
+) -> None:
+    wheel = _wheel(
+        tmp_path, "serving_child", ("cozy-runtime>=0.1",), b"VALUE=42\n", version="1.0.0"
+    )
+    runtime = _wheel(tmp_path, "cozy_runtime", (), b"VALUE=1\n", version="1.0.0")
+    index = _SimpleIndex(tmp_path / "index", [wheel, runtime])
+    base = environments.observe_base()
+    root = tmp_path / "installs"
+    slots = ["generate.models.model"] if declared else []
+    interface = canonical.write(
+        {
+            "format": package_interface.SCHEMA,
+            "application": "serving_child:app",
+            "entrypoints": [
+                {
+                    "name": "generate",
+                    "models": [{"class": "Model", "path": slots[0], "component_use": {}}],
+                    "request": {"fields": []},
+                    "result": {"fields": []},
+                }
+            ]
+            if declared
+            else [],
+            "jobs": [],
+        }
+    )
+    retained: list[environments.InstalledEnvironment] = []
+
+    def describe(installed: environments.InstalledEnvironment, distribution: str) -> bytes:
+        assert distribution == "serving-child"
+        assert (installed.site_packages / "serving_child.py").is_file()
+        return interface
+
+    try:
+        locked = environments.read_locked_requirements(
+            (
+                f"--index-url {index.url}\n"
+                + "\n".join(
+                    sorted(
+                        f"{item.name.split('-')[0].replace('_', '-')}=={item.name.split('-')[1]} "
+                        f"--hash=sha256:{hashlib.sha256(item.read_bytes()).hexdigest()}"
+                        for item in [wheel, runtime]
+                    )
+                )
+                + "\n"
+            ).encode()
+        )
+        request = pb.PreparePackageSetRequest(
+            install_root=str(root),
+            application="serving_child:app",
+            model_slot_paths=slots,
+            download_delegation=canonical.write(
+                {
+                    "format": "cozy.worker.v1.DownloadDelegation/1",
+                    "packages": [{"package": "proof/serving-child", "release": "1.0.0"}],
+                    "models": [],
+                }
+            ),
+            image_inventory=pb.ImageInventory(
+                profile="proof",
+                python=base.python_full_version,
+                distributions=[
+                    pb.ImageDistribution(distribution=n, version=v) for n, v in base.distributions
+                ],
+            ),
+            locked_requirements=(
+                f"--index-url {index.url}\n" + "\n".join(row.text for row in locked.rows) + "\n"
+            ).encode(),
+        )
+
+        def prepare() -> pb.PreparePackageSetResult:
+            return prepare_package_set(
+                request,
+                artifact_cache=tmp_path / "artifacts",
+                tensorfs_root=tmp_path / "store",
+                install_root=root,
+                python=Path(sys.executable),
+                describe=describe,
+                verified=lambda *args: None,
+                base=base,
+                materialized=retained.append,
+            )
+
+        if not declared:
+            with pytest.raises(PreparationRefusal, match="package_prepare_callable_absent"):
+                prepare()
+            assert retained == []
+            return
+        result = prepare()
+        (placement,) = read_placement_set(result.placement_set)
+        assert placement["entrypoints"] == placement["models"] == []
+        assert placement["package"] == {"package": "proof/serving-child", "release": "1.0.0"}
+        assert len(retained) == 1 and retained[0].receipt_digest
+        reopened = environments.open_generation(
+            root,
+            receipt_digest=retained[0].receipt_digest,
+            environment_digest=placement["environment_digest"],
+            python=Path(sys.executable),
+        )
+        assert reopened.content_digest == retained[0].content_digest
+        assert prepare().placement_set == result.placement_set
+    finally:
+        index.close()
+
+
+def test_real_worker_retains_published_serving_only_child_without_loading_model() -> None:
+    import os
+    import shutil
+    import tempfile
+
+    from conftest import image_python
+    from cozy_runtime.internal import child_env
+    from cozy_runtime.internal.config import Credentials, RuntimeConfig
+    from cozy_runtime.internal.worker.acquire import Acquirer
+    from cozy_runtime.internal.worker.control import InMemoryControlHost
+    from cozy_runtime.internal.worker.session import Worker, WorkerOptions
+    from cozy_runtime.protocol import documents
+    from test_publish_derivation import _closure_rows
+
+    python = image_python()
+    runtime = next(python.parent.parent.parent.glob("wheels/cozy_runtime-*.whl"))
+    uv = shutil.which("uv")
+    assert uv is not None
+    with tempfile.TemporaryDirectory(prefix="cozy-pubcode.") as raw:
+        root = Path(raw)
+        source = b"""import msgspec
+from cozy_runtime.author import App, Model
+app = App()
+class Request(msgspec.Struct):
+    text: str
+class Reply(msgspec.Struct):
+    text: str
+class Pipeline:
+    pass
+class Reference(Model[Pipeline]):
+    def load(self, loader):
+        raise AssertionError("code preparation must not load a model")
+@app.entrypoint
+async def generate(payload: Request, model: Reference) -> Reply:
+    raise AssertionError("code preparation must not execute a callable")
+"""
+        wheel = _wheel(
+            root,
+            "serving_child",
+            ("cozy-runtime>=0.18.24",),
+            source,
+            version="1.0.0",
+            resources={
+                "serving_child-1.0.0.dist-info/entry_points.txt": (
+                    b"[cozy.application]\napp = serving_child:app\n"
+                )
+            },
+        )
+        index = _SimpleIndex(root / "index", [runtime, wheel])
+        runtime_version = runtime.name.split("-")[1]
+        rows = sorted(
+            [
+                *_closure_rows(uv),
+                f"cozy-runtime=={runtime_version} "
+                f"--hash=sha256:{hashlib.sha256(runtime.read_bytes()).hexdigest()}",
+                "serving-child==1.0.0 "
+                f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}",
+            ]
+        )
+        locked = (
+            "--index-url https://pypi.org/simple\n"
+            + f"--extra-index-url {index.url}\n"
+            + "\n".join(rows)
+            + "\n"
+        ).encode()
+        worker = Worker(
+            RuntimeConfig(
+                cozy_home=root / "home",
+                credentials=Credentials(),
+                child_base_env=tuple(
+                    sorted(
+                        (key, value)
+                        for key, value in os.environ.items()
+                        if not child_env.erased(key) and key != "PYTHONPATH"
+                    )
+                ),
+            ),
+            WorkerOptions(
+                root=root / "worker",
+                devices="",
+                accelerator_backend="none",
+                python=str(python),
+                install_root=root / "installs",
+                artifact_cache=root / "artifacts",
+                tensorfs_root=root / "store",
+            ),
+            InMemoryControlHost(),
+        )
+        try:
+            request = pb.PreparePackageSetRequest(
+                install_root=str(root / "installs"),
+                application="serving_child:app",
+                model_slot_paths=["generate.models.model"],
+                download_delegation=canonical.write(
+                    {
+                        "format": "cozy.worker.v1.DownloadDelegation/1",
+                        "packages": [{"package": "proof/serving-child", "release": "1.0.0"}],
+                        "models": [],
+                    }
+                ),
+                image_inventory=pb.ImageInventory(
+                    profile="proof",
+                    python=worker.base.python_full_version,
+                    distributions=[
+                        pb.ImageDistribution(distribution=n, version=v)
+                        for n, v in worker.base.distributions
+                    ],
+                ),
+                locked_requirements=locked,
+            )
+            result = worker.prepare_package_set(request)
+            (placement,) = read_placement_set(result.placement_set)
+            key = (placement["placement_id"], placement["environment_digest"])
+            retained = worker.prepared_revisions[key]
+            assert retained.installed is not None and retained.installed.receipt_digest
+            assert retained.models == retained.entrypoints == ()
+            raw_interface = (
+                root / "artifacts" / documents.raw(placement["package_interface"]["digest"]).hex()
+            ).read_bytes()
+            interface = package_interface.read_bytes(raw_interface)
+            assert interface["jobs"] == [] and interface["entrypoints"][0]["name"] == "generate"
+            acquirer = Acquirer(
+                cache_root=root / "artifacts",
+                install_root=root / "installs",
+                selection_root=root / "selection",
+                tensorfs_root=root / "store",
+                python=python,
+                base=worker.base,
+            )
+            bindings, count = acquirer._bindings(retained)
+            assert bindings == {} and count == 1
+            assert worker.prepare_package_set(request).placement_set == result.placement_set
+        finally:
+            worker.shutdown()
+            index.close()

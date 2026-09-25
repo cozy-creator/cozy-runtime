@@ -747,12 +747,11 @@ class Acquirer:
         # Preparation selects the entrypoints whose model slots were supplied. Each
         # selected entrypoint and its complete slot set was checked above; the package
         # may also declare other entrypoints that this placement does not bind.
-        # Development code is prepared before its models are selected. That intermediate
-        # state has no executable bindings; a weightless entrypoint must still be selected.
-        code_only_preparation = (
-            bool(development)
-            and not models
-            and all(entrypoint.get("models") for entrypoint in visible.values())
+        # Captured code, published or unpublished, may precede model selection.
+        # This intermediate state has no executable bindings; a weightless
+        # entrypoint must still be selected and selected models cannot disappear.
+        code_only_preparation = not models and all(
+            entrypoint.get("models") for entrypoint in visible.values()
         )
         if not selected_entrypoints and (development or visible) and not code_only_preparation:
             raise AcquisitionRefusal(
