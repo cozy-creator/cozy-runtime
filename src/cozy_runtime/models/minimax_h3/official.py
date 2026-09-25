@@ -69,6 +69,13 @@ from cozy_runtime.author import (
 
 from .adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
 from .conditioner import build_text_conditioner, conditioning_scope
+from .continuation import (
+    AVContext,
+    CompletedTail,
+    ContinuationPlan,
+    align_context_rows,
+    audio_sample_range,
+)
 from .table_layout import TableLayout
 from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK, TurboOverlay, TurboSchedule
 from .vae_tiles import TileBatchedVideoVAE
@@ -1077,10 +1084,27 @@ class OfficialH3Pipeline:
         frames: int,
         reference_image_short_edges: Sequence[int],
         task: Task = "ref2va",
+        context: AVContext | None = None,
+        delivery: ContinuationPlan | None = None,
+        expected_context_provenance: str | None = None,
     ) -> Any:
         """``reference_image_short_edges`` is one resolved edge per image reference, in
         packed order; the official setup step resizes each image to its own."""
-        return self._start(
+        if context is not None:
+            context.validate()
+            if delivery is None or delivery.prefix_frames != context.frame_count:
+                raise InvalidRequest("context and delivery plan disagree", code="h3_continuation")
+            if expected_context_provenance != context.provenance:
+                raise InvalidRequest(
+                    "continuation renderer provenance differs", code="h3_continuation"
+                )
+        elif delivery is not None and delivery.prefix_frames:
+            raise InvalidRequest(
+                "delivery prefix requires a completed context", code="h3_continuation"
+            )
+        if delivery is not None and frames != delivery.sample_frames:
+            raise InvalidRequest("sample frames differ from delivery plan", code="h3_continuation")
+        state = self._start(
             _trunk_task(task, "ref2va"),
             prompt=prompt,
             generator=generator,
@@ -1089,6 +1113,13 @@ class OfficialH3Pipeline:
             references=list(references),
             image_short_edges=tuple(reference_image_short_edges),
         )
+        if context is not None and tuple(context.frames.shape[1:3]) != (state.height, state.width):
+            raise InvalidRequest(
+                "continuation canvas differs from this render", code="h3_continuation"
+            )
+        state.set("continuation_context", context)
+        state.set("continuation_delivery", delivery)
+        return state
 
     def _start(
         self,
@@ -1156,6 +1187,22 @@ class OfficialH3Pipeline:
     def condition_media(
         self, task: Task, state: Any, *, checks: NumericalChecks | None = None
     ) -> None:
+        context = state.get("continuation_context")
+        if context is not None:
+            # Text already contains only the caller's fixed references. This private
+            # condition is a temporal anchor, not another public Video/Audio slot.
+            state.set(
+                "normalized_references",
+                [
+                    *state.normalized_references,
+                    MiniMaxH3VideoReference(
+                        frames=context.frames,
+                        fps=float(FPS),
+                        audio=context.audio,
+                        sample_rate=context.sample_rate,
+                    ),
+                ],
+            )
         self._run(task, "vae_encoder", state, component="video_vae")
         if checks is not None:
             checks.outputs(
@@ -1267,6 +1314,10 @@ class OfficialH3Pipeline:
                     required=name.startswith("denoise.prepare_latents"),
                 )
 
+        context = state.get("continuation_context")
+        if context is not None:
+            align_context_rows(state, context, tuple(scoped.patch_size))
+
         # The receipt names the schedule the official blocks actually built, proven
         # against the plan by exact float32 equality of both modality vectors.
         plan = self._plans[task]
@@ -1307,9 +1358,21 @@ class OfficialH3Pipeline:
 
     def decode_audio(self, task: Task, state: Any) -> Any:
         self._run(task, "decode.audio", state, component="audio_vae")
-        return state.audio
+        delivery = state.get("continuation_delivery")
+        if delivery is None:
+            return state.audio
+        start, end = audio_sample_range(
+            delivery.delivery_start, delivery.delivery_end, int(state.sampling_rate)
+        )
+        if state.audio.shape[-1] < end:
+            raise OutputError("decoded audio does not cover the continuation delivery window")
+        return state.audio[..., start:end]
 
     def decode_video(self, task: Task, state: Any) -> Any:
+        if state.get("continuation_delivery") is not None:
+            raise InvalidRequest(
+                "continuation requires streaming video decode", code="h3_continuation"
+            )
         self._run(task, "decode.video", state, component="video_vae")
         return state.videos
 
@@ -1332,6 +1395,8 @@ class OfficialH3Pipeline:
         pixel_mean = torch.tensor(components.pixel_mean, device=device).view(1, -1, 1, 1, 1)
         pixel_std = torch.tensor(components.pixel_std, device=device).view(1, -1, 1, 1, 1)
         frames = 0
+        delivery = state.get("continuation_delivery")
+        tail = CompletedTail(delivery) if delivery is not None else None
         with torch.no_grad():
             chunks = vae.decode_chunks(state.latents * latents_std + latents_mean)
             while True:
@@ -1340,10 +1405,24 @@ class OfficialH3Pipeline:
                 ):
                     chunk = next(chunks, None)
                 if chunk is None:
+                    if tail is not None:
+                        tail.finish()
+                        state.set("completed_av_tail", tail)
+                        return tail.delivered
                     return frames
                 video = chunk.float() * pixel_std + pixel_mean
                 frames += int(video.shape[2])
-                on_chunk(video[0].permute(1, 0, 2, 3))
+                selected = video[0].permute(1, 0, 2, 3)
+                if tail is not None:
+                    selected = tail.push(selected)
+                if selected.shape[0]:
+                    on_chunk(selected)
+
+    def export_completed_av_tail(self, state: Any, *, provenance: str) -> AVContext:
+        tail = state.get("completed_av_tail")
+        if not isinstance(tail, CompletedTail) or state.get("audio") is None:
+            raise OutputError("continuation requires completed video and audio decode")
+        return tail.export(state.audio[0], int(state.sampling_rate), provenance)
 
     def _run(self, task: Task, name: str, state: Any, *, component: str | None = None) -> None:
         workflow = self._workflow(task, state)
