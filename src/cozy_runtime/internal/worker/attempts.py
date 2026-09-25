@@ -1147,9 +1147,7 @@ class AttemptEngine:
                 "names neither; a worker that guessed would run the wrong lifecycle",
                 cause=CAUSE.CAUSE_CODE_PROTOCOL,
             )
-        declared, prepared_model = self._resolve_binding(attempt)
-        attempt.declared = declared
-        attempt.prepared_model = prepared_model
+        attempt.declared = self._resolve_declared_binding(attempt)
         attempt.state = "preparing"
         self._fetch_payload(attempt)
         # HYDRATE before acceptance (cr-012): an oversized, ungranted, mislabelled or
@@ -1172,24 +1170,35 @@ class AttemptEngine:
         )
         return self._accepted(attempt, "staged")
 
-    def _resolve_binding(self, attempt: AttemptRecord) -> tuple[DeclaredBinding, PreparedModel]:
-        """The slot's binding for this serving attempt, or a typed refusal."""
+    def _resolve_declared_binding(self, attempt: AttemptRecord) -> DeclaredBinding:
+        """Validate queued work against its declaration, before any model is loaded.
+
+        The executor imports the package at startup and loads a construction only when
+        its first queued attempt enters the device. Queue admission must therefore need
+        only the immutable declaration; requiring PreparedModel here prevents that first
+        attempt from ever reaching the load.
+        """
         serving = attempt.spec["serving"]
         plan_id = serving["entrypoint_binding_digest"]
         slot = self.slot_of(attempt)
         declared = slot.bindings.get(plan_id)
-        prepared_model = slot.prepared_models.get(plan_id)
         if not slot.bindings_digest or serving.get("bindings_digest") != slot.bindings_digest:
             raise AttemptRefusal(
                 "model_bindings_changed",
                 "serving invocation differs from the exact activated model bindings",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
             )
-        if declared is None or prepared_model is None:
+        if declared is None:
             raise AttemptRefusal(
                 "unknown_binding",
                 f"no entrypoint binding {plan_id[:24]}… is selected on this worker",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+        if fault := slot.failed_bindings.get(plan_id):
+            raise AttemptRefusal(
+                "binding_faulted",
+                f"{plan_id[:24]}… could not be loaded: {fault}",
+                cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
         if declared.development and attempt.spec.get("environment_digest"):
             raise AttemptRefusal(
@@ -1204,6 +1213,21 @@ class AttemptEngine:
                 "environment_mismatch",
                 "InvocationSpec does not name the selected Environment",
                 cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+            )
+        return declared
+
+    def _resolve_binding(self, attempt: AttemptRecord) -> tuple[DeclaredBinding, PreparedModel]:
+        """Device entry requires the construction that the worker has just loaded."""
+        declared = self._resolve_declared_binding(attempt)
+        prepared_model = self.slot_of(attempt).prepared_models.get(
+            declared.entrypoint_binding_digest
+        )
+        if prepared_model is None:
+            raise AttemptRefusal(
+                "construction_not_loaded",
+                f"entrypoint {declared.entrypoint!r} is selected but its construction "
+                "has not loaded on this executor",
+                cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
         return declared, prepared_model
 
