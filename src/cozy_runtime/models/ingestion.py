@@ -37,7 +37,7 @@ def huggingface_recipe(repository: str, revision: str) -> Recipe | None:
             "text_encoder/model.safetensors.index.json",
             "vae/diffusion_pytorch_model.safetensors",
         ),
-        {name: (int(row[0]), str(row[1])) for name, row in qwen.FILES.items()},
+        dict(qwen.FILES),
     )
 
 

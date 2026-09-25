@@ -20,41 +20,41 @@ from cozy_runtime.author import (
 
 REPOSITORY = "Qwen/Qwen-Image-2.1"
 REVISION = "790c92633540aa0cb11d9abf19eb46d861714758"
-FILES = {
-    "transformer/config.json": [
+FILES: dict[str, tuple[int, str]] = {
+    "transformer/config.json": (
         370,
         "56ae3281c4e6c2d1aa3658252d187488071815fd79bef15808bb0205fc1a2241",
-    ],
-    "text_encoder/config.json": [
+    ),
+    "text_encoder/config.json": (
         1517,
         "6001331949f7f86ab6d791a80b12246d4f8da5159fa08c3e62368a39f36d63a9",
-    ],
-    "vae/config.json": [2079, "9785d527b278cb8b210e9f48a8028d92a4190968ce7e24c8fc85d9d1b82f6ba2"],
-    "scheduler/scheduler_config.json": [
+    ),
+    "vae/config.json": (2079, "9785d527b278cb8b210e9f48a8028d92a4190968ce7e24c8fc85d9d1b82f6ba2"),
+    "scheduler/scheduler_config.json": (
         485,
         "5895f3a167c14a967fe9ac70c64924ae5acc79799e0679fd12907e594a713cd1",
-    ],
-    "processor/tokenizer_config.json": [
+    ),
+    "processor/tokenizer_config.json": (
         5445,
         "81ec7bb9530159b326c0bef1d0b6c33d392090524014ea3f0123a3c1eb9c2af5",
-    ],
-    "processor/preprocessor_config.json": [
+    ),
+    "processor/preprocessor_config.json": (
         782,
         "93585062a80db5e8ca038efc7726a3e6411d9db948472d81d63c6303993be8c5",
-    ],
-    "processor/video_preprocessor_config.json": [
+    ),
+    "processor/video_preprocessor_config.json": (
         817,
         "59c5c9eb52182eb14c06ffb10ca9effd29adce5f238a95de23ca14a38dbd2cb1",
-    ],
-    "processor/chat_template.jinja": [
+    ),
+    "processor/chat_template.jinja": (
         5292,
         "3636d0f0bd6bef02654cdffdc447b79cb2cef8ab02cc75267345946291a489e4",
-    ],
-    "LICENSE": [7831, "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"],
-    "processor/tokenizer.json": [
+    ),
+    "LICENSE": (7831, "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"),
+    "processor/tokenizer.json": (
         11422654,
         "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
-    ],
+    ),
 }
 
 # Exact constructor census at Diffusers4295ee3, Transformers5.17; no tensor values.
@@ -191,7 +191,7 @@ async def prepare(
         ):
             raise ValueError(f"Source differs from the reviewed native checkpoint: {pair}")
     config = configuration(metadata.path)
-    provenance = {
+    provenance: dict[str, str] = {
         "source_repository": REPOSITORY,
         "source_revision": REVISION,
         "conversion": (

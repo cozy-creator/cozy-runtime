@@ -17,4 +17,10 @@ def run(args: list[str], opts: Options) -> Result:
         raise CliError(
             exc.code, str(exc), "Use the reviewed source revision", Exit.validation
         ) from exc
-    return Result(document={"recipe": asdict(recipe) if recipe else None})
+    document = asdict(recipe) if recipe else None
+    if document is not None and recipe is not None:
+        document["metadata"] = {
+            name: {"length": length, "sha256": digest}
+            for name, (length, digest) in recipe.metadata.items()
+        }
+    return Result(document={"recipe": document})

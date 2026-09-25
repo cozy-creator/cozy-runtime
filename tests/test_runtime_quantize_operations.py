@@ -121,8 +121,8 @@ def test_builtin_interface_is_static_and_matches_its_actual_app() -> None:
     )
     assert package_interface.canonical_bytes(static) == package_interface.canonical_bytes(actual)
     jobs = static["jobs"]
-    assert isinstance(jobs, list) and len(jobs) == 1
-    row = jobs[0]
+    assert isinstance(jobs, list) and {row["name"] for row in jobs} == {"quantize", "prepare_model"}
+    row = next(row for row in jobs if row["name"] == "quantize")
     assert isinstance(row, dict) and row["name"] == "quantize"
     assert row["weights_outputs"] == [
         {
