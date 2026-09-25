@@ -479,6 +479,30 @@ class _PreparationServicer(WorkspaceRPC):
             )
         return self.checkpoint_transfer(request)
 
+    def CheckPackageSetCompatibility(
+        self, request: pb.PreparePackageSetRequest, context: Any
+    ) -> Any:
+        """Minor 60's pre-check runs the same cached preparation as the following call."""
+        from .package_prepare import PreparationRefusal
+
+        handler = self.package_handler
+        if handler is None:
+            return context.abort(
+                grpc.StatusCode.UNIMPLEMENTED, "package preparation is unavailable"
+            )
+        try:
+            handler(request)
+        except PreparationRefusal as exc:
+            return pb.CheckPackageSetCompatibilityResult(
+                refusal_code=exc.code,
+                refusal_detail="".join(
+                    character if " " <= character <= "~" else "?" for character in exc.detail
+                )[:1024],
+            )
+        except Exception as exc:
+            return _refuse(context, exc)
+        return pb.CheckPackageSetCompatibilityResult()
+
     def PreparePackageSet(self, request: pb.PreparePackageSetRequest, context: Any) -> Any:
         handler = self.package_handler
         if handler is None:
