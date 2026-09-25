@@ -111,10 +111,10 @@ CALLED: dict[str, str] = {
     "Store.complete_cozytensors_manifests": "(self, /)",
     "Store.begin_derived": (
         "(self, /, transaction_id, writer_session_id, sources, targets, configs, order, "
-        "max_new_bytes, *, work_fingerprint, checkpoint=None)"
+        "max_new_bytes, files=None, *, work_fingerprint, checkpoint=None)"
     ),
     "Store.derived_declaration": (
-        "(self, /, sources, targets, configs, order, max_new_bytes, *, work_fingerprint)"
+        "(self, /, sources, targets, configs, order, max_new_bytes, files=None, *, work_fingerprint)"
     ),
     "Store.inspect_derived_source": "(self, /, manifest, manifest_length, components, configs)",
     "Store.validate_derived_checkpoint": (
