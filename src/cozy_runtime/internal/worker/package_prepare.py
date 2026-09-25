@@ -779,6 +779,7 @@ def prepare_local_package(
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
     dependency_python: Path | None = None,
+    builtin_snapshot: package_environment.InstalledEnvironment | None = None,
     dependency_cache: Path | None = None,
     materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
     cancel: Callable[[], bool] | None = None,
@@ -822,6 +823,7 @@ def prepare_local_package(
         base=base,
         development=package,
         dependency_python=dependency_python,
+        builtin_snapshot=builtin_snapshot,
         dependency_cache=dependency_cache,
         materialized=materialized,
         dependency_requirements=bytes(request.dependency_requirements),
@@ -980,6 +982,7 @@ def prepare_package(
     verified: Callable[[str, int, Path], None],
     base: base_observation.Observation | None = None,
     dependency_python: Path | None = None,
+    builtin_snapshot: package_environment.InstalledEnvironment | None = None,
     dependency_cache: Path | None = None,
     job_plan_root: Path | None = None,
     development: pb.DevelopmentPackage | None = None,
@@ -1145,15 +1148,33 @@ def prepare_package(
                     for grant in source.grants
                 ),
             )
-            installed = package_environment.materialize(
-                source,
-                install_root,
-                python=python,
-                base=observed_base,
-                dependency_python=None if dependency_requirements else dependency_python,
-                exact_dependencies=True,
-                dependency_cache=dependency_cache,
-            )
+            if builtin_snapshot is not None:
+                from cozy_runtime.internal import builtin_operations
+
+                if (
+                    package_name != "local/" + builtin_operations.NAME
+                    or dependency_python is not None
+                    or dependency_requirements
+                ):
+                    raise PreparationRefusal("builtin_snapshot_mismatch", "not a captured builtin")
+                installed = package_environment.materialize_captured_builtin(
+                    source,
+                    install_root,
+                    captured=builtin_snapshot,
+                    python=python,
+                    base=observed_base,
+                    dependency_cache=dependency_cache,
+                )
+            else:
+                installed = package_environment.materialize(
+                    source,
+                    install_root,
+                    python=python,
+                    base=observed_base,
+                    dependency_python=None if dependency_requirements else dependency_python,
+                    exact_dependencies=True,
+                    dependency_cache=dependency_cache,
+                )
         except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
             code = getattr(exc, "code", "package_environment_install_failed")
             detail = getattr(exc, "detail", type(exc).__name__)
