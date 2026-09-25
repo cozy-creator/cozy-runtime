@@ -6,6 +6,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import grpc
 import msgspec
@@ -67,12 +68,21 @@ def test_injected_model_refuses_as_model_before_reserving_a_child() -> None:
     app = App()
     app.job(consume)
     surface = describe(app)[0]
+    assert isinstance(surface.payload_type, type) and issubclass(
+        surface.payload_type, msgspec.Struct
+    )
+    assert isinstance(surface.result_type, type) and issubclass(surface.result_type, msgspec.Struct)
     key = ("sha256:" + "21" * 32, __name__, "consume")
-    exchanges = []
+    exchanges: list[tuple[str, dict[str, Any]]] = []
+
+    def exchange(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        exchanges.append((kind, payload))
+        return {}
+
     broker = _Broker(
         "parent",
         {key: _CallType(*key, surface.payload_type, surface.result_type)},
-        lambda *args: exchanges.append(args),
+        exchange,
     )
     broker.bind(fake_context(request_id="parent"))
     with pytest.raises(CapabilityError, match="retained ModelArtifact") as error:
