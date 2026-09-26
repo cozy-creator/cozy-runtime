@@ -16,6 +16,7 @@ from cozy_runtime.author._calls import MAX_ACTIVE_CALLS, MAX_CALL_BYTES, MAX_CAL
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.internal import canonical, output_budget, package_interface
+from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.capture_observation import document as observation_document
 from cozy_runtime.internal.seam import MAX_FRAME
 from cozy_runtime.internal.worker import byte_inputs, child_byte_results
@@ -84,8 +85,7 @@ class Calls:
         for entry in [*interface["jobs"], *interface["entrypoints"]]:
             declaration = entry.get("invocable")
             if declaration is not None and not any(
-                (row["module"], row["export"])
-                == (declaration["module"], declaration["export"])
+                (row["module"], row["export"]) == (declaration["module"], declaration["export"])
                 for row in result
             ):
                 # Published SDK wheels already carry their exact generated request
@@ -276,8 +276,7 @@ class Calls:
             (
                 row
                 for row in self.bindings(attempt)
-                if row["module"] == module
-                and row["export"] == export
+                if row["module"] == module and row["export"] == export
             ),
             None,
         )
@@ -298,17 +297,7 @@ class Calls:
             if allowed.get("native_source") or allowed.get("native_effect"):
                 raise ValueError("activation capture requires an ordinary serving invocation")
             capture = msgspec.convert(frame["capture"], type=ActivationCapture, strict=True)
-        digest = hashlib.sha256(
-            canonical.write(
-                {
-                    "module": module,
-                    "export": export,
-                    "request": value,
-                    **({"capture": capture.document()} if capture is not None else {}),
-                }
-            )
-        ).digest()
-        return pb.ChildCallRequest(
+        request = pb.ChildCallRequest(
             parent_request_id=attempt.request_id,
             parent_attempt_ordinal=attempt.attempt,
             parent_invocation_spec_digest=attempt.digest,
@@ -316,11 +305,12 @@ class Calls:
             module=module,
             export=export,
             request_canonical_bytes=payload.encode(),
-            intent_digest=digest,
             capture=pb.ActivationCapture(components=capture.components, steps=capture.steps)
             if capture is not None
             else None,
         )
+        request.intent_digest = hashlib.sha256(canonical_intent(request)).digest()
+        return request
 
     def absorb(self, result: pb.ChildCallResult) -> bool:
         with self.lock:

@@ -12,6 +12,7 @@ from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, source_interfaces
+from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -72,10 +73,7 @@ def _parent(db: Journal, owner: str, call: pb.ChildCallRequest) -> None:
 
 def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) -> dict[str, Any]:
     call = command.parent_call
-    if (
-        call.module != source_interfaces.MODULE
-        or len(call.request_canonical_bytes) > 48 << 10
-    ):
+    if call.module != source_interfaces.MODULE or len(call.request_canonical_bytes) > 48 << 10:
         raise WorkspaceRefusal("native source call exceeds its fixed interface")
     expected_operation = {
         "download_huggingface": pb.NATIVE_SOURCE_OPERATION_HUGGINGFACE,
@@ -86,15 +84,7 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
     }.get(call.export)
     if expected_operation is None or command.operation != expected_operation:
         raise WorkspaceRefusal("native source operation differs from its fixed interface")
-    value = canonical_json.decode(call.request_canonical_bytes)
-    intent = canonical_json.encode(
-        {
-            "interface_digest": source_interfaces.DIGEST,
-            "module": call.module,
-            "export": call.export,
-            "request": value,
-        }
-    )
+    intent = canonical_intent(call)
     if hashlib.sha256(intent).digest() != call.intent_digest:
         raise WorkspaceRefusal("native source intent digest differs")
     if command.service_id != identity(owner, call.parent_request_id, call.call_index):

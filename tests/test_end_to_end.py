@@ -206,9 +206,9 @@ def _write_pure_project(
     (package / "__init__.py").write_text(f"VALUE = {version!r}\n")
 
 
-def _wheel_rows(paths: list[Path]) -> list[pb.LocalPackageWheel]:
+def _wheel_rows(paths: list[Path]) -> list[pb.LocalPackageFile]:
     rows = [
-        pb.LocalPackageWheel(
+        pb.LocalPackageFile(
             digest=hashlib.sha256(path.read_bytes()).digest(),
             filename=path.name,
             length=path.stat().st_size,
@@ -216,7 +216,7 @@ def _wheel_rows(paths: list[Path]) -> list[pb.LocalPackageWheel]:
         )
         for path in paths
     ]
-    rows.sort(key=lambda row: row.digest)
+    rows.sort(key=lambda row: row.filename)
     return rows
 
 
@@ -226,8 +226,9 @@ def _development(
     return pb.DevelopmentPackage(
         package=package,
         release=release,
-        source_digest=hashlib.sha256(b"editable-source").digest(),
-        local_revision_digest=revision_digest or hashlib.sha256(b"unknown-revision").digest(),
+        installation_id=(
+            revision_digest.hex() if revision_digest else package.replace("/", "-") + "-" + release
+        ),
     )
 
 
