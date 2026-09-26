@@ -113,6 +113,7 @@ from cozy_runtime.author._markers import (
     Preflight,
     Shape,
 )
+from cozy_runtime.author._memo import MemoDistribution, MemoResource
 from cozy_runtime.author._model import (
     ConstructionIdentity,
     Model,
@@ -238,6 +239,8 @@ __all__ = [
     "Loader",
     "MediaDecodeError",
     "MediaDecoder",
+    "MemoDistribution",
+    "MemoResource",
     "Mixed",
     "Model",
     "ModelArtifact",
