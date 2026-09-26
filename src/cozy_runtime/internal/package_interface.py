@@ -257,6 +257,14 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
     """The package interface's fixed point, proven over the built document (§1.0)."""
     if isinstance(value, Mapping):
         for key, item in value.items():
+            if key == "operation_identity" and re.fullmatch(
+                r"\.(?:entrypoints|jobs)\[\d+\]\.invocable", path
+            ):
+                # This belongs to the deterministic operation cache, not package
+                # installation admission or source snapshot identity.
+                if not isinstance(item, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None:
+                    raise ConformanceError("invalid operation memo identity", code="fixed_point")
+                continue
             if key == "default_ladder" and re.fullmatch(
                 r"\.(?:entrypoints|jobs)\[\d+\]\.models\[\d+\]", path
             ):
