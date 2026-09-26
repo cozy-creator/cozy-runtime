@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager, ExitStack, nullcontext
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from cozy.worker.v1.wire_version import MODEL_DEFAULT_GPU_COUNT_WIRE_MINOR
 from cozy_runtime.internal import fill, hostfacts
 from cozy_runtime.protocol import CAPTURED_MODEL_DEFAULTS_WIRE_MINOR, documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -114,9 +115,14 @@ def verify(
             ):
                 raise WorkspaceRefusal("captured Model default has invalid exact rung facts")
             documents.raw(manifest["digest"])
-            selectors.append(gpu.lower())
+            gpus = rung.get("gpus", 0)
+            if type(gpus) is not int or gpus < 0:
+                raise WorkspaceRefusal("captured Model default has invalid GPU count")
+            if gpus and request.claim.wire_minor < MODEL_DEFAULT_GPU_COUNT_WIRE_MINOR:
+                raise WorkspaceRefusal("counted Model defaults require wire63")
+            selectors.append((gpu.lower(), gpus))
         if len(set(selectors)) != len(selectors):
-            raise WorkspaceRefusal("captured Model default repeats a GPU selector")
+            raise WorkspaceRefusal("captured Model default repeats a GPU and count selector")
     if len(keys) > 4096 or keys != sorted(set(keys)) or set(keys) != expected:
         raise WorkspaceRefusal("captured Model default inventory is incomplete or ambiguous")
 
@@ -159,7 +165,23 @@ def select(
     selected = []
     for parameter in sorted(missing):
         row = defaults[parameter]
-        rung = next((rung for rung in row["rungs"] if matches(rung["gpu"], facts.gpu_name)), None)
+        rung = None
+        lanes = getattr(worker, "lanes", None)
+        entries = getattr(lanes, "entries", None)
+        for candidate in row["rungs"]:
+            if not matches(candidate["gpu"], facts.gpu_name):
+                continue
+            count = candidate.get("gpus", 0)
+            if count:
+                if entries is None and "gpu_count" in facts.unreadable:
+                    raise WorkspaceRefusal(
+                        "counted Model default requires a readable granted GPU count"
+                    )
+                capacity = len(entries) if entries is not None else facts.gpu_count
+                if count > capacity:
+                    continue
+            rung = candidate
+            break
         if rung is None:
             raise WorkspaceRefusal("captured Model default has no rung for this accelerator")
         selected.append({"parameter": parameter, "public_origin": row["public_origin"], **rung})

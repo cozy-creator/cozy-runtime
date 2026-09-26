@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal.worker import machine_capture
+from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
@@ -19,21 +20,38 @@ def state(preparation: dict[str, Any]) -> pb.DesiredWorkerState:
 
 
 def replica(
-    worker: Worker, owner: str, placement: dict[str, Any], models: list[dict[str, Any]]
+    worker: Worker,
+    owner: str,
+    placement: dict[str, Any],
+    models: list[dict[str, Any]],
+    defaults: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[pb.PlacementDevicePin]]:
     """Reserve a stable replica through the durable child submission, not a GPU hint.
 
     Outstanding requests charge their selected devices, including queued preparations.
     A singleton model therefore fills all granted devices before queuing another round.
-    Model-declared sequence parallelism chooses the largest supported group.
+    An explicit authored count reserves exactly that group. Earlier captures without
+    a count retain the largest supported group behavior.
     """
+    requested = {row.get("gpus", 0) for row in (defaults or [])} - {0}
+    if len(requested) > 1:
+        raise WorkspaceRefusal("one serving construction has conflicting default GPU counts")
+    requested_degree = next(iter(requested), 0)
+    if requested_degree > len(worker.lanes.entries):
+        raise WorkspaceRefusal("the requested default GPU group exceeds the granted device pool")
     if not models or not worker.lanes.wide:
         return placement, []
     degrees = set.intersection(
-        *(set(model.get("sequence_parallel", {}).get("degrees", [1])) for model in models)
+        *(set(model.get("sequence_parallel", {}).get("degrees", [])) | {1} for model in models)
     )
     width = len(worker.lanes.entries)
-    degree = max((value for value in degrees if 0 < value <= width), default=width)
+    degree = (
+        requested_degree
+        if requested_degree
+        else max((value for value in degrees if 0 < value <= width), default=width)
+    )
+    if degree not in degrees or degree > width:
+        raise WorkspaceRefusal("the requested default GPU group is not supported on this machine")
     groups = [tuple(range(start, start + degree)) for start in range(0, width - degree + 1, degree)]
     loads = [0] * width
     executions = worker.executions
@@ -69,7 +87,11 @@ def replica(
     # The replica is a placement instance, not a new package or binding. Reusing the
     # same immutable code/models on the same devices reuses its supervised executor.
     identity = canonical_json.encode(
-        [machine_capture.installation_identity(placement), placement["bindings_digest"], list(ordinals)]
+        [
+            machine_capture.installation_identity(placement),
+            placement["bindings_digest"],
+            list(ordinals),
+        ]
     )
     selected = dict(placement)
     selected["placement_id"] = "machine-" + hashlib.sha256(identity).hexdigest()[:32]
