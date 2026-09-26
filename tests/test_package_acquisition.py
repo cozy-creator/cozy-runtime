@@ -362,7 +362,6 @@ def _prepare_modeled(release: ModeledRelease, root: Path, slots: tuple[str, ...]
         release="1.0.0",
         application="modeled_package:app",
         model_slot_paths=(GENERATE, TOKENIZED, TURBO, WIDE),
-        inventory=None,
         locked=package_environment.read_locked_requirements(
             b"--index-url https://pypi.org/simple\nmodeled==1.0.0 --hash=sha256:"
             + b"a" * 64

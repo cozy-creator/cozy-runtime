@@ -317,10 +317,6 @@ def test_pod_prep_requires_the_request_facts(tmp_path: Path) -> None:
         prep(slots=["b.models.x", "a.models.y"])
     assert unsorted.value.code == "package_prepare_model_slot_paths_invalid"
 
-    with pytest.raises(PreparationRefusal) as no_inventory:
-        prep(inventory=pb.ImageInventory())
-    assert no_inventory.value.code == "package_prepare_image_inventory_invalid"
-
     with pytest.raises(PreparationRefusal) as no_lock:
         prep(locked=b"")
     assert no_lock.value.code == "package_prepare_locked_requirements_invalid"
