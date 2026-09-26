@@ -9,6 +9,7 @@ import io
 import json
 import os
 import subprocess
+import tomllib
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
@@ -73,12 +74,13 @@ def test_public_native_reuse_preserves_record_tags_version_and_provenance(
     assert result.returncode == 0, result.stderr
     receipt = json.loads(result.stdout)
     wheel = Path(receipt["wheel"])
-    assert wheel.name == f"cozy_runtime-0.18.33-{TAG}.whl"
+    version = tomllib.loads((repo / "pyproject.toml").read_text())["project"]["version"]
+    assert wheel.name == f"cozy_runtime-{version}-{TAG}.whl"
     assert hashlib.sha256(wheel.read_bytes()).hexdigest() == receipt["sha256"]
     with zipfile.ZipFile(wheel) as archive, zipfile.ZipFile(donor) as original:
-        prefix = "cozy_runtime-0.18.33.dist-info/"
+        prefix = f"cozy_runtime-{version}.dist-info/"
         metadata = BytesParser().parsebytes(archive.read(prefix + "METADATA"))
-        assert metadata["Name"] == "cozy-runtime" and metadata["Version"] == "0.18.33"
+        assert metadata["Name"] == "cozy-runtime" and metadata["Version"] == version
         tags = BytesParser().parsebytes(archive.read(prefix + "WHEEL"))
         assert tags.get_all("Tag") == [TAG] and tags["Root-Is-Purelib"] == "false"
         stamp = archive.read("cozy_runtime/_build_provenance.py").decode()
@@ -132,7 +134,8 @@ def test_only_changed_native_inputs_authorize_a_full_build(
         elif change == "backend":
             source = source.replace('cmake.build-type = "Release"', 'cmake.build-type = "Debug"')
         else:
-            source = source.replace('version = "0.18.33"', 'version = "0.18.33+dev.proof"', 1)
+            version = tomllib.loads(source)["project"]["version"]
+            source = source.replace(f'version = "{version}"', f'version = "{version}+dev.proof"', 1)
         assert source != path.read_text()
         path.write_text(source)
         assert run("git", "add", str(path), cwd=repo).returncode == 0
