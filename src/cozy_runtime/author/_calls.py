@@ -59,10 +59,11 @@ def invocable[**P, R](
 
 @overload
 def invocable[**P, R](
-    *, memoize: bool = False,
+    *,
+    memoize: bool = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[Callable[..., object] | str, ...] = (),
-    defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None
+    defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
 ) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]: ...
 
 
@@ -88,11 +89,11 @@ def invocable[**P, R](
     or derivation. The injected Model object itself belongs to its current attempt;
     it is not a portable artifact receipt and cannot be forwarded to another call.
 
-    Memoized operations declare a semantic ``memo_version`` and helper callables
-    or Python module names in ``memo_dependencies``. Their source changes invalidate
-    the operation cache. Bump the version for changes outside those sources, such
-    as native algorithms or data tables. Without a version, execution remains valid
-    and does not reuse a completed operation result.
+    Memoized operations automatically bind their Python implementation. Declare
+    helper callables or Python modules in ``memo_dependencies`` when their logic
+    affects the result; source changes invalidate reuse without a manual version
+    bump. Optional ``memo_version`` salts behavior outside those sources, such as
+    native algorithms or data tables. Unavailable source disables reuse, not execution.
     """
     if type(memoize) is not bool:
         raise ConformanceError(
@@ -100,23 +101,34 @@ def invocable[**P, R](
         )
     if fn is None:
         return lambda target: invocable(
-            target, memoize=memoize, memo_version=memo_version,
-            memo_dependencies=memo_dependencies, defaults=defaults,
+            target,
+            memoize=memoize,
+            memo_version=memo_version,
+            memo_dependencies=memo_dependencies,
+            defaults=defaults,
         )
     if not inspect.iscoroutinefunction(fn) or "<locals>" in fn.__qualname__:
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
-    if memo_version is not None:
-        if not memoize or not isinstance(memo_version, str) or not 1 <= len(memo_version) <= 128:
-            raise ConformanceError("memo_version needs memoize=True and a bounded version", code="invocable_memoize")
-        if not isinstance(memo_dependencies, tuple) or len(memo_dependencies) > 64 or any(
-            not callable(helper) and not isinstance(helper, str) for helper in memo_dependencies
-        ):
-            raise ConformanceError("memo_dependencies needs bounded helper definitions", code="invocable_memoize")
-        setattr(fn, "_cozy_memo_declaration", (memo_version, memo_dependencies))
-    elif memo_dependencies:
-        raise ConformanceError("memo_dependencies needs memo_version", code="invocable_memoize")
+    if memo_version is not None and (
+        not memoize or not isinstance(memo_version, str) or len(memo_version) > 128
+    ):
+        raise ConformanceError(
+            "memo_version needs memoize=True and a bounded version", code="invocable_memoize"
+        )
+    if (
+        not isinstance(memo_dependencies, tuple)
+        or len(memo_dependencies) > 64
+        or any(not callable(helper) and not isinstance(helper, str) for helper in memo_dependencies)
+        or (memo_dependencies and not memoize)
+    ):
+        raise ConformanceError(
+            "memo_dependencies needs memoize=True and bounded helper definitions",
+            code="invocable_memoize",
+        )
+    if memo_version is not None or memo_dependencies:
+        fn.__dict__["_cozy_memo_declaration"] = (memo_version or "", memo_dependencies)
     export = _Export(fn, fn.__module__, fn.__name__, memoize, model_defaults(defaults))
 
     def proxy(*args: P.args, **kwargs: P.kwargs) -> PendingCall[R]:

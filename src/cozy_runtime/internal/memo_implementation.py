@@ -8,23 +8,20 @@ import importlib.util
 import inspect
 import json
 import textwrap
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 MAX_SOURCE_BYTES = 1 << 20
 
 
 def describe(fn: Callable[..., object]) -> dict[str, str]:
-    """Authors version external behavior and declare helpers that affect the result.
+    """Hash Python behavior; authors may salt external behavior and declare helpers.
 
     Only this callable and those declared helpers enter its key. Install handles,
     caller scripts, package inventories and client SDKs never participate. Missing
     source disables the shortcut; it cannot refuse an otherwise valid invocation.
     """
-    declaration = getattr(fn, "_cozy_memo_declaration", None)
-    if declaration is None:
-        return {"operation_identity_unavailable": "operation_version_not_declared"}
-    version, dependencies = declaration
+    version, dependencies = getattr(fn, "_cozy_memo_declaration", ("", ()))
     try:
         definitions = [_definition(fn)]
         for dependency in dependencies:
@@ -41,7 +38,9 @@ def describe(fn: Callable[..., object]) -> dict[str, str]:
                 definitions.append(_definition(dependency))
         document = json.dumps(
             {"operation_version": version, "definitions": definitions},
-            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
         ).encode()
     except (ImportError, OSError, TypeError, ValueError, SyntaxError):
         return {"operation_identity_unavailable": "operation_source_unavailable"}

@@ -114,13 +114,11 @@ def test_generated_interface_is_deterministic_typed_and_imports_without_implemen
         raw,
         distribution="private-operations",
         version="0.1.0",
-        implementation_digest="sha256:" + "17" * 32,
     )
     second = interface_wheel.build(
         raw,
         distribution="private-operations",
         version="0.1.0",
-        implementation_digest="sha256:" + "17" * 32,
     )
     assert first == second
     files = interface_wheel.generate(raw)
@@ -205,7 +203,7 @@ def test_ordinary_main_reserves_self_call_with_implicit_attempt_lifetime(tmp_pat
     broker = _Broker(
         "parent",
         {
-            ("", __name__, "transform"): _CallType(
+            (__name__, "transform"): _CallType(
                 "sha256:" + "13" * 32,
                 __name__,
                 "transform",
