@@ -2309,6 +2309,21 @@ class Worker:
 
     def _prepare_execution(self, preparation: dict[str, Any], request_id: str = "") -> bool:
         """Reuse the existing preparation/convergence engine without replacing live work."""
+        if self.phase == pb.WorkerPhase.WORKER_PHASE_FAILED:
+            # A failed convergence lane can never satisfy the pending-revision
+            # wait below. Refuse through the existing durable execution path so
+            # a parent awaiting this child receives the originating failure.
+            fault = next(
+                (
+                    fault
+                    for fault in reversed(self.engine.faults)
+                    if fault.subject == self.options.worker_id
+                ),
+                None,
+            )
+            detail = fault.reason if fault is not None else "worker entered FAILED state"
+            raise WorkspaceRefusal(f"worker preparation stopped: {detail}")
+
         from . import machine_capture
 
         desired = pb.DesiredWorkerState.FromString(
