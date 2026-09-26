@@ -1,133 +1,121 @@
 from __future__ import annotations
 
-import shutil
-import subprocess
+import importlib.metadata
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import grpc
 import pytest
 
-from cozy_runtime.internal.base_observation import Observation
+from cozy_runtime.author import describe
+from cozy_runtime.derive.operations import app
+from cozy_runtime.internal import package_interface
+from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.hostfacts import HostFacts
 from cozy_runtime.internal.numerical_environment import NumericalEnvironmentRefusal, fingerprint
 from cozy_runtime.internal.worker.control import _PreparationServicer
+from cozy_runtime.internal.worker.machine_child_target import Target, computation
 from cozy_runtime.protocol import worker_pb2 as pb
 from cozy_runtime.protocol import worker_pb2_grpc as rpc
 
 
-def test_probe_uses_selected_interpreter_and_ignores_install_location(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from cozy_runtime.internal import package_environment
-
-    root = Path(__file__).parents[1]
-    wheelhouse = tmp_path / "wheels"
-    subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(wheelhouse)],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    )
-    (wheel,) = wheelhouse.glob("*.whl")
-    interpreters = []
-    for name in ("first", "relocated"):
-        prefix = tmp_path / name
-        python = prefix / "bin/python"
-        copied_wheel = tmp_path / (name + "-wheels") / wheel.name
-        copied_wheel.parent.mkdir()
-        shutil.copyfile(wheel, copied_wheel)
-        subprocess.run(
-            ["uv", "venv", str(prefix), "--python", sys.executable], check=True, capture_output=True
+def quantize_key(root: Path, numerical: bytes) -> bytes:
+    document = package_interface.build(
+        Discovered(
+            app,
+            "cozy_runtime.derive.operations:app",
+            root,
+            sys.modules[app.get("quantize").fn.__module__],
+            describe(app),
+            {},
         )
-        subprocess.run(
-            ["uv", "pip", "install", "--offline", "--python", str(python), str(copied_wheel)],
-            check=True,
-            capture_output=True,
-        )
-        interpreters.append((python, package_environment.observe_base(python)))
-
-    def wrong_control(*args: object, **kwargs: object) -> None:
-        raise AssertionError("control interpreter distribution discovery was used")
-
-    monkeypatch.setattr("importlib.metadata.distribution", wrong_control)
-    device = HostFacts(backend="cpu")
-    identities = [
-        fingerprint(base, device, threads=1, alloc_conf="", inherited={}, python=python)
-        for python, base in interpreters
-    ]
-    assert len(identities[0]) == 32 and identities[0] == identities[1]
-    python, base = interpreters[0]
-    for distributions in (
-        tuple(
-            (name, "0.0.0" if name == "cozy-runtime" else version)
-            for name, version in base.distributions
-        ),
-        (*base.distributions, ("torch", "2.14.0")),
-    ):
-        with pytest.raises(NumericalEnvironmentRefusal):
-            fingerprint(
-                replace(base, distributions=distributions),
-                device,
-                threads=1,
-                alloc_conf="",
-                inherited={},
-                python=python,
-            )
-
-
-def test_installed_code_changes_reuse_identity_without_version_or_machine_changes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Real distribution discovery reads these wheel metadata files; no probe is mocked.
-    metadata = tmp_path / "cozy_runtime-0.9.0.dist-info"
-    metadata.mkdir()
-    (metadata / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: cozy-runtime\nVersion: 0.9.0\n"
     )
-    record = metadata / "RECORD"
-    record.write_text("cozy_runtime/algorithm.py,sha256=first-implementation,128\n")
+    rows: Any = document["jobs"]
+    declaration = next(row for row in rows if row["name"] == "quantize")
+    identity = declaration["invocable"]["operation_identity"]
+    target = Target("installation-is-not-computation", "quantize", declaration, {}, None, identity)
+    return computation(
+        target,
+        {
+            "source": {"manifest": {"digest": "sha256:" + "a" * 64, "length": 164}},
+            "plan": {"components": ["model"]},
+            "encoding": "fp8-rowwise/1",
+        },
+        numerical,
+    )
+
+
+def test_actual_managed_key_ignores_runtime_inventory_but_tracks_declared_native_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sdk = tmp_path / "cozy_runtime-0.9.0.dist-info"
+    sdk.mkdir()
+    (sdk / "METADATA").write_text("Name: cozy-runtime\nVersion: 0.9.0\n")
+    (sdk / "RECORD").write_text("cozy_runtime/caller.py,sha256=first,128\n")
     monkeypatch.syspath_prepend(str(tmp_path))
-    base = Observation(
-        "cp312",
-        "linux/amd64",
-        "glibc2.39",
-        "cuda",
-        "cu130",
-        "2.13.0",
-        "13.0",
-        "0.10.0",
-        (("cozy-runtime", "0.9.0"),),
-        (),
-        "3.12.12",
+    installed = importlib.metadata.distribution("tensorfs")
+    discover = importlib.metadata.distribution
+
+    def no_sdk_inventory(name: str) -> importlib.metadata.Distribution:
+        assert name.replace("_", "-") != "cozy-runtime", "the SDK is not a numerical dependency"
+        return discover(name)
+
+    monkeypatch.setattr(importlib.metadata, "distribution", no_sdk_inventory)
+    policy = fingerprint(HostFacts(backend="cpu"), threads=1, inherited={})
+    first = quantize_key(tmp_path, policy)
+    assert len(first) == 32
+    (sdk / "METADATA").write_text("Name: cozy-runtime\nVersion: 99.0\n")
+    (sdk / "RECORD").write_text("cozy_runtime/unrelated_caller.py,sha256=changed,256\n")
+    (sdk / "direct_url.json").write_text('{"dir_info":{"editable":true}}')
+    assert (
+        quantize_key(tmp_path, fingerprint(HostFacts(backend="cpu"), threads=1, inherited={}))
+        == first
     )
+    (sdk / "RECORD").unlink()
+    assert quantize_key(tmp_path, policy) == first
+
+    native = tmp_path / "tensorfs-999.0.dist-info"
+    native.mkdir()
+    metadata, wheel = installed.read_text("METADATA"), installed.read_text("WHEEL")
+    assert metadata is not None and wheel is not None
+    (native / "METADATA").write_text(
+        metadata.replace(f"Version: {installed.version}\n", "Version: 999.0\n", 1)
+    )
+    (native / "WHEEL").write_text(wheel)
+    assert quantize_key(tmp_path, policy) != first
+
+
+def test_gpu_execution_policy_changes_keys_without_capacity_or_diagnostic_noise(
+    tmp_path: Path,
+) -> None:
     device = HostFacts(backend="cuda", gpu_sm=89, driver_version="580.1")
 
-    def measure(selected: HostFacts = device, threads: int = 4) -> bytes:
-        return fingerprint(
-            base,
-            selected,
-            threads=threads,
-            alloc_conf="expandable_segments:True",
-            inherited={"COZY_BOOTSTRAP_CREDENTIAL": "never-part-of-identity"},
-        )
+    def key(selected: HostFacts = device, threads: int = 4, **flags: str) -> bytes:
+        return quantize_key(tmp_path, fingerprint(selected, threads=threads, inherited=flags))
 
-    first = measure()
-    assert len(first) == 32
-    assert measure(replace(device, gpu_name="different label", vram_total_bytes=128 << 30)) == first
-    assert measure(replace(device, driver_version="590.1")) != first
-    assert measure(threads=8) != first
-    record.write_text("cozy_runtime/algorithm.py,sha256=corrected-implementation,128\n")
-    assert measure() != first
-    (metadata / "direct_url.json").write_text('{"dir_info":{"editable":true}}')
+    first = key()
+    assert key(replace(device, gpu_name="another label", vram_total_bytes=128 << 30)) == first
+    assert (
+        key(
+            COZY_BOOTSTRAP_CREDENTIAL="never-key-material",
+            PYTORCH_CUDA_ALLOC_CONF="changed",
+            CUDA_LAUNCH_BLOCKING="1",
+            OMP_DISPLAY_ENV="TRUE",
+        )
+        == first
+    )
+    assert key(HostFacts(backend="cpu")) != first
+    assert key(replace(device, gpu_sm=90)) != first
+    assert key(replace(device, driver_version="590.1")) != first
+    assert key(NVIDIA_TF32_OVERRIDE="0") != first
+    assert key(CUBLAS_WORKSPACE_CONFIG=":4096:8") != first
+    assert key(threads=1) != first
     with pytest.raises(NumericalEnvironmentRefusal):
-        measure()
-    (metadata / "direct_url.json").unlink()
-    record.unlink()
-    with pytest.raises(NumericalEnvironmentRefusal):
-        measure()
+        key(replace(device, gpu_sm=0))
 
 
 def test_numerical_environment_rpc_refuses_unproven_identity_without_detail_leak() -> None:
