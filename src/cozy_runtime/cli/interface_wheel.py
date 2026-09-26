@@ -30,7 +30,6 @@ def run(args: list[str]) -> Result:
             "interface_path",
             "distribution",
             "version",
-            "implementation_digest",
             "output_directory",
             "implementation_wheel",
             "implementation_wheel_digest",
@@ -61,7 +60,6 @@ def run(args: list[str]) -> Result:
             interface,
             distribution=request["distribution"],
             version=request["version"],
-            implementation_digest=request["implementation_digest"],
             implementation_wheel=implementation,
             implementation_filename=source.name,
         )
