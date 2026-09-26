@@ -158,6 +158,7 @@ def test_preparation_start_is_visible_without_fabricated_fraction(tmp_path: Path
 
     emitted = []
     worker = SimpleNamespace(
+        workspace=None,
         emit_progress=lambda *args: emitted.append(args),
         calls=SimpleNamespace(progress_label=lambda *args: "Shot 1 of 7"),
     )
@@ -175,7 +176,7 @@ def test_preparation_start_is_visible_without_fabricated_fraction(tmp_path: Path
         )
         raise ValueError("download failed")
     assert emitted[-1][2]["fields"]["completed"] is False
-    serving.pool.shutdown()
+    serving.close()
 
 
 def test_optional_child_progress_cannot_turn_a_valid_result_into_failure(
