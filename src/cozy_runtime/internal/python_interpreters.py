@@ -102,8 +102,11 @@ def available(
             )
             try:
                 rows = json.loads(found.stdout) if found.returncode == 0 else []
+                # uv renders installed paths relative to its inherited working
+                # directory when possible. Anchor those discovery results before
+                # the strict probe, preserving symlinks and configured-path rules.
                 candidates.extend(
-                    Path(row["path"])
+                    Path(row["path"]).absolute()
                     for row in rows
                     if row.get("implementation") == "cpython"
                     and row.get("variant") == "default"
@@ -130,7 +133,7 @@ def available(
                     env=package_install_environment(),
                 )
                 if found.returncode == 0:
-                    candidates.append(Path(found.stdout.strip()))
+                    candidates.append(Path(found.stdout.strip()).absolute())
     if root is not None:
         pattern = "cpython-*/python.exe" if sys.platform == "win32" else "cpython-*/bin/python*.*"
         candidates.extend(sorted((root / "managed").glob(pattern)))
