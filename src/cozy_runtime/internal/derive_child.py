@@ -301,31 +301,27 @@ def _emit(value: Mapping[str, Any]) -> None:
     )
 
 
-def _derive_twice(
+def _derive_slot(
     binding: ModelBinding, config: Config, assets: Mapping[str, bytes]
 ) -> TensorRequirements:
-    """A transient derivation must still be deterministic within one request."""
+    """Derive the ordered construction once; serving validates its actual destinations.
+
+    Rebuilding here only samples determinism, which belongs in author tests. It
+    cannot replace the serving Loader's census/fit or component-agreement checks.
+    """
 
     from cozy_runtime.author import Artifact
     from cozy_runtime.internal.derive import derive
 
-    def once() -> TensorRequirements:
-        result = derive(
-            binding.model_class(),
-            Artifact("derive://request", {}, config, assets=assets, custody="canonical"),
-            component_use=binding.components,
-        )
-        rows = tuple(
-            (component, key, dtype, tuple(shape)) for component, key, dtype, shape in result.rows()
-        )
-        return TensorRequirements(binding.path, rows, result.components)
-
-    first = once()
-    if once() != first:
-        raise DeriveRefusal(
-            "derive_nondeterministic", f"{binding.path} produced different tensor rows on rebuild"
-        )
-    return first
+    result = derive(
+        binding.model_class(),
+        Artifact("derive://request", {}, config, assets=assets, custody="canonical"),
+        component_use=binding.components,
+    )
+    rows = tuple(
+        (component, key, dtype, tuple(shape)) for component, key, dtype, shape in result.rows()
+    )
+    return TensorRequirements(binding.path, rows, result.components)
 
 
 def _warm_torch() -> None:
@@ -388,7 +384,7 @@ def main() -> int:
                 requirements.append(SourceSlot(row.slot))
             else:
                 requirements.append(
-                    _derive_twice(
+                    _derive_slot(
                         binding,
                         Config(document, "config", tensor_dtypes=row.tensor_dtypes),
                         row.assets,
