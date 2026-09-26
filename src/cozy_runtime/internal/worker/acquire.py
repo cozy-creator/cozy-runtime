@@ -306,7 +306,7 @@ def preinstalled_development(
             "development_binding_set_changed",
             "the locally derived bindings do not cover the exact selected entrypoints",
         )
-    verified = interface_length
+    verified = len(placement.package_interface)
     for digest, binding in bindings.items():
         selected = selected_digests[digest]
         slots = selected.get("slots", [])
@@ -536,6 +536,7 @@ class Acquirer:
         return self._manifest_bytes[digest]
 
     def _bindings(self, placement: Any) -> tuple[Mapping[str, DeclaredBinding], int]:
+        development = placement.development
         interface_path = self.selection_root / placement.installation_id / "package-interface.json"
         interface_path.parent.mkdir(parents=True, exist_ok=True)
         interface_path.write_bytes(placement.package_interface)
