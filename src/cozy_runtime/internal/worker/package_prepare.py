@@ -206,7 +206,7 @@ def _installed_interface(
             "package_prepare_interface_invalid", f"{distribution!r} has multiple interfaces"
         )
     if metadata:
-        raw = _read_file(metadata[0], canonical.DOC_MAX_BYTES)
+        raw = _read_installed_interface(metadata[0], installed.site_packages)
     elif describe is not None:
         raw = describe(installed, distribution)
     else:
@@ -227,6 +227,36 @@ def _installed_interface(
         raw = describe(installed, distribution)
         package_interface.read_bytes(raw, "installed operation interface")
     return raw
+
+
+def _read_installed_interface(path: Path, site_packages: Path) -> bytes:
+    """Follow uv's installed metadata links, including the immutable image seed.
+
+    Only an installed distribution's direct interface member permits links. Cache
+    artifacts and receipts continue to use the no-symlink `_read_file` boundary.
+    """
+    maximum = canonical.DOC_MAX_BYTES
+    try:
+        relative = path.relative_to(site_packages)
+        if (
+            len(relative.parts) != 2
+            or not relative.parts[0].endswith(".dist-info")
+            or relative.parts[1] != "package-interface.json"
+        ):
+            raise OSError("invalid installed interface path")
+        resolved = path.resolve(strict=True)
+        if not stat.S_ISREG(resolved.lstat().st_mode):
+            raise OSError("invalid file")
+        with resolved.open("rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= maximum:
+                raise OSError("invalid file")
+            raw = stream.read(maximum + 1)
+        if not 0 < len(raw) <= maximum:
+            raise OSError("invalid file size")
+        return raw
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise PreparationRefusal("package_prepare_file_unreadable", str(path)) from exc
 
 
 def prepare_published_local(
