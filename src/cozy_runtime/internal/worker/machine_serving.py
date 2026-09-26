@@ -337,6 +337,7 @@ class Serving:
             return
         prepared = None
         keep_prepared = False
+        reservation_active = False
         try:
             prepared = future.result()
             from . import machine_lanes
@@ -361,6 +362,16 @@ class Serving:
             groups = self.worker.machine_groups
             if groups is not None:
                 groups.waiting.discard(call.child_request)
+                # ``replica`` runs before the child execution is durable.  Reserve this
+                # selected lane in the parent root so sibling children admitted in this
+                # same drive pass choose disjoint devices instead of all taking ordinal 0.
+                groups.reserve(
+                    owner,
+                    call.parent_request,
+                    call.child_request,
+                    pins[0].device_ordinals if pins else (),
+                )
+                reservation_active = True
             # Recipient custody begins only when this child can enter its GPU group.
             _, models = arguments(target, request.request_canonical_bytes)
             names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
@@ -507,6 +518,11 @@ class Serving:
                     max_attempts=attempts,
                     retry_delay_ms=delay,
                 )
+            if reservation_active:
+                groups = self.worker.machine_groups
+                if groups is not None:
+                    groups.release_reservation(owner, call.child_request)
+                reservation_active = False
             if executions.status(owner, call.child_request).state == "queued":
                 label = self.worker.calls.progress_label(
                     call.parent_request, request.parent_attempt_ordinal, call.call_index
@@ -520,6 +536,10 @@ class Serving:
                     },
                 )
         finally:
+            if reservation_active:
+                groups = self.worker.machine_groups
+                if groups is not None:
+                    groups.release_reservation(owner, call.child_request)
             if prepared is not None:
                 prepared.access.close()
             if not keep_prepared:

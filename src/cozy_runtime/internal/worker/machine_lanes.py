@@ -72,6 +72,11 @@ def replica(
     available = tuple(range(width))
     affinity = getattr(worker, "machine_groups", None)
     if parent_request and affinity is not None:
+        # A sibling may already have selected a lane in this drive pass while its
+        # durable execution row is still being written.  Include those transient
+        # selections in the tie-breaker as well as in root affinity's width growth.
+        transient = affinity.reservation_loads(owner, width)
+        loads = [current + pending for current, pending in zip(loads, transient, strict=True)]
         available = affinity.available(owner, parent_request, selected_degree, loads)
     if len(available) < selected_degree:
         return None
