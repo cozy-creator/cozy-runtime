@@ -68,6 +68,8 @@ def test_request_compositions_are_isolated_from_each_other() -> None:
         factors_b.lora_up.add_(1)
     baked_a = bake_lora_linear(base, factors_a)
     baked_b = bake_lora_linear(base, factors_b)
+    value = torch.arange(20, dtype=torch.float32).reshape(5, 4).to(torch.bfloat16)
+    pristine_output = base(value)
     before_b = baked_b.weight.detach().clone()
     with torch.no_grad():
         baked_a.weight.add_(1)
@@ -75,6 +77,7 @@ def test_request_compositions_are_isolated_from_each_other() -> None:
     torch.testing.assert_close(baked_b.weight, before_b, rtol=0, atol=0)
     # Neither request changes the shared source model.
     torch.testing.assert_close(base.weight, pristine, rtol=0, atol=0)
+    torch.testing.assert_close(base(value), pristine_output, rtol=0, atol=0)
 
 
 def test_bake_refuses_encoded_base_dtype() -> None:
