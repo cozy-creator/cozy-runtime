@@ -19,7 +19,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired, TypedDict
+
+import msgspec
 
 from cozy_runtime.internal import (
     base_observation,
@@ -37,6 +39,29 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 type FaultKind = pb.FaultKind
 type LegName = Literal["package", "model"]
+
+
+class _SequenceParallel(TypedDict):
+    degrees: list[int]
+
+
+_ModelDeclaration = TypedDict("_ModelDeclaration", {
+    "path": str,
+    "class": str,
+    "component_use": NotRequired[dict[str, list[str]]],
+    "sequence_parallel": NotRequired[_SequenceParallel],
+})
+
+
+class _EntrypointDeclaration(TypedDict):
+    name: str
+    models: NotRequired[list[_ModelDeclaration]]
+    internal: NotRequired[bool]
+
+
+class _ArtifactReference(msgspec.Struct, forbid_unknown_fields=True):
+    digest: str
+    length: int
 
 
 class AcquisitionRefusal(Exception):
@@ -565,7 +590,7 @@ class Acquirer:
                 )
             slots = entrypoint.get("slots", [])
             described_models = described.get("models", [])
-            if not isinstance(described_models, list) or len(slots) != len(described_models):
+            if len(slots) != len(described_models):
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED, "binding_slot_set_mismatch", name
                 )
@@ -584,9 +609,7 @@ class Acquirer:
                     internal=bool(described.get("internal", False)),
                 )
                 continue
-            described_by_path = {
-                str(row.get("path", "")): row for row in described_models if isinstance(row, dict)
-            }
+            described_by_path = {row["path"]: row for row in described_models}
             if len(described_by_path) != len(described_models):
                 raise AcquisitionRefusal(
                     pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
@@ -635,8 +658,8 @@ class Acquirer:
                     ) from exc
                 sequence_parallel = declared.get("sequence_parallel")
                 degrees = (
-                    tuple(int(d) for d in sequence_parallel.get("degrees", []))
-                    if isinstance(sequence_parallel, dict)
+                    tuple(sequence_parallel["degrees"])
+                    if sequence_parallel is not None
                     else ()
                 )
                 members.append(
@@ -728,9 +751,9 @@ def _model_group_weight_bytes(
     checkpoints = {
         snapshot: fill.Checkpoint(root, snapshot) for snapshot in set(snapshots.values())
     }
-    checkpoint_sizes = {}
+    checkpoint_sizes: dict[str, dict[str, int]] = {}
     for snapshot, checkpoint in checkpoints.items():
-        sizes = {}
+        sizes: dict[str, int] = {}
         for component in checkpoint.header["components"]:
             rows = checkpoint.rows(component)
             # Fill adds scratch/derived buffers to this header bound later.
@@ -781,22 +804,20 @@ def _verify_bytes(raw: bytes, digest: str, length: int) -> None:
 
 
 def _ref(value: object, name: str) -> tuple[str, int]:
-    if (
-        not isinstance(value, dict)
-        or set(value) != {"digest", "length"}
-        or not isinstance(value.get("digest"), str)
-        or not str(value["digest"]).startswith("sha256:")
-        or len(str(value["digest"])) != 71
-        or not isinstance(value.get("length"), int)
-        or isinstance(value["length"], bool)
-        or int(value["length"]) <= 0
-    ):
+    try:
+        reference = msgspec.convert(value, type=_ArtifactReference)
+        if (
+            not reference.digest.startswith("sha256:")
+            or len(reference.digest) != 71 or reference.length <= 0
+        ):
+            raise ValueError("invalid reference")
+    except (msgspec.ValidationError, ValueError) as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             f"{name}_ref_invalid",
             "reference is exactly {digest,length}",
-        )
-    return str(value["digest"]), int(value["length"])
+        ) from exc
+    return reference.digest, reference.length
 
 
 def cozytensors_ref(tensorfs: Any, raw: bytes) -> tuple[str, int]:
@@ -825,19 +846,16 @@ def cozytensors_ref(tensorfs: Any, raw: bytes) -> tuple[str, int]:
     return ref
 
 
-def _visible_entrypoints(interface: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    rows = interface.get("entrypoints")
-    if not isinstance(rows, list):
+def _visible_entrypoints(interface: Mapping[str, object]) -> dict[str, _EntrypointDeclaration]:
+    try:
+        rows = msgspec.convert(interface.get("entrypoints"), type=list[_EntrypointDeclaration])
+    except msgspec.ValidationError as exc:
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
             "package_interface_invalid",
-            "entrypoints is not an array",
-        )
-    visible = {
-        str(row["name"]): row
-        for row in rows
-        if isinstance(row, dict) and isinstance(row.get("name"), str)
-    }
+            str(exc),
+        ) from exc
+    visible = {row["name"]: row for row in rows}
     if len(visible) != len(rows):
         raise AcquisitionRefusal(
             pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,

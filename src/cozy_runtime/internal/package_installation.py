@@ -11,8 +11,12 @@ import sys
 import tarfile
 import uuid
 from contextlib import contextmanager
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import NotRequired, TypedDict
+
+import msgspec
 
 from cozy_runtime.internal.config import package_install_environment
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
@@ -21,6 +25,14 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
 MAX_SOURCE_BYTES = 1 << 30
 MAX_SOURCE_FILES = 100_000
 IMAGE_UV_CACHE = Path("/opt/cozy/dependency-seed/uv-cache")
+
+
+class InstallationRecord(TypedDict):
+    package: str
+    release: str
+    python: NotRequired[str]
+    generation: NotRequired[str]
+    site_packages: NotRequired[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +55,9 @@ def _directory(root: Path, installation_id: str) -> Path:
 def open_installation(root: Path, installation_id: str) -> InstalledEnvironment:
     directory = _directory(root, installation_id)
     try:
-        record = json.loads((directory / "installation.json").read_bytes())
+        record = msgspec.json.decode(
+            (directory / "installation.json").read_bytes(), type=InstallationRecord,
+        )
         python = Path(record.get("python", directory / "venv" / "bin" / "python"))
         generation = Path(record.get("generation", python.parent.parent))
         sites = ([Path(record["site_packages"])] if "site_packages" in record
@@ -228,7 +242,7 @@ def retain_environment(
 
 
 @contextmanager
-def _installation_lock(root: Path, identifier: str):
+def _installation_lock(root: Path, identifier: str) -> Iterator[int]:
     directory = _directory(root, identifier)
     locks = directory.parent / ".locks"
     locks.mkdir(parents=True, exist_ok=True, mode=0o700)
