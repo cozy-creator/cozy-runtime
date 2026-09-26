@@ -400,19 +400,18 @@ class Serving:
                 } == expected:
                     matched = candidate
                     break
-            with self.phase(call, request, "Preparing model files"):
-                machine_model_defaults.materialize(
-                    worker,
-                    defaults,
-                    access if matched is None else None,
-                    downloading=lambda: self.phase(call, request, "Downloading model"),
-                )
+            machine_model_defaults.materialize(
+                worker,
+                defaults,
+                access if matched is None else None,
+                downloading=lambda: self.phase(call, request, "Downloading model weights"),
+            )
             if matched is not None:
                 return Prepared(matched, defaults, access)
             installed = package_installation.open_installation(
                 Path(worker.options.install_root or ""), target.installation_id,
             )
-            with self.phase(call, request, "Checking model compatibility"), worker.preparation_lock:
+            with worker.preparation_lock, self.phase(call, request, "Checking model compatibility"):
 
                 def verified(digest: str, length: int, path: Path) -> None:
                     worker.verified_artifacts.record(digest, length, path)
