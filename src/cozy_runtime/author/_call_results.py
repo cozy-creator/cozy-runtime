@@ -46,6 +46,7 @@ def decode(
     guard: Callable[[], None],
     observation: ExecutionObservation | None,
     grant_token: object | None = None,
+    python_type: type[msgspec.Struct] | None = None,
 ) -> tuple[Any, ExecutionObservation | None]:
     """Every native result leaf is replaced from the separately verified host grant."""
     if len(grants) > 32:
@@ -151,6 +152,18 @@ def decode(
         raise TypeError("result asset is not a verified grant of this attempt")
 
     result = msgspec.convert(replace(value, ""), type=result_type, dec_hook=granted, strict=True)
+    if python_type is not None:
+        # The generated schema above owns wire admission, including unknown
+        # fields and tags. Then return the installed public Python type while
+        # retaining each granted native handle as the same object.
+        result = msgspec.convert(
+            msgspec.to_builtins(
+                result, builtin_types=(FileAsset, ImageAsset, AudioAsset, VideoAsset, Tree)
+            ),
+            type=python_type,
+            dec_hook=granted,
+            strict=True,
+        )
     # A received result becomes an input to the rest of the parent's Python
     # composition. Preserve its declared per-field media/decode limits through
     # the same concrete-value traversal used for ordinary input hydration.

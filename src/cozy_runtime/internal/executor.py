@@ -3413,7 +3413,7 @@ class Executor:
         """
         from types import ModuleType
 
-        from cozy_runtime.internal import interface_wheel
+        from cozy_runtime.internal import call_types, interface_wheel
 
         prepared: set[str] = set()
         for row in command.get("call_interfaces") or []:
@@ -3431,7 +3431,10 @@ class Executor:
             companion = ModuleType(companion_name)
             sys.modules[companion_name] = companion
             exec(compile(source, "<installed package callers>", "exec"), companion.__dict__)
-            bindings = companion.__dict__["__cozy_bindings__"]
+            bindings = {
+                export: call_types.public_result(imported, binding)
+                for export, binding in companion.__dict__["__cozy_bindings__"].items()
+            }
             imported.__dict__["__cozy_bindings__"] = bindings
             for export in bindings:
                 imported.__dict__[export] = companion.__dict__[export]

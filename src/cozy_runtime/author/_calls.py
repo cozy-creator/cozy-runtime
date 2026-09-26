@@ -208,6 +208,7 @@ class _CallType:
     export: str
     request: type[msgspec.Struct]
     result: type[msgspec.Struct]
+    python_result: type[msgspec.Struct] | None = None
 
 
 class PendingCall[R](Awaitable[R]):
@@ -376,6 +377,7 @@ class _Broker:
                             guard=guard,
                             observation=call.observation,
                             grant_token=self.grant_token,
+                            python_type=call.binding.python_result,
                         )
                         return cast(R, result)
                     except (ValueError, TypeError, msgspec.ValidationError) as exc:
