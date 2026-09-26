@@ -97,7 +97,13 @@ from cozy_runtime.internal.parallel.plan import (
     rank_invariant_digest,
 )
 from cozy_runtime.internal.residency import Construction, ConstructionArbiter, ResidencyRefusal
-from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError, connect
+from cozy_runtime.internal.seam import (
+    EXECUTOR_PROTOCOL_REVISION,
+    RESULT_DOCUMENT,
+    Channel,
+    SeamError,
+    connect,
+)
 from cozy_runtime.internal.worker.plan import shape_cell
 from cozy_runtime.protocol import documents
 
@@ -3519,8 +3525,8 @@ class Executor:
                 bindings[(module, export)] = binding
             else:
                 imported = importlib.import_module(module)
-                from cozy_runtime.author._calls import _export
                 from cozy_runtime.author._app import Registration
+                from cozy_runtime.author._calls import _export
 
                 function = getattr(imported, export, None)
                 declared = _export(function) if callable(function) else None
@@ -4045,6 +4051,7 @@ def main(argv: list[str] | None = None) -> int:
                     "python_abi": (sys.implementation.cache_tag or "").replace("cpython-", "cp"),
                     "python_executable": sys.executable,
                     "runtime_version": RUNTIME_VERSION,
+                    "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
                     "pgid": os.getpgrp(),
                     "no_new_privs": _proc_status("NoNewPrivs"),
                     "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),

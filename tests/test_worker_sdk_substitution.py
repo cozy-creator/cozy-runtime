@@ -20,7 +20,6 @@ import cozy_runtime
 from cozy_runtime.internal import package_environment as environment
 from cozy_runtime.internal import package_requirements
 from cozy_runtime.internal.worker import lanes
-from cozy_runtime.internal.worker.child import ExecutorRuntimeMismatch
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from test_device_lanes import _config, _workspace
@@ -165,7 +164,7 @@ def _shadowing_python(root: Path) -> Path:
 
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-def test_executor_handshake_refuses_another_runtime() -> None:
+def test_executor_handshake_accepts_compatible_protocol_with_other_package_metadata() -> None:
     with _workspace() as root:
         worker = Worker(
             _config(root / "home"),
@@ -178,9 +177,9 @@ def test_executor_handshake_refuses_another_runtime() -> None:
             assert same.hello["runtime_version"] == cozy_runtime.__version__
             worker.supervision.retire_current(same, "handshake proof")
             worker.supervision.python = str(_shadowing_python(root))
-            with pytest.raises(ExecutorRuntimeMismatch) as caught:
-                worker.supervision.spawn(imposed=worker.imposed(lane))
-            assert "cozy-runtime 0.0.1" in str(caught.value)
-            assert f"this worker runs {cozy_runtime.__version__}" in str(caught.value)
+            compatible = worker.supervision.spawn(imposed=worker.imposed(lane))
+            assert compatible.hello["runtime_version"] == "0.0.1"
+            assert compatible.hello["executor_protocol_revision"] == 1
+            worker.supervision.retire_current(compatible, "compatible protocol proof")
         finally:
             worker.supervision.close()
