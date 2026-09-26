@@ -58,7 +58,9 @@ class Calls:
         local: Callable[[AttemptRecord, pb.ChildCallRequest, str], pb.ChildCallResult | None]
         | None = None,
         installed_bindings: Callable[[AttemptRecord], list[dict[str, Any]]] | None = None,
+        prefetch: Callable[[AttemptRecord, Mapping[str, Any]], dict[str, Any]] | None = None,
     ):
+        self.prefetch = prefetch
         self.installed_bindings = installed_bindings
         self.send, self.stream, self.minor = send, stream, minor
         self.workspace, self.owner = workspace, owner
@@ -105,6 +107,10 @@ class Calls:
             try:
                 if self.minor() < 44 or attempt.state != "running" or attempt.canceling:
                     raise ValueError("parent call is not active under a capable owner")
+                if frame.get("kind") == "model_prefetch":
+                    if self.prefetch is None:
+                        return {"ok": True, "scheduled": False}
+                    return self.prefetch(attempt, frame)
                 index = frame.get("call_index")
                 if type(index) is not int or not 0 <= index <= MAX_CALL_INDEX:
                     raise ValueError("parent call index exceeds its bound")

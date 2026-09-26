@@ -2,25 +2,23 @@
 
 from __future__ import annotations
 
-from cozy_runtime.internal import package_installation
-
 import base64
 import contextlib
 import hashlib
-import sys
 import time
-from collections.abc import Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+import uuid
+from collections.abc import Callable, Hashable, Iterator, Mapping
+from concurrent.futures import Future
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._calls import MAX_ACTIVE_CALLS
-from cozy_runtime.internal import package_environment
+from cozy_runtime.internal import fill, package_installation
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
@@ -30,16 +28,19 @@ from . import (
     machine_byte_results,
     machine_capture,
     machine_checkpoint_inputs,
+    machine_child_target,
     machine_model_defaults,
     machine_models,
     package_prepare,
 )
 from .machine_child_target import Target
+from .preparations import Preparations
 from .workspace import WorkspaceRefusal
 from .workspace_calls import Call
 from .workspace_calls import Calls as JournalCalls
 
 if TYPE_CHECKING:
+    from .attempts import AttemptRecord
     from .session import Worker
 
 
@@ -78,8 +79,43 @@ class Prepared:
 class Serving:
     def __init__(self, worker: Worker):
         self.worker = worker
-        self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="machine-prepare")
+        self.preparations = Preparations[Prepared](MAX_ACTIVE_CALLS)
         self.pending: dict[tuple[str, str], Future[Prepared]] = {}
+        # Read leases die with the old process, but durable temporary holds need
+        # release through the existing journal after a worker restart.
+        workspace = worker.workspace
+        if workspace is not None:
+            with workspace.locked() as db:
+                abandoned = db.execute(
+                    "SELECT DISTINCT owner,recipient FROM execution_model_holds "
+                    "WHERE path LIKE 'preparation/%'"
+                ).fetchall()
+            for row in abandoned:
+                self._release_preparation(row["owner"], row["recipient"])
+
+    def _release_preparation(self, owner: str, recipient: str) -> None:
+        workspace = self.worker.workspace
+        assert workspace is not None
+        machine_models.release(workspace, owner, recipient)
+        with workspace.locked() as db:
+            db.execute(
+                "DELETE FROM execution_model_holds WHERE owner=? AND recipient=? "
+                "AND path LIKE 'preparation/%'",
+                (owner, recipient),
+            )
+
+    def _progress(self, call: Call, request: pb.ChildCallRequest, frame: dict[str, Any]) -> None:
+        if call.call_index == (1 << 32) - 1 and frame.get("kind") == "progress":
+            frame = {
+                "kind": "log",
+                "name": "model-prefetch",
+                "value": "info",
+                "fields": {key: value for key, value in frame.items() if key != "kind"},
+            }
+        # Optional shared observations can outlive their initiating parent while
+        # another parent still needs the same work. They cannot abort that work.
+        with contextlib.suppress(WorkspaceRefusal, OSError):
+            self.worker.emit_progress(call.parent_request, request.parent_attempt_ordinal, frame)
 
     @contextlib.contextmanager
     def phase(self, call: Call, request: pb.ChildCallRequest, name: str) -> Iterator[None]:
@@ -89,19 +125,15 @@ class Serving:
             call.parent_request, request.parent_attempt_ordinal, call.call_index
         )
         stage = f"{label} / {name}"[:120] if label else name
-        self.worker.emit_progress(
-            call.parent_request,
-            request.parent_attempt_ordinal,
-            {"kind": "progress", "stage": stage},
-        )
+        self._progress(call, request, {"kind": "progress", "stage": stage})
         succeeded = False
         try:
             yield
             succeeded = True
         finally:
-            self.worker.emit_progress(
-                call.parent_request,
-                request.parent_attempt_ordinal,
+            self._progress(
+                call,
+                request,
                 {
                     "kind": "log",
                     "name": name,
@@ -117,15 +149,64 @@ class Serving:
             )
 
     def close(self) -> None:
-        self.pool.shutdown(wait=True, cancel_futures=True)
-        for future in self.pending.values():
-            if not future.cancelled():
-                with contextlib.suppress(Exception):
-                    future.result().access.close()
+        self.preparations.close()
+
+    def prefetch(self, parent: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
+        """A model-only hint; never accepts a child execution or chooses a GPU lane."""
+        owner = self.worker.fence.record_owner_id
+        target = machine_child_target.resolve_export(
+            self.worker, parent, str(frame.get("module", "")), str(frame.get("export", ""))
+        )
+        if target.binding is not None:
+            raise WorkspaceRefusal("model prefetch requires a serving callable")
+        raw = frame.get("payload")
+        if not isinstance(raw, str) or len(raw.encode()) > 48 << 10:
+            raise WorkspaceRefusal("model prefetch exceeds its inline bound")
+        models = canonical_json.decode(raw.encode())
+        names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
+        if not isinstance(models, dict) or not models.keys() <= names:
+            raise WorkspaceRefusal("model prefetch names an undeclared Model slot")
+        for artifact in models.values():
+            if artifact is not None:
+                msgspec.convert(artifact, type=ModelArtifact, strict=True)
+        # Only the preparation context is needed; this is never journal.accept'ed
+        # and does not reserve a managed-call index or a child execution.
+        call = Call(
+            parent.request_id,
+            (1 << 32) - 1,
+            parent.attempt,
+            0,
+            b"",
+            b"",
+            "",
+            b"",
+            False,
+            b"",
+            "",
+            "",
+        )
+        request = pb.ChildCallRequest(parent_attempt_ordinal=parent.attempt)
+        try:
+            future = self._shared(owner, call, target, request, models, speculative=True)
+        except WorkspaceRefusal as error:
+            self.worker.note("model-prefetch", str(error))
+            return {"ok": True, "scheduled": False}
+        return {"ok": True, "scheduled": future is not None}
 
     def sweep(self, owner: str) -> None:
-        workspace, executions = self.worker.workspace, self.worker.executions
-        assert workspace is not None and executions is not None
+        def active(interest: Hashable) -> bool:
+            request_id, ordinal = cast(tuple[str, int], interest)
+            parent = self.worker.engine.live.get(request_id)
+            return bool(
+                parent is not None
+                and parent.attempt == ordinal
+                and parent.state == "running"
+                and not parent.canceling
+            )
+
+        self.preparations.retain(active)
+        workspace = self.worker.workspace
+        assert workspace is not None
         for key, future in list(self.pending.items()):
             if key[0] != owner or not future.done():
                 continue
@@ -136,11 +217,75 @@ class Serving:
                     "WHERE c.owner=? AND c.child_request=?",
                     key,
                 ).fetchone()
-            if row is not None and row["desired"] == "cancel":
-                with contextlib.suppress(Exception):
-                    future.result().access.close()
+            if row is not None and row["desired"] != "run":
                 machine_models.release(workspace, owner, key[1])
                 self.pending.pop(key, None)
+
+    def _shared(
+        self,
+        owner: str,
+        call: Call,
+        target: Target,
+        request: pb.ChildCallRequest,
+        models: dict[str, Any],
+        *,
+        speculative: bool,
+    ) -> Future[Prepared] | None:
+        names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
+        models = {
+            name: value for name, value in models.items() if name in names and value is not None
+        }
+        defaults = machine_model_defaults.select(self.worker, owner, call, target, models)
+        identity = hashlib.sha256(
+            canonical_json.encode(
+                {
+                    "owner": owner,
+                    "installation": target.installation_id,
+                    "interface": target.prepared_installation["placement"]["package_interface"],
+                    "entrypoint": target.entrypoint,
+                    "models": models,
+                    "defaults": defaults,
+                }
+            )
+        ).hexdigest()
+        source = replace(
+            call,
+            child_request="model-preparation." + uuid.uuid4().hex,
+            call_index=(1 << 32) - 1 if speculative else call.call_index,
+        )
+        tensorfs = fill.tensorfs_module()
+        token = tensorfs.PullCancellation()
+
+        def load(cancelled: Callable[[], bool]) -> Prepared:
+            try:
+                if cancelled():
+                    raise WorkspaceRefusal("model preparation canceled")
+                prepared = self._prepare(
+                    owner,
+                    source,
+                    target,
+                    request,
+                    model_arguments=models,
+                    defaults=defaults,
+                    cancellation=token,
+                    retention_prefix="preparation/",
+                )
+                # Consumers acquire their own holds at actual admission. Shared
+                # preparation retains only immutable binding metadata on completion.
+                prepared.access.close()
+                return prepared
+            finally:
+                assert self.worker.workspace is not None
+                self._release_preparation(owner, source.child_request)
+
+        return self.preparations.request(
+            identity,
+            (call.parent_request, request.parent_attempt_ordinal),
+            load,
+            speculative=speculative,
+            cancel=token.cancel,
+            refresh=not speculative,
+        )
 
     def drive(self, owner: str, call: Call, target: Target, request: pb.ChildCallRequest) -> None:
         workspace, executions = self.worker.workspace, self.worker.executions
@@ -168,17 +313,37 @@ class Serving:
         if future is None:
             if len(self.pending) >= MAX_ACTIVE_CALLS:
                 raise WorkspaceRefusal("captured inference preparation capacity is exhausted")
-            self.pending[key] = self.pool.submit(self._prepare, owner, call, target, request)
+            _, models = arguments(target, request.request_canonical_bytes)
+            future = self._shared(owner, call, target, request, models, speculative=False)
+            if future is not None:
+                self.pending[key] = future
             return
         if not future.done():
             return
         prepared = None
         try:
             prepared = future.result()
+            # A shared CPU preparation owns no recipient custody. Actual B retains
+            # its explicit artifacts exactly as ordinary demand preparation did.
+            _, models = arguments(target, request.request_canonical_bytes)
+            names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
+            for name, supplied in models.items():
+                if name in names and supplied is not None:
+                    machine_models.retain(
+                        workspace,
+                        owner,
+                        call.child_request,
+                        "input/" + name,
+                        msgspec.convert(supplied, type=ModelArtifact, strict=True),
+                    )
             from . import machine_lanes
 
             placement, pins = machine_lanes.replica(
-                self.worker, owner, prepared.placement, target.declaration.get("models", []), prepared.defaults
+                self.worker,
+                owner,
+                prepared.placement,
+                target.declaration.get("models", []),
+                prepared.defaults,
             )
             journal.check_active(owner, call)
             selected = next(
@@ -314,23 +479,48 @@ class Serving:
                     max_attempts=attempts,
                     retry_delay_ms=delay,
                 )
+            if executions.status(owner, call.child_request).state == "queued":
+                label = self.worker.calls.progress_label(
+                    call.parent_request, request.parent_attempt_ordinal, call.call_index
+                )
+                self.worker.emit_progress(
+                    call.parent_request,
+                    request.parent_attempt_ordinal,
+                    {
+                        "kind": "progress",
+                        "stage": (label + " / " if label else "") + "Waiting for GPUs",
+                    },
+                )
         finally:
             if prepared is not None:
                 prepared.access.close()
             self.pending.pop(key, None)
 
     def _prepare(
-        self, owner: str, call: Call, target: Target, request: pb.ChildCallRequest
+        self,
+        owner: str,
+        call: Call,
+        target: Target,
+        request: pb.ChildCallRequest,
+        *,
+        model_arguments: dict[str, Any] | None = None,
+        defaults: list[dict[str, Any]] | None = None,
+        cancellation: Any = None,
+        retention_prefix: str = "input/",
     ) -> Prepared:
         worker, workspace = self.worker, self.worker.workspace
         assert workspace is not None
         prepared = target.prepared_installation["placement"]
         if not target.declaration.get("models"):
             return Prepared(dict(prepared), [], contextlib.ExitStack())
-        _, model_arguments = arguments(target, request.request_canonical_bytes)
+        if model_arguments is None:
+            _, model_arguments = arguments(target, request.request_canonical_bytes)
         native: list[pb.NativeModelBinding] = []
-        with self.phase(call, request, "Selecting model"):
-            defaults = machine_model_defaults.select(worker, owner, call, target, model_arguments)
+        if defaults is None:
+            with self.phase(call, request, "Selecting model"):
+                defaults = machine_model_defaults.select(
+                    worker, owner, call, target, model_arguments
+                )
         access = contextlib.ExitStack()
         try:
             for model in target.declaration["models"]:
@@ -346,7 +536,7 @@ class Serving:
                     workspace,
                     owner,
                     call.child_request,
-                    "input/" + path.removeprefix(prefix),
+                    retention_prefix + path.removeprefix(prefix),
                     artifact,
                 )
                 access.enter_context(workspace.held_model(owner, retention, held.manifest))
@@ -368,7 +558,9 @@ class Serving:
             }
             expected.update({row["parameter"]: row["manifest"] for row in defaults})
             with worker.control_lock:
-                candidates = [dict(value.document) for value in worker.prepared_installations.values()]
+                candidates = [
+                    dict(value.document) for value in worker.prepared_installations.values()
+                ]
             matched = None
             for candidate in candidates:
                 if (
@@ -405,13 +597,29 @@ class Serving:
                 defaults,
                 access if matched is None else None,
                 downloading=lambda: self.phase(call, request, "Downloading model weights"),
+                cancellation=cancellation,
+                progress=lambda available, total: self._progress(
+                    call,
+                    request,
+                    {
+                        "kind": "progress",
+                        "stage": target.entrypoint + " / Downloading model weights",
+                        "position": available,
+                        "total": total,
+                    },
+                ),
             )
+            if cancellation is not None and cancellation.cancelled:
+                raise WorkspaceRefusal("model preparation canceled")
             if matched is not None:
                 return Prepared(matched, defaults, access)
             installed = package_installation.open_installation(
-                Path(worker.options.install_root or ""), target.installation_id,
+                Path(worker.options.install_root or ""),
+                target.installation_id,
             )
             with worker.preparation_lock, self.phase(call, request, "Checking model compatibility"):
+                if cancellation is not None and cancellation.cancelled:
+                    raise WorkspaceRefusal("model preparation canceled")
 
                 def verified(digest: str, length: int, path: Path) -> None:
                     worker.verified_artifacts.record(digest, length, path)

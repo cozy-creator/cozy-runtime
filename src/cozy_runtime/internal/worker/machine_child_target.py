@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
@@ -34,17 +33,31 @@ class Target:
 def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     if worker.executions is None or parent.job is None:
         raise WorkspaceRefusal("child call needs an accepted captured job parent")
-    owner = worker.fence.record_owner_id
-    root = worker.executions.capture_root(owner, parent.request_id)
-    capture = worker.executions.capture(owner, root)
     intent = canonical_json.decode(call.intent)
     if intent["module"] == builtin_operations.MODULE:
         assert worker.machine_calls is not None
         return worker.machine_calls.builtins.resolve(parent, call, intent)
+    return resolve_export(worker, parent, intent["module"], intent["export"])
+
+
+def resolve_export(worker: Worker, parent: AttemptRecord, module: str, export: str) -> Target:
+    """Resolve preparation and invocation through the same captured callable binding."""
+    if worker.executions is None or parent.job is None:
+        raise WorkspaceRefusal("child call needs an accepted captured job parent")
+    owner = worker.fence.record_owner_id
+    root = worker.executions.capture_root(owner, parent.request_id)
+    capture = worker.executions.capture(owner, root)
+    intent = {"module": module, "export": export}
     caller = parent.job.installation_id
-    selected = next((binding for binding in capture["bindings"]
-                     if (binding["caller_installation_id"], binding["module"], binding["export"])
-                     == (caller, intent["module"], intent["export"])), None)
+    selected = next(
+        (
+            binding
+            for binding in capture["bindings"]
+            if (binding["caller_installation_id"], binding["module"], binding["export"])
+            == (caller, intent["module"], intent["export"])
+        ),
+        None,
+    )
     if selected is None:
         raise WorkspaceRefusal("child callable is absent from the accepted installation bindings")
     identifier, entrypoint = selected["callee_installation_id"], selected["entrypoint"]
@@ -52,10 +65,17 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     if prepared is None:
         raise WorkspaceRefusal("child installation is not retained")
     import base64
+
     raw = base64.b64decode(prepared["placement"]["package_interface"], validate=True)
     interface = package_interface.read_bytes(raw, "installed child")
-    declared = next((entry for entry in [*interface["jobs"], *interface["entrypoints"]]
-                     if entry["name"] == entrypoint), None)
+    declared = next(
+        (
+            entry
+            for entry in [*interface["jobs"], *interface["entrypoints"]]
+            if entry["name"] == entrypoint
+        ),
+        None,
+    )
     if declared is None:
         raise WorkspaceRefusal("installed child has no callable declaration")
     if declared.get("internal", False) and caller != identifier:
@@ -63,7 +83,9 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     invocable = declared.get("invocable", {})
     if (invocable.get("module"), invocable.get("export")) != (intent["module"], intent["export"]):
         raise WorkspaceRefusal("child does not name the installed export")
-    if invocable.get("memoize") and {"egress", "secrets"}.intersection(invocable.get("capabilities", [])):
+    if invocable.get("memoize") and {"egress", "secrets"}.intersection(
+        invocable.get("capabilities", [])
+    ):
         raise WorkspaceRefusal("memoized child cannot carry effect or secret capabilities")
     parent_declaration = worker.engine._job_declaration(parent.job, parent.job.job_descriptor_id)
     if parent_declaration.get("invocable", {}).get("memoize") and not invocable.get("memoize"):
@@ -71,14 +93,30 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     binding = None
     if declared in interface["jobs"]:
         descriptor = package_interface.job_descriptor_id(interface, entrypoint)
-        binding = JobBinding.read(json.loads(job_plan.path(
-            worker.config.cozy_home / "job-plans", identifier, descriptor,
-        ).read_bytes()))
+        binding = JobBinding.read(
+            json.loads(
+                job_plan.path(
+                    worker.config.cozy_home / "job-plans",
+                    identifier,
+                    descriptor,
+                ).read_bytes()
+            )
+        )
     operation_identity = str(invocable.get("operation_identity", ""))
     if invocable.get("memoize") and not operation_identity:
-        worker.note("memoization", f"{intent['module']}.{intent['export']} runs uncached: callable implementation identity is unavailable")
-    return Target(identifier, entrypoint, declared, prepared, binding, operation_identity,
-                  binding is None and caller != identifier)
+        worker.note(
+            "memoization",
+            f"{intent['module']}.{intent['export']} runs uncached: callable implementation identity is unavailable",
+        )
+    return Target(
+        identifier,
+        entrypoint,
+        declared,
+        prepared,
+        binding,
+        operation_identity,
+        binding is None and caller != identifier,
+    )
 
 
 def computation(

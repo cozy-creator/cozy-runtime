@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import threading
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack, nullcontext
 from typing import TYPE_CHECKING, Any
@@ -194,6 +195,8 @@ def materialize(
     access: ExitStack | None,
     *,
     downloading: Callable[[], AbstractContextManager[None]] = nullcontext,
+    cancellation: Any = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> None:
     """Verify exact sources; lease bytes only when the preparer will read them.
 
@@ -206,27 +209,37 @@ def materialize(
     tensorfs = fill.tensorfs_module()
     store = fill.store(worker.workspace.store_root)
     for row in rows:
+        if cancellation is not None and cancellation.cancelled:
+            raise WorkspaceRefusal("model preparation canceled")
         manifest = row["manifest"]
         try:
             # Existing cached custody is sufficient. A cold use fetches this exact
             # public checkpoint; neither a release alias nor a credential is sent.
-            try:
-                store.verify_checkpoint_source(
-                    row["repository"], manifest["digest"], manifest["length"]
-                )
-            except tensorfs.errors.Refusal:
-                with downloading():
-                    tensorfs.pull(
-                        store,
-                        row["public_origin"],
-                        row["repository"] + "@" + manifest["digest"],
-                        allowed_hosts=worker.config.object_storage_hosts,
-                        allow_local=bool(worker.config.bootstrap_credential)
-                        and local_origin(row["public_origin"]),
+            with worker.model_transfer_lock:
+                transfer = worker.model_transfers.setdefault(manifest["digest"], threading.Lock())
+            with transfer:
+                if cancellation is not None and cancellation.cancelled:
+                    raise WorkspaceRefusal("model preparation canceled")
+                try:
+                    store.verify_checkpoint_source(
+                        row["repository"], manifest["digest"], manifest["length"]
                     )
-                store.verify_checkpoint_source(
-                    row["repository"], manifest["digest"], manifest["length"]
-                )
+                except tensorfs.errors.Refusal:
+                    with downloading():
+                        tensorfs.pull(
+                            store,
+                            row["public_origin"],
+                            row["repository"] + "@" + manifest["digest"],
+                            allowed_hosts=worker.config.object_storage_hosts,
+                            allow_local=bool(worker.config.bootstrap_credential)
+                            and local_origin(row["public_origin"]),
+                            streams=8,
+                            cancellation=cancellation,
+                            progress=progress,
+                        )
+                    store.verify_checkpoint_source(
+                        row["repository"], manifest["digest"], manifest["length"]
+                    )
             if access is not None:
                 access.enter_context(store.acquire_cozytensors(manifest["digest"]))
         except tensorfs.errors.Refusal as error:
