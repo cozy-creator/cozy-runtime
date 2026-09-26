@@ -65,15 +65,46 @@ print(json.dumps({"origin":cfg.tensorhub_origin,"child":dict(cfg.child_base_env)
         "hosts": [".objects.example", "storage.example"],
         "dependency_cache": "/var/lib/cozy/dependencies",
     }
+    # Settings from newer hosts (including credentials irrelevant to this
+    # worker) neither abort boot nor enter the child environment.
+    extended_auth = json.loads(handoff["COZY_RECORD_OWNER_AUTH_JSON"])
+    extended_auth["future_advisory"] = {"revision": 3}
+    evolved = subprocess.run(
+        [sys.executable, "-c", program],
+        input=json.dumps(
+            {
+                "env": handoff
+                | {
+                    "COZY_FUTURE_SETTING": "advisory",
+                    "TENSORHUB_TOKEN": "broad-token-must-not-cross",
+                    "COZY_WORKER_AUTH_TOKEN": "A" * 43,
+                    "COZY_RECORD_OWNER_AUTH_JSON": json.dumps(extended_auth, indent=2),
+                },
+                "path": str(path),
+            }
+        ),
+        text=True,
+        capture_output=True,
+    )
+    assert evolved.returncode == 0, evolved.stderr
+    assert json.loads(evolved.stdout) == json.loads(result.stdout)
     for env_change, change in (
-        ({"TENSORHUB_TOKEN": "broad-token-must-not-cross"}, {}),
+        ({"PYTHONPATH": "/untrusted/source"}, {}),
+        ({"COZY_RECORD_OWNER_AUTH_JSON": json.dumps({"future_advisory": True})}, {}),
+        (
+            {
+                "COZY_RECORD_OWNER_AUTH_JSON": json.dumps(
+                    extended_auth | {"control_public_key_ed25519_b64url": "invalid"}
+                )
+            },
+            {},
+        ),
         ({}, {"origin": "https://hub.example.test/redirect"}),
         ({}, {"worker_token": "invalid*"}),
         ({}, {"worker_token": "A" * 42 + "B"}),
         ({}, {"worker_id": "another-worker"}),
         ({}, {"origin": ""}),
         ({}, {"version": 1}),
-        ({"COZY_WORKER_AUTH_TOKEN": "A" * 43}, {}),
         ({}, {"grant": "not-boot-metadata"}),
     ):
         path.write_text(json.dumps(authority | change))
