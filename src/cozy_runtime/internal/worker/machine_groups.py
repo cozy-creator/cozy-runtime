@@ -88,6 +88,12 @@ class Groups:
         self.busy: set[str] = set()
         self.occupied: set[int] = set()
         self.waiting: set[str] = set()
+        # A serving child is selected before its durable execution row exists.  Keep
+        # that short hand-off in the same affinity owner as durable pins so siblings
+        # submitted by one parent cannot all select the first free device in the same
+        # drive tick.  Reservations are released once submit() journals the child (or
+        # when admission is retried), and disappear with this worker on restart.
+        self.reservations: dict[tuple[str, str], tuple[str, tuple[int, ...]]] = {}
         self.lock = threading.RLock()
 
     def root(self, owner: str, request: str) -> str:
@@ -96,6 +102,7 @@ class Groups:
         if owner != self.owner:
             self.roots.clear()
             self.ancestry.clear()
+            self.reservations.clear()
             self.owner = owner
             self.recovered = False
             self.waiting.clear()
@@ -122,6 +129,38 @@ class Groups:
             root = self.roots.get(self.root(owner, request))
             if root is not None:
                 root.downloads = max(0, root.downloads + change)
+
+    def reserve(
+        self, owner: str, parent: str, child: str, ordinals: Sequence[int]
+    ) -> None:
+        """Reserve a selected child lane until its durable execution is submitted.
+
+        Model preparation and child admission happen on the worker drive thread before
+        ``Executions.submit`` creates the durable preparation row.  Without this small
+        in-memory reservation window, several concurrent child calls observe an empty
+        journal and all choose the same lowest ordinal.  The reservation is an execution
+        hint only; ``admits`` still rechecks the durable pin when the row is replayed.
+        """
+        with self.lock:
+            root = self.root(owner, parent)
+            self.reservations[(owner, child)] = (root, tuple(sorted(set(ordinals))))
+
+    def release_reservation(self, owner: str, child: str) -> None:
+        """Drop a transient selection after durable submit or a failed admission."""
+        with self.lock:
+            self.reservations.pop((owner, child), None)
+
+    def reservation_loads(self, owner: str, width: int) -> list[int]:
+        """Return transient per-device load from selections not durable yet."""
+        loads = [0] * width
+        with self.lock:
+            for (reservation_owner, _child), (_root, ordinals) in self.reservations.items():
+                if reservation_owner != owner:
+                    continue
+                for ordinal in ordinals:
+                    if 0 <= ordinal < width:
+                        loads[ordinal] += 1
+        return loads
 
     def refresh(self, owner: str) -> None:
         executions = self.worker.executions
@@ -214,6 +253,13 @@ class Groups:
                     if self.root(owner, request) == name
                     for ordinal in pinned(executions.preparation(owner, request), len(loads))
                 }
+                used.update(
+                    ordinal
+                    for (reservation_owner, _child), (reservation_root, ordinals)
+                    in self.reservations.items()
+                    if reservation_owner == owner and reservation_root == name
+                    for ordinal in ordinals
+                )
                 root.width = max(root.width, min(capacity, len(used) + degree))
             root.claimed = True
             self.busy.add(name)

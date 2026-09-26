@@ -296,6 +296,49 @@ def test_singleton_children_fan_out_with_and_without_a_width_hint(
     assert seen == [(0,), (1,), (2,), (3,)]
 
 
+def test_transient_child_reservations_fan_out_before_durable_submit(tmp_path: Path) -> None:
+    """Concurrent serving calls reserve lanes before their execution rows exist.
+
+    ``machine_serving`` selects a placement and only then journals ``Executions.submit``.
+    A drive tick can therefore admit several siblings while the durable queue still looks
+    empty.  The affinity owner must account for those short-lived selections exactly as it
+    accounts for retained pins, or every sibling lands on ordinal zero.
+    """
+    host, groups, _ = worker(tmp_path, 4)
+    selected: list[tuple[int, ...]] = []
+    for index in range(4):
+        replica = machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="older")
+        assert replica is not None
+        pins = tuple(replica[1][0].device_ordinals)
+        selected.append(pins)
+        groups.reserve(OWNER, "older", f"transient-{index}", pins)
+    assert selected == [(0,), (1,), (2,), (3,)]
+    for index in range(4):
+        groups.release_reservation(OWNER, f"transient-{index}")
+
+
+def test_transient_singletons_do_not_change_later_group_degree(tmp_path: Path) -> None:
+    """Reference replicas fan out, then a sequence-parallel child still gets its group."""
+    host, groups, _ = worker(tmp_path, 4)
+    for index in range(3):
+        selected = machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="older")
+        assert selected is not None
+        pins = tuple(selected[1][0].device_ordinals)
+        assert pins == ((0,), (1,), (2,))[index]
+        groups.reserve(OWNER, "older", f"reference-{index}", pins)
+
+    h3 = machine_lanes.replica(
+        host,
+        OWNER,
+        PLACEMENT,
+        MODELS,
+        [{"gpus": 4}],
+        parent_request="older",
+    )
+    assert h3 is not None
+    assert tuple(h3[1][0].device_ordinals) == (0, 1, 2, 3)
+
+
 def test_free_non_aligned_group_is_usable(tmp_path: Path) -> None:
     host, _, executions = worker(tmp_path, 3)
     child(executions, "older", 0, (0,))
