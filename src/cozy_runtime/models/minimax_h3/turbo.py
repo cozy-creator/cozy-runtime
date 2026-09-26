@@ -71,6 +71,75 @@ class LoRAFactors(nn.Module):  # type: ignore[misc]
             flat[start : start + count].add_(self.scale * update[:count])
 
 
+def bake_lora_linear(base: nn.Linear, factors: LoRAFactors) -> nn.Linear:
+    """Return an isolated ordinary-linear prototype with one LoRA site composed.
+
+    This is intentionally a small preparation-time experiment, not the H3 serving path.
+    It only accepts a regular floating-point ``nn.Linear``.  Encoded FP8 weights and
+    provider-specific linear wrappers must expose an audited dequantize/requantize
+    capability before a composer can claim to bake them; silently converting those
+    weights here would change their storage contract.  The input module and factors are
+    never mutated or retained by the result, so separate requests cannot share a mutable
+    overlay through this helper.
+
+    The materialized matrix is computed once in FP32 and cast to the base dtype.  This
+    proves the ownership and dispatch shape of bake-once composition, but not bit-exact
+    equivalence with the current per-forward BF16 factor GEMMs; that remains a numerical
+    qualification gate before wiring this into ``OfficialH3Pipeline``.
+    """
+    if not isinstance(base, nn.Linear):
+        raise ConformanceError(
+            f"bake-once prototype requires torch.nn.Linear, got {type(base).__name__}",
+            code="artifact_config",
+            fields=["base"],
+        )
+    if base.weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ConformanceError(
+            f"bake-once prototype refuses encoded base dtype {base.weight.dtype}",
+            code="artifact_config",
+            fields=["base.weight"],
+        )
+    if factors.lora_down.ndim != 2 or factors.lora_down.shape[1] != base.in_features:
+        raise ConformanceError(
+            "LoRA down projection does not match the base input width",
+            code="artifact_config",
+            fields=["overlay"],
+        )
+    if factors.lora_up.ndim != 2 or factors.lora_up.shape[0] != base.out_features:
+        raise ConformanceError(
+            "LoRA up projection does not match the base output width",
+            code="artifact_config",
+            fields=["overlay"],
+        )
+    if factors.lora_down.shape[0] != factors.lora_up.shape[1]:
+        raise ConformanceError(
+            "LoRA factors have incompatible ranks",
+            code="artifact_config",
+            fields=["overlay"],
+        )
+    bias = base.bias.detach().clone() if base.bias is not None else None
+    with torch.no_grad():
+        delta = torch.mm(
+            factors.lora_up.detach().to(torch.float32),
+            factors.lora_down.detach().to(torch.float32),
+        )
+        merged = base.weight.detach().to(torch.float32) + factors.scale * delta
+        merged = merged.to(dtype=base.weight.dtype)
+    result = nn.Linear(
+        base.in_features,
+        base.out_features,
+        bias=base.bias is not None,
+        device=base.weight.device,
+        dtype=base.weight.dtype,
+    )
+    with torch.no_grad():
+        result.weight.copy_(merged)
+        if bias is not None:
+            assert result.bias is not None
+            result.bias.copy_(bias)
+    return result
+
+
 class _LoRAHook:
     """A permanent consumer hook, inactive for base forwards."""
 
