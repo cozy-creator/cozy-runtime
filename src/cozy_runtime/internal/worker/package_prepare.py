@@ -688,46 +688,31 @@ def prepare_package(
         raise PreparationRefusal("package_prepare_development_absent", package_name)
     if not 1 <= len(files) <= weights_limits.MAX_LOCAL_PACKAGE_FILES:
         raise PreparationRefusal("package_prepare_file_count", str(len(files)))
-    python, base = _select_python(
-        python, python_requires, python_version, base,
-        root=python_root or install_root / "python", cancel=cancel, progress=progress,
-    )
-    archive = None
-    wheels = []
-    names = [row.filename for row in files]
-    if names != sorted(set(names)):
-        raise PreparationRefusal("package_prepare_file_invalid", "filenames must be sorted unique")
-    for row in files:
-        path = Path(row.path)
-        if (
-            not path.is_absolute() or path.name != row.filename or path.parent != wheel_root
-            or path.resolve(strict=True) != path or not 0 < row.length <= MAX_FILE_BYTES
-            or path.stat().st_size != row.length
-        ):
-            raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
-        if row.filename == source_archive:
-            if row.digest:
-                raise PreparationRefusal("package_prepare_source_invalid", "source is operation-scoped")
-            archive = path
-        else:
-            if len(row.digest) != 32 or package_environment.wheel_name_version(row.filename) is None:
-                raise PreparationRefusal("package_prepare_file_invalid", row.filename)
-            with path.open("rb") as stream:
-                measured = hashlib.file_digest(stream, "sha256").digest()
-            if measured != row.digest:
-                raise PreparationRefusal("package_prepare_wheel_integrity", row.filename)
-            verified(documents.spell(row.digest), row.length, path)
-            wheels.append(path)
-    if source_archive and archive is None:
-        raise PreparationRefusal("package_prepare_source_absent", source_archive)
     try:
-        installed = package_installation.install(
-            install_root, package=package_name, release=release, python=python,
-            installation_id=installation_id, source_archive=archive,
-            requirements=dependency_requirements, wheels=tuple(wheels), cache=dependency_cache,
-        )
+        installed = package_installation.open_installation(install_root, installation_id)
     except package_environment.EnvironmentRefusal as exc:
-        raise PreparationRefusal(exc.code, exc.detail) from exc
+        if exc.code != "package_installation_absent":
+            raise PreparationRefusal(exc.code, exc.detail) from exc
+        installed = None
+    if installed is not None:
+        if (installed.package, installed.release) != (package_name, release):
+            raise PreparationRefusal(
+                "package_installation_conflict", "installation ID belongs to another package release"
+            )
+    elif any(not row.path for row in files):
+        # Host removes operation carriers after recording successful installation.
+        # Its inventory probe/replay intentionally has names but no transfer paths.
+        raise PreparationRefusal("local_package_reuse_unavailable", installation_id)
+    else:
+        installed = _install_private_files(
+            package_name=package_name, release=release, files=files,
+            wheel_root=wheel_root, installation_id=installation_id,
+            install_root=install_root, python=python, verified=verified,
+            source_archive=source_archive, base=base, dependency_cache=dependency_cache,
+            dependency_requirements=dependency_requirements,
+            python_requires=python_requires, python_version=python_version,
+            cancel=cancel, progress=progress, python_root=python_root,
+        )
     if materialized is not None:
         materialized(installed)
     distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
@@ -768,6 +753,59 @@ def prepare_package(
             placement_set_canonical_bytes=placement_bytes,
         ),
     )
+
+
+def _install_private_files(
+    *, package_name: str, release: str, files: Sequence[pb.LocalPackageFile],
+    wheel_root: Path, installation_id: str, install_root: Path, python: Path,
+    verified: Callable[[str, int, Path], None], source_archive: str,
+    base: base_observation.Observation | None, dependency_cache: Path | None,
+    dependency_requirements: bytes, python_requires: str, python_version: str,
+    cancel: Callable[[], bool] | None, progress: Callable[[str], None] | None,
+    python_root: Path | None,
+) -> package_installation.InstalledEnvironment:
+    """Read transferred carriers only when this installation does not exist yet."""
+    python, base = _select_python(
+        python, python_requires, python_version, base,
+        root=python_root or install_root / "python", cancel=cancel, progress=progress,
+    )
+    archive = None
+    wheels = []
+    names = [row.filename for row in files]
+    if names != sorted(set(names)):
+        raise PreparationRefusal("package_prepare_file_invalid", "filenames must be sorted unique")
+    for row in files:
+        path = Path(row.path)
+        if (
+            not path.is_absolute() or path.name != row.filename or path.parent != wheel_root
+            or path.resolve(strict=True) != path or not 0 < row.length <= MAX_FILE_BYTES
+            or path.stat().st_size != row.length
+        ):
+            raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
+        if row.filename == source_archive:
+            if row.digest:
+                raise PreparationRefusal("package_prepare_source_invalid", "source is operation-scoped")
+            archive = path
+        else:
+            if len(row.digest) != 32 or package_environment.wheel_name_version(row.filename) is None:
+                raise PreparationRefusal("package_prepare_file_invalid", row.filename)
+            with path.open("rb") as stream:
+                measured = hashlib.file_digest(stream, "sha256").digest()
+            if measured != row.digest:
+                raise PreparationRefusal("package_prepare_wheel_integrity", row.filename)
+            verified(documents.spell(row.digest), row.length, path)
+            wheels.append(path)
+    if source_archive and archive is None:
+        raise PreparationRefusal("package_prepare_source_absent", source_archive)
+    try:
+        installed = package_installation.install(
+            install_root, package=package_name, release=release, python=python,
+            installation_id=installation_id, source_archive=archive,
+            requirements=dependency_requirements, wheels=tuple(wheels), cache=dependency_cache,
+        )
+    except package_environment.EnvironmentRefusal as exc:
+        raise PreparationRefusal(exc.code, exc.detail) from exc
+    return installed
 
 
 #: `{slot path: (selected model, interface slot row)} -> {slot path: census}`.

@@ -112,11 +112,19 @@ class ExecutorRuntimeMismatch(ExecutorGone):
 
 
 def require_same_runtime(hello: dict[str, Any]) -> None:
+    from packaging.version import InvalidVersion, Version
+
     executor = hello.get("runtime_version") or "unknown (its hello predates the handshake)"
-    if executor != RUNTIME_VERSION:
+    try:
+        compatible = Version(executor).public == Version(RUNTIME_VERSION).public
+    except (InvalidVersion, TypeError):
+        compatible = False
+    if not compatible:
         raise ExecutorRuntimeMismatch(
             f"executor_runtime_mismatch: the executor at {hello.get('python_executable')} runs "
-            f"cozy-runtime {executor}; this worker runs {RUNTIME_VERSION}"
+            f"cozy-runtime {executor}; this worker runs {RUNTIME_VERSION}. "
+            "The internal executor protocol requires the same public Runtime release; "
+            "local development build labels may differ."
         )
 
 
