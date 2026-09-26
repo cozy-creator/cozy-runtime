@@ -61,12 +61,18 @@ def for_job(python: str, installation_id: str) -> list[dict[str, Any]]:
     generation = executable.parent.parent
     if not executable.is_absolute() or not (generation / "pyvenv.cfg").is_file():
         return []
-    # Runtime and every admitted implementation use the same CPython ABI. uv's
-    # venv layout is platform-defined; no package interpreter needs to run merely
-    # to locate immutable metadata on the preparation/control process.
-    site = generation / (
-        "Lib/site-packages"
-        if sys.platform == "win32"
-        else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
-    )
+    # The selected venv can use a different Python minor than this controller.
+    # Read its own layout metadata without starting package Python or .pth hooks.
+    if sys.platform == "win32":
+        site = generation / "Lib/site-packages"
+    else:
+        settings = {
+            key.strip(): value.strip()
+            for line in (generation / "pyvenv.cfg").read_text().splitlines()
+            if "=" in line
+            for key, value in [line.split("=", 1)]
+        }
+        version = settings.get("version_info", settings.get("version", ""))
+        minor = ".".join(version.split(".")[:2])
+        site = generation / f"lib/python{minor}/site-packages"
     return read(InstalledEnvironment(installation_id, generation, site, executable, "", "", True))
