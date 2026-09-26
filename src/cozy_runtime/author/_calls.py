@@ -56,7 +56,7 @@ def invocable[**P, R](
     memoize: bool = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
-    defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+    defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
 ) -> Callable[P, PendingCall[R]]: ...
 
 
@@ -66,7 +66,7 @@ def invocable[**P, R](
     memoize: bool = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
-    defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+    defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
 ) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]: ...
 
 
@@ -77,7 +77,7 @@ def invocable[**P, R](
     memoize: bool = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
-    defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+    defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
 ) -> (
     Callable[P, PendingCall[R]]
     | Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]

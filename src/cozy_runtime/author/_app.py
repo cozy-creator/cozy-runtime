@@ -123,7 +123,7 @@ class App:
         fn: Callable[P, R],
         /,
         *,
-        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         memoize: bool = False,
         memo_version: str | None = None,
         memo_dependencies: tuple[MemoDependency, ...] = (),
@@ -139,7 +139,7 @@ class App:
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
         source_profiles: Mapping[str, str] | None = None,
-        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         hidden: bool = False,
         internal: bool = False,
         memoize: bool = False,
@@ -156,7 +156,7 @@ class App:
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
         source_profiles: Mapping[str, str] | None = None,
-        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         hidden: bool = False,
         internal: bool = False,
         memoize: bool = False,
@@ -209,7 +209,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
-        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         demand: Bound | None = None,
         internal: bool = False,
     ) -> Callable[P, R]: ...
@@ -224,7 +224,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
-        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         demand: Bound | None = None,
         internal: bool = False,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
@@ -239,7 +239,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         source_profiles: Mapping[str, str] | None = None,
-        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         demand: Bound | None = None,
         internal: bool = False,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
@@ -286,7 +286,7 @@ class App:
         memoize: bool = False,
         memo_version: str | None = None,
         memo_dependencies: tuple[MemoDependency, ...] = (),
-        defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+        defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         if type(internal) is not bool:
             raise RegistrationError("internal must be a boolean")
