@@ -775,9 +775,15 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                 raise documents.DocumentError("wrong_type", "Slot.adapters")
             for adapter in adapters:
                 row = _closed_document(
-                    adapter, {"component", "model_id", "source_component", "scale"}, "ModelAdapter"
+                    adapter,
+                    {"component", "model_id", "source_component", "scale"},
+                    "ModelAdapter",
                 )
-                _required(row, {"component", "model_id", "source_component", "scale"}, "ModelAdapter")
+                _required(
+                    row,
+                    {"component", "model_id", "source_component", "scale"},
+                    "ModelAdapter",
+                )
                 if row["model_id"] not in known_models:
                     raise documents.DocumentError("unknown_model", "ModelAdapter.model_id")
                 _identifier(row["component"], "ModelAdapter.component")
