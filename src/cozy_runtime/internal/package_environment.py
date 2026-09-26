@@ -353,7 +353,7 @@ def _require_public_wheel_url(url: str) -> None:
         )
 
 
-def _interpreter_layout(python: Path) -> dict[str, str]:
+def interpreter_layout(python: Path) -> dict[str, str]:
     """Measure the selected interpreter's real prefix and import layout."""
     if not python.is_absolute() or not python.is_file():
         raise EnvironmentRefusal("package_environment_python_invalid", str(python))
@@ -431,4 +431,3 @@ def _name(value: str) -> str:
 
 def _sha(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
-
