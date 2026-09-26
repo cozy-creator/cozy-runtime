@@ -23,8 +23,13 @@ class Source(Model[object]):
 class EmptyServing(Model[object]):
     def load(self, loader):
         pass
+constructions = 0
 class LinearPipeline:
     def __init__(self, config):
+        global constructions
+        constructions += 1
+        if constructions != 1:
+            raise AssertionError("compatibility rebuilt the same model")
         import torch
         dtype = {"f32": torch.float32, "f16": torch.float16}[
             config.tensor_dtype("linear.weight", default="f32")
@@ -68,7 +73,7 @@ def test_declared_job_source_skips_load(source_project: Path) -> None:
         derive_child.derive_in(Path(sys.executable), unknown)
 
 
-def test_ordinary_torch_model_derives_and_empty_serving_refuses(source_project: Path) -> None:
+def test_ordinary_torch_model_derives_once_and_empty_serving_refuses(source_project: Path) -> None:
     pytest.importorskip("torch")
     serving = derive_child.DeriveRequest(
         (derive_child.SlotRequest("linear.models.model", b"{}"),), project=source_project
