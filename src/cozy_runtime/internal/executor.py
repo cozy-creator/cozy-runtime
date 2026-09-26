@@ -3437,6 +3437,8 @@ class Executor:
                 imported.__dict__[export] = companion.__dict__[export]
 
     def _call_broker(self, command: Mapping[str, Any]) -> Any:
+        import msgspec
+
         from cozy_runtime.author._calls import _Broker, _CallType
 
         rows = command.get("call_interfaces") or []
@@ -3518,18 +3520,27 @@ class Executor:
                 from cozy_runtime.author._app import Registration
 
                 function = getattr(imported, export, None)
-                declared = _export(function)
+                declared = _export(function) if callable(function) else None
                 if declared is not None:
                     surface = Registration(
                         name=export, kind=row.get("kind", "job"),
                         fn=declared.implementation, invocable=True,
                         memoize=declared.memoize, model_defaults=declared.defaults,
                     ).surface
-                    binding = _CallType("", module, export, surface.payload_type, surface.result_type)
+                    request_type, result_type = surface.payload_type, surface.result_type
+                    if not (
+                        isinstance(request_type, type)
+                        and issubclass(request_type, msgspec.Struct)
+                        and isinstance(result_type, type)
+                        and issubclass(result_type, msgspec.Struct)
+                    ):
+                        raise CapabilityError("invocable types are not structured", code="child_interface")
+                    binding = _CallType("", module, export, request_type, result_type)
                 else:
-                    binding = getattr(imported, "__cozy_bindings__", {}).get(export)
-                    if not isinstance(binding, _CallType):
+                    generated_binding = getattr(imported, "__cozy_bindings__", {}).get(export)
+                    if not isinstance(generated_binding, _CallType):
                         raise CapabilityError("installed export is not invocable", code="child_interface")
+                    binding = generated_binding
                 # Source-preserving caller wheels retain ordinary @invocable job
                 # wrappers, whose lookup is by their exact module/export pair.
                 prior = bindings.get((module, export))
