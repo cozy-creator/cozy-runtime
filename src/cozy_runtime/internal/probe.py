@@ -563,7 +563,8 @@ def _route_axes(
         if native is None or not native.get("passed"):
             return {"deviation_rel": -1.0, "resident_bits_per_element": -1.0}
         parts = {
-            role: _RolePartLike(int(t.numel() * t.element_size())) for role, t in roles.items()
+            role: _RolePartLike(tuple(int(n) for n in t.shape), int(t.numel() * t.element_size()))
+            for role, t in roles.items()
         }
         return {
             "deviation_rel": float(native["deviation_rel"]),
@@ -587,12 +588,16 @@ def _route_axes(
 
 
 class _RolePartLike:
-    """Just the byte count `resident_bits_per_element` reads. The probe holds real tensors,
-    not header rows, so this hands the provider the one field it asks of a `RolePart`."""
+    """Role geometry and bytes measured from the probe's real tensors.
 
-    __slots__ = ("nbytes",)
+    Native providers can pad stored roles for device layouts; MXFP8 uses the scale
+    grid's shape to price its blocked representation rather than its raw byte count.
+    """
 
-    def __init__(self, nbytes: int) -> None:
+    __slots__ = ("shape", "nbytes")
+
+    def __init__(self, shape: tuple[int, ...], nbytes: int) -> None:
+        self.shape = shape
         self.nbytes = nbytes
 
 
