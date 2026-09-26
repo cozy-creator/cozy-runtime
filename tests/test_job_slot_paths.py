@@ -213,7 +213,6 @@ def test_a_job_shaped_selection_prepares(
         release=RELEASE,
         application=str(interface["application"]),
         model_slot_paths=tuple(sorted((ENTRYPOINT_SLOT, RETOUCH_SLOT, JOB_SLOT))),
-        inventory=None,
         locked=package_environment.read_locked_requirements(
             b"--index-url https://pypi.org/simple\ntenant==1 --hash=sha256:" + b"a" * 64 + b"\n"
         ),
@@ -382,7 +381,6 @@ def test_an_entrypoints_only_facts_request_refuses_and_names_the_gap(
             release=RELEASE,
             application=str(interface["application"]),
             model_slot_paths=(ENTRYPOINT_SLOT, RETOUCH_SLOT),
-            inventory=None,
             locked=package_environment.read_locked_requirements(
                 b"--index-url https://pypi.org/simple\ntenant==1 --hash=sha256:" + b"a" * 64 + b"\n"
             ),
@@ -418,7 +416,7 @@ def test_the_bound_slots_are_a_subset_of_the_declared_ones() -> None:
     # sorted unique: the wire bound the hub already honours.
     declared = sorted([ENTRYPOINT_SLOT, RETOUCH_SLOT, JOB_SLOT])
     for bound in ([], [JOB_SLOT], [ENTRYPOINT_SLOT], declared):
-        _, slot_paths, _, _ = _request_facts(
+        _, slot_paths, _ = _request_facts(
             _facts_request(declared), [_selection(slot, "sha256:" + "b" * 64) for slot in bound]
         )
         assert set(bound).issubset(slot_paths)

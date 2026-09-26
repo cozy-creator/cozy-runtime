@@ -20,7 +20,6 @@ from cozy_runtime.internal import (
     canonical,
     census_cache,
     fill,
-    image_inventory,
     model_config,
     package_environment,
     package_installation,
@@ -76,25 +75,6 @@ def _select_python(
         raise PreparationRefusal(exc.code, exc.detail) from exc
 
 
-def _verify_control_inventory(
-    inventory: image_inventory.Inventory | None,
-    python: Path,
-    base: base_observation.Observation | None,
-) -> None:
-    if inventory is not None:
-        observed = base or package_environment.observe_base(python)
-        lie = image_inventory.disagreement(inventory, observed.distribution_versions)
-        if lie is not None:
-            raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
-
-
-def _verify_inventory_python(inventory: image_inventory.Inventory | None, python: Path) -> None:
-    if inventory is not None and inventory.interpreters:
-        actual = python_interpreters.probe(python)
-        if (actual.version, actual.abi) not in inventory.interpreters:
-            raise PreparationRefusal("package_prepare_image_python_disagrees", actual.version)
-
-
 def prepare_package_set(
     request: pb.PreparePackageSetRequest,
     *,
@@ -142,11 +122,7 @@ def prepare_package_set(
         raise PreparationRefusal("package_prepare_download_set_invalid", "package row")
     package_name = str(selected.get("package", ""))
     release = str(selected.get("release", ""))
-    application, slot_paths, inventory, locked = _request_facts(
-        request, models, preinstalled=preinstalled_python is not None
-    )
-    _verify_control_inventory(inventory, python, base)
-    _verify_inventory_python(inventory, python)
+    application, slot_paths, locked = _request_facts(request, models)
     python, base = _select_python(
         python,
         request.python_requires,
@@ -161,7 +137,6 @@ def prepare_package_set(
         release=release,
         application=application,
         model_slot_paths=slot_paths,
-        inventory=inventory,
         locked=locked,
         models=models,
         artifact_cache=artifact_cache,
@@ -284,7 +259,6 @@ def prepare_published_local(
         release=release,
         application=None,
         model_slot_paths=None,
-        inventory=None,
         locked=locked,
         models=models,
         artifact_cache=artifact_cache,
@@ -302,11 +276,9 @@ def prepare_published_local(
 
 
 def _request_facts(
-    request: pb.PreparePackageSetRequest, models: Sequence[Any], *, preinstalled: bool = False
-) -> tuple[
-    str, tuple[str, ...], image_inventory.Inventory | None, package_environment.LockedRequirements
-]:
-    """Admit the wire-30 release facts: the two facts, the inventory, and the lock."""
+    request: pb.PreparePackageSetRequest, models: Sequence[Any]
+) -> tuple[str, tuple[str, ...], package_environment.LockedRequirements]:
+    """Admit selected release facts; image inventory is advisory discovery metadata."""
 
     application = request.application
     if not application or _printable(application) != application or len(application) > 256:
@@ -322,38 +294,17 @@ def _request_facts(
         slot = str(row.get("slot", "")) if isinstance(row, Mapping) else ""
         if slot not in slot_paths:
             raise PreparationRefusal("package_prepare_model_slot_unknown", slot)
-    inventory = None
-    if preinstalled:
-        if request.HasField("image_inventory"):
-            raise PreparationRefusal(
-                "package_prepare_local_inventory_invalid",
-                "local prepared environment has no managed image inventory",
-            )
-    else:
-        if not request.HasField("image_inventory"):
-            raise PreparationRefusal("package_prepare_image_inventory_missing", "image_inventory")
-        try:
-            inventory = image_inventory.from_wire(
-                request.image_inventory.profile,
-                request.image_inventory.python,
-                request.image_inventory.distributions,
-                request.image_inventory.interpreters,
-            )
-        except image_inventory.ImageInventoryRefusal as exc:
-            raise PreparationRefusal("package_prepare_image_inventory_invalid", exc.detail) from exc
     try:
         locked = package_environment.read_locked_requirements(bytes(request.locked_requirements))
     except package_environment.EnvironmentRefusal as exc:
         raise PreparationRefusal("package_prepare_locked_requirements_invalid", exc.detail) from exc
-    return application, slot_paths, inventory, locked
+    return application, slot_paths, locked
 
 
 def _filtered_rows(
     package_name: str,
     release: str,
     locked: package_environment.LockedRequirements,
-    inventory: image_inventory.Inventory | None,
-    platform_versions: Mapping[str, str],
 ) -> list[package_environment.LockedRow]:
     """Validate the exact project pin and retain the complete locked wheel closure."""
 
@@ -373,7 +324,6 @@ def _prepare_published(
     release: str,
     application: str | None,
     model_slot_paths: tuple[str, ...] | None,
-    inventory: image_inventory.Inventory | None,
     locked: package_environment.LockedRequirements,
     models: Sequence[Any],
     artifact_cache: Path,
@@ -390,15 +340,14 @@ def _prepare_published(
 ) -> pb.PreparePackageSetResult:
     """Install from the exact export, read the interface, and author the PlacementSet.
 
-    On the wire path the request's facts cross-check the release interface and the image
-    inventory verifies the controller. On the local path (`installed_environment`) the venv
-    already exists from the same export and `interface` describes it; Creator compares that
+    On the wire path the request's facts cross-check the release interface. Image
+    inventory does not supply this environment. On the local path the venv already exists from the same export and `interface` describes it; Creator compares that
     against the committed release itself, so the facts are adopted from it.
     Both local and rented preparation materialize the complete locked closure; the
     controller SDK never supplies package dependencies or interpreter-specific wheels.
     """
 
-    _filtered_rows(package_name, release, locked, inventory, {})
+    _filtered_rows(package_name, release, locked)
     if installed_environment is not None:
         installed = installed_environment
     else:
