@@ -24,6 +24,8 @@ from typing import ParamSpec, TypeVar, overload
 from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
+from cozy_runtime.author._memo import MemoDependency
+from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
 from cozy_runtime.author._signature import Kind, Surface, analyze
 from cozy_runtime.author._weights import WeightsOutput
@@ -123,6 +125,8 @@ class App:
         *,
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
         memoize: bool = False,
+        memo_version: str | None = None,
+        memo_dependencies: tuple[MemoDependency, ...] = (),
         internal: bool = False,
     ) -> Callable[P, R]: ...
 
@@ -139,6 +143,8 @@ class App:
         hidden: bool = False,
         internal: bool = False,
         memoize: bool = False,
+        memo_version: str | None = None,
+        memo_dependencies: tuple[MemoDependency, ...] = (),
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def entrypoint(
@@ -154,6 +160,8 @@ class App:
         hidden: bool = False,
         internal: bool = False,
         memoize: bool = False,
+        memo_version: str | None = None,
+        memo_dependencies: tuple[MemoDependency, ...] = (),
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a request-serving callable. BARE is the common case (§1.2).
 
@@ -164,7 +172,9 @@ class App:
         It retains bindings and metadata, but cannot be invoked as an external request.
 
         `memoize=True` explicitly admits deterministic measurement results to the managed
-        operation cache. Ordinary generation remains nonmemoized by default.
+        operation cache. Optional `memo_dependencies` and `memo_version` declare
+        result-affecting helpers/resources/native builds just as for `invocable`.
+        Ordinary generation remains nonmemoized by default.
 
         ``source_profiles`` is RETIRED (cr-077): capability is the slot's class annotation,
         and the publish-time slot facts are derived from the class itself. Passing it
@@ -183,6 +193,8 @@ class App:
             hidden=hidden,
             internal=internal,
             memoize=memoize,
+            memo_version=memo_version,
+            memo_dependencies=memo_dependencies,
             defaults=defaults,
         )
 
@@ -272,6 +284,8 @@ class App:
         hidden: bool = False,
         internal: bool = False,
         memoize: bool = False,
+        memo_version: str | None = None,
+        memo_dependencies: tuple[MemoDependency, ...] = (),
         defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         if type(internal) is not bool:
@@ -296,6 +310,12 @@ class App:
                 raise ConformanceError(
                     "declare defaults once, on invocable or App registration", code="model_defaults"
                 )
+            declare_memo(
+                export.implementation if export is not None else target,
+                memoize=export.memoize if export is not None else memoize,
+                version=memo_version,
+                dependencies=memo_dependencies,
+            )
             self._registry[registered] = Registration(
                 name=registered,
                 kind=kind,

@@ -17,6 +17,8 @@ from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
 from cozy_runtime.author._capture import ActivationCapture, ExecutionObservation
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
+from cozy_runtime.author._memo import MemoDependency
+from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
 
@@ -52,7 +54,7 @@ def invocable[**P, R](
     *,
     memoize: bool = False,
     memo_version: str | None = None,
-    memo_dependencies: tuple[Callable[..., object] | str, ...] = (),
+    memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
 ) -> Callable[P, PendingCall[R]]: ...
 
@@ -62,7 +64,7 @@ def invocable[**P, R](
     *,
     memoize: bool = False,
     memo_version: str | None = None,
-    memo_dependencies: tuple[Callable[..., object] | str, ...] = (),
+    memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
 ) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]: ...
 
@@ -73,7 +75,7 @@ def invocable[**P, R](
     *,
     memoize: bool = False,
     memo_version: str | None = None,
-    memo_dependencies: tuple[Callable[..., object] | str, ...] = (),
+    memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
 ) -> (
     Callable[P, PendingCall[R]]
@@ -111,24 +113,7 @@ def invocable[**P, R](
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
-    if memo_version is not None and (
-        not memoize or not isinstance(memo_version, str) or len(memo_version) > 128
-    ):
-        raise ConformanceError(
-            "memo_version needs memoize=True and a bounded version", code="invocable_memoize"
-        )
-    if (
-        not isinstance(memo_dependencies, tuple)
-        or len(memo_dependencies) > 64
-        or any(not callable(helper) and not isinstance(helper, str) for helper in memo_dependencies)
-        or (memo_dependencies and not memoize)
-    ):
-        raise ConformanceError(
-            "memo_dependencies needs memoize=True and bounded helper definitions",
-            code="invocable_memoize",
-        )
-    if memo_version is not None or memo_dependencies:
-        fn.__dict__["_cozy_memo_declaration"] = (memo_version or "", memo_dependencies)
+    declare_memo(fn, memoize=memoize, version=memo_version, dependencies=memo_dependencies)
     export = _Export(fn, fn.__module__, fn.__name__, memoize, model_defaults(defaults))
 
     def proxy(*args: P.args, **kwargs: P.kwargs) -> PendingCall[R]:
