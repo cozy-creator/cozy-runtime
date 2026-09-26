@@ -115,6 +115,7 @@ from cozy_runtime.author._markers import (
 )
 from cozy_runtime.author._memo import MemoDistribution, MemoResource
 from cozy_runtime.author._model import (
+    AdapterCompatibility,
     ConstructionIdentity,
     Model,
     ModelRegistry,
@@ -243,6 +244,7 @@ __all__ = [
     "MemoResource",
     "Mixed",
     "Model",
+    "AdapterCompatibility",
     "ModelArtifact",
     "ModelAssets",
     "ModelBinding",

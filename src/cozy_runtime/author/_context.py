@@ -50,6 +50,9 @@ class AdapterRef:
     ref: str
     scale: float
     kind: str
+    component: str = ""
+    source_component: str = ""
+    family: str = ""
 
 
 @final

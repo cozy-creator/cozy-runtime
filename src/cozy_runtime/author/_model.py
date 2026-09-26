@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack
@@ -33,7 +34,7 @@ from typing import (
 )
 
 from cozy_runtime.author._attention import AttentionContext
-from cozy_runtime.author._context import Context, Device, RequestView, derive_seed
+from cozy_runtime.author._context import AdapterRef, Context, Device, RequestView, derive_seed
 from cozy_runtime.author._errors import (
     CapabilityError,
     ConformanceError,
@@ -55,6 +56,25 @@ PipelineT = TypeVar("PipelineT", covariant=True)
 P = ParamSpec("P")
 R = TypeVar("R")
 ModelT = TypeVar("ModelT", bound="Model[Any]")
+
+
+@dataclass(frozen=True, slots=True)
+class AdapterCompatibility:
+    """Closed compatibility declaration for one generic model-slot adapter kind."""
+
+    kind: str
+    family: str
+    components: tuple[str, ...]
+    weight_min: float = -1.0
+    weight_max: float = 1.0
+
+    def accepts(self, overlay: AdapterRef) -> bool:
+        return (
+            overlay.kind == self.kind
+            and (not self.family or overlay.family == self.family)
+            and overlay.component in self.components
+            and self.weight_min <= overlay.scale <= self.weight_max
+        )
 
 #: THE ENCODED-LEAF CONSENT, and the whole of the author's say in the delivery plane.
 #:
@@ -381,6 +401,9 @@ class Model[PipelineT]:
     reason: silence is not consent to a substituted forward. Nothing defaults to
     `require` — a requirement is only ever spelled out."""
 
+    __adapter_compatibility__: tuple[AdapterCompatibility, ...] = ()
+    """Closed generic adapter declarations; empty means overlays are refused."""
+
     checkpoint_ref: str = ""
     """The pinned-ref REPRODUCTION FACT for result structs — an observation, never catalog
     authority. Model-scoped because it is construction identity."""
@@ -471,6 +494,25 @@ class Model[PipelineT]:
     def unload(self, loader: Loader) -> None:
         """Release declared state. The runtime drains before calling this."""
         return None
+
+    def prepare_adapters(self, overlays: tuple[AdapterRef, ...]) -> None:
+        """Apply an admitted ordered overlay once during model preparation."""
+        if overlays:
+            raise CapabilityError(
+                f"{type(self).__name__} does not declare a generic adapter composer",
+                code="adapter_composition_unsupported",
+            )
+
+    @classmethod
+    def validate_adapter_stack(cls, overlays: tuple[AdapterRef, ...]) -> None:
+        """Validate ordered overlays against the model's closed compatibility declarations."""
+        for index, overlay in enumerate(overlays):
+            if not any(declaration.accepts(overlay) for declaration in cls.__adapter_compatibility__):
+                raise CapabilityError(
+                    f"adapter {index} ({overlay.kind}:{overlay.component}) is incompatible "
+                    f"with {cls.__name__}",
+                    code="adapter_incompatible",
+                )
 
     # ----------------------------------------------------------------- request
 
@@ -789,18 +831,38 @@ class ModelRegistry:
         artifact: Artifact,
         *,
         mode: Mode = "serve",
+        adapters: Sequence[AdapterRef] = (),
     ) -> ModelT:
         """Bind one path. Equal identity -> the SAME generation, constructed once."""
+        adapter_rows = tuple(adapters)
+        cls.validate_adapter_stack(adapter_rows)
+        variant = artifact.variant
+        if adapter_rows:
+            variant += "|adapters:" + json.dumps(
+                [
+                    {
+                        "ref": row.ref,
+                        "scale": row.scale,
+                        "kind": row.kind,
+                        "component": row.component,
+                        "source_component": row.source_component,
+                        "family": row.family,
+                    }
+                    for row in adapter_rows
+                ],
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         identity = ConstructionIdentity(
             release=self._release,
             model_class=f"{cls.__module__}:{cls.__qualname__}",
             artifact=artifact.snapshot,
-            variant=artifact.variant,
+            variant=variant,
         )
         with self._lock:
             generation = self._generations.get(identity)
             if generation is None:
-                generation = self._construct(identity, cls, artifact, mode)
+                generation = self._construct(identity, cls, artifact, mode, adapter_rows)
                 self._generations[identity] = generation
             generation.paths.append(binding_path)
             self._by_path[binding_path] = generation
@@ -842,7 +904,12 @@ class ModelRegistry:
     # ----------------------------------------------------------------- internals
 
     def _construct(
-        self, identity: ConstructionIdentity, cls: type[Model[Any]], artifact: Artifact, mode: Mode
+        self,
+        identity: ConstructionIdentity,
+        cls: type[Model[Any]],
+        artifact: Artifact,
+        mode: Mode,
+        adapters: Sequence[AdapterRef] = (),
     ) -> Generation:
         model = cls()
         loader = self._loader(model, artifact, mode)
@@ -869,6 +936,8 @@ class ModelRegistry:
             record = records[0] if len(records) == 1 else _merge(records)
             _prove_components(cls, record)
             constructed = loader.constructed()
+            if adapters:
+                model.prepare_adapters(tuple(adapters))
             # NOTHING IS WRAPPED HERE, AND THAT IS THE FIX (#573).
             #
             # A censused component used to be replaced by a proxy whose `__getattr__`
