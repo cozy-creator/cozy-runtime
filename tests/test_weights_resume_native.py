@@ -6,6 +6,7 @@ import json
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 import tensorfs
@@ -13,8 +14,8 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import WeightsReceipt
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.internal.base_observation import Observation
 from cozy_runtime.internal.hostfacts import HostFacts
+from cozy_runtime.internal.numerical_environment import fingerprint
 from cozy_runtime.internal.weights_sink import receipt_from_native, work_fingerprint
 from native_weights import NativeExecution
 
@@ -81,13 +82,15 @@ def test_pending_receipt_without_native_root_is_not_reusable(tmp_path: Path) -> 
 
 
 def test_work_identity_ignores_attempt_authority_but_binds_numerical_inputs() -> None:
-    # Use the actual closed InvocationSpec fixture, which includes both a deadline
-    # and publication grant. Hashing that whole document would bind those clocks.
-    spec = json.loads(
-        (
-            Path(__file__).parent / "testdata/worker-protocol/canonical/invocation_spec_job.json"
-        ).read_text()
-    )
+    spec: dict[str, Any] = {
+        "job": {
+            "installation_id": "first-installation",
+            "job_descriptor_id": "first-job",
+            "publication_contract": {"grant_id": "first-grant"},
+        },
+        "deadline_unix_ms": 1000,
+        "payload_digest": "sha256:" + "30" * 32,
+    }
     spec["inputs"] = [
         {
             "input_id": "model:base",
@@ -97,27 +100,16 @@ def test_work_identity_ignores_attempt_authority_but_binds_numerical_inputs() ->
             "order": 0,
         }
     ]
-    base = Observation(
-        python_abi="cp312",
-        python_full_version="3.12.12",
-        os_arch="linux/amd64",
-        libc="glibc2.28",
-        accelerator_backend="cuda",
-        accelerator_build="cu128",
-        torch_release="2.8.0",
-        cuda_version="12.8",
-        uv_version="0.8.0",
-        distributions=(
-            ("cozy-runtime", "0.2.26"),
-            ("tensorfs", "0.3.12"),
-            ("torch", "2.8.0+cu128"),
-            ("numpy", "2.3.0"),
-        ),
-        import_roots=(),
-    )
     device = HostFacts(gpu_name="H200", gpu_sm=90, driver_version="580.1", backend="cuda")
-    environment = "sha256:" + "32" * 32
-    expected = work_fingerprint(spec, environment, base, device)
+    numerical = fingerprint(device, threads=4, inherited={})
+    implementation = "sha256:" + "42" * 32
+
+    def work(
+        value: dict[str, Any], policy: bytes = numerical, identity: str = implementation
+    ) -> str:
+        return work_fingerprint(value, policy, operation_identity=identity)
+
+    expected = work(spec)
     replacement = deepcopy(spec)
     replacement["deadline_unix_ms"] += 1000
     replacement["job"]["publication_contract"]["grant_id"] = "new-owner-grant"
@@ -129,46 +121,19 @@ def test_work_identity_ignores_attempt_authority_but_binds_numerical_inputs() ->
         lease_id="new-lease",
         scratch="/new/path",
     )
-    assert (
-        work_fingerprint(
-            replacement,
-            environment,
-            replace(
-                base, uv_version="another-installer", import_roots=(("torch", ("/new/path",)),)
-            ),
-            replace(
-                device,
-                gpu_name="other H200",
-                vram_total_bytes=1,
-                host_ram_total_bytes=2,
-                vcpu_count=128,
-                platform="another host",
-            ),
-        )
-        == expected
-    )
-    for field in ("build_id", "job_descriptor_id"):
+    assert work(replacement) == expected
+    # A known callee, not its installing SDK or caller package, owns native work.
+    for field in ("installation_id", "job_descriptor_id"):
         changed = deepcopy(spec)
-        changed["job"][field] = "changed-producer"
-        assert work_fingerprint(changed, environment, base, device) != expected
+        changed["job"][field] = "changed-sdk-or-caller"
+        assert work(changed) == expected
+        assert work(changed, identity="") != work(spec, identity="")
     changed = deepcopy(spec)
     changed["payload_digest"] = "sha256:" + "33" * 32
-    assert work_fingerprint(changed, environment, base, device) != expected
+    assert work(changed) != expected
     changed = deepcopy(spec)
     changed["inputs"][0]["digest"] = "sha256:" + "34" * 32
-    assert work_fingerprint(changed, environment, base, device) != expected
-    assert work_fingerprint(spec, "sha256:" + "35" * 32, base, device) != expected
-    for name, version in base.distributions:
-        distributions = tuple(
-            (key, value if key != name else version + "+changed")
-            for key, value in base.distributions
-        )
-        assert (
-            work_fingerprint(spec, environment, replace(base, distributions=distributions), device)
-            != expected
-        )
-    assert work_fingerprint(spec, environment, base, replace(device, gpu_sm=89)) != expected
-    assert (
-        work_fingerprint(spec, environment, base, replace(device, driver_version="other"))
-        != expected
-    )
+    assert work(changed) != expected
+    assert work(spec, identity="sha256:" + "43" * 32) != expected
+    assert work(spec, fingerprint(replace(device, gpu_sm=89), threads=4, inherited={})) != expected
+    assert work(spec, fingerprint(device, threads=1, inherited={})) != expected
