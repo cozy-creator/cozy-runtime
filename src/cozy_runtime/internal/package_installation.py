@@ -19,6 +19,7 @@ from cozy_runtime.internal.package_environment import EnvironmentRefusal
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
 MAX_SOURCE_BYTES = 1 << 30
 MAX_SOURCE_FILES = 100_000
+IMAGE_UV_CACHE = Path("/opt/cozy/dependency-seed/uv-cache")
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +129,14 @@ def _install(
         raise EnvironmentRefusal("package_installation_uv_absent", "uv is required")
     environment = package_install_environment()
     environment["UV_PROJECT_ENVIRONMENT"] = str(directory / "venv")
-    if cache is not None:
+    if IMAGE_UV_CACHE.is_dir():
+        # The image already contains uv's expanded wheels and index records.
+        # Continue using that normal machine cache for matching and new packages.
+        # Symlinks avoid overlayfs copying the baked Torch payload into each venv;
+        # uv owns resolution, integrity and cache locking, with no Cozy inventory.
+        environment["UV_CACHE_DIR"] = str(IMAGE_UV_CACHE)
+        environment["UV_LINK_MODE"] = "symlink"
+    elif cache is not None:
         environment["UV_CACHE_DIR"] = str(cache / "uv-cache")
     try:
         if source_archive is not None:
