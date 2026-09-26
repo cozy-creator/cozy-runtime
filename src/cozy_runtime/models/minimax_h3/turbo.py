@@ -17,6 +17,7 @@ with the overlay absent from every forward they run.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -38,6 +39,30 @@ TABLED_FAMILY = "adaln_proj.linear"
 _LORA_ROW_CHUNK = 256
 #: Fix the FP32 projection's GEMM shape across Ulysses sequence partitions.
 _HEAD_ROW_CHUNK = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class TurboComposerCapability:
+    """Preparation-time report for a complete H3 Turbo bake.
+
+    ``linear_sites`` describes the part that can be materialized statically.  A complete
+    Turbo root also needs schedule-specific AdaLN tables and output heads, plus an isolated
+    root that is safe to cache per adapter set.  Until those pieces are composed together,
+    ``supports_bake`` stays false and callers retain the specialized overlay path.
+    """
+
+    supports_bake: bool
+    reason_code: str
+    detail: str
+    linear_sites: tuple[str, ...] = ()
+    encoded_sites: tuple[str, ...] = ()
+
+    def refusal(self) -> ConformanceError:
+        return ConformanceError(
+            self.detail,
+            code=self.reason_code,
+            fields=["turbo_lora"],
+        )
 
 
 class LoRAFactors(nn.Module):  # type: ignore[misc]
@@ -69,6 +94,52 @@ class LoRAFactors(nn.Module):  # type: ignore[misc]
             # addmm_ fuses the up projection and sum, skipping the BF16 update's
             # rounding. Chunked linear + add_ matches the released adapter.
             flat[start : start + count].add_(self.scale * update[:count])
+
+
+def inspect_turbo_composer(root: nn.Module) -> TurboComposerCapability:
+    """Inspect one filled DiT before a request asks for a complete static Turbo root.
+
+    Encoded leaves intentionally have no ``weight`` attribute; their provider and role
+    buffers are the resident storage.  Reporting those paths here avoids a late attribute
+    error or an accidental dequantize-to-BF16 fallback.  Even an all-floating root is
+    currently linear-only: the PDD tables/heads and request-isolated root are separate
+    composition obligations, so the complete bake capability remains refused.
+    """
+    linear_sites: list[str] = []
+    encoded_sites: list[str] = []
+    for path, site in root.named_modules():
+        if not path.endswith(LORA_FAMILIES):
+            continue
+        if not isinstance(site, nn.Linear):
+            provider = getattr(site, "provider", "")
+            label = f"{type(site).__name__}{f' {provider}' if provider else ''}"
+            encoded_sites.append(f"{path} ({label})")
+            continue
+        if site.weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            encoded_sites.append(f"{path} ({site.weight.dtype})")
+            continue
+        linear_sites.append(path)
+    if encoded_sites:
+        return TurboComposerCapability(
+            supports_bake=False,
+            reason_code="turbo_bake_unsupported",
+            detail=(
+                "H3 Turbo bake-once is unavailable for encoded/custom base leaves; provider "
+                "dequantize/compose/requantize semantics are not qualified at "
+                + ", ".join(encoded_sites[:8])
+            ),
+            linear_sites=tuple(linear_sites),
+            encoded_sites=tuple(encoded_sites),
+        )
+    return TurboComposerCapability(
+        supports_bake=False,
+        reason_code="turbo_bake_unsupported",
+        detail=(
+            "H3 Turbo bake-once found floating linear sites but complete composition still "
+            "requires static PDD AdaLN tables, evaluation heads, and a request-isolated root"
+        ),
+        linear_sites=tuple(linear_sites),
+    )
 
 
 class _LoRAHook:
