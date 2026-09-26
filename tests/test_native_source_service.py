@@ -188,7 +188,6 @@ def test_real_retained_source_conversion_reuses_and_registry_edit_invalidates(
             command.parent_call.intent_digest = hashlib.sha256(
                 canonical_json.encode(
                     {
-                        "interface_digest": source_interfaces.DIGEST,
                         "module": source_interfaces.MODULE,
                         "export": "convert_cozytensors",
                         "request": args,
@@ -533,7 +532,7 @@ def test_current_source_validation_refusal_reaches_protocol_peer(tmp_path: Path)
     command.worker_boot_id = "boot"
     command.phase = pb.NATIVE_SOURCE_PHASE_RESOLVE
     command.credential = "fake-source-refusal-secret-canary"
-    command.parent_call.interface_digest = b"wrong-interface" * 2
+    command.parent_call.module = "untrusted.source"
     outgoing: queue.Queue[pb.WorkerFrame] = queue.Queue()
 
     class DispatchWorker(Worker):

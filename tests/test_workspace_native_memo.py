@@ -22,7 +22,7 @@ def accepted(workspace: Workspace, parent: str) -> pb.NativeSourceCommand:
     raw = documents.canonical_bytes(
         pb.InvocationSpec(
             job=pb.JobInvocationSpec(
-                build_id="sha256:" + "22" * 32,
+                installation_id="native-source-fixture",
                 job_descriptor_id="sha256:" + "33" * 32,
             )
         )
@@ -48,7 +48,6 @@ def accepted(workspace: Workspace, parent: str) -> pb.NativeSourceCommand:
     args = {"repository": "example/model", "revision": "a" * 40}
     intent = canonical_json.encode(
         {
-            "interface_digest": source_interfaces.DIGEST,
             "module": source_interfaces.MODULE,
             "export": "download_huggingface",
             "request": args,
@@ -62,7 +61,6 @@ def accepted(workspace: Workspace, parent: str) -> pb.NativeSourceCommand:
             parent_attempt_ordinal=1,
             parent_invocation_spec_digest=spec,
             call_index=0,
-            interface_digest=documents.raw(source_interfaces.DIGEST),
             module=source_interfaces.MODULE,
             export="download_huggingface",
             intent_digest=hashlib.sha256(intent).digest(),

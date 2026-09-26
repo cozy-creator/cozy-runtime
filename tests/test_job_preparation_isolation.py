@@ -3,27 +3,29 @@
 from __future__ import annotations
 
 import dataclasses
+import email.parser
 import json
 import os
 import shutil
 import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import pytest
+from packaging.requirements import Requirement
 
 from conftest import image_python
 from cozy_runtime.internal import child_env
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.local import LocalRecordOwner, LocalRequest
 from cozy_runtime.internal.worker.job_slots import JobSlot
-from cozy_runtime.internal.worker.package_prepare import PreparationRefusal
 from cozy_runtime.internal.worker.plan import JobBinding
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 from cozy_runtime.protocol import worker_pb2 as pb
-from test_end_to_end import NO_EXECUTOR, _development, _measured_revision, _run, _wheel_rows
+from test_end_to_end import NO_EXECUTOR, _development, _run, _wheel_rows
 
 SOURCE = """from pathlib import Path
 import time
@@ -65,18 +67,48 @@ def package(root: Path, label: str) -> tuple[Path, pb.PrepareLocalPackageRequest
     assert uv is not None
     _run(uv, "build", "--wheel", "--out-dir", str(wheels), str(project))
     (wheel,) = wheels.glob("*.whl")
+    image = image_python()
+    runtime_wheel = next((image.parent.parent.parent / "wheels").glob("cozy_runtime-*.whl"))
+    runtime_copy = wheels / runtime_wheel.name
+    shutil.copyfile(runtime_wheel, runtime_copy)
+    with zipfile.ZipFile(runtime_copy) as archive:
+        metadata = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+        parsed = email.parser.BytesParser().parsebytes(archive.read(metadata))
+    dependencies = [Requirement(raw) for raw in parsed.get_all("Requires-Dist", [])]
+    requirements = root / (label + "-requirements.in")
+    requirements.write_text(
+        "\n".join(
+            str(row)
+            for row in dependencies
+            if row.marker is None or row.marker.evaluate({"extra": ""})
+        )
+        + "\n"
+    )
+    locked = root / (label + "-requirements.txt")
+    _run(
+        uv,
+        "pip",
+        "compile",
+        "--python",
+        str(image),
+        "--generate-hashes",
+        "--no-header",
+        "--no-annotate",
+        "--output-file",
+        str(locked),
+        str(requirements),
+    )
     return environment, pb.PrepareLocalPackageRequest(
         operation_id=label,
         package=_development("local/" + name, "1.0.0"),
-        wheels=_wheel_rows([wheel]),
+        files=_wheel_rows([wheel, runtime_copy]),
+        dependency_requirements=locked.read_bytes(),
         install_root=str(environment),
     )
 
 
 def measure(worker: Worker, request: pb.PrepareLocalPackageRequest) -> None:
-    with pytest.raises(PreparationRefusal) as missing:
-        worker.prepare_local_package(request)
-    request.package.local_revision_digest = _measured_revision(missing.value)
+    worker.prepare_local_package(request)
 
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")

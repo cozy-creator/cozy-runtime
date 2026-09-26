@@ -106,7 +106,6 @@ def view_call(
     arguments = {"source": canonical_json.decode(value)}
     intent = canonical_json.encode(
         {
-            "interface_digest": source_interfaces.DIGEST,
             "module": source_interfaces.MODULE,
             "export": "source_files",
             "request": arguments,
@@ -121,7 +120,6 @@ def view_call(
             parent_attempt_ordinal=parent.parent_attempt_ordinal,
             parent_invocation_spec_digest=parent.parent_invocation_spec_digest,
             call_index=index,
-            interface_digest=documents.raw(source_interfaces.DIGEST),
             module=source_interfaces.MODULE,
             export="source_files",
             request_canonical_bytes=canonical_json.encode(arguments),

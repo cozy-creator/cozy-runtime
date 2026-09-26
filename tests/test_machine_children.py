@@ -345,6 +345,7 @@ def native_origin(worker: Worker) -> tuple[ThreadingHTTPServer, threading.Thread
         "model_result",
         "model_admission",
         "source",
+        "source_conflict",
         "file",
         "byte_inputs",
         "byte_inputs_serving",
@@ -377,7 +378,15 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
         root = Path(directory)
         source = (
             MODEL_SOURCE
-            if case in ("model", "model_sequence", "model_result", "model_admission", "source")
+            if case
+            in (
+                "model",
+                "model_sequence",
+                "model_result",
+                "model_admission",
+                "source",
+                "source_conflict",
+            )
             else SOURCE
         )
         if case == "model_sequence":
@@ -445,7 +454,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     + "        ctx.raise_if_cancelled()\n        await asyncio.sleep(0.05)\n"
                     + "    return Media(result.value, result.image, call.observation.capture.tree)",
                 )
-        if case == "source":
+        if case in ("source", "source_conflict"):
             source = source.replace(
                 'return Result(len(view.components["body"]))',
                 "return Result(sum(len(v) for v in view.components.values()))",
@@ -470,6 +479,15 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 + f"    while not Path({str(root / 'gate')!r}).exists():\n"
                 + "        ctx.raise_if_cancelled()\n        await asyncio.sleep(0.02)\n"
                 + "    return Result(n * 2)",
+            )
+        if case == "source_conflict":
+            source = source.replace(
+                "    from cozy_runtime.author.sources import (",
+                "    from pathlib import Path\n    import asyncio\n"
+                + f"    Path({str(root / 'source-ready')!r}).touch()\n"
+                + f"    while not Path({str(root / 'source-release')!r}).exists():\n"
+                + "        ctx.raise_if_cancelled()\n        await asyncio.sleep(0.01)\n"
+                + "    from cozy_runtime.author.sources import (",
             )
         if case == "cycle":
             source = source.replace("first = await leaf(n=n)", "first = await compose(n=n)")
@@ -526,39 +544,18 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     }
                 )
             )
-        origin = native_origin(worker) if case == "source" else None
+        origin = native_origin(worker) if case in ("source", "source_conflict") else None
         try:
             fixture.measure(worker, preparation)
             prepared = worker.prepare_local_package(preparation)
-            placement = documents.read(
-                prepared.placement_set.placement_set_canonical_bytes, pb.PlacementSet
-            )["placements"][0]
-            revision = pb.LocalPackageRevision(
-                package=preparation.package.package,
-                release=preparation.package.release,
-                source_digest=preparation.package.source_digest,
-                package_interface=pb.Ref(
-                    digest=documents.raw(placement["package_interface"]["digest"]),
-                    length=placement["package_interface"]["length"],
-                ),
-                files=[
-                    pb.LocalPackageFileRef(
-                        filename=wheel.filename,
-                        digest=wheel.digest,
-                        length=wheel.length,
-                    )
-                    for wheel in preparation.wheels
-                ],
-            )
             captured, capture_digest = documents.identity(
                 pb.MachineExecutionCapture(
-                    root_revision_digest=preparation.package.local_revision_digest,
-                    revisions=[revision],
+                    root_installation_id=prepared.installed_package.installation_id,
+                    installed_packages=[prepared.installed_package],
                     bindings=[
                         pb.MachineCallableBinding(
-                            caller_revision_digest=preparation.package.local_revision_digest,
-                            callee_revision_digest=preparation.package.local_revision_digest,
-                            interface_digest=revision.package_interface.digest,
+                            caller_installation_id=prepared.installed_package.installation_id,
+                            callee_installation_id=prepared.installed_package.installation_id,
                             module="prepare_nested",
                             export=export,
                             entrypoint=export,
@@ -613,7 +610,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 ),
                 {},
                 root / "grants",
-                package_code_digest=binding.build_id,
+                package_installation_id=binding.installation_id,
             )
             generator.host.inbound.get_nowait()
             generator._dispatch()
@@ -644,6 +641,39 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 assert not worker.executions.owns("owner", "root")
                 return
             client.SubmitMachineExecution(submitted)
+            if case == "source_conflict":
+                from cozy_runtime.internal import source_interfaces
+                from cozy_runtime.internal.call_intent import canonical_intent
+                from cozy_runtime.internal.worker import workspace_sources
+
+                while not (root / "source-ready").exists():
+                    assert thread.is_alive() and time.monotonic() < deadline
+                    time.sleep(0.01)
+                # A native slot already accepted a different frozen source intent.
+                # The real public facade must receive the durable refusal and end.
+                call = pb.ChildCallRequest(
+                    parent_request_id="root",
+                    parent_attempt_ordinal=1,
+                    parent_invocation_spec_digest=submitted.offer.invocation_spec_digest,
+                    call_index=0,
+                    module=source_interfaces.MODULE,
+                    export="download_huggingface",
+                    request_canonical_bytes=canonical_json.encode(
+                        {"repository": "different/model", "revision": "b" * 40}
+                    ),
+                )
+                call.intent_digest = hashlib.sha256(canonical_intent(call)).digest()
+                assert worker.workspace is not None
+                workspace_sources.accepted(
+                    worker.workspace,
+                    "owner",
+                    pb.NativeSourceCommand(
+                        service_id=workspace_sources.identity("owner", "root", 0),
+                        operation=pb.NATIVE_SOURCE_OPERATION_HUGGINGFACE,
+                        parent_call=call,
+                    ),
+                )
+                (root / "source-release").touch()
             if case == "model_sequence":
                 while not (root / "between-children").exists():
                     assert thread.is_alive() and time.monotonic() < deadline
@@ -703,6 +733,17 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 time.sleep(0.02)
             outcome = worker.collect_execution(claim, "root")
             body = documents.read(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
+            if case == "source_conflict":
+                assert body["status"] == pb.OUTCOME_STATUS_FAILED, body
+                assert worker.workspace is not None
+                with worker.workspace.locked() as db:
+                    refused = db.execute(
+                        "SELECT safe_code,safe_detail FROM execution_calls "
+                        "WHERE parent_request='root' AND call_index=0"
+                    ).fetchone()
+                    assert refused["safe_code"] == "child_admission_refused"
+                    assert "another native source intent" in refused["safe_detail"]
+                return
             if case in ("cycle", "capacity", "model_admission", "byte_input_admission"):
                 assert body["status"] == pb.OUTCOME_STATUS_FAILED, body
                 assert worker.workspace is not None
@@ -812,7 +853,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                 "value": 16
                 if case == "serving_model"
                 else 1
-                if case == "source"
+                if case in ("source", "source_conflict")
                 else 2
                 if case in ("model", "model_sequence")
                 else 12
@@ -841,7 +882,7 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     assert all(not row["reuse_miss_reason"] for row in released)
                 assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == (
                     2
-                    if case == "source"
+                    if case in ("source", "source_conflict")
                     else 5
                     if case == "model_sequence"
                     else 4
@@ -865,7 +906,11 @@ def test_nested_capture_and_leaf_memoization_without_control_stream(
                     else 3
                 )
                 assert db.execute("SELECT count(*) FROM operation_cache").fetchone()[0] == (
-                    2 if case == "source" else 0 if case in ("serving", "internal_serving") else 1
+                    2
+                    if case in ("source", "source_conflict")
+                    else 0
+                    if case in ("serving", "internal_serving")
+                    else 1
                 )
         finally:
             worker.request_stop()

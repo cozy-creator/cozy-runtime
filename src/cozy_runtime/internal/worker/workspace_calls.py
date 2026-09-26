@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from cozy_runtime import canonical_json
+from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.worker.workspace import Journal, Row, Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_executions import transaction
-from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 SCHEMA8 = """
@@ -128,14 +128,7 @@ class Calls:
             or canonical_json.encode(value) != request.request_canonical_bytes
         ):
             raise WorkspaceRefusal("call arguments must be one canonical object")
-        body: dict[str, Any] = {
-            "module": request.module,
-            "export": request.export,
-            "request": value,
-        }
-        if request.HasField("capture"):
-            body["capture"] = documents.body(request.capture)
-        intent = canonical_json.encode(body)
+        intent = canonical_intent(request)
         if hashlib.sha256(intent).digest() != request.intent_digest:
             raise WorkspaceRefusal("call intent does not bind its exact arguments and target")
         with self.workspace.locked() as db, transaction(db):

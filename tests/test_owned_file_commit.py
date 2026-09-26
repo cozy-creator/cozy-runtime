@@ -148,7 +148,6 @@ def pending(
     }
     intent = canonical_json.encode(
         {
-            "interface_digest": source_interfaces.DIGEST,
             "module": source_interfaces.MODULE,
             "export": "commit_file",
             "request": arguments,
@@ -163,7 +162,6 @@ def pending(
             parent_attempt_ordinal=1,
             parent_invocation_spec_digest=source.parent_call.parent_invocation_spec_digest,
             call_index=1,
-            interface_digest=documents.raw(source_interfaces.DIGEST),
             module=source_interfaces.MODULE,
             export="commit_file",
             request_canonical_bytes=canonical_json.encode(arguments),
@@ -300,7 +298,6 @@ def replace_arguments(command: pb.NativeSourceCommand, arguments: dict[str, Any]
     call.intent_digest = hashlib.sha256(
         canonical_json.encode(
             {
-                "interface_digest": source_interfaces.DIGEST,
                 "module": source_interfaces.MODULE,
                 "export": "commit_file",
                 "request": arguments,

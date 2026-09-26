@@ -110,6 +110,13 @@ class Calls:
             child_request_id=call.child_request,
             state=pb.CHILD_CALL_STATE_PENDING,
         )
+        if call.safe_code:
+            result.state, result.safe_code, result.safe_detail = (
+                pb.CHILD_CALL_STATE_REFUSED,
+                call.safe_code,
+                call.safe_detail,
+            )
+            return result
         if request.module == source_interfaces.MODULE:
             return self.worker.machine_sources.result(owner, call, request, result)
         if call.result:
@@ -130,13 +137,6 @@ class Calls:
                     canonical_json.decode(call.prepared).get("result_schema", {}),
                     capture=capture,
                 )
-            )
-            return result
-        if call.safe_code:
-            result.state, result.safe_code, result.safe_detail = (
-                pb.CHILD_CALL_STATE_REFUSED,
-                call.safe_code,
-                call.safe_detail,
             )
             return result
         executions = self.worker.executions
@@ -335,7 +335,8 @@ class Calls:
                     ],
                     deadline_unix_ms=int(parent.spec.get("deadline_unix_ms", 0)),
                     job=pb.JobInvocationSpec(
-                        installation_id=target.installation_id, job_descriptor_id=target.binding.job_descriptor_id
+                        installation_id=target.installation_id,
+                        job_descriptor_id=target.binding.job_descriptor_id,
                     ),
                 )
                 spec.inputs.extend(model_inputs)
