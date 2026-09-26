@@ -2213,7 +2213,9 @@ class Worker:
             requests = self.executions.pending(owner)
             groups = self.machine_groups
             if groups is not None:
-                requests = tuple(sorted(requests, key=lambda request: groups.priority(owner, request)))
+                requests = tuple(
+                    sorted(requests, key=lambda request: groups.priority(owner, request))
+                )
             for request in requests:
                 state = self.executions.status(owner, request)
                 held = self.engine.history.get((request, state.attempt_ordinal))
@@ -2262,7 +2264,9 @@ class Worker:
                     continue
                 preparation = self.executions.preparation(owner, request)
                 try:
-                    if self.machine_groups is not None and not self.machine_groups.admits(owner, request, preparation):
+                    if self.machine_groups is not None and not self.machine_groups.admits(
+                        owner, request, preparation
+                    ):
                         self.machine_groups.wait(owner, request, request, state.attempt_ordinal)
                         continue
                     if preparation and not self._prepare_execution(preparation, request):
