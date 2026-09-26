@@ -166,9 +166,10 @@ def test_computed_default_is_never_evaluated_by_static_reader(tmp_path: Path) ->
 def test_explicit_gpu_count_is_preserved_and_validated() -> None:
     lane = "paul/minimax-h3@1.0.0/fp8"
     assert default_ladder([{"gpu": "H100", "gpus": 2, "lane": lane}]) == (("H100", 2, lane),)
-    for count in [0, -1, 17, True, 1.5, "2"]:
+    for count in [0, -1, True, 1.5, "2"]:
         with pytest.raises(ConformanceError):
             default_ladder([{"gpu": "H100", "gpus": count, "lane": lane}])
+    assert default_ladder([{"gpu": "future", "gpus": 17, "lane": lane}]) == (("future", 17, lane),)
     # Older immutable source/captures had no count and never asserted singleton execution.
     assert default_ladder([{"gpu": "H100", "lane": lane}]) == (("H100", 0, lane),)
 

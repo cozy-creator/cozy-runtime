@@ -43,7 +43,7 @@ catch-all `*` only last. Each target explicitly names a published release and po
 
 An explicit `gpus` count names the execution group, for example
 `{"gpu": "H100", "gpus": 2, "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-pruned"}`.
-Counts are integers from 1 through 16; counts above 1 must be declared by the model's
+Counts are positive integers; counts above 1 must be declared by the model's
 `sequence_parallel.degrees`. A four-device pool can reserve a two-device H3 group
 and run a singleton Qwen child separately. Extra devices do not enlarge a selected
 group. Rental purchase matches an explicit offered count; independent workflow

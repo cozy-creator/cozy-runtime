@@ -39,9 +39,9 @@ def default_ladder(value: object) -> DefaultLadder:
         gpus = 0
         if "gpus" in row:
             count = row["gpus"]
-            if type(count) is not int or not 1 <= count <= 16:
+            if type(count) is not int or count < 1:
                 raise ConformanceError(
-                    "default gpus must be an integer from 1 through 16", code="model_defaults"
+                    "default gpus must be a positive integer", code="model_defaults"
                 )
             gpus = count
         if (

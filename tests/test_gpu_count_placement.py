@@ -71,3 +71,44 @@ def test_counted_capture_needs_feature63_but_old_capture_accepts62():
         machine_model_defaults.verify(worker, request, capture, interfaces)
     request.claim.wire_minor = 63
     machine_model_defaults.verify(worker, request, capture, interfaces)
+
+
+def test_selection_uses_granted_pool_and_old_rows_do_not_need_count_probe(monkeypatch):
+    import pytest
+
+    from cozy_runtime.internal import hostfacts
+    from cozy_runtime.internal.worker import machine_model_defaults as defaults
+    from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+
+    row = {
+        "callee_installation_id": "installed",
+        "entrypoint": "run",
+        "parameter": "model",
+        "public_origin": "https://hub.example",
+        "rungs": [{"gpu": "H100"}],
+    }
+    worker = SimpleNamespace(
+        options=SimpleNamespace(accelerator_backend="cuda"),
+        executions=SimpleNamespace(
+            capture_root=lambda *_: "root", capture=lambda *_: {"model_defaults": [row]}
+        ),
+    )
+    target = SimpleNamespace(
+        installation_id="installed",
+        entrypoint="run",
+        declaration={"models": [{"path": "run.models.model"}]},
+    )
+    call = SimpleNamespace(parent_request="parent")
+    monkeypatch.setattr(
+        defaults.hostfacts,
+        "measure",
+        lambda _: hostfacts.HostFacts(
+            gpu_name="NVIDIA H100", gpu_count=4, unreadable=("gpu_count",)
+        ),
+    )
+    assert "gpus" not in defaults.select(worker, "owner", call, target, {})[0]
+    row["rungs"] = [{"gpu": "H100", "gpus": 4}, {"gpu": "H100", "gpus": 2}]
+    with pytest.raises(WorkspaceRefusal, match="readable granted GPU count"):
+        defaults.select(worker, "owner", call, target, {})
+    worker.lanes = SimpleNamespace(entries=[0, 1])
+    assert defaults.select(worker, "owner", call, target, {})[0]["gpus"] == 2
