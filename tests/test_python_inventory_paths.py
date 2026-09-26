@@ -1,7 +1,7 @@
 """Real uv inventory may print home-relative paths when invoked from the user's home."""
 
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -17,5 +17,5 @@ def test_managed_inventory_is_absolute_from_home(monkeypatch: pytest.MonkeyPatch
     assert choices
     assert all(choice.executable.is_absolute() for choice in choices)
     assert all(choice.executable.is_file() for choice in choices)
-    selected = python_interpreters.select(">=3.12,<3.13")
-    assert selected.version.startswith("3.12.")
+    selected = python_interpreters.select(">=3.12", choices[0].version)
+    assert selected.version == choices[0].version
