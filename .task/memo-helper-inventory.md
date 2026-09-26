@@ -35,4 +35,4 @@ The three privileged native source facades use a separate implementation/native-
 
 Current inventory is eighteen decorated managed functions, one memoized serving entrypoint, and three native source facades; the older count of twenty-one predates Runtime `prepare_model`. Counts establish no reuse, interruption, retention, GPU, or quality result.
 
-Follow-up scopes: **Eval memo helper and serving-instrument invalidation** and **SDXL/H3 memo helper/resource invalidation**. Both need actual edited-helper/resource negative controls, plus the still-open ordinary local/private CLI and partial-recovery matrix. No library declarations or live artifacts were changed by this audit.
+Named follow-ups: [Eval memo helper and serving-instrument invalidation](https://github.com/cozy-creator/tracker/issues/235) and [SDXL/H3 memo helper/resource invalidation](https://github.com/cozy-creator/tracker/issues/236). Both need actual edited-helper/resource negative controls, plus the still-open ordinary local/private CLI and partial-recovery matrix. No library declarations or live artifacts were changed by this audit.
