@@ -30,7 +30,7 @@ def _call(operation: str, arguments: dict[str, object]) -> Awaitable[object]:
         raise CapabilityError(
             "source operation has no admitted attempt", code="child_broker_absent"
         )
-    return broker.reserve("", __name__, operation, arguments)
+    return broker.reserve(__name__, operation, arguments)
 
 
 def download_huggingface(

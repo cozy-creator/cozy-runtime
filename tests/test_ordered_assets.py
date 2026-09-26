@@ -259,7 +259,7 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
     broker = _Broker(
         "parent",
         {
-            ("", __name__, "child"): _CallType(
+            (__name__, "child"): _CallType(
                 "sha256:" + "b" * 64, __name__, "child", surface.payload_type, Result
             )
         },
@@ -274,7 +274,7 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
     )
     original: Assets[ImageAsset] = Assets([photo.with_label("original")])
     forwarded: Assets[ImageAsset] = Assets([photo.with_label("second"), photo.with_label("first")])
-    reservation = broker.reserve("", __name__, "child", {"assets": forwarded})
+    reservation = broker.reserve(__name__, "child", {"assets": forwarded})
     payload = json.loads(reservation.payload)
     assert payload == {
         "assets": [
@@ -294,10 +294,9 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
     assert outcome.terminal == "succeeded", outcome
     assert result is not None and result.result.labels == ["second", "first"]
     assert result.result.ids == ["assets.0.asset", "assets.1.asset"]
-    reordered = broker.reserve("", __name__, "child", {"assets": forwarded.select(1, 0)})
+    reordered = broker.reserve(__name__, "child", {"assets": forwarded.select(1, 0)})
     assert reordered.payload != reservation.payload
     fidelity = broker.reserve(
-        "",
         __name__,
         "child",
         {
@@ -310,7 +309,6 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
     assert [item["asset"] for item in json.loads(fidelity.payload)["assets"]] == [photo.digest] * 2
     assert photo.fidelity == "auto"
     relabelled = broker.reserve(
-        "",
         __name__,
         "child",
         {"assets": Assets([photo.with_label("woman"), photo.with_label("first")])},
@@ -319,10 +317,10 @@ def test_managed_subset_labels_and_duplicates_are_explicit_and_rebind(tmp_path: 
     assert [row["asset"] for row in json.loads(relabelled.payload)["assets"]] == [
         row["asset"] for row in payload["assets"]
     ]
-    unlabelled = broker.reserve("", __name__, "child", {"assets": Assets([photo, photo])})
+    unlabelled = broker.reserve(__name__, "child", {"assets": Assets([photo, photo])})
     assert unlabelled.payload != reservation.payload
     with pytest.raises(CapabilityError, match=r"child\.asset_ungranted"):
-        broker.reserve("", __name__, "child", {"assets": Assets([ImageAsset(photo.digest)])})
+        broker.reserve(__name__, "child", {"assets": Assets([ImageAsset(photo.digest)])})
 
 
 @dataclass
@@ -466,14 +464,14 @@ def test_decoded_selection_forwards_custody_without_decoding(tmp_path: Path) -> 
     broker = _Broker(
         "parent",
         {
-            ("", __name__, "decoded_child"): _CallType(
+            (__name__, "decoded_child"): _CallType(
                 "sha256:" + "b" * 64, __name__, "decoded_child", surface.payload_type, Result
             )
         },
         lambda _operation, _payload: {},
     )
     broker.bind(fake_context(request_id="parent"))
-    call = broker.reserve("", __name__, "decoded_child", {"assets": forwarded})
+    call = broker.reserve(__name__, "decoded_child", {"assets": forwarded})
     payload = json.loads(call.payload)
     assert [row["label"] for row in payload["assets"]] == ["two", "one"]
     selected = {key: row for key, row in rows.items() if key.startswith("assets.")}
