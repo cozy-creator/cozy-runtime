@@ -305,7 +305,7 @@ class QwenImage21Pipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         text_model = getattr(self.text_encoder.model, "language_model", self.text_encoder.model)
         handle = text_model.norm.register_forward_hook(lambda module, args, output: args[0])
         try:
-            outputs = self.text_encoder(**forward_kwargs)
+            outputs = self.text_encoder.model(**forward_kwargs)
         finally:
             handle.remove()
         hidden_states = outputs.hidden_states[-1]
