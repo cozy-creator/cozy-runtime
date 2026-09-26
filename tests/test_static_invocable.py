@@ -132,6 +132,34 @@ def test_invocable_defaults_are_part_of_the_static_interface_identity(tmp_path: 
     assert before != after
 
 
+def test_serving_memo_dependencies_are_installed_metadata_not_executed_source(
+    tmp_path: Path,
+) -> None:
+    root = project(tmp_path)
+    (root / "ast_operations/__init__.py").write_text('''
+import msgspec
+from cozy_runtime.author import App, Context, MemoDistribution, MemoResource
+raise AssertionError("the static reader must never execute this module")
+class Request(msgspec.Struct):
+    value: int
+class Result(msgspec.Struct):
+    value: int
+def helper():
+    raise AssertionError("memo helpers must never execute during static inspection")
+def measure(ctx: Context, payload: Request) -> Result:
+    return Result(payload.value)
+app = App()
+app.entrypoint(measure, memoize=True, memo_version=helper(), memo_dependencies=(
+    helper, MemoResource("uninstalled", "plan.json"), MemoDistribution("uninstalled"),
+))
+''')
+    document = static_interface.build(root)
+    rows = cast(list[dict[str, Any]], document["entrypoints"])
+    assert len(rows) == 1
+    assert rows[0]["invocable"]["memoize"] is True
+    assert "operation_identity" not in rows[0]["invocable"]
+
+
 def test_declared_tensorfs_output_is_a_capability_without_a_weights_sink_parameter(
     tmp_path: Path,
 ) -> None:
