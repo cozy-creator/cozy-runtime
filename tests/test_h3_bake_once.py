@@ -33,14 +33,6 @@ def test_bake_is_one_time_and_does_not_call_adapter_forward_path(monkeypatch: An
     base, factors = _fixture()
     original = deepcopy(base.state_dict())
     baked = bake_lora_linear(base, factors)
-
-    def fail(*_args: Any, **_kwargs: Any) -> None:
-        raise AssertionError("a baked request must not run LoRAFactors.accumulate")
-
-    monkeypatch.setattr(factors, "accumulate", fail)
-    value = torch.arange(20, dtype=torch.float32).reshape(5, 4).to(torch.bfloat16)
-    actual = baked(value)
-    assert actual.shape == (5, 3)
     expected_weight = (
         base.weight.detach().to(torch.float32)
         + factors.scale
@@ -49,6 +41,15 @@ def test_bake_is_one_time_and_does_not_call_adapter_forward_path(monkeypatch: An
             factors.lora_down.detach().to(torch.float32),
         )
     ).to(torch.bfloat16)
+
+    def fail(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("a baked request must not run LoRAFactors.accumulate")
+
+    monkeypatch.setattr(factors, "accumulate", fail)
+    monkeypatch.setattr(torch, "mm", fail)
+    value = torch.arange(20, dtype=torch.float32).reshape(5, 4).to(torch.bfloat16)
+    actual = baked(value)
+    assert actual.shape == (5, 3)
     expected = torch.nn.functional.linear(value, expected_weight, base.bias)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     # The base remains pristine after composition and inference.
