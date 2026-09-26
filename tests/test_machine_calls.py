@@ -164,11 +164,14 @@ def test_preparation_start_is_visible_without_fabricated_fraction(tmp_path: Path
     serving = Serving(cast(Any, worker))
     call = SimpleNamespace(parent_request="parent", child_request="child", call_index=0)
     incoming = pb.ChildCallRequest(parent_attempt_ordinal=1)
-    with pytest.raises(ValueError), serving.phase(cast(Any, call), incoming, "Downloading model"):
+    with (
+        pytest.raises(ValueError),
+        serving.phase(cast(Any, call), incoming, "Downloading model weights"),
+    ):
         assert emitted[-1] == (
             "parent",
             1,
-            {"kind": "progress", "stage": "Shot 1 of 7 / Downloading model"},
+            {"kind": "progress", "stage": "Shot 1 of 7 / Downloading model weights"},
         )
         raise ValueError("download failed")
     assert emitted[-1][2]["fields"]["completed"] is False
