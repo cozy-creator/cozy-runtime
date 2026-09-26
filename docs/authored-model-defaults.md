@@ -40,3 +40,14 @@ putting nonempty defaults on both `invocable` and its App registration refuses. 
 can share one literal ladder constant between its functions. Model references are metadata,
 never executor-side lookups. A ladder admits 1 through 32 GPU selectors, with an optional
 catch-all `*` only last. Each target explicitly names a published release and portable lane.
+
+An explicit `gpus` count names the execution group, for example
+`{"gpu": "H100", "gpus": 2, "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-pruned"}`.
+Counts are integers from 1 through 16; counts above 1 must be declared by the model's
+`sequence_parallel.degrees`. A four-device pool can reserve a two-device H3 group
+and run a singleton Qwen child separately. Extra devices do not enlarge a selected
+group. Rental purchase matches an explicit offered count; independent workflow
+children require the maximum group count, while slots within a callable share one
+group. Older published declarations and captures without `gpus` preserve their
+unspecified-count behavior until republished. Explicit-count captures require
+wire 63; ordinary uncounted calls retain wire 62 compatibility.

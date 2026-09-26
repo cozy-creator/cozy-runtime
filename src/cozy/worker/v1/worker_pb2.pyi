@@ -620,14 +620,16 @@ class MachineModelDefault(_message.Message):
     def __init__(self, entrypoint: _Optional[str] = ..., parameter: _Optional[str] = ..., public_origin: _Optional[str] = ..., rungs: _Optional[_Iterable[_Union[MachineModelDefaultRung, _Mapping]]] = ..., unavailable_code: _Optional[str] = ..., callee_installation_id: _Optional[str] = ...) -> None: ...
 
 class MachineModelDefaultRung(_message.Message):
-    __slots__ = ("gpu", "repository", "manifest")
+    __slots__ = ("gpus", "gpu", "repository", "manifest")
+    GPUS_FIELD_NUMBER: _ClassVar[int]
     GPU_FIELD_NUMBER: _ClassVar[int]
     REPOSITORY_FIELD_NUMBER: _ClassVar[int]
     MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    gpus: int
     gpu: str
     repository: str
     manifest: Ref
-    def __init__(self, gpu: _Optional[str] = ..., repository: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
+    def __init__(self, gpus: _Optional[int] = ..., gpu: _Optional[str] = ..., repository: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
 class InstalledPackage(_message.Message):
     __slots__ = ("installation_id", "package", "release", "package_interface")
@@ -966,18 +968,20 @@ class PrepareEvent(_message.Message):
     def __init__(self, stage: _Optional[_Union[PrepareStage, str]] = ..., total_bytes: _Optional[int] = ..., transferred_bytes: _Optional[int] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., model_progress: _Optional[_Iterable[_Union[PrepareModelProgress, _Mapping]]] = ..., installed_package: _Optional[_Union[InstalledPackage, _Mapping]] = ...) -> None: ...
 
 class PrepareModelProgress(_message.Message):
-    __slots__ = ("model", "total_bytes", "transferred_bytes", "origin_bytes", "cached_bytes")
+    __slots__ = ("model", "total_bytes", "transferred_bytes", "origin_bytes", "cached_bytes", "cache_written_bytes")
     MODEL_FIELD_NUMBER: _ClassVar[int]
     TOTAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     TRANSFERRED_BYTES_FIELD_NUMBER: _ClassVar[int]
     ORIGIN_BYTES_FIELD_NUMBER: _ClassVar[int]
     CACHED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    CACHE_WRITTEN_BYTES_FIELD_NUMBER: _ClassVar[int]
     model: DownloadModelRef
     total_bytes: int
     transferred_bytes: int
     origin_bytes: int
     cached_bytes: int
-    def __init__(self, model: _Optional[_Union[DownloadModelRef, _Mapping]] = ..., total_bytes: _Optional[int] = ..., transferred_bytes: _Optional[int] = ..., origin_bytes: _Optional[int] = ..., cached_bytes: _Optional[int] = ...) -> None: ...
+    cache_written_bytes: int
+    def __init__(self, model: _Optional[_Union[DownloadModelRef, _Mapping]] = ..., total_bytes: _Optional[int] = ..., transferred_bytes: _Optional[int] = ..., origin_bytes: _Optional[int] = ..., cached_bytes: _Optional[int] = ..., cache_written_bytes: _Optional[int] = ...) -> None: ...
 
 class ModelSourceFileCall(_message.Message):
     __slots__ = ("claim", "request")

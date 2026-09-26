@@ -195,7 +195,16 @@ def model_slot(
         "component_use": {method: sorted(names) for method, names in sorted(components.items())},
     }
     if defaults:
-        doc["default_ladder"] = [{"gpu": gpu, "lane": lane} for gpu, lane in defaults]
+        for _, gpus, _ in defaults:
+            if gpus > 1 and gpus not in sequence_parallel:
+                raise ConformanceError(
+                    "default GPU count is not a declared sequence-parallel degree",
+                    code="model_defaults",
+                )
+        doc["default_ladder"] = [
+            {"gpu": gpu, **({"gpus": gpus} if gpus else {}), "lane": lane}
+            for gpu, gpus, lane in defaults
+        ]
     if sequence_parallel:
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
@@ -467,7 +476,15 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     model_path,
                 )
                 if "default_ladder" in slot:
-                    default_ladder(slot["default_ladder"])
+                    declared_defaults = default_ladder(slot["default_ladder"])
+                    parallel = slot.get("sequence_parallel", {})
+                    degrees = parallel.get("degrees", []) if isinstance(parallel, dict) else []
+                    if any(gpus > 1 and gpus not in degrees for _, gpus, _ in declared_defaults):
+                        _invalid(
+                            source,
+                            model_path,
+                            "default GPU count is not a declared sequence-parallel degree",
+                        )
                 for consent, vocabulary in (
                     ("encoded_leaves", ENCODED_LEAVES),
                     ("fusion", FUSION),

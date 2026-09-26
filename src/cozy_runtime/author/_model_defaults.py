@@ -15,7 +15,7 @@ _REFERENCE = re.compile(
 )
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 
-type DefaultLadder = tuple[tuple[str, str], ...]
+type DefaultLadder = tuple[tuple[str, int, str], ...]
 
 
 def default_ladder(value: object) -> DefaultLadder:
@@ -24,14 +24,26 @@ def default_ladder(value: object) -> DefaultLadder:
         raise ConformanceError(
             "a model default ladder has 1 through 32 rungs", code="model_defaults"
         )
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, int, str]] = []
     target: tuple[str, str] | None = None
     for index, row in enumerate(value):
-        if not isinstance(row, Mapping) or set(row) != {"gpu", "lane"}:
+        if not isinstance(row, Mapping) or set(row) not in (
+            {"gpu", "lane"},
+            {"gpu", "gpus", "lane"},
+        ):
             raise ConformanceError(
-                "each model default rung carries only gpu and lane", code="model_defaults"
+                "each model default rung carries gpu, optional gpus, and lane",
+                code="model_defaults",
             )
         gpu, lane = row["gpu"], row["lane"]
+        gpus = 0
+        if "gpus" in row:
+            count = row["gpus"]
+            if type(count) is not int or not 1 <= count <= 16:
+                raise ConformanceError(
+                    "default gpus must be an integer from 1 through 16", code="model_defaults"
+                )
+            gpus = count
         if (
             not isinstance(gpu, str)
             or not 1 <= len(gpu.encode()) <= 64
@@ -58,7 +70,7 @@ def default_ladder(value: object) -> DefaultLadder:
                 code="model_defaults",
             )
         target = current
-        out.append((gpu, lane))
+        out.append((gpu, gpus, lane))
     return tuple(out)
 
 

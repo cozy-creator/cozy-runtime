@@ -22,7 +22,7 @@ LADDER = VECTORS["valid"][1]["ladder"]
 @pytest.mark.parametrize("vector", VECTORS["valid"], ids=lambda row: row["name"])
 def test_ladder_valid_vectors(vector: dict[str, Any]) -> None:
     assert default_ladder(vector["ladder"]) == tuple(
-        (row["gpu"], row["lane"]) for row in vector["ladder"]
+        (row["gpu"], row.get("gpus", 0), row["lane"]) for row in vector["ladder"]
     )
 
 
@@ -161,3 +161,33 @@ def test_computed_default_is_never_evaluated_by_static_reader(tmp_path: Path) ->
     root = project(tmp_path, invocable=True, defaults="make_defaults()")
     with pytest.raises(ConformanceError, match="static"):
         static_interface.build(root)
+
+
+def test_explicit_gpu_count_is_preserved_and_validated() -> None:
+    lane = "paul/minimax-h3@1.0.0/fp8"
+    assert default_ladder([{"gpu": "H100", "gpus": 2, "lane": lane}]) == (("H100", 2, lane),)
+    for count in [0, -1, 17, True, 1.5, "2"]:
+        with pytest.raises(ConformanceError):
+            default_ladder([{"gpu": "H100", "gpus": count, "lane": lane}])
+    # Older immutable source/captures had no count and never asserted singleton execution.
+    assert default_ladder([{"gpu": "H100", "lane": lane}]) == (("H100", 0, lane),)
+
+
+def test_gpu_count_requires_the_models_declared_group() -> None:
+    defaults = default_ladder([{"gpu": "H100", "gpus": 2, "lane": "paul/minimax-h3@1.0.0/fp8"}])
+    kwargs = dict(
+        path="run.models.model",
+        class_name="Demo",
+        encoded_leaves="refuse",
+        fusion="refuse",
+        components={},
+        defaults=defaults,
+    )
+    assert (
+        package_interface.model_slot(sequence_parallel=[2, 4], **kwargs)["default_ladder"][0][
+            "gpus"
+        ]
+        == 2
+    )
+    with pytest.raises(ConformanceError):
+        package_interface.model_slot(sequence_parallel=[4], **kwargs)

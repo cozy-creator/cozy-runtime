@@ -178,7 +178,7 @@ class Serving:
             from . import machine_lanes
 
             placement, pins = machine_lanes.replica(
-                self.worker, owner, prepared.placement, target.declaration.get("models", [])
+                self.worker, owner, prepared.placement, target.declaration.get("models", []), prepared.defaults
             )
             journal.check_active(owner, call)
             selected = next(
