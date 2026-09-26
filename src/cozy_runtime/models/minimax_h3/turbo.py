@@ -99,6 +99,21 @@ def bake_lora_linear(base: nn.Linear, factors: LoRAFactors) -> nn.Linear:
             code="artifact_config",
             fields=["base.weight"],
         )
+    if (
+        factors.lora_down.device != base.weight.device
+        or factors.lora_up.device != base.weight.device
+    ):
+        raise ConformanceError(
+            "LoRA factors and base weight must be on the same device",
+            code="artifact_config",
+            fields=["overlay"],
+        )
+    if not factors.lora_down.is_floating_point() or not factors.lora_up.is_floating_point():
+        raise ConformanceError(
+            "bake-once prototype requires floating-point LoRA factors",
+            code="artifact_config",
+            fields=["overlay"],
+        )
     if factors.lora_down.ndim != 2 or factors.lora_down.shape[1] != base.in_features:
         raise ConformanceError(
             "LoRA down projection does not match the base input width",
