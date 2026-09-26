@@ -81,19 +81,19 @@ def test_injected_model_refuses_as_model_before_reserving_a_child() -> None:
 
     broker = _Broker(
         "parent",
-        {key: _CallType(*key, surface.payload_type, surface.result_type)},
+        {key[1:]: _CallType(*key, surface.payload_type, surface.result_type)},
         exchange,
     )
     broker.bind(fake_context(request_id="parent"))
     with pytest.raises(CapabilityError, match="retained ModelArtifact") as error:
-        broker.reserve(*key, {"source": Source.for_test()})
+        broker.reserve(*key[1:], {"source": Source.for_test()})
     assert error.value.code == "child.model_artifact_required"
     assert not broker.calls and broker.next_index == 0 and not exchanges
 
     artifact = ModelArtifact(
         "producer", "result", ObjectRef("sha256:" + "17" * 32, 512), "sha256:" + "18" * 32
     )
-    call = broker.reserve(*key, {"source": artifact})
+    call = broker.reserve(*key[1:], {"source": artifact})
     assert call.index == 0 and json.loads(call.payload)["source"] == msgspec.to_builtins(artifact)
 
 

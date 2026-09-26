@@ -102,7 +102,11 @@ def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
             ],
         }
 
-    broker = _Broker("script#1", source_interfaces.bindings(), exchange)
+    broker = _Broker(
+        "script#1",
+        {(b.module, b.export): b for b in source_interfaces.bindings().values()},
+        exchange,
+    )
     _, outcome, _ = attempt(
         app.get("write"),
         {},

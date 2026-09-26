@@ -41,7 +41,7 @@ def _call(operation: str, arguments: dict[str, object]) -> Awaitable[object]:
     broker = _current.get()
     if broker is None:
         raise CapabilityError("publication has no admitted attempt", code="child_broker_absent")
-    return broker.reserve("", __name__, operation, arguments)
+    return broker.reserve(__name__, operation, arguments)
 
 
 def upload_checkpoint(artifact: ModelArtifact, *, destination: str) -> Awaitable[CheckpointRef]:

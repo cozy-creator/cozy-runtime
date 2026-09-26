@@ -36,14 +36,14 @@ def test_pending_bound_orders_activation_and_releases_completed_history() -> Non
             return {"ok": True}
         return {"ok": True, "state": "succeeded", "result": f'{{"value":{index}}}'}
 
-    broker = _Broker("parent", {key: _CallType(*key, Arguments, Result)}, exchange)
+    broker = _Broker("parent", {key[1:]: _CallType(*key, Arguments, Result)}, exchange)
     broker.bind(fake_context(request_id="parent"))
 
     async def run() -> None:
         for batch in range(3):
-            calls = [broker.reserve(*key, {"value": i}) for i in range(MAX_ACTIVE_CALLS)]
+            calls = [broker.reserve(*key[1:], {"value": i}) for i in range(MAX_ACTIVE_CALLS)]
             with pytest.raises(CapabilityError, match="child_fanout"):
-                broker.reserve(*key, {"value": 99})
+                broker.reserve(*key[1:], {"value": 99})
             results = await asyncio.gather(*calls)
             assert [r.value for r in results] == list(
                 range(batch * MAX_ACTIVE_CALLS, (batch + 1) * MAX_ACTIVE_CALLS)
@@ -62,16 +62,16 @@ def test_call_index_refuses_overflow_without_reusing_an_accepted_index() -> None
     def exchange(kind: str, frame: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "state": "succeeded", "result": '{"value":1}'}
 
-    broker = _Broker("parent", {key: _CallType(*key, Arguments, Result)}, exchange)
+    broker = _Broker("parent", {key[1:]: _CallType(*key, Arguments, Result)}, exchange)
     broker.bind(fake_context(request_id="parent"))
     broker.next_index = MAX_CALL_INDEX
 
     async def run() -> None:
-        last = broker.reserve(*key, {"value": 1})
+        last = broker.reserve(*key[1:], {"value": 1})
         assert last.index == MAX_CALL_INDEX
         await last
         with pytest.raises(CapabilityError, match="child_index_exhausted"):
-            broker.reserve(*key, {"value": 2})
+            broker.reserve(*key[1:], {"value": 2})
 
     asyncio.run(run())
     assert not broker.calls
@@ -82,10 +82,10 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
     frames: list[Any] = []
     ctx = fake_context(request_id="parent")
     telemetry = Telemetry(Attempt("parent", tmp_path, sink=frames.append), ctx)
-    broker = _Broker("parent", {key: _CallType(*key, Arguments, Result)}, lambda *a: {})
+    broker = _Broker("parent", {key[1:]: _CallType(*key, Arguments, Result)}, lambda *a: {})
     broker.bind(ctx, telemetry)
     with telemetry.scope("Shot 2 of 7", overall_range=(0.2, 0.4)):
-        first = broker.reserve(*key, {"value": 1})
+        first = broker.reserve(*key[1:], {"value": 1})
         update = {
             "child_request_id": "child-1",
             "progress": {
@@ -113,7 +113,7 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
         broker._observe(first, update)
         assert len(frames) == count
     with telemetry.scope("Shot 3 of 7", overall_range=(0.4, 0.6)):
-        second = broker.reserve(*key, {"value": 2})
+        second = broker.reserve(*key[1:], {"value": 2})
         broker._observe(second, {**update, "child_request_id": "child-2"})
         assert frames[-1].stage == "Shot 3 of 7 / denoise"
         assert frames[-1].overall_fraction == 0.5

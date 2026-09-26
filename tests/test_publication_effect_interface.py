@@ -57,7 +57,7 @@ def test_effect_reservations_use_existing_parent_index_and_refuse_unknown_inputs
     def exchange(*_: object) -> dict[str, object]:
         raise AssertionError("unawaited effects must not be sent")
 
-    broker = _Broker("parent", bindings(), exchange)
+    broker = _Broker("parent", {(b.module, b.export): b for b in bindings().values()}, exchange)
     _, outcome, _ = attempt(
         app.get("script"), {}, Invocation("parent", tmp_path, time.monotonic() + 10, calls=broker)
     )
@@ -84,7 +84,7 @@ def test_assessment_refuses_files_without_received_custody(tmp_path: Path) -> No
     def exchange(*_: object) -> dict[str, object]:
         raise AssertionError("unreceived artifact must not reach the effect owner")
 
-    broker = _Broker("parent", bindings(), exchange)
+    broker = _Broker("parent", {(b.module, b.export): b for b in bindings().values()}, exchange)
     _, outcome, _ = attempt(
         app.get("script"), {}, Invocation("parent", tmp_path, time.monotonic() + 10, calls=broker)
     )

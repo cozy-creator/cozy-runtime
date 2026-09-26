@@ -262,7 +262,7 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
     broker = _Broker(
         "parent",
         {
-            ("", "tiny", "render"): _CallType(
+            ("tiny", "render"): _CallType(
                 "sha256:" + "01" * 32,
                 "tiny",
                 "render",
@@ -273,7 +273,7 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
         exchange,
     )
     broker.bind(Context("parent", time.monotonic() + 60))
-    pending = broker.reserve("", "tiny", "render", {"fail": False})
+    pending = broker.reserve("tiny", "render", {"fail": False})
     pending.capture = ActivationCapture(("denoiser",), (0, 2))
     before = pending.observation
     assert before is None
