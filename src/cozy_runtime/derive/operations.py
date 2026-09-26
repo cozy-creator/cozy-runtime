@@ -14,6 +14,7 @@ from cozy_runtime.author import (
     AssetBound,
     Context,
     Loader,
+    MemoDistribution,
     Model,
     ModelArtifact,
     Telemetry,
@@ -168,6 +169,10 @@ def _selection(structure: SourceInspection, plan: QuantizationPlan) -> ArtifactQ
         "cozy_runtime.derive.quantization",
         "cozy_runtime.derive.microscale",
         "cozy_runtime.derive.safetensors_io",
+        "tensorfs.derived",
+        MemoDistribution("tensorfs"),
+        MemoDistribution("numpy"),
+        MemoDistribution("msgspec"),
     ),
 )
 async def quantize(
@@ -203,7 +208,12 @@ app.job(quantize, weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BY
 @invocable(
     memoize=True,
     memo_version="prepare-model/1",
-    memo_dependencies=("cozy_runtime.models.qwen_image21.ingestion",),
+    memo_dependencies=(
+        "cozy_runtime.models.qwen_image21.ingestion",
+        "tensorfs.derived",
+        MemoDistribution("tensorfs"),
+        MemoDistribution("msgspec"),
+    ),
 )
 async def prepare_model(
     ctx: Context,
