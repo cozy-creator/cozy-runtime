@@ -1,4 +1,4 @@
-"""Read exact generated interface dependencies from a sealed package environment."""
+"""Discover invocable interface metadata in an ordinary installed package environment."""
 
 from __future__ import annotations
 
@@ -14,10 +14,6 @@ from cozy_runtime.internal.package_environment import InstalledEnvironment
 
 
 def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
-    if not installed.content_digest:
-        raise ConformanceError(
-            "package calls require a sealed environment", code="child_environment"
-        )
     directories = sorted(installed.site_packages.glob("*.dist-info"))
     if len(directories) > 4096:
         raise ConformanceError(
@@ -53,49 +49,8 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
         if len(body) > canonical.DOC_MAX_BYTES:
             raise ConformanceError("installed interface exceeds its bound", code="child_interface")
         descriptor = package_interface.read_bytes(body)
-        # The sealed implementation keeps ordinary library source. Only the generated
-        # private caller code and terminal export replacement confer invoke authority.
-        if metadata.get("Cozy-Interface-Layout") == "overlay":
-            modules = {
-                entry["invocable"]["module"]
-                for entry in [*descriptor["entrypoints"], *descriptor["jobs"]]
-                if "invocable" in entry and not entry.get("internal", False)
-            }
-            available = {
-                candidate
-                for module in modules
-                for candidate in (
-                    module.replace(".", "/") + ".py",
-                    module.replace(".", "/") + "/__init__.py",
-                )
-                if (installed.site_packages / candidate).is_file()
-            }
-            sources = interface_wheel.overlay_sources(body, available)
-            expected_files = {}
-            for relative_module, (companion, expected, suffix) in sources.items():
-                try:
-                    with (installed.site_packages / relative_module).open("rb") as stream:
-                        stream.seek(-len(suffix), 2)
-                        if stream.read() != suffix:
-                            raise ValueError("terminal caller exports changed")
-                except (OSError, ValueError) as exc:
-                    raise ConformanceError(
-                        "installed caller exports changed", code="child_interface"
-                    ) from exc
-                expected_files[companion] = expected
-        else:
-            expected_files = interface_wheel.generate(body)
-        for relative, expected in expected_files.items():
-            target = installed.site_packages / relative
-            try:
-                with target.open("rb") as stream:
-                    actual = stream.read(len(expected) + 1)
-            except OSError as exc:
-                raise ConformanceError("installed proxy is absent", code="child_interface") from exc
-            if actual != expected:
-                raise ConformanceError(
-                    "installed proxy differs from trusted generator", code="child_interface"
-                )
+        # uv owns installed package bytes. Discovery reads the declared interface;
+        # it does not re-generate and compare installed Python source at invocation.
         digest = "sha256:" + hashlib.sha256(body).hexdigest()
         for entry in [*descriptor["entrypoints"], *descriptor["jobs"]]:
             invocable = entry.get("invocable")
