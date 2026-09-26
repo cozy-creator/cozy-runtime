@@ -475,16 +475,6 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     source,
                     model_path,
                 )
-                if "default_ladder" in slot:
-                    declared_defaults = default_ladder(slot["default_ladder"])
-                    parallel = slot.get("sequence_parallel", {})
-                    degrees = parallel.get("degrees", []) if isinstance(parallel, dict) else []
-                    if any(gpus > 1 and gpus not in degrees for _, gpus, _ in declared_defaults):
-                        _invalid(
-                            source,
-                            model_path,
-                            "default GPU count is not a declared sequence-parallel degree",
-                        )
                 for consent, vocabulary in (
                     ("encoded_leaves", ENCODED_LEAVES),
                     ("fusion", FUSION),
@@ -497,6 +487,16 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                     _sequence_parallel(
                         slot["sequence_parallel"], source, f"{model_path}.sequence_parallel"
                     )
+                if "default_ladder" in slot:
+                    declared_defaults = default_ladder(slot["default_ladder"])
+                    parallel = slot.get("sequence_parallel", {})
+                    degrees = parallel.get("degrees", []) if isinstance(parallel, dict) else []
+                    if any(gpus > 1 and gpus not in degrees for _, gpus, _ in declared_defaults):
+                        _invalid(
+                            source,
+                            model_path,
+                            "default GPU count is not a declared sequence-parallel degree",
+                        )
                 prefix = f"{name}.models."
                 if (
                     not isinstance(slot["path"], str)
