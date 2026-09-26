@@ -14,6 +14,7 @@ also prevents filling an existing version with artifacts from another source.
 from __future__ import annotations
 
 import json
+import argparse
 import os
 import pathlib
 import re
@@ -56,18 +57,29 @@ def unpublished(version: str) -> None:
 
 
 def main() -> int:
-    if os.environ["GITHUB_EVENT_NAME"] != "push":
-        raise ValueError("publication requires a new tag push")
+    global ROOT
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=pathlib.Path, default=ROOT)
+    args = parser.parse_args()
+    ROOT = args.source.resolve()
     event = json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-    ref = os.environ["GITHUB_REF"]
-    if (
-        not ref.startswith("refs/tags/v")
-        or event["ref"] != ref
-        or event["created"] is not True
-        or event["deleted"] is not False
-        or event["before"] != "0" * 40
-    ):
-        raise ValueError("publication requires a newly created v* tag, never a moved/deleted tag")
+    manual = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+    if manual:
+        tag = event.get("inputs", {}).get("release_tag", "")
+        if not isinstance(tag, str) or not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+            raise ValueError("manual publication requires an existing version tag")
+        ref = "refs/tags/" + tag
+    else:
+        ref = os.environ["GITHUB_REF"]
+        if (
+            os.environ["GITHUB_EVENT_NAME"] != "push"
+            or not ref.startswith("refs/tags/v")
+            or event["ref"] != ref
+            or event["created"] is not True
+            or event["deleted"] is not False
+            or event["before"] != "0" * 40
+        ):
+            raise ValueError("publication requires a new tag push or an explicit manual tag")
     with (ROOT / "pyproject.toml").open("rb") as source:
         version = tomllib.load(source)["project"]["version"]
     if not isinstance(version, str) or not version:
@@ -76,19 +88,18 @@ def main() -> int:
     if tag != f"v{version}":
         raise ValueError(f"tag {tag} != pyproject version {version}")
     head = git("rev-parse", "HEAD")
-    if any(
-        value != head
-        for value in (
-            git("rev-parse", "--verify", f"{ref}^{{commit}}"),
-            commit(os.environ["GITHUB_SHA"]),
-            commit(event["after"]),
-        )
-    ):
+    expected = [git("rev-parse", "--verify", f"{ref}^{{commit}}")]
+    if not manual:
+        expected.extend((commit(os.environ["GITHUB_SHA"]), commit(event["after"])))
+    if any(value != head for value in expected):
         raise ValueError("release tag, push event, and checked-out source must agree")
     if git("status", "--porcelain", "--untracked-files=normal"):
         raise ValueError("release checkout has uncommitted or untracked changes")
     unpublished(version)
-    print(f"release guard green: new {tag} at {head}, version absent from PyPI")
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+            print(f"source={head}", file=stream)
+    print(f"release guard green: {tag} at {head}, version absent from PyPI")
     return 0
 
 
