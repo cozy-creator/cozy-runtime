@@ -1,23 +1,17 @@
-# H3 Turbo bake-once capability boundary
+# H3 Turbo direct activation
 
-H3 Turbo remains a base AdaLN-pruned DiT plus a PDD-8 adapter. The default path is still
-the specialized overlay: `LoRAFactors.accumulate` runs its released BF16 down/up GEMMs for
-each matching forward. This change adds an explicit opt-in `bake_once` contract before the
-request state is touched.
+H3 Turbo is a supported direct activation path: the PDD-8 adapter's LoRA factors, pruned
+AdaLN tables, and evaluation heads are loaded once with the prepared variant. Each denoise
+step selects the prepared overlay through the request's attention selector. This preserves
+the released BF16 factor rounding and leaves FP8-pruned base storage encoded; no
+dequantize/merge/requantize operation is attempted.
 
-`OfficialH3Pipeline.turbo_composer_capability(trunk)` inspects the filled DiT. Encoded
-providers replace projections with role-buffer modules that have no floating `.weight`; the
-capability reports their paths and returns `turbo_bake_unsupported` rather than silently
-dequantizing or mutating FP8 storage. An all-floating synthetic root is also refused until
-the complete graph composer covers PDD AdaLN tables, evaluation-specific output heads, and
-an isolated root per adapter set. The existing specialized path is unchanged when
-`bake_once=False`.
+`OfficialH3TurboLoRA.overlay()` returns the already prepared component for the requested
+trunk. `H3TurboLoRA._sample()` installs that object only for the duration of the request
+and restores the caller's `attention_kwargs` in `finally`. Separate requests therefore
+cannot retain one another's overlay selection, while repeated steps in one request reuse
+the same loaded adapter/tables/heads.
 
-The model method accepts `bake_once=True` so a caller can request a strict no-fallback bake.
-It calls the capability before overlay selection or `attention_kwargs` mutation. A refusal
-therefore cannot leave request state armed or accidentally fall through to per-step adapter
-GEMMs. The current FP8/PDD-8 lane intentionally remains overlay-only.
-
-Completing the composer requires provider-owned dequantize/compose/requantize semantics,
-numerical equivalence across CP tail shapes, static table/head selection, and request-root
-cache isolation. No GPU, quality, or release qualification is claimed here.
+The focused CPU tests cover prepared-variant reuse and request-state restoration. GPU
+quality and latency remain separate qualification work; this path intentionally keeps the
+specialized per-forward activation semantics.
