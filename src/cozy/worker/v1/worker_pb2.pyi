@@ -592,34 +592,32 @@ class KeepRentalAliveResult(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., worker_id: _Optional[str] = ..., worker_boot_id: _Optional[str] = ..., acknowledged_at_unix_ms: _Optional[int] = ..., idle_deadline_unix_ms: _Optional[int] = ...) -> None: ...
 
 class MachineExecutionCapture(_message.Message):
-    __slots__ = ("root_revision_digest", "revisions", "bindings", "published_revisions", "model_defaults")
-    ROOT_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    REVISIONS_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("bindings", "model_defaults", "root_installation_id", "installed_packages")
     BINDINGS_FIELD_NUMBER: _ClassVar[int]
-    PUBLISHED_REVISIONS_FIELD_NUMBER: _ClassVar[int]
     MODEL_DEFAULTS_FIELD_NUMBER: _ClassVar[int]
-    root_revision_digest: bytes
-    revisions: _containers.RepeatedCompositeFieldContainer[LocalPackageRevision]
+    ROOT_INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
+    INSTALLED_PACKAGES_FIELD_NUMBER: _ClassVar[int]
     bindings: _containers.RepeatedCompositeFieldContainer[MachineCallableBinding]
-    published_revisions: _containers.RepeatedCompositeFieldContainer[PublishedPackageRevision]
     model_defaults: _containers.RepeatedCompositeFieldContainer[MachineModelDefault]
-    def __init__(self, root_revision_digest: _Optional[bytes] = ..., revisions: _Optional[_Iterable[_Union[LocalPackageRevision, _Mapping]]] = ..., bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ..., published_revisions: _Optional[_Iterable[_Union[PublishedPackageRevision, _Mapping]]] = ..., model_defaults: _Optional[_Iterable[_Union[MachineModelDefault, _Mapping]]] = ...) -> None: ...
+    root_installation_id: str
+    installed_packages: _containers.RepeatedCompositeFieldContainer[InstalledPackage]
+    def __init__(self, bindings: _Optional[_Iterable[_Union[MachineCallableBinding, _Mapping]]] = ..., model_defaults: _Optional[_Iterable[_Union[MachineModelDefault, _Mapping]]] = ..., root_installation_id: _Optional[str] = ..., installed_packages: _Optional[_Iterable[_Union[InstalledPackage, _Mapping]]] = ...) -> None: ...
 
 class MachineModelDefault(_message.Message):
-    __slots__ = ("callee_revision_digest", "entrypoint", "parameter", "public_origin", "rungs", "unavailable_code")
-    CALLEE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("entrypoint", "parameter", "public_origin", "rungs", "unavailable_code", "callee_installation_id")
     ENTRYPOINT_FIELD_NUMBER: _ClassVar[int]
     PARAMETER_FIELD_NUMBER: _ClassVar[int]
     PUBLIC_ORIGIN_FIELD_NUMBER: _ClassVar[int]
     RUNGS_FIELD_NUMBER: _ClassVar[int]
     UNAVAILABLE_CODE_FIELD_NUMBER: _ClassVar[int]
-    callee_revision_digest: bytes
+    CALLEE_INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     entrypoint: str
     parameter: str
     public_origin: str
     rungs: _containers.RepeatedCompositeFieldContainer[MachineModelDefaultRung]
     unavailable_code: str
-    def __init__(self, callee_revision_digest: _Optional[bytes] = ..., entrypoint: _Optional[str] = ..., parameter: _Optional[str] = ..., public_origin: _Optional[str] = ..., rungs: _Optional[_Iterable[_Union[MachineModelDefaultRung, _Mapping]]] = ..., unavailable_code: _Optional[str] = ...) -> None: ...
+    callee_installation_id: str
+    def __init__(self, entrypoint: _Optional[str] = ..., parameter: _Optional[str] = ..., public_origin: _Optional[str] = ..., rungs: _Optional[_Iterable[_Union[MachineModelDefaultRung, _Mapping]]] = ..., unavailable_code: _Optional[str] = ..., callee_installation_id: _Optional[str] = ...) -> None: ...
 
 class MachineModelDefaultRung(_message.Message):
     __slots__ = ("gpu", "repository", "manifest")
@@ -631,31 +629,31 @@ class MachineModelDefaultRung(_message.Message):
     manifest: Ref
     def __init__(self, gpu: _Optional[str] = ..., repository: _Optional[str] = ..., manifest: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
 
-class PublishedPackageRevision(_message.Message):
-    __slots__ = ("package", "environment", "package_interface")
+class InstalledPackage(_message.Message):
+    __slots__ = ("installation_id", "package", "release", "package_interface")
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
-    ENVIRONMENT_FIELD_NUMBER: _ClassVar[int]
+    RELEASE_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
-    package: PackageSelection
-    environment: Environment
-    package_interface: Ref
-    def __init__(self, package: _Optional[_Union[PackageSelection, _Mapping]] = ..., environment: _Optional[_Union[Environment, _Mapping]] = ..., package_interface: _Optional[_Union[Ref, _Mapping]] = ...) -> None: ...
+    installation_id: str
+    package: str
+    release: str
+    package_interface: bytes
+    def __init__(self, installation_id: _Optional[str] = ..., package: _Optional[str] = ..., release: _Optional[str] = ..., package_interface: _Optional[bytes] = ...) -> None: ...
 
 class MachineCallableBinding(_message.Message):
-    __slots__ = ("caller_revision_digest", "interface_digest", "module", "export", "callee_revision_digest", "entrypoint")
-    CALLER_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    INTERFACE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("module", "export", "entrypoint", "caller_installation_id", "callee_installation_id")
     MODULE_FIELD_NUMBER: _ClassVar[int]
     EXPORT_FIELD_NUMBER: _ClassVar[int]
-    CALLEE_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     ENTRYPOINT_FIELD_NUMBER: _ClassVar[int]
-    caller_revision_digest: bytes
-    interface_digest: bytes
+    CALLER_INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
+    CALLEE_INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     module: str
     export: str
-    callee_revision_digest: bytes
     entrypoint: str
-    def __init__(self, caller_revision_digest: _Optional[bytes] = ..., interface_digest: _Optional[bytes] = ..., module: _Optional[str] = ..., export: _Optional[str] = ..., callee_revision_digest: _Optional[bytes] = ..., entrypoint: _Optional[str] = ...) -> None: ...
+    caller_installation_id: str
+    callee_installation_id: str
+    def __init__(self, module: _Optional[str] = ..., export: _Optional[str] = ..., entrypoint: _Optional[str] = ..., caller_installation_id: _Optional[str] = ..., callee_installation_id: _Optional[str] = ...) -> None: ...
 
 class MachineExecutionWorkspaceQuery(_message.Message):
     __slots__ = ("claim",)
@@ -948,7 +946,7 @@ class PreparePrivatePlacementCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., private_placement_set: _Optional[_Union[DesiredPrivatePlacementSet, _Mapping]] = ..., supports_model_materialization_recovery: bool = ...) -> None: ...
 
 class PrepareEvent(_message.Message):
-    __slots__ = ("stage", "total_bytes", "transferred_bytes", "placement_set", "safe_code", "safe_detail", "model_progress")
+    __slots__ = ("stage", "total_bytes", "transferred_bytes", "placement_set", "safe_code", "safe_detail", "model_progress", "installed_package")
     STAGE_FIELD_NUMBER: _ClassVar[int]
     TOTAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     TRANSFERRED_BYTES_FIELD_NUMBER: _ClassVar[int]
@@ -956,6 +954,7 @@ class PrepareEvent(_message.Message):
     SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
     SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
     MODEL_PROGRESS_FIELD_NUMBER: _ClassVar[int]
+    INSTALLED_PACKAGE_FIELD_NUMBER: _ClassVar[int]
     stage: PrepareStage
     total_bytes: int
     transferred_bytes: int
@@ -963,7 +962,8 @@ class PrepareEvent(_message.Message):
     safe_code: str
     safe_detail: str
     model_progress: _containers.RepeatedCompositeFieldContainer[PrepareModelProgress]
-    def __init__(self, stage: _Optional[_Union[PrepareStage, str]] = ..., total_bytes: _Optional[int] = ..., transferred_bytes: _Optional[int] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., model_progress: _Optional[_Iterable[_Union[PrepareModelProgress, _Mapping]]] = ...) -> None: ...
+    installed_package: InstalledPackage
+    def __init__(self, stage: _Optional[_Union[PrepareStage, str]] = ..., total_bytes: _Optional[int] = ..., transferred_bytes: _Optional[int] = ..., placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., model_progress: _Optional[_Iterable[_Union[PrepareModelProgress, _Mapping]]] = ..., installed_package: _Optional[_Union[InstalledPackage, _Mapping]] = ...) -> None: ...
 
 class PrepareModelProgress(_message.Message):
     __slots__ = ("model", "total_bytes", "transferred_bytes", "origin_bytes", "cached_bytes")
@@ -1242,16 +1242,14 @@ class LocalPackageUploadFrame(_message.Message):
     def __init__(self, header: _Optional[_Union[LocalPackageUploadHeader, _Mapping]] = ..., chunk: _Optional[_Union[LocalPackageUploadChunk, _Mapping]] = ...) -> None: ...
 
 class LocalPackageUploadHeader(_message.Message):
-    __slots__ = ("claim", "operation_id", "source_digest", "file")
+    __slots__ = ("claim", "operation_id", "file")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     FILE_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     operation_id: str
-    source_digest: bytes
     file: LocalPackageFileRef
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., file: _Optional[_Union[LocalPackageFileRef, _Mapping]] = ...) -> None: ...
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., operation_id: _Optional[str] = ..., file: _Optional[_Union[LocalPackageFileRef, _Mapping]] = ...) -> None: ...
 
 class LocalPackageUploadChunk(_message.Message):
     __slots__ = ("offset", "data")
@@ -1330,10 +1328,12 @@ class ImageDistribution(_message.Message):
     def __init__(self, distribution: _Optional[str] = ..., version: _Optional[str] = ...) -> None: ...
 
 class PreparePackageSetResult(_message.Message):
-    __slots__ = ("placement_set",)
+    __slots__ = ("placement_set", "installed_package")
     PLACEMENT_SET_FIELD_NUMBER: _ClassVar[int]
+    INSTALLED_PACKAGE_FIELD_NUMBER: _ClassVar[int]
     placement_set: DesiredPlacementSet
-    def __init__(self, placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ...) -> None: ...
+    installed_package: InstalledPackage
+    def __init__(self, placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., installed_package: _Optional[_Union[InstalledPackage, _Mapping]] = ...) -> None: ...
 
 class CheckPackageSetCompatibilityResult(_message.Message):
     __slots__ = ("refusal_code", "refusal_detail")
@@ -1344,24 +1344,26 @@ class CheckPackageSetCompatibilityResult(_message.Message):
     def __init__(self, refusal_code: _Optional[str] = ..., refusal_detail: _Optional[str] = ...) -> None: ...
 
 class PrepareLocalPackageRequest(_message.Message):
-    __slots__ = ("operation_id", "package", "wheels", "install_root", "dependency_requirements", "python_requires", "python_version")
+    __slots__ = ("operation_id", "package", "files", "install_root", "dependency_requirements", "python_requires", "python_version", "source_archive")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
-    WHEELS_FIELD_NUMBER: _ClassVar[int]
+    FILES_FIELD_NUMBER: _ClassVar[int]
     INSTALL_ROOT_FIELD_NUMBER: _ClassVar[int]
     DEPENDENCY_REQUIREMENTS_FIELD_NUMBER: _ClassVar[int]
     PYTHON_REQUIRES_FIELD_NUMBER: _ClassVar[int]
     PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_ARCHIVE_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     package: DevelopmentPackage
-    wheels: _containers.RepeatedCompositeFieldContainer[LocalPackageWheel]
+    files: _containers.RepeatedCompositeFieldContainer[LocalPackageFile]
     install_root: str
     dependency_requirements: bytes
     python_requires: str
     python_version: str
-    def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., wheels: _Optional[_Iterable[_Union[LocalPackageWheel, _Mapping]]] = ..., install_root: _Optional[str] = ..., dependency_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ...) -> None: ...
+    source_archive: str
+    def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFile, _Mapping]]] = ..., install_root: _Optional[str] = ..., dependency_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., source_archive: _Optional[str] = ...) -> None: ...
 
-class LocalPackageWheel(_message.Message):
+class LocalPackageFile(_message.Message):
     __slots__ = ("digest", "filename", "length", "path")
     DIGEST_FIELD_NUMBER: _ClassVar[int]
     FILENAME_FIELD_NUMBER: _ClassVar[int]
@@ -1374,20 +1376,20 @@ class LocalPackageWheel(_message.Message):
     def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., length: _Optional[int] = ..., path: _Optional[str] = ...) -> None: ...
 
 class PreparePrivatePlacementRequest(_message.Message):
-    __slots__ = ("operation_id", "local_revision_digest", "download_delegation", "download_delegation_signature", "native_models", "claim")
+    __slots__ = ("operation_id", "download_delegation", "download_delegation_signature", "native_models", "claim", "installation_id")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    LOCAL_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     NATIVE_MODELS_FIELD_NUMBER: _ClassVar[int]
     CLAIM_FIELD_NUMBER: _ClassVar[int]
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
-    local_revision_digest: bytes
     download_delegation: bytes
     download_delegation_signature: bytes
     native_models: _containers.RepeatedCompositeFieldContainer[NativeModelBinding]
     claim: Claim
-    def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ..., claim: _Optional[_Union[Claim, _Mapping]] = ...) -> None: ...
+    installation_id: str
+    def __init__(self, operation_id: _Optional[str] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ..., claim: _Optional[_Union[Claim, _Mapping]] = ..., installation_id: _Optional[str] = ...) -> None: ...
 
 class LocalModelSourceFile(_message.Message):
     __slots__ = ("member", "object_id", "length", "path", "header_path", "verified")
@@ -1724,7 +1726,7 @@ class WorkerFrame(_message.Message):
     def __init__(self, claim_ack: _Optional[_Union[ClaimAck, _Mapping]] = ..., observed_state: _Optional[_Union[ObservedWorkerState, _Mapping]] = ..., attempt_accepted: _Optional[_Union[AttemptAccepted, _Mapping]] = ..., attempt_outcome: _Optional[_Union[AttemptOutcome, _Mapping]] = ..., boot_failure: _Optional[_Union[BootFailure, _Mapping]] = ..., checkpoint_request: _Optional[_Union[JobCheckpointRequest, _Mapping]] = ..., checkpoint_ack: _Optional[_Union[JobCheckpointAck, _Mapping]] = ..., snapshot: _Optional[_Union[WorkerSnapshot, _Mapping]] = ..., weights_finalize_result: _Optional[_Union[WeightsFinalizeResult, _Mapping]] = ..., weights_intent: _Optional[_Union[WeightsIntentFrame, _Mapping]] = ..., weights_receipt: _Optional[_Union[WeightsReceiptFrame, _Mapping]] = ..., weights_read_result: _Optional[_Union[WeightsReadResult, _Mapping]] = ..., weights_transfer_status: _Optional[_Union[WeightsTransferStatus, _Mapping]] = ..., model_source_file_status: _Optional[_Union[ModelSourceFileStatus, _Mapping]] = ..., model_source_prepared: _Optional[_Union[ModelSourcePrepared, _Mapping]] = ..., local_package_file_status: _Optional[_Union[LocalPackageFileStatus, _Mapping]] = ..., local_package_abort_status: _Optional[_Union[LocalPackageAbortStatus, _Mapping]] = ..., weights_upload_result: _Optional[_Union[WeightsUploadResult, _Mapping]] = ..., weights_checkpoint: _Optional[_Union[WeightsCheckpointFrame, _Mapping]] = ..., weights_transaction: _Optional[_Union[WeightsTransactionStatus, _Mapping]] = ..., child_call_request: _Optional[_Union[ChildCallRequest, _Mapping]] = ..., child_call_cancel: _Optional[_Union[ChildCallCancel, _Mapping]] = ..., native_source_status: _Optional[_Union[NativeSourceStatus, _Mapping]] = ..., native_artifact_transfer_status: _Optional[_Union[NativeArtifactTransferStatus, _Mapping]] = ...) -> None: ...
 
 class ChildCallRequest(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_request_id", "parent_attempt_ordinal", "parent_invocation_spec_digest", "call_index", "interface_digest", "module", "export", "request_canonical_bytes", "intent_digest", "capture")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_request_id", "parent_attempt_ordinal", "parent_invocation_spec_digest", "call_index", "module", "export", "request_canonical_bytes", "intent_digest", "capture")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1732,7 +1734,6 @@ class ChildCallRequest(_message.Message):
     PARENT_ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
     PARENT_INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
     CALL_INDEX_FIELD_NUMBER: _ClassVar[int]
-    INTERFACE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     MODULE_FIELD_NUMBER: _ClassVar[int]
     EXPORT_FIELD_NUMBER: _ClassVar[int]
     REQUEST_CANONICAL_BYTES_FIELD_NUMBER: _ClassVar[int]
@@ -1745,13 +1746,12 @@ class ChildCallRequest(_message.Message):
     parent_attempt_ordinal: int
     parent_invocation_spec_digest: bytes
     call_index: int
-    interface_digest: bytes
     module: str
     export: str
     request_canonical_bytes: bytes
     intent_digest: bytes
     capture: ActivationCapture
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_request_id: _Optional[str] = ..., parent_attempt_ordinal: _Optional[int] = ..., parent_invocation_spec_digest: _Optional[bytes] = ..., call_index: _Optional[int] = ..., interface_digest: _Optional[bytes] = ..., module: _Optional[str] = ..., export: _Optional[str] = ..., request_canonical_bytes: _Optional[bytes] = ..., intent_digest: _Optional[bytes] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., parent_request_id: _Optional[str] = ..., parent_attempt_ordinal: _Optional[int] = ..., parent_invocation_spec_digest: _Optional[bytes] = ..., call_index: _Optional[int] = ..., module: _Optional[str] = ..., export: _Optional[str] = ..., request_canonical_bytes: _Optional[bytes] = ..., intent_digest: _Optional[bytes] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ...) -> None: ...
 
 class ChildCallCancel(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "parent_request_id", "parent_attempt_ordinal", "parent_invocation_spec_digest", "call_index", "intent_digest")
@@ -2098,34 +2098,36 @@ class DesiredPackageSet(_message.Message):
     def __init__(self, download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ...) -> None: ...
 
 class DesiredLocalPackageSet(_message.Message):
-    __slots__ = ("operation_id", "package", "files", "dependency_requirements", "python_requires", "python_version")
+    __slots__ = ("operation_id", "package", "files", "dependency_requirements", "python_requires", "python_version", "source_archive")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     FILES_FIELD_NUMBER: _ClassVar[int]
     DEPENDENCY_REQUIREMENTS_FIELD_NUMBER: _ClassVar[int]
     PYTHON_REQUIRES_FIELD_NUMBER: _ClassVar[int]
     PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_ARCHIVE_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     package: DevelopmentPackage
     files: _containers.RepeatedCompositeFieldContainer[LocalPackageFileRef]
     dependency_requirements: bytes
     python_requires: str
     python_version: str
-    def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ..., dependency_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ...) -> None: ...
+    source_archive: str
+    def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ..., dependency_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., source_archive: _Optional[str] = ...) -> None: ...
 
 class DesiredPrivatePlacementSet(_message.Message):
-    __slots__ = ("operation_id", "local_revision_digest", "download_delegation", "download_delegation_signature", "native_models")
+    __slots__ = ("operation_id", "download_delegation", "download_delegation_signature", "native_models", "installation_id")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    LOCAL_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_FIELD_NUMBER: _ClassVar[int]
     DOWNLOAD_DELEGATION_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     NATIVE_MODELS_FIELD_NUMBER: _ClassVar[int]
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
-    local_revision_digest: bytes
     download_delegation: bytes
     download_delegation_signature: bytes
     native_models: _containers.RepeatedCompositeFieldContainer[NativeModelBinding]
-    def __init__(self, operation_id: _Optional[str] = ..., local_revision_digest: _Optional[bytes] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ...) -> None: ...
+    installation_id: str
+    def __init__(self, operation_id: _Optional[str] = ..., download_delegation: _Optional[bytes] = ..., download_delegation_signature: _Optional[bytes] = ..., native_models: _Optional[_Iterable[_Union[NativeModelBinding, _Mapping]]] = ..., installation_id: _Optional[str] = ...) -> None: ...
 
 class NativeModelBinding(_message.Message):
     __slots__ = ("slot", "model", "manifest", "retention", "adapters")
@@ -2150,26 +2152,6 @@ class LocalPackageFileRef(_message.Message):
     filename: str
     length: int
     def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., length: _Optional[int] = ...) -> None: ...
-
-class LocalPackageRevision(_message.Message):
-    __slots__ = ("package", "release", "source_digest", "package_interface", "files", "dependency_requirements", "python_requires", "python_version")
-    PACKAGE_FIELD_NUMBER: _ClassVar[int]
-    RELEASE_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
-    FILES_FIELD_NUMBER: _ClassVar[int]
-    DEPENDENCY_REQUIREMENTS_FIELD_NUMBER: _ClassVar[int]
-    PYTHON_REQUIRES_FIELD_NUMBER: _ClassVar[int]
-    PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
-    package: str
-    release: str
-    source_digest: bytes
-    package_interface: Ref
-    files: _containers.RepeatedCompositeFieldContainer[LocalPackageFileRef]
-    dependency_requirements: Ref
-    python_requires: str
-    python_version: str
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., package_interface: _Optional[_Union[Ref, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileRef, _Mapping]]] = ..., dependency_requirements: _Optional[_Union[Ref, _Mapping]] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ...) -> None: ...
 
 class DesiredPlacementSet(_message.Message):
     __slots__ = ("placement_set_digest", "placement_set_canonical_bytes", "device_pins", "orchestration_parent")
@@ -2260,26 +2242,24 @@ class DownloadPackageRef(_message.Message):
     def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ...) -> None: ...
 
 class Placement(_message.Message):
-    __slots__ = ("placement_id", "package", "development", "environment_digest", "package_interface", "bindings_digest", "models", "entrypoints", "environment")
+    __slots__ = ("placement_id", "package", "development", "bindings_digest", "models", "entrypoints", "installation_id", "package_interface")
     PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     DEVELOPMENT_FIELD_NUMBER: _ClassVar[int]
-    ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
     BINDINGS_DIGEST_FIELD_NUMBER: _ClassVar[int]
     MODELS_FIELD_NUMBER: _ClassVar[int]
     ENTRYPOINTS_FIELD_NUMBER: _ClassVar[int]
-    ENVIRONMENT_FIELD_NUMBER: _ClassVar[int]
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
+    PACKAGE_INTERFACE_FIELD_NUMBER: _ClassVar[int]
     placement_id: str
     package: PackageSelection
     development: DevelopmentPackage
-    environment_digest: bytes
-    package_interface: Ref
     bindings_digest: bytes
     models: _containers.RepeatedCompositeFieldContainer[Model]
     entrypoints: _containers.RepeatedCompositeFieldContainer[Entrypoint]
-    environment: Environment
-    def __init__(self, placement_id: _Optional[str] = ..., package: _Optional[_Union[PackageSelection, _Mapping]] = ..., development: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., environment_digest: _Optional[bytes] = ..., package_interface: _Optional[_Union[Ref, _Mapping]] = ..., bindings_digest: _Optional[bytes] = ..., models: _Optional[_Iterable[_Union[Model, _Mapping]]] = ..., entrypoints: _Optional[_Iterable[_Union[Entrypoint, _Mapping]]] = ..., environment: _Optional[_Union[Environment, _Mapping]] = ...) -> None: ...
+    installation_id: str
+    package_interface: bytes
+    def __init__(self, placement_id: _Optional[str] = ..., package: _Optional[_Union[PackageSelection, _Mapping]] = ..., development: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., bindings_digest: _Optional[bytes] = ..., models: _Optional[_Iterable[_Union[Model, _Mapping]]] = ..., entrypoints: _Optional[_Iterable[_Union[Entrypoint, _Mapping]]] = ..., installation_id: _Optional[str] = ..., package_interface: _Optional[bytes] = ...) -> None: ...
 
 class Ref(_message.Message):
     __slots__ = ("digest", "length")
@@ -2288,22 +2268,6 @@ class Ref(_message.Message):
     digest: bytes
     length: int
     def __init__(self, digest: _Optional[bytes] = ..., length: _Optional[int] = ...) -> None: ...
-
-class WheelFact(_message.Message):
-    __slots__ = ("ref", "distribution", "version", "filename", "import_roots", "tags")
-    REF_FIELD_NUMBER: _ClassVar[int]
-    DISTRIBUTION_FIELD_NUMBER: _ClassVar[int]
-    VERSION_FIELD_NUMBER: _ClassVar[int]
-    FILENAME_FIELD_NUMBER: _ClassVar[int]
-    IMPORT_ROOTS_FIELD_NUMBER: _ClassVar[int]
-    TAGS_FIELD_NUMBER: _ClassVar[int]
-    ref: Ref
-    distribution: str
-    version: str
-    filename: str
-    import_roots: _containers.RepeatedScalarFieldContainer[str]
-    tags: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, ref: _Optional[_Union[Ref, _Mapping]] = ..., distribution: _Optional[str] = ..., version: _Optional[str] = ..., filename: _Optional[str] = ..., import_roots: _Optional[_Iterable[str]] = ..., tags: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class PackageSelection(_message.Message):
     __slots__ = ("package", "release")
@@ -2314,26 +2278,14 @@ class PackageSelection(_message.Message):
     def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ...) -> None: ...
 
 class DevelopmentPackage(_message.Message):
-    __slots__ = ("package", "release", "source_digest", "project_wheel", "local_revision_digest")
+    __slots__ = ("package", "release", "installation_id")
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     RELEASE_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    PROJECT_WHEEL_FIELD_NUMBER: _ClassVar[int]
-    LOCAL_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     package: str
     release: str
-    source_digest: bytes
-    project_wheel: WheelFact
-    local_revision_digest: bytes
-    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., project_wheel: _Optional[_Union[WheelFact, _Mapping]] = ..., local_revision_digest: _Optional[bytes] = ...) -> None: ...
-
-class Environment(_message.Message):
-    __slots__ = ("locked_requirements", "local_wheels")
-    LOCKED_REQUIREMENTS_FIELD_NUMBER: _ClassVar[int]
-    LOCAL_WHEELS_FIELD_NUMBER: _ClassVar[int]
-    locked_requirements: Ref
-    local_wheels: _containers.RepeatedCompositeFieldContainer[WheelFact]
-    def __init__(self, locked_requirements: _Optional[_Union[Ref, _Mapping]] = ..., local_wheels: _Optional[_Iterable[_Union[WheelFact, _Mapping]]] = ...) -> None: ...
+    installation_id: str
+    def __init__(self, package: _Optional[str] = ..., release: _Optional[str] = ..., installation_id: _Optional[str] = ...) -> None: ...
 
 class Model(_message.Message):
     __slots__ = ("id", "repo", "version", "lane", "manifest")
@@ -2406,8 +2358,7 @@ class Stamp(_message.Message):
     def __init__(self, component: _Optional[str] = ..., key: _Optional[str] = ..., values: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class JobDirective(_message.Message):
-    __slots__ = ("build_id", "job_descriptor_id", "resource_caps", "publication_contract", "reclaim_on_terminal", "device_count", "orchestration", "orchestration_parent")
-    BUILD_ID_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("job_descriptor_id", "resource_caps", "publication_contract", "reclaim_on_terminal", "device_count", "orchestration", "orchestration_parent", "installation_id")
     JOB_DESCRIPTOR_ID_FIELD_NUMBER: _ClassVar[int]
     RESOURCE_CAPS_FIELD_NUMBER: _ClassVar[int]
     PUBLICATION_CONTRACT_FIELD_NUMBER: _ClassVar[int]
@@ -2415,7 +2366,7 @@ class JobDirective(_message.Message):
     DEVICE_COUNT_FIELD_NUMBER: _ClassVar[int]
     ORCHESTRATION_FIELD_NUMBER: _ClassVar[int]
     ORCHESTRATION_PARENT_FIELD_NUMBER: _ClassVar[int]
-    build_id: str
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     job_descriptor_id: str
     resource_caps: ResourceCaps
     publication_contract: PublicationContract
@@ -2423,7 +2374,8 @@ class JobDirective(_message.Message):
     device_count: int
     orchestration: bool
     orchestration_parent: JobDirective
-    def __init__(self, build_id: _Optional[str] = ..., job_descriptor_id: _Optional[str] = ..., resource_caps: _Optional[_Union[ResourceCaps, _Mapping]] = ..., publication_contract: _Optional[_Union[PublicationContract, _Mapping]] = ..., reclaim_on_terminal: bool = ..., device_count: _Optional[int] = ..., orchestration: bool = ..., orchestration_parent: _Optional[_Union[JobDirective, _Mapping]] = ...) -> None: ...
+    installation_id: str
+    def __init__(self, job_descriptor_id: _Optional[str] = ..., resource_caps: _Optional[_Union[ResourceCaps, _Mapping]] = ..., publication_contract: _Optional[_Union[PublicationContract, _Mapping]] = ..., reclaim_on_terminal: bool = ..., device_count: _Optional[int] = ..., orchestration: bool = ..., orchestration_parent: _Optional[_Union[JobDirective, _Mapping]] = ..., installation_id: _Optional[str] = ...) -> None: ...
 
 class ObservedWorkerState(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "applied_wire_minor", "held_attempts", "faults", "activity", "job_capacity", "placements", "admission_epoch", "admission_state", "available_attempt_slots", "accepted_desired_state_revision", "accepted_placement_set_digest", "converged_revision", "worker_phase", "lanes", "held_manifests")
@@ -2480,7 +2432,7 @@ class DeviceLane(_message.Message):
     def __init__(self, lane_id: _Optional[str] = ..., device_ordinals: _Optional[_Iterable[int]] = ..., available_attempt_slots: _Optional[int] = ..., placement_ids: _Optional[_Iterable[str]] = ..., resident_placement_ids: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class PlacementStatus(_message.Message):
-    __slots__ = ("placement_id", "executor_epoch", "dispatchable_binding_digests", "materializable_binding_digests", "faults", "accelerator", "placement_set_digest", "materialization", "serving", "retained_fallback_placement_set_digest", "acquisition", "environment_digest", "device_lane_id", "loaded_binding_digests")
+    __slots__ = ("placement_id", "executor_epoch", "dispatchable_binding_digests", "materializable_binding_digests", "faults", "accelerator", "placement_set_digest", "materialization", "serving", "retained_fallback_placement_set_digest", "acquisition", "device_lane_id", "loaded_binding_digests", "installation_id")
     PLACEMENT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTOR_EPOCH_FIELD_NUMBER: _ClassVar[int]
     DISPATCHABLE_BINDING_DIGESTS_FIELD_NUMBER: _ClassVar[int]
@@ -2492,9 +2444,9 @@ class PlacementStatus(_message.Message):
     SERVING_FIELD_NUMBER: _ClassVar[int]
     RETAINED_FALLBACK_PLACEMENT_SET_DIGEST_FIELD_NUMBER: _ClassVar[int]
     ACQUISITION_FIELD_NUMBER: _ClassVar[int]
-    ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     DEVICE_LANE_ID_FIELD_NUMBER: _ClassVar[int]
     LOADED_BINDING_DIGESTS_FIELD_NUMBER: _ClassVar[int]
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     placement_id: str
     executor_epoch: int
     dispatchable_binding_digests: _containers.RepeatedScalarFieldContainer[bytes]
@@ -2506,10 +2458,10 @@ class PlacementStatus(_message.Message):
     serving: ServingState
     retained_fallback_placement_set_digest: bytes
     acquisition: PlacementAcquisitionObservation
-    environment_digest: str
     device_lane_id: str
     loaded_binding_digests: _containers.RepeatedScalarFieldContainer[bytes]
-    def __init__(self, placement_id: _Optional[str] = ..., executor_epoch: _Optional[int] = ..., dispatchable_binding_digests: _Optional[_Iterable[bytes]] = ..., materializable_binding_digests: _Optional[_Iterable[bytes]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_set_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_placement_set_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ..., environment_digest: _Optional[str] = ..., device_lane_id: _Optional[str] = ..., loaded_binding_digests: _Optional[_Iterable[bytes]] = ...) -> None: ...
+    installation_id: str
+    def __init__(self, placement_id: _Optional[str] = ..., executor_epoch: _Optional[int] = ..., dispatchable_binding_digests: _Optional[_Iterable[bytes]] = ..., materializable_binding_digests: _Optional[_Iterable[bytes]] = ..., faults: _Optional[_Iterable[_Union[Fault, _Mapping]]] = ..., accelerator: _Optional[_Union[AcceleratorQualification, _Mapping]] = ..., placement_set_digest: _Optional[bytes] = ..., materialization: _Optional[_Union[MaterializationState, str]] = ..., serving: _Optional[_Union[ServingState, str]] = ..., retained_fallback_placement_set_digest: _Optional[bytes] = ..., acquisition: _Optional[_Union[PlacementAcquisitionObservation, _Mapping]] = ..., device_lane_id: _Optional[str] = ..., loaded_binding_digests: _Optional[_Iterable[bytes]] = ..., installation_id: _Optional[str] = ...) -> None: ...
 
 class PlacementAcquisitionObservation(_message.Message):
     __slots__ = ("package", "model")
@@ -3280,28 +3232,25 @@ class LocalPackageFileGrant(_message.Message):
     def __init__(self, digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., length: _Optional[int] = ..., url: _Optional[str] = ...) -> None: ...
 
 class LocalPackageFetchRequest(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_digest", "files")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "files")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     FILES_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
     operation_id: str
-    source_digest: bytes
     files: _containers.RepeatedCompositeFieldContainer[LocalPackageFileGrant]
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileGrant, _Mapping]]] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., files: _Optional[_Iterable[_Union[LocalPackageFileGrant, _Mapping]]] = ...) -> None: ...
 
 class LocalPackageFileStatus(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_digest", "digest", "filename", "length", "state", "received_bytes", "safe_code", "safe_detail")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "digest", "filename", "length", "state", "received_bytes", "safe_code", "safe_detail")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     DIGEST_FIELD_NUMBER: _ClassVar[int]
     FILENAME_FIELD_NUMBER: _ClassVar[int]
     LENGTH_FIELD_NUMBER: _ClassVar[int]
@@ -3313,7 +3262,6 @@ class LocalPackageFileStatus(_message.Message):
     control_stream_epoch: int
     worker_boot_id: str
     operation_id: str
-    source_digest: bytes
     digest: bytes
     filename: str
     length: int
@@ -3321,32 +3269,26 @@ class LocalPackageFileStatus(_message.Message):
     received_bytes: int
     safe_code: str
     safe_detail: str
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., length: _Optional[int] = ..., state: _Optional[_Union[LocalPackageFileState, str]] = ..., received_bytes: _Optional[int] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., digest: _Optional[bytes] = ..., filename: _Optional[str] = ..., length: _Optional[int] = ..., state: _Optional[_Union[LocalPackageFileState, str]] = ..., received_bytes: _Optional[int] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class LocalPackageAbort(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_digest", "local_revision_digest")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    LOCAL_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     record_owner_epoch: int
     control_stream_epoch: int
     worker_boot_id: str
     operation_id: str
-    source_digest: bytes
-    local_revision_digest: bytes
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., local_revision_digest: _Optional[bytes] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ...) -> None: ...
 
 class LocalPackageAbortStatus(_message.Message):
-    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "source_digest", "local_revision_digest", "outcome", "safe_code", "safe_detail")
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "operation_id", "outcome", "safe_code", "safe_detail")
     RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_DIGEST_FIELD_NUMBER: _ClassVar[int]
-    LOCAL_REVISION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     OUTCOME_FIELD_NUMBER: _ClassVar[int]
     SAFE_CODE_FIELD_NUMBER: _ClassVar[int]
     SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
@@ -3354,12 +3296,10 @@ class LocalPackageAbortStatus(_message.Message):
     control_stream_epoch: int
     worker_boot_id: str
     operation_id: str
-    source_digest: bytes
-    local_revision_digest: bytes
     outcome: LocalPackageAbortOutcome
     safe_code: str
     safe_detail: str
-    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., source_digest: _Optional[bytes] = ..., local_revision_digest: _Optional[bytes] = ..., outcome: _Optional[_Union[LocalPackageAbortOutcome, str]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., operation_id: _Optional[str] = ..., outcome: _Optional[_Union[LocalPackageAbortOutcome, str]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class WeightsFinalizeRequest(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "invocation_spec_digest", "output_slot", "disposition", "weights_receipt_digest", "scratch_root_id", "owner_authority_scope", "invocation_spec_canonical_bytes")
@@ -3612,8 +3552,7 @@ class AttemptProgress(_message.Message):
     def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., seq: _Optional[int] = ..., content_type: _Optional[str] = ..., data: _Optional[bytes] = ..., placement_id: _Optional[str] = ...) -> None: ...
 
 class InvocationSpec(_message.Message):
-    __slots__ = ("environment_digest", "payload_digest", "inputs", "outputs", "deadline_unix_ms", "serving", "job", "capture", "attention_kernel")
-    ENVIRONMENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("payload_digest", "inputs", "outputs", "deadline_unix_ms", "serving", "job", "capture", "attention_kernel", "installation_id")
     PAYLOAD_DIGEST_FIELD_NUMBER: _ClassVar[int]
     INPUTS_FIELD_NUMBER: _ClassVar[int]
     OUTPUTS_FIELD_NUMBER: _ClassVar[int]
@@ -3622,7 +3561,7 @@ class InvocationSpec(_message.Message):
     JOB_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_FIELD_NUMBER: _ClassVar[int]
     ATTENTION_KERNEL_FIELD_NUMBER: _ClassVar[int]
-    environment_digest: str
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     payload_digest: str
     inputs: _containers.RepeatedCompositeFieldContainer[InputBinding]
     outputs: _containers.RepeatedCompositeFieldContainer[OutputBinding]
@@ -3631,7 +3570,8 @@ class InvocationSpec(_message.Message):
     job: JobInvocationSpec
     capture: ActivationCapture
     attention_kernel: str
-    def __init__(self, environment_digest: _Optional[str] = ..., payload_digest: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[OutputBinding, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., serving: _Optional[_Union[ServingInvocationSpec, _Mapping]] = ..., job: _Optional[_Union[JobInvocationSpec, _Mapping]] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., attention_kernel: _Optional[str] = ...) -> None: ...
+    installation_id: str
+    def __init__(self, payload_digest: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[InputBinding, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[OutputBinding, _Mapping]]] = ..., deadline_unix_ms: _Optional[int] = ..., serving: _Optional[_Union[ServingInvocationSpec, _Mapping]] = ..., job: _Optional[_Union[JobInvocationSpec, _Mapping]] = ..., capture: _Optional[_Union[ActivationCapture, _Mapping]] = ..., attention_kernel: _Optional[str] = ..., installation_id: _Optional[str] = ...) -> None: ...
 
 class InputBinding(_message.Message):
     __slots__ = ("input_id", "digest", "length", "kind_mime", "order")
@@ -3668,14 +3608,14 @@ class ServingInvocationSpec(_message.Message):
     def __init__(self, entrypoint_binding_digest: _Optional[str] = ..., attempt_binding_id: _Optional[str] = ..., bindings_digest: _Optional[str] = ...) -> None: ...
 
 class JobInvocationSpec(_message.Message):
-    __slots__ = ("build_id", "job_descriptor_id", "publication_contract")
-    BUILD_ID_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("job_descriptor_id", "publication_contract", "installation_id")
     JOB_DESCRIPTOR_ID_FIELD_NUMBER: _ClassVar[int]
     PUBLICATION_CONTRACT_FIELD_NUMBER: _ClassVar[int]
-    build_id: str
+    INSTALLATION_ID_FIELD_NUMBER: _ClassVar[int]
     job_descriptor_id: str
     publication_contract: PublicationContract
-    def __init__(self, build_id: _Optional[str] = ..., job_descriptor_id: _Optional[str] = ..., publication_contract: _Optional[_Union[PublicationContract, _Mapping]] = ...) -> None: ...
+    installation_id: str
+    def __init__(self, job_descriptor_id: _Optional[str] = ..., publication_contract: _Optional[_Union[PublicationContract, _Mapping]] = ..., installation_id: _Optional[str] = ...) -> None: ...
 
 class DeliveryGrant(_message.Message):
     __slots__ = ("invocation_spec_digest", "credential", "file_base_url", "expires_at_unix", "inputs", "outputs")

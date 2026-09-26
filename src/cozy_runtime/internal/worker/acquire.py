@@ -550,7 +550,6 @@ class Acquirer:
             ) from exc
         visible = _visible_entrypoints(interface)
         models = {str(row["id"]): row for row in placement.models}
-        development = placement.development
         package_code_digest = placement.installation_id
         bindings: dict[str, DeclaredBinding] = {}
         count = 1

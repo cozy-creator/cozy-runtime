@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import uuid
 from contextlib import contextmanager
@@ -61,7 +62,7 @@ def _run(command: list[str], *, directory: Path, environment: dict[str, str], lo
     result = subprocess.run(
         command, cwd=directory, env=environment, stdin=subprocess.DEVNULL,
         capture_output=True, text=True, check=False,
-        **({"pass_fds": (lock_fd,)} if os.name != "nt" and lock_fd >= 0 else {}),
+        pass_fds=(lock_fd,) if sys.platform != "win32" and lock_fd >= 0 else (),
     )
     if result.returncode:
         raise EnvironmentRefusal(
@@ -232,7 +233,7 @@ def _installation_lock(root: Path, identifier: str):
     locks = directory.parent / ".locks"
     locks.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (locks / (identifier + ".lock")).open("a+b") as held:
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
             held.write(b"0")
             held.flush()
@@ -244,7 +245,7 @@ def _installation_lock(root: Path, identifier: str):
         try:
             yield held.fileno()
         finally:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 held.seek(0)
                 msvcrt.locking(held.fileno(), msvcrt.LK_UNLCK, 1)
             else:
