@@ -57,9 +57,11 @@ See [its native context implementation](https://github.com/yolain/ComfyUI-Easy-M
 ## Native API and ownership
 
 `continuation.py` exports `plan_continuation`, `ContinuationPlan`, `AVContext`,
-`encode_context`, `decode_context` and `audio_sample_range`. Contexts hold22/39/56
-RGB8 frames and exactly aligned stereo32kHz PCM, bounded by256MiB including the
-safetensors carrier. They record their source frame interval, schema and canonical
+`encode_context`, `decode_context` and `audio_sample_range`. Schema 2 contexts hold
+three independently re-encoded native normalized video/audio conditioning windows
+for 22, 39, and 56 delivered frames. The safetensors carrier is bounded by 64 MiB;
+at the maximum 1344 by 768 canvas its float32 tensors occupy about 14 MB.
+They record their source frame interval, schema and canonical
 renderer provenance. Consumers must compare current model/base-adapter manifests,
 native inference-code identity and relevant software. Parent workflow/script identity
 is not a model compatibility fence.
@@ -67,17 +69,27 @@ is not a model compatibility fence.
 `OfficialH3Pipeline.start_ref2va` accepts optional `context`, `delivery` and
 `expected_context_provenance`. With no delivery/context its old path remains unchanged.
 Persistent user references are encoded normally. The private temporal condition is
-added after text encoding, so it is not a new numbered Picture/Video/Audio reference.
-Native VAE encoding and native packed layout supply its rows; their times are aligned
+added after text and public-reference VAE encoding, so it is not a new numbered
+Picture/Video/Audio reference. Pre-encoded context tensors and private layout metadata
+supply its rows; their times are aligned
 to the target prefix. Native scheduling holds those condition rows fixed. This is the
 Director-style guide path, not a claim that target-prefix pixels are hard-copied.
 
 The video decoder streams only the new delivery window and retains a ring of its last56
-RGB8 frames. Audio uses integer frame-to-sample boundaries. `export_completed_av_tail`
-is valid only after complete video and audio decode. The package serializes that bounded
-context as a private child artifact. Only its final MP4 and final PNG are public outputs.
-Re-encoding the actual delivered tail avoids latent phase/overshoot mistakes; retaining
-native latent state is a later optimization requiring separate custody and parity proof.
+RGB8 frames. Audio uses integer frame-to-sample boundaries.
+`H3Model.export_completed_av_tail(state, provenance=...)` is valid only after complete
+video and audio decode, and owns both video-VAE and audio-VAE residency scopes.
+Each of the three windows is separately passed through the native reference encoder:
+shorter windows cannot be sliced from a longer causal-video/audio latent grid without
+changing phase. `.select(22 | 39 | 56)` chooses that independently encoded window.
+The package serializes the context as a private child artifact. Only its final MP4 and
+final PNG are public outputs. Old raw schema 1 carriers must be regenerated.
+
+The private Runtime 0.18.28 candidate was built with the unchanged released native
+extension. Source review and one CPU-constrained wheel build have completed; local
+tests, lint, vet and CI were not run, per user instruction. The existing codec/layout
+fixtures were updated for schema 2 without execution. Real model continuation and
+both requested 60-second continuous videos remain GPU qualification gates.
 
 ## Duration contract and gates
 
