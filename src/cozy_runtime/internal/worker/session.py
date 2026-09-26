@@ -1808,7 +1808,18 @@ class Worker:
             from cozy_runtime.internal import package_interface
             body = package_interface.read_bytes(raw)
             kind = "job" if any(row["name"] == binding["entrypoint"] for row in body["jobs"]) else "entrypoint"
-            rows.append({"module": binding["module"], "export": binding["export"], "kind": kind})
+            row: dict[str, Any] = {
+                "module": binding["module"], "export": binding["export"], "kind": kind,
+            }
+            if identifier == attempt.job.installation_id:
+                row["self"] = True
+            else:
+                # Private source projects have ordinary Python implementations,
+                # including synchronous serving functions. Supply the installed
+                # schema so the caller executor can expose managed imports before
+                # importing the workflow, without rewriting either source tree.
+                row["interface_document"] = body
+            rows.append(row)
         return rows
 
     def _new_preparation_supervision(self) -> ExecutorSupervision:

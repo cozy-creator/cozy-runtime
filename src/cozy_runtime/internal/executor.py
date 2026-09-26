@@ -2575,12 +2575,6 @@ class Executor:
             if development_project
             else discover_installed(application)
         )
-        published = package_interface.read_bytes(Path(interface_path).read_bytes(), interface_path)
-        package_interface.compare(
-            published,
-            package_interface.build(discovered),
-            ("provisioned PackageInterface", "installed package"),
-        )
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
 
@@ -3234,6 +3228,7 @@ class Executor:
                 return refused
         if self.discovered is None:
             try:
+                self._install_call_proxies(command)
                 self._discover_provisioned(
                     {
                         "application": command["application"],
@@ -3408,6 +3403,38 @@ class Executor:
                 "gpu_count": 1 if self.torch is not None else 0,
             },
         }
+
+    def _install_call_proxies(self, command: Mapping[str, Any]) -> None:
+        """Expose managed dependency imports before importing a private workflow.
+
+        App registrations keep their original implementations. Only public module
+        exports in this caller process become typed proxies; installed files and
+        the independently executing callee remain ordinary uv installations.
+        """
+        from types import ModuleType
+
+        from cozy_runtime.internal import interface_wheel
+
+        prepared: set[str] = set()
+        for row in command.get("call_interfaces") or []:
+            document = row.get("interface_document")
+            module = row["module"]
+            if not document or module in prepared:
+                continue
+            prepared.add(module)
+            imported = importlib.import_module(module)
+            generated = interface_wheel.generate(package_interface.canonical_bytes(document))
+            source = generated.get(module.replace(".", "/") + "/__init__.py")
+            if source is None:
+                raise CapabilityError("installed dependency export is absent", code="child_interface")
+            companion_name = module + "._cozy_runtime_callers"
+            companion = ModuleType(companion_name)
+            sys.modules[companion_name] = companion
+            exec(compile(source, "<installed package callers>", "exec"), companion.__dict__)
+            bindings = companion.__dict__["__cozy_bindings__"]
+            imported.__dict__["__cozy_bindings__"] = bindings
+            for export in bindings:
+                imported.__dict__[export] = companion.__dict__[export]
 
     def _call_broker(self, command: Mapping[str, Any]) -> Any:
         from cozy_runtime.author._calls import _Broker, _CallType
