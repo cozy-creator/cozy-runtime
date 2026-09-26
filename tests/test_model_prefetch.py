@@ -107,7 +107,7 @@ def test_background_preparation_overlaps_current_work_and_demand_joins() -> None
         queue.close()
 
 
-def test_optional_failure_is_observed_only_by_the_demanded_consumer() -> None:
+def test_optional_failure_can_retry_after_repair_without_a_new_parent() -> None:
     queue = Preparations[bytes]()
 
     def failed(_: Callable[[], bool]) -> bytes:
@@ -115,13 +115,14 @@ def test_optional_failure_is_observed_only_by_the_demanded_consumer() -> None:
 
     try:
         future = queue.request("B", "parent", failed, speculative=True)
-        # Other model A finishes independently of B's optional failed future.
+        assert future is not None
+        with pytest.raises(OSError, match="model transfer unavailable"):
+            future.result(5)
         demand = queue.request("A", "parent", lambda _: b"A result", speculative=False)
         assert demand is not None and demand.result(5) == b"A result"
-        joined = queue.request("B", "parent", failed, speculative=False)
-        assert joined is future and joined is not None
-        with pytest.raises(OSError, match="model transfer unavailable"):
-            joined.result(5)
+        repaired = queue.request("B", "parent", lambda _: b"B repaired", speculative=False)
+        assert repaired is not None and repaired is not future
+        assert repaired.result(5) == b"B repaired"
     finally:
         queue.close()
 

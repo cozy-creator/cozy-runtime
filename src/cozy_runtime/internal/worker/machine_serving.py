@@ -6,6 +6,7 @@ import base64
 import contextlib
 import hashlib
 import time
+import uuid
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
@@ -80,6 +81,41 @@ class Serving:
         self.worker = worker
         self.preparations = Preparations[Prepared](MAX_ACTIVE_CALLS)
         self.pending: dict[tuple[str, str], Future[Prepared]] = {}
+        # Read leases die with the old process, but durable temporary holds need
+        # release through the existing journal after a worker restart.
+        workspace = worker.workspace
+        if workspace is not None:
+            with workspace.locked() as db:
+                abandoned = db.execute(
+                    "SELECT DISTINCT owner,recipient FROM execution_model_holds "
+                    "WHERE path LIKE 'preparation/%'"
+                ).fetchall()
+            for row in abandoned:
+                self._release_preparation(row["owner"], row["recipient"])
+
+    def _release_preparation(self, owner: str, recipient: str) -> None:
+        workspace = self.worker.workspace
+        assert workspace is not None
+        machine_models.release(workspace, owner, recipient)
+        with workspace.locked() as db:
+            db.execute(
+                "DELETE FROM execution_model_holds WHERE owner=? AND recipient=? "
+                "AND path LIKE 'preparation/%'",
+                (owner, recipient),
+            )
+
+    def _progress(self, call: Call, request: pb.ChildCallRequest, frame: dict[str, Any]) -> None:
+        if call.call_index == (1 << 32) - 1 and frame.get("kind") == "progress":
+            frame = {
+                "kind": "log",
+                "name": "model-prefetch",
+                "value": "info",
+                "fields": {key: value for key, value in frame.items() if key != "kind"},
+            }
+        # Optional shared observations can outlive their initiating parent while
+        # another parent still needs the same work. They cannot abort that work.
+        with contextlib.suppress(WorkspaceRefusal, OSError):
+            self.worker.emit_progress(call.parent_request, request.parent_attempt_ordinal, frame)
 
     @contextlib.contextmanager
     def phase(self, call: Call, request: pb.ChildCallRequest, name: str) -> Iterator[None]:
@@ -89,19 +125,15 @@ class Serving:
             call.parent_request, request.parent_attempt_ordinal, call.call_index
         )
         stage = f"{label} / {name}"[:120] if label else name
-        self.worker.emit_progress(
-            call.parent_request,
-            request.parent_attempt_ordinal,
-            {"kind": "progress", "stage": stage},
-        )
+        self._progress(call, request, {"kind": "progress", "stage": stage})
         succeeded = False
         try:
             yield
             succeeded = True
         finally:
-            self.worker.emit_progress(
-                call.parent_request,
-                request.parent_attempt_ordinal,
+            self._progress(
+                call,
+                request,
                 {
                     "kind": "log",
                     "name": name,
@@ -216,7 +248,11 @@ class Serving:
                 }
             )
         ).hexdigest()
-        source = replace(call, child_request="model-preparation." + identity)
+        source = replace(
+            call,
+            child_request="model-preparation." + uuid.uuid4().hex,
+            call_index=(1 << 32) - 1 if speculative else call.call_index,
+        )
         tensorfs = fill.tensorfs_module()
         token = tensorfs.PullCancellation()
 
@@ -232,6 +268,7 @@ class Serving:
                     model_arguments=models,
                     defaults=defaults,
                     cancellation=token,
+                    retention_prefix="preparation/",
                 )
                 # Consumers acquire their own holds at actual admission. Shared
                 # preparation retains only immutable binding metadata on completion.
@@ -239,7 +276,7 @@ class Serving:
                 return prepared
             finally:
                 assert self.worker.workspace is not None
-                machine_models.release(self.worker.workspace, owner, source.child_request)
+                self._release_preparation(owner, source.child_request)
 
         return self.preparations.request(
             identity,
@@ -247,6 +284,7 @@ class Serving:
             load,
             speculative=speculative,
             cancel=token.cancel,
+            refresh=not speculative,
         )
 
     def drive(self, owner: str, call: Call, target: Target, request: pb.ChildCallRequest) -> None:
@@ -468,6 +506,7 @@ class Serving:
         model_arguments: dict[str, Any] | None = None,
         defaults: list[dict[str, Any]] | None = None,
         cancellation: Any = None,
+        retention_prefix: str = "input/",
     ) -> Prepared:
         worker, workspace = self.worker, self.worker.workspace
         assert workspace is not None
@@ -497,7 +536,7 @@ class Serving:
                     workspace,
                     owner,
                     call.child_request,
-                    "input/" + path.removeprefix(prefix),
+                    retention_prefix + path.removeprefix(prefix),
                     artifact,
                 )
                 access.enter_context(workspace.held_model(owner, retention, held.manifest))
@@ -559,9 +598,9 @@ class Serving:
                 access if matched is None else None,
                 downloading=lambda: self.phase(call, request, "Downloading model weights"),
                 cancellation=cancellation,
-                progress=lambda available, total: worker.emit_progress(
-                    call.parent_request,
-                    request.parent_attempt_ordinal,
+                progress=lambda available, total: self._progress(
+                    call,
+                    request,
                     {
                         "kind": "progress",
                         "stage": target.entrypoint + " / Downloading model weights",
@@ -579,6 +618,8 @@ class Serving:
                 target.installation_id,
             )
             with worker.preparation_lock, self.phase(call, request, "Checking model compatibility"):
+                if cancellation is not None and cancellation.cancelled:
+                    raise WorkspaceRefusal("model preparation canceled")
 
                 def verified(digest: str, length: int, path: Path) -> None:
                     worker.verified_artifacts.record(digest, length, path)

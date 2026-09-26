@@ -36,6 +36,7 @@ class Preparations[T]:
         *,
         speculative: bool,
         cancel: Callable[[], None] = lambda: None,
+        refresh: bool = False,
     ) -> Future[T] | None:
         with self.lock:
             if self.closed:
@@ -48,6 +49,15 @@ class Preparations[T]:
                     return None
                 del self.entries[key]
                 entry = None
+            if (
+                entry is not None
+                and entry.future.done()
+                and not speculative
+                and (refresh or entry.future.exception() is not None)
+            ):
+                # A failed speculative attempt is not a permanent refusal. A
+                # demanded refresh also revalidates disk custody after cache GC.
+                entry = self.entries[key] = _Entry(load, cancel, interests=entry.interests.copy())
             if entry is None:
                 if speculative and len(self.entries) >= self.maximum - 1:
                     return None
