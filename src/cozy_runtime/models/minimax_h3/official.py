@@ -80,15 +80,7 @@ from .continuation import (
     audio_sample_range,
 )
 from .table_layout import TableLayout
-from .turbo import (
-    ATTENTION_KWARG,
-    OVERLAY_KWARG,
-    TURBO_BANK,
-    TurboComposerCapability,
-    TurboOverlay,
-    TurboSchedule,
-    inspect_turbo_composer,
-)
+from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK, TurboOverlay, TurboSchedule
 from .vae_tiles import TileBatchedVideoVAE
 
 #: A trunk is one DiT and its conditioning workflow; a task is one served function — the
@@ -1055,16 +1047,6 @@ class OfficialH3Pipeline:
                 code="artifact_config",
             )
         return torch.Generator().manual_seed(source.getrandbits(63))
-
-    def turbo_composer_capability(self, trunk: Trunk) -> TurboComposerCapability:
-        """Report whether this filled DiT can satisfy a complete bake-once request.
-
-        This is deliberately evaluated after Runtime fill, because encoded providers replace
-        ordinary projections with role-buffer modules at that boundary.  The report is a
-        capability/refusal contract only; the existing specialized overlay remains the
-        default until tables, heads, and isolated-root ownership are composed as one graph.
-        """
-        return inspect_turbo_composer(self.components[_DIT_COMPONENT[trunk]])
 
     def image_reference(self, image: Image) -> Any:
         return MiniMaxH3ImageReference(image=image if image.mode == "RGB" else image.convert("RGB"))

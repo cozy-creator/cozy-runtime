@@ -20,12 +20,7 @@ from .official import (
     build_h3_turbo_base,
     build_h3_turbo_lora,
 )
-from .turbo import (
-    ATTENTION_KWARG,
-    OVERLAY_KWARG,
-    TURBO_BANK,
-    TurboComposerCapability,
-)
+from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
 
 
 @sequence_parallel(degrees=(2, 4))
@@ -190,7 +185,6 @@ class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
         cancel: Any,
         checks: NumericalChecks,
         sol_dense_steps: int = 4,
-        bake_once: bool = False,
     ) -> ScheduleFacts:
         return turbo_lora.sample_fl2va(
             self,
@@ -199,7 +193,6 @@ class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
             cancel=cancel,
             checks=checks,
             sol_dense_steps=sol_dense_steps,
-            bake_once=bake_once,
         )
 
     @uses_components("ref2va_dit")
@@ -212,7 +205,6 @@ class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
         cancel: Any,
         checks: NumericalChecks,
         sol_dense_steps: int = 4,
-        bake_once: bool = False,
     ) -> ScheduleFacts:
         return turbo_lora.sample_ref2va(
             self,
@@ -221,7 +213,6 @@ class H3TurboBase(H3Model, encoded_leaves="accept", fusion="accept"):
             cancel=cancel,
             checks=checks,
             sol_dense_steps=sol_dense_steps,
-            bake_once=bake_once,
         )
 
 
@@ -237,15 +228,6 @@ class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
     def unload(self, loader: Loader) -> None:
         return None
 
-    def prepare_turbo(
-        self, base: H3Model, trunk: Literal["fl2va", "ref2va"], *, bake_once: bool
-    ) -> TurboComposerCapability:
-        """Run the strict bake capability gate before selecting request overlay state."""
-        capability = base.pipe.turbo_composer_capability(trunk)
-        if bake_once and not capability.supports_bake:
-            raise capability.refusal()
-        return capability
-
     @uses_components("fl2va_turbo")
     def sample_fl2va(
         self,
@@ -256,7 +238,6 @@ class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
         cancel: Any,
         checks: NumericalChecks,
         sol_dense_steps: int = 4,
-        bake_once: bool = False,
     ) -> ScheduleFacts:
         return self._sample(
             base,
@@ -266,7 +247,6 @@ class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
             cancel=cancel,
             checks=checks,
             sol_dense_steps=sol_dense_steps,
-            bake_once=bake_once,
         )
 
     @uses_components("ref2va_turbo")
@@ -279,7 +259,6 @@ class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
         cancel: Any,
         checks: NumericalChecks,
         sol_dense_steps: int = 4,
-        bake_once: bool = False,
     ) -> ScheduleFacts:
         return self._sample(
             base,
@@ -289,7 +268,6 @@ class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
             cancel=cancel,
             checks=checks,
             sol_dense_steps=sol_dense_steps,
-            bake_once=bake_once,
         )
 
     def _sample(
@@ -302,11 +280,9 @@ class H3TurboLoRA(Model[OfficialH3TurboLoRA], encoded_leaves="accept"):
         cancel: Any,
         checks: NumericalChecks,
         sol_dense_steps: int,
-        bake_once: bool,
     ) -> ScheduleFacts:
         _validate_sol_dense_steps(sol_dense_steps)
         task: Task = "fl2va_turbo" if trunk == "fl2va" else "ref2va_turbo"
-        self.prepare_turbo(base, trunk, bake_once=bake_once)
         overlay = self.pipe.overlay(base.pipe, trunk)
         root = base.pipe.components[f"{trunk}_dit"]
         checks.component(f"{trunk}_dit", root)
