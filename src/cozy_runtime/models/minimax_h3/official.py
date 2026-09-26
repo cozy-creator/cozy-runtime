@@ -44,6 +44,7 @@ from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
     video_latent_num_frames,
 )
 from diffusers.modular_pipelines.modular_pipeline import PipelineState
+from torch.nn.utils.weight_norm import WeightNorm
 from torch.utils._pytree import keystr, tree_flatten_with_path
 from transformers import (
     AddedToken,
@@ -1354,7 +1355,17 @@ class OfficialH3Pipeline:
         return facts
 
     def decode_audio(self, task: Task, state: Any) -> Any:
-        self._run(task, "decode.audio", state, component="audio_vae")
+        try:
+            self._run(task, "decode.audio", state, component="audio_vae")
+        finally:
+            # Legacy weight_norm retains an unregistered computed `weight` on each
+            # convolution. Evicting registered weight_g/weight_v cannot release it.
+            # Drop only those transient attributes, including after a failed decode;
+            # the unchanged pre-hook recomputes them before the next forward.
+            for module in self.components["audio_vae"].decoder.modules():
+                for hook in module._forward_pre_hooks.values():
+                    if isinstance(hook, WeightNorm):
+                        module.__dict__.pop(hook.name, None)
         delivery = state.get("continuation_delivery")
         if delivery is None:
             return state.audio
