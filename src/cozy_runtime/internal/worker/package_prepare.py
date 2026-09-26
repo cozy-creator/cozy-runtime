@@ -886,6 +886,31 @@ def _entrypoints(
         )
         for slot, value in sorted(selected.items(), key=lambda item: model_ids[item[0]])
     ]
+    adapter_ids: dict[str, list[dict[str, str]]] = {}
+    for slot, value in sorted(selected.items(), key=lambda item: model_ids[item[0]]):
+        for index, adapter in enumerate(value["selection"].get("adapters", [])):
+            adapter_id = model_id(f"{slot}.adapter.{index}")
+            manifest = str(adapter.get("manifest", ""))
+            models.append(
+                pb.Model(
+                    id=adapter_id,
+                    repo=str(adapter.get("model", "")),
+                    version=str(adapter.get("release", "")),
+                    lane=str(adapter.get("lane", "")),
+                    manifest=pb.Ref(
+                        digest=documents.raw(manifest),
+                        length=int(adapter.get("manifest_length", 0)),
+                    ),
+                )
+            )
+            adapter_ids.setdefault(slot, []).append(
+                {
+                    "component": str(adapter.get("component", "")),
+                    "model_id": adapter_id,
+                    "source_component": str(adapter.get("source_component", "")),
+                    "scale": str(adapter.get("scale", "")),
+                }
+            )
     bound: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     for value in rows:
         if not isinstance(value, dict) or not isinstance(value.get("name"), str):
@@ -946,6 +971,9 @@ def _entrypoints(
                         pb.Component(component=component, model_id=model_ids[path])
                         for component in found.components
                     ],
+                    adapters=[
+                        pb.ModelAdapter(**adapter) for adapter in adapter_ids.get(path, [])
+                    ],
                 )
             )
         slots.sort(key=lambda row: row.slot)
@@ -957,6 +985,7 @@ def _entrypoints(
         )
         out.append(entrypoint)
     out.sort(key=lambda row: row.name)
+    models.sort(key=lambda row: row.id)
     if len({row.name for row in out}) != len(out):
         raise PreparationRefusal("package_prepare_interface_invalid", "duplicate entrypoint")
     unbound = sorted(set(selected) - described_slots)
@@ -1133,6 +1162,41 @@ def _selected_models(
             ):
                 raise PreparationRefusal("package_prepare_model_manifest_mismatch", digest)
             manifests[digest] = (length, raw, bytes(held["header"]))
+            adapters = selection.get("adapters", [])
+            if not isinstance(adapters, list):
+                raise PreparationRefusal(
+                    "package_prepare_model_selection_mismatch", f"{selection.get('slot', '')}: adapters"
+                )
+            for adapter in adapters:
+                if not isinstance(adapter, dict):
+                    raise PreparationRefusal("package_prepare_model_selection_mismatch", "adapter")
+                adapter_digest = str(adapter.get("manifest", ""))
+                adapter_model = str(adapter.get("model", ""))
+                adapter_release = str(adapter.get("release", ""))
+                adapter_lane = str(adapter.get("lane", ""))
+                adapter_parts = adapter_model.split("/")
+                if (
+                    not adapter_digest
+                    or len(adapter_parts) != 2
+                    or not all(adapter_parts)
+                    or bool(adapter_release) != bool(adapter_lane)
+                ):
+                    raise PreparationRefusal("package_prepare_model_selection_mismatch", "adapter identity")
+                adapter_ref = store.manifest(adapter_digest)
+                adapter_raw = bytes(adapter_ref["manifest"])
+                adapter_length = len(adapter_raw)
+                if "sha256:" + hashlib.sha256(adapter_raw).hexdigest() != adapter_digest:
+                    raise PreparationRefusal("package_prepare_model_manifest_mismatch", adapter_digest)
+                if adapter_release:
+                    _resolved_manifest_length(
+                        store.resolve_release(
+                            adapter_parts[0], adapter_parts[1], adapter_release, adapter_lane
+                        ),
+                        adapter_digest,
+                        adapter_length,
+                        f"{adapter_model}@{adapter_release}/{adapter_lane}",
+                    )
+                adapter["manifest_length"] = adapter_length
         for digest, (length, raw, header_raw) in sorted(manifests.items()):
             header_digest, header_length = acquire.cozytensors_ref(tensorfs, raw)
             if (
