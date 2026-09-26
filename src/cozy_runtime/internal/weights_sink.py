@@ -12,7 +12,7 @@ import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
@@ -23,61 +23,34 @@ from cozy_runtime.author._weights import (
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-if TYPE_CHECKING:
-    from cozy_runtime.internal.base_observation import Observation
-    from cozy_runtime.internal.hostfacts import HostFacts
-
 _OUTPUT_SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 _EXCHANGE_KINDS = frozenset({"declaration", "receipt", "derivation", "native-receipt"})
 
 
 def work_fingerprint(
     spec: Mapping[str, Any],
-    environment_installation_id: str,
-    base: Observation,
-    device: HostFacts,
+    numerical: bytes,
     *,
     operation_identity: str = "",
 ) -> str:
-    """Parent-authored numerical work identity, independent of attempt/custody clocks.
+    """Bind native partial work to callee logic, actual inputs, and numerical policy.
 
-    The original exact InvocationSpec still scopes the transaction. Its deadline and
-    publication grant are authority, not inputs to arithmetic. CUDA architecture/driver
-    deliberately participate: AdaLN tables computed on another architecture are not
-    presumed bit-identical. Device UUID, memory, paths and boot facts never participate.
+    Attempt/custody clocks and SDK inventories never define numerical work.
+    An unavailable callee identity keeps non-memoized work private to the exact
+    frozen installation instead of guessing that arbitrary code is reusable.
     """
-    from cozy_runtime.internal.base_observation import protected_distribution
-
     job = spec.get("job")
-    if not isinstance(job, Mapping) or not environment_installation_id:
+    if not isinstance(job, Mapping) or len(numerical) != 32:
         raise CapabilityError(
-            "weights work has no selected job environment", code="weights_work_identity"
-        )
-    if device.backend == "cuda" and (device.gpu_sm <= 0 or not device.driver_version):
-        raise CapabilityError(
-            "CUDA work has no measured architecture/driver", code="weights_work_identity"
+            "weights work has no selected job or numerical policy", code="weights_work_identity"
         )
     facts = {
-        # Versioned operations reuse compatible partial work across installations.
-        # Without a defined implementation identity, keep partial work private to
-        # this installation rather than treating arbitrary Python as deterministic.
-        "operation": operation_identity or {
-            key: job[key] for key in ("installation_id", "job_descriptor_id")
-        },
+        "operation": operation_identity
+        or {key: job[key] for key in ("installation_id", "job_descriptor_id")},
         "payload_digest": spec["payload_digest"],
         "inputs": spec.get("inputs", []),
         "outputs": spec.get("outputs", []),
-        "interpreter": base.interpreter_identity,
-        "distributions": {
-            name: version for name, version in base.distributions if protected_distribution(name)
-        },
-        "torch_build": base.accelerator_build,
-        "cuda_runtime": base.cuda_version,
-        "device": {
-            "backend": device.backend or "cpu",
-            "architecture": device.gpu_sm,
-            "driver": device.driver_version,
-        },
+        "numerical_environment_digest": documents.spell(numerical),
     }
     return (
         "sha256:"

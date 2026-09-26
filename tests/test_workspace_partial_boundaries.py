@@ -6,15 +6,14 @@ import hashlib
 import threading
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 import tensorfs
 
-from cozy_runtime.internal.base_observation import current
 from cozy_runtime.internal.hostfacts import HostFacts
+from cozy_runtime.internal.numerical_environment import fingerprint as numerical_fingerprint
 from cozy_runtime.internal.weights_sink import work_fingerprint
 from cozy_runtime.internal.worker import workspace_finalize
 from cozy_runtime.internal.worker.workspace import Journal, Workspace, WorkspaceRefusal
@@ -109,13 +108,15 @@ def test_each_partial_work_identity_mismatch_misses_and_native_refuses(
     tmp_path: Path, change: str
 ) -> None:
     spec_body: dict[str, Any] = {
-        "job": {"build_id": "sha256:" + "21" * 32, "job_descriptor_id": "sha256:" + "22" * 32},
+        "job": {
+            "installation_id": "sha256:" + "21" * 32,
+            "job_descriptor_id": "sha256:" + "22" * 32,
+        },
         "payload_digest": "sha256:" + "23" * 32,
         "inputs": [{"input_id": "source", "digest": "sha256:" + "24" * 32, "length": 2048}],
     }
-    environment = "sha256:" + "25" * 32
-    base, device = current(), HostFacts(backend="cpu")
-    fingerprint = work_fingerprint(spec_body, environment, base, device)
+    numerical = numerical_fingerprint(HostFacts(backend="cpu"), threads=1, inherited={})
+    fingerprint = work_fingerprint(spec_body, numerical)
     store, workspace, spec, first, original, targets, order, _ = fixture(
         tmp_path, fingerprint=fingerprint
     )
@@ -132,14 +133,13 @@ def test_each_partial_work_identity_mismatch_misses_and_native_refuses(
     elif change == "input":
         changed_spec["inputs"][0]["digest"] = "sha256:" + "32" * 32
     elif change == "numerical":
-        unchanged = tuple(row for row in base.distributions if row[0] != "torch")
-        base = replace(base, distributions=(*unchanged, ("torch", "2.13.0+changed")))
+        numerical = numerical_fingerprint(HostFacts(backend="cpu"), threads=2, inherited={})
     elif change == "order":
         changed_order.reverse()
     else:
         changed_targets["model"]["add"]["b"]["shape"] = [256]
         changed_targets["model"]["add"]["b"]["parts"]["value"]["shape"] = [256]
-    changed_fingerprint = work_fingerprint(changed_spec, environment, base, device)
+    changed_fingerprint = work_fingerprint(changed_spec, numerical)
     declaration = store.derived_declaration(
         {}, changed_targets, {}, changed_order, 4096, work_fingerprint=changed_fingerprint
     )

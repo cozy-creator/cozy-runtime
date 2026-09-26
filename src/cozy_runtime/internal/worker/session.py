@@ -1141,9 +1141,7 @@ class Worker:
             tensorfs_root=options.tensorfs_root,
             work_fingerprint=lambda attempt: weights_sink.work_fingerprint(
                 attempt.spec,
-                attempt.job.installation_id if attempt.job else "",
-                self.base,
-                hostfacts.measure(options.accelerator_backend),
+                self.numerical_environment(),
                 operation_identity=(
                     self.engine._job_declaration(attempt.job, attempt.job.job_descriptor_id)
                     .get("invocable", {}).get("operation_identity", "")

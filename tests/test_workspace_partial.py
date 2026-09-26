@@ -28,7 +28,7 @@ def accepted(workspace: Workspace, request: str, *, memoize: bool = True) -> tup
                 )
             ],
             job=pb.JobInvocationSpec(
-                build_id="sha256:" + "22" * 32,
+                installation_id="sha256:" + "22" * 32,
                 job_descriptor_id="sha256:" + "33" * 32,
             ),
         )
