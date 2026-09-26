@@ -10,9 +10,12 @@ from contextlib import AbstractContextManager, ExitStack, nullcontext
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from cozy.worker.v1.wire_version import MODEL_DEFAULT_GPU_COUNT_WIRE_MINOR
 from cozy_runtime.internal import fill, hostfacts
-from cozy_runtime.protocol import CAPTURED_MODEL_DEFAULTS_WIRE_MINOR, documents
+from cozy_runtime.protocol import (
+    CAPTURED_MODEL_DEFAULTS_WIRE_MINOR,
+    MODEL_DEFAULT_GPU_COUNT_WIRE_MINOR,
+    documents,
+)
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import grants

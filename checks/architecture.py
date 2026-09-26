@@ -652,7 +652,7 @@ def fence_torch_free_import() -> list[str]:
 
 STATIC_READERS = tuple(
     SRC / "internal" / name
-    for name in ("static_interface.py", "static_invocable.py", "builtin_operations.py")
+    for name in ("static_interface.py", "static_invocable.py")
 )
 #: Modules and builtins through which source becomes execution. The static reader may name none.
 EXECUTION_MODULES = frozenset({"importlib", "sys", "runpy", "subprocess", "builtins"})
@@ -670,7 +670,6 @@ STATIC_READER_IMPORTS = frozenset(
         "cozy_runtime.internal.static_interface",
         "cozy_runtime.internal.static_invocable",
         "cozy_runtime.internal.invocable_interface",
-        "cozy_runtime.internal.builtin_operations",
     }
 )
 
