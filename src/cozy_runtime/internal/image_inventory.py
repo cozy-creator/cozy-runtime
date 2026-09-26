@@ -42,18 +42,18 @@ class Inventory:
 
 
 def read_bytes(raw: bytes) -> Inventory:
-    """Admit one staged inventory document; the exact mirror of tensorhub's writer rule."""
+    """Read required inventory facts while tolerating additive producer metadata."""
 
     try:
         value: Any = json.loads(raw)
     except ValueError as exc:
         raise ImageInventoryRefusal(f"not JSON: {exc}") from exc
-    if not isinstance(value, dict) or set(value) - {"interpreters", "provisionable_minors"} != {
+    if not isinstance(value, dict) or not {
         "distributions",
         "format",
         "profile",
         "python",
-    }:
+    }.issubset(value):
         raise ImageInventoryRefusal("wrong fields")
     if value["format"] != INVENTORY_FORMAT:
         raise ImageInventoryRefusal(f"format {value['format']!r}")
@@ -69,7 +69,7 @@ def read_bytes(raw: bytes) -> Inventory:
     distributions: list[tuple[str, str]] = []
     prior = ""
     for row in rows:
-        if not isinstance(row, dict) or set(row) != {"name", "version"}:
+        if not isinstance(row, dict) or not {"name", "version"}.issubset(row):
             raise ImageInventoryRefusal("distribution row fields")
         name = row["name"]
         version = row["version"]
@@ -132,7 +132,7 @@ def _interpreters(rows: Any) -> tuple[tuple[str, str], ...]:
         raise ImageInventoryRefusal("interpreter inventory must contain at most three versions")
     result = []
     for row in rows:
-        if not isinstance(row, dict) or set(row) != {"version", "abi"}:
+        if not isinstance(row, dict) or not {"version", "abi"}.issubset(row):
             raise ImageInventoryRefusal("interpreter inventory row fields")
         try:
             version = Version(row["version"])

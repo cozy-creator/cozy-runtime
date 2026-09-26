@@ -391,7 +391,7 @@ def _parse(value: object) -> Observation:
         "torch_release",
         "uv_version",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    if not isinstance(value, dict) or not fields.issubset(value):
         raise ObservationRefusal("base observation fields are invalid")
     try:
         observation = Observation(
@@ -414,6 +414,7 @@ def _parse(value: object) -> Observation:
         )
     except (TypeError, ValueError) as exc:
         raise ObservationRefusal("base observation rows are invalid") from exc
-    if _body(observation) != value:
+    # Another installed Runtime may add diagnostics; only consumed facts are canonical.
+    if _body(observation) != {name: value[name] for name in fields}:
         raise ObservationRefusal("base observation is not canonical internal data")
     return observation
