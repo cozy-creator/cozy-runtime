@@ -95,6 +95,7 @@ def _callable(surface: Surface) -> dict[str, Json]:
                 binding.fusion,
                 binding.components,
                 binding.sequence_parallel,
+                adapter_compatibility=binding.adapter_compatibility,
                 defaults=surface.model_defaults.get(binding.param, ()),
             )
             for binding in surface.model_bindings
@@ -181,6 +182,7 @@ def model_slot(
     components: Mapping[str, Sequence[str]],
     sequence_parallel: Sequence[int],
     *,
+    adapter_compatibility: Sequence[Mapping[str, Json]] = (),
     defaults: DefaultLadder = (),
 ) -> dict[str, Json]:
     """One model slot. The PATH is the binding point, the CLASS carries `encoded_leaves`,
@@ -209,6 +211,8 @@ def model_slot(
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
         doc["sequence_parallel"] = {"degrees": list(sequence_parallel)}
+    if adapter_compatibility:
+        doc["adapter_compatibility"] = [dict(row) for row in adapter_compatibility]
     if fusion != "refuse":
         # The fused-glue consent (h3a-015); the conservative default is the absent key.
         doc["fusion"] = fusion
@@ -471,7 +475,7 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                 slot = _closed(
                     model,
                     {"class", "component_use", "path"},
-                    {"encoded_leaves", "fusion", "sequence_parallel", "default_ladder"},
+                    {"encoded_leaves", "fusion", "sequence_parallel", "default_ladder", "adapter_compatibility"},
                     source,
                     model_path,
                 )
@@ -497,6 +501,27 @@ def _validate(body: Mapping[str, Json], source: str) -> None:
                             model_path,
                             "default GPU count is not a declared sequence-parallel degree",
                         )
+                if "adapter_compatibility" in slot:
+                    compatibility = slot["adapter_compatibility"]
+                    if not isinstance(compatibility, list):
+                        _invalid(source, f"{model_path}.adapter_compatibility", "must be an array")
+                    for index, declaration in enumerate(compatibility):
+                        if not isinstance(declaration, dict):
+                            _invalid(source, f"{model_path}.adapter_compatibility[{index}]", "must be an object")
+                        required = {"kind", "family", "components", "weight_min", "weight_max"}
+                        if set(declaration) != required:
+                            _invalid(source, f"{model_path}.adapter_compatibility[{index}]", "has invalid fields")
+                        if (
+                            not isinstance(declaration["kind"], str)
+                            or not isinstance(declaration["family"], str)
+                            or not isinstance(declaration["components"], list)
+                            or not declaration["components"]
+                            or not all(isinstance(component, str) and component for component in declaration["components"])
+                            or not isinstance(declaration["weight_min"], (int, float))
+                            or not isinstance(declaration["weight_max"], (int, float))
+                            or declaration["weight_min"] > declaration["weight_max"]
+                        ):
+                            _invalid(source, f"{model_path}.adapter_compatibility[{index}]", "has invalid compatibility values")
                 prefix = f"{name}.models."
                 if (
                     not isinstance(slot["path"], str)

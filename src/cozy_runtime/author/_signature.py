@@ -220,6 +220,19 @@ class ModelBinding:
     def fusion(self) -> str:
         return str(getattr(self.model_class, "__fusion__", "refuse"))
 
+    @property
+    def adapter_compatibility(self) -> tuple[Mapping[str, object], ...]:
+        return tuple(
+            {
+                "kind": declaration.kind,
+                "family": declaration.family,
+                "components": list(declaration.components),
+                "weight_min": declaration.weight_min,
+                "weight_max": declaration.weight_max,
+            }
+            for declaration in getattr(self.model_class, "__adapter_compatibility__", ())
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class Surface:
