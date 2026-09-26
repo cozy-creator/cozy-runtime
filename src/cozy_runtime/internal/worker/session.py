@@ -1799,6 +1799,7 @@ class Worker:
         capture = self.executions.capture(owner, root)
         prepared = self.executions.preparation(owner, root)["installations"]
         rows = []
+        described_modules: set[tuple[str, str]] = set()
         for binding in capture.get("bindings", []):
             if binding["caller_installation_id"] != attempt.job.installation_id:
                 continue
@@ -1813,12 +1814,25 @@ class Worker:
             }
             if identifier == attempt.job.installation_id:
                 row["self"] = True
-            else:
+            elif (identifier, binding["module"]) not in described_modules:
                 # Private source projects have ordinary Python implementations,
                 # including synchronous serving functions. Supply the installed
                 # schema so the caller executor can expose managed imports before
                 # importing the workflow, without rewriting either source tree.
-                row["interface_document"] = body
+                # A package can export many functions across several modules.
+                # Transport each module's schemas once, not the whole package for
+                # every export, so ordinary dependency graphs fit the control seam.
+                described_modules.add((identifier, binding["module"]))
+                row["interface_document"] = {
+                    **body,
+                    **{
+                        collection: [
+                            entry for entry in body[collection]
+                            if entry.get("invocable", {}).get("module") == binding["module"]
+                        ]
+                        for collection in ("jobs", "entrypoints")
+                    },
+                }
             rows.append(row)
         return rows
 
