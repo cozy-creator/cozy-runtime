@@ -192,3 +192,14 @@ def test_gpu_count_requires_the_models_declared_group() -> None:
     )
     with pytest.raises(ConformanceError):
         package_interface.model_slot(sequence_parallel=[4], **kwargs)
+
+
+def test_counted_artifact_with_malformed_parallel_contract_refuses_typed(tmp_path: Path) -> None:
+    body = static_interface.build(project(tmp_path, invocable=True))
+    for parallel in (None, {"degrees": None}, {"degrees": [2, True]}):
+        invalid = deepcopy(body)
+        slot = invalid["entrypoints"][0]["models"][0]
+        slot["default_ladder"][0]["gpus"] = 2
+        slot["sequence_parallel"] = parallel
+        with pytest.raises(ConformanceError):
+            package_interface.read_bytes(package_interface.canonical_bytes(invalid))
