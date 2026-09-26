@@ -28,7 +28,10 @@ DIFFUSERS_VERSION = "0.40.0"
 # whenever `native/` changes, so optimization identity tracks the kernels, not releases.
 FUSED_ANIMA_CUDA_KERNEL_MODULE = "cozy_runtime._kernels"
 FUSED_ANIMA_CUDA_KERNEL_REVISION = "0.1.0"
-FUSED_ANIMA_TORCH_RELEASE = "2.13.0"
+# This extension consumes DLPack arrays and a CUDA stream through nanobind; it
+# neither links libtorch nor depends on Torch's C++ ABI. Keep an explicit Python
+# API/numerical cohort rather than admitting every future Torch release.
+FUSED_ANIMA_TORCH_RELEASES = ("2.13.0", "2.14.0")
 FUSED_ANIMA_CUDA_RELEASE = "13.0"
 
 _APPLICATION = "anima:app"
@@ -463,7 +466,7 @@ def _require_transformer_config(transformer: Any) -> None:
         )
 
 
-def fused_anima_capability_refusal() -> str:
+def fused_anima_capability_refusal(*, application: str, model_class: str) -> str:
     """WHY the fused lane is unavailable, in one line, or "" when it is available.
 
     `_fused_anima_cuda_capability` has six silent `return None` edges and an operator who
@@ -471,6 +474,8 @@ def fused_anima_capability_refusal() -> str:
     proto-038). This recomputes the same gate for REPORTING only; it decides nothing and
     never enters generation identity.
     """
+    if application != _APPLICATION or model_class != _MODEL_CLASS:
+        return ""
     torch_version = _installed_version("torch")
     if torch_version is None:
         return "torch is not installed"
@@ -478,8 +483,11 @@ def fused_anima_capability_refusal() -> str:
         installed = Version(torch_version)
     except InvalidVersion:
         return f"torch version {torch_version!r} does not parse"
-    if installed.public != FUSED_ANIMA_TORCH_RELEASE:
-        return f"torch {installed.public} != the fused lane's {FUSED_ANIMA_TORCH_RELEASE}"
+    if installed.public not in FUSED_ANIMA_TORCH_RELEASES:
+        return (
+            f"torch {installed.public} is outside the fused lane's supported releases "
+            f"{', '.join(FUSED_ANIMA_TORCH_RELEASES)}"
+        )
     try:
         torch = import_module("torch")
     except ImportError:
@@ -514,7 +522,7 @@ def _fused_anima_cuda_capability() -> tuple[Any, Any] | None:
         installed_torch = Version(torch_version)
     except InvalidVersion:
         return None
-    if installed_torch.public != FUSED_ANIMA_TORCH_RELEASE:
+    if installed_torch.public not in FUSED_ANIMA_TORCH_RELEASES:
         return None
     try:
         torch = import_module("torch")

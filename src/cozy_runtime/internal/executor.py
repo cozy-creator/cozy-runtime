@@ -2209,7 +2209,12 @@ class Executor:
             # verdict itself already rode in `execution_optimization` below and nothing
             # rendered it; a `None` with no reason is the part an operator cannot act on.
             "execution_optimization_refusal": (
-                "" if optimization else fused_anima_capability_refusal()
+                ""
+                if optimization
+                else fused_anima_capability_refusal(
+                    application=str(binding["application"]),
+                    model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
+                )
             ),
             # The fused-glue plan's record (h3a-015): None where the class did not consent,
             # else what was substituted (or why nothing was) on this device.
