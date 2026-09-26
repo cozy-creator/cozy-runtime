@@ -14,6 +14,7 @@ from cozy_runtime.author import InvalidRequest  # noqa: E402
 from cozy_runtime.models.minimax_h3.continuation import (  # noqa: E402
     AVContext,
     CompletedTail,
+    ContextReferenceLayout,
     align_context_rows,
     audio_sample_range,
     decode_context,
@@ -23,10 +24,14 @@ from cozy_runtime.models.minimax_h3.continuation import (  # noqa: E402
 
 
 def context(frames: int = 56, end: int = 262) -> AVContext:
-    start, stop = audio_sample_range(end - frames, end, 32000)
-    pixels = np.arange(frames * 32 * 64 * 3, dtype=np.uint8).reshape(frames, 32, 64, 3)
-    audio = torch.arange(2 * (stop - start), dtype=torch.float32).reshape(2, stop - start) / 100000
-    return AVContext(pixels, audio, 32000, end - frames, end, "model-and-inference-v1")
+    windows = {
+        n: (
+            torch.full((1, 24, 5 * ((n - 5) // 17) + 2, 2, 4), n / 100),
+            torch.full((2 * ((n * 5 + 2) // 3), 32), n / 100),
+        )
+        for n in (22, 39, 56)
+    }
+    return AVContext(windows, 32, 64, end, "model-and-inference-v1", frames)
 
 
 @pytest.mark.parametrize("prefix,sampled", [(0, 243), (22, 277), (39, 294), (56, 311)])
@@ -46,20 +51,24 @@ def test_delivery_clock_charges_context_without_delivering_it(prefix: int, sampl
 
 
 @pytest.mark.parametrize("frames", [22, 39, 56])
-def test_context_codec_and_selection_preserve_exact_samples(frames: int) -> None:
+def test_context_codec_and_selection_preserve_independent_native_windows(frames: int) -> None:
     original = context()
     selected = decode_context(encode_context(original)).select(frames)
-    assert np.array_equal(selected.frames, original.frames[-frames:])
-    base, _ = audio_sample_range(original.source_start_frame, original.source_end_frame, 32000)
-    start, end = audio_sample_range(selected.source_start_frame, selected.source_end_frame, 32000)
-    assert torch.equal(selected.audio, original.audio[:, start - base : end - base])
+    assert torch.equal(selected.video_latents, original.windows[frames][0])
+    assert torch.equal(selected.audio_latents, original.windows[frames][1])
+    assert selected.source_start_frame == original.source_end_frame - frames
+    assert selected.frame_count == frames
+    if frames != 56:
+        assert not torch.equal(
+            selected.video_latents, original.video_latents[:, :, -selected.video_latents.shape[2]:]
+        )
     assert selected.provenance == original.provenance
     with pytest.raises(InvalidRequest):
         decode_context(encode_context(original)[:-1])
     with pytest.raises(InvalidRequest):
         decode_context(b"\xff" * 8)
     broken = context()
-    broken.audio[0, 0] = float("nan")
+    broken.audio_latents[0, 0] = float("nan")
     with pytest.raises(InvalidRequest, match="finite"):
         encode_context(broken)
 
@@ -95,10 +104,7 @@ def test_streaming_tail_comes_from_delivered_end_not_sample_padding(prefix: int)
 @pytest.mark.parametrize("frames", [22, 39, 56])
 def test_native_context_layout_preserves_refs_and_every_scheduler_step(frames: int) -> None:
     from diffusers import MiniMaxH3Scheduler
-    from diffusers.modular_pipelines.minimax_h3 import (
-        MiniMaxH3ImageReference,
-        MiniMaxH3VideoReference,
-    )
+    from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3ImageReference
     from diffusers.modular_pipelines.minimax_h3.before_denoise import (
         MiniMaxH3Ref2VAPrepareLayoutStep,
     )
@@ -109,7 +115,7 @@ def test_native_context_layout_preserves_refs_and_every_scheduler_step(frames: i
     ticks = (frames * 5 + 2) // 3
     refs = [
         MiniMaxH3ImageReference(image=np.zeros((32, 64, 3), dtype=np.uint8)),
-        MiniMaxH3VideoReference(frames=ctx.frames, audio=ctx.audio, sample_rate=32000),
+        ContextReferenceLayout(),
     ]
     conditions = [torch.zeros(1, 24, 1, 2, 4), torch.zeros(1, 24, latent_frames, 2, 4)]
     audios = [torch.zeros(2 * ticks, 32)]
