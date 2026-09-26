@@ -240,7 +240,10 @@ _SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
 _NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
 _ENTRYPOINT_KEYWORDS = frozenset(
-    {"name", "preflight", "demand", "hidden", "memoize", "defaults", "internal"}
+    {
+        "name", "preflight", "demand", "hidden", "memoize", "memo_version",
+        "memo_dependencies", "defaults", "internal",
+    }
 )
 _JOB_KEYWORDS = frozenset(
     {"name", "publishes", "emits_media", "weights", "demand", "defaults", "internal"}
@@ -1444,6 +1447,10 @@ def _registration(
             continue
         if keyword.arg == "demand":
             reader.fold(module, keyword.value)
+            continue
+        if keyword.arg in {"memo_version", "memo_dependencies"}:
+            # Like @invocable options, installed-environment memo identities
+            # are not part of the source-stable client contract.
             continue
         value = reader.fold(module, keyword.value)
         if keyword.arg == "defaults":
