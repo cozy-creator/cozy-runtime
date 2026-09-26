@@ -965,6 +965,18 @@ class _ImageEdges:
             )
 
 
+@contextmanager
+def _audio_weight_norm_scope(audio_vae: Any) -> Iterator[None]:
+    """Release only legacy WeightNorm's recomputable, unregistered attributes."""
+    try:
+        yield
+    finally:
+        for module in audio_vae.modules():
+            for hook in module._forward_pre_hooks.values():
+                if isinstance(hook, WeightNorm):
+                    module.__dict__.pop(hook.name, None)
+
+
 class OfficialH3Pipeline:
     """Both official task workflows over one shared, dual-DiT construction."""
 
@@ -1355,17 +1367,7 @@ class OfficialH3Pipeline:
         return facts
 
     def decode_audio(self, task: Task, state: Any) -> Any:
-        try:
-            self._run(task, "decode.audio", state, component="audio_vae")
-        finally:
-            # Legacy weight_norm retains an unregistered computed `weight` on each
-            # convolution. Evicting registered weight_g/weight_v cannot release it.
-            # Drop only those transient attributes, including after a failed decode;
-            # the unchanged pre-hook recomputes them before the next forward.
-            for module in self.components["audio_vae"].decoder.modules():
-                for hook in module._forward_pre_hooks.values():
-                    if isinstance(hook, WeightNorm):
-                        module.__dict__.pop(hook.name, None)
+        self._run(task, "decode.audio", state, component="audio_vae")
         delivery = state.get("continuation_delivery")
         if delivery is None:
             return state.audio
@@ -1468,7 +1470,15 @@ class OfficialH3Pipeline:
             if component is None
             else _ScopedPipeline(self._pipes[workflow], self.components[component])
         )
-        self._run_with(task, pipe, name, state)
+        if name in {"vae_encoder", "decode.audio"}:
+            # Both reference conditioning and continuation export encode audio.
+            # Legacy WeightNorm leaves computed CUDA weights outside parameters
+            # and buffers; release them on success or failure before stage eviction.
+            # The unchanged pre-hook recomputes from weight_g/weight_v next time.
+            with _audio_weight_norm_scope(self.components["audio_vae"]):
+                self._run_with(task, pipe, name, state)
+        else:
+            self._run_with(task, pipe, name, state)
 
     def _run_with(self, task: Task, pipe: Any, name: str, state: Any) -> None:
         block = self._blocks[self._workflow(task, state)].sub_blocks[name]
