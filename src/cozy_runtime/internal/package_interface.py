@@ -218,7 +218,7 @@ _FORBIDDEN_KEYS = frozenset(
     {
         "release",
         "built_at",
-        "build_id",
+        "installation_id",
         "timestamp",
         "created_at",
         "generated_at",

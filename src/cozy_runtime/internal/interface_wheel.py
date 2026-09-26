@@ -308,7 +308,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
         functions.append(
             f"def {export}({', '.join(parameters)}) -> {returned}:\n"
             f"    return cast({returned}, "
-            f"_invoke_proxy({digest!r}, {module!r}, {export!r}, {arguments}{options}))\n"
+            f"_invoke_proxy({module!r}, {export!r}, {arguments}{options}))\n"
         )
         bindings.append(
             f"    {export!r}: _CallType({digest!r}, {module!r}, {export!r}, "

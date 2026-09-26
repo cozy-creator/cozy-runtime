@@ -29,6 +29,8 @@ RUNNING process's loaded modules and mapped libraries, not against the import gr
 
 from __future__ import annotations
 
+from cozy_runtime.internal import package_installation
+
 import argparse
 import base64
 import contextlib
@@ -311,7 +313,7 @@ class WorkerOptions:
     """Explicit same-user source-checkout execution; product published venvs leave absent."""
     development_package: str = ""
     development_release: str = ""
-    development_source_digest: str = ""
+    development_installation_id: str = ""
     """Exact launch facts the development Placement must echo."""
     development_binding_overrides: Mapping[str, str] = field(default_factory=dict)
     """One-shot local resolver inputs; long-lived Creator launches use package.toml."""
@@ -369,12 +371,11 @@ class Placement:
     placement_set_digest: bytes
     package: dict[str, Any]
     development: dict[str, Any]
-    environment_digest: bytes
-    package_interface: tuple[str, int]
+    installation_id: str
+    package_interface: bytes
     bindings_digest: bytes
     models: tuple[dict[str, Any], ...]
     entrypoints: tuple[dict[str, Any], ...]
-    environment: dict[str, Any]
     document: dict[str, Any]
     acquisition: pb.PlacementAcquisitionObservation = field(
         default_factory=pb.PlacementAcquisitionObservation
@@ -396,7 +397,7 @@ class Placement:
     #: wheels were the pod host's carriers and are gone once the PlacementSet is journaled,
     #: so the placement over that revision serves from this environment instead of
     #: re-acquiring bytes nothing on the pod still holds.
-    installed: package_environment.InstalledEnvironment | None = None
+    installed: package_installation.InstalledEnvironment | None = None
 
 
 @dataclass(slots=True)
@@ -655,141 +656,37 @@ def _package_selection(value: object) -> dict[str, Any]:
 
 
 def _development_package(value: object) -> dict[str, Any]:
-    row = _closed_document(
-        value,
-        {
-            "package",
-            "release",
-            "source_digest",
-            "project_wheel",
-            "local_revision_digest",
-        },
-        "DevelopmentPackage",
-    )
-    _required(row, {"package", "release", "source_digest"}, "DevelopmentPackage")
-    package = _identifier(row["package"], "DevelopmentPackage.package")
-    release = _identifier(row["release"], "DevelopmentPackage.release")
-    if package.count("/") != 1 or not all(package.split("/")) or SEMVER.fullmatch(release) is None:
-        raise documents.DocumentError(
-            "development_invalid", "package identity or release is invalid"
-        )
-    if (
-        not isinstance(row["source_digest"], str)
-        or HASH_ENTRY.fullmatch(row["source_digest"]) is None
-    ):
-        raise documents.DocumentError("development_invalid", "source_digest is malformed")
-    if "project_wheel" in row:
-        project = _wheel_fact(row["project_wheel"], "DevelopmentPackage.project_wheel")
-        if project["distribution"] != package.split("/", 1)[1] or project["version"] != release:
-            raise documents.DocumentError("project_wheel_mismatch", package)
-    remote = "project_wheel" in row
-    local_revision = "local_revision_digest" in row
-    if remote != local_revision:
-        raise documents.DocumentError(
-            "development_invalid",
-            "project_wheel and local_revision_digest must be present together",
-        )
-    if local_revision and (
-        not isinstance(row["local_revision_digest"], str)
-        or HASH_ENTRY.fullmatch(row["local_revision_digest"]) is None
-    ):
-        raise documents.DocumentError("development_invalid", "local_revision_digest is malformed")
+    row = _closed_document(value, {"package", "release", "installation_id"}, "DevelopmentPackage")
+    _required(row, {"package", "release", "installation_id"}, "DevelopmentPackage")
+    _identifier(row["package"], "DevelopmentPackage.package")
+    _identifier(row["release"], "DevelopmentPackage.release")
+    _identifier(row["installation_id"], "DevelopmentPackage.installation_id")
     return row
 
 
 def _placement_profile(entry: dict[str, Any]) -> None:
-    fields = {
-        "placement_id",
-        "package",
-        "development",
-        "environment_digest",
-        "package_interface",
-        "bindings_digest",
-        "models",
-        "entrypoints",
-        "environment",
-    }
+    fields = {"placement_id", "package", "development", "installation_id", "package_interface",
+              "bindings_digest", "models", "entrypoints"}
     _closed_document(entry, fields, "Placement")
-    _required(
-        entry,
-        {"placement_id", "package_interface", "bindings_digest", "entrypoints"},
-        "Placement",
-    )
+    _required(entry, {"placement_id", "installation_id", "package_interface",
+                      "bindings_digest", "entrypoints"}, "Placement")
     _identifier(entry["placement_id"], "Placement.placement_id")
-    _exact_ref(entry["package_interface"], "Placement.package_interface")
-    if (
-        not isinstance(entry["bindings_digest"], str)
-        or HASH_ENTRY.fullmatch(entry["bindings_digest"]) is None
-    ):
+    _identifier(entry["installation_id"], "Placement.installation_id")
+    try:
+        interface = base64.b64decode(entry["package_interface"], validate=True)
+        if not 0 < len(interface) <= canonical.DOC_MAX_BYTES:
+            raise ValueError("interface bound")
+    except (ValueError, TypeError) as exc:
+        raise documents.DocumentError("package_interface_invalid", "invalid interface bytes") from exc
+    if not isinstance(entry["bindings_digest"], str) or HASH_ENTRY.fullmatch(entry["bindings_digest"]) is None:
         raise documents.DocumentError("malformed_digest", "Placement.bindings_digest")
-    published = "package" in entry
-    development = "development" in entry
+    published, development = "package" in entry, "development" in entry
     if published == development:
         raise documents.DocumentError("package_mode_invalid", "select exactly one package mode")
-    package = (
+    if published:
         _package_selection(entry["package"])
-        if published
-        else _development_package(entry["development"])
-    )
-    remote_development = development and "project_wheel" in package
-    if published or remote_development:
-        _required(
-            entry,
-            {"environment_digest", "environment"},
-            "Placement",
-        )
-        if (
-            not isinstance(entry["environment_digest"], str)
-            or HASH_ENTRY.fullmatch(entry["environment_digest"]) is None
-        ):
-            raise documents.DocumentError("malformed_digest", "Placement.environment_digest")
-        environment = _closed_document(
-            entry["environment"], {"local_wheels", "locked_requirements"}, "Environment"
-        )
-        wheels = environment.get("local_wheels", [])
-        if not isinstance(wheels, list):
-            raise documents.DocumentError("wrong_type", "Environment.local_wheels")
-        wheel_rows = [
-            _wheel_fact(row, f"Environment.local_wheels[{index}]")
-            for index, row in enumerate(wheels)
-        ]
-        names = [str(row["distribution"]) for row in wheel_rows]
-        if names != sorted(set(names)):
-            raise documents.DocumentError("sort_order", "Environment.local_wheels")
-        if published:
-            # A published install is identified by the exact export it materialized from;
-            # supplied wheels belong to editable revisions only.
-            if wheels:
-                raise documents.DocumentError(
-                    "environment_invalid", "published Environment carries local_wheels"
-                )
-            _exact_ref(environment.get("locked_requirements"), "Environment.locked_requirements")
-        else:
-            if "locked_requirements" in environment:
-                raise documents.DocumentError(
-                    "environment_invalid", "development Environment carries a lock ref"
-                )
-            if package["project_wheel"]["distribution"] in names:
-                raise documents.DocumentError(
-                    "project_wheel_mismatch", "project wheel is in dependency wheels"
-                )
-        measured_environment = documents.spell(
-            documents.embedded_document_digest(environment, "cozy.worker.v1.Environment")
-        )
-        if measured_environment != entry["environment_digest"]:
-            raise documents.DocumentError(
-                "environment_digest_mismatch",
-                f"measured {measured_environment}, expected {entry['environment_digest']}",
-            )
     else:
-        forbidden = {
-            "environment_digest",
-            "environment",
-        } & set(entry)
-        if forbidden:
-            raise documents.DocumentError(
-                "development_fields_invalid", f"development carries {sorted(forbidden)[0]}"
-            )
+        _development_package(entry["development"])
 
     models = entry.get("models", [])
     if not isinstance(models, list):
@@ -1144,7 +1041,7 @@ class Worker:
         # Exact code/interface/environment revisions prepared over the existing seam.
         # Captured machine executions persist their immutable receipt and restore this
         # same inventory after restart, independent of their code's publication origin.
-        self.prepared_revisions: dict[tuple[str, str], Placement] = {}
+        self.prepared_installations: dict[tuple[str, str], Placement] = {}
         self.local_operations: dict[tuple[str, str], Placement] = {}
         self.claim_ready = threading.Event()
         if options.claim_ready:
@@ -1244,9 +1141,14 @@ class Worker:
             tensorfs_root=options.tensorfs_root,
             work_fingerprint=lambda attempt: weights_sink.work_fingerprint(
                 attempt.spec,
-                attempt.job.environment_content_digest if attempt.job else "",
+                attempt.job.installation_id if attempt.job else "",
                 self.base,
                 hostfacts.measure(options.accelerator_backend),
+                operation_identity=(
+                    self.engine._job_declaration(attempt.job, attempt.job.job_descriptor_id)
+                    .get("invocable", {}).get("operation_identity", "")
+                    if attempt.job else ""
+                ),
             ),
         )
         self.engine.boot_id = self.fence.worker_boot_id
@@ -1259,6 +1161,7 @@ class Worker:
             workspace=self.workspace,
             owner=lambda: self.fence.record_owner_id,
             local=self._machine_call,
+            installed_bindings=self._installed_call_bindings,
         )
         from .machine_calls import Calls as MachineCalls
         from .machine_effects import Effects
@@ -1782,7 +1685,7 @@ class Worker:
         self,
         request: pb.PrepareLocalPackageRequest,
         result: pb.PreparePackageSetResult,
-        installed: package_environment.InstalledEnvironment,
+        installed: package_installation.InstalledEnvironment,
     ) -> pb.PreparePackageSetResult:
         from cozy_runtime.internal.worker import package_prepare
 
@@ -1794,14 +1697,14 @@ class Worker:
             )
         stored = self._placement_from_entry(prepared[0], result.placement_set.placement_set_digest)
         stored.installed = installed
-        revision = str(stored.development.get("local_revision_digest", ""))
-        if revision != documents.spell(request.package.local_revision_digest):
+        revision = stored.installation_id
+        if revision != request.package.installation_id:
             raise package_prepare.PreparationRefusal(
-                "local_package_revision_mismatch",
-                "prepared Placement changed the declared local revision",
+                "local_package_installation_invalid",
+                "prepared Placement changed the installation ID",
             )
         self.local_operations[(request.operation_id, revision)] = stored
-        self.prepared_revisions[(stored.placement_id, revision)] = stored
+        self.prepared_installations[(stored.placement_id, revision)] = stored
         return result
 
     def prepare_unpublished_placement(
@@ -1810,7 +1713,7 @@ class Worker:
         from cozy_runtime.internal.worker import package_prepare
 
         with self.preparation_lock:
-            revision = documents.spell(request.local_revision_digest)
+            revision = request.installation_id
             prepared = self.local_operations.get((request.operation_id, revision))
             if prepared is None:
                 raise package_prepare.PreparationRefusal("local_revision_unprepared", revision)
@@ -1852,7 +1755,7 @@ class Worker:
             joined = read_placement_set(result.placement_set)
             if (
                 len(joined) != 1
-                or joined[0].get("development", {}).get("local_revision_digest") != revision
+                or joined[0].get("installation_id") != revision
             ):
                 raise package_prepare.PreparationRefusal(
                     "private_placement_result_invalid", revision
@@ -1882,32 +1785,31 @@ class Worker:
                         {row.name: row.version for row in selected.rows}, self.base
                     ):
                         self.note("warning", warning)
-            if local:
-                from cozy_runtime.internal.worker import local_installations, package_prepare
-
-                assert isinstance(request, pb.PrepareLocalPackageRequest)
-                retained = local_installations.reopen(
-                    Path(self.options.install_root or ""),
-                    request,
-                    python_root=self.config.managed_python_root,
-                    artifact_cache=Path(self.options.artifact_cache or ""),
-                    python=Path(self.options.python or sys.executable),
-                    base=self.base,
-                    job_plan_root=self.config.cozy_home / "job-plans",
-                )
-                if retained is not None:
-                    result, installed = retained
-                    return self._register_local_package(request, result, installed)
-                if request.wheels and not any(wheel.path for wheel in request.wheels):
-                    raise package_prepare.PreparationRefusal(
-                        "local_package_reuse_unavailable",
-                        "the installed local revision is absent or changed; upload a new operation",
-                    )
             if not local:
                 assert isinstance(request, pb.PreparePackageSetRequest)
                 return self._prepare_published(request)
             assert isinstance(request, pb.PrepareLocalPackageRequest)
             return self._prepare_local_in(request)
+
+    def _installed_call_bindings(self, attempt: AttemptRecord) -> list[dict[str, Any]]:
+        if self.executions is None or attempt.job is None:
+            return []
+        owner = self.fence.record_owner_id
+        root = self.executions.capture_root(owner, attempt.request_id)
+        capture = self.executions.capture(owner, root)
+        prepared = self.executions.preparation(owner, root)["installations"]
+        rows = []
+        for binding in capture.get("bindings", []):
+            if binding["caller_installation_id"] != attempt.job.installation_id:
+                continue
+            identifier = binding["callee_installation_id"]
+            placement = prepared[identifier]["placement"]
+            raw = base64.b64decode(placement["package_interface"], validate=True)
+            from cozy_runtime.internal import package_interface
+            body = package_interface.read_bytes(raw)
+            kind = "job" if any(row["name"] == binding["entrypoint"] for row in body["jobs"]) else "entrypoint"
+            rows.append({"module": binding["module"], "export": binding["export"], "kind": kind})
+        return rows
 
     def _new_preparation_supervision(self) -> ExecutorSupervision:
         """The preparation-scoped executor slot for an installed package's describe. Package
@@ -1938,14 +1840,15 @@ class Worker:
         return supervision
 
     def _describe_installed(
-        self, installed: package_environment.InstalledEnvironment, distribution: str
+        self, installed: package_installation.InstalledEnvironment, distribution: str,
+        *, application: str = "",
     ) -> bytes:
         """Import package code only inside a dedicated preparation executor."""
         from cozy_runtime.internal.worker import package_prepare
 
         supervision = self._new_preparation_supervision()
         try:
-            supervision.use_environment(str(installed.python), installed.content_digest)
+            supervision.use_environment(str(installed.python), installed.installation_id)
             lane = self._primary_lane()
             try:
                 executor = supervision.spawn(imposed=self.imposed(lane))
@@ -1957,6 +1860,7 @@ class Worker:
                         {
                             "cmd": "describe_installed",
                             "distribution": distribution,
+                            "application": application,
                             "output": str(output),
                         },
                         timeout=None,
@@ -1984,18 +1888,6 @@ class Worker:
                 ) from exc
             finally:
                 output.unlink(missing_ok=True)
-            digest = "sha256:" + hashlib.sha256(raw).hexdigest()
-            if reply.get("digest") != digest or reply.get("length") != len(raw):
-                # QUOTE BOTH SIDES OF BOTH COMPARISONS. This reported a digest/length
-                # disagreement as `reply.get("code")` — absent on an ok reply, so the
-                # detail was the literal words "invalid reply" and an operator could not
-                # tell which of the two values disagreed, or by how much.
-                raise package_prepare.PreparationRefusal(
-                    "package_prepare_interface_failed",
-                    f"the executor's document does not match its own claim: "
-                    f"digest {reply.get('digest')!r} vs {digest!r}, "
-                    f"length {reply.get('length')!r} vs {len(raw)}",
-                )
             return raw
         finally:
             supervision.close()
@@ -2003,12 +1895,12 @@ class Worker:
     def _prepare_local_in(
         self, request: pb.PrepareLocalPackageRequest
     ) -> pb.PreparePackageSetResult:
-        from cozy_runtime.internal.worker import local_installations, package_prepare
+        from cozy_runtime.internal.worker import package_prepare
 
         def mark_verified(digest: str, length: int, path: Path) -> None:
             self.verified_artifacts.record(digest, length, path)
 
-        materialized: list[package_environment.InstalledEnvironment] = []
+        materialized: list[package_installation.InstalledEnvironment] = []
         result = package_prepare.prepare_local_package(
             request,
             python_root=self.config.managed_python_root,
@@ -2026,22 +1918,19 @@ class Worker:
             dependency_cache=self.config.dependency_cache,
         )
         installed = materialized[0]
-        local_installations.record(
-            Path(self.options.install_root or ""), request, result, installed
-        )
         return self._register_local_package(request, result, installed)
 
     def _prepare_published(
         self, request: pb.PreparePackageSetRequest
     ) -> pb.PreparePackageSetResult:
-        """Bind the release interface; pre-61 callers describe only on an install cache miss."""
+        """Install a release and retain its worker-discovered callable interface."""
 
         from cozy_runtime.internal.worker import package_prepare
 
         def mark_verified(digest: str, length: int, path: Path) -> None:
             self.verified_artifacts.record(digest, length, path)
 
-        published: list[package_environment.InstalledEnvironment] = []
+        published: list[package_installation.InstalledEnvironment] = []
         result = package_prepare.prepare_package_set(
             request,
             describe=self._describe_installed,
@@ -2068,8 +1957,8 @@ class Worker:
             )
         stored = self._placement_from_entry(entries[0], result.placement_set.placement_set_digest)
         stored.installed = published[0]
-        self.prepared_revisions[
-            (stored.placement_id, documents.spell(stored.environment_digest))
+        self.prepared_installations[
+            (stored.placement_id, stored.installation_id)
         ] = stored
         return result
 
@@ -2168,14 +2057,14 @@ class Worker:
             if "job" in spec:
                 descriptor = spec["job"]["job_descriptor_id"]
                 binding = self.engine.jobs.get(descriptor)
-                if binding is None or binding.build_id != spec["job"]["build_id"]:
+                if binding is None or binding.installation_id != spec["job"]["installation_id"]:
                     from cozy_runtime.internal import job_plan
 
                     binding = JobBinding.read(
                         json.loads(
                             job_plan.path(
                                 self.config.cozy_home / "job-plans",
-                                spec["job"]["build_id"],
+                                spec["job"]["installation_id"],
                                 descriptor,
                             ).read_bytes()
                         )
@@ -2384,10 +2273,9 @@ class Worker:
         if (
             placement is None
             or placement.placement_id != attempt.placement_id
-            or len(placement.environment_digest) != 32
+            or not placement.installation_id
             or len(placement.bindings_digest) != 32
-            or documents.spell(placement.environment_digest)
-            != attempt.spec.get("environment_digest")
+            or placement.installation_id != attempt.spec.get("installation_id")
             or documents.spell(placement.bindings_digest) != serving.get("bindings_digest")
         ):
             return None
@@ -2413,7 +2301,7 @@ class Worker:
                 json.loads(
                     job_plan.path(
                         self.config.cozy_home / "job-plans",
-                        desired.job.build_id,
+                        desired.job.installation_id,
                         desired.job.job_descriptor_id,
                     ).read_bytes()
                 )
@@ -3840,21 +3728,16 @@ class Worker:
     def _placement_from_entry(
         self, entry: Mapping[str, Any], placement_set_digest: bytes
     ) -> Placement:
-        package_interface = dict(entry.get("package_interface", {}))
         return Placement(
             placement_id=str(entry.get("placement_id", "")),
             placement_set_digest=placement_set_digest,
             package=dict(entry.get("package", {})),
             development=dict(entry.get("development", {})),
-            environment_digest=_digest_field(entry.get("environment_digest")),
-            package_interface=(
-                str(package_interface.get("digest", "")),
-                int(package_interface.get("length", 0)),
-            ),
+            installation_id=str(entry.get("installation_id", "")),
+            package_interface=base64.b64decode(entry.get("package_interface", ""), validate=True),
             bindings_digest=_digest_field(entry.get("bindings_digest")),
             models=tuple(dict(row) for row in entry.get("models", [])),
             entrypoints=tuple(dict(row) for row in entry.get("entrypoints", [])),
-            environment=dict(entry.get("environment", {})),
             document=dict(entry),
             device_pin=self.accepted.device_pins.get(str(entry.get("placement_id", ""))),
         )
@@ -4257,7 +4140,7 @@ class Worker:
         installed = acquired.installed
         if installed is not None:
             changed = self.supervision.use_environment(
-                str(installed.python), installed.content_digest
+                str(installed.python), installed.installation_id
             )
             if changed and self.supervision.current is not None:
                 self.supervision.current.poisoned = "package environment generation changed"
@@ -4370,7 +4253,7 @@ class Worker:
             outgoing.placement_id == candidate.placement_id
             and outgoing.package == candidate.package
             and outgoing.development == candidate.development
-            and outgoing.environment_digest == candidate.environment_digest
+            and outgoing.installation_id == candidate.installation_id
             and outgoing.device_pin == candidate.device_pin
             and outgoing.materialization == pb.MaterializationState.MATERIALIZATION_STATE_STAGED
             and outgoing.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
@@ -4662,7 +4545,7 @@ class Worker:
             return
         installed = acquired.installed
         if installed is not None:
-            hosted.supervision.use_environment(str(installed.python), installed.content_digest)
+            hosted.supervision.use_environment(str(installed.python), installed.installation_id)
         hosted.bindings = bindings
         hosted.prepared_models = {}
         hosted.failed_bindings = {}
@@ -4741,7 +4624,7 @@ class Worker:
             expected_development = {
                 "package": self.options.development_package,
                 "release": self.options.development_release,
-                "source_digest": self.options.development_source_digest,
+                "installation_id": self.options.development_installation_id,
             }
             if placement.development != expected_development or placement.package:
                 self._materialization_failed(
@@ -4779,7 +4662,7 @@ class Worker:
                     static_interface.build(self.options.development_project),
                     package=self.options.development_package,
                     release=self.options.development_release,
-                    source_digest=self.options.development_source_digest,
+                    installation_id=self.options.development_installation_id,
                     artifact_cache=self.options.artifact_cache,
                     tensorfs_root=self.options.tensorfs_root,
                     project=self.options.development_project,
@@ -4819,67 +4702,12 @@ class Worker:
                     terminal=True,
                 )
                 return None
-        if placement.development and "project_wheel" not in placement.development:
-            self._materialization_failed(
-                placement,
-                pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                    subject=placement.placement_id,
-                    reason="development_project_absent",
-                    detail="a live development Placement requires an explicit same-user "
-                    "--development-project launch; a remote snapshot must carry its exact wheel",
-                ),
-                terminal=True,
-            )
-            return None
-        from .machine_capture import code_identity
+        from .machine_capture import installation_identity
 
-        prepared = self.prepared_revisions.get(
-            (placement.placement_id, code_identity(placement.document))
+        prepared = self.prepared_installations.get(
+            (placement.placement_id, installation_identity(placement.document))
         )
-        if placement.development or prepared is not None:
-            if prepared is None:
-                self._materialization_failed(
-                    placement,
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        subject=placement.placement_id,
-                        reason="local_revision_unprepared",
-                        detail="prepare this exact local code revision before binding models",
-                    ),
-                    terminal=True,
-                )
-                return None
-            core_fields = (
-                "package",
-                "development",
-                "environment_digest",
-                "environment",
-                "package_interface",
-            )
-            changed = next(
-                (
-                    name
-                    for name in core_fields
-                    if placement.document.get(name) != prepared.document.get(name)
-                ),
-                "",
-            )
-            if changed:
-                self._materialization_failed(
-                    placement,
-                    pb.Fault(
-                        kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        subject=placement.placement_id,
-                        reason="local_revision_changed",
-                        detail=f"model-bound Placement changed prepared field {changed}",
-                    ),
-                    terminal=True,
-                )
-                return None
-            prepared_environment = prepared.installed
-        else:
-            prepared_environment = None
+        prepared_environment = prepared.installed if prepared is not None else None
         if (
             self.options.install_root is None and self.options.environment_python is None
         ) or self.options.tensorfs_root is None:
@@ -4916,37 +4744,10 @@ class Worker:
                 and self.options.install_root is None
                 and self.options.environment_python is not None
             ):
-                package = placement.package or placement.development
-                project_wheel = package.get("project_wheel", {})
-                project_ref = (
-                    project_wheel.get("ref", {}) if isinstance(project_wheel, dict) else {}
-                )
-                # Published placements carry no wheel fact at wire 30: the derived
-                # package interface is the exact code surface, so it is the code digest.
-                package_code_digest = (
-                    placement.package_interface[0]
-                    if placement.package
-                    else str(project_ref.get("digest", ""))
-                    or str(placement.development.get("source_digest", ""))
-                )
-                if not re.fullmatch(r"sha256:[0-9a-f]{64}", package_code_digest):
-                    raise package_environment.EnvironmentRefusal(
-                        "package_environment_code_digest_absent",
-                        "preinstalled package selection has no exact interface, "
-                        "project-wheel, or source digest",
-                    )
-                content_digest = canonical.digest(
-                    {
-                        "package_code_digest": package_code_digest,
-                        "package_interface": {
-                            "digest": placement.package_interface[0],
-                            "length": placement.package_interface[1],
-                        },
-                        "environment_digest": documents.spell(placement.environment_digest),
-                    }
-                )
-                installed_environment = package_environment.open_existing_environment(
-                    self.options.environment_python, content_digest
+                installed_environment = package_installation.open_existing_environment(
+                    self.options.environment_python, placement.installation_id,
+                    package=(placement.package or placement.development).get("package", ""),
+                    release=(placement.package or placement.development).get("release", ""),
                 )
             install_root = self.options.install_root or (
                 installed_environment.generation if installed_environment is not None else None
@@ -4971,7 +4772,7 @@ class Worker:
                 f"revision {revision}: {acquired.manifests} manifest(s) held; "
                 f"{acquired.fetched_bytes} byte(s) new; "
                 + (
-                    f"environment {acquired.installed.content_digest} at "
+                    f"environment {acquired.installed.installation_id} at "
                     f"{acquired.installed.generation}"
                     if acquired.installed is not None
                     else "source-checkout environment"
@@ -5089,12 +4890,12 @@ class Worker:
                 from cozy_runtime.internal import job_plan
 
                 record = job_plan.path(
-                    self.config.cozy_home / "job-plans", parent.build_id, parent.job_descriptor_id
+                    self.config.cozy_home / "job-plans", parent.installation_id, parent.job_descriptor_id
                 )
                 binding = JobBinding.read(json.loads(record.read_text()))
                 declaration = self.engine._job_declaration(binding, parent.job_descriptor_id)
                 if (
-                    binding.build_id != parent.build_id
+                    binding.installation_id != parent.installation_id
                     or binding.job_descriptor_id != parent.job_descriptor_id
                     or not parent.reclaim_on_terminal
                 ):
@@ -5141,7 +4942,7 @@ class Worker:
                 self.lanes.orchestration.forget("")
             if parent is not None and not cpu_same:
                 supervision = self._new_orchestration_supervision()
-                supervision.use_environment(binding.python, binding.environment_content_digest)
+                supervision.use_environment(binding.python, binding.installation_id)
                 copied = pb.JobDirective()
                 copied.CopyFrom(parent)
                 self.job_slots["orchestration"] = JobSlot(
@@ -5278,7 +5079,7 @@ class Worker:
         from cozy_runtime.internal import job_plan
 
         try:
-            record = job_plan.path(plans, job.build_id, job.job_descriptor_id)
+            record = job_plan.path(plans, job.installation_id, job.job_descriptor_id)
         except ValueError:
             self.latched = "job_plan_identity_invalid"
             self._settle()
@@ -5298,7 +5099,7 @@ class Worker:
         binding = JobBinding.read(json.loads(record.read_text()))
         if (
             binding.job_descriptor_id != job.job_descriptor_id
-            or binding.build_id != job.build_id
+            or binding.installation_id != job.installation_id
             or not job.reclaim_on_terminal
         ):
             self.engine.fault(
@@ -5312,7 +5113,7 @@ class Worker:
             self.latched = "job_plan_mismatch"
             self._settle()
             return
-        self.supervision.use_environment(binding.python, binding.environment_content_digest)
+        self.supervision.use_environment(binding.python, binding.installation_id)
         self.jobs[job.job_descriptor_id] = binding
         self.engine.jobs = self.jobs
         self.engine.job_device_count = job.device_count
@@ -6524,7 +6325,7 @@ class Worker:
                 from . import internal_calls, machine_capture
 
                 placement = self._placement_by_id(offered.placement_id)
-                revision = machine_capture.code_identity(placement.document) if placement else ""
+                revision = machine_capture.installation_identity(placement.document) if placement else ""
                 try:
                     internal_calls.require_child(
                         self.workspace,
@@ -6556,7 +6357,7 @@ class Worker:
                     if child_slot is not None
                     else self.engine.jobs.get(descriptor)
                 )
-                if binding is None or binding.build_id != attempt.spec["job"]["build_id"]:
+                if binding is None or binding.installation_id != attempt.spec["job"]["installation_id"]:
                     self.refuse(
                         offered,
                         "job_binding_unavailable",
@@ -6577,7 +6378,7 @@ class Worker:
                             self.workspace,
                             self.fence.record_owner_id,
                             offered,
-                            binding.build_id,
+                            binding.installation_id,
                             binding.job,
                             machine_owned=machine_owned,
                         )
@@ -7502,13 +7303,9 @@ class Worker:
             placement.materialization == pb.MaterializationState.MATERIALIZATION_STATE_STAGED
             and placement.serving == pb.ServingState.SERVING_STATE_DISPATCHABLE
         ):
-            status.environment_digest = (
-                documents.spell(placement.environment_digest)
-                if placement.environment_digest
-                else canonical.digest({})
-            )
-            if re.fullmatch(r"sha256:[0-9a-f]{64}", status.environment_digest) is None:
-                raise RuntimeError("dispatchable placement has incomplete invocation identity")
+            status.installation_id = placement.installation_id
+            if not status.installation_id:
+                raise RuntimeError("dispatchable placement has no installed environment")
         if placement.acquisition.ListFields():
             status.acquisition.CopyFrom(placement.acquisition)
         lane_wire.emit_device_lane_id(status, placement.lane_id)
@@ -7777,7 +7574,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
     parser.add_argument("--development-project", default="", help=argparse.SUPPRESS)
     parser.add_argument("--development-package", default="", help=argparse.SUPPRESS)
     parser.add_argument("--development-release", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--development-source-digest", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--development-installation-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("--alloc-conf", default="expandable_segments:True")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--grace", type=float, default=GRACE_SECONDS)
@@ -7805,7 +7602,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         args.development_project,
         args.development_package,
         args.development_release,
-        args.development_source_digest,
+        args.development_installation_id,
     )
     if any(development_values) and not all(development_values):
         print(
@@ -7818,7 +7615,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         args.development_package.count("/") != 1
         or not all(args.development_package.split("/"))
         or SEMVER.fullmatch(args.development_release) is None
-        or HASH_ENTRY.fullmatch(args.development_source_digest) is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}", args.development_installation_id) is None
     ):
         print(
             "[worker] development package identity, semantic release, or source digest is invalid",
@@ -7850,7 +7647,7 @@ def serve_worker(config: RuntimeConfig, argv: list[str] | None = None) -> int:
         ),
         development_package=args.development_package,
         development_release=args.development_release,
-        development_source_digest=args.development_source_digest,
+        development_installation_id=args.development_installation_id,
         alloc_conf=args.alloc_conf,
         threads=args.threads,
         grace=args.grace,

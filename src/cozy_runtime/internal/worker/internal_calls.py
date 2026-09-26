@@ -12,13 +12,13 @@ def require_child(
     workspace: Workspace | None,
     owner: str,
     offered: pb.AttemptOffer,
-    revision: str,
+    installation_id: str,
     entrypoint: str,
     *,
     machine_owned: bool,
 ) -> None:
     """A public request cannot gain child authority by supplying a known request ID."""
-    detail = "internal_callable: only managed children of the same package revision may invoke this"
+    detail = "internal_callable: only managed children of the same installation may invoke this"
     if not machine_owned or workspace is None:
         raise WorkspaceRefusal(detail)
     with workspace.locked() as db:
@@ -37,10 +37,10 @@ def require_child(
     child = pb.AttemptOffer.FromString(row["child_offer"])
     parent_spec = documents.read(parent.invocation_spec_canonical_bytes, pb.InvocationSpec)
     if (
-        not revision
-        or plan.get("revision") != revision
+        not installation_id
+        or plan.get("installation_id") != installation_id
         or plan.get("entrypoint") != entrypoint
-        or parent_spec.get("job", {}).get("build_id") != revision
+        or parent_spec.get("job", {}).get("installation_id") != installation_id
         or child.invocation_spec_digest != offered.invocation_spec_digest
         or child.invocation_spec_canonical_bytes != offered.invocation_spec_canonical_bytes
     ):

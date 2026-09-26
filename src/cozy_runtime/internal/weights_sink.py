@@ -33,9 +33,11 @@ _EXCHANGE_KINDS = frozenset({"declaration", "receipt", "derivation", "native-rec
 
 def work_fingerprint(
     spec: Mapping[str, Any],
-    environment_content_digest: str,
+    environment_installation_id: str,
     base: Observation,
     device: HostFacts,
+    *,
+    operation_identity: str = "",
 ) -> str:
     """Parent-authored numerical work identity, independent of attempt/custody clocks.
 
@@ -47,7 +49,7 @@ def work_fingerprint(
     from cozy_runtime.internal.base_observation import protected_distribution
 
     job = spec.get("job")
-    if not isinstance(job, Mapping) or not environment_content_digest:
+    if not isinstance(job, Mapping) or not environment_installation_id:
         raise CapabilityError(
             "weights work has no selected job environment", code="weights_work_identity"
         )
@@ -56,9 +58,12 @@ def work_fingerprint(
             "CUDA work has no measured architecture/driver", code="weights_work_identity"
         )
     facts = {
-        "job": {key: job[key] for key in ("build_id", "job_descriptor_id")},
-        "environment_digest": spec.get("environment_digest", ""),
-        "environment_content_digest": environment_content_digest,
+        # Versioned operations reuse compatible partial work across installations.
+        # Without a defined implementation identity, keep partial work private to
+        # this installation rather than treating arbitrary Python as deterministic.
+        "operation": operation_identity or {
+            key: job[key] for key in ("installation_id", "job_descriptor_id")
+        },
         "payload_digest": spec["payload_digest"],
         "inputs": spec.get("inputs", []),
         "outputs": spec.get("outputs", []),

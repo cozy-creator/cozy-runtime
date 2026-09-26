@@ -19,6 +19,15 @@ from cozy_runtime.internal import canonical, schema
 
 
 def metadata(surface: Surface) -> dict[str, Any]:
+    result = _metadata(surface)
+    if surface.memoize:
+        from cozy_runtime.internal.memo_implementation import describe
+
+        result.update(describe(surface.fn))
+    return result
+
+
+def _metadata(surface: Surface) -> dict[str, Any]:
     if surface.kind == "entrypoint" and not surface.invocable:
         return serving_metadata(
             surface.payload_type,
@@ -209,7 +218,8 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
         "memoize",
         "capabilities",
     }
-    if not isinstance(value, dict) or set(value) != keys:
+    optional = {"operation_identity", "operation_identity_unavailable"}
+    if not isinstance(value, dict) or not keys.issubset(value) or set(value) - keys - optional:
         raise ConformanceError(
             "invocable metadata has unknown or missing fields", code="invocable_interface"
         )
@@ -217,6 +227,18 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
         raise ConformanceError(
             "invocable memoization declaration must be a boolean", code="invocable_interface"
         )
+    if optional.issubset(value) or (not value["memoize"] and optional.intersection(value)):
+        raise ConformanceError("operation identity requires one memoized identity outcome", code="invocable_interface")
+    if "operation_identity" in value:
+        import re
+
+        if not isinstance(value["operation_identity"], str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value["operation_identity"]) is None:
+            raise ConformanceError("invalid operation identity", code="invocable_interface")
+    if "operation_identity_unavailable" in value and (
+        not isinstance(value["operation_identity_unavailable"], str)
+        or not 1 <= len(value["operation_identity_unavailable"]) <= 256
+    ):
+        raise ConformanceError("invalid operation identity reason", code="invocable_interface")
     capabilities = value["capabilities"]
     if (
         not isinstance(capabilities, list)

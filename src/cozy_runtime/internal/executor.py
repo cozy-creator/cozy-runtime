@@ -570,7 +570,8 @@ class Executor:
         output = Path(str(command.get("output", "")))
         if not distribution or not output.is_absolute():
             return {"ok": False, "code": "package_prepare_path_invalid", "detail": "paths"}
-        discovered = discover_distribution(distribution)
+        application = str(command.get("application", ""))
+        discovered = discover_installed(application) if application else discover_distribution(distribution)
         body = package_interface.build(discovered)
         raw = package_interface.canonical_bytes(body)
         with output.open("xb") as stream:
@@ -583,7 +584,6 @@ class Executor:
         return {
             "ok": True,
             "application": discovered.application,
-            "digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
             "length": len(raw),
         }
 
@@ -3419,16 +3419,16 @@ class Executor:
             raise CapabilityError(
                 "call interface inventory exceeds its bound", code="child_interface"
             )
-        bindings: dict[tuple[str, str, str], _CallType] = {}
+        bindings: dict[tuple[str, str], _CallType] = {}
         for row in rows:
-            interface, module, export = row["interface_digest"], row["module"], row["export"]
+            interface, module, export = row.get("interface_digest", ""), row["module"], row["export"]
             if row.get("native_source"):
                 from cozy_runtime.internal import source_interfaces
 
                 if interface != source_interfaces.DIGEST or module != source_interfaces.MODULE:
                     raise CapabilityError("native source interface changed", code="child_interface")
                 binding = source_interfaces.bindings()[(interface, module, export)]
-                bindings[("", module, export)] = binding
+                bindings[(module, export)] = binding
             elif row.get("native_effect"):
                 from cozy_runtime.internal import effect_interfaces
 
@@ -3438,7 +3438,7 @@ class Executor:
                         "native effect interface differs from the fixed service",
                         code="child_interface",
                     )
-                bindings[("", module, export)] = effect_binding
+                bindings[(module, export)] = effect_binding
             elif row.get("builtin"):
                 import msgspec
 
@@ -3464,7 +3464,7 @@ class Executor:
                 ):
                     raise CapabilityError("Runtime builtin types changed", code="child_interface")
                 binding = _CallType(interface, module, export, request_type, result_type)
-                bindings[("", module, export)] = binding
+                bindings[(module, export)] = binding
             elif row.get("self"):
                 assert self.discovered is not None
                 surface = next(
@@ -3484,27 +3484,31 @@ class Executor:
                 binding = _CallType(
                     interface, module, export, surface.payload_type, surface.result_type
                 )
-                bindings[("", module, export)] = binding
+                bindings[(module, export)] = binding
             else:
                 imported = importlib.import_module(module)
-                candidate = getattr(imported, "__cozy_bindings__", {}).get(export)
-                if not isinstance(candidate, _CallType) or (
-                    candidate.interface_digest,
-                    candidate.module,
-                    candidate.export,
-                ) != (interface, module, export):
-                    raise CapabilityError(
-                        "imported interface differs from the admitted closure",
-                        code="child_interface",
-                    )
-                binding = candidate
+                from cozy_runtime.author._calls import _export
+                from cozy_runtime.author._app import Registration
+
+                function = getattr(imported, export, None)
+                declared = _export(function)
+                if declared is not None:
+                    surface = Registration(
+                        name=export, kind=row.get("kind", "job"),
+                        fn=declared.implementation, invocable=True,
+                        memoize=declared.memoize, model_defaults=declared.defaults,
+                    ).surface
+                    binding = _CallType("", module, export, surface.payload_type, surface.result_type)
+                else:
+                    binding = getattr(imported, "__cozy_bindings__", {}).get(export)
+                    if not isinstance(binding, _CallType):
+                        raise CapabilityError("installed export is not invocable", code="child_interface")
                 # Source-preserving caller wheels retain ordinary @invocable job
                 # wrappers, whose lookup is by their exact module/export pair.
-                prior = bindings.get(("", module, export))
+                prior = bindings.get((module, export))
                 if prior is not None and prior != binding:
                     raise CapabilityError("ambiguous managed export", code="child_interface")
-                bindings[("", module, export)] = binding
-            bindings[(interface, module, export)] = binding
+                bindings[(module, export)] = binding
         return _Broker(str(command["request_id"]), bindings, self._durable)
 
     def _durable(

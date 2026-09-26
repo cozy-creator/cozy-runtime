@@ -45,8 +45,7 @@ class Sources:
                 self.selections.pop(status.service_id, None)
 
     def command(self, owner: str, request: pb.ChildCallRequest) -> pb.NativeSourceCommand:
-        if request.interface_digest != documents.raw(source_interfaces.DIGEST):
-            raise WorkspaceRefusal("native source call has another fixed interface")
+
         command = pb.NativeSourceCommand(
             service_id=workspace_sources.identity(
                 owner, request.parent_request_id, request.call_index

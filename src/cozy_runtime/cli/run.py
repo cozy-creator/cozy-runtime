@@ -37,7 +37,6 @@ from cozy_runtime.internal.local import (
     LocalRequest,
     SliceOutcome,
     development_placement_documents,
-    development_source_digest,
     run_slice,
 )
 from cozy_runtime.internal.worker.session import WorkerOptions
@@ -276,7 +275,7 @@ def run(
 
         remove_checkout(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
-    package_code_digest = development_source_digest(project)
+    package_installation_id = "local-" + uuid.uuid4().hex
     if kind == "job":
         interface_path = workspace / "metadata" / "package-interface.json"
         interface_path.parent.mkdir()
@@ -284,11 +283,10 @@ def run(
         job_records.append(
             {
                 "job_descriptor_id": descriptor_id,
-                "build_id": package_code_digest,
+                "installation_id": package_installation_id,
                 "application": str(body["application"]),
                 "package_interface": str(interface_path),
                 "python": sys.executable,
-                "environment_content_digest": package_code_digest,
                 "job": function,
                 "publishes": bool(surface.publishes),
                 "emits_media": bool(surface.emits_media),
@@ -328,14 +326,14 @@ def run(
             request,
             job_records=job_records,
             workspace=workspace,
-            package_code_digest=package_code_digest,
+            package_installation_id=package_installation_id,
             package_interface_document=body if kind == "entrypoint" else None,
             project=project,
             development_tensorfs_root=tensorfs_root,
             development_binding_overrides=overrides,
             options=WorkerOptions(
                 root=workspace / "worker",
-                release_id=package_code_digest,
+                release_id=package_installation_id,
                 # THE EXECUTION-PATH OVERRIDE (cr-125), and the only entrance it has: this
                 # ephemeral worker. `serve` takes no such flag, so a serving deployment
                 # cannot be pinned and keeps choosing the fastest kernel by itself.
@@ -443,7 +441,7 @@ def resolved_bindings(opts: Options) -> tuple[list[dict[str, Any]], list[dict[st
                     body,
                     package="local/development-package",
                     release="0.0.0",
-                    source_digest=development_source_digest(project),
+                    installation_id="local-" + uuid.uuid4().hex,
                 ).subjects()
             )
             if visible and not opts.package_interface

@@ -87,7 +87,7 @@ def ensure(worker: Worker, request: str, directive: pb.JobDirective, binding: Jo
         executor_gid=worker.options.executor_gid,
         jit_pod_scope=f"{worker.fence.worker_boot_id}-{slot_key}",
     )
-    supervision.use_environment(binding.python, binding.environment_content_digest)
+    supervision.use_environment(binding.python, binding.installation_id)
     supervision.on_change = lambda executor: lane.row("").ledger.begin_generation(
         executor.pid if executor else 0
     )

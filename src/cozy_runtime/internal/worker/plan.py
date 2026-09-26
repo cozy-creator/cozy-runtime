@@ -231,11 +231,10 @@ class JobBinding:
     """
 
     job_descriptor_id: str
-    build_id: str
+    installation_id: str
     application: str
     package_interface: str
     python: str
-    environment_content_digest: str
     job: str
     """The registered `@app.job` name this job descriptor id resolves to."""
     publishes: bool = False
@@ -261,15 +260,10 @@ class JobBinding:
         from cozy_runtime.internal import installed_interfaces
 
         observed = installed_interfaces.for_job(
-            str(record.get("python", "")), str(record.get("environment_content_digest", ""))
+            str(record.get("python", "")), str(record.get("installation_id", ""))
         )
         captured = dict(record)
-        supplied = captured.pop("call_interfaces", None)
-        if supplied is not None and tuple(supplied) != tuple(observed):
-            raise PlanRefusal(
-                "job_plan_child_interfaces_changed",
-                "the selected environment differs from its frozen interface inventory",
-            )
+        captured.pop("call_interfaces", None)
         return cls(**captured, call_interfaces=tuple(observed))
 
 
@@ -374,7 +368,7 @@ class DeclaredBinding:
     release: str
     models: tuple[ModelBinding, ...] = ()
     internal: bool = False
-    environment_digest: str = ""
+    installation_id: str = ""
     """The exact inline Environment selected beside this binding."""
     application: str = ""
     """The exact PackageInterface application imported from the installed venv."""

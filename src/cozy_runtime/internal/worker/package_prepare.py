@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import copy
 import hashlib
@@ -11,7 +12,6 @@ import re
 import stat
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +23,10 @@ from cozy_runtime.internal import (
     image_inventory,
     model_config,
     package_environment,
+    package_installation,
     package_interface,
-    placement_materialization,
     python_interpreters,
 )
-from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker import acquire
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -108,19 +107,16 @@ def prepare_package_set(
     base: base_observation.Observation | None = None,
     preinstalled_python: Path | None = None,
     dependency_cache: Path | None = None,
-    materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
+    materialized: Callable[[package_installation.InstalledEnvironment], None] | None = None,
     cancel: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
     python_root: Path | None = None,
-    describe: Callable[[package_environment.InstalledEnvironment, str], bytes] | None = None,
+    describe: Callable[[package_installation.InstalledEnvironment, str], bytes] | None = None,
 ) -> pb.PreparePackageSetResult:
-    """Parse the desired download set plus the request's release facts and prepare.
+    """Install the requested release with uv and discover its installed interface.
 
-    The request carries the release's PackageInterface (wire 61), `application`, the
-    declared model-slot paths, the image inventory and the locked-requirements export.
-    Wheels come from the export's indexes under its own hashes. Before wire 61, the
-    request omitted the interface: read installed metadata or describe once per immutable
-    installation. Model manifests resolve from the local Store on either path.
+    The worker owns the installation and its interface. The caller supplies release
+    selection, dependency requirements and model selections, never a code fingerprint.
     """
 
     if (
@@ -184,10 +180,10 @@ def prepare_package_set(
 
 
 def _installed_interface(
-    installed: package_environment.InstalledEnvironment,
+    installed: package_installation.InstalledEnvironment,
     distribution: str,
     artifact_cache: Path,
-    describe: Callable[[package_environment.InstalledEnvironment, str], bytes] | None,
+    describe: Callable[[package_installation.InstalledEnvironment, str], bytes] | None,
 ) -> bytes:
     """Read the interface from this installed environment, never a host SDK snapshot."""
     candidates = [
@@ -219,9 +215,17 @@ def _installed_interface(
             f"{distribution!r} has no installed interface and no sandbox describe is available",
         )
     try:
-        package_interface.read_bytes(raw, "installed package interface")
+        body = package_interface.read_bytes(raw, "installed package interface")
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
+    if metadata and describe is not None and any(
+        entry.get("invocable", {}).get("memoize")
+        for entry in [*body["jobs"], *body["entrypoints"]]
+    ):
+        # Installed callee/helper definitions own memo invalidation. The wheel's
+        # static schema is never a second code reading to compare or admit against.
+        raw = describe(installed, distribution)
+        package_interface.read_bytes(raw, "installed operation interface")
     return raw
 
 
@@ -235,8 +239,8 @@ def prepare_published_local(
     tensorfs_root: Path,
     install_root: Path,
     python: Path,
-    describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
-    installed_environment: package_environment.InstalledEnvironment,
+    describe: Callable[[package_installation.InstalledEnvironment, str], bytes],
+    installed_environment: package_installation.InstalledEnvironment,
     job_plan_root: Path | None = None,
 ) -> pb.PreparePackageSetResult:
     """Creator's local published preparation over its already-materialized locked venv.
@@ -346,13 +350,13 @@ def _prepare_published(
     tensorfs_root: Path | None,
     install_root: Path,
     python: Path,
-    interface: Callable[[package_environment.InstalledEnvironment, str], bytes],
+    interface: Callable[[package_installation.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None,
     base: base_observation.Observation | None,
-    installed_environment: package_environment.InstalledEnvironment | None = None,
+    installed_environment: package_installation.InstalledEnvironment | None = None,
     dependency_cache: Path | None = None,
-    materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
+    materialized: Callable[[package_installation.InstalledEnvironment], None] | None = None,
 ) -> pb.PreparePackageSetResult:
     """Install from the exact export, read the interface, and author the PlacementSet.
 
@@ -364,51 +368,18 @@ def _prepare_published(
     controller SDK never supplies package dependencies or interpreter-specific wheels.
     """
 
-    environment = pb.Environment(
-        locked_requirements=pb.Ref(digest=documents.raw(locked.digest), length=locked.length)
-    )
-    environment_body = documents.body(environment)
-    environment_digest = documents.spell(
-        documents.embedded_document_digest(environment_body, "cozy.worker.v1.Environment")
-    )
+    _filtered_rows(package_name, release, locked, inventory, {})
     if installed_environment is not None:
         installed = installed_environment
-        from cozy_runtime.internal import package_requirements
-
-        try:
-            package_requirements.validate(
-                installed.site_packages, python, base or package_environment.observe_base(python)
-            )
-        except package_environment.EnvironmentRefusal as exc:
-            raise PreparationRefusal(exc.code, exc.detail) from exc
     else:
+        requirements = "\n".join(
+            [*(f"{('--index-url' if i == 0 else '--extra-index-url')} {url}"
+               for i, url in enumerate(locked.indexes)), *(row.text for row in locked.rows)]
+        ).encode() + b"\n"
         try:
-            observed_base = base or package_environment.observe_base(python)
-        except package_environment.EnvironmentRefusal as exc:
-            raise PreparationRefusal(exc.code, exc.detail) from exc
-
-        lie = (
-            image_inventory.disagreement(inventory, observed_base.distribution_versions)
-            if inventory is not None and inventory.python == observed_base.python_full_version
-            else None
-        )
-        if lie is not None:
-            raise PreparationRefusal("package_prepare_image_inventory_disagrees", lie)
-        platform = (
-            observed_base.distribution_versions
-            if package_environment.is_base_interpreter(python)
-            else {}
-        )
-        install_rows = _filtered_rows(package_name, release, locked, inventory, platform)
-        try:
-            installed = package_environment.materialize_locked(
-                locked,
-                install_rows,
-                install_root,
-                environment_digest=environment_digest,
-                python=python,
-                base=observed_base,
-                dependency_cache=dependency_cache,
+            installed = package_installation.install(
+                install_root, package=package_name, release=release, python=python,
+                requirements=requirements, cache=dependency_cache,
             )
         except package_environment.EnvironmentRefusal as exc:
             raise PreparationRefusal(exc.code, exc.detail) from exc
@@ -437,7 +408,7 @@ def _prepare_published(
     jobs = _stage_job_plans(
         interface_body,
         root=job_plan_root,
-        build_id=environment_digest,
+        installation_id=installed.installation_id,
         interface_path=artifact_cache / interface_ref[0].removeprefix("sha256:"),
         installed=installed,
     )
@@ -474,12 +445,11 @@ def _prepare_published(
     placement = pb.Placement(
         placement_id=placement_id(package_name, release),
         package=pb.PackageSelection(package=package_name, release=release),
-        environment_digest=documents.raw(environment_digest),
-        package_interface=pb.Ref(digest=documents.raw(interface_ref[0]), length=interface_ref[1]),
+        installation_id=installed.installation_id,
+        package_interface=interface_raw,
         bindings_digest=bindings_digest,
         models=selected_models,
         entrypoints=entrypoints,
-        environment=environment,
     )
     placement_bytes = canonical.write(
         {"format": "cozy.worker.v1.PlacementSet/1", "placements": [documents.body(placement)]}
@@ -487,6 +457,10 @@ def _prepare_published(
     if materialized is not None:
         materialized(installed)
     return pb.PreparePackageSetResult(
+        installed_package=pb.InstalledPackage(
+            installation_id=installed.installation_id, package=package_name,
+            release=release, package_interface=interface_raw,
+        ),
         placement_set=pb.DesiredPlacementSet(
             placement_set_digest=documents.digest_of(placement_bytes),
             placement_set_canonical_bytes=placement_bytes,
@@ -520,19 +494,19 @@ def prepare_local_package(
     artifact_cache: Path,
     install_root: Path,
     python: Path,
-    describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
+    describe: Callable[[package_installation.InstalledEnvironment, str], bytes],
     verified: Callable[[str, int, Path], None],
     job_plan_root: Path | None = None,
     base: base_observation.Observation | None = None,
     dependency_python: Path | None = None,
-    builtin_snapshot: package_environment.InstalledEnvironment | None = None,
+    builtin_snapshot: package_installation.InstalledEnvironment | None = None,
     dependency_cache: Path | None = None,
-    materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
+    materialized: Callable[[package_installation.InstalledEnvironment], None] | None = None,
     cancel: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
     python_root: Path | None = None,
 ) -> pb.PreparePackageSetResult:
-    """Prepare one exact local wheel revision without inventing Hub provenance."""
+    """Install a private source sync without publishing it to a repository."""
 
     if (
         Path(request.install_root) != install_root
@@ -545,9 +519,7 @@ def prepare_local_package(
         _OPERATION_ID.fullmatch(request.operation_id) is None
         or package.package.count("/") != 1
         or not package.release
-        or len(package.source_digest) != 32
-        or len(package.local_revision_digest) != 32
-        or package.HasField("project_wheel")
+        or not package.installation_id
     ):
         raise PreparationRefusal("local_package_identity_invalid", request.operation_id)
     return prepare_package(
@@ -556,10 +528,11 @@ def prepare_local_package(
         progress=progress,
         package_name=package.package,
         release=package.release,
-        wheels=request.wheels,
+        files=request.files,
+        source_archive=request.source_archive,
         # proto-031: editable wheels stage beside the install namespace that owns them.
         wheel_root=install_root / ".stage" / request.operation_id / "wheels",
-        placement_seed=(request.operation_id.encode("ascii") + package.local_revision_digest),
+        installation_id=package.installation_id,
         artifact_cache=artifact_cache,
         install_root=install_root,
         python=python,
@@ -582,30 +555,23 @@ def prepare_unpublished_placement(
     request: pb.PreparePrivatePlacementRequest,
     *,
     prepared: Mapping[str, Any],
-    installed: package_environment.InstalledEnvironment | None,
+    installed: package_installation.InstalledEnvironment | None,
     artifact_cache: Path,
     tensorfs_root: Path | None,
     verified: Callable[[str, int, Path], None],
 ) -> pb.PreparePackageSetResult:
-    """Bind verified models to one exact already-prepared local revision core."""
+    """Bind retained models to an already-installed private package."""
 
     if installed is None:
         raise PreparationRefusal(
             "private_placement_environment_absent",
-            f"{request.operation_id}: the local revision's environment is not held, so its "
+            f"{request.operation_id}: the installation's environment is not held, so its "
             "slots cannot be derived",
         )
-    development = prepared.get("development")
-    interface_ref = prepared.get("package_interface")
     if (
         _OPERATION_ID.fullmatch(request.operation_id) is None
-        or len(request.local_revision_digest) != 32
-        or not isinstance(development, dict)
-        or development.get("local_revision_digest")
-        != documents.spell(request.local_revision_digest)
-        or not isinstance(interface_ref, dict)
-        or not isinstance(interface_ref.get("digest"), str)
-        or not isinstance(interface_ref.get("length"), int)
+        or request.installation_id != installed.installation_id
+        or prepared.get("installation_id") != installed.installation_id
     ):
         raise PreparationRefusal("private_placement_identity_invalid", request.operation_id)
     models: list[Any] = []
@@ -638,7 +604,7 @@ def prepare_unpublished_placement(
 def prepare_model_placement(
     *,
     prepared: Mapping[str, Any],
-    installed: package_environment.InstalledEnvironment,
+    installed: package_installation.InstalledEnvironment,
     native_models: Sequence[pb.NativeModelBinding],
     artifact_cache: Path,
     tensorfs_root: Path | None,
@@ -647,7 +613,7 @@ def prepare_model_placement(
 ) -> pb.PreparePackageSetResult:
     """Derive new Model bindings from either origin's exact immutable preparation."""
     package = prepared.get("package") or prepared.get("development") or {}
-    interface_ref = prepared["package_interface"]
+    interface_raw = base64.b64decode(prepared["package_interface"], validate=True)
     models = list(models)
     slots = [row.slot for row in native_models]
     if slots != sorted(set(slots)) or not all(slots):
@@ -669,18 +635,6 @@ def prepare_model_placement(
         raise PreparationRefusal(
             "prepared_placement_models_invalid", "a placement requires between 1 and 32 model slots"
         )
-    digest = str(interface_ref["digest"])
-    length = int(interface_ref["length"])
-    try:
-        documents.raw(digest)
-    except (documents.DocumentError, ValueError) as exc:
-        raise PreparationRefusal("prepared_placement_interface_invalid", digest) from exc
-    interface_raw = _read_file(artifact_cache / digest.removeprefix("sha256:"), length)
-    if (
-        len(interface_raw) != length
-        or "sha256:" + hashlib.sha256(interface_raw).hexdigest() != digest
-    ):
-        raise PreparationRefusal("prepared_placement_interface_invalid", digest)
     try:
         interface_body = package_interface.read_bytes(interface_raw, "prepared package interface")
     except package_interface.StalePackageInterface as exc:
@@ -715,348 +669,105 @@ def prepare_model_placement(
 
 
 def prepare_package(
-    *,
-    package_name: str,
-    release: str,
-    wheels: Sequence[pb.LocalPackageWheel],
-    wheel_root: Path,
-    placement_seed: bytes,
-    artifact_cache: Path,
-    install_root: Path,
-    python: Path,
-    describe: Callable[[package_environment.InstalledEnvironment, str], bytes],
-    verified: Callable[[str, int, Path], None],
+    *, package_name: str, release: str, files: Sequence[pb.LocalPackageFile],
+    wheel_root: Path, installation_id: str, artifact_cache: Path, install_root: Path,
+    python: Path, describe: Callable[[package_installation.InstalledEnvironment, str], bytes],
+    verified: Callable[[str, int, Path], None], source_archive: str = "",
     base: base_observation.Observation | None = None,
     dependency_python: Path | None = None,
-    builtin_snapshot: package_environment.InstalledEnvironment | None = None,
-    dependency_cache: Path | None = None,
-    job_plan_root: Path | None = None,
-    development: pb.DevelopmentPackage | None = None,
-    dependency_requirements: bytes = b"",
-    python_requires: str = "",
-    python_version: str = "",
-    materialized: Callable[[package_environment.InstalledEnvironment], None] | None = None,
-    cancel: Callable[[], bool] | None = None,
-    progress: Callable[[str], None] | None = None,
+    builtin_snapshot: package_installation.InstalledEnvironment | None = None,
+    dependency_cache: Path | None = None, job_plan_root: Path | None = None,
+    development: pb.DevelopmentPackage | None = None, dependency_requirements: bytes = b"",
+    python_requires: str = "", python_version: str = "",
+    materialized: Callable[[package_installation.InstalledEnvironment], None] | None = None,
+    cancel: Callable[[], bool] | None = None, progress: Callable[[str], None] | None = None,
     python_root: Path | None = None,
 ) -> pb.PreparePackageSetResult:
-    """Inspect, install, import, and describe one exact local package revision.
-
-    This is the ONE preparation that still receives files: an editable revision's wheels
-    exist on no index, so their exact bytes are the install input (xs-017). Every row
-    sits directly in `wheel_root` — `<install_root>/.stage/<operation>/wheels` per
-    proto-031 — beside the install namespace that owns it. The project wheel is the row
-    that MEASURES as the package's own distribution and release — no kind row travels.
-
-    `materialized` receives the environment this preparation installed. A local revision's
-    wheels are the pod host's carriers, deleted once the PlacementSet is journaled, so the
-    placement that follows cannot re-acquire them: the session retains the environment and
-    serves the placement from it.
-
-    A native dependency wheel installs like any other wheel (cr-093): whether its extension
-    loads is answered by the executor that imports it, not by a prepare-time inspection.
-    """
-
+    """Install a synchronized source project or ordinary wheels; describe installed code."""
     if development is None:
         raise PreparationRefusal("package_prepare_development_absent", package_name)
-    rows = list(wheels)
-    if not 1 <= len(rows) <= weights_limits.MAX_LOCAL_PACKAGE_FILES:
-        raise PreparationRefusal("package_prepare_file_count", str(len(rows)))
+    if not 1 <= len(files) <= weights_limits.MAX_LOCAL_PACKAGE_FILES:
+        raise PreparationRefusal("package_prepare_file_count", str(len(files)))
     python, base = _select_python(
-        python,
-        python_requires,
-        python_version,
-        base,
-        root=python_root or install_root / "python",
-        cancel=cancel,
-        progress=progress,
+        python, python_requires, python_version, base,
+        root=python_root or install_root / "python", cancel=cancel, progress=progress,
     )
-    expected_distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
-    try:
-        observed_base = base or package_environment.observe_base(python)
-    except package_environment.EnvironmentRefusal as exc:
-        raise PreparationRefusal(exc.code, exc.detail) from exc
-    if not wheel_root.is_absolute():
-        raise PreparationRefusal("package_prepare_file_path_invalid", str(wheel_root))
-    facts: list[
-        tuple[package_environment.Wheel, Path, package_environment.VerifiedFile | None]
-    ] = []
-    prior = b""
-    for row in rows:
-        if len(row.digest) != 32 or row.digest <= prior or not 0 < row.length <= MAX_FILE_BYTES:
-            raise PreparationRefusal("package_prepare_file_invalid", row.filename)
-        prior = bytes(row.digest)
+    archive = None
+    wheels = []
+    names = [row.filename for row in files]
+    if names != sorted(set(names)):
+        raise PreparationRefusal("package_prepare_file_invalid", "filenames must be sorted unique")
+    for row in files:
         path = Path(row.path)
         if (
-            not path.is_absolute()
-            or path.name != row.filename
-            or path.parent != wheel_root
-            or path.resolve(strict=True) != path
+            not path.is_absolute() or path.name != row.filename or path.parent != wheel_root
+            or path.resolve(strict=True) != path or not 0 < row.length <= MAX_FILE_BYTES
+            or path.stat().st_size != row.length
         ):
             raise PreparationRefusal("package_prepare_file_path_invalid", row.filename)
-        digest = documents.spell(bytes(row.digest))
-        named = package_environment.wheel_name_version(row.filename)
-        if named is None:
-            raise PreparationRefusal("package_prepare_file_invalid", row.filename)
-        owner = "project" if named == (expected_distribution, release) else "custom"
-        try:
-            wheel, receipt = package_environment.measure_wheel(
-                path, owner, observed_base, allow_base_owned=owner == "custom"
-            )
-        except package_environment.EnvironmentRefusal as exc:
-            raise PreparationRefusal(exc.code, exc.detail) from exc
-        if wheel.digest != digest or wheel.length != row.length:
-            raise PreparationRefusal("package_prepare_file_identity_mismatch", row.filename)
-        if owner == "project":
-            from cozy_runtime.internal import builtin_operations
-
-            if wheel.distribution == builtin_operations.NAME:
-                builtin_operations.validate_carrier(path, wheel.version)
-            elif not wheel.import_roots:
-                raise PreparationRefusal(
-                    "package_prepare_project_wheel_no_import_roots",
-                    f"{row.filename} installs no importable module",
-                )
-        facts.append((wheel, path, receipt))
-    image_seeds = set()
-    with contextlib.ExitStack() as downloaded:
-        locked_dependencies = None
-        if dependency_requirements:
-            try:
-                locked_dependencies = package_environment.read_dependency_requirements(
-                    dependency_requirements
-                )
-                names = {wheel.distribution for wheel, _path, _receipt in facts}
-                overlap = names.intersection(row.name for row in locked_dependencies.rows)
-                if overlap:
-                    raise package_environment.EnvironmentRefusal(
-                        "package_environment_wheel_duplicate", ", ".join(sorted(overlap))
-                    )
-                downloaded.callback(
-                    package_environment._release_locked_wheels, locked_dependencies.rows
-                )
-                for item in package_environment.fetch_locked_wheels(
-                    locked_dependencies.rows,
-                    install_root,
-                    observed_base,
-                    cache_root=dependency_cache,
-                    python=python,
-                ):
-                    if item.image_seed:
-                        image_seeds.add(item.wheel.digest)
-                    facts.append(
-                        (
-                            item.wheel,
-                            item.path,
-                            None
-                            if item.image_seed
-                            else package_environment.VerifiedFile.record(
-                                item.path, item.wheel.digest, item.wheel.length
-                            ),
-                        )
-                    )
-            except package_environment.EnvironmentRefusal as exc:
-                raise PreparationRefusal(exc.code, exc.detail) from exc
-        projects = [item for item in facts if item[0].owner == "project"]
-        if len(projects) != 1:
-            raise PreparationRefusal("package_prepare_project_wheel_count", str(len(projects)))
-        project = projects[0][0]
-        if project.distribution != expected_distribution or project.version != release:
-            raise PreparationRefusal("package_prepare_project_wheel_mismatch", project.filename)
-
-        dependency_facts = sorted(
-            (wheel for wheel, _path, _receipt in facts if wheel.owner == "custom"),
-            key=lambda wheel: wheel.distribution,
+        if row.filename == source_archive:
+            if row.digest:
+                raise PreparationRefusal("package_prepare_source_invalid", "source is operation-scoped")
+            archive = path
+        else:
+            if len(row.digest) != 32 or package_environment.wheel_name_version(row.filename) is None:
+                raise PreparationRefusal("package_prepare_file_invalid", row.filename)
+            with path.open("rb") as stream:
+                measured = hashlib.file_digest(stream, "sha256").digest()
+            if measured != row.digest:
+                raise PreparationRefusal("package_prepare_wheel_integrity", row.filename)
+            verified(documents.spell(row.digest), row.length, path)
+            wheels.append(path)
+    if source_archive and archive is None:
+        raise PreparationRefusal("package_prepare_source_absent", source_archive)
+    try:
+        installed = package_installation.install(
+            install_root, package=package_name, release=release, python=python,
+            installation_id=installation_id, source_archive=archive,
+            requirements=dependency_requirements, wheels=tuple(wheels), cache=dependency_cache,
         )
-        environment = pb.Environment(
-            local_wheels=[_wheel_fact(wheel) for wheel in dependency_facts]
-        )
-        environment_body = documents.body(environment)
-        environment_digest = documents.spell(
-            documents.embedded_document_digest(environment_body, "cozy.worker.v1.Environment")
-        )
-        wheel_paths = {wheel.digest: path for wheel, path, _receipt in facts}
-        receipts = {wheel.digest: receipt for wheel, _path, receipt in facts if receipt is not None}
-        try:
-            source = placement_materialization.package_environment_input(
-                package_name=package_name,
-                release=release,
-                project_wheel=documents.body(_wheel_fact(project)),
-                environment=environment_body,
-                environment_digest=environment_digest,
-                wheel_paths=wheel_paths,
-                verified_wheels=receipts,
-            )
-            source = replace(
-                source,
-                grants=tuple(
-                    replace(grant, image_seed=True) if grant.digest in image_seeds else grant
-                    for grant in source.grants
-                ),
-            )
-            if builtin_snapshot is not None:
-                from cozy_runtime.internal import builtin_operations
-
-                if (
-                    package_name != "local/" + builtin_operations.NAME
-                    or dependency_python is not None
-                    or dependency_requirements
-                ):
-                    raise PreparationRefusal("builtin_snapshot_mismatch", "not a captured builtin")
-                installed = package_environment.materialize_captured_builtin(
-                    source,
-                    install_root,
-                    captured=builtin_snapshot,
-                    python=python,
-                    base=observed_base,
-                    dependency_cache=dependency_cache,
-                )
-            else:
-                installed = package_environment.materialize(
-                    source,
-                    install_root,
-                    python=python,
-                    base=observed_base,
-                    dependency_python=None if dependency_requirements else dependency_python,
-                    exact_dependencies=True,
-                    dependency_cache=dependency_cache,
-                )
-        except (package_environment.EnvironmentRefusal, LaunchRefusal) as exc:
-            code = getattr(exc, "code", "package_environment_install_failed")
-            detail = getattr(exc, "detail", type(exc).__name__)
-            raise PreparationRefusal(str(code), str(detail)) from exc
-        for wheel, path, _receipt in facts:
-            if wheel.digest not in image_seeds:
-                verified(wheel.digest, wheel.length, path)
-        if materialized is not None:
-            materialized(installed)
-
-        interface_raw = describe(installed, project.distribution)
-        try:
-            interface_body = package_interface.read_bytes(
-                interface_raw, "prepared package interface"
-            )
-        except package_interface.StalePackageInterface as exc:
-            raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
-        interface_ref = _stage(artifact_cache, interface_raw)
-        _verify_local_revision(
-            development,
-            interface_ref,
-            rows,
-            dependency_requirements,
-            python_requires,
-            python_version,
-        )
-        _stage_job_plans(
-            interface_body,
-            root=job_plan_root,
-            build_id=documents.spell(development.local_revision_digest),
-            interface_path=artifact_cache / interface_ref[0].removeprefix("sha256:"),
-            installed=installed,
-        )
-        # Local package transport freezes code, PackageInterface, and Environment only. A
-        # later ordinary PlacementSet supplies exact modeled serving bindings; JobDirective
-        # + InvocationSpec supplies a job's exact model inputs. Weightless serving bindings
-        # need no later model authority and are already exact consequences of this retained
-        # package interface.
-        selected_models, entrypoints = _entrypoints(
-            interface_body,
-            package_name=package_name,
-            selections=(),
-            tensorfs_root=None,
-            verified=verified,
-            census=None,
-        )
-        entrypoint_bodies = [documents.body(row) for row in entrypoints]
-        bindings_digest = documents.digest_of(
-            canonical.write(
-                {
-                    "entrypoints": entrypoint_bodies,
-                    "models": [documents.body(model) for model in selected_models],
-                }
-            )
-        )
-        placement = pb.Placement(
-            placement_id="package-" + hashlib.sha256(placement_seed).hexdigest()[:24],
-            environment_digest=documents.raw(environment_digest),
-            package_interface=pb.Ref(
-                digest=documents.raw(interface_ref[0]), length=interface_ref[1]
-            ),
-            bindings_digest=bindings_digest,
-            models=selected_models,
-            entrypoints=entrypoints,
-            environment=environment,
-        )
-        placement.development.CopyFrom(
-            pb.DevelopmentPackage(
-                package=development.package,
-                release=development.release,
-                source_digest=development.source_digest,
-                local_revision_digest=development.local_revision_digest,
-                project_wheel=_wheel_fact(project),
-            )
-        )
-        placement_body = documents.body(placement)
-        placement_bytes = canonical.write(
-            {"format": "cozy.worker.v1.PlacementSet/1", "placements": [placement_body]}
-        )
-        return pb.PreparePackageSetResult(
-            placement_set=pb.DesiredPlacementSet(
-                placement_set_digest=documents.digest_of(placement_bytes),
-                placement_set_canonical_bytes=placement_bytes,
-            )
-        )
-
-
-def _wheel_fact(wheel: package_environment.Wheel) -> pb.WheelFact:
-    return pb.WheelFact(
-        ref=pb.Ref(digest=documents.raw(wheel.digest), length=wheel.length),
-        distribution=wheel.distribution,
-        version=wheel.version,
-        filename=wheel.filename,
-        import_roots=list(wheel.import_roots),
-        tags=list(wheel.tags),
+    except package_environment.EnvironmentRefusal as exc:
+        raise PreparationRefusal(exc.code, exc.detail) from exc
+    if materialized is not None:
+        materialized(installed)
+    distribution = _DISTRIBUTION.sub("-", package_name.rsplit("/", 1)[-1]).lower()
+    interface_raw = describe(installed, distribution)
+    interface_body = package_interface.read_bytes(interface_raw, "installed package interface")
+    interface_path = install_root / "installations" / installation_id / "package-interface.json"
+    interface_path.write_bytes(interface_raw)
+    interface_path.chmod(0o644)
+    _stage_job_plans(
+        interface_body, root=job_plan_root, installation_id=installation_id,
+        interface_path=interface_path, installed=installed,
     )
-
-
-def _verify_local_revision(
-    development: pb.DevelopmentPackage,
-    interface_ref: tuple[str, int],
-    wheels: Sequence[pb.LocalPackageWheel],
-    dependency_requirements: bytes = b"",
-    python_requires: str = "",
-    python_version: str = "",
-) -> None:
-    revision = pb.LocalPackageRevision(
-        python_requires=python_requires,
-        python_version=python_version,
-        package=development.package,
-        release=development.release,
-        source_digest=development.source_digest,
-        package_interface=pb.Ref(digest=documents.raw(interface_ref[0]), length=interface_ref[1]),
-        files=[
-            pb.LocalPackageFileRef(
-                digest=row.digest,
-                filename=row.filename,
-                length=row.length,
-            )
-            for row in wheels
-        ],
+    selected_models, entrypoints = _entrypoints(
+        interface_body, package_name=package_name, selections=(), tensorfs_root=None,
+        verified=verified, census=None,
     )
-    if dependency_requirements:
-        revision.dependency_requirements.CopyFrom(
-            pb.Ref(
-                digest=documents.digest_of(dependency_requirements),
-                length=len(dependency_requirements),
-            )
-        )
-    _raw, measured = documents.identity(revision)
-    if measured != development.local_revision_digest:
-        raise PreparationRefusal(
-            "local_package_revision_mismatch",
-            f"measured {documents.spell(measured)}, expected "
-            f"{documents.spell(development.local_revision_digest)}",
-        )
+    bindings_digest = documents.digest_of(canonical.write({
+        "entrypoints": [documents.body(row) for row in entrypoints], "models": [],
+    }))
+    placement = pb.Placement(
+        placement_id="package-" + installation_id,
+        development=pb.DevelopmentPackage(
+            package=package_name, release=release, installation_id=installation_id,
+        ),
+        installation_id=installation_id, package_interface=interface_raw,
+        bindings_digest=bindings_digest, models=selected_models, entrypoints=entrypoints,
+    )
+    placement_bytes = canonical.write({
+        "format": "cozy.worker.v1.PlacementSet/1", "placements": [documents.body(placement)],
+    })
+    return pb.PreparePackageSetResult(
+        installed_package=pb.InstalledPackage(
+            installation_id=installation_id, package=package_name, release=release,
+            package_interface=interface_raw,
+        ),
+        placement_set=pb.DesiredPlacementSet(
+            placement_set_digest=documents.digest_of(placement_bytes),
+            placement_set_canonical_bytes=placement_bytes,
+        ),
+    )
 
 
 #: `{slot path: (selected model, interface slot row)} -> {slot path: census}`.
@@ -1066,7 +777,7 @@ CensusLookup = Callable[
 
 
 def _census(
-    installed: package_environment.InstalledEnvironment, application: str, artifact_cache: Path
+    installed: package_installation.InstalledEnvironment, application: str, artifact_cache: Path
 ) -> CensusLookup:
     """`Slot.components` is what the factory constructs for this config (D9), read from the
     content-keyed census cache; misses construct once, in the package's own environment,
@@ -1081,7 +792,7 @@ def _census(
             return census_cache.ensure(
                 artifact_cache / "census",
                 python=installed.python,
-                environment=installed.content_digest,
+                environment=installed.installation_id,
                 application=application,
                 slots=[
                     census_cache.SlotInput(
@@ -1252,9 +963,9 @@ def _stage_job_plans(
     body: Mapping[str, Any],
     *,
     root: Path | None,
-    build_id: str,
+    installation_id: str,
     interface_path: Path,
-    installed: package_environment.InstalledEnvironment,
+    installed: package_installation.InstalledEnvironment,
 ) -> set[str]:
     rows = body.get("jobs")
     if not isinstance(rows, list):
@@ -1275,11 +986,10 @@ def _stage_job_plans(
         descriptor_id = package_interface.job_descriptor_id(body, name)
         record = {
             "job_descriptor_id": descriptor_id,
-            "build_id": build_id,
+            "installation_id": installation_id,
             "application": application,
             "package_interface": str(interface_path),
             "python": str(installed.python),
-            "environment_content_digest": installed.content_digest,
             "job": name,
             "publishes": bool(row.get("publishes", False)),
             "emits_media": False,

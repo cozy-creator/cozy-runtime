@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from cozy_runtime.internal import package_installation
+
 import base64
 import contextlib
 import hashlib
@@ -154,7 +156,7 @@ class Serving:
                 canonical_json.encode(
                     {
                         "kind": "serving",
-                        "revision": target.revision,
+                        "installation_id": target.installation_id,
                         "entrypoint": target.entrypoint,
                         "parent_attempt": request.parent_attempt_ordinal,
                         "result_schema": target.declaration["result"],
@@ -194,7 +196,7 @@ class Serving:
                 ).fetchone()
             parent = documents.read(row["invocation"], pb.InvocationSpec)
             spec = pb.InvocationSpec(
-                environment_digest=placement["environment_digest"],
+                installation_id=placement["installation_id"],
                 payload_digest=digest,
                 inputs=[
                     pb.InputBinding(
@@ -274,10 +276,10 @@ class Serving:
             )
             preparation = canonical_json.encode(
                 {
-                    "revisions": {
-                        target.revision: {
+                    "installations": {
+                        target.installation_id: {
                             "placement": placement,
-                            "receipt_digest": target.prepared_revision["receipt_digest"],
+                            "installation_id": target.installation_id,
                         }
                     },
                     "state": base64.b64encode(
@@ -322,7 +324,7 @@ class Serving:
     ) -> Prepared:
         worker, workspace = self.worker, self.worker.workspace
         assert workspace is not None
-        prepared = target.prepared_revision["placement"]
+        prepared = target.prepared_installation["placement"]
         if not target.declaration.get("models"):
             return Prepared(dict(prepared), [], contextlib.ExitStack())
         _, model_arguments = arguments(target, request.request_canonical_bytes)
@@ -366,12 +368,12 @@ class Serving:
             }
             expected.update({row["parameter"]: row["manifest"] for row in defaults})
             with worker.control_lock:
-                candidates = [dict(value.document) for value in worker.prepared_revisions.values()]
+                candidates = [dict(value.document) for value in worker.prepared_installations.values()]
             matched = None
             for candidate in candidates:
                 if (
-                    machine_capture.code_identity(candidate) != target.revision
-                    or candidate.get("environment_digest") != prepared["environment_digest"]
+                    machine_capture.installation_identity(candidate) != target.installation_id
+                    or candidate.get("installation_id") != prepared["installation_id"]
                     or candidate.get("package_interface") != prepared["package_interface"]
                 ):
                     continue
@@ -407,11 +409,8 @@ class Serving:
                 )
             if matched is not None:
                 return Prepared(matched, defaults, access)
-            installed = package_environment.open_generation(
-                Path(worker.options.install_root or ""),
-                receipt_digest=target.prepared_revision["receipt_digest"],
-                environment_digest=prepared["environment_digest"],
-                python=Path(worker.options.python or sys.executable),
+            installed = package_installation.open_installation(
+                Path(worker.options.install_root or ""), target.installation_id,
             )
             with self.phase(call, request, "Checking model compatibility"), worker.preparation_lock:
 

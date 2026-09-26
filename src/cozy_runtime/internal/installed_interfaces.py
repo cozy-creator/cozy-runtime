@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import sys
-from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author import ConformanceError
-from cozy_runtime.internal import canonical, interface_wheel, package_interface
-from cozy_runtime.internal.package_environment import InstalledEnvironment
+from cozy_runtime.internal import canonical, package_interface
+from cozy_runtime.internal.package_installation import InstalledEnvironment
 
 
 def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
@@ -25,25 +23,6 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
         path = directory / "package-interface.json"
         if not path.is_file():
             continue
-        with (directory / "METADATA").open("rb") as stream:
-            raw = stream.read((1 << 20) + 1)
-        if len(raw) > 1 << 20:
-            raise ConformanceError("installed metadata exceeds its bound", code="child_environment")
-        metadata = BytesParser().parsebytes(raw)
-        implementation = metadata.get("Cozy-Implementation-Digest")
-        generator = metadata.get("Cozy-Interface-Generator")
-        if implementation is None and generator is None:
-            continue
-        if (
-            generator != interface_wheel.GENERATOR_ABI
-            or metadata.get("Cozy-Interface-Layout") not in {"overlay", "generated"}
-            or implementation is None
-            or not canonical.DIGEST_RE.fullmatch(implementation)
-        ):
-            raise ConformanceError(
-                "installed interface has no exact supported implementation join",
-                code="child_interface",
-            )
         with path.open("rb") as stream:
             body = stream.read(canonical.DOC_MAX_BYTES + 1)
         if len(body) > canonical.DOC_MAX_BYTES:
@@ -51,7 +30,6 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
         descriptor = package_interface.read_bytes(body)
         # uv owns installed package bytes. Discovery reads the declared interface;
         # it does not re-generate and compare installed Python source at invocation.
-        digest = "sha256:" + hashlib.sha256(body).hexdigest()
         for entry in [*descriptor["entrypoints"], *descriptor["jobs"]]:
             invocable = entry.get("invocable")
             if invocable is None or entry.get("internal", False):
@@ -64,10 +42,9 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
             exports.add(key)
             interfaces.append(
                 {
-                    "interface_digest": digest,
                     "module": key[0],
                     "export": key[1],
-                    "implementation_digest": implementation,
+                    "kind": "job" if entry in descriptor["jobs"] else "entrypoint",
                     "interface_path": str(path),
                 }
             )
@@ -78,7 +55,7 @@ def read(installed: InstalledEnvironment) -> list[dict[str, Any]]:
     return interfaces
 
 
-def for_job(python: str, content_digest: str) -> list[dict[str, Any]]:
+def for_job(python: str, installation_id: str) -> list[dict[str, Any]]:
     """Read the explicitly selected venv; never run its interpreter or inherit imports."""
     executable = Path(python)
     generation = executable.parent.parent
@@ -92,4 +69,4 @@ def for_job(python: str, content_digest: str) -> list[dict[str, Any]]:
         if sys.platform == "win32"
         else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
     )
-    return read(InstalledEnvironment(generation, site, executable, b"", "", content_digest, True))
+    return read(InstalledEnvironment(installation_id, generation, site, executable, "", "", True))

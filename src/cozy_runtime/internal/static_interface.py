@@ -1185,12 +1185,6 @@ def build_installed(distribution: str, *, environment_python: Path) -> dict[str,
             code="static_distribution",
         )
     metadata = matches[0]
-    if normalize(distribution) == "cozy-runtime-operations":
-        from cozy_runtime.internal.builtin_operations import validate_installed
-
-        validate_installed(metadata)
-        return build_builtin("operations")
-
     def read(name: str) -> str:
         path = metadata / name
         if metadata.is_symlink() or path.is_symlink() or not path.is_file():
@@ -1390,15 +1384,20 @@ def _registration(
         invocable = True
         if isinstance(export, ast.Call):
             if export.args or any(
-                keyword.arg not in {"memoize", "defaults"} for keyword in export.keywords
+                keyword.arg not in {"memoize", "defaults", "memo_version", "memo_dependencies"}
+                for keyword in export.keywords
             ):
                 reader.refuse(
                     function_module,
                     export,
-                    "@invocable accepts only memoize= and defaults=",
+                    "@invocable accepts memoize, memo_version, memo_dependencies and defaults",
                     "static_unsupported",
                 )
             for keyword in export.keywords:
+                if keyword.arg in {"memo_version", "memo_dependencies"}:
+                    # Operation identity is discovered in the installed environment.
+                    # Static client inspection cannot author or compare that key.
+                    continue
                 value = reader.fold(function_module, keyword.value)
                 if keyword.arg == "defaults":
                     default_models = model_defaults(value)

@@ -957,7 +957,7 @@ class PublicationReceipt:
     grant_id: str
     """The publication contract's scope — the scratch model a job's writes are rewritten
     into. Empty on the serving lane, which publishes into granted destinations only."""
-    build_id: str
+    installation_id: str
     subject_id: str
     """`job_descriptor_id` in job mode, `entrypoint_binding_digest` in serving mode."""
     request_id: str
@@ -969,7 +969,7 @@ class PublicationReceipt:
         return {
             "mode": self.mode,
             "grant_id": self.grant_id,
-            "build_id": self.build_id,
+            "installation_id": self.installation_id,
             "subject_id": self.subject_id,
             "request_id": self.request_id,
             "attempt": self.attempt,

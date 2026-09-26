@@ -15,6 +15,7 @@ from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import (
+    package_installation,
     base_observation,
     canonical,
     config,
@@ -27,11 +28,10 @@ from cozy_runtime.internal.exits import Exit
 
 REQUEST_FIELDS = {
     "device_index",
-    "environment_digest",
+    "installation_id",
     "install_root",
     "expected_result_digest",
     "fixture",
-    "installed_environment_receipt_digest",
     "python",
 }
 
@@ -39,11 +39,10 @@ REQUEST_FIELDS = {
 @dataclass(frozen=True, slots=True)
 class Request:
     device_index: int | None
-    environment_digest: str
+    installation_id: str
     install_root: Path
     expected_result_digest: str
     fixture: str
-    installed_receipt_digest: str
     python: Path
 
 
@@ -57,12 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         evidence_path = _fresh_output(_absolute(args[1], "evidence"))
         request = _request(request_path)
         base = package_environment.observe_base(request.python)
-        installed = package_environment.open_generation(
-            request.install_root,
-            receipt_digest=request.installed_receipt_digest,
-            environment_digest=request.environment_digest,
-            python=request.python,
-        )
+        installed = package_installation.open_installation(request.install_root, request.installation_id)
         inspection = native_wheel.inspect_installed(installed.site_packages)
         runtime_config = config.read_config()
         base_environment = spawn.seal(runtime_config.child_base_env, {})
@@ -86,7 +80,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             cache_scope = jit_cache.scope(
                 runtime_config.cozy_home,
-                installed.content_digest,
+                installed.installation_id,
                 pod_scope=proof_pod_scope,
             )
         except jit_cache.JITCacheRefusal as exc:
@@ -116,15 +110,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ) from exc
         evidence = {
             "base_worker_profile": _profile_id(base),
-            "environment_digest": request.environment_digest,
+            "installation_id": request.installation_id,
             "host_capability": {
                 "gpu": gpu,
                 "seat": running_seat,
             },
             "host_qualification": host,
-            "installed_environment_receipt_digest": request.installed_receipt_digest,
             "operator_observation": operator,
-            "package_environment_content_digest": installed.content_digest,
+            "package_environment_installation_id": installed.installation_id,
             "static_inspection": inspection.document(),
         }
         payload = canonical.write(evidence)
@@ -171,11 +164,7 @@ def _request(path: Path) -> Request:
         raise _error(str(exc)) from exc
     if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
         raise _error("request fields are not closed")
-    digests = (
-        "environment_digest",
-        "expected_result_digest",
-        "installed_environment_receipt_digest",
-    )
+    digests = ("expected_result_digest",)
     if any(
         not isinstance(value[name], str) or canonical.DIGEST_RE.fullmatch(value[name]) is None
         for name in digests
@@ -191,11 +180,10 @@ def _request(path: Path) -> Request:
         raise _error("fixture or device")
     return Request(
         device,
-        str(value["environment_digest"]),
+        str(value["installation_id"]),
         _existing_directory(_absolute(value["install_root"], "install_root")),
         str(value["expected_result_digest"]),
         fixture,
-        str(value["installed_environment_receipt_digest"]),
         _existing_executable(_absolute(value["python"], "python")),
     )
 

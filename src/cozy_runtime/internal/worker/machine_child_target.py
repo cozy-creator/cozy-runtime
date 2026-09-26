@@ -20,15 +20,14 @@ if TYPE_CHECKING:
     from .session import Worker
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Target:
-    revision: str
+    installation_id: str
     entrypoint: str
-    interface_digest: str
     declaration: dict[str, Any]
-    prepared_revision: dict[str, Any]
+    prepared_installation: dict[str, Any]
     binding: JobBinding | None
-    digest: str
+    operation_identity: str
     serving_envelope: bool = False
 
 
@@ -42,61 +41,29 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     if intent["module"] == builtin_operations.MODULE:
         assert worker.machine_calls is not None
         return worker.machine_calls.builtins.resolve(parent, call, intent)
-    caller = parent.job.build_id
-    selected = next(
-        (
-            binding
-            for binding in capture["bindings"]
-            if (
-                binding["caller_revision_digest"],
-                binding["interface_digest"],
-                binding["module"],
-                binding["export"],
-            )
-            == (caller, intent["interface_digest"], intent["module"], intent["export"])
-        ),
-        None,
-    )
+    caller = parent.job.installation_id
+    selected = next((binding for binding in capture["bindings"]
+                     if (binding["caller_installation_id"], binding["module"], binding["export"])
+                     == (caller, intent["module"], intent["export"])), None)
     if selected is None:
-        raise WorkspaceRefusal("child callable is absent from the frozen capture")
-    revision, entrypoint = selected["callee_revision_digest"], selected["entrypoint"]
-    prepared = worker.executions.preparation(owner, root)["revisions"].get(revision)
+        raise WorkspaceRefusal("child callable is absent from the accepted installation bindings")
+    identifier, entrypoint = selected["callee_installation_id"], selected["entrypoint"]
+    prepared = worker.executions.preparation(owner, root)["installations"].get(identifier)
     if prepared is None:
-        raise WorkspaceRefusal("captured child environment is not retained")
-    interface_ref = prepared["placement"]["package_interface"]
-    if interface_ref["digest"] != intent["interface_digest"]:
-        raise WorkspaceRefusal("captured child interface changed")
-    interface_path = (
-        Path(worker.options.artifact_cache or "") / documents.raw(interface_ref["digest"]).hex()
-    )
-    with interface_path.open("rb") as stream:
-        raw = stream.read((1 << 20) + 1)
-    if (
-        len(raw) != interface_ref["length"]
-        or "sha256:" + hashlib.sha256(raw).hexdigest() != interface_ref["digest"]
-    ):
-        raise WorkspaceRefusal("captured child interface bytes are unavailable")
-    interface = package_interface.read_bytes(raw, "captured child")
-    declared = next(
-        (
-            entry
-            for entry in [*interface["jobs"], *interface["entrypoints"]]
-            if entry["name"] == entrypoint
-        ),
-        None,
-    )
+        raise WorkspaceRefusal("child installation is not retained")
+    import base64
+    raw = base64.b64decode(prepared["placement"]["package_interface"], validate=True)
+    interface = package_interface.read_bytes(raw, "installed child")
+    declared = next((entry for entry in [*interface["jobs"], *interface["entrypoints"]]
+                     if entry["name"] == entrypoint), None)
     if declared is None:
-        raise WorkspaceRefusal("captured child has no callable declaration")
-    if declared.get("internal", False) and caller != revision:
-        raise WorkspaceRefusal(
-            "internal_callable: child requires the same installed package revision"
-        )
+        raise WorkspaceRefusal("installed child has no callable declaration")
+    if declared.get("internal", False) and caller != identifier:
+        raise WorkspaceRefusal("internal_callable: child requires the same installation")
     invocable = declared.get("invocable", {})
     if (invocable.get("module"), invocable.get("export")) != (intent["module"], intent["export"]):
-        raise WorkspaceRefusal("captured child export changed")
-    if invocable.get("memoize") and {"egress", "secrets"}.intersection(
-        invocable.get("capabilities", [])
-    ):
+        raise WorkspaceRefusal("child does not name the installed export")
+    if invocable.get("memoize") and {"egress", "secrets"}.intersection(invocable.get("capabilities", [])):
         raise WorkspaceRefusal("memoized child cannot carry effect or secret capabilities")
     parent_declaration = worker.engine._job_declaration(parent.job, parent.job.job_descriptor_id)
     if parent_declaration.get("invocable", {}).get("memoize") and not invocable.get("memoize"):
@@ -104,40 +71,14 @@ def resolve(worker: Worker, parent: AttemptRecord, call: Call) -> Target:
     binding = None
     if declared in interface["jobs"]:
         descriptor = package_interface.job_descriptor_id(interface, entrypoint)
-        binding = JobBinding.read(
-            json.loads(
-                job_plan.path(
-                    worker.config.cozy_home / "job-plans", revision, descriptor
-                ).read_bytes()
-            )
-        )
-    identity = canonical_json.encode(
-        {
-            "local_revision_digest": revision,
-            "interface_digest": intent["interface_digest"],
-            "entrypoint": entrypoint,
-            "module": intent["module"],
-            "export": intent["export"],
-        }
-    )
-    return Target(
-        revision,
-        entrypoint,
-        intent["interface_digest"],
-        declared,
-        prepared,
-        binding,
-        "sha256:" + hashlib.sha256(identity).hexdigest(),
-        binding is None
-        and (
-            selected["caller_revision_digest"] != revision
-            or any(
-                (row["interface_digest"], row["module"], row["export"])
-                == (intent["interface_digest"], intent["module"], intent["export"])
-                for row in parent.job.call_interfaces
-            )
-        ),
-    )
+        binding = JobBinding.read(json.loads(job_plan.path(
+            worker.config.cozy_home / "job-plans", identifier, descriptor,
+        ).read_bytes()))
+    operation_identity = str(invocable.get("operation_identity", ""))
+    if invocable.get("memoize") and not operation_identity:
+        worker.note("memoization", f"{intent['module']}.{intent['export']} runs uncached: callable implementation identity is unavailable")
+    return Target(identifier, entrypoint, declared, prepared, binding, operation_identity,
+                  binding is None and caller != identifier)
 
 
 def computation(
@@ -147,6 +88,8 @@ def computation(
     capture: dict[str, Any] | None = None,
 ) -> bytes:
     """Bind the callee's frozen implementation and inputs, excluding caller and custody."""
+    if not target.operation_identity:
+        return b""
     inputs = dict(arguments)
     for model in target.declaration.get("models", []):
         parameter = model["path"].removeprefix(target.entrypoint + ".models.")
@@ -155,8 +98,7 @@ def computation(
             raise WorkspaceRefusal("memoized Model argument requires an exact retained manifest")
         inputs[parameter] = {"manifest": value["manifest"]}
     identity: dict[str, Any] = {
-        "target_digest": target.digest,
-        "installed_receipt_digest": target.prepared_revision["receipt_digest"],
+        "operation_identity": target.operation_identity,
         "inputs": inputs,
     }
     if capture is not None:

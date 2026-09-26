@@ -35,6 +35,7 @@ import contextlib
 import dataclasses
 import hashlib
 import os
+import re
 import shutil
 import threading
 import time
@@ -292,7 +293,7 @@ class LocalRecordOwner:
         bindings: dict[str, str],
         workspace: Path,
         *,
-        package_code_digest: str,
+        package_installation_id: str,
         placement: pb.Placement | None = None,
         auto_ack: bool = True,
         on_progress: Any = None,
@@ -302,7 +303,7 @@ class LocalRecordOwner:
         #: JOB mode: the durable checkpoint requests this owner answered, in order.
         self.checkpoints: list[dict[str, Any]] = []
         self.workspace = workspace
-        self.package_code_digest = package_code_digest
+        self.package_installation_id = package_installation_id
         self.placement = placement
         self.auto_ack = auto_ack
         self.native_workspace: Workspace | None = None
@@ -762,7 +763,7 @@ class LocalRecordOwner:
             # is no binding plan to prepare, no warm pool to fill and no serving pointer.
             directive.job.CopyFrom(
                 pb.JobDirective(
-                    build_id=self.package_code_digest,
+                    installation_id=self.package_installation_id,
                     job_descriptor_id=self.request.job_descriptor_id,
                     resource_caps=pb.ResourceCaps(
                         device_required=False, max_rss_bytes=0, max_disk_bytes=0
@@ -872,14 +873,7 @@ class LocalRecordOwner:
         # local RecordOwner must not mint a whitespace-dependent dialect beside Tensorhub.
         body = canonical.write(self.request.payload)
         spec = pb.InvocationSpec(
-            environment_digest=(
-                ""
-                if self.placement is not None
-                and self.placement.WhichOneof("package_mode") == "development"
-                else documents.spell(self.placement.environment_digest)
-                if self.placement is not None
-                else ""
-            ),
+            installation_id=self.placement.installation_id if self.placement is not None else self.package_installation_id,
             payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
             inputs=self._input_bindings(body),
             outputs=self._output_bindings(),
@@ -898,7 +892,7 @@ class LocalRecordOwner:
         if self.request.kind == "job":
             spec.job.CopyFrom(
                 pb.JobInvocationSpec(
-                    build_id=self.package_code_digest,
+                    installation_id=self.package_installation_id,
                     job_descriptor_id=self.request.job_descriptor_id,
                     publication_contract=self._publication(),
                 )
@@ -1077,7 +1071,7 @@ def stage_development_placement(
     *,
     package: str,
     release: str,
-    source_digest: str,
+    installation_id: str,
     artifact_cache: Path,
     tensorfs_root: Path,
     project: Path | None = None,
@@ -1099,7 +1093,7 @@ def stage_development_placement(
         interface,
         package=package,
         release=release,
-        source_digest=source_digest,
+        installation_id=installation_id,
         project=project,
         cozy_home=home,
         tensorfs_root=selected_store,
@@ -1124,7 +1118,7 @@ def development_placement_documents(
     *,
     package: str,
     release: str,
-    source_digest: str,
+    installation_id: str,
     project: Path | None = None,
     cozy_home: Path | None = None,
     tensorfs_root: Path | None = None,
@@ -1144,16 +1138,15 @@ def development_placement_documents(
         raise RuntimeError("a local package requires at least one visible entrypoint or job")
     if package.count("/") != 1 or not all(package.split("/")) or not release:
         raise RuntimeError("development package identity or release is invalid")
-    try:
-        source_raw = documents.raw(source_digest)
-    except documents.DocumentError as exc:
-        raise RuntimeError("development source digest is invalid") from exc
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}", installation_id) is None:
+        raise RuntimeError("development installation ID is invalid")
 
     interface_bytes = package_interface.canonical_bytes(interface)
-    interface_ref = _exact_ref(interface_bytes)
     interface_path = ""
     if artifact_cache is not None:
-        _, staged_interface = _stage_exact(artifact_cache, interface_bytes)
+        staged_interface = artifact_cache / "installed-interfaces" / installation_id / "package-interface.json"
+        staged_interface.parent.mkdir(parents=True, exist_ok=True)
+        staged_interface.write_bytes(interface_bytes)
         interface_path = str(staged_interface)
     modeled_paths = sorted(
         str(model.get("path", ""))
@@ -1247,7 +1240,8 @@ def development_placement_documents(
             model_class=first.model_class if first is not None else "",
             model_binding_path=first.model_binding_path if first is not None else "",
             model_parameter_name=first.model_parameter_name if first is not None else "",
-            release=source_digest,
+            release=release,
+            installation_id=installation_id,
             models=model_set,
             application=str(interface.get("application", "")),
             interface_path=interface_path,
@@ -1277,11 +1271,10 @@ def development_placement_documents(
         development=pb.DevelopmentPackage(
             package=package,
             release=release,
-            source_digest=source_raw,
+            installation_id=installation_id,
         ),
-        package_interface=pb.Ref(
-            digest=documents.raw(str(interface_ref["digest"])), length=len(interface_bytes)
-        ),
+        installation_id=installation_id,
+        package_interface=interface_bytes,
         bindings_digest=bindings_digest,
         models=models,
         entrypoints=entrypoints,
@@ -1472,26 +1465,6 @@ def _exact_ref(raw: bytes) -> dict[str, Any]:
     return {"digest": "sha256:" + hashlib.sha256(raw).hexdigest(), "length": len(raw)}
 
 
-def development_source_digest(root: Path) -> str:
-    """Hash one local source snapshot without Git, caches, environments, or build output."""
-
-    digest = hashlib.sha256()
-    ignored = {".git", ".venv", "__pycache__", ".mypy_cache", ".ruff_cache", "dist", "outputs"}
-    for current, directories, filenames in os.walk(root):
-        directories[:] = sorted(name for name in directories if name not in ignored)
-        for filename in sorted(filenames):
-            path = Path(current, filename)
-            if path.is_symlink() or not path.is_file():
-                continue
-            relative = path.relative_to(root).as_posix().encode()
-            digest.update(len(relative).to_bytes(8, "big"))
-            digest.update(relative)
-            with path.open("rb") as handle:
-                while chunk := handle.read(1 << 20):
-                    digest.update(chunk)
-    return "sha256:" + digest.hexdigest()
-
-
 def _stage_exact(root: Path, raw: bytes) -> tuple[dict[str, Any], Path]:
     ref = _exact_ref(raw)
     digest = str(ref["digest"])
@@ -1557,7 +1530,7 @@ def run_slice(
     binding_records: list[dict[str, Any]] | None = None,
     *,
     workspace: Path,
-    package_code_digest: str,
+    package_installation_id: str,
     package_interface_document: Mapping[str, Any] | None = None,
     project: Path | None = None,
     development_tensorfs_root: Path | None = None,
@@ -1584,13 +1557,13 @@ def run_slice(
     if package_interface_document is not None:
         if request.kind != "entrypoint":
             raise RuntimeError("only a serving run accepts a package binding closure")
-        source_digest = development_source_digest(Path.cwd().resolve())
+        installation_id = "local-" + uuid.uuid4().hex
         staged = stage_development_placement(
             config.cozy_home,
             package_interface_document,
             package="local/development-package",
             release="0.0.0",
-            source_digest=source_digest,
+            installation_id=installation_id,
             artifact_cache=workspace / "artifact-cache",
             tensorfs_root=development_tensorfs_root or workspace / "tensorfs",
             project=project,
@@ -1602,10 +1575,10 @@ def run_slice(
         request,
         bindings,
         workspace,
-        package_code_digest=(
-            documents.spell(staged.placement.development.source_digest)
+        package_installation_id=(
+            staged.placement.development.installation_id
             if staged is not None
-            else package_code_digest
+            else package_installation_id
         ),
         placement=staged.placement if staged is not None else None,
         auto_ack=auto_ack,
@@ -1621,7 +1594,7 @@ def run_slice(
             development_project=Path.cwd().resolve(),
             development_package=staged.placement.development.package,
             development_release=staged.placement.development.release,
-            development_source_digest=documents.spell(staged.placement.development.source_digest),
+            development_installation_id=staged.placement.development.installation_id,
             development_binding_overrides=dict(development_binding_overrides or {}),
         )
     if not options.instance_id:

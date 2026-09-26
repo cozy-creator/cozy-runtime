@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
@@ -100,7 +101,7 @@ _DEVELOPMENT_FLAGS = (
     "--development-project",
     "--development-package",
     "--development-release",
-    "--development-source-digest",
+    "--development-installation-id",
 )
 
 
@@ -154,7 +155,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
         raise CliError(
             "usage",
             "development launch is missing " + ", ".join(missing),
-            "Creator supplies project, package, release, and source digest together",
+            "Creator supplies project, package, release, and installation ID together",
             Exit.usage,
         )
     artifact_flags = ("--tensorfs-root", "--artifact-cache")
@@ -192,7 +193,7 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
                 static_interface.build(project),
                 package=development["--development-package"],
                 release=development["--development-release"],
-                source_digest=development["--development-source-digest"],
+                installation_id=development["--development-installation-id"],
                 artifact_cache=Path(values["--artifact-cache"]).expanduser().resolve(),
                 tensorfs_root=Path(values["--tensorfs-root"]).expanduser().resolve(),
                 project=project,
@@ -223,8 +224,8 @@ def serve(config: RuntimeConfig, args: list[str]) -> int:
             development["--development-package"],
             "--development-release",
             development["--development-release"],
-            "--development-source-digest",
-            development["--development-source-digest"],
+            "--development-installation-id",
+            development["--development-installation-id"],
         ]
         os.chdir(project)
     elif len(supplied_artifacts) != len(artifact_flags):
@@ -262,7 +263,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
 
     values: dict[str, str] = {}
     rest = list(args)
-    required = {"--package", "--release", "--source-digest", "--tensorfs-root"}
+    required = {"--package", "--release", "--installation-id", "--tensorfs-root"}
     allowed = set(required) | {"--environment-python"}
     while rest:
         flag = rest.pop(0)
@@ -270,7 +271,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
             raise CliError(
                 "usage",
                 f"development-placement received invalid argument {flag!r}",
-                "pass --package <org/name> --release <semver> --source-digest sha256:<hex> "
+                "pass --package <org/name> --release <semver> --installation-id <id> "
                 "--tensorfs-root <TensorFS Store root>",
                 Exit.usage,
             )
@@ -285,19 +286,17 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
         )
     package = values["--package"]
     release = values["--release"]
-    source_digest = values["--source-digest"]
+    installation_id = values["--installation-id"]
     if (
         package.count("/") != 1
         or not all(package.split("/"))
         or SEMVER.fullmatch(release) is None
-        or len(source_digest) != 71
-        or not source_digest.startswith("sha256:")
-        or any(char not in "0123456789abcdef" for char in source_digest[7:])
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}", installation_id) is None
     ):
         raise CliError(
             "validation",
-            "development package, release, or source digest is invalid",
-            "use org/name, SemVer, and sha256:<64 lowercase hex>",
+            "development package, release, or installation ID is invalid",
+            "use org/name, SemVer, and an opaque installation ID",
             Exit.validation,
         )
     project = Path(opts.dir).expanduser().resolve()
@@ -322,7 +321,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
             interface,
             package=package,
             release=release,
-            source_digest=source_digest,
+            installation_id=installation_id,
             project=project,
             cozy_home=config.cozy_home,
             tensorfs_root=Path(values["--tensorfs-root"]).expanduser().resolve(),
@@ -345,7 +344,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
     document = {
         "package": package,
         "release": release,
-        "source_digest": source_digest,
+        "installation_id": installation_id,
         "placement_set": {
             "canonical_bytes_base64": base64.b64encode(placement_bytes).decode(),
             "digest": placement_digest,
@@ -358,7 +357,7 @@ def development_placement(config: RuntimeConfig, args: list[str], opts: Options)
         },
     }
     return Result(
-        rows=(("package", package), ("release", release), ("source_digest", source_digest)),
+        rows=(("package", package), ("release", release), ("installation_id", installation_id)),
         document=document,
     )
 
