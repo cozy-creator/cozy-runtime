@@ -21,9 +21,9 @@ from cozy_runtime.author import InvalidRequest
 FPS = 24
 CONTEXT_FRAMES = (22, 39, 56)
 MAX_CONTEXT_FRAMES = 56
-MAX_CONTEXT_BYTES = 256 << 20
+MAX_CONTEXT_BYTES = 64 << 20
 MAX_CONTEXT_PIXELS = 1344 * 768
-CONTEXT_SCHEMA = "cozy.minimax-h3.av-context/1"
+CONTEXT_SCHEMA = "cozy.minimax-h3.av-context/2"
 
 
 def _refuse(message: str) -> NoReturn:
@@ -75,7 +75,7 @@ def plan_continuation(delivered_frames: int, *, context_frames: int = 0) -> Cont
 
 
 @dataclass(frozen=True)
-class AVContext:
+class DeliveredAVWindow:
     frames: Any  # uint8 CPU ndarray, [frames,height,width,RGB]
     audio: Any  # float32 CPU tensor, [stereo,samples]
     sample_rate: int
@@ -123,7 +123,7 @@ class AVContext:
     def frame_count(self) -> int:
         return int(self.frames.shape[0])
 
-    def select(self, frames: int) -> AVContext:
+    def select(self, frames: int) -> DeliveredAVWindow:
         self.validate()
         if type(frames) is not int or frames not in CONTEXT_FRAMES or frames > self.frame_count:
             _refuse("requested continuation window is absent from the completed tail")
@@ -132,7 +132,7 @@ class AVContext:
             self.source_start_frame, self.source_end_frame, self.sample_rate
         )
         start, end = audio_sample_range(start_frame, self.source_end_frame, self.sample_rate)
-        return AVContext(
+        return DeliveredAVWindow(
             self.frames[-frames:].copy(),
             self.audio[:, start - old_start : end - old_start].clone(),
             self.sample_rate,
@@ -142,49 +142,142 @@ class AVContext:
         )
 
 
+@dataclass(frozen=True)
+class AVContext:
+    """Native normalized AV windows, independently encoded from delivered RGB/audio.
+
+    A shorter causal VAE window is not a suffix of a longer window's latents.
+    Keeping all three encodings also preserves the audio grid's window-local phase.
+    """
+
+    windows: dict[int, tuple[torch.Tensor, torch.Tensor]]
+    height: int
+    width: int
+    source_end_frame: int
+    provenance: str
+    frame_count: int = MAX_CONTEXT_FRAMES
+    sample_rate: int = 32000
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    @property
+    def source_start_frame(self) -> int:
+        return self.source_end_frame - self.frame_count
+
+    @property
+    def video_latents(self) -> torch.Tensor:
+        return self.windows[self.frame_count][0]
+
+    @property
+    def audio_latents(self) -> torch.Tensor:
+        return self.windows[self.frame_count][1]
+
+    def validate(self) -> None:
+        if (
+            type(self.frame_count) is not int
+            or self.frame_count not in CONTEXT_FRAMES
+            or not isinstance(self.windows, dict)
+            or set(self.windows) != set(CONTEXT_FRAMES)
+            or any(type(n) is not int for n in self.windows)
+        ):
+            _refuse("context must contain all three independently encoded AV windows")
+        if (
+            type(self.height) is not int or type(self.width) is not int
+            or min(self.height, self.width) < 32
+            or self.height % 32 or self.width % 32
+            or self.height * self.width > MAX_CONTEXT_PIXELS
+        ):
+            _refuse("context canvas is outside the qualified H3 geometry")
+        if type(self.source_end_frame) is not int or not 56 <= self.source_end_frame <= 362:
+            _refuse("context source frame clock is invalid")
+        audio_sample_range(self.source_end_frame - 56, self.source_end_frame, self.sample_rate)
+        if (
+            not isinstance(self.provenance, str) or not self.provenance
+            or len(self.provenance.encode("utf-8")) > 16384
+        ):
+            _refuse("context requires bounded renderer provenance")
+        for n, pair in self.windows.items():
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                _refuse("context AV window is invalid")
+            video, audio = pair
+            shapes = (
+                (1, 24, 5 * ((n - 5) // 17) + 2, self.height // 16, self.width // 16),
+                (2 * ((n * 5 + 2) // 3), 32),
+            )
+            for tensor, shape in zip((video, audio), shapes, strict=True):
+                if (
+                    not isinstance(tensor, torch.Tensor)
+                    or tensor.device.type != "cpu" or tensor.dtype != torch.float32
+                    or tuple(tensor.shape) != shape
+                    or not bool(torch.isfinite(tensor).all())
+                ):
+                    _refuse("context must contain finite native float32 AV conditioning tensors")
+
+    def select(self, frames: int) -> AVContext:
+        self.validate()
+        if type(frames) is not int or frames not in CONTEXT_FRAMES:
+            _refuse("requested continuation window is absent from the completed tail")
+        return AVContext(
+            self.windows, self.height, self.width, self.source_end_frame,
+            self.provenance, frames, self.sample_rate,
+        )
+
+
+@dataclass(frozen=True)
+class ContextReferenceLayout:
+    """Private packed-layout metadata, appended only after public reference encoding."""
+
+    kind: str = "video"
+    has_audio: bool = True
+
+
 def encode_context(context: AVContext) -> bytes:
     context.validate()
-    data = save(
-        {"frames": torch.from_numpy(context.frames.copy()), "audio": context.audio.contiguous()},
-        metadata={
-            "schema": CONTEXT_SCHEMA,
-            "sample_rate": str(context.sample_rate),
-            "source_start_frame": str(context.source_start_frame),
-            "source_end_frame": str(context.source_end_frame),
-            "provenance": context.provenance,
-        },
-    )
+    tensors = {
+        f"{kind}_{n}": tensor.contiguous()
+        for n, pair in context.windows.items()
+        for kind, tensor in zip(("video", "audio"), pair, strict=True)
+    }
+    data = save(tensors, metadata={
+        "schema": CONTEXT_SCHEMA,
+        "sample_rate": str(context.sample_rate),
+        "height": str(context.height), "width": str(context.width),
+        "frame_count": str(context.frame_count),
+        "source_end_frame": str(context.source_end_frame),
+        "provenance": context.provenance,
+    })
     if len(data) > MAX_CONTEXT_BYTES:
-        _refuse("encoded context exceeds its 256 MiB bound")
+        _refuse("encoded context exceeds its 64 MiB bound")
     return cast(bytes, data)
 
 
 def decode_context(data: bytes) -> AVContext:
     if not isinstance(data, bytes) or not 8 <= len(data) <= MAX_CONTEXT_BYTES:
-        _refuse("context carrier is absent or exceeds its 256 MiB bound")
+        _refuse("context carrier is absent or exceeds its 64 MiB bound")
     length = struct.unpack("<Q", data[:8])[0]
     if not 2 <= length <= min(65536, len(data) - 8):
         _refuse("context header is invalid or exceeds its bound")
     try:
         header = json.loads(data[8 : 8 + length])
         metadata = header.get("__metadata__", {})
+        keys = {f"{kind}_{n}" for n in CONTEXT_FRAMES for kind in ("video", "audio")}
         if (
-            set(header) != {"frames", "audio", "__metadata__"}
-            or set(metadata)
-            != {"schema", "sample_rate", "source_start_frame", "source_end_frame", "provenance"}
+            set(header) != keys | {"__metadata__"}
+            or set(metadata) != {
+                "schema", "sample_rate", "height", "width", "frame_count",
+                "source_end_frame", "provenance",
+            }
             or metadata["schema"] != CONTEXT_SCHEMA
         ):
             _refuse("context schema or fields do not match")
-        # Safetensors validates offsets/byte lengths before constructing tensors;
-        # the whole uncompressed carrier is bounded above, with no pickle/code loading.
+        # Bounded, uncompressed safetensors validates offsets before allocation.
         tensors = load(data)
         return AVContext(
-            tensors["frames"].numpy(),
-            tensors["audio"],
-            int(metadata["sample_rate"]),
-            int(metadata["source_start_frame"]),
-            int(metadata["source_end_frame"]),
-            metadata["provenance"],
+            {n: (tensors[f"video_{n}"], tensors[f"audio_{n}"]) for n in CONTEXT_FRAMES},
+            int(metadata["height"]), int(metadata["width"]),
+            int(metadata["source_end_frame"]), metadata["provenance"],
+            int(metadata["frame_count"]), int(metadata["sample_rate"]),
         )
     except InvalidRequest:
         raise
@@ -274,7 +367,7 @@ class CompletedTail:
             _refuse("completed continuation decode differs from its sampled/delivered frame plan")
         self.complete = True
 
-    def export(self, audio: torch.Tensor, sample_rate: int, provenance: str) -> AVContext:
+    def export(self, audio: torch.Tensor, sample_rate: int, provenance: str) -> DeliveredAVWindow:
         if not self.complete or self._tail is None or len(self._tail) != MAX_CONTEXT_FRAMES:
             _refuse("continuation is not a completed decoded segment")
         end_frame = self.plan.delivery_end
@@ -282,7 +375,7 @@ class CompletedTail:
         start, end = audio_sample_range(start_frame, end_frame, sample_rate)
         if audio.ndim != 2 or audio.shape[0] != 2 or audio.shape[1] < end:
             _refuse("completed audio does not cover the delivered continuation window")
-        return AVContext(
+        return DeliveredAVWindow(
             self._tail.numpy().copy(),
             audio[:, start:end].float().cpu().clone(),
             sample_rate,

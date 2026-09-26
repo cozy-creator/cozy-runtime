@@ -70,8 +70,10 @@ from cozy_runtime.author import (
 from .adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
 from .conditioner import build_text_conditioner, conditioning_scope
 from .continuation import (
+    CONTEXT_FRAMES,
     AVContext,
     CompletedTail,
+    ContextReferenceLayout,
     ContinuationPlan,
     align_context_rows,
     audio_sample_range,
@@ -1113,7 +1115,7 @@ class OfficialH3Pipeline:
             references=list(references),
             image_short_edges=tuple(reference_image_short_edges),
         )
-        if context is not None and tuple(context.frames.shape[1:3]) != (state.height, state.width):
+        if context is not None and (context.height, context.width) != (state.height, state.width):
             raise InvalidRequest(
                 "continuation canvas differs from this render", code="h3_continuation"
             )
@@ -1187,23 +1189,18 @@ class OfficialH3Pipeline:
     def condition_media(
         self, task: Task, state: Any, *, checks: NumericalChecks | None = None
     ) -> None:
+        # Encode public references first; private context never reaches Qwen or a VAE
+        # on the receiving segment. Its tensors already use the native normalization.
+        self._run(task, "vae_encoder", state, component="video_vae")
         context = state.get("continuation_context")
         if context is not None:
-            # Text already contains only the caller's fixed references. This private
-            # condition is a temporal anchor, not another public Video/Audio slot.
+            state.set("condition_latents", [*state.condition_latents, context.video_latents])
             state.set(
-                "normalized_references",
-                [
-                    *state.normalized_references,
-                    MiniMaxH3VideoReference(
-                        frames=context.frames,
-                        fps=float(FPS),
-                        audio=context.audio,
-                        sample_rate=context.sample_rate,
-                    ),
-                ],
+                "audio_condition_latents", [*state.audio_condition_latents, context.audio_latents]
             )
-        self._run(task, "vae_encoder", state, component="video_vae")
+            state.set(
+                "normalized_references", [*state.normalized_references, ContextReferenceLayout()]
+            )
         if checks is not None:
             checks.outputs(
                 "condition_media",
@@ -1422,7 +1419,36 @@ class OfficialH3Pipeline:
         tail = state.get("completed_av_tail")
         if not isinstance(tail, CompletedTail) or state.get("audio") is None:
             raise OutputError("continuation requires completed video and audio decode")
-        return tail.export(state.audio[0], int(state.sampling_rate), provenance)
+        raw = tail.export(state.audio[0], int(state.sampling_rate), provenance)
+        windows = {}
+        # Run exactly the native reference encoder, separately for each delivered
+        # window. Do not slice latent suffixes: both VAEs have window-local grids.
+        for count in CONTEXT_FRAMES:
+            selected = raw.select(count)
+            encoding = PipelineState(
+                values={
+                    "normalized_references": [
+                        MiniMaxH3VideoReference(
+                            frames=selected.frames,
+                            fps=float(FPS),
+                            audio=selected.audio,
+                            sample_rate=selected.sample_rate,
+                        )
+                    ],
+                }
+            )
+            self._run("ref2va", "vae_encoder", encoding, component="video_vae")
+            windows[count] = (
+                encoding.condition_latents[0].detach().float().cpu().contiguous(),
+                encoding.audio_condition_latents[0].detach().float().cpu().contiguous(),
+            )
+        return AVContext(
+            windows,
+            int(raw.frames.shape[1]),
+            int(raw.frames.shape[2]),
+            raw.source_end_frame,
+            provenance,
+        )
 
     def _run(self, task: Task, name: str, state: Any, *, component: str | None = None) -> None:
         workflow = self._workflow(task, state)

@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from cozy_runtime.author import Context, Loader, Model, sequence_parallel, uses_components
 
+from .continuation import AVContext
 from .official import (
     NumericalChecks,
     OfficialH3Pipeline,
@@ -124,6 +125,11 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
             on_chunk(chunk)
 
         return self.pipe.decode_video_chunks(task, state, observed)
+
+    @uses_components("video_vae", "audio_vae")
+    def export_completed_av_tail(self, state: Any, *, provenance: str) -> AVContext:
+        """Re-encode the delivered tail while both native VAE components are resident."""
+        return self.pipe.export_completed_av_tail(state, provenance=provenance)
 
     @uses_components("video_vae")
     def condition_fl2va_media(self, task: Task, state: Any, *, checks: NumericalChecks) -> None:
