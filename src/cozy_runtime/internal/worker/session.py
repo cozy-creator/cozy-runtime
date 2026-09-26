@@ -1997,12 +1997,9 @@ class Worker:
         from cozy_runtime.internal.numerical_environment import fingerprint
 
         return fingerprint(
-            self.base,
             hostfacts.measure(self.options.accelerator_backend),
             threads=self.options.threads,
-            alloc_conf=self.options.alloc_conf,
             inherited=dict(self.config.child_base_env),
-            python=self.options.environment_python or Path(self.options.python or sys.executable),
         )
 
     def authorize_workspace(self, claim: pb.Claim) -> str:
