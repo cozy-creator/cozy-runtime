@@ -149,7 +149,6 @@ def prepare_package_set(
     application, slot_paths, inventory, locked = _request_facts(
         request, models, preinstalled=preinstalled_python is not None
     )
-    interface_raw = bytes(request.package_interface)
     _verify_control_inventory(inventory, python, base)
     _verify_inventory_python(inventory, python)
     python, base = _select_python(
@@ -173,8 +172,8 @@ def prepare_package_set(
         tensorfs_root=tensorfs_root,
         install_root=install_root,
         python=python,
-        interface=lambda installed, distribution: (
-            interface_raw or _installed_interface(installed, distribution, artifact_cache, describe)
+        interface=lambda installed, distribution: _installed_interface(
+            installed, distribution, artifact_cache, describe
         ),
         verified=verified,
         job_plan_root=job_plan_root,
@@ -190,60 +189,39 @@ def _installed_interface(
     artifact_cache: Path,
     describe: Callable[[package_environment.InstalledEnvironment, str], bytes] | None,
 ) -> bytes:
-    """The installed package's interface, with one sandbox import only on a cache miss."""
-    identity = canonical.digest(
-        {
-            "environment": installed.content_digest,
-            "distribution": distribution,
-            "schema": package_interface.SCHEMA,
-        }
-    ).removeprefix("sha256:")
-    root = artifact_cache / "installed-interfaces"
-    cached = root / identity
-    if cached.exists():
-        raw = _read_file(cached, canonical.DOC_MAX_BYTES)
+    """Read the interface from this installed environment, never a host SDK snapshot."""
+    candidates = [
+        item
+        for item in importlib.metadata.distributions(path=[str(installed.site_packages)])
+        if _DISTRIBUTION.sub("-", item.metadata["Name"]).lower() == distribution
+    ]
+    if len(candidates) != 1:
+        raise PreparationRefusal(
+            "package_prepare_interface_missing",
+            f"installed distribution {distribution!r} is absent or ambiguous",
+        )
+    metadata = [
+        Path(str(candidates[0].locate_file(row)))
+        for row in candidates[0].files or ()
+        if str(row).endswith(".dist-info/package-interface.json")
+    ]
+    if len(metadata) > 1:
+        raise PreparationRefusal(
+            "package_prepare_interface_invalid", f"{distribution!r} has multiple interfaces"
+        )
+    if metadata:
+        raw = _read_file(metadata[0], canonical.DOC_MAX_BYTES)
+    elif describe is not None:
+        raw = describe(installed, distribution)
     else:
-        candidates = [
-            item
-            for item in importlib.metadata.distributions(path=[str(installed.site_packages)])
-            if _DISTRIBUTION.sub("-", item.metadata["Name"]).lower() == distribution
-        ]
-        if len(candidates) != 1:
-            raise PreparationRefusal(
-                "package_prepare_interface_missing",
-                f"installed distribution {distribution!r} is absent or ambiguous",
-            )
-        metadata = [
-            Path(str(candidates[0].locate_file(row)))
-            for row in candidates[0].files or ()
-            if str(row).endswith(".dist-info/package-interface.json")
-        ]
-        if len(metadata) > 1:
-            raise PreparationRefusal(
-                "package_prepare_interface_invalid", f"{distribution!r} has multiple interfaces"
-            )
-        if metadata:
-            raw = _read_file(metadata[0], canonical.DOC_MAX_BYTES)
-        elif describe is not None:
-            raw = describe(installed, distribution)
-        else:
-            raise PreparationRefusal(
-                "package_prepare_interface_missing",
-                f"{distribution!r} has no installed interface and no sandbox describe is available",
-            )
+        raise PreparationRefusal(
+            "package_prepare_interface_missing",
+            f"{distribution!r} has no installed interface and no sandbox describe is available",
+        )
     try:
         package_interface.read_bytes(raw, "installed package interface")
     except package_interface.StalePackageInterface as exc:
         raise PreparationRefusal("package_prepare_interface_invalid", str(exc)) from exc
-    if not cached.exists():
-        digest, _length = _stage(artifact_cache, raw)
-        root.mkdir(parents=True, exist_ok=True, mode=0o755)
-        root.chmod(0o755)
-        try:
-            os.link(artifact_cache / digest.removeprefix("sha256:"), cached)
-        except FileExistsError:
-            if _read_file(cached, canonical.DOC_MAX_BYTES) != raw:
-                raise PreparationRefusal("package_prepare_cache_conflict", identity) from None
     return raw
 
 
