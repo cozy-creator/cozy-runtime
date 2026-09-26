@@ -1154,6 +1154,8 @@ class Worker:
         self.engine.boot_id = self.fence.worker_boot_id
         from cozy_runtime.internal.worker.calls import Calls
 
+        self.model_transfer_lock = threading.Lock()
+        self.model_transfers: dict[str, threading.Lock] = {}
         self.calls = Calls(
             self.send,
             lambda: self.fence.control_stream_epoch,
@@ -1161,6 +1163,7 @@ class Worker:
             workspace=self.workspace,
             owner=lambda: self.fence.record_owner_id,
             local=self._machine_call,
+            prefetch=self._machine_prefetch,
             installed_bindings=self._installed_call_bindings,
         )
         from .machine_calls import Calls as MachineCalls
@@ -2043,6 +2046,14 @@ class Worker:
         if self.executions is None:
             raise ValueError("worker has no execution workspace")
         return self.executions, owner
+
+    def _machine_prefetch(self, attempt: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
+        if self.executions is None or not self.executions.owns(
+            self.fence.record_owner_id, attempt.request_id
+        ):
+            return {"ok": True, "scheduled": False}
+        assert self.machine_calls is not None
+        return self.machine_calls.serving.prefetch(attempt, frame)
 
     def _machine_call(
         self, attempt: AttemptRecord, request: pb.ChildCallRequest, action: str

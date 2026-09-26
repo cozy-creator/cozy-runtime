@@ -93,6 +93,9 @@ def active_work(worker: Worker) -> bool:
     the reporter must keep telling the supervisor that preparation is active.
     An unacknowledged outcome remains in ``in_flight`` but is not active work.
     """
+    calls = getattr(worker, "machine_calls", None)
+    if calls is not None and calls.serving.preparations.active():
+        return True
     if worker.preparation_lock.locked():
         return True
     placements = [worker.placement, *(h.placement for h in tuple(worker.hosted.values()))]

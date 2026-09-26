@@ -30,7 +30,7 @@ from cozy_runtime.author._assets import (
 )
 from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
-from cozy_runtime.author._calls import ChildCallError, PendingCall, invocable
+from cozy_runtime.author._calls import ChildCallError, PendingCall, invocable, prefetch
 from cozy_runtime.author._capture import (
     ActivationCapture,
     ActivationCaptureResult,
@@ -294,6 +294,7 @@ __all__ = [
     "describe",
     "invocable",
     "invoke",
+    "prefetch",
     "prepare",
     "publish_release",
     "register_adapter",

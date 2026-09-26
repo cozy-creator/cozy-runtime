@@ -1568,7 +1568,7 @@ class AttemptEngine:
             from cozy_runtime.internal.worker.tree_members import project
 
             return project(self.calls, attempt, frame)
-        if kind in ("child_call", "child_poll", "child_cancel", "child_forget"):
+        if kind in ("child_call", "child_poll", "child_cancel", "child_forget", "model_prefetch"):
             if self.calls is None:
                 return {
                     "ok": False,

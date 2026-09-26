@@ -13,6 +13,7 @@ from typing import Any, Concatenate, ParamSpec, TypeVar, cast, overload
 import msgspec
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
 from cozy_runtime.author._capture import ActivationCapture, ExecutionObservation
 from cozy_runtime.author._context import Context
@@ -169,6 +170,50 @@ def invocable[**P, R](
 def _export(fn: Callable[..., object]) -> _Export | None:
     value = getattr(fn, "_cozy_export", None)
     return value if isinstance(value, _Export) else None
+
+
+def prefetch(
+    callee: Callable[..., object],
+    *,
+    models: Mapping[str, ModelArtifact | None] | None = None,
+) -> None:
+    """Prepare a known next call's models while current work runs.
+
+    This optional hint downloads and checks only the selected models, without
+    invoking the callable or reserving GPU memory. Omitted models use the same
+    captured defaults as a later ordinary call. No future media inputs are needed.
+    Preparation failures are observed when those models are actually invoked.
+    """
+    broker = _current.get()
+    if broker is None or broker.closed or broker.context is None:
+        raise CapabilityError("model prefetch has no admitted attempt", code="child_broker_absent")
+    broker.context.raise_if_cancelled()
+    module, name = getattr(callee, "__module__", ""), getattr(callee, "__name__", "")
+    if not callable(callee) or (module, name) not in broker.bindings:
+        raise CapabilityError("prefetch needs an exact locked callable", code="child_undeclared")
+    selected = {} if models is None else dict(models)
+    if any(
+        not isinstance(k, str) or (v is not None and not isinstance(v, ModelArtifact))
+        for k, v in selected.items()
+    ):
+        raise ConformanceError(
+            "prefetch models require named ModelArtifact values", code="child_arguments"
+        )
+    payload = canonical_json.encode(msgspec.to_builtins(selected))
+    if len(payload) > MAX_CALL_BYTES:
+        raise CapabilityError("model prefetch exceeds inline bound", code="child_payload_bound")
+    answer = broker.exchange(
+        "model_prefetch", {"module": module, "export": name, "payload": payload.decode()}
+    )
+    # An older/nonlocal worker can decline an optional optimization. Normal calls
+    # retain their ordinary demand preparation path.
+    if not answer.get("ok") and answer.get("code") not in (
+        "model_prefetch_unsupported",
+        "weights_host_unavailable",
+        "weights_operation_unknown",
+        "unknown_durable_request",
+    ):
+        broker._check(answer, 0)
 
 
 @dataclass(frozen=True, slots=True)
