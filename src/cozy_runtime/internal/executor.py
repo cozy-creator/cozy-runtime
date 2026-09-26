@@ -55,7 +55,7 @@ from typing import Any
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.author._assets import GrantedInput, InputMetadata
 from cozy_runtime.author._capture import ActivationCapture
-from cozy_runtime.author._context import Device
+from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._errors import CapabilityError, Outcome, classify
 from cozy_runtime.author._invoke import (
     Invocation,
@@ -1939,7 +1939,20 @@ class Executor:
                 {name: tuple(r.key for r in checkpoints[name].rows(name)) for name in present}
             )
             stage("lease_acquire")
-            model = registry.acquire(binding["model_binding_path"], model_cls, artifact)
+            adapter_rows = tuple(
+                AdapterRef(
+                    ref=str(row.get("model_id", row.get("ref", ""))),
+                    scale=float(row.get("scale", 1.0)),
+                    kind=str(row.get("kind", "lora")),
+                    component=str(row.get("component", "")),
+                    source_component=str(row.get("source_component", "")),
+                    family=str(row.get("family", "")),
+                )
+                for row in binding.get("adapters", ())
+            )
+            model = registry.acquire(
+                binding["model_binding_path"], model_cls, artifact, adapters=adapter_rows
+            )
             stage("construct_and_fill")
             optimization = apply_anima_execution_plan(
                 model,

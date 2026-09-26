@@ -333,6 +333,7 @@ class ModelBinding:
     model: str = ""
     """`org/name@release/lane` — the checkpoint's catalog name, for the one line a person
     reads when the code does not fit it (model-code-fit §3). Resolution, never identity."""
+    adapters: tuple[Mapping[str, Any], ...] = ()
 
     def snapshot_for(self, component: str) -> str:
         return self.snapshots.get(component, self.reference_snapshot)
@@ -349,6 +350,7 @@ class ModelBinding:
             "steps_basis": self.steps_basis,
             "model_weight_bytes": self.model_weight_bytes,
             "custody": self.custody,
+            "adapters": [dict(row) for row in self.adapters],
         }
 
 
