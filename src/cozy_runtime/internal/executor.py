@@ -97,7 +97,13 @@ from cozy_runtime.internal.parallel.plan import (
     rank_invariant_digest,
 )
 from cozy_runtime.internal.residency import Construction, ConstructionArbiter, ResidencyRefusal
-from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError, connect
+from cozy_runtime.internal.seam import (
+    EXECUTOR_PROTOCOL_REVISION,
+    RESULT_DOCUMENT,
+    Channel,
+    SeamError,
+    connect,
+)
 from cozy_runtime.internal.worker.plan import shape_cell
 from cozy_runtime.protocol import documents
 
@@ -571,7 +577,9 @@ class Executor:
         if not distribution or not output.is_absolute():
             return {"ok": False, "code": "package_prepare_path_invalid", "detail": "paths"}
         application = str(command.get("application", ""))
-        discovered = discover_installed(application) if application else discover_distribution(distribution)
+        discovered = (
+            discover_installed(application) if application else discover_distribution(distribution)
+        )
         body = package_interface.build(discovered)
         raw = package_interface.canonical_bytes(body)
         with output.open("xb") as stream:
@@ -3426,7 +3434,9 @@ class Executor:
             generated = interface_wheel.generate(package_interface.canonical_bytes(document))
             source = generated.get(module.replace(".", "/") + "/__init__.py")
             if source is None:
-                raise CapabilityError("installed dependency export is absent", code="child_interface")
+                raise CapabilityError(
+                    "installed dependency export is absent", code="child_interface"
+                )
             companion_name = module + "._cozy_runtime_callers"
             companion = ModuleType(companion_name)
             sys.modules[companion_name] = companion
@@ -3453,7 +3463,11 @@ class Executor:
             )
         bindings: dict[tuple[str, str], _CallType] = {}
         for row in rows:
-            interface, module, export = row.get("interface_digest", ""), row["module"], row["export"]
+            interface, module, export = (
+                row.get("interface_digest", ""),
+                row["module"],
+                row["export"],
+            )
             if row.get("native_source"):
                 from cozy_runtime.internal import source_interfaces
 
@@ -3519,16 +3533,19 @@ class Executor:
                 bindings[(module, export)] = binding
             else:
                 imported = importlib.import_module(module)
-                from cozy_runtime.author._calls import _export
                 from cozy_runtime.author._app import Registration
+                from cozy_runtime.author._calls import _export
 
                 function = getattr(imported, export, None)
                 declared = _export(function) if callable(function) else None
                 if declared is not None:
                     surface = Registration(
-                        name=export, kind=row.get("kind", "job"),
-                        fn=declared.implementation, invocable=True,
-                        memoize=declared.memoize, model_defaults=declared.defaults,
+                        name=export,
+                        kind=row.get("kind", "job"),
+                        fn=declared.implementation,
+                        invocable=True,
+                        memoize=declared.memoize,
+                        model_defaults=declared.defaults,
                     ).surface
                     request_type, result_type = surface.payload_type, surface.result_type
                     if not (
@@ -3537,12 +3554,16 @@ class Executor:
                         and isinstance(result_type, type)
                         and issubclass(result_type, msgspec.Struct)
                     ):
-                        raise CapabilityError("invocable types are not structured", code="child_interface")
+                        raise CapabilityError(
+                            "invocable types are not structured", code="child_interface"
+                        )
                     binding = _CallType("", module, export, request_type, result_type)
                 else:
                     generated_binding = getattr(imported, "__cozy_bindings__", {}).get(export)
                     if not isinstance(generated_binding, _CallType):
-                        raise CapabilityError("installed export is not invocable", code="child_interface")
+                        raise CapabilityError(
+                            "installed export is not invocable", code="child_interface"
+                        )
                     binding = generated_binding
                 # Source-preserving caller wheels retain ordinary @invocable job
                 # wrappers, whose lookup is by their exact module/export pair.
@@ -4045,6 +4066,7 @@ def main(argv: list[str] | None = None) -> int:
                     "python_abi": (sys.implementation.cache_tag or "").replace("cpython-", "cp"),
                     "python_executable": sys.executable,
                     "runtime_version": RUNTIME_VERSION,
+                    "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
                     "pgid": os.getpgrp(),
                     "no_new_privs": _proc_status("NoNewPrivs"),
                     "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),

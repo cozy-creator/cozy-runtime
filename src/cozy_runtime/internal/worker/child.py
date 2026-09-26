@@ -42,7 +42,13 @@ from cozy_runtime.internal.child_env import (
     EXECUTOR_SCOPE_ENV,
     FLASH_ATTENTION_CACHE_ENABLED_ENV,
 )
-from cozy_runtime.internal.seam import Channel, DescriptorReply, SeamError, listener
+from cozy_runtime.internal.seam import (
+    EXECUTOR_PROTOCOL_REVISION,
+    Channel,
+    DescriptorReply,
+    SeamError,
+    listener,
+)
 from cozy_runtime.internal.worker.plan import PreparedModel
 
 #: The grace budget: long enough for the longest uninterruptible kernel plus one loop step,
@@ -104,28 +110,36 @@ class ExecutorGone(Exception):
         self.status = status
 
 
-class ExecutorRuntimeMismatch(ExecutorGone):
-    """The executor imported another cozy-runtime than this worker's: their private
-    command protocol is not versioned, so the spawn is refused before any command."""
+class ExecutorProtocolMismatch(ExecutorGone):
+    """Only this executor is refused before dispatch when its IPC is unsupported."""
 
-    code = "executor_runtime_mismatch"
+    code = "executor_protocol_incompatible"
 
 
-def require_same_runtime(hello: dict[str, Any]) -> None:
-    from packaging.version import InvalidVersion, Version
+def require_executor_protocol(hello: dict[str, Any]) -> None:
+    revision = hello.get("executor_protocol_revision")
+    if revision is None:
+        # v0.18.33 predates the hello field but uses the reviewed revision-1
+        # command/reply contract. Older unknown implementations are not inferred
+        # compatible from their package name or from a missing field.
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import InvalidVersion, Version
 
-    executor = hello.get("runtime_version") or "unknown (its hello predates the handshake)"
-    try:
-        compatible = Version(executor).public == Version(RUNTIME_VERSION).public
-    except (InvalidVersion, TypeError):
-        compatible = False
-    if not compatible:
-        raise ExecutorRuntimeMismatch(
-            f"executor_runtime_mismatch: the executor at {hello.get('python_executable')} runs "
-            f"cozy-runtime {executor}; this worker runs {RUNTIME_VERSION}. "
-            "The internal executor protocol requires the same public Runtime release; "
-            "local development build labels may differ."
-        )
+        try:
+            legacy = Version(str(hello.get("runtime_version", "")))
+            if legacy in SpecifierSet(">=0.18.33,<0.18.34"):
+                revision = 1
+        except InvalidVersion:
+            pass
+    if type(revision) is int and revision == EXECUTOR_PROTOCOL_REVISION:
+        return
+    raise ExecutorProtocolMismatch(
+        f"executor_protocol_incompatible: the executor at {hello.get('python_executable')} "
+        f"declares protocol {revision!r}; this worker supports {EXECUTOR_PROTOCOL_REVISION}. "
+        f"Executor Runtime {hello.get('runtime_version', 'unknown')}, "
+        f"worker Runtime {RUNTIME_VERSION}. "
+        "Reprepare this executor with a compatible protocol implementation."
+    )
 
 
 @dataclass(slots=True)
@@ -923,7 +937,7 @@ class ExecutorSupervision:
                     f"{spawned.seal_digest}; received pid {executor.hello.get('pid')}, "
                     f"parent {executor.hello.get('ppid')}"
                 )
-            require_same_runtime(executor.hello)
+            require_executor_protocol(executor.hello)
             executor.ready_at = time.perf_counter()
             exit_published = self._start_exit_watcher(executor)
             self.current = executor

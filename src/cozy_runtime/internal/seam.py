@@ -35,6 +35,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
+#: Worker/executor command-and-reply compatibility, independent of SDK package
+#: version or source build. Compatible additive fields keep this revision; only
+#: an incompatible change to required commands/semantics raises it.
+EXECUTOR_PROTOCOL_REVISION = 1
+
 #: Frames are control. 64 KiB is generous for a payload document and small enough that a
 #: caller trying to move tensors or media through here fails immediately.
 MAX_FRAME = 64 * 1024
