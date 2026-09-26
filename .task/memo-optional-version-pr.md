@@ -1,0 +1,7 @@
+`@invocable(memoize=True)` silently ran uncached unless its author also supplied a manual `memo_version`; declaring helper dependencies without a version was rejected. Ordinary Python operations now derive their identity from the callee AST by default, and declared helpers work without a manual version. An optional version remains a salt for external behavior; empty and omitted salts agree. Unavailable source still disables reuse without refusing valid execution.
+
+The identity remains independent of caller edits and installation IDs. Focused tests build real authored modules and interfaces, compare production computation keys, and execute the functions: caller edits preserve the key, callee/helper edits invalidate it, explicit salts differ, and opaque-source functions still run. Two stale test-only calls were updated to the current interface-builder/broker API.
+
+Validation: all five new regressions failed on the baseline; 25 focused memo/interface/static tests pass after the fix. Ruff and focused mypy pass (existing generated protobuf stub diagnostics excluded only in external qualification config). No native build, broad suite, live Runtime, rental, or CLI/daemon changes.
+
+The [first-party helper inventory](.task/memo-helper-inventory.md) is an explicit qualification gap: sixteen managed wrappers plus Eval's serving quality entrypoint still have uncovered helper/resource behavior. This change does not prove their invalidation safety or the complete operation-memoization matrix.
