@@ -1,0 +1,9 @@
+{
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.12",
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": ["src","checks","tests","examples","scripts","research"],
+  "extraPaths": ["src","checks","tests","scripts"],
+  "exclude": ["src/cozy/worker/v1/worker_pb2.py","src/cozy/worker/v1/worker_pb2_grpc.py","src/cozy_runtime/models/qwen_image21/upstream"]
+}

@@ -81,7 +81,7 @@ wheel.py-api = "cp312"
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "checks", "tests", "examples"]
+files = ["src", "checks", "tests", "examples", "scripts", "research"]
 # The bindings live under the PROTO PACKAGE PATH (`src/cozy/worker/v1`) and are PEP 420
 # namespace packages — no `__init__.py`, because protoc writes none and the copy is
 # byte-identical. mypy needs the source roots stated for that, or it maps
@@ -96,6 +96,10 @@ mypy_path = "src:checks:tests:examples/marco-polo:tests/testdata/static_describe
 # `protocol/documents.py` beside them is hand-written and IS checked.
 exclude = "src/cozy/worker/v1/worker_pb2|src/cozy_runtime/models/qwen_image21/upstream"
 strict = true
+show_error_codes = true
+warn_unused_configs = true
+enable_error_code = ["ignore-without-code"]
+follow_imports = "silent"
 warn_unreachable = true
 disallow_any_generics = true
 implicit_reexport = false
@@ -119,9 +123,8 @@ ignore_missing_imports = true
 # `tensorfs` is tfs-007's compiled facade. It SHIPS type information (`py.typed` plus a
 # hand-written `_ext.pyi`), so this is not a case of an untyped dependency. The development
 # environment installs it for model-bound Runtime tests; the base package still does not.
-[[tool.mypy.overrides]]
-module = ["tensorfs", "tensorfs.*"]
-ignore_missing_imports = true
+# TensorFS is a typed first-party dependency of the checking environment.
+# Missing or stale facade/native stubs must fail the check.
 
 # `corpus/` is the adversarial corpus and the real-torch H3 fixture. Checking it here would
 # be checking torch-shaped code against a torch that is not installed, which produces

@@ -32,6 +32,8 @@ jobs:
       # --locked: fail loudly if uv.lock drifts from pyproject.toml instead of
       # silently resolving versions nothing ever saw.
       - run: uv sync --locked
+      - name: Strict types for the exact release source
+        run: sh scripts/typecheck.sh
       - name: Fences
         run: uv run python checks/architecture.py
 
