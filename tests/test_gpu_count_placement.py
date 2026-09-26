@@ -29,3 +29,45 @@ def test_counted_group_cannot_exceed_granted_pool_even_on_a_larger_host():
         machine_lanes.replica(
             worker, "owner", {}, [{"sequence_parallel": {"degrees": [2, 4]}}], [{"gpus": 2}]
         )
+
+
+def test_counted_capture_needs_feature63_but_old_capture_accepts62():
+    import copy
+
+    import pytest
+
+    from cozy_runtime.internal.worker import machine_model_defaults
+    from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+    from cozy_runtime.protocol import worker_pb2 as pb
+
+    row = {
+        "callee_installation_id": "installed",
+        "entrypoint": "run",
+        "parameter": "model",
+        "public_origin": "https://hub.example",
+        "rungs": [
+            {
+                "gpu": "H100",
+                "repository": "proof/h3",
+                "manifest": {"digest": "sha256:" + "a" * 64, "length": 1},
+            }
+        ],
+    }
+    capture = {
+        "bindings": [{"callee_installation_id": "installed", "entrypoint": "run"}],
+        "model_defaults": [row],
+    }
+    interfaces = {
+        "installed": {"entrypoints": [{"name": "run", "models": [{"path": "run.models.model"}]}]}
+    }
+    worker = SimpleNamespace(config=SimpleNamespace(bootstrap_credential=""))
+    request = pb.MachineExecutionSubmit(claim=pb.Claim(wire_minor=62))
+    machine_model_defaults.verify(worker, request, capture, interfaces)
+    row["rungs"][0]["gpus"] = 2
+    second = copy.deepcopy(row["rungs"][0])
+    second["gpus"] = 4
+    row["rungs"].append(second)
+    with pytest.raises(WorkspaceRefusal, match="require wire63"):
+        machine_model_defaults.verify(worker, request, capture, interfaces)
+    request.claim.wire_minor = 63
+    machine_model_defaults.verify(worker, request, capture, interfaces)
