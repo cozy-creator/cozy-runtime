@@ -11,7 +11,7 @@ import sys
 import tarfile
 import uuid
 from contextlib import contextmanager
-from collections.abc import Iterator
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import NotRequired, TypedDict
@@ -209,14 +209,14 @@ def open_existing_environment(
     python: Path, installation_id: str, *, package: str = "", release: str = "",
 ) -> InstalledEnvironment:
     """Adopt a normal same-user uv venv for its invocation lifetime."""
-    from cozy_runtime.internal.package_environment import _interpreter_layout
+    from cozy_runtime.internal.package_environment import interpreter_layout
 
     if not _ID.fullmatch(installation_id) or not python.is_absolute():
         raise EnvironmentRefusal("package_installation_invalid", "invalid local installation")
     generation = python.parent.parent
     if not (generation / "pyvenv.cfg").is_file():
         raise EnvironmentRefusal("package_installation_invalid", "a uv virtual environment is required")
-    layout = _interpreter_layout(python)
+    layout = interpreter_layout(python)
     site = Path(layout["purelib"])
     if layout["prefix"] != str(generation) or not site.is_relative_to(generation):
         raise EnvironmentRefusal("package_installation_invalid", "Python does not belong to its venv")
@@ -228,8 +228,8 @@ def retain_environment(
 ) -> InstalledEnvironment:
     """Retain the Runtime package's existing uv environment without copying its files."""
     identifier = "install-" + uuid.uuid4().hex
-    from cozy_runtime.internal.package_environment import _interpreter_layout
-    layout = _interpreter_layout(python)
+    from cozy_runtime.internal.package_environment import interpreter_layout
+    layout = interpreter_layout(python)
     held = InstalledEnvironment(identifier, Path(layout["prefix"]), Path(layout["purelib"]),
                                 python, package, release, True)
     directory = _directory(root, identifier)
@@ -242,7 +242,7 @@ def retain_environment(
 
 
 @contextmanager
-def _installation_lock(root: Path, identifier: str) -> Iterator[int]:
+def _installation_lock(root: Path, identifier: str) -> Generator[int, None, None]:
     directory = _directory(root, identifier)
     locks = directory.parent / ".locks"
     locks.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -253,16 +253,17 @@ def _installation_lock(root: Path, identifier: str) -> Iterator[int]:
             held.flush()
             held.seek(0)
             msvcrt.locking(held.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield held.fileno()
+            finally:
+                held.seek(0)
+                msvcrt.locking(held.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
             fcntl.flock(held.fileno(), fcntl.LOCK_EX)
-        try:
-            yield held.fileno()
-        finally:
-            if sys.platform == "win32":
-                held.seek(0)
-                msvcrt.locking(held.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
+            try:
+                yield held.fileno()
+            finally:
                 fcntl.flock(held.fileno(), fcntl.LOCK_UN)
 
 
