@@ -17,6 +17,7 @@ dependencies = [
     "cryptography>=45",
     "grpcio>=1.76",
     "msgspec>=0.19",
+    "numpy>=1.26",
     "packaging>=24",
     "pillow>=12",
     "protobuf>=6.31",
@@ -35,9 +36,6 @@ dev = [
     "tensorfs>=0.3.55,<0.4",
     "types-protobuf>=6.30",
     "av>=18.1,<19",
-    # `cozy_runtime.derive` is numpy code; the checking venv installs numpy so mypy checks
-    # the real array types instead of Any. The base package still declares no numpy.
-    "numpy>=1.26",
 ]
 
 [project.scripts]
