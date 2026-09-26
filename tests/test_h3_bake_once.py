@@ -15,12 +15,14 @@ def _fixture() -> tuple[Any, Any]:
     torch = pytest.importorskip("torch")
     from cozy_runtime.models.minimax_h3.turbo import LoRAFactors
 
-    torch.manual_seed(19)
     base = torch.nn.Linear(4, 3, dtype=torch.bfloat16)
     factors = LoRAFactors(4, 3, rank=2, scale=0.5)
     with torch.no_grad():
-        factors.lora_down.copy_(torch.randn_like(factors.lora_down))
-        factors.lora_up.copy_(torch.randn_like(factors.lora_up))
+        base.weight.copy_(torch.arange(12, dtype=torch.float32).reshape(3, 4).to(torch.bfloat16))
+        assert base.bias is not None
+        base.bias.copy_(torch.arange(3, dtype=torch.float32).to(torch.bfloat16))
+        factors.lora_down.copy_(torch.arange(8, dtype=torch.float32).reshape(2, 4))
+        factors.lora_up.copy_(torch.arange(6, dtype=torch.float32).reshape(3, 2))
     return base, factors
 
 
@@ -36,7 +38,7 @@ def test_bake_is_one_time_and_does_not_call_adapter_forward_path(monkeypatch: An
         raise AssertionError("a baked request must not run LoRAFactors.accumulate")
 
     monkeypatch.setattr(factors, "accumulate", fail)
-    value = torch.randn(5, 4, dtype=torch.bfloat16)
+    value = torch.arange(20, dtype=torch.float32).reshape(5, 4).to(torch.bfloat16)
     actual = baked(value)
     assert actual.shape == (5, 3)
     expected_weight = (
