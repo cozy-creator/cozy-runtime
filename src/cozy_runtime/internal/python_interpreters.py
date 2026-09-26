@@ -74,6 +74,8 @@ def available(
 ) -> tuple[Interpreter, ...]:
     """Return supported, installed interpreters in deterministic lowest-version order."""
     configured = package_python_paths()
+    if configured is not None and not configured.strip():
+        raise InterpreterRefusal("configured Python interpreter list is empty")
     candidates = (
         [Path(item) for item in configured.split(os.pathsep)]
         if configured is not None
@@ -104,13 +106,17 @@ def available(
                 rows = json.loads(found.stdout) if found.returncode == 0 else []
                 candidates.extend(
                     Path(row["path"]).absolute()
-                    for row in rows
-                    if row.get("implementation") == "cpython"
+                    for row in (rows if isinstance(rows, list) else [])
+                    if isinstance(row, dict)
+                    and row.get("implementation") == "cpython"
                     and row.get("variant") == "default"
-                    and row.get("path")
+                    and isinstance(row.get("path"), str)
+                    and row["path"]
                 )
-            except (ValueError, KeyError, TypeError) as exc:
-                raise InterpreterRefusal(f"invalid uv installed Python inventory: {exc}") from exc
+            except (ValueError, KeyError, TypeError):
+                # Optional discovery metadata cannot invalidate an executable
+                # already supplied by this host. Selection probes actual paths.
+                pass
             # Preserve installed PATH/system discovery as well as all managed patches.
             for minor in supported_minors():
                 found = subprocess.run(
@@ -138,14 +144,15 @@ def available(
     for path in candidates:
         if path.name.endswith("-config"):
             continue
-        interpreter = probe(path)
+        try:
+            interpreter = probe(path)
+        except (InterpreterRefusal, OSError):
+            # A stale sibling installation says nothing about the interpreter
+            # selected for this operation. If no usable candidate remains,
+            # select/ensure reports that requested requirement's failure.
+            continue
         minor = ".".join(interpreter.version.split(".")[:2])
         if minor not in supported_minors():
-            if configured is not None:
-                raise InterpreterRefusal(
-                    f"configured Python {interpreter.version} is outside "
-                    f"the supported window {', '.join(supported_minors())}"
-                )
             continue
         observed.setdefault(str(path.resolve()), interpreter)
     return tuple(
