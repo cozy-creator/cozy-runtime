@@ -150,18 +150,6 @@ class TensorhubOrigin:
     port: int
 
 
-# The CLOSED non-HMAC host projection of PodEnvironmentContract/1. Unknown COZY_* and
-# TENSORHUB_* names refuse; provider/image inheritance is not a configuration channel.
-WORKER_HOST_ENV = {
-    "COZY_WORKER_ID",
-    "COZY_MEDIA_INTERNAL_PORT",
-    "COZY_WORKER_LEASE_EXPIRY_UNIX",
-    "COZY_RECORD_OWNER_AUTH_JSON",
-    "COZY_WORKER_INTERNAL_PORT",
-    "COZY_STORAGE_ADMISSION_FD",
-    "TENSORHUB_OBJECT_STORAGE_HOSTS",
-}
-
 # The host starts one current control worker. Provider/image inheritance is not a config
 # channel: only these non-secret platform values survive. In particular RUNPOD/AWS/HF
 # variables never cross.
@@ -363,7 +351,7 @@ def read_worker_host_config(
     *,
     publication_authority_path: Path = host_paths.MACHINE_PUBLICATION_AUTHORITY,
 ) -> WorkerHostConfig:
-    """Read the fixed product-host handoff once; admit no extra product env name."""
+    """Read the understood product-host handoff once; ignore unused additions."""
 
     global _worker_host_read
     if _worker_host_read:
@@ -380,17 +368,9 @@ def read_worker_host_config(
             "PYTHONHOME/PYTHONPATH source injection is forbidden for the fixed worker",
             "execute the image-owned cozy-runtime-worker without source paths",
         )
-    if unknown := sorted(
-        name
-        for name in env
-        if (name.startswith("COZY_") or name.startswith("TENSORHUB_"))
-        and name not in WORKER_HOST_ENV
-    ):
-        raise ConfigError(
-            "worker_host_config",
-            f"unknown worker environment variable {unknown[0]}",
-            "use the closed five-value worker handoff",
-        )
+    # A newer host may supply settings this worker does not consume. They do
+    # not become configuration or child authority merely by existing here;
+    # WORKER_CHILD_PLATFORM_ENV remains the only inherited child projection.
 
     def required(name: str) -> str:
         value = env.get(name, "")
@@ -432,13 +412,13 @@ def read_worker_host_config(
         raise ConfigError(
             "worker_host_config", "RecordOwner auth is not JSON", "fix host launch"
         ) from exc
-    if not isinstance(record_owner_auth, dict) or set(record_owner_auth) != {
+    if not isinstance(record_owner_auth, dict) or not {
         "control_public_key_ed25519_b64url",
         "media_token_sha256",
-    }:
+    }.issubset(record_owner_auth):
         raise ConfigError(
             "worker_host_config",
-            "RecordOwner auth is not the closed control-key/media-hash record",
+            "RecordOwner auth lacks its required control-key/media-hash fields",
             "fix host launch",
         )
     public_key_text = record_owner_auth.get("control_public_key_ed25519_b64url")
