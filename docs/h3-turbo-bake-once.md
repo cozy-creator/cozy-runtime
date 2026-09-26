@@ -53,6 +53,9 @@ yet a bit-exact proof of the current per-forward BF16 rounding contract.
 
 ## Tracker issue draft
 
+Filed as [tracker #243](https://github.com/cozy-creator/tracker/issues/243); the draft below
+is kept beside the source prototype so the design boundary remains reviewable with the PR.
+
 **Title:** H3 Turbo: add capability-gated bake-once composer with request-isolated roots
 
 **Problem:** The current PDD-8 overlay installs permanent hooks and performs two adapter
