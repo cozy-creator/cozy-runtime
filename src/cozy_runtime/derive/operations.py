@@ -159,7 +159,17 @@ def _selection(structure: SourceInspection, plan: QuantizationPlan) -> ArtifactQ
     return selection
 
 
-@invocable(memoize=True)
+@invocable(
+    memoize=True,
+    memo_version="quantize/1",
+    memo_dependencies=(
+        _selection,
+        "cozy_runtime.derive.facade",
+        "cozy_runtime.derive.quantization",
+        "cozy_runtime.derive.microscale",
+        "cozy_runtime.derive.safetensors_io",
+    ),
+)
 async def quantize(
     ctx: Context,
     *,
@@ -190,7 +200,11 @@ async def quantize(
 app.job(quantize, weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),))
 
 
-@invocable(memoize=True)
+@invocable(
+    memoize=True,
+    memo_version="prepare-model/1",
+    memo_dependencies=("cozy_runtime.models.qwen_image21.ingestion",),
+)
 async def prepare_model(
     ctx: Context,
     *,

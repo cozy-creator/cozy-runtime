@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from cozy_runtime.internal import package_installation
+
 import base64
 import hashlib
 import json
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 
 from cozy_runtime.cli.io import CliError, Options, Result
@@ -52,9 +55,9 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
     package = values["--package"][0]
     release = values["--release"][0]
     try:
-        installed_environment = package_environment.open_existing_environment(
+        installed_environment = package_installation.open_existing_environment(
             environment_python,
-            canonical.digest({"locked_requirements": locked.digest}),
+            "local-" + uuid.uuid4().hex, package=package, release=release,
         )
     except package_environment.EnvironmentRefusal as exc:
         raise CliError(
@@ -102,8 +105,8 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
         cozy_home=config.cozy_home,
     )
 
-    def describe(installed: package_environment.InstalledEnvironment, distribution: str) -> bytes:
-        supervisor.use_environment(str(installed.python), installed.content_digest)
+    def describe(installed: package_installation.InstalledEnvironment, distribution: str) -> bytes:
+        supervisor.use_environment(str(installed.python), installed.installation_id)
         executor = supervisor.spawn(imposed={})
         output = supervisor.handoff(executor.epoch, INTERFACE_DOCUMENT)
         with executor.watched("describe_installed"):
@@ -121,8 +124,6 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
             raise PreparationRefusal(
                 "package_prepare_interface_failed", "package-interface output is absent"
             ) from exc
-        if reply.get("digest") != _digest(raw) or reply.get("length") != len(raw):
-            raise PreparationRefusal("package_prepare_interface_failed", "invalid reply")
         return raw
 
     try:
@@ -156,15 +157,13 @@ def prepare_local_package(config: RuntimeConfig, args: list[str], _opts: Options
 
     placement_bytes = result.placement_set.placement_set_canonical_bytes
     placement = documents.read(placement_bytes, pb.PlacementSet)["placements"][0]
-    interface_ref = placement["package_interface"]
-    staged_interface = artifact_cache / str(interface_ref["digest"]).removeprefix("sha256:")
-    interface_raw = staged_interface.read_bytes()
     return Result(
         rows=(("package", package), ("release", release)),
         document={
             "package": package,
             "release": release,
-            "package_interface": _exact(interface_raw),
+            "installation_id": result.installed_package.installation_id,
+            "package_interface": base64.b64encode(result.installed_package.package_interface).decode(),
             "placement_set": _exact(placement_bytes),
         },
     )

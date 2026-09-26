@@ -60,19 +60,16 @@ _FLOAT_TYPES = frozenset({FD.TYPE_FLOAT, FD.TYPE_DOUBLE})
 EXPLICIT_REPEATED: dict[str, tuple[str, ...]] = {
     "cozy.worker.v1.DownloadDelegation": ("models", "packages"),
     "cozy.worker.v1.Entrypoint": ("slots",),
-    "cozy.worker.v1.Environment": ("local_wheels",),
     "cozy.worker.v1.Placement": ("entrypoints", "models"),
-    "cozy.worker.v1.LocalPackageRevision": ("files",),
-    "cozy.worker.v1.MachineExecutionCapture": ("bindings", "revisions"),
+    "cozy.worker.v1.MachineExecutionCapture": ("bindings", "installed_packages"),
     "cozy.worker.v1.Slot": ("components", "stamps"),
     "cozy.worker.v1.Stamp": ("values",),
-    "cozy.worker.v1.WheelFact": ("import_roots", "tags"),
 }
 
 
 def doc_format(full_name: str) -> str:
     """The pre-release `format` tag for a document kind: `<full.Name>/1`."""
-    return f"{full_name}/1"
+    return f"{full_name}/{2 if full_name == 'cozy.worker.v1.MachineExecutionCapture' else 1}"
 
 
 class DocumentError(Exception):

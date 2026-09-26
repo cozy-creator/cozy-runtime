@@ -9,6 +9,8 @@ environment-specification, object-set, or binding documents.
 
 from __future__ import annotations
 
+from cozy_runtime.internal import package_installation
+
 import hashlib
 import time
 from collections.abc import Callable, Mapping
@@ -199,7 +201,7 @@ class HeldManifests:
 
 @dataclass(frozen=True, slots=True)
 class AcquiredPlacement:
-    installed: package_environment.InstalledEnvironment | None
+    installed: package_installation.InstalledEnvironment | None
     bindings: Mapping[str, DeclaredBinding]
     manifests: int
     documents: int
@@ -279,9 +281,9 @@ def preinstalled_development(
             "the accepted Placement does not equal the launch Runtime's local derivation",
         )
 
-    interface_digest, interface_length = placement.package_interface
-    interface_path = cache_root / interface_digest.removeprefix("sha256:")
-    _verify_file(interface_path, interface_digest, interface_length)
+    interface_path = cache_root / "installed-interfaces" / placement.installation_id / "package-interface.json"
+    interface_path.parent.mkdir(parents=True, exist_ok=True)
+    interface_path.write_bytes(placement.package_interface)
     try:
         interface = package_interface.read_bytes(interface_path.read_bytes(), str(interface_path))
     except package_interface.StalePackageInterface as exc:
@@ -342,7 +344,7 @@ class Acquirer:
         tensorfs_root: Path,
         python: Path,
         base: base_observation.Observation | None = None,
-        installed_environment: package_environment.InstalledEnvironment | None = None,
+        installed_environment: package_installation.InstalledEnvironment | None = None,
         verified_cache: VerifiedArtifactCache | None = None,
         held_manifests: HeldManifests | None = None,
         on_observation: Any = None,
@@ -441,7 +443,7 @@ class Acquirer:
 
     def _run_package(
         self, placement: Any, models: Future[int]
-    ) -> tuple[package_environment.InstalledEnvironment, Mapping[str, DeclaredBinding], int]:
+    ) -> tuple[package_installation.InstalledEnvironment, Mapping[str, DeclaredBinding], int]:
         self._thread.leg = "package"
         self.observation.start("package")
         try:
@@ -462,7 +464,7 @@ class Acquirer:
         finally:
             self.observation.finish("model")
 
-    def _environment(self, placement: Any) -> package_environment.InstalledEnvironment:
+    def _environment(self, placement: Any) -> package_installation.InstalledEnvironment:
         """Reopen the generation this placement's prepare published; move no wheel bytes.
 
         Wire 30 deletes wheel members and grants from the download path outright: a
@@ -473,54 +475,8 @@ class Acquirer:
         re-acquire package bytes.
         """
 
-        environment_digest = documents.spell(placement.environment_digest)
         try:
-            if placement.package:
-                lock = placement.environment.get("locked_requirements")
-                if not isinstance(lock, dict):
-                    raise AcquisitionRefusal(
-                        pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
-                        "environment_lock_absent",
-                        "published placement names no locked_requirements",
-                    )
-                _content, receipt_digest = package_environment.locked_identity(
-                    self.base,
-                    locked_digest=str(lock.get("digest", "")),
-                    locked_length=int(lock.get("length", 0)),
-                    environment_digest=environment_digest,
-                )
-            else:
-                package = placement.development
-                wheel_rows = [
-                    package["project_wheel"],
-                    *placement.environment.get("local_wheels", []),
-                ]
-                wheels = []
-                for row in wheel_rows:
-                    digest, _length = _ref(row["ref"], "wheel.ref")
-                    wheels.append(
-                        package_environment.Wheel(
-                            distribution=str(row.get("distribution", "")),
-                            version=str(row.get("version", "")),
-                            filename=str(row.get("filename", "")),
-                            digest=digest,
-                            length=int(row["ref"]["length"]),
-                            tags=tuple(row.get("tags", [])),
-                            owner="project" if row is wheel_rows[0] else "custom",
-                            import_roots=tuple(row.get("import_roots", [])),
-                        )
-                    )
-                receipt_digest = package_environment.wheel_receipt_digest(
-                    self.base,
-                    wheels=wheels,
-                    environment_digest=environment_digest,
-                )
-            return package_environment.open_generation(
-                self.install_root,
-                receipt_digest=receipt_digest,
-                environment_digest=environment_digest,
-                python=self.python,
-            )
+            return package_installation.open_installation(self.install_root, placement.installation_id)
         except AcquisitionRefusal:
             raise
         except (LaunchRefusal, package_environment.EnvironmentRefusal) as exc:
@@ -580,10 +536,9 @@ class Acquirer:
         return self._manifest_bytes[digest]
 
     def _bindings(self, placement: Any) -> tuple[Mapping[str, DeclaredBinding], int]:
-        interface_digest, interface_length = placement.package_interface
-        interface_path = self._stage(
-            interface_digest, self.fetch(interface_digest, interface_length).read_bytes()
-        )
+        interface_path = self.selection_root / placement.installation_id / "package-interface.json"
+        interface_path.parent.mkdir(parents=True, exist_ok=True)
+        interface_path.write_bytes(placement.package_interface)
         try:
             interface = package_interface.read_bytes(
                 interface_path.read_bytes(), str(interface_path)
@@ -594,20 +549,7 @@ class Acquirer:
             ) from exc
         visible = _visible_entrypoints(interface)
         models = {str(row["id"]): row for row in placement.models}
-        development = dict(getattr(placement, "development", {}))
-        project_wheel = development.get("project_wheel", {})
-        # Published placements carry no wheel fact at wire 30; the exact derived package
-        # interface is the code surface, so its digest is the binding's code identity.
-        package_code_digest = (
-            interface_digest
-            if placement.package
-            else str(
-                project_wheel.get("ref", {}).get("digest", "")
-                if isinstance(project_wheel, dict)
-                else ""
-            )
-            or str(development.get("source_digest", ""))
-        )
+        package_code_digest = placement.installation_id
         bindings: dict[str, DeclaredBinding] = {}
         count = 1
         for entrypoint in placement.entrypoints:
@@ -632,7 +574,7 @@ class Acquirer:
                     entrypoint_binding_digest=binding_digest,
                     entrypoint=name,
                     release=package_code_digest,
-                    environment_digest=documents.spell(placement.environment_digest),
+                    installation_id=placement.installation_id,
                     model_class="",
                     model_binding_path="",
                     model_parameter_name="",
@@ -723,7 +665,7 @@ class Acquirer:
                 entrypoint=name,
                 release=package_code_digest,
                 models=model_set,
-                environment_digest=documents.spell(placement.environment_digest),
+                installation_id=placement.installation_id,
                 model_class=first.model_class,
                 model_binding_path=first.model_binding_path,
                 model_parameter_name=first.model_parameter_name,

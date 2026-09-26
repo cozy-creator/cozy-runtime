@@ -1033,7 +1033,7 @@ class AttemptEngine:
         job = attempt.spec["job"]
         descriptor_id = str(job["job_descriptor_id"])
         binding = self.slot_of(attempt).job_binding or self.jobs.get(descriptor_id)
-        if binding is None or binding.build_id != job.get("build_id"):
+        if binding is None or binding.installation_id != job.get("installation_id"):
             raise AttemptRefusal(
                 "unknown_job_descriptor",
                 f"no job descriptor {descriptor_id[:24]}… is bound on this worker (it has "
@@ -1101,7 +1101,7 @@ class AttemptEngine:
                         "invocation_spec_digest": documents.spell(attempt.digest),
                         "plan_digest": plan_digest,
                         "job_descriptor_id": descriptor_id,
-                        "build_id": binding.build_id,
+                        "installation_id": binding.installation_id,
                         "grant_epoch": attempt.grant.credential_epoch,
                         "executor_epoch": attempt.executor_epoch,
                         "executor_pid": attempt.executor_pid,
@@ -1202,15 +1202,7 @@ class AttemptEngine:
                 f"{plan_id[:24]}… could not be loaded: {fault}",
                 cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
             )
-        if declared.development and attempt.spec.get("environment_digest"):
-            raise AttemptRefusal(
-                "development_environment_present",
-                "development execution has no published Environment identity",
-                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-            )
-        if not declared.development and (
-            attempt.spec.get("environment_digest") != declared.environment_digest
-        ):
+        if attempt.spec.get("installation_id") != declared.installation_id:
             raise AttemptRefusal(
                 "environment_mismatch",
                 "InvocationSpec does not name the selected Environment",
@@ -2533,8 +2525,8 @@ class AttemptEngine:
         return grants.PublicationReceipt(
             mode="job" if attempt.job is not None else "serving",
             grant_id=str(contract.get("grant_id", "")),
-            build_id=(
-                attempt.job.build_id
+            installation_id=(
+                attempt.job.installation_id
                 if attempt.job is not None
                 else (attempt.declared.release if attempt.declared else "")
             ),

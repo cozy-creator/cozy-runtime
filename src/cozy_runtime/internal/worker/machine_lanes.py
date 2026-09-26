@@ -69,7 +69,7 @@ def replica(
     # The replica is a placement instance, not a new package or binding. Reusing the
     # same immutable code/models on the same devices reuses its supervised executor.
     identity = canonical_json.encode(
-        [machine_capture.code_identity(placement), placement["bindings_digest"], list(ordinals)]
+        [machine_capture.installation_identity(placement), placement["bindings_digest"], list(ordinals)]
     )
     selected = dict(placement)
     selected["placement_id"] = "machine-" + hashlib.sha256(identity).hexdigest()[:32]

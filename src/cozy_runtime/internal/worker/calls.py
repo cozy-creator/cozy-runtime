@@ -56,7 +56,9 @@ class Calls:
         owner: Callable[[], str] = lambda: "",
         local: Callable[[AttemptRecord, pb.ChildCallRequest, str], pb.ChildCallResult | None]
         | None = None,
+        installed_bindings: Callable[[AttemptRecord], list[dict[str, Any]]] | None = None,
     ):
+        self.installed_bindings = installed_bindings
         self.send, self.stream, self.minor = send, stream, minor
         self.workspace, self.owner = workspace, owner
         self.local = local
@@ -65,35 +67,33 @@ class Calls:
         self.received: dict[tuple[str, int], dict[str, _Received]] = {}
         self.lock = threading.RLock()
 
-    @staticmethod
-    def bindings(attempt: AttemptRecord) -> list[dict[str, Any]]:
+    def bindings(self, attempt: AttemptRecord) -> list[dict[str, Any]]:
         if attempt.job is None:
             return []
         from cozy_runtime.internal import builtin_operations, effect_interfaces, source_interfaces
 
         result = [dict(row) for row in attempt.job.call_interfaces]
+        if self.installed_bindings is not None:
+            result.extend(self.installed_bindings(attempt))
         result.extend(source_interfaces.rows())
         result.extend(effect_interfaces.rows())
         if builtin_operations.supports_environment(attempt.job.python):
             result.extend(builtin_operations.rows())
         raw = Path(attempt.job.package_interface).read_bytes()
         interface = package_interface.read_bytes(raw)
-        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
         for entry in [*interface["jobs"], *interface["entrypoints"]]:
             declaration = entry.get("invocable")
             if declaration is not None and not any(
-                (row["interface_digest"], row["module"], row["export"])
-                == (digest, declaration["module"], declaration["export"])
-                for row in attempt.job.call_interfaces
+                (row["module"], row["export"])
+                == (declaration["module"], declaration["export"])
+                for row in result
             ):
                 # Published SDK wheels already carry their exact generated request
                 # convention. Do not replace that binding with a raw self-call shape.
                 result.append(
                     {
-                        "interface_digest": digest,
                         "module": declaration["module"],
                         "export": declaration["export"],
-                        "implementation_digest": attempt.job.build_id,
                         "interface_path": attempt.job.package_interface,
                         "self": True,
                     }
@@ -271,14 +271,12 @@ class Calls:
     def _request(
         self, attempt: AttemptRecord, frame: Mapping[str, Any], index: int
     ) -> pb.ChildCallRequest:
-        interface = str(frame.get("interface_digest", ""))
         module, export = str(frame.get("module", "")), str(frame.get("export", ""))
         allowed = next(
             (
                 row
                 for row in self.bindings(attempt)
-                if row["interface_digest"] == interface
-                and row["module"] == module
+                if row["module"] == module
                 and row["export"] == export
             ),
             None,
@@ -303,7 +301,6 @@ class Calls:
         digest = hashlib.sha256(
             canonical.write(
                 {
-                    "interface_digest": interface,
                     "module": module,
                     "export": export,
                     "request": value,
@@ -316,7 +313,6 @@ class Calls:
             parent_attempt_ordinal=attempt.attempt,
             parent_invocation_spec_digest=attempt.digest,
             call_index=index,
-            interface_digest=documents.raw(interface),
             module=module,
             export=export,
             request_canonical_bytes=payload.encode(),

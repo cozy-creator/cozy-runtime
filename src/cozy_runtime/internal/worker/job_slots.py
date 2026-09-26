@@ -23,7 +23,7 @@ class JobSlot:
             executor is not None
             and executor.reserved_for_job
             and executor.launch_python == self.binding.python
-            and executor.environment_content_digest == self.binding.environment_content_digest
+            and executor.environment_installation_id == self.binding.installation_id
             and not executor.poisoned
             and executor.alive()
         )

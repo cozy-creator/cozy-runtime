@@ -120,7 +120,6 @@ class Effects:
             intent = canonical_json.decode(call.intent)
             if (
                 intent["module"] != effect_interfaces.MODULE
-                or intent["interface_digest"] != effect_interfaces.DIGEST
             ):
                 raise PublicationRefusal("publication.interface_changed")
             client = self.authority.client(grant)

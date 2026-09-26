@@ -51,13 +51,18 @@ def invocable[**P, R](
     /,
     *,
     memoize: bool = False,
+    memo_version: str | None = None,
+    memo_dependencies: tuple[Callable[..., object] | str, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
 ) -> Callable[P, PendingCall[R]]: ...
 
 
 @overload
 def invocable[**P, R](
-    *, memoize: bool = False, defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None
+    *, memoize: bool = False,
+    memo_version: str | None = None,
+    memo_dependencies: tuple[Callable[..., object] | str, ...] = (),
+    defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None
 ) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]: ...
 
 
@@ -66,6 +71,8 @@ def invocable[**P, R](
     /,
     *,
     memoize: bool = False,
+    memo_version: str | None = None,
+    memo_dependencies: tuple[Callable[..., object] | str, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
 ) -> (
     Callable[P, PendingCall[R]]
@@ -80,17 +87,36 @@ def invocable[**P, R](
     At the call site, a Model parameter takes a retained ModelArtifact from conversion
     or derivation. The injected Model object itself belongs to its current attempt;
     it is not a portable artifact receipt and cannot be forwarded to another call.
+
+    Memoized operations declare a semantic ``memo_version`` and helper callables
+    or Python module names in ``memo_dependencies``. Their source changes invalidate
+    the operation cache. Bump the version for changes outside those sources, such
+    as native algorithms or data tables. Without a version, execution remains valid
+    and does not reuse a completed operation result.
     """
     if type(memoize) is not bool:
         raise ConformanceError(
             "invocable memoization declaration must be a boolean", code="invocable_memoize"
         )
     if fn is None:
-        return lambda target: invocable(target, memoize=memoize, defaults=defaults)
+        return lambda target: invocable(
+            target, memoize=memoize, memo_version=memo_version,
+            memo_dependencies=memo_dependencies, defaults=defaults,
+        )
     if not inspect.iscoroutinefunction(fn) or "<locals>" in fn.__qualname__:
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
+    if memo_version is not None:
+        if not memoize or not isinstance(memo_version, str) or not 1 <= len(memo_version) <= 128:
+            raise ConformanceError("memo_version needs memoize=True and a bounded version", code="invocable_memoize")
+        if not isinstance(memo_dependencies, tuple) or len(memo_dependencies) > 64 or any(
+            not callable(helper) and not isinstance(helper, str) for helper in memo_dependencies
+        ):
+            raise ConformanceError("memo_dependencies needs bounded helper definitions", code="invocable_memoize")
+        setattr(fn, "_cozy_memo_declaration", (memo_version, memo_dependencies))
+    elif memo_dependencies:
+        raise ConformanceError("memo_dependencies needs memo_version", code="invocable_memoize")
     export = _Export(fn, fn.__module__, fn.__name__, memoize, model_defaults(defaults))
 
     def proxy(*args: P.args, **kwargs: P.kwargs) -> PendingCall[R]:
@@ -108,7 +134,7 @@ def invocable[**P, R](
         capture = arguments.pop("capture", None)
         if capture is not None and not isinstance(capture, ActivationCapture):
             raise ConformanceError("capture needs ActivationCapture", code="capture_option")
-        call = broker.reserve("", export.module, export.name, arguments)
+        call = broker.reserve(export.module, export.name, arguments)
         call.capture = capture
         return cast(PendingCall[R], call)
 
@@ -186,7 +212,7 @@ class _Broker:
     def __init__(
         self,
         request_id: str,
-        bindings: Mapping[tuple[str, str, str], _CallType],
+        bindings: Mapping[tuple[str, str], _CallType],
         exchange: Callable[[str, dict[str, Any]], dict[str, Any]],
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
@@ -206,7 +232,6 @@ class _Broker:
 
     def reserve(
         self,
-        interface_digest: str,
         module: str,
         export: str,
         arguments: Mapping[str, object],
@@ -215,7 +240,7 @@ class _Broker:
         if self.closed or ctx is None or ctx.request_id != self.request_id:
             raise CapabilityError("package call escaped its attempt", code="escaped_handle")
         ctx.raise_if_cancelled()
-        binding = self.bindings.get((interface_digest, module, export))
+        binding = self.bindings.get((module, export))
         if binding is None:
             raise CapabilityError(
                 "export is not an exact locked dependency", code="child_undeclared"
@@ -374,7 +399,6 @@ class _Broker:
     def _intent(call: PendingCall[Any]) -> dict[str, Any]:
         return {
             "call_index": call.index,
-            "interface_digest": call.binding.interface_digest,
             "module": call.binding.module,
             "export": call.binding.export,
             "payload": call.payload.decode(),
@@ -405,7 +429,6 @@ _current: ContextVar[_Broker | None] = ContextVar("cozy_package_call_attempt", d
 
 
 def _invoke_proxy(
-    interface_digest: str,
     module: str,
     export: str,
     arguments: Mapping[str, object],
@@ -417,6 +440,6 @@ def _invoke_proxy(
         raise CapabilityError("package call has no admitted attempt", code="child_broker_absent")
     if capture is not None and not isinstance(capture, ActivationCapture):
         raise ConformanceError("capture needs ActivationCapture", code="capture_option")
-    call = broker.reserve(interface_digest, module, export, arguments)
+    call = broker.reserve(module, export, arguments)
     call.capture = capture
     return call

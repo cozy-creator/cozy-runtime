@@ -257,14 +257,14 @@ class Calls:
                 )
                 plan: dict[str, Any] = {
                     "kind": "job",
-                    "revision": target.revision,
+                    "installation_id": target.installation_id,
                     "entrypoint": target.entrypoint,
                     "parent_attempt": parent.attempt,
                     "computation": key.hex(),
                     "result_schema": target.declaration["result"],
                 }
-                if "runtime_builtin" in target.prepared_revision:
-                    plan["builtin_preparation"] = target.prepared_revision
+                if "runtime_builtin" in target.prepared_installation:
+                    plan["builtin_preparation"] = target.prepared_installation
                 self.journal.freeze(owner, call, canonical_json.encode(plan))
                 call = self.journal.get(owner, parent.request_id, request.call_index)
                 if key:
@@ -319,7 +319,7 @@ class Calls:
                     self.worker.calls,
                 )
                 spec = pb.InvocationSpec(
-                    environment_digest=target.prepared_revision["placement"]["environment_digest"],
+                    installation_id=target.prepared_installation["placement"]["installation_id"],
                     payload_digest=documents.spell(hashlib.sha256(payload).digest()),
                     inputs=[
                         pb.InputBinding(
@@ -335,7 +335,7 @@ class Calls:
                     ],
                     deadline_unix_ms=int(parent.spec.get("deadline_unix_ms", 0)),
                     job=pb.JobInvocationSpec(
-                        build_id=target.revision, job_descriptor_id=target.binding.job_descriptor_id
+                        installation_id=target.installation_id, job_descriptor_id=target.binding.job_descriptor_id
                     ),
                 )
                 spec.inputs.extend(model_inputs)
@@ -370,7 +370,7 @@ class Calls:
                     wire_minor=self.worker.fence.wire_minor,
                     posture=pb.POSTURE_ACCEPTING,
                     job=pb.JobDirective(
-                        build_id=target.revision,
+                        installation_id=target.installation_id,
                         job_descriptor_id=target.binding.job_descriptor_id,
                         orchestration=not bool(
                             target.declaration.get("models")
@@ -381,7 +381,7 @@ class Calls:
                 )
                 preparation = canonical_json.encode(
                     {
-                        "revisions": {target.revision: target.prepared_revision},
+                        "installations": {target.installation_id: target.prepared_installation},
                         "state": base64.b64encode(
                             desired.SerializeToString(deterministic=True)
                         ).decode(),
@@ -575,7 +575,7 @@ class Calls:
                     spec = documents.read(row["invocation"], pb.InvocationSpec)
                     if (
                         target.binding is not None
-                        and spec.get("job", {}).get("build_id") == target.revision
+                        and spec.get("job", {}).get("installation_id") == target.installation_id
                         and spec.get("job", {}).get("job_descriptor_id")
                         == target.binding.job_descriptor_id
                         and spec.get("payload_digest")

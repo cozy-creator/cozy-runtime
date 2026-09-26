@@ -73,8 +73,7 @@ def _parent(db: Journal, owner: str, call: pb.ChildCallRequest) -> None:
 def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) -> dict[str, Any]:
     call = command.parent_call
     if (
-        call.interface_digest != documents.raw(source_interfaces.DIGEST)
-        or call.module != source_interfaces.MODULE
+        call.module != source_interfaces.MODULE
         or len(call.request_canonical_bytes) > 48 << 10
     ):
         raise WorkspaceRefusal("native source call exceeds its fixed interface")

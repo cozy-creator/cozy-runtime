@@ -129,7 +129,6 @@ class Calls:
         ):
             raise WorkspaceRefusal("call arguments must be one canonical object")
         body: dict[str, Any] = {
-            "interface_digest": documents.spell(request.interface_digest),
             "module": request.module,
             "export": request.export,
             "request": value,

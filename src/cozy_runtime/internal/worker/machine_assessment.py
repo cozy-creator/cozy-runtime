@@ -77,14 +77,13 @@ def render_arguments(
     # checkpoint claim supplied by the assessment script.
     prepared = canonical_json.decode(call_prepared)
     _check(prepared.get("kind") == "serving")
-    revisions = canonical_json.decode(preparation)["revisions"]
-    _check(prepared["revision"] in revisions)
-    placement = revisions[prepared["revision"]]["placement"]
+    installations = canonical_json.decode(preparation)["installations"]
+    _check(prepared["installation_id"] in installations)
+    placement = installations[prepared["installation_id"]]["placement"]
     serving = spec["serving"]
     _check(
         serving["bindings_digest"] == placement["bindings_digest"]
-        and spec["environment_digest"] == placement["environment_digest"]
-        and placement["package_interface"]["digest"] == intent["interface_digest"]
+        and spec["installation_id"] == placement["installation_id"]
     )
     entries = [
         entry

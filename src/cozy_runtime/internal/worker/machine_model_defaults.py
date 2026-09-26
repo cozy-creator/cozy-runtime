@@ -66,7 +66,7 @@ def verify(
         raise WorkspaceRefusal("captured Model defaults require wire56")
     expected: set[tuple[str, str, str]] = set()
     for binding in capture["bindings"]:
-        revision, entrypoint = binding["callee_revision_digest"], binding["entrypoint"]
+        revision, entrypoint = binding["callee_installation_id"], binding["entrypoint"]
         for entry in interfaces[revision]["entrypoints"]:
             if entry["name"] == entrypoint:
                 expected.update(
@@ -75,9 +75,9 @@ def verify(
                 )
     keys = []
     for row in rows:
-        if not {"callee_revision_digest", "entrypoint", "parameter"} <= row.keys():
+        if not {"callee_installation_id", "entrypoint", "parameter"} <= row.keys():
             raise WorkspaceRefusal("captured Model default has no exact slot identity")
-        key = row["callee_revision_digest"], row["entrypoint"], row["parameter"]
+        key = row["callee_installation_id"], row["entrypoint"], row["parameter"]
         keys.append(key)
         rungs, unavailable = row.get("rungs", []), row.get("unavailable_code", "")
         if unavailable:
@@ -146,8 +146,8 @@ def select(
     defaults = {
         row["parameter"]: row
         for row in rows
-        if (row["callee_revision_digest"], row["entrypoint"])
-        == (target.revision, target.entrypoint)
+        if (row["callee_installation_id"], row["entrypoint"])
+        == (target.installation_id, target.entrypoint)
     }
     for parameter in sorted(missing):
         row = defaults.get(parameter)

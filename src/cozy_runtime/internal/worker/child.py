@@ -149,7 +149,7 @@ class Executor:
     sealed_devices: str = ""
     #: Frozen launch environment, independent of the supervision's next selection.
     launch_python: str = ""
-    environment_content_digest: str = ""
+    environment_installation_id: str = ""
     hello: dict[str, Any] = field(default_factory=dict)
     #: the bindings this process is DISPATCHABLE for: started, package imported; their
     #: constructions load on the attempt path
@@ -349,7 +349,7 @@ class ExecutorSupervision:
     ) -> None:
         self.root = root
         self.python = python
-        self.environment_content_digest = ""
+        self.environment_installation_id = ""
         self.jit_cache = ""
         """One worker-boot/content cache path, deleted after worker shutdown."""
         self.base_env = base_env
@@ -738,16 +738,16 @@ class ExecutorSupervision:
                 )
             return self._spawn_locked(imposed=imposed)
 
-    def use_environment(self, python: str, content_digest: str) -> bool:
+    def use_environment(self, python: str, installation_id: str) -> bool:
         """Point the executor at one package venv and node-local JIT scope."""
 
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_digest):
-            raise ExecutorGone(f"invalid package content digest for JIT cache: {content_digest!r}")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}", installation_id):
+            raise ExecutorGone(f"invalid installation ID for JIT cache: {installation_id!r}")
         with self._lifecycle:
-            if (self.python, self.environment_content_digest) == (python, content_digest):
+            if (self.python, self.environment_installation_id) == (python, installation_id):
                 return False
             self.python = python
-            self.environment_content_digest = content_digest
+            self.environment_installation_id = installation_id
             return True
 
     def _prepare_jit_cache(self) -> dict[str, str]:
@@ -760,11 +760,11 @@ class ExecutorSupervision:
         scheduler first imports its compile helpers; that post-CUDA write broke the env
         seal in local SDXL. The fresh scope fixes the ordering without inventing reuse.
         """
-        content_digest = self.environment_content_digest or f"sha256:{secrets.token_hex(32)}"
+        installation_id = self.environment_installation_id or f"executor-{secrets.token_hex(16)}"
         try:
             prepared = jit_cache.scope(
                 self.cozy_home,
-                content_digest,
+                installation_id,
                 pod_scope=self.jit_pod_scope,
                 uid=self.executor_uid,
                 gid=self.executor_gid,
@@ -886,7 +886,7 @@ class ExecutorSupervision:
                 seal_digest=spawned.seal_digest,
                 sealed_devices=spawned.env.get("CUDA_VISIBLE_DEVICES", ""),
                 launch_python=self.python,
-                environment_content_digest=self.environment_content_digest,
+                environment_installation_id=self.environment_installation_id,
                 spawned_at=started,
             )
             # Identity is checked before `current` can point at it: a stale connector is not

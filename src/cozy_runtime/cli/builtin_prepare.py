@@ -22,14 +22,13 @@ def run(
         raise CliError(
             "usage",
             "builtin-prepare requires operations",
-            "builtin-prepare operations --wheel <carrier> --out <root>",
+            "builtin-prepare operations --out <root>",
         )
-    values = _values(args[1:], {"--wheel", "--out"}, set())
-    wheel_path = Path(values["--wheel"][0]).absolute()
+    values = _values(args[1:], {"--out"}, set())
     root = Path(values["--out"][0]).absolute()
     try:
         prepared = builtin_environment.prepare(
-            wheel_path, root, capture=capture, dependency_cache=dependency_cache
+            root, dependency_cache=dependency_cache
         )
         return Result(document=prepared.document())
     except (
@@ -40,6 +39,6 @@ def run(
         raise CliError(
             str(getattr(exc, "code", "builtin_prepare")),
             str(exc),
-            "use the exact Runtime-owned carrier and an immutable installed SDK",
+            "use the Runtime installed in its ordinary uv environment",
             Exit.structural,
         ) from exc

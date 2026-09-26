@@ -2,7 +2,7 @@
 
 Upstream keys are an optimization, not a same-UID security boundary. Tensorhub guarantees one
 public trust domain per pod; private renter cross-org stacking retains its documented same-UID
-risk. Runtime scopes cache reuse to one unpredictable worker boot plus exact package content and
+risk. Runtime scopes cache reuse to one unpredictable worker boot plus an installed executor lifetime and
 deletes the whole boot scope only after worker shutdown has reclaimed the executor tree.
 """
 
@@ -18,7 +18,7 @@ from pathlib import Path
 
 from cozy_runtime.internal.child_env import JIT_CACHE_ENV
 
-_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_INSTALLATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
 
 
 class JITCacheRefusal(Exception):
@@ -33,17 +33,17 @@ class Scope:
 
 def scope(
     cozy_home: Path,
-    content_digest: str,
+    installation_id: str,
     *,
     pod_scope: str,
     uid: int = -1,
     gid: int = -1,
 ) -> Scope:
-    """Create/reuse one exact-content cache inside one trusted worker-boot scope."""
+    """Create/reuse one installation cache inside one trusted worker-boot scope."""
 
     if (
         not cozy_home.is_absolute()
-        or _DIGEST.fullmatch(content_digest) is None
+        or _INSTALLATION.fullmatch(installation_id) is None
         or not pod_scope
         or len(pod_scope) > 256
     ):
@@ -51,7 +51,7 @@ def scope(
     pod_key = hashlib.sha256(pod_scope.encode()).hexdigest()
     parent = cozy_home / "jit-cache"
     pod = parent / pod_key
-    content = pod / content_digest.removeprefix("sha256:")
+    content = pod / installation_id
     for boundary in (parent, pod):
         boundary.mkdir(parents=True, exist_ok=True, mode=0o711)
         _require_boundary(boundary)
