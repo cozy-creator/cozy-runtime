@@ -731,6 +731,7 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                     "components",
                     "model_construction_contract",
                     "stamps",
+                    "adapters",
                 },
                 "Slot",
             )
@@ -769,6 +770,20 @@ def _placement_profile(entry: dict[str, Any]) -> None:
                     raise documents.DocumentError("unknown_model", "Component.model_id")
             if len(component_names) != len(set(component_names)):
                 raise documents.DocumentError("sort_order", "Slot.components")
+            adapters = slot.get("adapters", [])
+            if not isinstance(adapters, list):
+                raise documents.DocumentError("wrong_type", "Slot.adapters")
+            for adapter in adapters:
+                row = _closed_document(
+                    adapter, {"component", "model_id", "source_component", "scale"}, "ModelAdapter"
+                )
+                _required(row, {"component", "model_id", "source_component", "scale"}, "ModelAdapter")
+                if row["model_id"] not in known_models:
+                    raise documents.DocumentError("unknown_model", "ModelAdapter.model_id")
+                _identifier(row["component"], "ModelAdapter.component")
+                _identifier(row["source_component"], "ModelAdapter.source_component")
+                if not isinstance(row["scale"], str) or not row["scale"].strip():
+                    raise documents.DocumentError("invalid_scale", "ModelAdapter.scale")
         if slot_names != sorted(set(slot_names)):
             raise documents.DocumentError("sort_order", "Entrypoint.slots")
         expected_entrypoint = (

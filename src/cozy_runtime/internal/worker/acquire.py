@@ -679,6 +679,15 @@ class Acquirer:
                         model=str(reference["repo"])
                         + (f"@{reference['version']}" if reference.get("version") else "")
                         + (f"/{reference['lane']}" if reference.get("lane") else ""),
+                        adapters=tuple(
+                            {
+                                "component": str(adapter.get("component", "")),
+                                "model_id": str(adapter.get("model_id", "")),
+                                "source_component": str(adapter.get("source_component", "")),
+                                "scale": str(adapter.get("scale", "")),
+                            }
+                            for adapter in slot.get("adapters", [])
+                        ),
                     )
                 )
             members.sort(key=lambda member: member.model_binding_path)
