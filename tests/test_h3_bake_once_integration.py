@@ -1,90 +1,96 @@
-"""Capability/refusal contract for H3 Turbo bake-once preparation."""
+"""CPU contracts for direct, request-isolated H3 Turbo activation."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
 
-def _linear_root(torch: Any) -> Any:
-    root = torch.nn.Module()
-    block = torch.nn.Module()
-    block.attn = torch.nn.Module()
-    block.attn.to_q = torch.nn.Linear(4, 4, bias=False)
-    root.transformer_blocks = torch.nn.ModuleList([block])
-    return root
-
-
-def test_filled_encoded_leaf_reports_bake_unsupported() -> None:
-    torch = pytest.importorskip("torch")
-    from cozy_runtime.models.minimax_h3.turbo import inspect_turbo_composer
-
-    class Encoded(torch.nn.Module):  # type: ignore[name-defined,misc]
-        provider = "cozy.fp8-rowwise.native-leaf/1"
-        encoding = "fp8-rowwise/1"
-
-    root = _linear_root(torch)
-    root.transformer_blocks[0].attn.to_q = Encoded()
-    capability = inspect_turbo_composer(root)
-    assert not capability.supports_bake
-    assert capability.reason_code == "turbo_bake_unsupported"
-    assert "cozy.fp8-rowwise.native-leaf/1" in capability.detail
-    assert capability.encoded_sites == (
-        "transformer_blocks.0.attn.to_q (Encoded cozy.fp8-rowwise.native-leaf/1)",
-    )
-
-
-def test_floating_root_still_refuses_until_full_graph_is_composed() -> None:
-    torch = pytest.importorskip("torch")
-    from cozy_runtime.models.minimax_h3.turbo import inspect_turbo_composer
-
-    capability = inspect_turbo_composer(_linear_root(torch))
-    assert not capability.supports_bake
-    assert capability.reason_code == "turbo_bake_unsupported"
-    assert capability.linear_sites == ("transformer_blocks.0.attn.to_q",)
-    assert "AdaLN tables" in capability.detail
-
-
-def test_bake_once_refuses_before_overlay_or_request_state_mutation() -> None:
+def _model_types() -> tuple[Any, Any]:
     pytest.importorskip("torch")
     try:
         from cozy_runtime.models.minimax_h3.model import H3TurboLoRA
+        from cozy_runtime.models.minimax_h3.official import OfficialH3TurboLoRA
     except ImportError as exc:
         pytest.skip(f"installed Diffusers does not expose the H3 API: {exc}")
-    from cozy_runtime.author import ConformanceError
-    from cozy_runtime.models.minimax_h3.turbo import TurboComposerCapability
+    return H3TurboLoRA, OfficialH3TurboLoRA
 
+
+def test_prepared_overlay_is_reused_for_a_variant() -> None:
+    _model_types()
+    from cozy_runtime.models.minimax_h3.official import OfficialH3TurboLoRA
+
+    adapter = cast(Any, OfficialH3TurboLoRA.__new__(OfficialH3TurboLoRA))
+    config = {"hidden_size": 4}
+    marker = object()
+    adapter.specs = {"fl2va": (config, None), "ref2va": (config, None)}
+    adapter.components = {"fl2va_turbo": marker, "ref2va_turbo": object()}
+    base = SimpleNamespace(
+        _dit_specs={
+            "fl2va": (config, "adaln-pruned", None),
+            "ref2va": (config, "adaln-pruned", None),
+        }
+    )
+    first = adapter.overlay(base, "fl2va")
+    second = adapter.overlay(base, "fl2va")
+    assert first is second is marker
+
+
+def test_request_state_is_restored_and_overlay_is_loaded_once() -> None:
+    H3TurboLoRA, _ = _model_types()
+
+    class State:
+        def __init__(self) -> None:
+            self.values = {"attention_kwargs": {"caller": "A"}}
+
+        def get(self, name: str) -> Any:
+            return self.values.get(name)
+
+        def set(self, name: str, value: Any) -> None:
+            self.values[name] = value
+
+    class Checks:
+        def component(self, _name: str, _root: Any) -> None:
+            return None
+
+        @contextmanager
+        def forwards(self, _root: Any, _name: str) -> Any:
+            yield
+
+    state = State()
+    checks = Checks()
+    overlay = object()
     calls: list[str] = []
-    capability = TurboComposerCapability(
-        supports_bake=False,
-        reason_code="turbo_bake_unsupported",
-        detail="encoded H3 test base cannot be composed",
-    )
+
+    def denoise(_task: str, current: State, **_kwargs: Any) -> str:
+        calls.append("denoise")
+        selected = current.get("attention_kwargs")
+        assert selected["cozy_h3_bank"] == "turbo"
+        assert selected["cozy_h3_overlay"] is overlay
+        return "done"
+
+    def load_overlay(_base: Any, _trunk: Any) -> Any:
+        calls.append("overlay")
+        return overlay
+
     adapter = cast(Any, H3TurboLoRA.__new__(H3TurboLoRA))
-    adapter.pipe = SimpleNamespace(
-        overlay=lambda *_args: calls.append("overlay"),
-    )
+    adapter.pipe = SimpleNamespace(overlay=load_overlay)
     base = SimpleNamespace(
         pipe=SimpleNamespace(
-            turbo_composer_capability=lambda _trunk: capability,
+            components={"fl2va_dit": object()},
+            denoise=denoise,
         )
     )
-    state_calls: list[str] = []
-    state = SimpleNamespace(
-        get=lambda _name: None,
-        set=lambda *_args: state_calls.append("set"),
+    result = adapter._sample(
+        base,
+        "fl2va",
+        state,
+        on_step=None,
+        cancel=None,
+        checks=checks,
+        sol_dense_steps=4,
     )
-    with pytest.raises(ConformanceError) as raised:
-        adapter._sample(
-            base,
-            "fl2va",
-            state,
-            on_step=None,
-            cancel=None,
-            checks=None,
-            sol_dense_steps=4,
-            bake_once=True,
-        )
-    assert raised.value.code == "turbo_bake_unsupported"
-    assert calls == []
-    assert state_calls == []
+    assert result == "done"
+    assert calls == ["overlay", "denoise"]
+    assert state.get("attention_kwargs") == {"caller": "A"}
