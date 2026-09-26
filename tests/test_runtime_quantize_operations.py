@@ -119,6 +119,15 @@ def test_builtin_interface_is_static_and_matches_its_actual_app() -> None:
             {},
         )
     )
+    # The installed environment supplies the implementation/native identity;
+    # the static client contract deliberately cannot supply that identity.
+    actual_jobs = actual["jobs"]
+    assert isinstance(actual_jobs, list)
+    for declaration in actual_jobs:
+        assert isinstance(declaration, dict)
+        metadata = declaration["invocable"]
+        assert isinstance(metadata, dict)
+        assert str(metadata.pop("operation_identity")).startswith("sha256:")
     assert package_interface.canonical_bytes(static) == package_interface.canonical_bytes(actual)
     jobs = static["jobs"]
     assert isinstance(jobs, list) and {row["name"] for row in jobs} == {"quantize", "prepare_model"}
