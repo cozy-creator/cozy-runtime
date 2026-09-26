@@ -336,16 +336,11 @@ def build(
     *,
     distribution: str,
     version: str,
-    implementation_digest: str,
     implementation_wheel: bytes | None = None,
     implementation_filename: str | None = None,
 ) -> tuple[str, bytes]:
-    """Package deterministic source and its exact implementation join into one wheel."""
-    if (
-        not _DISTRIBUTION.fullmatch(distribution)
-        or str(Version(version)) != version
-        or not canonical.DIGEST_RE.fullmatch(implementation_digest)
-    ):
+    """Package deterministic interface source and an optional implementation overlay."""
+    if not _DISTRIBUTION.fullmatch(distribution) or str(Version(version)) != version:
         raise ConformanceError("interface wheel binding is not exact", code="interface_binding")
     normalized = re.sub(r"[-_.]+", "_", distribution).lower()
     dist = f"{normalized}-{version}.dist-info"
@@ -373,7 +368,6 @@ def build(
         header.rstrip(b"\n")
         + (
             f"\nCozy-Interface-Generator: {GENERATOR_ABI}\n"
-            f"Cozy-Implementation-Digest: {implementation_digest}\n"
             f"Cozy-Interface-Layout: {layout}\n\n"
         ).encode()
         + description
@@ -471,7 +465,6 @@ def _overlay(
             headers.get("Cozy-Interface-Generator") != GENERATOR_ABI
             or headers.get("Cozy-Interface-Layout") != "overlay"
             or files.get(expected_dist + "/package-interface.json") != interface
-            or not canonical.DIGEST_RE.fullmatch(str(headers.get("Cozy-Implementation-Digest", "")))
         ):
             raise ConformanceError("caller wheel provenance changed", code="interface_binding")
         for target, (generated, source, suffix) in overlay_sources(interface, set(files)).items():
