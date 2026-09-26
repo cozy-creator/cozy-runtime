@@ -15,7 +15,7 @@ on:
 
 # Serialize retries for one release name; distinct versions can build independently.
 concurrency:
-  group: runtime-release-${{ inputs.release_tag || github.ref }}
+  group: runtime-release-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
