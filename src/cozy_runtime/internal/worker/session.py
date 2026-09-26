@@ -1170,6 +1170,9 @@ class Worker:
         from .machine_effects import Effects
 
         self.machine_calls = MachineCalls(self) if self.workspace is not None else None
+        from .machine_groups import Groups
+
+        self.machine_groups = Groups(self) if self.executions is not None else None
         from .machine_sources import Sources as MachineSources
 
         self.machine_sources = MachineSources(self)
@@ -2202,10 +2205,16 @@ class Worker:
             owner = self.fence.record_owner_id
             if self.machine_effects is not None:
                 self.machine_effects.drive(owner)
+            if self.machine_groups is not None:
+                self.machine_groups.refresh(owner)
             if self.machine_calls is not None:
                 self.machine_calls.drive()
             self.executions.retry_due(owner, worker_boot=self.fence.worker_boot_id)
-            for request in self.executions.pending(owner):
+            requests = self.executions.pending(owner)
+            groups = self.machine_groups
+            if groups is not None:
+                requests = tuple(sorted(requests, key=lambda request: groups.priority(owner, request)))
+            for request in requests:
                 state = self.executions.status(owner, request)
                 held = self.engine.history.get((request, state.attempt_ordinal))
                 if state.state in workspace_executions.TERMINAL:
@@ -2253,6 +2262,9 @@ class Worker:
                     continue
                 preparation = self.executions.preparation(owner, request)
                 try:
+                    if self.machine_groups is not None and not self.machine_groups.admits(owner, request, preparation):
+                        self.machine_groups.wait(owner, request, request, state.attempt_ordinal)
+                        continue
                     if preparation and not self._prepare_execution(preparation, request):
                         continue
                 except Exception as exc:

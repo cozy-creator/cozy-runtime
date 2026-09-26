@@ -127,10 +127,16 @@ class Serving:
         stage = f"{label} / {name}"[:120] if label else name
         self._progress(call, request, {"kind": "progress", "stage": stage})
         succeeded = False
+        groups = getattr(self.worker, "machine_groups", None)
+        transferring = groups is not None and name == "Downloading model weights"
+        if transferring:
+            groups.transfer(self.worker.fence.record_owner_id, call.parent_request, 1)
         try:
             yield
             succeeded = True
         finally:
+            if transferring:
+                groups.transfer(self.worker.fence.record_owner_id, call.parent_request, -1)
             self._progress(
                 call,
                 request,
@@ -236,6 +242,15 @@ class Serving:
             name: value for name, value in models.items() if name in names and value is not None
         }
         defaults = machine_model_defaults.select(self.worker, owner, call, target, models)
+        groups = getattr(self.worker, "machine_groups", None)
+        if groups is not None:
+            from .machine_lanes import degree
+
+            groups.announce(
+                owner,
+                call.parent_request,
+                degree(self.worker, target.declaration.get("models", []), defaults),
+            )
         identity = hashlib.sha256(
             canonical_json.encode(
                 {
@@ -321,10 +336,32 @@ class Serving:
         if not future.done():
             return
         prepared = None
+        keep_prepared = False
         try:
             prepared = future.result()
-            # A shared CPU preparation owns no recipient custody. Actual B retains
-            # its explicit artifacts exactly as ordinary demand preparation did.
+            from . import machine_lanes
+
+            replica = machine_lanes.replica(
+                self.worker,
+                owner,
+                prepared.placement,
+                target.declaration.get("models", []),
+                prepared.defaults,
+                parent_request=call.parent_request,
+            )
+            if replica is None:
+                keep_prepared = True
+                groups = self.worker.machine_groups
+                assert groups is not None
+                groups.wait(
+                    owner, call.child_request, call.parent_request, request.parent_attempt_ordinal
+                )
+                return
+            placement, pins = replica
+            groups = self.worker.machine_groups
+            if groups is not None:
+                groups.waiting.discard(call.child_request)
+            # Recipient custody begins only when this child can enter its GPU group.
             _, models = arguments(target, request.request_canonical_bytes)
             names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
             for name, supplied in models.items():
@@ -336,15 +373,6 @@ class Serving:
                         "input/" + name,
                         msgspec.convert(supplied, type=ModelArtifact, strict=True),
                     )
-            from . import machine_lanes
-
-            placement, pins = machine_lanes.replica(
-                self.worker,
-                owner,
-                prepared.placement,
-                target.declaration.get("models", []),
-                prepared.defaults,
-            )
             journal.check_active(owner, call)
             selected = next(
                 (entry for entry in placement["entrypoints"] if entry["name"] == target.entrypoint),
@@ -494,7 +522,8 @@ class Serving:
         finally:
             if prepared is not None:
                 prepared.access.close()
-            self.pending.pop(key, None)
+            if not keep_prepared:
+                self.pending.pop(key, None)
 
     def _prepare(
         self,

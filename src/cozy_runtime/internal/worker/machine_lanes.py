@@ -25,7 +25,9 @@ def replica(
     placement: dict[str, Any],
     models: list[dict[str, Any]],
     defaults: list[dict[str, Any]] | None = None,
-) -> tuple[dict[str, Any], list[pb.PlacementDevicePin]]:
+    *,
+    parent_request: str = "",
+) -> tuple[dict[str, Any], list[pb.PlacementDevicePin]] | None:
     """Reserve a stable replica through the durable child submission, not a GPU hint.
 
     Outstanding requests charge their selected devices, including queued preparations.
@@ -33,26 +35,10 @@ def replica(
     An explicit authored count reserves exactly that group. Earlier captures without
     a count retain the largest supported group behavior.
     """
-    requested = {row.get("gpus", 0) for row in (defaults or [])} - {0}
-    if len(requested) > 1:
-        raise WorkspaceRefusal("one serving construction has conflicting default GPU counts")
-    requested_degree = next(iter(requested), 0)
-    if requested_degree > len(worker.lanes.entries):
-        raise WorkspaceRefusal("the requested default GPU group exceeds the granted device pool")
+    selected_degree = degree(worker, models, defaults)
     if not models or not worker.lanes.wide:
         return placement, []
-    degrees = set.intersection(
-        *(set(model.get("sequence_parallel", {}).get("degrees", [])) | {1} for model in models)
-    )
     width = len(worker.lanes.entries)
-    degree = (
-        requested_degree
-        if requested_degree
-        else max((value for value in degrees if 0 < value <= width), default=width)
-    )
-    if degree not in degrees or degree > width:
-        raise WorkspaceRefusal("the requested default GPU group is not supported on this machine")
-    groups = [tuple(range(start, start + degree)) for start in range(0, width - degree + 1, degree)]
     loads = [0] * width
     executions = worker.executions
     assert executions is not None
@@ -83,7 +69,17 @@ def replica(
             for ordinal in lane.ordinals:
                 loads[ordinal] += 1
             charged.add(attempt.request_id)
-    ordinals = min(groups, key=lambda group: (sum(loads[index] for index in group), group))
+    available = tuple(range(width))
+    affinity = getattr(worker, "machine_groups", None)
+    if parent_request and affinity is not None:
+        available = affinity.available(owner, parent_request, selected_degree, loads)
+    if len(available) < selected_degree:
+        return None
+    # Additive lane load admits any free compatible set, without aligned buckets
+    # or enumerating every possible group on large machines.
+    ordinals = tuple(
+        sorted(sorted(available, key=lambda index: (loads[index], index))[:selected_degree])
+    )
     # The replica is a placement instance, not a new package or binding. Reusing the
     # same immutable code/models on the same devices reuses its supervised executor.
     identity = canonical_json.encode(
@@ -98,6 +94,34 @@ def replica(
     return selected, [
         pb.PlacementDevicePin(placement_id=selected["placement_id"], device_ordinals=ordinals)
     ]
+
+
+def degree(
+    worker: Worker, models: list[dict[str, Any]], defaults: list[dict[str, Any]] | None = None
+) -> int:
+    """Selected model capacity; planning this count never reserves a GPU."""
+    requested = {row.get("gpus", 0) for row in (defaults or [])} - {0}
+    if len(requested) > 1:
+        raise WorkspaceRefusal("one serving construction has conflicting default GPU counts")
+    requested_degree = next(iter(requested), 0)
+    if requested_degree > len(worker.lanes.entries):
+        raise WorkspaceRefusal("the requested default GPU group exceeds the granted device pool")
+    if not models:
+        return 0
+    if not worker.lanes.wide:
+        return 1
+    degrees = set.intersection(
+        *(set(model.get("sequence_parallel", {}).get("degrees", [])) | {1} for model in models)
+    )
+    width = len(worker.lanes.entries)
+    degree = (
+        requested_degree
+        if requested_degree
+        else max((value for value in degrees if 0 < value <= width), default=width)
+    )
+    if degree not in degrees or degree > width:
+        raise WorkspaceRefusal("the requested default GPU group is not supported on this machine")
+    return degree
 
 
 def compose(worker: Worker, desired: pb.DesiredWorkerState) -> pb.DesiredWorkerState | None:
