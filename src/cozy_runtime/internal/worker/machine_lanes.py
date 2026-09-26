@@ -36,7 +36,7 @@ def replica(
     a count retain the largest supported group behavior.
     """
     selected_degree = degree(worker, models, defaults)
-    if not models or not worker.lanes.wide:
+    if not models:
         return placement, []
     width = len(worker.lanes.entries)
     loads = [0] * width

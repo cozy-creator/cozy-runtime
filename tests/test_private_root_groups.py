@@ -17,7 +17,7 @@ from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.worker import machine_lanes
 from cozy_runtime.internal.worker.machine_groups import Groups, layout
 from cozy_runtime.internal.worker.session import Worker
-from cozy_runtime.internal.worker.workspace import Workspace
+from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.internal.worker.workspace_calls import Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
 from cozy_runtime.protocol import documents
@@ -98,14 +98,14 @@ def child(executions: Executions, parent: str, index: int, pins: tuple[int, ...]
     return call.child_request
 
 
-def finish(executions: Executions, request: str) -> None:
+def finish(executions: Executions, request: str, status: int = pb.OUTCOME_STATUS_SUCCEEDED) -> None:
     offer = executions.offer(OWNER, request)
     raw, identity = documents.identity(
         pb.AttemptOutcomeBody(
             request_id=request,
             attempt_ordinal=offer.attempt_ordinal,
             invocation_spec_digest=documents.spell(offer.invocation_spec_digest),
-            status=pb.OUTCOME_STATUS_SUCCEEDED,
+            status=status,
             result=pb.ResultEnvelope(inline_result=b"null"),
         )
     )
@@ -184,6 +184,99 @@ def test_two_gpu_owner_leaves_third_gpu_for_singleton_work(tmp_path: Path) -> No
     selected = machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="newer")
     assert selected is not None and list(selected[1][0].device_ordinals) == [2]
     assert groups.available(OWNER, "older", 2) == (0, 1)
+
+
+def test_singleton_parent_keeps_its_gpu_across_children_and_restart(tmp_path: Path) -> None:
+    host, groups, executions = worker(tmp_path)
+    selected = machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="older")
+    assert selected is not None and list(selected[1][0].device_ordinals) == [0]
+    first = child(executions, "older", 0, (0,))
+    finish(executions, first)
+    groups.refresh(OWNER)
+    assert groups.available(OWNER, "newer", 1) == (1,)
+    assert not groups.admits(OWNER, "newer", preparation((0,)))
+    restored = Groups(host)
+    restored.refresh(OWNER)
+    assert restored.available(OWNER, "newer", 1) == (1,)
+    later = child(executions, "older", 1, (0,))
+    assert restored.admits(OWNER, later, preparation((0,)))
+
+
+def test_one_device_worker_keeps_parent_priority_through_child_handoff(tmp_path: Path) -> None:
+    host, groups, executions = worker(tmp_path, 1)
+    selected = machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="older")
+    assert selected is not None and list(selected[1][0].device_ordinals) == [0]
+    first = child(executions, "older", 0, (0,))
+    finish(executions, first)
+    groups.refresh(OWNER)
+    assert machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="newer") is None
+    later = child(executions, "older", 1, (0,))
+    assert groups.admits(OWNER, later, preparation((0,)))
+    assert not groups.admits(OWNER, "newer", preparation((0,)))
+    assert groups.admits(OWNER, "newer", {})  # CPU orchestration remains independent.
+    finish(executions, later)
+    finish(executions, "older")
+    groups.refresh(OWNER)
+    assert machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="newer") is not None
+
+
+def test_one_device_restart_recovers_previously_unpinned_model_children(tmp_path: Path) -> None:
+    host, _, executions = worker(tmp_path, 1)
+    state = machine_lanes.state(preparation(()))
+    state.placement_set.placement_set_canonical_bytes = canonical_json.encode(
+        {"placements": [{"models": [{"id": "model"}]}]}
+    )
+    retained = {"state": base64.b64encode(state.SerializeToString()).decode()}
+    first = child(executions, "older", 0, ())
+    with executions.workspace.locked() as db:
+        db.execute(
+            "UPDATE executions SET preparation=? WHERE request=?",
+            (canonical_json.encode(retained), first),
+        )
+    finish(executions, first)
+    restored = Groups(host)
+    restored.refresh(OWNER)
+    assert not restored.admits(OWNER, "newer", retained)
+    assert restored.admits(OWNER, "older", retained)
+
+
+def test_no_hint_fanout_recovers_all_used_devices(tmp_path: Path) -> None:
+    host, _, executions = worker(tmp_path, 3)
+    children = []
+    for index in range(3):
+        selected = machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="older")
+        assert selected is not None
+        children.append(child(executions, "older", index, tuple(selected[1][0].device_ordinals)))
+    for request in children:
+        finish(executions, request)
+    restored = Groups(host)
+    restored.refresh(OWNER)
+    assert restored.available(OWNER, "newer", 1) == ()
+    assert restored.available(OWNER, "older", 1) == (0, 1, 2)
+
+
+def test_singleton_fanout_does_not_outgrow_capacity_reserved_by_older_root(tmp_path: Path) -> None:
+    host, groups, executions = worker(tmp_path, 3)
+    groups.announce(OWNER, "older", 2)
+    assert groups.available(OWNER, "older", 2) == (0, 1)
+    for index in range(2):
+        selected = machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="newer")
+        assert selected is not None and list(selected[1][0].device_ordinals) == [2]
+        child(executions, "newer", index, (2,))
+    submit(executions, "youngest")
+    assert groups.available(OWNER, "youngest", 1) == ()
+
+
+def test_group_growth_preserves_selected_device_when_another_gpu_is_busy(tmp_path: Path) -> None:
+    host, groups, executions = worker(tmp_path, 3)
+    # Existing work makes the older root initially select the middle GPU.
+    child(executions, "newer", 0, (0,))
+    selected = machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="older")
+    assert selected is not None and list(selected[1][0].device_ordinals) == [1]
+    first = child(executions, "older", 0, (1,))
+    selected = machine_lanes.replica(host, OWNER, PLACEMENT, [{}], parent_request="older")
+    assert selected is not None and list(selected[1][0].device_ordinals) == [2]
+    assert groups.admits(OWNER, first, preparation((1,)))
 
 
 @pytest.mark.parametrize("hint", [False, True])
@@ -265,6 +358,25 @@ def test_pending_child_reservation_already_has_root_priority(tmp_path: Path) -> 
     nested = child(executions, first, 0, (0,))
     assert executions.scheduling_root(OWNER, nested) == executions.scheduling_root(OWNER, "older")
     assert groups.priority(OWNER, nested) < groups.priority(OWNER, "newer")
+
+
+def test_impossible_retained_pin_refuses_instead_of_waiting_forever(tmp_path: Path) -> None:
+    _, groups, _ = worker(tmp_path, 2)
+    with pytest.raises(WorkspaceRefusal, match="granted device pool"):
+        groups.admits(OWNER, "older", preparation((0, 2)))
+
+
+@pytest.mark.parametrize("status", [pb.OUTCOME_STATUS_SUCCEEDED, pb.OUTCOME_STATUS_FAILED])
+def test_finished_root_does_not_keep_a_group_for_its_cached_models(
+    tmp_path: Path, status: int
+) -> None:
+    _, groups, executions = worker(tmp_path)
+    assert groups.available(OWNER, "older", 2) == (0, 1)
+    first = child(executions, "older", 0, (0, 1))
+    finish(executions, first)
+    finish(executions, "older", status)
+    groups.refresh(OWNER)
+    assert groups.available(OWNER, "newer", 2) == (0, 1)
 
 
 def test_actual_dispatch_defers_younger_topology_before_model_activation(tmp_path: Path) -> None:

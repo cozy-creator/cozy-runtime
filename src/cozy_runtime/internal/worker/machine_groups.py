@@ -24,15 +24,16 @@ class Root:
     claimed: bool = False
     preferred: tuple[int, ...] = ()
     downloads: int = 0
+    announced: int = 1
 
 
-def pinned(preparation: dict[str, Any]) -> tuple[int, ...]:
+def pinned(preparation: dict[str, Any], width: int = 0) -> tuple[int, ...]:
     if not preparation or not preparation.get("state"):
         return ()
     desired = machine_lanes.state(preparation)
     if desired.WhichOneof("mode") != "placement_set":
         return ()
-    return tuple(
+    group = tuple(
         sorted(
             {
                 ordinal
@@ -41,6 +42,11 @@ def pinned(preparation: dict[str, Any]) -> tuple[int, ...]:
             }
         )
     )
+    if not group and width == 1:
+        placement_set = canonical_json.decode(desired.placement_set.placement_set_canonical_bytes)
+        if any(row.get("models") for row in placement_set.get("placements", [])):
+            return (0,)
+    return group
 
 
 def layout(
@@ -51,13 +57,19 @@ def layout(
     occupied = occupied or set()
     groups = {}
     for name, root in sorted(roots.items(), key=lambda item: (item[1].accepted_ms, item[0])):
-        if not root.claimed or root.width <= 1 or root.width > len(free):
+        if not root.claimed or root.width > len(free):
             continue
         selected = root.preferred
         if len(selected) != root.width or not set(selected) <= free:
+            retained = set(selected) & free
             selected = tuple(
                 sorted(
-                    sorted(free, key=lambda ordinal: (ordinal in occupied, ordinal))[: root.width]
+                    retained
+                    | set(
+                        sorted(free - retained, key=lambda ordinal: (ordinal in occupied, ordinal))[
+                            : root.width - len(retained)
+                        ]
+                    )
                 )
             )
         groups[name] = selected
@@ -103,6 +115,7 @@ class Groups:
         with self.lock:
             root = self.roots[self.root(owner, request)]
             root.width = max(root.width, width)
+            root.announced = max(root.announced, width)
 
     def transfer(self, owner: str, request: str, change: int) -> None:
         with self.lock:
@@ -113,6 +126,7 @@ class Groups:
     def refresh(self, owner: str) -> None:
         executions = self.worker.executions
         assert executions is not None
+        width = len(self.worker.lanes.entries)
         with self.lock:
             active = executions.scheduling_roots(owner)
             changed_owner = owner != self.owner
@@ -132,20 +146,23 @@ class Groups:
                 self.roots.setdefault(name, Root(accepted))
             if fresh:
                 for name, raw in executions.scheduling_history(owner):
-                    group = pinned(canonical_json.decode(raw))
+                    group = pinned(canonical_json.decode(raw), width)
                     record = self.roots.get(name)
                     if record is None:
                         continue
-                    if group and len(group) >= record.width:
-                        record.width, record.preferred, record.claimed = len(group), group, True
+                    if group:
+                        record.preferred = tuple(sorted(set(record.preferred) | set(group)))
+                        record.width = max(record.width, len(record.preferred))
+                        record.announced = max(record.announced, len(group))
+                        record.claimed = True
             self.recovered = True
             self.busy.clear()
             self.occupied.clear()
             for request in executions.pending(owner):
                 preparation = executions.preparation(owner, request)
                 desired = machine_lanes.state(preparation) if preparation else None
-                self.occupied.update(pinned(preparation))
-                if pinned(preparation) or (
+                self.occupied.update(pinned(preparation, width))
+                if pinned(preparation, width) or (
                     desired is not None
                     and desired.WhichOneof("mode") == "job"
                     and not desired.job.orchestration
@@ -182,6 +199,22 @@ class Groups:
             name = self.root(owner, parent)
             root = self.roots[name]
             root.width = max(root.width, degree)
+            root.announced = max(root.announced, degree)
+            if loads is not None and root.announced == 1:
+                executions = self.worker.executions
+                assert executions is not None
+                capacity = len(loads) - sum(
+                    other.width
+                    for other_name, other in self.roots.items()
+                    if other.claimed and (other.accepted_ms, other_name) < (root.accepted_ms, name)
+                )
+                used = {
+                    ordinal
+                    for request in executions.pending(owner)
+                    if self.root(owner, request) == name
+                    for ordinal in pinned(executions.preparation(owner, request), len(loads))
+                }
+                root.width = max(root.width, min(capacity, len(used) + degree))
             root.claimed = True
             self.busy.add(name)
             occupied = (
@@ -200,9 +233,15 @@ class Groups:
             return tuple(sorted(available))
 
     def admits(self, owner: str, request: str, preparation: dict[str, Any]) -> bool:
-        group = pinned(preparation)
+        group = pinned(preparation, len(self.worker.lanes.entries))
         if not group:
             return True
+        if any(ordinal >= len(self.worker.lanes.entries) for ordinal in group):
+            raise WorkspaceRefusal("retained GPU group exceeds the granted device pool")
+        with self.lock:
+            root = self.roots[self.root(owner, request)]
+            if not root.claimed:
+                root.preferred = group
         allowed = self.available(owner, request, len(group))
         admitted = set(group) <= set(allowed)
         if admitted:
