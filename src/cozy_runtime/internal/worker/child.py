@@ -119,15 +119,15 @@ class ExecutorProtocolMismatch(ExecutorGone):
 def require_executor_protocol(hello: dict[str, Any]) -> None:
     revision = hello.get("executor_protocol_revision")
     if revision is None:
-        # v0.18.33 predates the hello field but uses the reviewed revision-1
-        # command/reply contract. Older unknown implementations are not inferred
-        # compatible from their package name or from a missing field.
+        # Older Runtime releases predate the hello field but use the reviewed
+        # revision-1 command/reply contract. Do not require patch-level lockstep;
+        # unknown older implementations are still refused.
         from packaging.specifiers import SpecifierSet
         from packaging.version import InvalidVersion, Version
 
         try:
             legacy = Version(str(hello.get("runtime_version", "")))
-            if legacy in SpecifierSet(">=0.18.33,<0.18.34"):
+            if legacy in SpecifierSet(">=0.18.30,<0.18.34"):
                 revision = 1
         except InvalidVersion:
             pass
