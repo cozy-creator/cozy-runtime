@@ -134,12 +134,19 @@ def require_executor_protocol(hello: dict[str, Any]) -> None:
             pass
     if type(revision) is int and revision == EXECUTOR_PROTOCOL_REVISION:
         return
+    # A real capability floor: an executor before protocol 1 (cozy-runtime 0.18.30) speaks
+    # an unreviewed command set this worker cannot drive. Say which side to update.
+    executor = hello.get("runtime_version", "unknown")
+    remedy = (
+        "update the rental's Runtime: cozy rental update <rental>"
+        if type(revision) is int and revision > EXECUTOR_PROTOCOL_REVISION
+        else "publish the package against cozy-runtime>=0.18.30 (its lock pins "
+        f"cozy-runtime {executor}), then run it again"
+    )
     raise ExecutorProtocolMismatch(
-        f"executor_protocol_incompatible: the executor at {hello.get('python_executable')} "
-        f"declares protocol {revision!r}; this worker supports {EXECUTOR_PROTOCOL_REVISION}. "
-        f"Executor Runtime {hello.get('runtime_version', 'unknown')}, "
-        f"worker Runtime {RUNTIME_VERSION}. "
-        "Reprepare this executor with a compatible protocol implementation."
+        f"executor_protocol_incompatible: the package environment runs cozy-runtime "
+        f"{executor} (executor protocol {revision!r}) and this worker runs {RUNTIME_VERSION} "
+        f"(protocol {EXECUTOR_PROTOCOL_REVISION}); {remedy}."
     )
 
 

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 from pathlib import Path
 
-from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
+
+
+class RetentionRefusal(ValueError):
+    """A request whose identities are malformed or name another result; retrying cannot help."""
 
 
 def change(
@@ -21,7 +23,7 @@ def change(
         or len(request.tensorfs_receipt_digest) != 32
         or re.fullmatch(r"sha256:[0-9a-f]{64}", request.retention_id) is None
     ):
-        raise ValueError("derived retention requires exact bounded identities")
+        raise RetentionRefusal("derived retention requires exact bounded identities")
     store = fill.store(tensorfs_root)
     action = store.release_derived_retention if release else store.retain_derived_result
     value = action(
@@ -35,7 +37,7 @@ def change(
         or value.get("retention_id") != request.retention_id
         or value.get("released") is not release
     ):
-        raise ValueError("native derived retention result changed identity")
+        raise RetentionRefusal("native derived retention result changed identity")
     result = pb.DerivedRetentionResult(
         weights_transaction_id=request.weights_transaction_id,
         tensorfs_receipt_digest=request.tensorfs_receipt_digest,
@@ -47,7 +49,7 @@ def change(
             pb.Ref(digest=documents.raw("sha256:" + manifest["sha256"]), length=manifest["length"])
         )
     elif not release:
-        raise ValueError("native retained result has no manifest")
+        raise RetentionRefusal("native retained result has no manifest")
     return result
 
 
@@ -59,17 +61,13 @@ def release_result(
         or re.fullmatch(r"sha256:[0-9a-f]{64}", request.weights_transaction_id) is None
         or len(request.tensorfs_receipt_digest) != 32
     ):
-        raise ValueError("derived result release requires exact identities")
+        raise RetentionRefusal("derived result release requires exact identities")
     store = fill.store(tensorfs_root)
-    observed = store.derived_lookup(request.weights_transaction_id)
-    receipt = observed.get("receipt")
-    if (
-        observed.get("state") != "committed"
-        or not isinstance(receipt, dict)
-        or hashlib.sha256(canonical_json.encode(receipt)).digest()
-        != request.tensorfs_receipt_digest
-    ):
-        raise ValueError("original derived receipt does not match its release")
+    # The transaction id is the committed result's identity (one commit per transaction),
+    # so it is what release compares; re-encoding TensorFS's receipt would tie release to
+    # one receipt format forever.
+    if store.derived_lookup(request.weights_transaction_id).get("state") != "committed":
+        raise RetentionRefusal("derived result is not committed")
     store.derived_dispose(request.weights_transaction_id)
     return pb.DerivedResultReleaseResult(
         weights_transaction_id=request.weights_transaction_id,

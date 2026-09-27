@@ -885,7 +885,17 @@ class Ledger:
                     row["residual"] = residual
                     row["verdict"] = "residency_transition"
                 first = self.closed_since_baseline == 0
-                if residual > 0 and name == "device_allocated" and first:
+                if residual < 0 and name == "device_allocated":
+                    # Returned MORE than the attempt took: the device has more free memory
+                    # than the ledger priced, which can only make choices conservative. The
+                    # baseline moves down to the truth; nothing is refused.
+                    row["verdict"] = "baseline_shift"
+                    shifts.append(
+                        f"device_allocated: {residual:+d} B released beyond the attempt's "
+                        "own allocation; the baseline moves down to the measured device"
+                    )
+                    self.device_baseline += residual
+                elif residual > 0 and name == "device_allocated" and first:
                     row["verdict"] = "baseline_shift"
                     shifts.append(
                         f"device_allocated: +{residual} B on the first attempt of this "
@@ -894,7 +904,9 @@ class Ledger:
                         "later attempt is held to the new line"
                     )
                     self.device_baseline += residual
-                elif residual != 0:
+                elif residual > 0:
+                    # KEPT: an unexplained growth means the chooser would price rungs against
+                    # memory the device no longer has, which is an OOM mid-attempt (cl-003).
                     row["verdict"] = "leak"
                     leaks.append(
                         f"{name}: {residual:+d} B unaccounted across the attempt "

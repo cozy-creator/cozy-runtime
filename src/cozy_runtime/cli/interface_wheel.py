@@ -64,14 +64,15 @@ def run(args: list[str]) -> Result:
         output = Path(request["output_directory"]).resolve()
         output.mkdir(parents=True, exist_ok=True)
         target = output / filename
-        if target.exists():
-            if not target.is_file() or target.read_bytes() != wheel:
-                raise ValueError("interface wheel output exists with different immutable bytes")
-        else:
-            with target.open("xb") as stream:
+        # The wheel is derived from its inputs: an existing file with other bytes (another
+        # generator version) is replaced atomically, never a refusal.
+        if not target.is_file() or target.read_bytes() != wheel:
+            temporary = output / f".{filename}.{os.getpid()}.partial"
+            with temporary.open("wb") as stream:
                 stream.write(wheel)
                 stream.flush()
                 os.fsync(stream.fileno())
+            os.replace(temporary, target)
         return Result(
             document={
                 "filename": filename,

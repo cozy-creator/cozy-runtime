@@ -525,6 +525,17 @@ def _capability_unavailable(operation: str, minor: int) -> str:
     )
 
 
+def _same_parent(left: pb.JobDirective, right: pb.JobDirective) -> bool:
+    """One CPU orchestration parent: the prepared job it runs. Policy fields (limits,
+    publication, reclaim) may change without replacing a parent, which keeps the contract
+    it captured when it started."""
+    return (left.installation_id, left.job_descriptor_id, left.orchestration) == (
+        right.installation_id,
+        right.job_descriptor_id,
+        right.orchestration,
+    )
+
+
 def desired_state_body(desired: pb.DesiredWorkerState) -> bytes:
     """The canonical bytes of a DesiredWorkerState's DESIRED STATE — envelope excluded (#494a).
 
@@ -591,6 +602,8 @@ def read_placement_set(desired_set: pb.DesiredPlacementSet) -> list[dict[str, An
 
 
 HASH_ENTRY = re.compile(r"^sha256:[0-9a-f]{64}$")
+#: The fault reason asking the owner to prepare a stale-shaped placement set again.
+REPREPARE = "placement_set_reprepare_required"
 SEMVER = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
@@ -681,6 +694,14 @@ def _development_package(value: object) -> dict[str, Any]:
 
 
 def _placement_profile(entry: dict[str, Any]) -> None:
+    if "installation_id" not in entry or isinstance(entry.get("package_interface"), dict):
+        # The shape an older Runtime prepared (interface by Ref, no installation). Nothing
+        # is wrong with the request: its owner prepares the set again on this worker.
+        raise documents.DocumentError(
+            REPREPARE,
+            "this placement set was prepared by an older Runtime; prepare the package set "
+            "again on this worker",
+        )
     _required(entry, {"placement_id", "installation_id", "package_interface",
                       "bindings_digest", "entrypoints"}, "Placement")
     _identifier(entry["placement_id"], "Placement.placement_id")
@@ -3832,7 +3853,7 @@ class Worker:
             supplied_parent = desired.placement_set.orchestration_parent
             if (
                 retained_parent is None
-                or supplied_parent != retained_parent.directive
+                or not _same_parent(supplied_parent, retained_parent.directive)
                 or not supplied_parent.orchestration
                 or supplied_parent.HasField("orchestration_parent")
                 or supplied_parent.device_count
@@ -3880,6 +3901,8 @@ class Worker:
                 kind = (
                     pb.FaultKind.FAULT_KIND_PLACEMENT_SET_DIGEST_MISMATCH
                     if exc.code == "placement_set_digest_mismatch"
+                    else pb.FaultKind.FAULT_KIND_ARTIFACT_FETCH_FAILED
+                    if exc.code == REPREPARE
                     else pb.FaultKind.FAULT_KIND_CONFIG_REFUSED
                 )
                 self.note(
@@ -4980,7 +5003,9 @@ class Worker:
                     raise ValueError("one job cannot occupy the parent and ordinary slots together")
             old_cpu = self.job_slots.get("orchestration")
             cpu_same = bool(
-                parent is not None and old_cpu is not None and old_cpu.directive == parent
+                parent is not None
+                and old_cpu is not None
+                and _same_parent(old_cpu.directive, parent)
             )
             old_gpu = self.job_slots.get("envelope")
             ordinary = pb.JobDirective()
