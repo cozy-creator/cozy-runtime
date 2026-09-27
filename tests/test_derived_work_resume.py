@@ -53,7 +53,9 @@ def test_interrupted_derived_work_resumes_after_a_new_installation(tmp_path: Pat
     writer.add_part("model", "a", "value", io.BytesIO(b"\x31" * 2048))
     facts = writer.checkpoint("before-upgrade", "model")
     writer.fence()  # the worker stopped here; Runtime is upgraded and the release reinstalled
-    head = (str(facts["head"]), int(facts["head_length"]))
+    head_length = facts["head_length"]
+    assert isinstance(head_length, int)
+    head = (str(facts["head"]), head_length)
     resumed = store.begin_derived(
         transaction, 2, {}, targets, {}, order, 4096, work_fingerprint=AFTER, checkpoint=head
     )
