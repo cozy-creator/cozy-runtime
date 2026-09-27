@@ -62,6 +62,7 @@ ERASED_PREFIXES: tuple[str, ...] = (
     # objects are erased then imposed, so no image or operator export can redirect a
     # compiler cache out of the worker-boot scope that owns and deletes it.
     "FLASH_ATTENTION_",
+    "TMPDIR",
 )
 
 #: The fill plane's capture directory, named here because the allowlist row and the config
@@ -144,6 +145,13 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "turns on the persistent half of FlashAttention-4's compile cache, which upstream "
         "reads at import and gates on a variable separate from the directory. Imposed with "
         "the directory or not at all: alone it would name a cache with nowhere to live",
+    ),
+    ProjectedVar(
+        "TMPDIR",
+        "worker.pod_jit_cache_scope",
+        "the executor's temporary files (quantization spills, compiler scratch) go to its "
+        "Runtime-owned scope on the machine's disk, never an inherited TMPDIR that may be "
+        "RAM-backed; deleted with the scope",
     ),
     ProjectedVar(
         "COZY_HOME",

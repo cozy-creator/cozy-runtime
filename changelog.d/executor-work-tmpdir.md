@@ -1,0 +1,1 @@
+Every executor gets `TMPDIR` imposed at its own Runtime-owned scope under `COZY_HOME/jit-cache` (on the machine disk, deleted with the worker boot) and any inherited `TMPDIR` is erased, so quantization spills and other temporary files never depend on an ambient, possibly RAM-backed, temporary directory.

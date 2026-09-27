@@ -296,7 +296,7 @@ def _run_job(machine: Machine, scratch: Path) -> tuple[str, pb.AttemptOutcome]:
             installed_packages=[prepared.installed_package],
         )
     )
-    payload = canonical_json.encode({})
+    payload = canonical_json.encode({"temporary": str(scratch / "temporary")})
     payload_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     spec, spec_digest = documents.identity(
         pb.InvocationSpec(
@@ -448,6 +448,9 @@ def test_user_worker_runs_a_job_under_its_root_and_reports_a_virtual_inventory()
             ):
                 assert (root / relative).exists(), relative
             assert _files_outside(root) == []
+            # Spills go to the executor's own scope under Runtime's root, not the Host's TMPDIR.
+            temporary = Path((Path(raw) / "scratch/temporary").read_text())
+            assert temporary.is_relative_to(root / "run/cozy/jit-cache"), temporary
         finally:
             code = machine.close()
         assert code == 0, machine.output()

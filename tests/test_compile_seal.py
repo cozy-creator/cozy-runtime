@@ -45,7 +45,7 @@ def _torch_here() -> str:
 NO_TORCH = _torch_here()
 pytestmark = pytest.mark.skipif(bool(NO_TORCH), reason=NO_TORCH or "")
 
-JIT_NAMES = tuple(name for name, _directory in child_env.JIT_CACHE_ENV)
+JIT_NAMES = (*(name for name, _directory in child_env.JIT_CACHE_ENV), "TMPDIR")
 
 
 @pytest.fixture

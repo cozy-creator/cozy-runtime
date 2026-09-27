@@ -69,7 +69,8 @@ def scope(
             raise JITCacheRefusal(f"JIT cache content scope has the wrong owner: {content}")
         os.chown(content, wanted_uid, wanted_gid)
     content.chmod(0o700)
-    return Scope(content, {name: str(content / directory) for name, directory in JIT_CACHE_ENV})
+    environment = {name: str(content / directory) for name, directory in JIT_CACHE_ENV}
+    return Scope(content, {**environment, "TMPDIR": str(content)})
 
 
 def remove_pod(cozy_home: Path, pod_scope: str) -> None:
