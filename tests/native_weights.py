@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import socket
 import threading
-import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -137,7 +137,7 @@ class NativeExecution:
 
         return Context(
             self.attempt.request_id,
-            time.monotonic() + 600,
+            math.inf,  # no stopwatch: a test attempt ends on its own outcome
             _tensorfs_source=lambda model: self.client.source(model.checkpoint_ref),
             _tensorfs_output=lambda slot: OutputCapability(
                 lambda definition: open_output(slot, definition)
