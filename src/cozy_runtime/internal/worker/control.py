@@ -36,8 +36,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import grpc
+from tensorfs import errors as tensorfs_errors
 
+from cozy_runtime.internal.numerical_environment import NumericalEnvironmentRefusal
+from cozy_runtime.internal.worker.derived_retention import RetentionRefusal
 from cozy_runtime.internal.worker.machine_execution_rpc import MachineExecutionRPC
+from cozy_runtime.internal.worker.model_source_prepare import ModelSourceRefusal
 from cozy_runtime.internal.worker.workspace_rpc import Service as WorkspaceService
 from cozy_runtime.internal.worker.workspace_rpc import WorkspaceRPC
 from cozy_runtime.protocol import MIN_COMPATIBLE_WIRE_MINOR, WIRE_MINOR
@@ -324,6 +328,40 @@ class GrpcControlHost:
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
 
 
+#: TensorFS refusals that describe the store's momentary state, not the request.
+_TRANSIENT_STORE_CODES = frozenset(
+    {
+        "CAPACITY_EXHAUSTED",
+        "DEADLINE_EXCEEDED",
+        "DURABILITY_UNPROVEN",
+        "FD_HEADROOM",
+        "IO_FAILED",
+        "LOCK_CONTENDED",
+        "STORE_BUSY",
+    }
+)
+
+
+def _custody_failure(
+    context: Any, exc: BaseException, what: str, *permanent: type[BaseException]
+) -> Any:
+    """Refuse only what retrying cannot change; everything else is UNAVAILABLE (retry).
+
+    A typed Runtime refusal and a TensorFS refusal about the request's data are verdicts. A
+    busy or momentarily failing store, an OSError, or any unexpected failure is not: the
+    owner retries with its own backoff. Details stay generic; the type names the fault.
+    """
+    store_code = exc.code if isinstance(exc, tensorfs_errors.Refusal) else None
+    if isinstance(exc, permanent) or (
+        store_code is not None and store_code not in _TRANSIENT_STORE_CODES
+    ):
+        return context.abort(grpc.StatusCode.FAILED_PRECONDITION, f"{what} was refused")
+    return context.abort(
+        grpc.StatusCode.UNAVAILABLE,
+        f"{what} is temporarily unavailable ({store_code or type(exc).__name__}); retry",
+    )
+
+
 def _refuse(context: Any, exc: BaseException) -> Any:
     """Answer one failed preparation call, saying WHICH KIND of failure it was.
 
@@ -437,11 +475,11 @@ class _PreparationServicer(WorkspaceRPC):
         try:
             digest = self.numerical_environment()
             if len(digest) != 32:
-                raise ValueError("invalid numerical identity")
+                raise NumericalEnvironmentRefusal("invalid numerical identity")
             return pb.NumericalEnvironmentResult(digest=digest)
-        except Exception:
-            return context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION, "numerical environment identity is unproven"
+        except Exception as exc:
+            return _custody_failure(
+                context, exc, "numerical environment identity", NumericalEnvironmentRefusal
             )
 
     def ValidateWeightsCheckpoint(
@@ -519,8 +557,8 @@ class _PreparationServicer(WorkspaceRPC):
             return context.abort(grpc.StatusCode.UNIMPLEMENTED, "source release is unavailable")
         try:
             self.model_source_releaser(request.operation_id)
-        except Exception:
-            return context.abort(grpc.StatusCode.FAILED_PRECONDITION, "source release was refused")
+        except Exception as exc:
+            return _custody_failure(context, exc, "source release", ModelSourceRefusal)
         return pb.ReleaseModelSourceResult(operation_id=request.operation_id, released=True)
 
     def RetainDerivedResult(self, request: pb.DerivedRetentionRequest, context: Any) -> Any:
@@ -532,10 +570,8 @@ class _PreparationServicer(WorkspaceRPC):
             return context.abort(grpc.StatusCode.UNIMPLEMENTED, "store collection is unavailable")
         try:
             return self.store_collector()
-        except Exception:
-            return context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION, "store collection was refused"
-            )
+        except Exception as exc:
+            return _custody_failure(context, exc, "store collection")
 
     def ReleaseDerivedResult(self, request: pb.DerivedResultReleaseRequest, context: Any) -> Any:
 
@@ -545,10 +581,8 @@ class _PreparationServicer(WorkspaceRPC):
             )
         try:
             return self.derived_result_releaser(request)
-        except Exception:
-            return context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION, "derived result release was refused"
-            )
+        except Exception as exc:
+            return _custody_failure(context, exc, "derived result release", RetentionRefusal)
 
     def ReleaseDerivedRetention(self, request: pb.DerivedRetentionRequest, context: Any) -> Any:
         return self._derived_retention(request, context, True)
@@ -561,10 +595,8 @@ class _PreparationServicer(WorkspaceRPC):
             return context.abort(grpc.StatusCode.UNIMPLEMENTED, "derived retention is unavailable")
         try:
             return self.derived_retainer(request, release)
-        except Exception:
-            return context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION, "derived retention was refused"
-            )
+        except Exception as exc:
+            return _custody_failure(context, exc, "derived retention", RetentionRefusal)
 
     def PrepareLocalPackage(self, request: pb.PrepareLocalPackageRequest, context: Any) -> Any:
         handler = self.local_package_handler

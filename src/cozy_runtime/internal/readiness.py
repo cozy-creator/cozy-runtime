@@ -290,8 +290,45 @@ def receipt_payload(
     )
 
 
+#: The facts the supervisor seals and the Hub attests: which boot, which listener identity,
+#: which owner credentials and which GPUs. Every other payload field (ports, proofs, fields a
+#: newer Runtime adds) may differ when a worker restarts within the same boot.
+ATTESTED_FACTS = (
+    "pod_boot_id",
+    "tls_certificate_der_base64",
+    "observed_record_owner_auth.control_public_key_ed25519_b64url",
+    "observed_record_owner_auth.media_token_sha256",
+    "runtime_gpus[].device_uuid",
+)
+
+
+def attested(payload: bytes) -> dict[str, object]:
+    """The attested facts of one readiness payload, by their `ATTESTED_FACTS` names."""
+    value = canonical.parse(payload)
+    if not isinstance(value, dict):
+        raise ValueError("readiness payload is not an object")
+    auth = value.get("observed_record_owner_auth") or {}
+    gpus = value.get("runtime_gpus") or []
+    if not isinstance(auth, dict) or not isinstance(gpus, list):
+        raise ValueError("readiness payload facts are malformed")
+    return {
+        "pod_boot_id": value.get("pod_boot_id"),
+        "tls_certificate_der_base64": value.get("tls_certificate_der_base64"),
+        "observed_record_owner_auth.control_public_key_ed25519_b64url": auth.get(
+            "control_public_key_ed25519_b64url"
+        ),
+        "observed_record_owner_auth.media_token_sha256": sorted(
+            auth.get("media_token_sha256") or []
+        ),
+        "runtime_gpus[].device_uuid": sorted(
+            str(row.get("device_uuid")) for row in gpus if isinstance(row, dict)
+        ),
+    }
+
+
 def publish(path: Path, payload: bytes, *, owner: tuple[int, int] | None = None) -> None:
-    """Publish atomically once; an exact replay converges and different bytes refuse."""
+    """Publish atomically. A worker restarted within the same boot republishes: the new
+    payload replaces the old one when every attested fact agrees, and refuses otherwise."""
 
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.parent / f".receipt-{uuid.uuid4().hex}"
@@ -309,21 +346,18 @@ def publish(path: Path, payload: bytes, *, owner: tuple[int, int] | None = None)
             finally:
                 os.close(owned)
         try:
-            os.link(temporary, path)
-        except FileExistsError:
-            try:
-                existing = path.read_bytes()
-            except OSError as exc:
+            existing = attested(path.read_bytes())
+        except (OSError, ValueError, canonical.CanonicalError):
+            existing = None
+        if existing is not None:
+            changed = [name for name, fact in attested(payload).items() if existing[name] != fact]
+            if changed:
                 raise LaunchRefusal(
-                    "readiness_receipt_conflict", "existing receipt is unreadable"
-                ) from exc
-            if existing != payload:
-                raise LaunchRefusal("readiness_receipt_conflict", "receipt bytes differ") from None
-            if owner is not None and (path.stat().st_uid, path.stat().st_gid) != owner:
-                raise LaunchRefusal(
-                    "readiness_receipt_owner_mismatch", "existing receipt has the wrong owner"
-                ) from None
-            return
+                    "readiness_receipt_conflict",
+                    f"this boot already attested different {', '.join(changed)}; "
+                    "a restarted worker cannot change what the pod attested",
+                )
+        os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory)

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import importlib
 import logging
 import os
 import subprocess
@@ -61,27 +60,21 @@ def _native_selection(value: pb.NativeSourceSelection) -> dict[str, Any]:
     }
 
 
-def implementation_digest(store: Any) -> str:
-    import cozy_runtime
+def computation_key(operation: str, effective: dict[str, Any]) -> bytes:
+    """The native memo key: the operation, its declared output version and its real inputs.
 
-    root = Path(cozy_runtime.__file__).parent
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*.py")):
-        name = str(path.relative_to(root)).encode()
-        body = path.read_bytes()
-        digest.update(len(name).to_bytes(8, "little"))
-        digest.update(name)
-        digest.update(len(body).to_bytes(8, "little"))
-        digest.update(body)
-    digest.update(store.implementation_sha256.encode())
-    extension = importlib.import_module("tensorfs._ext")
-    extension_path = extension.__file__
-    if extension_path is None:
-        raise WorkspaceRefusal("native implementation has no immutable extension artifact")
-    with Path(extension_path).open("rb") as binary:
-        for chunk in iter(lambda: binary.read(1 << 20), b""):
-            digest.update(chunk)
-    return "sha256:" + digest.hexdigest()
+    A Runtime or TensorFS release that keeps an operation's output meaning keeps the key;
+    one that changes it bumps `source_interfaces.OPERATION_VERSIONS` by hand.
+    """
+    return hashlib.sha256(
+        canonical_json.encode(
+            {
+                "operation": operation,
+                "version": source_interfaces.OPERATION_VERSIONS[operation],
+                "effective": effective,
+            }
+        )
+    ).digest()
 
 
 def refusal_frame(command: pb.NativeSourceCommand, code: str) -> pb.WorkerFrame:
@@ -413,7 +406,6 @@ class SourceCalls:
                     byte_output_spec=view_fact[2] if view_fact else b"",
                 )
                 return
-            store = fill.store(self.workspace.store_root)
             binding = source_interfaces.bindings()[
                 (source_interfaces.DIGEST, source_interfaces.MODULE, row["operation"])
             ]
@@ -477,16 +469,7 @@ class SourceCalls:
                             "content_manifest"
                         ]
                     }
-                computation = hashlib.sha256(
-                    canonical_json.encode(
-                        {
-                            "interface": source_interfaces.DIGEST,
-                            "operation": row["operation"],
-                            "implementation": implementation_digest(store),
-                            "effective": effective,
-                        }
-                    )
-                ).digest()
+                computation = computation_key(row["operation"], effective)
                 hit = (
                     None
                     if native_bytes

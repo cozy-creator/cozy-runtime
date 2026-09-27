@@ -52,6 +52,9 @@ _TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
     "source_files": (SourceFiles, _SourceFilesResult),
     "commit_file": (CommitFile, CommittedFile),
 }
+#: Each operation's output semantics, bumped by hand when the same inputs would produce
+#: a different result. Native source memo keys carry this, never a source-tree hash.
+OPERATION_VERSIONS: dict[str, int] = {name: 1 for name in _TYPES}
 DOCUMENT = canonical_json.encode(
     {
         "format": "cozy.native-source-interface/1",
