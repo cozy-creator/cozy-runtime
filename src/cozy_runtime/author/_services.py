@@ -19,7 +19,7 @@ import shutil
 import stat
 import threading
 import time
-from collections.abc import Buffer, Callable, Iterator, Mapping
+from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -41,6 +41,7 @@ from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import (
     DecodedAudioChunk,
+    DecodedAudioFormat,
     DecodedMediaEvent,
     DecodedMediaHeader,
     DecodedVideoFrame,
@@ -442,7 +443,183 @@ class Outputs(_Bound):
         video_format = header.video
         if video_format.nominal_frame_rate is None:
             raise OutputError("streaming video header has no nominal frame rate", code="frame_rate")
+        rate = video_format.nominal_frame_rate
         audio_format = header.audio
+
+        def feed(encoder: _codec.StreamingMP4Encoder) -> int:
+            audio_samples = 0
+            for event in source:
+                self._attempt.check_open("Outputs.save_video_stream")
+                if isinstance(event, DecodedMediaHeader):
+                    raise OutputError(
+                        "streaming video contains a second header", code="media_header"
+                    )
+                if not isinstance(event, DecodedVideoFrame):
+                    audio_samples = self._write_audio(encoder, audio_format, event, audio_samples)
+                    continue
+                if (
+                    event.width != video_format.width
+                    or event.height != video_format.height
+                    or event.time_base != video_format.time_base
+                    or event.pixel_aspect_ratio != video_format.pixel_aspect_ratio
+                    or event.color_primaries != video_format.color_primaries
+                    or event.color_transfer != video_format.color_transfer
+                    or event.color_matrix != video_format.color_matrix
+                    or event.color_range != video_format.color_range
+                ):
+                    raise OutputError(
+                        "streaming video frame differs from its header", code="frame_shape"
+                    )
+                expected = Fraction(encoder.video_frames, 1) / rate
+                if event.start_time != expected:
+                    raise OutputError(
+                        f"streaming video frame starts at {event.start_time}, expected {expected}",
+                        code="video_discontinuity",
+                    )
+                if event.duration * event.time_base != 1 / rate:
+                    raise OutputError(
+                        "streaming video frame duration differs from its output rate",
+                        code="video_discontinuity",
+                    )
+                encoder.write_video(event.rgb)
+            return audio_samples
+
+        return self._save_mp4(
+            dict(
+                width=video_format.width,
+                height=video_format.height,
+                frame_rate=rate,
+                pixel_aspect_ratio=video_format.pixel_aspect_ratio,
+                color_primaries=video_format.color_primaries,
+                color_transfer=video_format.color_transfer,
+                color_matrix=video_format.color_matrix,
+                color_range=video_format.color_range,
+            ),
+            audio_format,
+            feed,
+        )
+
+    def save_video_concat(
+        self,
+        videos: Sequence[VideoAsset],
+        soundtrack: Callable[[Sequence[int]], Iterator[DecodedMediaEvent]],
+    ) -> SavedVideo:
+        """Join H.264 videos by packet copy under one newly encoded soundtrack.
+
+        No picture is decoded or encoded. Every video must be one H.264 track with the same
+        parameters, starting on a keyframe, on a zero-based fixed frame clock; otherwise it
+        refuses `video_copy_incompatible` before `soundtrack` is called. `soundtrack` receives
+        each video's frame count and returns an audio-only header and its chunks on the
+        zero-based sample clock, encoded as `save_video_stream` encodes audio.
+        """
+        self._attempt.check_open("Outputs.save_video_concat")
+        _codec.require_encoder()
+        if not videos:
+            raise OutputError("a joined video needs at least one video", code="media_header")
+        paths = []
+        for video in videos:
+            if (
+                not isinstance(video, VideoAsset)
+                or video._local is None
+                or video._attempt != self._attempt.request_id
+            ):
+                raise CapabilityError(
+                    "joined videos must be hydrated inputs of this attempt", code="foreign_asset"
+                )
+            video._check_file()
+            paths.append(video._local)
+        copy = _codec.plan_video_copy(tuple(paths))
+        source = iter(soundtrack(copy.frames))
+        header = next(source, None)
+        if (
+            not isinstance(header, DecodedMediaHeader)
+            or header.video is not None
+            or not header.audio
+        ):
+            raise OutputError(
+                "a joined soundtrack must begin with an audio header", code="media_header"
+            )
+        audio_format = header.audio
+
+        def feed(encoder: _codec.StreamingMP4Encoder) -> int:
+            audio_samples = 0
+            pending: DecodedMediaEvent | None = next(source, None)
+
+            def before(time: Fraction | None) -> None:
+                """Write the soundtrack up to `time`; None writes the rest."""
+                nonlocal audio_samples, pending
+                while pending is not None and (
+                    time is None
+                    or not isinstance(pending, DecodedAudioChunk)  # refused when written
+                    or pending.start_time < time
+                ):
+                    audio_samples = self._write_audio(encoder, audio_format, pending, audio_samples)
+                    pending = next(source, None)
+
+            encoder.copy_video(before)
+            before(None)
+            for video in videos:
+                video._check_file()
+            return audio_samples
+
+        return self._save_mp4(
+            dict(
+                width=copy.width,
+                height=copy.height,
+                frame_rate=copy.frame_rate,
+                pixel_aspect_ratio=copy.pixel_aspect_ratio,
+                color_primaries=copy.color_primaries,
+                color_transfer=copy.color_transfer,
+                color_matrix=copy.color_matrix,
+                color_range=copy.color_range,
+            ),
+            audio_format,
+            feed,
+            copy,
+        )
+
+    def _write_audio(
+        self,
+        encoder: _codec.StreamingMP4Encoder,
+        audio_format: DecodedAudioFormat | None,
+        event: DecodedMediaEvent,
+        written: int,
+    ) -> int:
+        """One chunk on the declared format and sample clock; the samples now written."""
+        if not isinstance(event, DecodedAudioChunk):
+            raise OutputError(
+                f"streaming video received {type(event).__name__}, not a media event",
+                code="media_event",
+            )
+        if audio_format is None:
+            raise OutputError("streaming video contains undeclared audio", code="audio_absent")
+        if (
+            event.channels != audio_format.channels
+            or event.sample_rate != audio_format.sample_rate
+            or event.channel_layout != audio_format.channel_layout
+            or event.channel_names != audio_format.channel_names
+            or event.time_base != audio_format.time_base
+        ):
+            raise OutputError("streaming audio chunk differs from its header", code="audio_format")
+        expected = Fraction(written, audio_format.sample_rate)
+        if event.start_time != expected:
+            raise OutputError(
+                f"streaming audio starts at {event.start_time}, expected {expected}",
+                code="audio_discontinuity",
+            )
+        planar, clipped = _codec.audio_chunk(event.pcm_f32le, event.sample_count)
+        self._clip_row(clipped)
+        encoder.write_audio(planar)
+        return written + event.sample_count
+
+    def _save_mp4(
+        self,
+        video: dict[str, Any],
+        audio_format: DecodedAudioFormat | None,
+        feed: Callable[[_codec.StreamingMP4Encoder], int],
+        copy: _codec.VideoCopy | None = None,
+    ) -> SavedVideo:
+        """Write, probe and atomically register one MP4; `feed` returns its audio samples."""
         handle = self._attempt.next_handle(VideoAsset.kind)
         tail = handle.rsplit("/", 1)[-1]
         temporary = self._attempt.spool / f".video-{tail}.partial"
@@ -450,104 +627,33 @@ class Outputs(_Bound):
         encoder: _codec.StreamingMP4Encoder | None = None
         finished = False
         registered = False
-        frame_count = 0
-        audio_samples = 0
         try:
             encoder = _codec.StreamingMP4Encoder(
                 temporary,
-                width=video_format.width,
-                height=video_format.height,
-                frame_rate=video_format.nominal_frame_rate,
-                pixel_aspect_ratio=video_format.pixel_aspect_ratio,
-                color_primaries=video_format.color_primaries,
-                color_transfer=video_format.color_transfer,
-                color_matrix=video_format.color_matrix,
-                color_range=video_format.color_range,
+                **video,
                 max_bytes=self._attempt.max_output_bytes,
                 audio_channels=audio_format.channels if audio_format is not None else 0,
                 audio_sample_rate=audio_format.sample_rate if audio_format is not None else 0,
+                copy=copy,
             )
-            for event in source:
-                self._attempt.check_open("Outputs.save_video_stream")
-                if isinstance(event, DecodedMediaHeader):
-                    raise OutputError(
-                        "streaming video contains a second header", code="media_header"
-                    )
-                if isinstance(event, DecodedVideoFrame):
-                    if (
-                        event.width != video_format.width
-                        or event.height != video_format.height
-                        or event.time_base != video_format.time_base
-                        or event.pixel_aspect_ratio != video_format.pixel_aspect_ratio
-                        or event.color_primaries != video_format.color_primaries
-                        or event.color_transfer != video_format.color_transfer
-                        or event.color_matrix != video_format.color_matrix
-                        or event.color_range != video_format.color_range
-                    ):
-                        raise OutputError(
-                            "streaming video frame differs from its header", code="frame_shape"
-                        )
-                    expected = Fraction(frame_count, 1) / video_format.nominal_frame_rate
-                    if event.start_time != expected:
-                        raise OutputError(
-                            f"streaming video frame starts at {event.start_time}, expected "
-                            f"{expected}",
-                            code="video_discontinuity",
-                        )
-                    if event.duration * event.time_base != 1 / video_format.nominal_frame_rate:
-                        raise OutputError(
-                            "streaming video frame duration differs from its output rate",
-                            code="video_discontinuity",
-                        )
-                    encoder.write_video(event.rgb)
-                    frame_count += 1
-                    continue
-                if not isinstance(event, DecodedAudioChunk):
-                    raise OutputError(
-                        f"streaming video received {type(event).__name__}, not a media event",
-                        code="media_event",
-                    )
-                if audio_format is None:
-                    raise OutputError(
-                        "streaming video contains undeclared audio", code="audio_absent"
-                    )
-                if (
-                    event.channels != audio_format.channels
-                    or event.sample_rate != audio_format.sample_rate
-                    or event.channel_layout != audio_format.channel_layout
-                    or event.channel_names != audio_format.channel_names
-                    or event.time_base != audio_format.time_base
-                ):
-                    raise OutputError(
-                        "streaming audio chunk differs from its header", code="audio_format"
-                    )
-                expected_audio = Fraction(audio_samples, audio_format.sample_rate)
-                if event.start_time != expected_audio:
-                    raise OutputError(
-                        f"streaming audio starts at {event.start_time}, expected {expected_audio}",
-                        code="audio_discontinuity",
-                    )
-                planar, clipped = _codec.audio_chunk(event.pcm_f32le, event.sample_count)
-                self._clip_row(clipped)
-                encoder.write_audio(planar)
-                audio_samples += event.sample_count
-
+            audio_samples = feed(encoder)
             if audio_format is not None and audio_samples == 0:
                 raise OutputError(
                     "streaming video declared audio but yielded no samples", code="audio_shape"
                 )
+            frame_count = encoder.video_frames
             facts = encoder.finish()
             finished = True
             if (
-                facts.width != video_format.width
-                or facts.height != video_format.height
+                facts.width != video["width"]
+                or facts.height != video["height"]
                 or facts.frame_count != frame_count
-                or facts.frame_rate != video_format.nominal_frame_rate
-                or facts.pixel_aspect_ratio != video_format.pixel_aspect_ratio
-                or facts.color_primaries != video_format.color_primaries
-                or facts.color_transfer != video_format.color_transfer
-                or facts.color_matrix != video_format.color_matrix
-                or facts.color_range != video_format.color_range
+                or facts.frame_rate != video["frame_rate"]
+                or facts.pixel_aspect_ratio != video["pixel_aspect_ratio"]
+                or facts.color_primaries != video["color_primaries"]
+                or facts.color_transfer != video["color_transfer"]
+                or facts.color_matrix != video["color_matrix"]
+                or facts.color_range != video["color_range"]
                 or facts.video_codec != "h264"
                 or (audio_format is None and facts.audio_codec)
                 or (audio_format is not None and facts.audio_codec != "aac")
@@ -563,7 +669,7 @@ class Outputs(_Bound):
             ):
                 raise OutputError(
                     "streaming MP4 probe disagrees with submitted media: "
-                    f"submitted frames={frame_count} rate={video_format.nominal_frame_rate} "
+                    f"submitted frames={frame_count} rate={video['frame_rate']} "
                     f"audio={audio_samples}; probed {facts}",
                     code="output_probe",
                 )

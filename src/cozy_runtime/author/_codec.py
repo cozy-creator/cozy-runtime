@@ -264,6 +264,9 @@ def audio_chunk(pcm_f32le: tuple[bytes, ...], sample_count: int) -> tuple[Planar
         )
     floats = array("f")
     floats.frombytes(b"".join(pcm_f32le))
+    # The whole chunk in C first: finite (see `_require_finite_f32`) and inside [-1, 1].
+    if math.isfinite(sum(floats)) and max(floats) <= 1.0 and min(floats) >= -1.0:
+        return Planar(floats.tobytes(), (channels, sample_count)), 0
     clipped = 0
     for index, value in enumerate(floats):
         if not math.isfinite(value):
@@ -497,8 +500,96 @@ class _BoundedWriter:
         return True
 
 
+@dataclass(frozen=True, slots=True)
+class VideoCopy:
+    """H.264 tracks proved joinable by packet copy, read without decoding a picture."""
+
+    paths: tuple[Path, ...]
+    frames: tuple[int, ...]
+    width: int
+    height: int
+    frame_rate: Fraction
+    pixel_aspect_ratio: Fraction
+    color_primaries: int
+    color_transfer: int
+    color_matrix: int
+    color_range: int
+
+
+def plan_video_copy(paths: tuple[Path, ...]) -> VideoCopy:
+    """Refuse `video_copy_incompatible` unless every track shares one set of H.264
+    parameters and one zero-based frame clock, and each begins on a keyframe."""
+
+    def refuse(why: str) -> OutputError:
+        return OutputError(
+            f"videos cannot be joined by packet copy: {why}", code="video_copy_incompatible"
+        )
+
+    av = _av()
+    shared: tuple[Any, ...] | None = None
+    frames: list[int] = []
+    for path in paths:
+        with av.open(str(path), "r") as container:
+            streams = list(container.streams.video)
+            if len(streams) != 1 or streams[0].codec_context.name != "h264":
+                raise refuse(f"{path.name} is not exactly one H.264 track")
+            stream = streams[0]
+            context = stream.codec_context
+            facts = (
+                bytes(context.extradata or b""),
+                int(context.width or 0),
+                int(context.height or 0),
+                Fraction(stream.average_rate or 0),
+                Fraction(stream.sample_aspect_ratio or 1),
+                stream.time_base,
+                int(context.color_primaries),
+                int(context.color_trc),
+                int(context.colorspace),
+                int(context.color_range),
+            )
+            if shared is None:
+                shared = facts
+                if not facts[3] or (1 / (facts[3] * facts[5])).denominator != 1:
+                    raise refuse("the frame rate is not a whole number of time-base ticks")
+            elif facts != shared:
+                raise refuse(f"{path.name} differs in codec parameters or clock")
+            step = int(1 / (facts[3] * facts[5]))
+            times: list[int] = []
+            prior: int | None = None
+            for packet in container.demux(stream):
+                if packet.size == 0:
+                    continue
+                if not times and not packet.is_keyframe:
+                    raise refuse(f"{path.name} does not begin on a keyframe")
+                if (
+                    packet.dts is None
+                    or packet.pts is None
+                    or packet.dts > packet.pts
+                    or (prior is not None and packet.dts <= prior)
+                ):
+                    raise refuse(f"{path.name} has no monotone decode clock")
+                prior = packet.dts
+                times.append(packet.pts)
+            if sorted(times) != list(range(0, step * len(times), step)) or not times:
+                raise refuse(f"{path.name} is not on a zero-based fixed frame clock")
+            frames.append(len(times))
+    assert shared is not None
+    return VideoCopy(
+        paths,
+        tuple(frames),
+        shared[1],
+        shared[2],
+        shared[3],
+        shared[4],
+        *shared[6:],
+    )
+
+
 class StreamingMP4Encoder:
-    """The one bounded fragmented H.264/AAC writer used by the author stream sink."""
+    """The one bounded fragmented H.264/AAC writer used by the author stream sinks.
+
+    With `copy`, its video track is the planned tracks' packets, never re-encoded.
+    """
 
     def __init__(
         self,
@@ -515,6 +606,7 @@ class StreamingMP4Encoder:
         max_bytes: int,
         audio_channels: int = 0,
         audio_sample_rate: int = 0,
+        copy: VideoCopy | None = None,
     ) -> None:
         if width <= 0 or height <= 0 or width % 2 or height % 2:
             raise OutputError(
@@ -539,6 +631,7 @@ class StreamingMP4Encoder:
             )
 
         self.path = path
+        self.copy = copy
         self.width = width
         self.height = height
         self.frame_rate = frame_rate
@@ -558,8 +651,10 @@ class StreamingMP4Encoder:
         self._streams_started: set[int] = set()
         self._av = _av()
         try:
-            self._colorspace = _color.colorspace(self._av, color_matrix)
-            self._color_range = _color.range_value(self._av, color_range)
+            # A copied track keeps its own colour tags; only the RGB converter needs them.
+            if copy is None:
+                self._colorspace = _color.colorspace(self._av, color_matrix)
+                self._color_range = _color.range_value(self._av, color_range)
         except ValueError as exc:
             raise OutputError(str(exc), code="video_color") from exc
         self._reformatter = self._av.video.reformatter.VideoReformatter()
@@ -580,20 +675,26 @@ class StreamingMP4Encoder:
                     "use_editlist": "1" if audio_channels else "0",
                 },
             )
-            self._video = self._container.add_stream("libx264", rate=frame_rate)
-            self._video.width = width
-            self._video.height = height
-            self._video.pix_fmt = "yuv420p"
-            self._video.sample_aspect_ratio = pixel_aspect_ratio
-            vcodec = self._video.codec_context
-            vcodec.thread_count = x264_threads()
-            vcodec.gop_size = max(1, round(float(frame_rate)))
-            vcodec.max_b_frames = 0
-            vcodec.color_primaries = color_primaries
-            vcodec.color_trc = color_transfer
-            vcodec.colorspace = color_matrix
-            vcodec.color_range = color_range
-            vcodec.options = dict(_X264)
+            if copy is not None:
+                with self._av.open(str(copy.paths[0]), "r") as template:
+                    self._video = self._container.add_stream_from_template(
+                        template.streams.video[0]
+                    )
+            else:
+                self._video = self._container.add_stream("libx264", rate=frame_rate)
+                self._video.width = width
+                self._video.height = height
+                self._video.pix_fmt = "yuv420p"
+                self._video.sample_aspect_ratio = pixel_aspect_ratio
+                vcodec = self._video.codec_context
+                vcodec.thread_count = x264_threads()
+                vcodec.gop_size = max(1, round(float(frame_rate)))
+                vcodec.max_b_frames = 0
+                vcodec.color_primaries = color_primaries
+                vcodec.color_trc = color_transfer
+                vcodec.colorspace = color_matrix
+                vcodec.color_range = color_range
+                vcodec.options = dict(_X264)
             self._audio = None
             if audio_channels:
                 self._audio = self._container.add_stream("aac", rate=audio_sample_rate)
@@ -653,6 +754,23 @@ class StreamingMP4Encoder:
             self._mux(packet)
         self.video_frames += 1
 
+    def copy_video(self, before: Any) -> None:
+        """Mux the planned tracks' packets back to back; `before(t)` writes audio up to t."""
+        assert self.copy is not None
+        for path, frames in zip(self.copy.paths, self.copy.frames, strict=True):
+            with self._av.open(str(path), "r") as container:
+                stream = container.streams.video[0]
+                offset = int(self.video_frames / (self.frame_rate * stream.time_base))
+                for packet in container.demux(stream):
+                    if packet.size == 0:
+                        continue
+                    packet.pts += offset
+                    packet.dts += offset
+                    before(packet.dts * stream.time_base)
+                    packet.stream = self._video
+                    self._mux(packet)
+            self.video_frames += frames
+
     def write_audio(self, planar: Planar) -> None:
         if self._audio is None:
             raise OutputError("streaming video was declared without audio", code="audio_absent")
@@ -678,7 +796,7 @@ class StreamingMP4Encoder:
     def finish(self) -> EncodedVideoFacts:
         if self.video_frames == 0:
             raise OutputError("streaming video contains no frames", code="frame_shape")
-        for packet in self._video.encode():
+        for packet in self._video.encode() if self.copy is None else ():
             packet.duration = 1
             self._mux(packet)
         if self._audio is not None:
