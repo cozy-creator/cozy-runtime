@@ -241,6 +241,7 @@ class Surface:
     demand_bound: Bound | None = None
     preflight: PreflightSpec | None = None
     internal: bool = False
+    accelerator: bool | None = None
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d). Hidden callables stay in the local registry but
     are absent from the package interface, so no binding is staged and no request reaches them."""
@@ -352,6 +353,7 @@ def analyze(
     preflight: Callable[..., object] | None = None,
     hidden: bool = False,
     internal: bool = False,
+    accelerator: bool | None = None,
     invocable: bool = False,
     memoize: bool = False,
     model_defaults: Mapping[str, DefaultLadder] | None = None,
@@ -542,6 +544,7 @@ def analyze(
         preflight=spec,
         hidden=hidden,
         internal=internal,
+        accelerator=accelerator,
         invocable=invocable,
         memoize=memoize,
         model_defaults=model_defaults or {},

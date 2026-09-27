@@ -202,7 +202,11 @@ async def quantize(
     return facade._artifact_result(result, receipt, tel, "model")
 
 
-app.job(quantize, weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),))
+app.job(
+    quantize,
+    weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),),
+    accelerator=False,
+)
 
 
 @invocable(
@@ -249,4 +253,4 @@ async def prepare_model(
         return ctx.adopt_model(transaction.commit())
 
 
-app.job(prepare_model, weights=(WeightsOutput("model", max_new_bytes=8 << 20),))
+app.job(prepare_model, weights=(WeightsOutput("model", max_new_bytes=8 << 20),), accelerator=False)
