@@ -888,20 +888,22 @@ class WorkspaceActivationCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., migration_id: _Optional[str] = ...) -> None: ...
 
 class ProtocolInfoResult(_message.Message):
-    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery", "supports_local_installation_reuse", "supports_rental_keepalive")
+    __slots__ = ("wire_minor", "minimum_wire_minor", "supports_mixed_model_inputs", "supports_model_materialization_recovery", "supports_local_installation_reuse", "supports_rental_keepalive", "supports_weights_transaction_refusal")
     WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     MINIMUM_WIRE_MINOR_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_MIXED_MODEL_INPUTS_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_MODEL_MATERIALIZATION_RECOVERY_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_LOCAL_INSTALLATION_REUSE_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_RENTAL_KEEPALIVE_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_WEIGHTS_TRANSACTION_REFUSAL_FIELD_NUMBER: _ClassVar[int]
     wire_minor: int
     minimum_wire_minor: int
     supports_mixed_model_inputs: bool
     supports_model_materialization_recovery: bool
     supports_local_installation_reuse: bool
     supports_rental_keepalive: bool
-    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ..., supports_local_installation_reuse: bool = ..., supports_rental_keepalive: bool = ...) -> None: ...
+    supports_weights_transaction_refusal: bool
+    def __init__(self, wire_minor: _Optional[int] = ..., minimum_wire_minor: _Optional[int] = ..., supports_mixed_model_inputs: bool = ..., supports_model_materialization_recovery: bool = ..., supports_local_installation_reuse: bool = ..., supports_rental_keepalive: bool = ..., supports_weights_transaction_refusal: bool = ...) -> None: ...
 
 class PreparePackageSetCall(_message.Message):
     __slots__ = ("claim", "package_set", "application", "model_slot_paths", "image_inventory", "locked_requirements", "supports_model_materialization_recovery", "python_requires", "python_version", "package_interface")
@@ -1634,7 +1636,7 @@ class PrepareModelSourceResult(_message.Message):
     def __init__(self, outcome: _Optional[_Union[ModelSourcePrepareOutcome, str]] = ..., sources: _Optional[_Iterable[_Union[PreparedModelSource, _Mapping]]] = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ..., checkpoints: _Optional[_Iterable[_Union[ModelSourceCheckpoint, _Mapping]]] = ..., spent_members: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class RecordOwnerFrame(_message.Message):
-    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "weights_finalize_request", "weights_host_ack", "weights_transfer_request", "weights_read_request", "model_source_file_request", "model_source_prepare_request", "local_package_abort", "weights_upload_request", "local_package_fetch_request", "child_call_result", "native_source_command", "native_artifact_transfer")
+    __slots__ = ("claim", "desired_state", "attempt_offer", "cancel_attempt", "outcome_ack", "checkpoint_receipt", "snapshot_ack", "weights_finalize_request", "weights_host_ack", "weights_transfer_request", "weights_read_request", "model_source_file_request", "model_source_prepare_request", "local_package_abort", "weights_upload_request", "local_package_fetch_request", "child_call_result", "native_source_command", "native_artifact_transfer", "weights_transaction_refused")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     DESIRED_STATE_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_OFFER_FIELD_NUMBER: _ClassVar[int]
@@ -1654,6 +1656,7 @@ class RecordOwnerFrame(_message.Message):
     CHILD_CALL_RESULT_FIELD_NUMBER: _ClassVar[int]
     NATIVE_SOURCE_COMMAND_FIELD_NUMBER: _ClassVar[int]
     NATIVE_ARTIFACT_TRANSFER_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_TRANSACTION_REFUSED_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     desired_state: DesiredWorkerState
     attempt_offer: AttemptOffer
@@ -1673,7 +1676,8 @@ class RecordOwnerFrame(_message.Message):
     child_call_result: ChildCallResult
     native_source_command: NativeSourceCommand
     native_artifact_transfer: NativeArtifactTransfer
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., weights_finalize_request: _Optional[_Union[WeightsFinalizeRequest, _Mapping]] = ..., weights_host_ack: _Optional[_Union[WeightsHostAck, _Mapping]] = ..., weights_transfer_request: _Optional[_Union[WeightsTransferRequest, _Mapping]] = ..., weights_read_request: _Optional[_Union[WeightsReadRequest, _Mapping]] = ..., model_source_file_request: _Optional[_Union[ModelSourceFileRequest, _Mapping]] = ..., model_source_prepare_request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ..., local_package_abort: _Optional[_Union[LocalPackageAbort, _Mapping]] = ..., weights_upload_request: _Optional[_Union[WeightsUploadRequest, _Mapping]] = ..., local_package_fetch_request: _Optional[_Union[LocalPackageFetchRequest, _Mapping]] = ..., child_call_result: _Optional[_Union[ChildCallResult, _Mapping]] = ..., native_source_command: _Optional[_Union[NativeSourceCommand, _Mapping]] = ..., native_artifact_transfer: _Optional[_Union[NativeArtifactTransfer, _Mapping]] = ...) -> None: ...
+    weights_transaction_refused: WeightsTransactionRefused
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., desired_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., attempt_offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., cancel_attempt: _Optional[_Union[CancelAttempt, _Mapping]] = ..., outcome_ack: _Optional[_Union[AttemptOutcomeAck, _Mapping]] = ..., checkpoint_receipt: _Optional[_Union[JobCheckpointReceipt, _Mapping]] = ..., snapshot_ack: _Optional[_Union[SnapshotAck, _Mapping]] = ..., weights_finalize_request: _Optional[_Union[WeightsFinalizeRequest, _Mapping]] = ..., weights_host_ack: _Optional[_Union[WeightsHostAck, _Mapping]] = ..., weights_transfer_request: _Optional[_Union[WeightsTransferRequest, _Mapping]] = ..., weights_read_request: _Optional[_Union[WeightsReadRequest, _Mapping]] = ..., model_source_file_request: _Optional[_Union[ModelSourceFileRequest, _Mapping]] = ..., model_source_prepare_request: _Optional[_Union[ModelSourcePrepareRequest, _Mapping]] = ..., local_package_abort: _Optional[_Union[LocalPackageAbort, _Mapping]] = ..., weights_upload_request: _Optional[_Union[WeightsUploadRequest, _Mapping]] = ..., local_package_fetch_request: _Optional[_Union[LocalPackageFetchRequest, _Mapping]] = ..., child_call_result: _Optional[_Union[ChildCallResult, _Mapping]] = ..., native_source_command: _Optional[_Union[NativeSourceCommand, _Mapping]] = ..., native_artifact_transfer: _Optional[_Union[NativeArtifactTransfer, _Mapping]] = ..., weights_transaction_refused: _Optional[_Union[WeightsTransactionRefused, _Mapping]] = ...) -> None: ...
 
 class WorkerFrame(_message.Message):
     __slots__ = ("claim_ack", "observed_state", "attempt_accepted", "attempt_outcome", "boot_failure", "checkpoint_request", "checkpoint_ack", "snapshot", "weights_finalize_result", "weights_intent", "weights_receipt", "weights_read_result", "weights_transfer_status", "model_source_file_status", "model_source_prepared", "local_package_file_status", "local_package_abort_status", "weights_upload_result", "weights_checkpoint", "weights_transaction", "child_call_request", "child_call_cancel", "native_source_status", "native_artifact_transfer_status")
@@ -2834,6 +2838,34 @@ class ValidateWeightsCheckpointResult(_message.Message):
     safe_code: str
     safe_detail: str
     def __init__(self, weights: _Optional[_Union[WeightsCheckpointSubject, _Mapping]] = ..., checkpoint: _Optional[_Union[CheckpointRef, _Mapping]] = ..., valid: bool = ..., safe_code: _Optional[str] = ..., safe_detail: _Optional[str] = ...) -> None: ...
+
+class WeightsTransactionRefused(_message.Message):
+    __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "weights_transaction_id", "writer_epoch", "stage", "refusal", "safe_detail")
+    RECORD_OWNER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    CONTROL_STREAM_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    WORKER_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_SPEC_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_SLOT_FIELD_NUMBER: _ClassVar[int]
+    WEIGHTS_TRANSACTION_ID_FIELD_NUMBER: _ClassVar[int]
+    WRITER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    STAGE_FIELD_NUMBER: _ClassVar[int]
+    REFUSAL_FIELD_NUMBER: _ClassVar[int]
+    SAFE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    record_owner_epoch: int
+    control_stream_epoch: int
+    worker_boot_id: str
+    request_id: str
+    attempt_ordinal: int
+    invocation_spec_digest: bytes
+    output_slot: str
+    weights_transaction_id: str
+    writer_epoch: int
+    stage: WeightsHostStage
+    refusal: WeightsHostRefusal
+    safe_detail: str
+    def __init__(self, record_owner_epoch: _Optional[int] = ..., control_stream_epoch: _Optional[int] = ..., worker_boot_id: _Optional[str] = ..., request_id: _Optional[str] = ..., attempt_ordinal: _Optional[int] = ..., invocation_spec_digest: _Optional[bytes] = ..., output_slot: _Optional[str] = ..., weights_transaction_id: _Optional[str] = ..., writer_epoch: _Optional[int] = ..., stage: _Optional[_Union[WeightsHostStage, str]] = ..., refusal: _Optional[_Union[WeightsHostRefusal, str]] = ..., safe_detail: _Optional[str] = ...) -> None: ...
 
 class WeightsReceiptFrame(_message.Message):
     __slots__ = ("record_owner_epoch", "control_stream_epoch", "worker_boot_id", "request_id", "attempt_ordinal", "invocation_spec_digest", "output_slot", "weights_transaction_id", "writer_epoch", "tensorfs_declaration_digest", "weights_receipt", "objects", "manifest")

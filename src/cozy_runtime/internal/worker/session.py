@@ -3453,6 +3453,41 @@ class Worker:
                 return
             self._dispatch_current_frame(frame)
 
+    def _weights_refused(self, refused: pb.WeightsTransactionRefused) -> None:
+        """The Host holds no custody for one transaction: stop it and fail only its attempt.
+
+        The envelope was fenced by the caller. A refusal naming no transaction this worker
+        opened, or one already refused, is a no-op; the control stream always continues.
+        """
+        owner = self.fence.record_owner_id
+        transaction = refused.weights_transaction_id
+        if self.workspace is None:
+            return
+        try:
+            row = self.workspace.weights_row(owner, transaction)
+        except WorkspaceRefusal:
+            row = None
+        if (
+            row is None
+            or row["request"] != refused.request_id
+            or row["ordinal"] != refused.attempt_ordinal
+            or row["epoch"] != refused.writer_epoch
+        ):
+            self.note("weights", f"ignored a custody refusal for unknown {transaction[:23]}")
+            return
+        self.weights.abandon(transaction)
+        if not self.workspace.refuse_weights(owner, transaction):
+            return
+        detail = safe(
+            f"output {refused.output_slot!r}: the Host refused "
+            f"{pb.WeightsHostStage.Name(refused.stage)} "
+            f"({pb.WeightsHostRefusal.Name(refused.refusal)}): {refused.safe_detail}"
+        )
+        attempt = self.engine.history.get((refused.request_id, refused.attempt_ordinal))
+        if attempt is not None and attempt.state not in ("outcome", "closed"):
+            attempt.weights_refused = detail
+        self.note("weights", f"{refused.request_id}#{refused.attempt_ordinal} {detail}")
+
     def _dispatch_current_frame(self, frame: pb.RecordOwnerFrame) -> None:
         kind = frame.WhichOneof("msg")
         if kind is None:
@@ -3462,6 +3497,9 @@ class Worker:
             self.note("claim", "PROTOCOL: a second Claim on an established stream; ignored")
             return
         if self.fenced(inner):
+            return
+        if kind == "weights_transaction_refused":
+            self._weights_refused(inner)
             return
         if kind == "snapshot_ack":
             # THE BARRIER IS BOUND BY BOTH (§5). An ack naming a different `snapshot_id` OR

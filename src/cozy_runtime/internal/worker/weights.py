@@ -204,6 +204,7 @@ class WeightsExchange:
         self, attempt: Any, transaction: str, binding: Any, facts: dict[str, Any]
     ) -> None:
         """Publish the parent native writer's own observation, never child-authored refs."""
+        self._require_open(transaction)
         checkpoint = pb.CheckpointRef(
             head=pb.Ref(digest=documents.raw(facts["head"]), length=facts["head_length"]),
             plan_digest=documents.raw(facts["plan_digest"]),
@@ -341,6 +342,7 @@ class WeightsExchange:
     ) -> dict[str, Any]:
         if self.workspace is None:
             raise WeightsExchangeError("workspace_unavailable", "worker has no workspace custody")
+        self._require_open(transaction_id)
         intent = pb.WeightsIntentFrame(
             request_id=attempt.request_id,
             attempt_ordinal=attempt.attempt,
@@ -509,6 +511,13 @@ class WeightsExchange:
         self.writer_broker.close()
         with self._lock:
             self._held = {}
+
+    def _require_open(self, transaction_id: str) -> None:
+        with self._lock:
+            if transaction_id in self._abandoned:
+                raise WeightsExchangeError(
+                    "weights_transaction_abandoned", "the Host refused this transaction"
+                )
 
     def abandon(self, transaction_id: str) -> None:
         """Stop late receipt/transfer registration; native disposition owns the roots."""

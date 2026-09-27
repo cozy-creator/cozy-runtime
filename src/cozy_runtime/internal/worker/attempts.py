@@ -390,6 +390,8 @@ class AttemptRecord:
     #: Host-ACKed WeightsReceipt/1 refs, one per interface-declared output slot.
     weights_receipts: dict[str, pb.WeightsReceiptRef] = dataclasses_field(default_factory=dict)
     weights_work_fingerprint: str = ""
+    #: The Host refused custody of one of this attempt's weights transactions: its detail.
+    weights_refused: str = ""
     job_models: dict[str, JobModel] = dataclasses_field(default_factory=dict)
     model_leases: list[Any] = dataclasses_field(default_factory=list)
 
@@ -449,6 +451,7 @@ class AttemptRecord:
         self.publication = {}
         self.weights_receipts = {}
         self.weights_work_fingerprint = ""
+        self.weights_refused = ""
         self.job_models = {}
         self.model_leases = []
 
@@ -1955,6 +1958,17 @@ class AttemptEngine:
     ) -> pb.AttemptOutcome:
         if attempt.canceling:
             return self.finish_cancel(attempt, attempt.canceling)
+        if attempt.weights_refused:
+            # The Host holds no custody for one of its outputs: whatever the handler did,
+            # this attempt cannot deliver it. Only this attempt fails.
+            grants.abort_outputs(spool)
+            return self.outcome(
+                attempt,
+                STATUS.OUTCOME_STATUS_FAILED,
+                CAUSE.CAUSE_CODE_LOCAL_SAFETY,
+                ORIGIN.CAUSE_ORIGIN_WORKER,
+                f"weights_custody_refused: {attempt.weights_refused}",
+            )
         if not reply.get("ok"):
             grants.abort_outputs(spool)
             return self.outcome(
