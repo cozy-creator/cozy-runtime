@@ -25,6 +25,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.internal import canonical, interface_wheel, package_interface
 from cozy_runtime.internal.discovery import Discovered
+from test_serving_interfaces import built
 
 
 class Detail(msgspec.Struct, frozen=True):
@@ -132,12 +133,12 @@ def test_generated_interface_is_deterministic_typed_and_imports_without_implemen
     tmp_path: Path,
 ) -> None:
     _, raw = described()
-    first = interface_wheel.build(
+    first = built(
         raw,
         distribution="private-operations",
         version="0.1.0",
     )
-    second = interface_wheel.build(
+    second = built(
         raw,
         distribution="private-operations",
         version="0.1.0",
