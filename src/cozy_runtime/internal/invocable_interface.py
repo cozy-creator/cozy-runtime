@@ -228,11 +228,16 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
             "invocable memoization declaration must be a boolean", code="invocable_interface"
         )
     if optional.issubset(value) or (not value["memoize"] and optional.intersection(value)):
-        raise ConformanceError("operation identity requires one memoized identity outcome", code="invocable_interface")
+        raise ConformanceError(
+            "operation identity requires one memoized identity outcome", code="invocable_interface"
+        )
     if "operation_identity" in value:
         import re
 
-        if not isinstance(value["operation_identity"], str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value["operation_identity"]) is None:
+        if (
+            not isinstance(value["operation_identity"], str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", value["operation_identity"]) is None
+        ):
             raise ConformanceError("invalid operation identity", code="invocable_interface")
     if "operation_identity_unavailable" in value and (
         not isinstance(value["operation_identity_unavailable"], str)

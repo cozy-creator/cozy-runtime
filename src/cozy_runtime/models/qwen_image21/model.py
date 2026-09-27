@@ -167,9 +167,11 @@ class QwenImage21Model(Model[QwenImage21Graph]):
                 image = image.convert("RGBA")
                 width, height, _ = calculate_dimensions(1024 * 1024, image.width / image.height)
                 resized.append(pipeline.image_processor.resize(image, width=width, height=height))
-                pixels = pipeline.image_processor.preprocess(
-                    image, width=width, height=height
-                ).unsqueeze(2).to(device=device, dtype=vae.dtype)
+                pixels = (
+                    pipeline.image_processor.preprocess(image, width=width, height=height)
+                    .unsqueeze(2)
+                    .to(device=device, dtype=vae.dtype)
+                )
                 # argmax encoding is deterministic and consumes no sampler RNG.
                 encoded = pipeline._encode_vae_image(pixels, generator=None)
                 packed.append(
@@ -210,7 +212,9 @@ class QwenImage21Model(Model[QwenImage21Graph]):
         pipeline = self._pipeline()
         if reference_images is not None:
             if not reference_images or reference_latents is None or image_pad_mask is None:
-                raise ValueError("Qwen Image references require images, latents and vision token mask")
+                raise ValueError(
+                    "Qwen Image references require images, latents and vision token mask"
+                )
             pipeline.reference_latents = reference_latents
             pipeline.reference_pad_mask = image_pad_mask.to(device=device)
         elif reference_latents is not None or image_pad_mask is not None:

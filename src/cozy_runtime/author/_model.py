@@ -76,6 +76,7 @@ class AdapterCompatibility:
             and self.weight_min <= overlay.scale <= self.weight_max
         )
 
+
 #: THE ENCODED-LEAF CONSENT, and the whole of the author's say in the delivery plane.
 #:
 #: Every other rung the runtime can choose is invisible to author code by construction: the
@@ -507,7 +508,9 @@ class Model[PipelineT]:
     def validate_adapter_stack(cls, overlays: tuple[AdapterRef, ...]) -> None:
         """Validate ordered overlays against the model's closed compatibility declarations."""
         for index, overlay in enumerate(overlays):
-            if not any(declaration.accepts(overlay) for declaration in cls.__adapter_compatibility__):
+            if not any(
+                declaration.accepts(overlay) for declaration in cls.__adapter_compatibility__
+            ):
                 raise CapabilityError(
                     f"adapter {index} ({overlay.kind}:{overlay.component}) is incompatible "
                     f"with {cls.__name__}",

@@ -873,7 +873,9 @@ class LocalRecordOwner:
         # local RecordOwner must not mint a whitespace-dependent dialect beside Tensorhub.
         body = canonical.write(self.request.payload)
         spec = pb.InvocationSpec(
-            installation_id=self.placement.installation_id if self.placement is not None else self.package_installation_id,
+            installation_id=self.placement.installation_id
+            if self.placement is not None
+            else self.package_installation_id,
             payload_digest="sha256:" + hashlib.sha256(body).hexdigest(),
             inputs=self._input_bindings(body),
             outputs=self._output_bindings(),
@@ -1144,7 +1146,9 @@ def development_placement_documents(
     interface_bytes = package_interface.canonical_bytes(interface)
     interface_path = ""
     if artifact_cache is not None:
-        staged_interface = artifact_cache / "installed-interfaces" / installation_id / "package-interface.json"
+        staged_interface = (
+            artifact_cache / "installed-interfaces" / installation_id / "package-interface.json"
+        )
         staged_interface.parent.mkdir(parents=True, exist_ok=True)
         staged_interface.write_bytes(interface_bytes)
         interface_path = str(staged_interface)

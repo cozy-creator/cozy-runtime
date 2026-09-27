@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import stat
 from pathlib import Path
+
 from cozy_runtime.internal import fill, host_paths
 from cozy_runtime.internal.config import WorkerHostConfig
 from cozy_runtime.internal.refusal import LaunchRefusal
 
 BOOT_ROOT = host_paths.BOOT_DATA
 LOCAL_TENSORFS_ROOT = host_paths.TENSORFS_ROOT
+
 
 def prepare_boot(
     config: WorkerHostConfig,
@@ -53,5 +55,3 @@ def _directory(path: Path, *, mode: int = 0o700) -> None:
         raise LaunchRefusal("provision_store_invalid", str(path))
     if stat.S_IMODE(info.st_mode) != mode:
         path.chmod(mode)
-
-
