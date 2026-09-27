@@ -35,6 +35,7 @@ from cozy_runtime.internal import effect_interfaces
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.worker.machine_effects import Effects
 from cozy_runtime.internal.worker.machine_publication import PublicationAuthority
+from cozy_runtime.internal.worker.session import _progress_document
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.internal.worker.workspace_calls import Call, Calls
 from cozy_runtime.internal.worker.workspace_executions import Executions
@@ -381,11 +382,13 @@ class Stage:
                 ).fetchall()
             ]
 
-    def progress(self) -> list[dict[str, Any]]:
+    def progress(self, kind: str = "progress") -> list[dict[str, Any]]:
         page = self.executions.events("owner", "parent")
-        return [
-            json.loads(event.body)["payload"] for event in page.events if event.kind == "progress"
-        ]
+        return [json.loads(event.body)["payload"] for event in page.events if event.kind == kind]
+
+    def report(self, request: str, attempt: int, _index: int, frame: dict[str, Any]) -> None:
+        """The worker's lane: a frame journals on its parent execution, as Creator reads it."""
+        self.executions.progress("owner", request, attempt, _progress_document(frame))
 
 
 @contextlib.contextmanager
@@ -429,7 +432,9 @@ def staging(
     ):
         hub.bucket_url = f"http://127.0.0.1:{bucket_port}"
         authority = PublicationAuthority(f"https://localhost:{hub_port}", "worker", WORKER_TOKEN)
-        effects = Effects(workspace, executions, authority, allow_local=True)
+        effects = Effects(
+            workspace, executions, authority, allow_local=True, progress=staged.report
+        )
         try:
             yield staged, hub, effects
         finally:
@@ -480,7 +485,7 @@ def test_push_failure_retries_the_frozen_operation_without_repushing(
     assert hub.bucket.puts[failing] > 1
     assert all(hub.bucket.puts[key] == 1 for key in closure - {failing})
     assert any(
-        event.get("phase") == "retrying"
+        event.get("stage") == "Uploading checkpoint / retrying"
         and event.get("code") == "publication.adapter_failed.TransferFailed.TRANSFER_FAILED"
         for event in staged.progress()
     )
@@ -503,6 +508,40 @@ def test_pushes_slide_through_a_full_window_with_grants_fetched_ahead(
         assert hub.grant_batches == [32, 32, 32, 6]
 
 
+def test_upload_reports_held_bytes_then_publication_with_stage_timings(
+    stage: tuple[Stage, Hub, Effects],
+) -> None:
+    staged, hub, effects = stage
+    digest = staged.artifact.manifest.digest
+    total = staged.artifact.manifest.length + sum(
+        int(row["length"])
+        for row in tensorfs.Store.ensure(staged.workspace.store_root).walk_cozytensors(digest)
+    )
+    hub.finalize_seconds = 1.5
+    call = settle(staged, effects)
+    assert not call.safe_code and call.result
+    progress = staged.progress()
+    upload = [event for event in progress if event.get("stage") == "Uploading checkpoint"]
+    assert upload[0] == {"stage": "Uploading checkpoint", "step_ms": 0.0}
+    assert upload[-1]["position"] == upload[-1]["total"] == total
+    assert upload[-1]["unit"] == "bytes"
+    # Every byte is held before Hub's finalization publishes the checkpoint.
+    stages = [event["stage"] for event in progress if "stage" in event]
+    assert stages.index("Publishing checkpoint") > stages.index("Uploading checkpoint")
+    assert "Publishing checkpoint / reconciling" in stages
+    phases = {
+        log["name"]: log["fields"]
+        for log in staged.progress("log")
+        if "phase" in log.get("fields", {})
+    }
+    assert list(phases) == ["Uploading checkpoint", "Publishing checkpoint"]
+    uploaded, published = phases["Uploading checkpoint"], phases["Publishing checkpoint"]
+    assert uploaded["completed"] and uploaded["bytes"] == uploaded["moved_bytes"] == total
+    assert uploaded["rate_bytes_per_second"] > 0
+    # The publication stage spans the finalization retries, not only the last attempt.
+    assert published["completed"] and published["elapsed_ms"] >= 1500
+
+
 def test_asynchronous_finalization_is_pending_until_the_hub_commits(
     stage: tuple[Stage, Hub, Effects],
 ) -> None:
@@ -515,7 +554,9 @@ def test_asynchronous_finalization_is_pending_until_the_hub_commits(
     assert result["checkpoint"] == staged.artifact.manifest.digest
     assert result["observation"] == "acknowledged"
     assert {"phase": "reconciling", "code": "publication.finalization_pending"} in [
-        {"phase": event["phase"], "code": event["code"]} for event in staged.progress()
+        {"phase": event["phase"], "code": event["code"]}
+        for event in staged.progress()
+        if "phase" in event
     ]
     # Reconciliation reads the durable job; it never reopens or re-finalizes.
     assert hub.opens[call.child_request] == 1
@@ -543,6 +584,7 @@ def test_canceled_parent_settles_a_finalize_that_never_reached_the_hub(
     hub.lose_finalize = True
     drive(effects, lambda: staged.call().sent and bool(staged.progress()))
     assert staged.progress()[-1] == {
+        "stage": "Publishing checkpoint / reconciling",
         "operation": "publication",
         "call_index": 0,
         "phase": "reconciling",

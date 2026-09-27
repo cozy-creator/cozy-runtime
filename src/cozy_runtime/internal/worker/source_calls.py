@@ -10,12 +10,14 @@ import base64
 import hashlib
 import logging
 import os
+import re
+import signal
 import subprocess
 import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import msgspec
 
@@ -23,11 +25,104 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
 from cozy_runtime.internal import fill, source_interfaces, storage_admission
 from cozy_runtime.internal.worker import source_views, source_worker, workspace_sources
+from cozy_runtime.internal.worker.stage_progress import Progress, StageProgress
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
 _LOG = logging.getLogger(__name__)
+
+STAGES = {"download": "Downloading source", "convert": "Converting to cozytensors"}
+# The retained stderr tail, and the part of it a child-call failure detail carries
+# (authors see at most 1 KiB of detail).
+TAIL_BYTES = 8 << 10
+LOG_TAIL_CHARS = 4000
+DETAIL_TAIL_CHARS = 600
+_FRAME = re.compile(r'File "(?:[^"]*/)?([^"/]+)", line (\d+),? in ')
+_URL_QUERY = re.compile(r"(\w+://[^\s?#'\"]+)[?#][^\s'\"]*")
+_SECRET = re.compile(
+    r"(?i)\b(bearer|token|authorization|signature|credential)([\s:=\"']+)[^\s'\",;]+"
+)
+
+
+class _Tail:
+    """The last stderr bytes of a child, drained continuously so it never blocks."""
+
+    def __init__(self, stream: IO[bytes]) -> None:
+        self.data = bytearray()
+        self.thread = threading.Thread(
+            target=self._drain, args=(stream,), daemon=True, name="native-source-stderr"
+        )
+        self.thread.start()
+
+    def _drain(self, stream: IO[bytes]) -> None:
+        while chunk := stream.read(65536):
+            self.data += chunk
+            del self.data[:-TAIL_BYTES]
+
+    def text(self) -> str:
+        self.thread.join()
+        return self.data.decode(errors="replace")
+
+
+def diagnosis(returncode: int, stderr: str, credential: str) -> str:
+    """Why a native child ended, with its redacted stderr tail; never argv or env."""
+    for secret in {credential, *credential.split()}:
+        if len(secret) >= 8:
+            stderr = stderr.replace(secret, "[redacted]")
+    stderr = _SECRET.sub(r"\1\2[redacted]", _URL_QUERY.sub(r"\1?[redacted]", stderr))
+    stderr = _FRAME.sub(r"\1:\2 in ", stderr)  # stack frames without host paths
+    if returncode < 0:
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        cause = f"source worker was killed by {name}"
+        if name == "SIGKILL":
+            cause += " (the kernel's out-of-memory killer sends SIGKILL)"
+    elif returncode:
+        cause = f"source worker exited with status {returncode}"
+    else:
+        cause = "source worker ended without a bounded result"
+    lines = " | ".join(line.strip() for line in stderr.splitlines() if line.strip())
+    return f"{cause}; stderr: {_clip(lines, LOG_TAIL_CHARS)}" if lines else cause
+
+
+def _clip(text: str, limit: int) -> str:
+    """Keep the headline (a fatal error or panic names itself first) and the newest end."""
+    if len(text) <= limit:
+        return text
+    head = text.partition(" | ")[0][:160]
+    return f"{head} | … {text[len(head) - limit + 5 :]}"
+
+
+def brief(detail: str) -> str:
+    cause, _, tail = detail.partition("; stderr: ")
+    return f"{cause}; stderr: {_clip(tail, DETAIL_TAIL_CHARS)}" if tail else cause
+
+
+def _exchange(
+    process: subprocess.Popen[bytes], command: bytes, observe: Callable[[dict[str, Any]], None]
+) -> bytes:
+    """Send the command; stream progress lines; return the raw final result line."""
+    assert process.stdin is not None and process.stdout is not None
+    try:
+        process.stdin.write(command)
+        process.stdin.close()
+    except BrokenPipeError:
+        pass  # a killed child; its exit status says why
+    answer = b""
+    while line := process.stdout.readline((2 << 20) + 2):
+        if line.startswith(b'{"progress":') and line.endswith(b"\n"):
+            document = canonical_json.decode(line)
+            if isinstance(document, dict) and document.keys() == {"progress"}:
+                observe(document["progress"])
+                continue
+        answer += line
+        if len(answer) > (2 << 20) + 1:
+            process.kill()
+            break
+    return answer
 
 
 def _selection(value: dict[str, Any]) -> pb.NativeSourceSelection:
@@ -95,8 +190,8 @@ def refusal_frame(command: pb.NativeSourceCommand, code: str) -> pb.WorkerFrame:
 
 
 class NativeSourceFailure(Exception):
-    def __init__(self, code: str) -> None:
-        self.code = code
+    def __init__(self, code: str, detail: str = "") -> None:
+        self.code, self.detail = code, detail
         super().__init__(code)
 
 
@@ -111,8 +206,12 @@ class SourceCalls:
         endpoints: dict[str, str] | None = None,
         native_registry: bytes | None = None,
         spool_root: Path | None = None,
+        progress: Progress | None = None,
     ):
         self.workspace, self.owner, self.send, self.current = workspace, owner, send, current
+        self.progress = progress
+        # The latest failure detail per native call, for the machine child-call result.
+        self.details: dict[str, str] = {}
         self.endpoints = endpoints or {}
         self.native_registry = native_registry
         self.spool_root = spool_root
@@ -163,6 +262,7 @@ class SourceCalls:
             if command.service_id in self.processes:
                 return
             self.processes[command.service_id] = None
+            self.details.pop(command.service_id, None)
             self.parents[command.service_id] = command.parent_call.parent_request_id
             done = threading.Event()
             self.tasks[command.service_id] = done
@@ -265,6 +365,17 @@ class SourceCalls:
         with self.lock:
             return self.commands.get(command.service_id, command)
 
+    def failure_detail(self, service_id: str) -> str:
+        with self.lock:
+            return self.details.get(service_id, "")
+
+    def _emit(self, command: pb.NativeSourceCommand, frame: dict[str, Any]) -> None:
+        if self.progress is not None:
+            call = self._latest(command).parent_call
+            self.progress(
+                call.parent_request_id, call.parent_attempt_ordinal, call.call_index, frame
+            )
+
     def fence_owner(self, owner: str) -> None:
         with self.lock:
             for service, expected in self.process_owners.items():
@@ -284,6 +395,7 @@ class SourceCalls:
         computation: bytes = b"",
         selection: pb.NativeSourceSelection | None = None,
         code: str = "",
+        detail: str = "",
         memo_hit: bool = False,
         byte_output: pb.NativeByteTreeRef | None = None,
         byte_output_attempt: int = 0,
@@ -305,6 +417,7 @@ class SourceCalls:
             native_receipt_canonical_bytes=receipt,
             computation_digest=computation,
             safe_code=code,
+            safe_detail=detail,
             memo_hit=memo_hit,
             byte_output_attempt_ordinal=byte_output_attempt,
             byte_output_invocation_spec_digest=byte_output_spec,
@@ -384,6 +497,7 @@ class SourceCalls:
         view = command.operation == pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES
         file = command.operation == pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE
         native_bytes = view or file
+        stage: StageProgress | None = None
         try:
             if row["state"] == "complete":
                 view_fact = (
@@ -518,25 +632,40 @@ class SourceCalls:
             encoded = canonical_json.encode(envelope)
             if len(encoded) > 2 << 20:
                 raise WorkspaceRefusal("source execution command exceeds bounded transfer")
+
+            def observe(sample: dict[str, Any]) -> None:
+                nonlocal stage
+                label = STAGES.get(str(sample.get("stage")))
+                if label is None:
+                    return
+                if stage is None or stage.stage != label:
+                    if stage is not None:
+                        stage.finish(True)
+                    stage = StageProgress(label, lambda frame: self._emit(command, frame))
+                stage.update(int(sample["position"]), int(sample["total"]))
+
             with storage_admission.admit(*self._write_bounds(envelope)):
                 process = subprocess.Popen(
                     [sys.executable, "-m", "cozy_runtime.internal.worker.source_worker"],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                 )
                 with self.lock:
                     self.processes[command.service_id] = process
                     if command.service_id in self.canceled:
                         process.kill()
+                assert process.stderr is not None
+                tail = _Tail(process.stderr)
                 try:
-                    output, _ = process.communicate(encoded)
+                    output = _exchange(process, encoded, observe)
                 finally:
                     # Do not free admission while an exceptional IPC exit leaves
                     # the privileged native child writing in the background.
                     if process.poll() is None:
                         process.kill()
                     process.wait()
+                stderr = tail.text()
             with self.lock:
                 canceled = command.service_id in self.canceled
             if canceled:
@@ -548,10 +677,15 @@ class SourceCalls:
                         "AND service_id=? AND state IN ('accepted','resolved','executing')",
                         (owner, command.service_id),
                     )
+                if stage is not None:
+                    stage.finish(False)
                 terminal(command, pb.NATIVE_SOURCE_STATE_CANCELED)
                 return
-            if process.returncode or len(output) > 2 << 20:
-                raise WorkspaceRefusal("native source execution ended without bounded result")
+            if process.returncode or not output or len(output) > 2 << 20:
+                raise NativeSourceFailure(
+                    "native_source_failed",
+                    diagnosis(process.returncode, stderr, command.credential),
+                )
             command = self._latest(command)
             if self.owner() != owner or not self.current(command):
                 return
@@ -560,7 +694,9 @@ class SourceCalls:
                 code = answer.get("code")
                 if not isinstance(code, str) or code not in fill.tensorfs_module().errors.CODES:
                     code = "native_source_failed"
-                raise NativeSourceFailure(code)
+                raise NativeSourceFailure(
+                    code, diagnosis(0, stderr, command.credential) if stderr.strip() else ""
+                )
             if phase == "resolve":
                 resolved = _selection(answer["selection"])
                 workspace_sources.record_pin(self.workspace, owner, command, resolved)
@@ -600,6 +736,8 @@ class SourceCalls:
                     workspace_memo.record_native(self.workspace, owner, command.service_id)
                 except Exception:
                     _LOG.exception("native memo was not recorded")
+            if stage is not None:
+                stage.finish(True)
             terminal(
                 command,
                 pb.NATIVE_SOURCE_STATE_SUCCEEDED,
@@ -611,12 +749,14 @@ class SourceCalls:
                 byte_output_spec=view_fact[2] if view_fact else b"",
             )
         except Exception as exc:
-            # Only a known native refusal code crosses; arbitrary exception text stays private.
+            # Only a known native refusal code crosses; arbitrary exception text stays
+            # private. A child's redacted exit status and stderr tail is its diagnosis.
             code = (
                 exc.code
                 if isinstance(exc, (NativeSourceFailure, storage_admission.StorageRefusal))
                 else "native_source_failed"
             )
+            detail = exc.detail if isinstance(exc, NativeSourceFailure) else ""
             with self.workspace.locked() as db:
                 db.execute(
                     "UPDATE native_calls SET state='failed',native_error=? "
@@ -624,7 +764,24 @@ class SourceCalls:
                     "AND state IN ('accepted','resolved','executing')",
                     (code, owner, command.service_id),
                 )
-            terminal(command, pb.NATIVE_SOURCE_STATE_FAILED, code=code)
+            if stage is not None:
+                stage.finish(False)
+            if detail:
+                _LOG.warning("native source %s failed: %s", command.service_id, detail)
+                with self.lock:
+                    self.details[command.service_id] = brief(detail)
+                    while len(self.details) > 256:
+                        self.details.pop(next(iter(self.details)))
+                self._emit(
+                    command,
+                    {
+                        "kind": "log",
+                        "name": "native source failed",
+                        "value": "error",
+                        "fields": {"code": code, "detail": detail},
+                    },
+                )
+            terminal(command, pb.NATIVE_SOURCE_STATE_FAILED, code=code, detail=brief(detail))
         finally:
             if view:
                 try:

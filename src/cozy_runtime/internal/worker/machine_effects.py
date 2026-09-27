@@ -26,6 +26,7 @@ from cozy_runtime.internal.worker.machine_publication import (
     reconcile_checkpoint,
     upload_checkpoint,
 )
+from cozy_runtime.internal.worker.stage_progress import Progress, StageProgress
 from cozy_runtime.internal.worker.workspace import (
     Workspace,
     WorkspaceBusy,
@@ -75,9 +76,10 @@ class Effects:
         authority: PublicationAuthority | None,
         *,
         allow_local: bool = False,
+        progress: Progress | None = None,
     ):
         self.workspace, self.executions, self.authority = workspace, executions, authority
-        self.allow_local = allow_local
+        self.allow_local, self.report = allow_local, progress
         self.journal = Calls(workspace)
         self.lock = threading.Lock()
         self.thread_ids: set[int] = set()
@@ -88,6 +90,8 @@ class Effects:
         self.retry_after: dict[tuple[str, str], float] = {}
         self.landed: dict[tuple[str, str], int] = {}
         self.stalls: dict[tuple[str, str], int] = {}
+        # The stage each effect is in; it outlives retries, so its timing covers them.
+        self.stages: dict[tuple[str, str], StageProgress] = {}
         self.cleanup_after: dict[str, tuple[int, str]] = {}
         self.stopped = False
 
@@ -142,6 +146,24 @@ class Effects:
             if not self.stopped and len(self.active) < 2 and key not in self.active:
                 self.active[key] = self.pool.submit(self._cleanup, owner)
 
+    def _stage(self, key: tuple[str, str], call: Call, name: str) -> StageProgress:
+        """The effect's current stage, ending its previous stage as completed."""
+        with self.lock:
+            current = self.stages.get(key)
+        if current is not None and current.stage == name:
+            return current
+        if current is not None:
+            current.finish(True)
+
+        def emit(frame: dict[str, Any]) -> None:
+            if self.report is not None:
+                self.report(call.parent_request, call.parent_ordinal, call.call_index, frame)
+
+        stage = StageProgress(name, emit)
+        with self.lock:
+            self.stages[key] = stage
+        return stage
+
     def _before_stage(self, owner: str, call: Call) -> None:
         with self.lock:
             if self.stopped:
@@ -185,6 +207,7 @@ class Effects:
                 if not call.prepared:
                     frozen = prepare_release(client, **msgspec.structs.asdict(request))
                     call = self.journal.freeze(owner, call, frozen)
+                self._stage(key, call, "Publishing release")
                 result: Any = apply_release(
                     client,
                     call.prepared,
@@ -212,7 +235,7 @@ class Effects:
                 self.journal.complete(owner, call, raw)
             else:
                 self.journal.observe_result(owner, call, raw)
-            self._settled(key)
+            self._settled(key, True)
         except Exception as caught:
             exc = _refusal(caught)
             pending = isinstance(exc, PublicationRefusal) and (
@@ -245,12 +268,12 @@ class Effects:
                     if transient
                     else "publication was refused before its commit",
                 )
-                self._settled(key)
+                self._settled(key, False)
                 return
             if latest.sent and isinstance(exc, PublicationUncommitted):
                 # Hub durably reports the commit did not land: settle like a refusal.
                 self.journal.uncommitted(owner, latest, exc.code, "publication commit did not land")
-                self._settled(key)
+                self._settled(key, False)
                 return
             if (
                 latest.sent
@@ -265,6 +288,9 @@ class Effects:
                 self.journal.unresolved(owner, latest, exc.code)
             # An interrupted/revoked authority does not establish whether a prior
             # send committed. Keep the obligation and exact baseline for readback.
+            phase = "reconciling" if latest.sent else "retrying"
+            with self.lock:
+                stage = self.stages.get(key)
             self.executions.progress(
                 owner,
                 call.parent_request,
@@ -272,9 +298,10 @@ class Effects:
                 {
                     "type": "progress",
                     "payload": {
+                        **({"stage": f"{stage.stage} / {phase}"} if stage is not None else {}),
                         "operation": "publication",
                         "call_index": call.call_index,
-                        "phase": "reconciling" if latest.sent else "retrying",
+                        "phase": phase,
                         "code": exc.code
                         if isinstance(exc, PublicationRefusal)
                         else "publication.parent_stopped",
@@ -283,10 +310,13 @@ class Effects:
             )
             raise
 
-    def _settled(self, key: tuple[str, str]) -> None:
+    def _settled(self, key: tuple[str, str], completed: bool) -> None:
         with self.lock:
             self.landed.pop(key, None)
             self.stalls.pop(key, None)
+            stage = self.stages.pop(key, None)
+        if stage is not None:
+            stage.finish(completed)
 
     def _upload(
         self, owner: str, call: Call, request: effect_interfaces.Upload, client: PublicationClient
@@ -323,8 +353,10 @@ class Effects:
         checkpoint = CheckpointRef(
             request.destination, artifact.manifest.digest, artifact.manifest, call.child_request, ""
         )
+        total = sum(objects.values())
         if call.sent:
             # A sent finalize is decided by Hub's durable job, without re-staging bytes.
+            self._stage(slot, call, "Publishing checkpoint")
             settled = reconcile_checkpoint(
                 client, operation=call.child_request, checkpoint=checkpoint, objects=objects
             )
@@ -345,9 +377,14 @@ class Effects:
                     allow_local=self.allow_local,
                 )
 
-            def landed(count: int) -> None:
+            def landed(count: int, held: int) -> None:
                 with self.lock:
                     self.landed[slot] = max(self.landed.get(slot, 0), count)
+                if held < total:
+                    self._stage(slot, call, "Uploading checkpoint").update(held, total)
+                else:
+                    # Every closure byte is held; Hub's finalization publishes it.
+                    self._stage(slot, call, "Publishing checkpoint")
 
             return upload_checkpoint(
                 client,

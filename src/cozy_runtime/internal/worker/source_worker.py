@@ -7,16 +7,98 @@ The parent owns acceptance and memoization; this child owns only bounded native 
 from __future__ import annotations
 
 import base64
+import contextlib
+import faulthandler
 import hashlib
+import inspect
 import os
 import sys
 import threading
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill
+from cozy_runtime.internal.worker.stage_progress import SAMPLE_SECONDS
 
 MAX_COMMAND = 2 << 20
+_STDOUT = threading.Lock()
+
+
+def report(stage: str, position: int, total: int) -> None:
+    """One progress line ahead of the final result line; the parent owns throttling."""
+    line = canonical_json.encode(
+        {"progress": {"stage": stage, "position": position, "total": total}}
+    )
+    with _STDOUT:
+        sys.stdout.buffer.write(line + b"\n")
+        sys.stdout.buffer.flush()
+
+
+def landed_bytes(store: Any, root: Path, owner: str, members: Sequence[Sequence[Any]]) -> int:
+    """Bytes of a selection present locally: complete objects plus their durable prefixes.
+
+    Only for a binding without a download progress callback. Allocated blocks bound a
+    sparse part, so a preallocated or out-of-order part never overstates progress.
+    """
+    present = 0
+    for digest, length in {str(row[1]): int(row[2]) for row in members}.items():
+        hex_digest = digest.removeprefix("sha256:")
+        if store.contains(hex_digest):
+            present += length
+            continue
+        part = root / "roots/source-downloads" / owner.removeprefix("sha256:") / hex_digest
+        try:
+            stat = (part / "bytes.part").stat()
+        except FileNotFoundError:
+            continue
+        present += min(stat.st_size, stat.st_blocks * 512, length)
+    return present
+
+
+def reports_progress(function: Any) -> bool:
+    """Whether a binding declares the download progress callback (TensorFS > 0.3.57)."""
+    try:
+        return "progress" in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def materialize(store: Any, command: dict[str, Any]) -> dict[str, Any]:
+    selected = command["selection"]
+    members = [tuple(member) for member in selected["members"]]
+    total = sum({str(row[1]): int(row[2]) for row in members}.values())
+    options: dict[str, Any] = {
+        "allowed_hosts": selected["allowed_hosts"],
+        "credential_hosts": selected["credential_hosts"],
+        "credential": command.get("credential", ""),
+        "allow_local": command.get("allow_local", False),
+    }
+    produced: dict[str, Any]
+    if reports_progress(store.materialize_source):
+        options["progress"] = lambda present, whole: report("download", present, whole)
+        produced = store.materialize_source(command["native_owner"], members, **options)
+        return produced
+    stopped = threading.Event()
+
+    def sample() -> None:
+        root, owner = Path(command["store"]), command["native_owner"]
+        while True:
+            # Optional narration: an unreadable sample is skipped, never a download failure.
+            with contextlib.suppress(Exception):
+                report("download", landed_bytes(store, root, owner, members), total)
+            if stopped.wait(SAMPLE_SECONDS):
+                return
+
+    sampler = threading.Thread(target=sample, daemon=True, name="source-progress")
+    sampler.start()
+    try:
+        produced = store.materialize_source(command["native_owner"], members, **options)
+    finally:
+        stopped.set()
+        sampler.join()
+    return produced
 
 
 class ConversionRefusal(ValueError):
@@ -100,15 +182,7 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
         )
         return {"selection": selection, "implementation": store.implementation_sha256}
     if operation in ("download_huggingface", "download_civitai"):
-        selected = command["selection"]
-        produced = store.materialize_source(
-            command["native_owner"],
-            [tuple(member) for member in selected["members"]],
-            allowed_hosts=selected["allowed_hosts"],
-            credential_hosts=selected["credential_hosts"],
-            credential=command.get("credential", ""),
-            allow_local=command.get("allow_local", False),
-        )
+        produced = materialize(store, command)
         root = produced["artifact"]
         receipt = root["receipt"]
         result = {
@@ -142,6 +216,10 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
             if command.get("registry")
             else None
         )
+        retained = store.tree_root(command["source_owner"])
+        total = sum(int(row["length"]) for row in store.walk(retained["manifest_digest"]))
+        written = 0
+        report("convert", 0, total)
         while True:
             prepared = store.prepare_source_artifact(
                 command["source_owner"],
@@ -152,8 +230,13 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
                 registry=registry,
             )
             adopt = None
+            written += int(prepared["converted_bytes"])
             if prepared["complete"]:
+                report("convert", total, total)
                 break
+            # Checkpoint heads carry resumed work; this process's passes carry the rest.
+            durable = sum(int(row["bytes"]) for row in prepared["checkpoints"])
+            report("convert", min(max(durable, written), total), total)
             checkpoints = [
                 (row["slot"], row["head"], row["head_length"]) for row in prepared["checkpoints"]
             ]
@@ -230,6 +313,8 @@ def execute(command: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
+    # A native crash leaves every thread's stack in the stderr tail the parent keeps.
+    faulthandler.enable()
     try:
         command = canonical_json.decode(sys.stdin.buffer.read(MAX_COMMAND + 1))
         if not isinstance(command, dict):
@@ -253,7 +338,9 @@ def main() -> None:
     body = canonical_json.encode(result)
     if len(body) > MAX_COMMAND:
         body = canonical_json.encode({"ok": False, "code": "source_result_bound"})
-    sys.stdout.buffer.write(body)
+    with _STDOUT:
+        sys.stdout.buffer.write(body + b"\n")
+        sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":

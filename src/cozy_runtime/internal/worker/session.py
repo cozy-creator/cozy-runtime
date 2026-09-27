@@ -178,7 +178,8 @@ def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
     """Preserve the measured progress coordinates the executor already supplied.
 
     Stage-local and overall fractions stay separate. Optional coordinates are omitted when
-    the package does not know them; no layer fabricates whole-invocation completion.
+    the package does not know them; no layer fabricates whole-invocation completion. A
+    byte stage names its `unit` and the `rate` it measured since its previous sample.
     Other events retain the executor's public record, already bounded and redacted at
     emission. Only seam routing fields are removed; a log's scalar value is its level,
     not its message, and a load's value may be None beside a measured position.
@@ -192,7 +193,7 @@ def _progress_document(frame: Mapping[str, Any]) -> dict[str, Any]:
             "stage": str(frame.get("stage", ""))[:120],
             "step_ms": frame.get("step_ms", 0.0),
         }
-        for field in ("stage_fraction", "position", "total", "overall_fraction"):
+        for field in ("stage_fraction", "position", "total", "overall_fraction", "unit", "rate"):
             if frame.get(field) is not None:
                 payload[field] = frame[field]
     return {"type": kind, "payload": payload}
@@ -1194,7 +1195,12 @@ class Worker:
 
         self.machine_sources = MachineSources(self)
         self.machine_effects = (
-            Effects(self.workspace, self.executions, options.publication_authority)
+            Effects(
+                self.workspace,
+                self.executions,
+                options.publication_authority,
+                progress=self.native_progress,
+            )
             if self.workspace is not None and self.executions is not None
             else None
         )
@@ -1212,6 +1218,7 @@ class Worker:
                     and command.worker_boot_id == self.fence.worker_boot_id
                 ),
                 spool_root=self.engine.spool_root,
+                progress=self.native_progress,
             )
             if self.workspace is not None
             else None
@@ -3296,6 +3303,17 @@ class Worker:
                 )
             )
         )
+
+    def native_progress(
+        self, request_id: str, attempt: int, index: int, frame: dict[str, Any]
+    ) -> None:
+        """Native child work reports on its parent's lane, under the call's author label."""
+        label = self.calls.progress_label(request_id, attempt, index)
+        if label and frame.get("kind") == "progress":
+            frame = {**frame, "stage": f"{label} / {frame['stage']}"[:120]}
+        # Optional narration can outlive its parent attempt; it never fails the work.
+        with contextlib.suppress(WorkspaceRefusal, OSError):
+            self.emit_progress(request_id, attempt, frame)
 
     # ------------------------------------------------------------------ the stream
 
