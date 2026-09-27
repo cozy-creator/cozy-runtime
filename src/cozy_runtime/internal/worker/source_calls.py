@@ -16,15 +16,25 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import IO, Any
 
 import msgspec
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author._errors import AuthorError
 from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
 from cozy_runtime.internal import fill, source_interfaces, storage_admission
-from cozy_runtime.internal.worker import source_views, source_worker, workspace_sources
+from cozy_runtime.internal.worker import (
+    source_upload,
+    source_views,
+    source_worker,
+    upload_plan,
+    workspace_partial,
+    workspace_sources,
+)
+from cozy_runtime.internal.worker.machine_publication import PublicationClient, PublicationRefusal
 from cozy_runtime.internal.worker.stage_progress import Progress, StageProgress
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
@@ -207,6 +217,7 @@ class SourceCalls:
         native_registry: bytes | None = None,
         spool_root: Path | None = None,
         progress: Progress | None = None,
+        publication: Callable[[str, str, int], PublicationClient] | None = None,
     ):
         self.workspace, self.owner, self.send, self.current = workspace, owner, send, current
         self.progress = progress
@@ -215,6 +226,7 @@ class SourceCalls:
         self.endpoints = endpoints or {}
         self.native_registry = native_registry
         self.spool_root = spool_root
+        self.publication = publication
         self.lock = threading.Lock()
         self.processes: dict[str, subprocess.Popen[bytes] | None] = {}
         self.tasks: dict[str, threading.Event] = {}
@@ -428,6 +440,174 @@ class SourceCalls:
             status.byte_output.CopyFrom(byte_output)
         self.send(pb.WorkerFrame(native_source_status=status))
 
+    def active(self) -> set[str]:
+        """Native calls running now; pressure reclamation never touches their bytes."""
+        with self.lock:
+            return set(self.tasks)
+
+    def _live_uploads(self) -> set[str]:
+        with self.workspace.locked() as db:
+            return workspace_sources.live_uploads(db)
+
+    def _stopped(self, service_id: str) -> bool:
+        with self.lock:
+            return service_id in self.canceled
+
+    def _child(self, command: pb.NativeSourceCommand, envelope: dict[str, Any]) -> dict[str, Any]:
+        """One killable upload step. A cancellation kills it and surfaces as ``Canceled``."""
+        encoded = canonical_json.encode(envelope)
+        if len(encoded) > 2 << 20:
+            raise WorkspaceRefusal("upload step exceeds bounded transfer")
+        process = subprocess.Popen(
+            [sys.executable, "-m", "cozy_runtime.internal.upload_child"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        with self.lock:
+            self.processes[command.service_id] = process
+            if command.service_id in self.canceled:
+                process.kill()
+        assert process.stderr is not None
+        tail = _Tail(process.stderr)
+        try:
+            output = _exchange(process, encoded, lambda _sample: None)
+        finally:
+            # Admission is held by the caller until this child can no longer write.
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+        stderr = tail.text()
+        if self._stopped(command.service_id):
+            raise source_upload.Canceled()
+        if process.returncode or not output or len(output) > 2 << 20:
+            raise NativeSourceFailure(
+                "native_source_failed", diagnosis(process.returncode, stderr, command.credential)
+            )
+        answer = canonical_json.decode(output)
+        if not answer.get("ok"):
+            code = answer.get("code")
+            if not isinstance(code, str) or (
+                code not in fill.tensorfs_module().errors.CODES and code not in upload_plan.CODES
+            ):
+                code = "native_source_failed"
+            raise NativeSourceFailure(
+                code, diagnosis(0, stderr, command.credential) if stderr.strip() else ""
+            )
+        return dict(answer)
+
+    def _upload(
+        self,
+        owner: str,
+        command: pb.NativeSourceCommand,
+        row: dict[str, Any],
+        arguments: dict[str, Any],
+        phase: str,
+        terminal: Callable[..., None],
+    ) -> None:
+        """Resolve, or stream the pinned source through conversion into its publication."""
+        try:
+            self._upload_steps(owner, command, row, arguments, phase, terminal)
+        except (upload_plan.UploadRefusal, AuthorError, PublicationRefusal) as exc:
+            # A reviewed or Hub refusal keeps its stable code; its text stays private.
+            raise NativeSourceFailure(exc.code) from exc
+
+    def _upload_steps(
+        self,
+        owner: str,
+        command: pb.NativeSourceCommand,
+        row: dict[str, Any],
+        arguments: dict[str, Any],
+        phase: str,
+        terminal: Callable[..., None],
+    ) -> None:
+        if self.publication is None:
+            raise NativeSourceFailure("publication_authority_absent")
+        call = command.parent_call
+        stage: StageProgress | None = None
+
+        def report(name: str, position: int, total: int) -> None:
+            nonlocal stage
+            if stage is None or stage.stage != name:
+                if stage is not None:
+                    stage.finish(True)
+                stage = StageProgress(name, lambda frame: self._emit(command, frame))
+            stage.update(position, total)
+
+        upload = source_upload.Upload(
+            store_root=self.workspace.store_root,
+            native_owner=row["native_owner"],
+            service_id=command.service_id,
+            operation=row["operation"],
+            arguments=arguments,
+            envelope={
+                "store": str(self.workspace.store_root),
+                "parent_pid": os.getpid(),
+                "operation": row["operation"],
+                "arguments": arguments,
+                "native_owner": row["native_owner"],
+                "credential": command.credential,
+                **self.endpoints,
+                "allow_local": bool(self.endpoints),
+            },
+            registry=self.native_registry,
+            client=self.publication(owner, call.parent_request_id, call.parent_attempt_ordinal),
+            hooks=source_upload.Hooks(
+                child=lambda envelope: self._child(command, envelope),
+                canceled=lambda: self._stopped(command.service_id),
+                active=self.active,
+                live=self._live_uploads,
+                evict_retired=lambda target: workspace_partial.reclaim(self.workspace, target),
+                consume=partial(workspace_sources.consume_partial, self.workspace, owner),
+                progress=report,
+            ),
+            allow_local=bool(self.endpoints),
+            directory=self.workspace.directory,
+        )
+        try:
+            if phase == "resolve":
+                resolved = _selection(upload.resolve())
+                workspace_sources.record_pin(self.workspace, owner, command, resolved)
+                terminal(command, pb.NATIVE_SOURCE_STATE_RESOLVED, selection=resolved)
+                return
+            content = workspace_sources.selection_content(command.selection)
+            effective = {
+                "source": content["content_manifest"],
+                "slots": upload.slots,
+                "recipe": upload.recipe.name if upload.recipe is not None else "",
+                "destination": arguments["destination"],
+            }
+            if self.native_registry is not None:
+                effective["registry"] = hashlib.sha256(self.native_registry).hexdigest()
+            computation = computation_key(row["operation"], effective)
+            checkpoint = upload.run(
+                _native_selection(command.selection),
+                content,
+                documents.spell(computation),
+                call.parent_attempt_ordinal,
+            )
+        except source_upload.Canceled:
+            if stage is not None:
+                stage.finish(False)
+            with self.workspace.locked() as db:
+                db.execute(
+                    "UPDATE native_calls SET state='failed' WHERE owner=? "
+                    "AND service_id=? AND state IN ('accepted','resolved','executing')",
+                    (owner, command.service_id),
+                )
+            terminal(command, pb.NATIVE_SOURCE_STATE_CANCELED)
+            return
+        if stage is not None:
+            stage.finish(True)
+        result = canonical_json.encode(msgspec.to_builtins(checkpoint))
+        workspace_sources.record_upload(self.workspace, owner, command, result, computation)
+        try:
+            upload.finish()
+        except Exception:
+            # The checkpoint is committed; the parent's release and pressure retry cleanup.
+            _LOG.exception("upload cleanup deferred")
+        terminal(command, pb.NATIVE_SOURCE_STATE_SUCCEEDED, result=result, computation=computation)
+
     def _write_bounds(self, command: dict[str, Any]) -> tuple[storage_admission.Write, ...]:
         if not storage_admission.pressure_enabled():
             return ()
@@ -507,7 +687,7 @@ class SourceCalls:
                     if view
                     else None
                 )
-                if not native_bytes:
+                if not native_bytes and row["operation"] not in source_interfaces.UPLOADS:
                     workspace_memo.retain_native_result(self.workspace, owner, command.service_id)
                 terminal(
                     command,
@@ -529,6 +709,9 @@ class SourceCalls:
                 )
             )
             phase = "resolve" if command.phase == pb.NATIVE_SOURCE_PHASE_RESOLVE else "execute"
+            if row["operation"] in source_interfaces.UPLOADS:
+                self._upload(owner, command, row, arguments, phase, terminal)
+                return
             envelope = {
                 "store": str(self.workspace.store_root),
                 "parent_pid": os.getpid(),

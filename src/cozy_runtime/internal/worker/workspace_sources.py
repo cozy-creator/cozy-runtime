@@ -14,6 +14,7 @@ from typing import Any
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import fill, source_interfaces
 from cozy_runtime.internal.call_intent import canonical_intent
+from cozy_runtime.internal.worker import source_upload
 from cozy_runtime.internal.worker.workspace import (
     Journal,
     Workspace,
@@ -88,6 +89,8 @@ def accepted(workspace: Workspace, owner: str, command: pb.NativeSourceCommand) 
         "convert_cozytensors": pb.NATIVE_SOURCE_OPERATION_CONVERT,
         "source_files": pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES,
         "commit_file": pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE,
+        "upload_huggingface": pb.NATIVE_SOURCE_OPERATION_HUGGINGFACE,
+        "upload_civitai": pb.NATIVE_SOURCE_OPERATION_CIVITAI,
     }.get(call.export)
     if expected_operation is None or command.operation != expected_operation:
         raise WorkspaceRefusal("native source operation differs from its fixed interface")
@@ -280,6 +283,37 @@ def record_complete(
         )
 
 
+def record_upload(
+    workspace: Workspace,
+    owner: str,
+    command: pb.NativeSourceCommand,
+    result: bytes,
+    computation: bytes,
+) -> None:
+    """An upload's result is the Hub checkpoint it acknowledged; it retains no local root."""
+    if len(result) > 48 << 10 or len(computation) != 32:
+        raise WorkspaceRefusal("upload completion exceeds its result identity bound")
+    with workspace.locked() as db:
+        _parent(db, owner, command.parent_call)
+        row = db.execute(
+            "SELECT * FROM native_calls WHERE owner=? AND service_id=?", (owner, command.service_id)
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] in ("releasing", "released")
+            or row["operation"] not in source_interfaces.UPLOADS
+            or row["intent_digest"] != command.parent_call.intent_digest
+        ):
+            raise WorkspaceRefusal("upload completion has no active accepted call")
+        if row["result"] and (row["result"] != result or row["computation_digest"] != computation):
+            raise WorkspaceRefusal("upload completion contradicts its prior result")
+        db.execute(
+            "UPDATE native_calls SET result=?,computation_digest=?,state='complete',"
+            "native_error='' WHERE owner=? AND service_id=?",
+            (result, computation, owner, command.service_id),
+        )
+
+
 def adopt_download_progress(workspace: Workspace, owner: str, service_id: str) -> bool:
     """Independently acquire only a stopped predecessor with the exact native work key."""
     with workspace.locked() as db:
@@ -406,10 +440,23 @@ def release_intent(db: Journal, owner: str, ack: pb.AttemptOutcomeAck) -> list[s
 # identical call to adopt.
 _PARTIAL_OPERATIONS = ("download_huggingface", "download_civitai", "convert_cozytensors")
 
+# An upload's landed source is a donor for a later upload of the same source whether or
+# not it finished, so a retired upload is a partial either way.
 PARTIALS = (
     "SELECT n.* FROM native_calls n WHERE n.state='stopped' AND n.retired_ms>0 "
-    "AND length(n.result)=0"
+    "AND (length(n.result)=0 OR n.operation IN ('upload_huggingface','upload_civitai'))"
 )
+
+
+def live_uploads(db: Journal) -> set[str]:
+    """Uploads whose conversion session is still owned by a call that may run again."""
+    return {
+        str(row[0])
+        for row in db.execute(
+            "SELECT service_id FROM native_calls WHERE operation IN "
+            "('upload_huggingface','upload_civitai') AND state NOT IN ('stopped','released')"
+        )
+    }
 
 
 def now_ms() -> int:
@@ -423,8 +470,13 @@ def _has_progress(store: Any, row: dict[str, Any]) -> bool:
     return root is not None and not root.get("released") and not root.get("complete")
 
 
-def _release_native(store: Any, owner: str, row: dict[str, Any]) -> None:
+def _release_native(
+    store: Any, owner: str, row: dict[str, Any], workspace: Workspace, live: set[str]
+) -> None:
     if row["native_owner"] != native_owner(owner, row["service_id"]):
+        return
+    if row["operation"] in source_interfaces.UPLOADS:
+        source_upload.release(store, workspace.directory, row, live)
         return
     if row["operation"] == "convert_cozytensors":
         state = store.derived_lookup(row["native_owner"])
@@ -452,7 +504,7 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
         if row["state"] != "releasing":
             raise WorkspaceRefusal("native cleanup has no permanent release intent")
         row = dict(row)
-    if row["operation"] not in ("source_files", "commit_file"):
+    if row["operation"] not in ("source_files", "commit_file", *source_interfaces.UPLOADS):
         workspace_memo.release_native_result(workspace, owner, service_id)
         workspace_memo.release_native_lookup(workspace, owner, service_id)
     store = fill.store(workspace.store_root)
@@ -470,10 +522,15 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
         and not row["result"]
         and row["computation_digest"]
         and _has_progress(store, row)
+    ) or (
+        row["operation"] in source_interfaces.UPLOADS
+        and source_upload.retire(store, workspace.directory, row)
     ):
         final = "stopped"
     else:
-        _release_native(store, owner, row)
+        with workspace.locked() as db:
+            live = live_uploads(db)
+        _release_native(store, owner, row, workspace, live)
     with workspace.locked() as db:
         db.execute(
             "UPDATE native_calls SET state=?,retired_ms=CASE WHEN ?<>'stopped' THEN 0 "
@@ -484,7 +541,9 @@ def release(workspace: Workspace, owner: str, service_id: str) -> None:
 
 
 def spend(db: Journal, workspace: Workspace, row: dict[str, Any]) -> None:
-    db.native(partial(_release_native, fill.store(workspace.store_root), row["owner"], row))
+    live = live_uploads(db)
+    store = fill.store(workspace.store_root)
+    db.native(partial(_release_native, store, row["owner"], row, workspace, live))
     db.execute(
         "UPDATE native_calls SET state='released' WHERE owner=? AND service_id=? "
         "AND state='stopped'",

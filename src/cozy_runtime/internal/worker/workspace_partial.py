@@ -17,6 +17,7 @@ from cozy_runtime.internal.worker import store_gc, workspace_sources
 from cozy_runtime.internal.worker.workspace import (
     Journal,
     Workspace,
+    WorkspaceBusy,
     WorkspaceRefusal,
     _stop_native_transaction,
 )
@@ -71,6 +72,16 @@ def evict(db: Journal, workspace: Workspace, *, target_bytes: int) -> tuple[int,
         if collected.store_busy:
             return reclaimed, removed, True
     return reclaimed, removed, False
+
+
+def reclaim(workspace: Workspace, target_bytes: int) -> int:
+    """Evict retired partials, oldest first, for a writer that needs ``target_bytes``."""
+    try:
+        with workspace.locked(blocking=False) as db:
+            reclaimed, _, _ = evict(db, workspace, target_bytes=max(target_bytes, 1))
+    except WorkspaceBusy:
+        return 0
+    return reclaimed
 
 
 def adopt(workspace: Workspace, db: Journal, owner: str, transaction: str) -> dict[str, Any]:

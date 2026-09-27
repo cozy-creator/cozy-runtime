@@ -6,6 +6,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from cozy_runtime import canonical_json
+from cozy_runtime.internal import source_interfaces
 from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import (
@@ -28,7 +29,11 @@ OPERATIONS = {
     "convert_cozytensors": pb.NATIVE_SOURCE_OPERATION_CONVERT,
     "source_files": pb.NATIVE_SOURCE_OPERATION_SOURCE_FILES,
     "commit_file": pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE,
+    # An upload is a provider source operation whose result is a publication.
+    "upload_huggingface": pb.NATIVE_SOURCE_OPERATION_HUGGINGFACE,
+    "upload_civitai": pb.NATIVE_SOURCE_OPERATION_CIVITAI,
 }
+PROVIDER_EXPORTS = ("download_huggingface", "download_civitai", *source_interfaces.UPLOADS)
 
 
 class Sources:
@@ -79,7 +84,7 @@ class Sources:
                 and row["state"] in ("complete", "failed", "stopped", "released", "releasing")
             ):
                 return
-        if request.export in ("download_huggingface", "download_civitai"):
+        if request.export in PROVIDER_EXPORTS:
             with self.lock:
                 selection = self.selections.get(command.service_id)
             if selection is None:
