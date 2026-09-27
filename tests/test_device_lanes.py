@@ -29,6 +29,7 @@ from typing import Any
 import pytest
 
 from conftest import sample_python
+from cozy.worker.v1.wire_version import MIN_COMPATIBLE_WIRE_MINOR
 from cozy_runtime.internal import accel, child_env, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
@@ -174,13 +175,13 @@ def test_previous_minor_owner_runs_inference_on_current_worker() -> None:
     def previous(owner: LocalRecordOwner) -> None:
         queued = owner.host.inbound.get_nowait()
         assert queued is not None and queued.WhichOneof("msg") == "claim"
-        queued.claim.wire_minor = 60
+        queued.claim.wire_minor = MIN_COMPATIBLE_WIRE_MINOR
         owner.host.deliver(queued)
         make_desired = owner._desired_state
 
         def desired() -> pb.DesiredWorkerState:
             directive = make_desired()
-            directive.wire_minor = 60
+            directive.wire_minor = MIN_COMPATIBLE_WIRE_MINOR
             return directive
 
         owner._desired_state = desired  # type: ignore[method-assign]
