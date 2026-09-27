@@ -12,6 +12,8 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -41,8 +43,8 @@ def test_the_device_grant_alone_decides_the_slot() -> None:
         assert not machine_slots.admits(granted, {})
 
 
-@pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
-def test_a_root_with_models_and_weights_gets_its_own_cpu_lane() -> None:
+@contextmanager
+def _cpu_worker() -> Iterator[tuple[Worker, JobBinding, str]]:
     # A short root: the executor's control socket path must fit `sockaddr_un`.
     with tempfile.TemporaryDirectory(prefix="cpu") as short:
         root = Path(short)
@@ -105,6 +107,15 @@ def test_a_root_with_models_and_weights_gets_its_own_cpu_lane() -> None:
             ),
             InMemoryControlHost(),
         )
+        try:
+            yield worker, binding, descriptor
+        finally:
+            worker.shutdown()
+
+
+@pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
+def test_a_root_with_models_and_weights_gets_its_own_cpu_lane() -> None:
+    with _cpu_worker() as (worker, binding, descriptor):
         directive = pb.JobDirective(
             installation_id="install-cpu", job_descriptor_id=descriptor, orchestration=True
         )
@@ -118,7 +129,34 @@ def test_a_root_with_models_and_weights_gets_its_own_cpu_lane() -> None:
             assert not machine_slots.ensure(worker, "request-gpu", granted, binding)
         finally:
             machine_slots.release(worker, "request-cpu")
-            worker.shutdown()
+
+
+@pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")
+def test_the_next_request_of_a_cpu_job_adopts_its_idle_executor() -> None:
+    with _cpu_worker() as (worker, binding, descriptor):
+        directive = pb.JobDirective(
+            installation_id="install-cpu", job_descriptor_id=descriptor, orchestration=True
+        )
+        assert machine_slots.ensure(worker, "first", directive, binding)
+        first = worker.job_slots[machine_slots.key("first")].supervision.current
+        assert first is not None
+        machine_slots.release(worker, "first")
+        assert first.alive() and machine_slots.key("first") not in worker.job_slots
+
+        assert machine_slots.ensure(worker, "second", directive, binding)
+        slot = worker.job_slots[machine_slots.key("second")]
+        assert slot.supervision.current is first and slot.ready()
+        assert slot.lane.lane_id == machine_slots.key("second") and not worker.warm_cpu
+        # Another request of the job while the idle one is taken starts its own.
+        assert machine_slots.ensure(worker, "third", directive, binding)
+        third = worker.job_slots[machine_slots.key("third")].supervision.current
+        assert third is not None and third.pid != first.pid
+        machine_slots.release(worker, "second")
+        machine_slots.release(worker, "third")
+        assert len(worker.warm_cpu) == 1 and not third.alive()
+
+        machine_slots.forget(worker, "install-cpu")
+        assert not worker.warm_cpu and not first.alive()
 
 
 def _script(tmp_path: Path, name: str, metadata: str, body: str) -> Path:
