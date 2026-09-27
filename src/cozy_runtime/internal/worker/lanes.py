@@ -109,13 +109,14 @@ class LaneRow:
     supervision: child.ExecutorSupervision | None = None
     #: the lane clock at this tenant's latest admission or prepare: LRU victim order
     last_used: int = 0
-    #: THE LANE RESIDENCY SIGNATURE under which this tenant's last attempt died of a device
-    #: OOM, or "" when it did not (cr-097). A retry under the SAME signature is the same
-    #: request asked twice and cannot get a different answer -- measured as four identical
-    #: 38.3 s failures, each followed by a 25.8 s executor rebuild, while an IDLE co-tenant
-    #: held 6.07 GiB. The arbitration reads it to make the retry a different request, or to
-    #: refuse it typed instead of spending the handler again.
-    oom_signature: str = ""
+    #: invocation spec digest -> THE LANE RESIDENCY SIGNATURE under which an attempt of
+    #: that exact invocation died of a device OOM (cr-097). The same invocation under the
+    #: SAME signature cannot get a different answer -- measured as four identical 38.3 s
+    #: failures, each followed by a 25.8 s executor rebuild, while an IDLE co-tenant held
+    #: 6.07 GiB. The arbitration reads it to make that retry a different request, or to
+    #: refuse it typed instead of spending the handler again. Keyed by invocation (cr-190):
+    #: one oversized request must not refuse every other request of the placement.
+    oom_signatures: dict[bytes, str] = field(default_factory=dict)
 
     def resident_bytes(self) -> int:
         return sum(self.ledger.resident.values())
