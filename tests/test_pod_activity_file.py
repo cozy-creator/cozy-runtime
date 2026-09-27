@@ -194,12 +194,11 @@ def test_model_warmup_is_active_but_a_resident_model_is_idle() -> None:
             placement_set_digest=b"",
             package={},
             development={},
-            environment_digest=b"",
-            package_interface=("", 0),
+            installation_id="",
+            package_interface=b"",
             bindings_digest=b"",
             models=(),
             entrypoints=(),
-            environment={},
             document={},
             serving=pb.SERVING_STATE_ACTIVATING,
         )
@@ -349,7 +348,7 @@ def test_a_stopped_executor_leaves_an_attempt_in_flight_with_a_meter_that_has_st
         summary, samples = _drive(root, "wedge")
 
     window = summary["window"]
-    assert len(window) == 2, "the attempt was never admitted, so nothing was stopped"
+    assert len(window) == 2, "the attempt never entered the device, so nothing was stopped"
     assert summary["ended"] == "terminal", (summary["ended"], summary["error"])
     # The driver confirms the kernel stop and excludes the one publication whose
     # meter read may already have started before that stop.

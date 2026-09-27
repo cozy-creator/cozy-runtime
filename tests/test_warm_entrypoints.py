@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,6 @@ from cozy_runtime.internal import fill, package_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.local import (
     LocalRequest,
-    development_source_digest,
     stage_development_placement,
 )
 from cozy_runtime.internal.worker.control import InMemoryControlHost
@@ -80,7 +80,7 @@ class _Booted:
             body,
             package="local/development-package",
             release="0.0.0",
-            source_digest=development_source_digest(PACKAGE),
+            installation_id="local-" + uuid.uuid4().hex,
             artifact_cache=root / "artifact-cache",
             tensorfs_root=store.root,
             project=PACKAGE,
@@ -93,9 +93,7 @@ class _Booted:
             development_project=PACKAGE,
             development_package=self.staged.placement.development.package,
             development_release=self.staged.placement.development.release,
-            development_source_digest=documents.spell(
-                self.staged.placement.development.source_digest
-            ),
+            development_installation_id=self.staged.placement.development.installation_id,
         )
         self.worker = Worker(config, options, InMemoryControlHost())
         self.notes: list[tuple[str, str]] = []

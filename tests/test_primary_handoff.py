@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -17,7 +18,6 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.local import (
     LocalRecordOwner,
     LocalRequest,
-    development_source_digest,
     stage_development_placement,
 )
 from cozy_runtime.internal.worker.attempts import AttemptRecord, Released
@@ -61,7 +61,7 @@ def offer(
         LocalRequest(entrypoint="serve", payload={"wait": wait}, outputs=(), request_id=request_id),
         {"serve": documents.spell(placement.entrypoints[0].entrypoint_binding_digest)},
         root / request_id,
-        package_code_digest=documents.spell(placement.development.source_digest),
+        package_installation_id=placement.development.installation_id,
         placement=placement,
     )
     owner._dispatch()
@@ -119,7 +119,7 @@ def test_replacement_waits_for_work_then_retires_before_assignment() -> None:
             package_interface.build(discover(project)),
             package="local/handoff",
             release="0.0.0",
-            source_digest=development_source_digest(project),
+            installation_id="local-" + uuid.uuid4().hex,
             artifact_cache=root / "artifacts",
             tensorfs_root=root / "store",
             project=project,
@@ -161,9 +161,7 @@ def test_replacement_waits_for_work_then_retires_before_assignment() -> None:
                 development_project=project,
                 development_package=staged.placement.development.package,
                 development_release=staged.placement.development.release,
-                development_source_digest=documents.spell(
-                    staged.placement.development.source_digest
-                ),
+                development_installation_id=staged.placement.development.installation_id,
             ),
             InMemoryControlHost(),
         )
@@ -258,7 +256,7 @@ def test_replacement_waits_for_work_then_retires_before_assignment() -> None:
 @needs_executor
 def test_only_the_process_identity_decides_between_in_place_and_replacement() -> None:
     """proto-061 D2: a started process is kept for a new document of the same placement,
-    package, environment, device pin and lane shape, and replaced for anything else."""
+    package, installation, device pin and lane shape, and replaced for anything else."""
     with _workspace() as root:
         project = root / "project"
         project.mkdir()
@@ -276,7 +274,7 @@ def test_only_the_process_identity_decides_between_in_place_and_replacement() ->
             package_interface.build(discover(project)),
             package="local/identity",
             release="0.0.0",
-            source_digest=development_source_digest(project),
+            installation_id="local-" + uuid.uuid4().hex,
             artifact_cache=root / "artifacts",
             tensorfs_root=root / "store",
             project=project,
@@ -295,9 +293,7 @@ def test_only_the_process_identity_decides_between_in_place_and_replacement() ->
                 development_project=project,
                 development_package=staged.placement.development.package,
                 development_release=staged.placement.development.release,
-                development_source_digest=documents.spell(
-                    staged.placement.development.source_digest
-                ),
+                development_installation_id=staged.placement.development.installation_id,
             ),
             InMemoryControlHost(),
         )
@@ -323,10 +319,10 @@ def test_only_the_process_identity_decides_between_in_place_and_replacement() ->
             entry = dict(outgoing.document)
             same = worker._placement_from_entry(entry, b"next")
             assert worker._grows_in_place(outgoing, same, worker.bindings)
-            other_env = worker._placement_from_entry(
-                {**entry, "environment_digest": "sha256:" + "e" * 64}, b"next"
+            other_installation = worker._placement_from_entry(
+                {**entry, "installation_id": "local-" + uuid.uuid4().hex}, b"next"
             )
-            assert not worker._grows_in_place(outgoing, other_env, worker.bindings)
+            assert not worker._grows_in_place(outgoing, other_installation, worker.bindings)
             pinned = worker._placement_from_entry(entry, b"next")
             pinned.device_pin = (1,)
             assert not worker._grows_in_place(outgoing, pinned, worker.bindings)

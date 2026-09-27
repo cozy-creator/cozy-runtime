@@ -2,26 +2,20 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 import tensorfs
 
-from cozy_runtime.internal import accel, base_observation, canonical
+from cozy_runtime.internal import accel, base_observation
 from cozy_runtime.internal.worker.acquire import Acquirer
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.plan import DeclaredBinding
-from cozy_runtime.internal.worker.session import (
-    Placement,
-    Worker,
-    WorkerOptions,
-    read_placement_set,
-)
+from cozy_runtime.internal.worker.session import Placement, Worker, WorkerOptions
 from cozy_runtime.protocol import documents
-from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _config
 from test_group_stage_residency import binding as independent_slots
+from test_group_stage_residency import current_placement
 
 FIXTURE = Path(__file__).parent / "testdata/h3-public-binding-sets"
 BASE = FIXTURE.parent / "h3-group-residency"
@@ -43,29 +37,20 @@ def public_bindings(root: Path) -> tuple[Placement, dict[str, DeclaredBinding]]:
             documents.spell(documents.digest_of(header.read_bytes())),
             header.stat().st_size,
         )
-    raw = (FIXTURE / "placement.json").read_bytes()
-    (entry,) = read_placement_set(
-        pb.DesiredPlacementSet(
-            placement_set_digest=documents.digest_of(raw),
-            placement_set_canonical_bytes=raw,
-        )
-    )
     interface = (FIXTURE / "package-interface.json").read_bytes()
-    assert canonical.digest(json.loads(interface)) == entry["package_interface"]["digest"]
+    raw, entry = current_placement((FIXTURE / "placement.json").read_bytes(), interface)
     cache = root / "artifacts"
     cache.mkdir()
-    (cache / entry["package_interface"]["digest"].removeprefix("sha256:")).write_bytes(interface)
     placement = Placement(
         placement_id=entry["placement_id"],
         placement_set_digest=documents.digest_of(raw),
         package=entry["package"],
         development={},
-        environment_digest=documents.raw(entry["environment_digest"]),
-        package_interface=(entry["package_interface"]["digest"], len(interface)),
+        installation_id=entry["installation_id"],
+        package_interface=interface,
         bindings_digest=documents.raw(entry["bindings_digest"]),
         models=tuple(entry["models"]),
         entrypoints=tuple(entry["entrypoints"]),
-        environment=entry["environment"],
         document=entry,
     )
     result, _ = Acquirer(

@@ -28,6 +28,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -38,10 +39,10 @@ from cozy_runtime.internal import child_env, liveness, package_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.local import (
+    LOCAL_PLACEMENT,
     LocalRecordOwner,
     LocalRequest,
     SliceOutcome,
-    development_source_digest,
     run_slice,
 )
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -103,7 +104,7 @@ def _run(root: Path, hook: Any) -> tuple[SliceOutcome, float]:
     body = package_interface.build(found)
     workspace = root / ".run"
     workspace.mkdir(parents=True)
-    digest = development_source_digest(PACKAGE)
+    installation_id = "local-" + uuid.uuid4().hex
     request = LocalRequest(
         entrypoint="marco",
         payload={"message": "marco"},
@@ -117,11 +118,11 @@ def _run(root: Path, hook: Any) -> tuple[SliceOutcome, float]:
             config,
             request,
             workspace=workspace,
-            package_code_digest=digest,
+            package_installation_id=installation_id,
             package_interface_document=body,
             project=PACKAGE,
             development_tensorfs_root=home / "tensorfs",
-            options=WorkerOptions(root=workspace / "worker", release_id=digest),
+            options=WorkerOptions(root=workspace / "worker", release_id=installation_id),
             record_owner_hook=hook,
         )
     return outcome, time.monotonic() - started
@@ -165,7 +166,7 @@ def test_a_boot_that_keeps_working_is_never_cut(monkeypatch: pytest.MonkeyPatch)
 def test_a_boot_that_stops_working_is_ended_on_the_measurement() -> None:
     """The wedged arm: an executor that stops dead is observed, and the run ends on that.
 
-    SIGSTOP the moment the executor has dialled back: the worker's `prepare` then blocks on
+    SIGSTOP the moment the executor has dialled back: the worker's `start` then blocks on
     the seam with nothing burning anywhere — no cursor moving, no thread working, no child
     working. The run must end `worker_wedged`, naming the open boot step and the measured
     stillness, after the derived floor and NOT on any larger clock; and the workspace's
@@ -191,7 +192,7 @@ def test_a_boot_that_stops_working_is_ended_on_the_measurement() -> None:
     assert stopped, "the executor was never spawned, so nothing was wedged"
     assert outcome.ended == "worker_wedged", (outcome.ended, outcome.error)
     assert "no measurable progress for" in outcome.error
-    assert "load:prepare:marco" in outcome.error, outcome.error
+    assert f"load:start:{LOCAL_PLACEMENT}" in outcome.error, outcome.error
     assert elapsed > boot_floor(), f"{elapsed:.1f}s: ended before the derived floor"
     # Promptly: within a few floors, which the rule explains. The old clock was 60 floors.
     assert elapsed < 4 * boot_floor(), f"{elapsed:.1f}s: the run waited on a clock"

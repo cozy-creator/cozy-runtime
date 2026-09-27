@@ -22,6 +22,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,6 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.local import (
     LocalRecordOwner,
     LocalRequest,
-    development_source_digest,
     run_slice,
 )
 from cozy_runtime.internal.worker import session
@@ -65,7 +65,7 @@ def main(argv: list[str]) -> int:
     body = package_interface.build(found)
     workspace = root / ".run"
     workspace.mkdir(parents=True, exist_ok=True)
-    digest = development_source_digest(PACKAGE)
+    installation_id = "local-" + uuid.uuid4().hex
     request = LocalRequest(
         entrypoint="marco",
         payload={"message": "marco"},
@@ -74,19 +74,19 @@ def main(argv: list[str]) -> int:
         kind="entrypoint",
     )
     window: list[int] = []
-    hook = _freeze_on_admit(window) if mode == "wedge" else None
+    hook = _freeze_on_entry(window) if mode == "wedge" else None
     with contextlib.chdir(PACKAGE), contextlib.redirect_stdout(sys.stderr):
         outcome = run_slice(
             config,
             request,
             workspace=workspace,
-            package_code_digest=digest,
+            package_installation_id=installation_id,
             package_interface_document=body,
             project=PACKAGE,
             development_tensorfs_root=home / "tensorfs",
             options=WorkerOptions(
                 root=workspace / "worker",
-                release_id=digest,
+                release_id=installation_id,
                 activity_path=path,
             ),
             record_owner_hook=hook,
@@ -104,8 +104,8 @@ def main(argv: list[str]) -> int:
     return 0
 
 
-def _freeze_on_admit(window: list[int]) -> Any:
-    """SIGSTOP the executor the instant the worker ADMITS the attempt: the attempt is
+def _freeze_on_entry(window: list[int]) -> Any:
+    """SIGSTOP the executor the instant the attempt ENTERS the device: the attempt is
     accepted, the worker is fine, and nothing is moving — a process alive, owning its scope,
     burning nothing. SIGCONT afterwards, so the run still reaches its terminal and the arm
     proves the stopped worker was RESUMABLE and not merely broken."""
@@ -120,7 +120,7 @@ def _freeze_on_admit(window: list[int]) -> Any:
             return executor
 
         worker.supervision.spawn = remember  # type: ignore[method-assign]
-        admit = worker.admit
+        enter = worker.enter
 
         def resume_after(pid: int) -> None:
             # This fixture's clock-only helper is not the subject's work, just like
@@ -135,8 +135,8 @@ def _freeze_on_admit(window: list[int]) -> Any:
             finally:
                 worker.pollers.discard(tid)
 
-        def stop_after_admit(attempt: Any) -> bool:
-            accepted = admit(attempt)
+        def stop_after_entry(attempt: Any) -> bool:
+            accepted = enter(attempt)
             if accepted and executors and not window:
                 os.kill(executors[0], signal.SIGSTOP)
                 stopped = os.waitid(os.P_PID, executors[0], os.WSTOPPED | os.WEXITED | os.WNOWAIT)
@@ -150,7 +150,7 @@ def _freeze_on_admit(window: list[int]) -> Any:
                 ).start()
             return accepted
 
-        worker.admit = stop_after_admit  # type: ignore[method-assign]
+        worker.enter = stop_after_entry  # type: ignore[method-assign]
 
     return hook
 

@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,6 @@ from cozy_runtime.internal.local import (
     LOCAL_PLACEMENT,
     LocalRecordOwner,
     LocalRequest,
-    development_source_digest,
     stage_development_placement,
 )
 from cozy_runtime.internal.worker.session import Worker, WorkerOptions
@@ -166,7 +166,7 @@ def _serve(
         body,
         package="local/development-package",
         release="0.0.0",
-        source_digest=development_source_digest(PACKAGE),
+        installation_id="local-" + uuid.uuid4().hex,
         artifact_cache=workspace / "artifact-cache",
         tensorfs_root=config.cozy_home / "tensorfs",
         project=PACKAGE,
@@ -175,7 +175,7 @@ def _serve(
         requests,
         dict(staged.bindings),
         workspace,
-        package_code_digest=documents.spell(staged.placement.development.source_digest),
+        package_installation_id=staged.placement.development.installation_id,
         placement=staged.placement,
     )
     options = WorkerOptions(
@@ -188,7 +188,7 @@ def _serve(
         development_project=PACKAGE,
         development_package=staged.placement.development.package,
         development_release=staged.placement.development.release,
-        development_source_digest=documents.spell(staged.placement.development.source_digest),
+        development_installation_id=staged.placement.development.installation_id,
     )
     worker = Worker(config, options, owner.host)
     owner.watch(worker)

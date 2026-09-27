@@ -16,17 +16,17 @@ from cozy_runtime.protocol import worker_pb2 as pb
 from test_device_lanes import _config, _slice, _workspace, needs_executor
 
 BINDING = "sha256:" + "b" * 64
-ENVIRONMENT = "sha256:" + "e" * 64
+INSTALLATION = "local-installation"
 
 
 def offer(
-    request: str, *, binding: str = BINDING, environment: str = ENVIRONMENT, seed: int = 0
+    request: str, *, binding: str = BINDING, installation: str = INSTALLATION, seed: int = 0
 ) -> pb.AttemptOffer:
     payload = json.dumps({"seed": seed}).encode()
     payload_digest = documents.spell(documents.digest_of(payload))
     raw, digest = documents.identity(
         pb.InvocationSpec(
-            environment_digest=environment,
+            installation_id=installation,
             payload_digest=payload_digest,
             inputs=[
                 pb.InputBinding(
@@ -72,12 +72,11 @@ def test_cold_model_queue_validates_without_loading_or_losing_faults(tmp_path: P
         placement_set_digest=b"p" * 32,
         package={},
         development={},
-        environment_digest=bytes.fromhex("e" * 64),
-        package_interface=("", 0),
+        installation_id=INSTALLATION,
+        package_interface=b"",
         bindings_digest=b"s" * 32,
         models=(),
         entrypoints=(),
-        environment={},
         document={},
     )
     worker.bindings[BINDING] = DeclaredBinding(
@@ -87,7 +86,7 @@ def test_cold_model_queue_validates_without_loading_or_losing_faults(tmp_path: P
         model_binding_path="model",
         model_parameter_name="model",
         release="sha256:" + "d" * 64,
-        environment_digest=ENVIRONMENT,
+        installation_id=INSTALLATION,
     )
     try:
         assert not worker.bindings[BINDING].weightless
@@ -110,7 +109,7 @@ def test_cold_model_queue_validates_without_loading_or_losing_faults(tmp_path: P
 
         for incoming, expected in (
             (offer("unknown", binding="sha256:" + "a" * 64), "unknown_binding"),
-            (offer("other-environment", environment="sha256:" + "a" * 64), "environment_mismatch"),
+            (offer("other-installation", installation="local-other"), "environment_mismatch"),
         ):
             refused = worker.engine.offer(incoming)
             worker._bind_attempt_slot(refused)

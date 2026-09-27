@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 import tensorfs
@@ -21,6 +23,30 @@ from cozy_runtime.protocol import worker_pb2 as pb
 FIXTURE = Path(__file__).parent / "testdata/h3-group-residency"
 HEADROOM = 85_017_493_504
 TEXT_ENCODER = 51_506_191_840
+INSTALLATION = "local-h3-fixture"
+
+
+def current_placement(raw: bytes, interface: bytes) -> tuple[bytes, dict[str, Any]]:
+    """The captured H3 placement on the current wire: an installation, and interface bytes."""
+    document = json.loads(raw)
+    (row,) = document["placements"]
+    del row["environment"], row["environment_digest"]
+    row["installation_id"] = INSTALLATION
+    row["package_interface"] = base64.b64encode(interface).decode()
+    if "development" in row:
+        development = row["development"]
+        row["development"] = {
+            "package": development["package"],
+            "release": development["release"],
+            "installation_id": INSTALLATION,
+        }
+    raw = canonical.write(document)
+    (entry,) = read_placement_set(
+        pb.DesiredPlacementSet(
+            placement_set_digest=documents.digest_of(raw), placement_set_canonical_bytes=raw
+        )
+    )
+    return raw, entry
 
 
 def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1) -> DeclaredBinding:
@@ -35,14 +61,9 @@ def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1) -> Decla
         documents.spell(documents.digest_of(header.read_bytes())),
         header.stat().st_size,
     )
-    interface = json.loads((FIXTURE.parent / "h3-code-only/package-interface.json").read_bytes())
-    raw = (FIXTURE / "placement.json").read_bytes()
-    (entry,) = read_placement_set(
-        pb.DesiredPlacementSet(
-            placement_set_digest=documents.digest_of(raw),
-            placement_set_canonical_bytes=raw,
-        )
-    )
+    captured = (FIXTURE.parent / "h3-code-only/package-interface.json").read_bytes()
+    interface = json.loads(captured)
+    raw, entry = current_placement((FIXTURE / "placement.json").read_bytes(), captured)
     described = next(row for row in interface["entrypoints"] if row["name"] == "fl2va")
     model = described["models"][0]
     if scope == "simultaneous":
@@ -69,22 +90,18 @@ def binding(tmp_path: Path, *, scope: str = "authored", slots: int = 1) -> Decla
         selected = copy.deepcopy(entry["entrypoints"][0]["slots"][0])
         selected["slot"] = "other"
         entry["entrypoints"][0]["slots"].append(selected)
-    body = canonical.write(interface)
-    digest = canonical.digest(interface)
     cache = tmp_path / "artifacts"
     cache.mkdir()
-    (cache / digest.removeprefix("sha256:")).write_bytes(body)
     placement = Placement(
         placement_id=entry["placement_id"],
         placement_set_digest=documents.digest_of(raw),
         package={},
         development=entry["development"],
-        environment_digest=documents.raw(entry["environment_digest"]),
-        package_interface=(digest, len(body)),
+        installation_id=entry["installation_id"],
+        package_interface=canonical.write(interface),
         bindings_digest=documents.raw(entry["bindings_digest"]),
         models=tuple(entry["models"]),
         entrypoints=tuple(entry["entrypoints"]),
-        environment=entry["environment"],
         document=entry,
         device_pin=(0, 1),
     )
