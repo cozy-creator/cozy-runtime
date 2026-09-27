@@ -368,7 +368,6 @@ Path(sys.argv[2]).write_text(sent[0]["payload"])
     body = canonical_json.decode(frozen)
     for wrong in [
         body["payload"],
-        {**body, "extra": 1},
         {**body, "models": {"foreign": None}},
         {**body, "payload": []},
     ]:
@@ -376,6 +375,9 @@ Path(sys.argv[2]).write_text(sent[0]["payload"])
             arguments(target, canonical_json.encode(wrong))
     for omitted in ({}, {"model": None}):
         assert arguments(target, canonical_json.encode({**body, "models": omitted}))[1] == {}
+    # A newer generator's additive envelope field and an absent model map are tolerated.
+    assert arguments(target, canonical_json.encode({**body, "extra": 1}))[0] == payload
+    assert arguments(target, canonical_json.encode({"payload": body["payload"]}))[1] == {}
     # A self-call is the original invocable contract, even when its user fields
     # happen to be named payload and models. No heuristic peeks inside user data.
     from dataclasses import replace

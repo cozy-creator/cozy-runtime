@@ -119,7 +119,6 @@ def test_plain_script_returns_installed_public_struct_after_managed_call(
     "value",
     [
         {"projection": None, "ready": "false"},
-        {"projection": None, "ready": False, "extra": 1},
         {"projection": None},
     ],
 )
@@ -128,9 +127,7 @@ def test_public_result_conversion_retains_generated_wire_refusals(
 ) -> None:
     imported, _, _ = installed(tmp_path, monkeypatch)
     binding = imported.__cozy_bindings__["select"]
-    # The source class permits unknown fields by default; generated wire
-    # validation must reject them before conversion into that public class.
-    assert not imported.Selection.__struct_config__.forbid_unknown_fields
+    # Generated wire validation still rejects wrong types and missing fields.
     with pytest.raises(msgspec.ValidationError):
         decode(
             value,
@@ -141,6 +138,24 @@ def test_public_result_conversion_retains_generated_wire_refusals(
             observation=None,
             python_type=binding.python_result,
         )
+
+
+def test_a_result_field_added_by_a_newer_child_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    imported, _, _ = installed(tmp_path, monkeypatch)
+    binding = imported.__cozy_bindings__["select"]
+    assert not binding.result.__struct_config__.forbid_unknown_fields
+    value, _ = decode(
+        {"projection": None, "ready": True, "added_by_newer_child": 1},
+        binding.result,
+        [],
+        request_id="parent",
+        guard=lambda: None,
+        observation=None,
+        python_type=binding.python_result,
+    )
+    assert type(value) is imported.Selection and value.ready is True
 
 
 @pytest.mark.parametrize(

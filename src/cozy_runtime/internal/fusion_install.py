@@ -162,16 +162,13 @@ def _require_sources() -> None:
     if DIFFUSERS_ABSENT:
         raise FusionRefusal("fusion_dependency_absent", DIFFUSERS_ABSENT)
     try:
-        installed = metadata.version("diffusers")
+        metadata.version("diffusers")
     except metadata.PackageNotFoundError as exc:
         raise FusionRefusal(
             "fusion_dependency_absent", "diffusers is required by the fused glue plan"
         ) from exc
-    if installed != DIFFUSERS_VERSION:
-        raise FusionRefusal(
-            "fusion_dependency_mismatch",
-            f"the fused glue plan pins diffusers=={DIFFUSERS_VERSION}, found {installed}",
-        )
+    # The capability is the exact source of the replaced forwards, checked below; any
+    # Diffusers release that keeps those sources byte-identical is fusable.
     sources: dict[str, Callable[..., object]] = {
         "MiniMaxH3TransformerBlock.forward": MiniMaxH3TransformerBlock.forward,
         "MiniMaxH3AttnProcessor.__call__": MiniMaxH3AttnProcessor.__call__,
@@ -319,8 +316,8 @@ def _install_transformer(transformer: Any, root: str) -> tuple[list[tuple[str, s
             and block.norm2.weight is not None
             and attn.norm_q.weight is not None
             and attn.norm_k.weight is not None,
-            f"{path} is not the exact Diffusers {DIFFUSERS_VERSION} MiniMax-H3 block the fused "
-            "plan was matched to",
+            f"{path} is not the MiniMax-H3 block shape the fused plan was matched to "
+            f"(Diffusers {DIFFUSERS_VERSION} sources)",
         )
         attn_fp8 = all(_rowwise_leaf(m) for m in (attn.to_q, attn.to_k, attn.to_v))
         ff_fp8 = _rowwise_leaf(ff.net[0].proj)

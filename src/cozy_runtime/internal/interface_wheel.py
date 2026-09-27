@@ -20,7 +20,7 @@ from packaging.version import Version
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import invocable_interface, package_interface
 
-GENERATOR_ABI = "cozy.interface-generator/8"
+GENERATOR_ABI = "cozy.interface-generator/9"
 MAX_IMPLEMENTATION_WHEEL = 256 << 20
 _DISTRIBUTION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _COMPANION = re.compile(r"(?:.+/)?_cozy_callers_[0-9a-f]{16}_[0-9]+\.py")
@@ -115,7 +115,8 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                         "interface type collides with a generated export",
                         code="interface_name_conflict",
                     )
-                options = ["kw_only=True", "frozen=True", "forbid_unknown_fields=True"]
+                # Open wire types: a callee may add result fields a caller does not read yet.
+                options = ["kw_only=True", "frozen=True"]
                 if "tag" in node:
                     options += [
                         "tag=" + repr(node["tag"]),
@@ -243,7 +244,7 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
                     bound = {
                         key: value
                         for key, value in row.items()
-                        if key not in {"kind", "max_count", "prepare"}
+                        if key in package_interface.ASSET_BOUND_KEYS
                     }
                     bound["media_types"] = tuple(bound["media_types"])
                     if any(bound.values()):
@@ -295,14 +296,14 @@ def _module(module: str, entries: list[dict[str, Any]], digest: str) -> str:
             _declare(
                 declarations,
                 models_name,
-                f"class {models_name}(msgspec.Struct, kw_only=True, frozen=True, "
-                "forbid_unknown_fields=True):\n" + "\n".join(model_fields or ["    pass"]) + "\n",
+                f"class {models_name}(msgspec.Struct, kw_only=True, frozen=True):\n"
+                + "\n".join(model_fields or ["    pass"])
+                + "\n",
             )
             _declare(
                 declarations,
                 call_name,
-                f"class {call_name}(msgspec.Struct, kw_only=True, frozen=True, "
-                "forbid_unknown_fields=True):\n"
+                f"class {call_name}(msgspec.Struct, kw_only=True, frozen=True):\n"
                 f"    payload: {request_name}\n    models: {models_name}\n",
             )
             models = "{" + ", ".join(f"{name!r}: {name}" for name in model_names) + "}"
