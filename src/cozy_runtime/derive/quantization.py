@@ -7,11 +7,18 @@ Publication belongs to Tensorhub's production transaction.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import math
+import os
 import tempfile
-from collections.abc import Callable, Iterator, Mapping, Sequence
+import threading
+from collections import deque
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from importlib.resources import files
-from typing import Any, NamedTuple
+from pathlib import Path
+from typing import IO, Any, NamedTuple
 
 import msgspec
 import numpy as np
@@ -128,7 +135,7 @@ _ARTIFACT_SPECS = {
 }
 PLAIN_SPEC = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f"
 _MAX_ARTIFACT_PLAN_BYTES = 8 << 20
-_SOURCE_READ_CHUNK = 32 << 20
+_SOURCE_READ_CHUNK = 8 << 20
 MAX_OUTPUT_BYTES = 32 << 30
 
 
@@ -394,7 +401,11 @@ def quantize_component_into(
     source_component: str,
     target_component: str,
 ) -> QuantizationStats:
-    """Write one plan component into an already-open caller-owned transaction."""
+    """Write one plan component into an already-open caller-owned transaction.
+
+    Tensors encode ahead on the shared pool; their roles are added and checkpointed here,
+    one tensor at a time and in plan order, exactly as a serial encoder would.
+    """
     _validate_request(payload)
     encoder = _ENCODINGS.get(encoding)
     if encoder is None:
@@ -410,100 +421,69 @@ def quantize_component_into(
     total = len(tensors)
     completed = completed_parts(transaction)
     reused = 0
-    for done, tensor in enumerate(tensors, 1):
-        ctx.raise_if_cancelled()
-        if all((target_component, tensor.key, role) in completed for role in ("data", "scale")):
-            reused += 1
-            tel.progress(done / total, stage=f"{encoding}-{target_component}")
-            continue
-        scale_expected = (
-            ("U8", [tensor.shape[0], tensor.shape[1] // 32])
-            if encoding == "mxfp8/1"
-            else ("F32", [tensor.shape[0]])
-        )
-        amax = max_error = sse = energy = 0.0
-        read = rows = tensor_saturated = 0
-        scales: list[bytes] = []
-        with tempfile.TemporaryFile() as spill:
-            for values in _read_chunks(
-                transaction,
-                source=source,
-                component=source_component,
-                key=tensor.key,
-                role=tensor.source_role,
-                logical_dtype=tensor.logical_dtype,
-                shape=tensor.shape,
-            ):
-                encoded = encoder.encode(tensor.key, values)
-                if len(encoded.companions) != 1:
-                    raise UnsupportedInput(f"{encoding} emitted an unexpected companion set")
-                scale = encoded.companions[0]
-                count = values.shape[0]
-                if (
-                    encoded.payload_dtype != "F8_E4M3"
-                    or encoded.payload_shape != [count, tensor.shape[1]]
-                    or (scale.dtype, scale.shape)
-                    != (scale_expected[0], [count, *scale_expected[1][1:]])
-                ):
+
+    def finished(tensor: QuantizationTensor) -> bool:
+        return all((target_component, tensor.key, role) in completed for role in ("data", "scale"))
+
+    encode = functools.partial(
+        _encode_tensor, transaction, encoding, source=source, source_component=source_component
+    )
+    results = _in_order([tensor for tensor in tensors if not finished(tensor)], encode)
+    with contextlib.closing(results):
+        for done, tensor in enumerate(tensors, 1):
+            ctx.raise_if_cancelled()
+            if finished(tensor):
+                reused += 1
+                tel.progress(done / total, stage=f"{encoding}-{target_component}")
+                continue
+            result = next(results)
+            with result.spill as spill:
+                bound = result.amax * encoder.round_trip_bound
+                if result.max_error > bound:
+                    raise UnsupportedInput(
+                        f"{source_component}.{tensor.key}: round-trip error "
+                        f"{result.max_error:.4g} exceeds the {encoding} bound {bound:.4g}",
+                        code="quantization_tripwire",
+                    )
+                if result.rows != tensor.shape[0]:
                     raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
-                if values.size:
-                    amax = max(amax, float(np.max(np.abs(values))))
-                max_error = max(max_error, encoded.max_abs_err)
-                sse += encoded.sse
-                energy += encoded.energy
-                tensor_saturated += encoded.saturated
-                read += values.size * {"bf16": 2, "f16": 2, "f32": 4}[tensor.logical_dtype]
-                rows += count
-                spill.write(encoded.payload)
-                scales.append(scale.raw)
-                del values, encoded
-            bound = amax * encoder.round_trip_bound
-            if max_error > bound:
-                raise UnsupportedInput(
-                    f"{source_component}.{tensor.key}: round-trip error "
-                    f"{max_error:.4g} exceeds the {encoding} bound {bound:.4g}",
-                    code="quantization_tripwire",
-                )
-            if rows != tensor.shape[0]:
-                raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
-            relative = math.sqrt(sse / energy) if energy > 0 else 0.0
-            if (
-                payload.max_relative_frobenius is not None
-                and relative > payload.max_relative_frobenius
-            ):
-                raise UnsupportedInput(
-                    f"{source_component}.{tensor.key}: relative Frobenius {relative:.6f} "
-                    f"exceeds the declared tripwire {payload.max_relative_frobenius}",
-                    code="quantization_tripwire",
-                )
-            # A role becomes resumable only after every numerical acceptance check. A
-            # half-written group is recomputed; TensorFS accepts only identical role replay.
-            written = 0
-            data_bytes = spill.tell()
-            spill.seek(0)
-            scale_raw = b"".join(scales)
-            for role, part, part_bytes in (
-                ("data", spill, data_bytes),
-                ("scale", scale_raw, len(scale_raw)),
-            ):
-                transaction.add_part(target_component, tensor.key, role, part)
-                if (target_component, tensor.key, role) not in completed:
-                    written += part_bytes
-        transaction.checkpoint()
-        worst = max(worst, relative)
-        source_bytes += read
-        new_bytes += written
-        saturated += tensor_saturated
-        tel.log(
-            "quantized tensor",
-            level="info",
-            encoding=encoding,
-            component=target_component,
-            key=tensor.key,
-            done=done,
-            total=total,
-        )
-        tel.progress(done / total, stage=f"{encoding}-{target_component}")
+                relative = math.sqrt(result.sse / result.energy) if result.energy > 0 else 0.0
+                if (
+                    payload.max_relative_frobenius is not None
+                    and relative > payload.max_relative_frobenius
+                ):
+                    raise UnsupportedInput(
+                        f"{source_component}.{tensor.key}: relative Frobenius {relative:.6f} "
+                        f"exceeds the declared tripwire {payload.max_relative_frobenius}",
+                        code="quantization_tripwire",
+                    )
+                # A role becomes resumable only after every numerical acceptance check. A
+                # half-written group is recomputed; TensorFS accepts only identical role replay.
+                written = 0
+                data_bytes = spill.tell()
+                spill.seek(0)
+                for role, part, part_bytes in (
+                    ("data", spill, data_bytes),
+                    ("scale", result.scales, len(result.scales)),
+                ):
+                    transaction.add_part(target_component, tensor.key, role, part)
+                    if (target_component, tensor.key, role) not in completed:
+                        written += part_bytes
+            transaction.checkpoint()
+            worst = max(worst, relative)
+            source_bytes += result.read
+            new_bytes += written
+            saturated += result.saturated
+            tel.log(
+                "quantized tensor",
+                level="info",
+                encoding=encoding,
+                component=target_component,
+                key=tensor.key,
+                done=done,
+                total=total,
+            )
+            tel.progress(done / total, stage=f"{encoding}-{target_component}")
 
     return QuantizationStats(
         encoded_keys=total - reused,
@@ -513,6 +493,133 @@ def quantize_component_into(
         saturated_elements=saturated,
         worst_relative_frobenius=None if reused else worst,
     )
+
+
+class _Encoded(NamedTuple):
+    """One tensor's payload (spilled to disk), its scales and its acceptance facts."""
+
+    spill: IO[bytes]
+    scales: bytes
+    amax: float
+    max_error: float
+    sse: float
+    energy: float
+    saturated: int
+    read: int
+    rows: int
+
+
+def _encode_tensor(
+    transaction: DerivedTransaction,
+    encoding: str,
+    tensor: QuantizationTensor,
+    stop: threading.Event,
+    *,
+    source: str,
+    source_component: str,
+) -> _Encoded:
+    encoder = _ENCODINGS[encoding]
+    scale_expected = (
+        ("U8", [tensor.shape[0], tensor.shape[1] // 32])
+        if encoding == "mxfp8/1"
+        else ("F32", [tensor.shape[0]])
+    )
+    amax = max_error = sse = energy = 0.0
+    read = rows = saturated = 0
+    scales: list[bytes] = []
+    spill = tempfile.TemporaryFile()
+    try:
+        for values in _read_chunks(
+            transaction,
+            source=source,
+            component=source_component,
+            key=tensor.key,
+            role=tensor.source_role,
+            logical_dtype=tensor.logical_dtype,
+            shape=tensor.shape,
+        ):
+            if stop.is_set():
+                raise _Stopped
+            encoded = encoder.encode(tensor.key, values)
+            if len(encoded.companions) != 1:
+                raise UnsupportedInput(f"{encoding} emitted an unexpected companion set")
+            scale = encoded.companions[0]
+            count = values.shape[0]
+            if (
+                encoded.payload_dtype != "F8_E4M3"
+                or encoded.payload_shape != [count, tensor.shape[1]]
+                or (scale.dtype, scale.shape)
+                != (scale_expected[0], [count, *scale_expected[1][1:]])
+            ):
+                raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
+            if values.size:
+                amax = max(amax, float(values.max()), -float(values.min()))
+            max_error = max(max_error, encoded.max_abs_err)
+            sse += encoded.sse
+            energy += encoded.energy
+            saturated += encoded.saturated
+            read += values.size * {"bf16": 2, "f16": 2, "f32": 4}[tensor.logical_dtype]
+            rows += count
+            spill.write(encoded.payload)
+            scales.append(scale.raw)
+            del values, encoded
+        return _Encoded(
+            spill, b"".join(scales), amax, max_error, sse, energy, saturated, read, rows
+        )
+    except BaseException:
+        spill.close()
+        raise
+
+
+class _Stopped(Exception):
+    """The consumer left; encoding ahead of it is abandoned."""
+
+
+def _in_order(
+    items: Sequence[QuantizationTensor],
+    produce: Callable[[QuantizationTensor, threading.Event], _Encoded],
+) -> Generator[_Encoded, None, None]:
+    """`produce` over `items` on the shared pool, a bounded window ahead, yielded in order.
+
+    Closing the iterator stops the producers and releases every result nobody consumed.
+    """
+    stop = threading.Event()
+    window: deque[Future[_Encoded]] = deque()
+    pending = iter(items)
+    try:
+        for _ in items:
+            while len(window) <= _cpu_budget() and (item := next(pending, None)) is not None:
+                window.append(_pool().submit(produce, item, stop))
+            yield window.popleft().result()
+    finally:
+        stop.set()
+        for future in window:
+            if not future.cancel():
+                with contextlib.suppress(Exception):
+                    future.result().spill.close()
+
+
+@functools.cache
+def _pool() -> ThreadPoolExecutor:
+    """One process-wide encoder pool: callers that shard their own work share its bound."""
+    return ThreadPoolExecutor(_cpu_budget(), thread_name_prefix="cozy-quantize")
+
+
+@functools.cache
+def _cpu_budget() -> int:
+    """CPUs this process may use: its affinity, capped by any cgroup v2 quota above it."""
+    count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    with contextlib.suppress(OSError, IndexError, ValueError):
+        root = Path("/sys/fs/cgroup")
+        own = root / Path("/proc/self/cgroup").read_text().split("::", 1)[1].strip().lstrip("/")
+        for directory in (own, *own.parents):
+            if not directory.is_relative_to(root):
+                break
+            with contextlib.suppress(OSError, ValueError):
+                quota, period = (directory / "cpu.max").read_text().split()
+                if quota != "max":
+                    count = min(count or 1, -(-int(quota) // int(period)))
+    return max(1, count or 1)
 
 
 def _artifact_plan(raw: bytes) -> ArtifactQuantizationPlan:
