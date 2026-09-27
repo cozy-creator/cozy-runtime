@@ -19,9 +19,12 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+import msgspec
+
 from cozy_runtime.author._assets import Asset
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import AXES, Shape
+from cozy_runtime.author._signature import AssetInputValue
 from cozy_runtime.author._walker import Node, field_values, value_domain, walk
 
 #: Axis-named request fields normalize with zero author involvement. A field named for an
@@ -76,15 +79,42 @@ def _top_level(payload_type: object) -> list[Node]:
     return [node for node in walk(payload_type) if "." not in node.path]
 
 
+#: The widest bounded-int field a preset table may cover; wider is not a preset.
+MAX_INT_DOMAIN = 4096
+
+
+def shape_domain(node: Node) -> tuple[object, ...] | None:
+    """A closed Enum or Literal, or an int bounded on both sides by its `msgspec.Meta`
+    (H3's `duration_s`, 5..15 whole seconds): the values a preset table must cover."""
+    domain = value_domain(node.annotation)
+    if domain is not None or node.annotation is not int:
+        return domain
+    low: int | None = None
+    high: int | None = None
+    for meta in (m for m in node.markers if isinstance(m, msgspec.Meta)):
+        if isinstance(meta.ge, int):
+            low = meta.ge
+        if isinstance(meta.gt, int):
+            low = meta.gt + 1
+        if isinstance(meta.le, int):
+            high = meta.le
+        if isinstance(meta.lt, int):
+            high = meta.lt - 1
+    if low is None or high is None or not 0 <= high - low < MAX_INT_DOMAIN:
+        return None
+    return tuple(range(low, high + 1))
+
+
 def _check_coverage(node: Node, shape: Shape[object]) -> None:
     """A preset table must cover its field's COMPLETE value domain, or the axis is
     underivable for some admissible request — which is a build refusal, not a KeyError
     at admission."""
-    domain = value_domain(node.annotation)
+    domain = shape_domain(node)
     if domain is None:
         raise ConformanceError(
             f"Shape on {node.path}: {node.annotation!r} is an open value domain, so the "
-            "preset table cannot cover it — annotate a closed Enum or Literal field",
+            "preset table cannot cover it — annotate a closed Enum or Literal field, or an "
+            "int bounded by msgspec.Meta(ge=..., le=...)",
             code="underivable_axis",
             fields=[node.path],
         )
@@ -117,9 +147,12 @@ def normalize(payload: object) -> RequestFeatures:
         shape = node.marker(Shape)
         if shape is not None and value is not None:
             values.update(shape.resolve(value))
-        if isinstance(value, (list, tuple)) and any(isinstance(item, Asset) for item in value):
+        if isinstance(value, (list, tuple)) and any(
+            isinstance(item, (Asset, AssetInputValue)) for item in value
+        ):
             # Each listed input (a reference image, a clip) adds tokens and memory, so
-            # their count is a demand axis: 1 and 10 references are different cells.
+            # their count is a demand axis: 1 and 10 references are different cells. An
+            # `Assets` parameter's occurrences arrive as `AssetInputValue` rows.
             values["assets"] = values.get("assets", 0) + len(value)
     if "pixels" not in values and "width" in values and "height" in values:
         values["pixels"] = values["width"] * values["height"]

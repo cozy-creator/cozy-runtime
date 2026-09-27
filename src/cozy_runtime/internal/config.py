@@ -578,6 +578,13 @@ def package_install_environment(environ: Mapping[str, str] | None = None) -> dic
     }
 
 
+def cute_dsl_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """CuTe DSL's own `CUTE_DSL_*` variables. The DSL reads them at import, so each one shapes
+    the objects it emits and belongs in their kernel keys (h3a-087)."""
+    source = os.environ if environ is None else environ
+    return {name: value for name, value in sorted(source.items()) if name.startswith("CUTE_DSL_")}
+
+
 def package_python_paths() -> str | None:
     """Operator-configured finite interpreter set; absent means installed discovery."""
     return os.environ.get("COZY_PACKAGE_PYTHONS")

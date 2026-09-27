@@ -205,13 +205,26 @@ def namespace(root: Path, uid: int) -> Path:
     return root / f"u{uid}"
 
 
-def from_environment(environ: Mapping[str, str]) -> Store | None:
+def from_sealed(sealed: Mapping[str, str]) -> Store | None:
     """The executor's store, from the two locations its worker imposed; none when absent."""
-    own = environ.get(OWN_ENV, "")
+    own = sealed.get(OWN_ENV, "")
     if not own:
         return None
-    trusted = environ.get(TRUSTED_ENV, "")
+    trusted = sealed.get(TRUSTED_ENV, "")
     return Store(Path(own), Path(trusted) if trusted else None)
+
+
+_MACHINE_STORE: list[Store | None] = [None]
+
+
+def configure(store: Store | None) -> None:
+    """Set once by the executor entrypoint from its sealed configuration."""
+    _MACHINE_STORE[0] = store
+
+
+def configured() -> Store | None:
+    """This process's store, or None: kernels then compile in-process as upstream does."""
+    return _MACHINE_STORE[0]
 
 
 #: Where this executor writes compiled kernel objects: its own uid's namespace.

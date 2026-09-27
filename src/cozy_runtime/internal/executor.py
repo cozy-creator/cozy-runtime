@@ -77,6 +77,7 @@ from cozy_runtime.internal import (
     canonical,
     child_env,
     execution_evidence,
+    kernel_cache,
     kernel_site,
     model_config,
     native_interfaces,
@@ -4372,6 +4373,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--socket is required for rank 0")
 
     _capture_seal()
+    kernel_cache.configure(kernel_cache.from_sealed(_SEALED))
     # Before any kernel import: the image's kernel site, only if its torch build is ours.
     kernel_site.activate()
     # cr-042: the executor's ONE network fence, installed BEFORE the seam dials so the
