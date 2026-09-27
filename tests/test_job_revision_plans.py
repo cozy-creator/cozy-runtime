@@ -92,7 +92,9 @@ def compute(payload:Input)->Output:
     inode = old.stat().st_ino
     job_plan.write(root, original)
     assert old.stat().st_ino == inode
-    original["python"] = "/different/interpreter"
-    with pytest.raises(ValueError, match="conflicts with its immutable"):
+    original["python"] = "/relocated/interpreter"
+    job_plan.write(root, original)
+    assert json.loads(old.read_bytes())["python"] == "/relocated/interpreter"
+    original["job"] = "another"
+    with pytest.raises(ValueError, match="another callable"):
         job_plan.write(root, original)
-    assert old.read_bytes() == old_bytes

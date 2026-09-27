@@ -219,10 +219,9 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
         "capabilities",
     }
     optional = {"operation_identity", "operation_identity_unavailable"}
-    if not isinstance(value, dict) or not keys.issubset(value) or set(value) - keys - optional:
-        raise ConformanceError(
-            "invocable metadata has unknown or missing fields", code="invocable_interface"
-        )
+    # Keys another Runtime version added are ignored; the generator reads only these.
+    if not isinstance(value, dict) or not keys.issubset(value):
+        raise ConformanceError("invocable metadata is missing fields", code="invocable_interface")
     if type(value["memoize"]) is not bool:
         raise ConformanceError(
             "invocable memoization declaration must be a boolean", code="invocable_interface"
@@ -245,13 +244,11 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
     ):
         raise ConformanceError("invalid operation identity reason", code="invocable_interface")
     capabilities = value["capabilities"]
-    if (
-        not isinstance(capabilities, list)
-        or not all(isinstance(capability, str) for capability in capabilities)
-        or capabilities != sorted(set(capabilities))
+    if not isinstance(capabilities, list) or not all(
+        isinstance(capability, str) for capability in capabilities
     ):
         raise ConformanceError(
-            "invocable capabilities must be sorted unique names", code="invocable_interface"
+            "invocable capabilities must be a list of names", code="invocable_interface"
         )
     if value["memoize"] and set(capabilities) & {"egress", "secrets"}:
         raise ConformanceError(
@@ -327,10 +324,12 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
 
     walk(request, "request")
     walk(result, "result")
+    # Names and defaults for paths this schema does not have are never read: ignore them.
     for path, name in value["type_names"].items():
+        if path not in nodes:
+            continue
         if (
-            path not in nodes
-            or not _identifier(name)
+            not _identifier(name)
             or not isinstance(nodes[path], dict)
             or not ("fields" in nodes[path] or "literal" in nodes[path])
         ):
@@ -339,6 +338,8 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
             )
     for path, members in value["enum_members"].items():
         node = nodes.get(path)
+        if node is None:
+            continue
         if (
             not isinstance(node, dict)
             or path not in value["type_names"]
@@ -358,7 +359,9 @@ def validate(value: object, request: Any, result: Any, *, kind: str = "job") -> 
         empty_sequence = (
             default in ([], ()) and isinstance(nodes.get(path), dict) and "list" in nodes[path]
         )
-        if path not in nodes or not (default is None or type(default) in allowed or empty_sequence):
+        if path not in nodes:
+            continue
+        if not (default is None or type(default) in allowed or empty_sequence):
             raise ConformanceError(
                 "invocable default is not a canonical immutable field value",
                 code="invocable_interface",

@@ -52,3 +52,10 @@ def test_activate_parks_the_least_recently_used_construction_under_the_ceiling(
         pytest.skip("device residency is measured on a CUDA card")
     facts = _run(tmp_path, "--arm", "sized-blocks", "--size", "8192")
     assert len(facts["activate_ms"]) == 3  # type: ignore[arg-type]
+
+
+def test_loads_refused_before_holding_device_bytes_keep_the_process_serving(
+    tmp_path: Path,
+) -> None:
+    facts = _run(tmp_path, "--arm", "refused-loads")
+    assert facts["codes"] == ["model_fit_refused", "device_shortfall"]

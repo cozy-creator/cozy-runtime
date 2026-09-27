@@ -175,6 +175,21 @@ def test_scoped_pin_preserves_compiled_and_parallel_fences() -> None:
         attention.plan(_device(), roots, "vae=sdpa", "a context-parallel group is installed")
 
 
+def test_a_compiled_construction_serves_the_pin_it_was_prepared_with(tmp_path: Path) -> None:
+    executor = Executor(None, tmp_path)  # type: ignore[arg-type]
+    roots = _roots()
+    attention.select(_device(), roots, "dit=sdpa")
+    roots["dit"][0]._compiled_call_impl = lambda: None
+    executor.attention_defaults = attention.snapshot(roots)
+    executor.device_facts = _device()
+    executor.backend = SimpleNamespace(components=roots, parked={})
+    executor._attention_check("dit=sdpa")
+    assert executor._attention_plan("dit=sdpa") is None
+    with pytest.raises(attention.AttentionRefusal, match="pinned construction") as refused:
+        executor._attention_check("dit=flash-attn3")
+    assert refused.value.code == "attention_kernel_frozen"
+
+
 def test_registration_is_idempotent_local_and_dispatches_real_cpu_attention() -> None:
     torch = pytest.importorskip("torch")
     from diffusers.models.attention_dispatch import _AttentionBackendRegistry, dispatch_attention_fn
