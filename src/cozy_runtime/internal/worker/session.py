@@ -1195,7 +1195,12 @@ class Worker:
 
         self.machine_sources = MachineSources(self)
         self.machine_effects = (
-            Effects(self.workspace, self.executions, options.publication_authority)
+            Effects(
+                self.workspace,
+                self.executions,
+                options.publication_authority,
+                progress=self.native_progress,
+            )
             if self.workspace is not None and self.executions is not None
             else None
         )

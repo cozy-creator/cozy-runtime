@@ -15,6 +15,8 @@ from typing import Any
 SAMPLE_SECONDS = 1.0
 
 Emit = Callable[[dict[str, Any]], None]
+# Where native child work reports: (parent request, parent attempt, call index, frame).
+Progress = Callable[[str, int, int, dict[str, Any]], None]
 
 
 class StageProgress:
@@ -27,13 +29,13 @@ class StageProgress:
         self.total = 0
         self.sampled_at = self.started
         self.sampled = 0
-        self.done = False
+        self.complete = self.done = False
         emit({"kind": "progress", "stage": self.stage})
 
     def update(self, position: int, total: int) -> None:
-        if self.done or total <= 0:
-            return
         position = max(0, min(position, total))
+        if self.done or total <= 0 or (self.complete and position == total):
+            return
         if self.baseline is None:
             self.baseline = self.sampled = position
         self.position, self.total = position, total
@@ -50,6 +52,7 @@ class StageProgress:
         if now > self.sampled_at and position >= self.sampled:
             frame["rate"] = round((position - self.sampled) / (now - self.sampled_at), 1)
         self.sampled_at, self.sampled = now, position
+        self.complete = position == total
         self.emit(frame)
 
     def finish(self, completed: bool) -> None:

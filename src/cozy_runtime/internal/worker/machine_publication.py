@@ -416,7 +416,7 @@ def upload_checkpoint(
     before_stage: Callable[[], None],
     before_write: Callable[[], None],
     push: Callable[[str, int, str], None],
-    landed: Callable[[int], None],
+    landed: Callable[[int, int], None],
 ) -> CheckpointRef:
     """Stage one exact retained closure and commit it; native TensorFS performs each push.
 
@@ -425,7 +425,7 @@ def upload_checkpoint(
     Opening, granting and pushing only stage bytes under the frozen operation, so
     ``before_stage`` fences them without a send marker; retrying them re-grants only
     objects the Hub does not hold. ``before_write`` records the one commit, finalize.
-    ``landed`` receives the count of closure objects the Hub is known to hold.
+    ``landed`` receives the count and bytes of closure objects the Hub is known to hold.
     """
     path, manifest = _checkpoint_inputs(operation, checkpoint, objects)
     try:
@@ -490,19 +490,20 @@ def upload_checkpoint(
             pending.append(key)
     pending.sort()
     held_count = len(objects) - len(pending)
+    held_bytes = sum(objects.values()) - sum(objects[key] for key in pending)
     count_lock = threading.Lock()
-    landed(held_count)
+    landed(held_count, held_bytes)
 
     def pushed(key: str, length: int, grant: str) -> None:
-        nonlocal held_count
+        nonlocal held_count, held_bytes
         push(key, length, grant)
         with count_lock:
-            held_count += 1
-            landed(held_count)
+            held_count, held_bytes = held_count + 1, held_bytes + length
+            landed(held_count, held_bytes)
 
     def granted(selected: list[str]) -> list[tuple[str, int, str]]:
         """Validate one complete grants answer before spending any of its grants."""
-        nonlocal held_count
+        nonlocal held_count, held_bytes
         before_stage()
         body = canonical_json.encode({"object_ids": selected})
         answer = _object(client.request("POST", path + "/grants", body))
@@ -540,7 +541,8 @@ def upload_checkpoint(
         if held:
             with count_lock:
                 held_count += len(held)
-                landed(held_count)
+                held_bytes += sum(objects[item["object_id"]] for item in held)
+                landed(held_count, held_bytes)
         return uploads
 
     # A sliding window: each finished push starts the next granted object, and the next

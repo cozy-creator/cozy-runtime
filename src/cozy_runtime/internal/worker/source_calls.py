@@ -25,7 +25,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author.sources import SOURCE_FILES_MAX_BYTES
 from cozy_runtime.internal import fill, source_interfaces, storage_admission
 from cozy_runtime.internal.worker import source_views, source_worker, workspace_sources
-from cozy_runtime.internal.worker.stage_progress import StageProgress
+from cozy_runtime.internal.worker.stage_progress import Progress, StageProgress
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -43,9 +43,6 @@ _URL_QUERY = re.compile(r"(\w+://[^\s?#'\"]+)[?#][^\s'\"]*")
 _SECRET = re.compile(
     r"(?i)\b(bearer|token|authorization|signature|credential)([\s:=\"']+)[^\s'\",;]+"
 )
-
-# (parent request, parent attempt, call index, executor progress/log frame)
-Progress = Callable[[str, int, int, dict[str, Any]], None]
 
 
 class _Tail:
