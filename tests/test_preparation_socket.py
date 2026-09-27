@@ -10,7 +10,8 @@ from typing import cast
 import pytest
 
 from cozy_runtime.internal.worker.child import SUN_PATH_MAX, ExecutorGone, socket_path_refusal
-from cozy_runtime.internal.worker.session import Worker
+from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 
 
 def worker(root: Path, home: Path) -> Worker:
@@ -18,8 +19,8 @@ def worker(root: Path, home: Path) -> Worker:
         Worker,
         SimpleNamespace(
             root=root,
-            options=SimpleNamespace(python=sys.executable, executor_gid=-1),
-            config=SimpleNamespace(child_base_env=(), cozy_home=home),
+            options=WorkerOptions(root=root, python=sys.executable),
+            config=RuntimeConfig(cozy_home=home, credentials=Credentials()),
             fence=SimpleNamespace(worker_boot_id="fixed-boot"),
             _slot_executor_uid=lambda _: -1,
             fail_machine=lambda *args: None,

@@ -64,6 +64,17 @@ CALLED: dict[str, str] = {
     ),
     "PullCancellation": "()",
     "transfer_streams": "(wanted)",
+    "manifest_max_bytes": "()",
+    "read_source_heads": (
+        "(source_uri, members, *, credential=Ellipsis, huggingface=None, civitai=None, "
+        "allow_local=False)"
+    ),
+    "prepare_selected_source": (
+        "(store, operation_id, source_selection_digest, profiles, members, *, registry=None, "
+        "write_budget_bytes=None)"
+    ),
+    "model_source_objects": "(store, operation_id)",
+    "record_model_source_custody": "(store, operation_id, objects, evidence)",
     "PullCancellation.cancel": "(self, /)",
     "gc": "(root, dry_run=False, *, evict_cached=False, keep_manifests=Ellipsis)",
     "fit": (

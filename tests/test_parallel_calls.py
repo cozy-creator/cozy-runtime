@@ -6,6 +6,7 @@ The command transport, follower Executor.run, model wrappers, and collectives ar
 
 from __future__ import annotations
 
+import functools
 import inspect
 import os
 import socket
@@ -453,18 +454,19 @@ def test_hosting_plan_keeps_h3s_text_encoder_on_a_follower_only_when_rank_0_cann
         "sample_ref2va": ("ref2va_dit",),
         "sample_fl2va": ("fl2va_dit",),
     }
-    plan = {
-        "placeable": ("text_encoder",),
-        "sizes": sizes,
-        "sharded": {"ref2va_dit", "fl2va_dit"},
-        "scopes": scopes,
-    }
-    assert mirror.hosting_plan(**plan, budget=85_017_493_504, world=4) == {"text_encoder": 1}
-    assert mirror.hosting_plan(**plan, budget=85_017_493_504, world=1) == {}
+    plan = functools.partial(
+        mirror.hosting_plan,
+        placeable=("text_encoder",),
+        sizes=sizes,
+        sharded={"ref2va_dit", "fl2va_dit"},
+        scopes=scopes,
+    )
+    assert plan(budget=85_017_493_504, world=4) == {"text_encoder": 1}
+    assert plan(budget=85_017_493_504, world=1) == {}
     # An H200 holds everything on rank 0; nothing moves.
-    assert mirror.hosting_plan(**plan, budget=140_000_000_000, world=2) == {}
+    assert plan(budget=140_000_000_000, world=2) == {}
     # A card too small for the conditioner beside a DiT shard keeps staging it on rank 0.
-    assert mirror.hosting_plan(**plan, budget=70_000_000_000, world=4) == {}
+    assert plan(budget=70_000_000_000, world=4) == {}
 
 
 def test_a_model_output_crosses_the_rank_seam(tmp_path: Path) -> None:

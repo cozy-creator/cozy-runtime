@@ -10,11 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from cozy_runtime.internal import accel
+from cozy_runtime.internal.fill import StreamingFillBackend
 from cozy_runtime.internal.residency import ComponentResidency
 from cozy_runtime.internal.worker.ledger import Ledger
 
@@ -122,7 +123,10 @@ def plane(device: Device, resident: tuple[str, ...]) -> tuple[ComponentResidency
     for name in resident:
         backend.stage(name)
     backend.staged.clear()
-    return ComponentResidency(backend=backend, torch=None, placement="component_staged"), backend
+    residency = ComponentResidency(
+        backend=cast(StreamingFillBackend, backend), torch=None, placement="component_staged"
+    )
+    return residency, backend
 
 
 def serve(residency: ComponentResidency, backend: Backend, measured: bool) -> dict[str, Any]:

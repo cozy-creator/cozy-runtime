@@ -30,6 +30,7 @@ from cozy_runtime.internal.worker import (
 )
 from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRecord
 from cozy_runtime.internal.worker.calls import Calls, _Pending
+from cozy_runtime.internal.worker.plan import AttemptPlan, DeclaredBinding
 from cozy_runtime.internal.worker.workspace import Workspace
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -173,22 +174,16 @@ def test_native_file_commit_uses_the_recorded_parent_budget(
 def test_worker_command_keeps_intermediate_room_for_a_small_final_report(tmp_path: Path) -> None:
     # The executor receives enough room for intermediate files even when final
     # output fields are small. The host independently retains final authority.
-    parent = SimpleNamespace(
-        inputs={},
-        job=None,
-        spec=spec_for(7, 11),
-        trees={},
-        declared=SimpleNamespace(
-            entrypoint="report", max_input_bytes=64 << 20, construction_key=lambda: "report"
-        ),
-        plan=SimpleNamespace(placement="cpu", headroom_bytes=0, scope_headroom_bytes={}),
+    parent = AttemptRecord(
+        "report",
+        1,
+        b"",
+        spec_for(7, 11),
+        declared=DeclaredBinding("", "report", "", "", "", ""),
+        plan=AttemptPlan("", "", "", "cpu", 0, 0, "", ""),
     )
     command = AttemptEngine._command(
-        cast(AttemptEngine, SimpleNamespace(attention_pin="")),
-        cast(AttemptRecord, parent),
-        "report#1",
-        tmp_path,
-        30,
+        cast(AttemptEngine, SimpleNamespace(attention_pin="")), parent, "report#1", tmp_path, 30
     )
     assert command["max_output_bytes"] == 256 << 20
     assert output_budget.effective(parent.spec, command) == 18
