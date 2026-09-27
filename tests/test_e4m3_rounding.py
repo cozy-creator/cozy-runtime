@@ -54,6 +54,48 @@ def test_complete_quantization_bytes_scales_and_statistics_are_unchanged(
     values[2::3] *= np.float32(2**8)
     encode = getattr(microscale, encoding)
     actual = encode("weight", values)
-    monkeypatch.setattr(microscale, "e4m3_encode", table_encoding)
+    monkeypatch.setattr(
+        microscale, "_e4m3_signed", lambda values, _magnitude: table_encoding(values)
+    )
     expected = encode("weight", values)
     assert actual == expected
+
+
+def reference_fp8_rowwise(values: np.ndarray) -> tuple[bytes, bytes]:
+    """The pre-optimization encoder, one expression per step, as the byte oracle."""
+    scale = np.maximum(np.max(np.abs(values), axis=-1) / np.float32(448), np.float32(1e-12))
+    return table_encoding(np.clip(values / scale[:, None], -448, 448)).tobytes(), scale.tobytes()
+
+
+def reference_mxfp8(values: np.ndarray) -> tuple[bytes, bytes]:
+    blk = values.reshape(values.shape[0], -1, 32)
+    bamax = np.max(np.abs(blk), axis=-1)
+    with np.errstate(divide="ignore"):
+        e_lo = np.where(bamax > 0, np.floor(np.log2(bamax.astype(np.float64))) - 8.0, -127.0)
+    lo = np.clip(e_lo + 127.0, 0.0, 254.0)
+    candidates = []
+    for exponent in (lo, np.where(bamax > 0, np.clip(lo + 1.0, 0.0, 254.0), lo)):
+        scale = np.power(np.float32(2.0), (exponent - 127.0).astype(np.float32))[..., None]
+        enc = table_encoding(np.clip(blk / scale, -448, 448))
+        recon = microscale.E4M3_MAG32[np.minimum(enc & 0x7F, 126)] * np.where(enc & 0x80, -1, 1)
+        sse = np.sum((recon.astype(np.float32) * scale - blk).astype(np.float64) ** 2, axis=-1)
+        candidates.append((exponent, enc, sse))
+    (lo_e, lo_enc, lo_sse), (hi_e, hi_enc, hi_sse) = candidates
+    take = hi_sse < lo_sse
+    enc = np.where(take[..., None], hi_enc, lo_enc)
+    return enc.tobytes(), np.where(take, hi_e, lo_e).astype(np.uint8).tobytes()
+
+
+@pytest.mark.parametrize("shape", [(1280, 1280), (257, 2048), (3, 64)])
+def test_encoders_emit_the_reference_bytes_on_weight_like_tensors(shape: tuple[int, int]) -> None:
+    rng = np.random.default_rng(1303)
+    values = (rng.standard_normal(shape, dtype=np.float32) * np.float32(0.03)).astype(np.float16)
+    values = values.astype(np.float32)
+    values[0] = 0
+    values[1, ::3] *= np.float32(2**-14)
+    for encode, reference in (
+        (microscale.encode_fp8_rowwise, reference_fp8_rowwise),
+        (microscale.encode_mxfp8, reference_mxfp8),
+    ):
+        encoded = encode("weight", values)
+        assert (encoded.payload, encoded.companions[0].raw) == reference(values)

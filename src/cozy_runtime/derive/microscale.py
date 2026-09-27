@@ -43,6 +43,10 @@ from cozy_runtime.author import UnsupportedInput
 
 from .safetensors_io import row_chunks
 
+#: Rows per step for the fp8 encoders: a working set that stays in cache is several times
+#: faster than one streamed through memory. Encoders are row-independent, so no byte changes.
+CACHE_ELEMENTS = 1 << 18
+
 # --------------------------------------------------------------------- element tables
 
 
@@ -84,26 +88,39 @@ def _nearest_even(mags: np.ndarray, x: np.ndarray) -> np.ndarray:
 def e4m3_encode(values: np.ndarray) -> np.ndarray:
     """float32 -> E4M3 bytes, RNE, SATURATING at +/-448 (the cast itself does not, which
     is why every caller in this family clamps and why the border's own note says so)."""
-    v = np.nan_to_num(
-        np.asarray(values, dtype=np.float32), nan=0.0, posinf=E4M3_MAX, neginf=-E4M3_MAX
-    )
-    mag = np.minimum(np.abs(v), np.float32(E4M3_MAX))
-    bits = mag.view(np.uint32)
+    v = np.asarray(values, dtype=np.float32)
+    if not np.isfinite(v).all():
+        v = np.nan_to_num(v, nan=0.0, posinf=E4M3_MAX, neginf=-E4M3_MAX)
+    return _e4m3_signed(v, np.minimum(np.abs(v), np.float32(E4M3_MAX)))
+
+
+def _e4m3_signed(values: np.ndarray, magnitude: np.ndarray) -> np.ndarray:
+    """E4M3 bytes of finite `values` whose magnitudes are already at most 448."""
+    bits = magnitude.view(np.uint32)
     # Normal values discard 20 of float32's 23 mantissa bits. Adding half an
     # ulp minus one, plus the retained LSB, rounds ties to even; carry also
     # rounds across exponent boundaries. Adjust exponent bias from 127 to 7.
-    rounded = ((bits + np.uint32(0x7FFFF) + ((bits >> 20) & 1)) >> 20) - (120 << 3)
-    # E4M3 subnormals have fixed spacing 2**-9. Multiplication is exact here,
-    # and rint applies the same even-tie rule, including the smallest normal.
-    idx = np.where(mag < np.float32(2.0**-6), np.rint(mag * 512), rounded).astype(np.uint8)
-    out: np.ndarray = idx | (np.signbit(v).astype(np.uint8) << 7)
+    code = bits + np.uint32(0x7FFFF)
+    code += (bits >> 20) & np.uint32(1)
+    code >>= 20
+    code -= np.uint32(120 << 3)
+    # E4M3 subnormals have fixed spacing 2**-9. Multiplication is exact here, and adding
+    # 2**23 rounds to an integer with the same even-tie rule, left in the low bits.
+    small = bits < np.uint32(0x3C800000)
+    sub = (magnitude[small] * np.float32(512) + np.float32(2.0**23)).view(np.uint32)
+    code[small] = sub - np.uint32(0x4B000000)
+    code |= (np.ascontiguousarray(values).view(np.uint32) >> 24) & np.uint32(0x80)
+    out: np.ndarray = code.astype(np.uint8)
     return out
 
 
+#: byte -> float32, sign in bit 7; the NaN codes 0x7F/0xFF read as the largest magnitude.
+E4M3_DECODE32 = np.concatenate([E4M3_MAG32[np.minimum(np.arange(128), 126)]] * 2)
+E4M3_DECODE32[128:] *= -1
+
+
 def e4m3_decode(raw: np.ndarray) -> np.ndarray:
-    b = np.asarray(raw, dtype=np.uint8)
-    mag = E4M3_MAG32[np.minimum(b & 0x7F, 126)]
-    out: np.ndarray = np.where(b & 0x80, -mag, mag).astype(np.float32)
+    out: np.ndarray = E4M3_DECODE32.take(np.asarray(raw, dtype=np.uint8), mode="clip")
     return out
 
 
@@ -176,10 +193,13 @@ class _Accum:
         self.sat = 0
 
     def add(self, source: np.ndarray, recon: np.ndarray) -> None:
-        diff = recon.astype(np.float64) - source.astype(np.float64)
-        self.sse += float(np.sum(diff * diff))
-        self.energy += float(np.sum(source.astype(np.float64) ** 2))
-        self.max_abs = max(self.max_abs, float(np.max(np.abs(diff))) if diff.size else 0.0)
+        wide = source.astype(np.float64)
+        diff = recon.astype(np.float64)
+        diff -= wide
+        if diff.size:
+            self.max_abs = max(self.max_abs, float(diff.max()), -float(diff.min()))
+        self.sse += float(np.sum(np.square(diff, out=diff)))
+        self.energy += float(np.sum(np.square(wide, out=wide)))
 
 
 def _require_2d(key: str, values: np.ndarray, block: int) -> tuple[int, int]:
@@ -316,36 +336,24 @@ def encode_mxfp8(key: str, values: np.ndarray) -> Encoded:
     payload = np.empty((rows, cols), dtype=np.uint8)
     scales = np.empty((rows, nb), dtype=np.uint8)
     acc = _Accum()
-    for sl in row_chunks(rows, cols):
+    for sl in row_chunks(rows, cols, CACHE_ELEMENTS):
         blk = np.ascontiguousarray(values[sl], dtype=np.float32).reshape(-1, nb, MXFP8_BLOCK)
-        bamax = np.max(np.abs(blk), axis=-1)
+        bamax = _block_amax(blk)
         with np.errstate(divide="ignore"):
             e_lo = np.where(bamax > 0, np.floor(np.log2(bamax.astype(np.float64))) - 8.0, -127.0)
         byte_lo = np.clip(e_lo + 127.0, 0.0, 254.0)
         byte_hi = np.where(bamax > 0, np.clip(byte_lo + 1.0, 0.0, 254.0), byte_lo)
-
-        best_sse: np.ndarray | None = None
-        best: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-        for cand in (byte_lo, byte_hi):
-            scale = np.power(np.float32(2.0), (cand - 127.0).astype(np.float32))[..., None]
-            enc = e4m3_encode(np.clip(blk / scale, -E4M3_MAX, E4M3_MAX))
-            recon = (e4m3_decode(enc) * scale).astype(np.float32)
-            sse = np.sum((recon - blk).astype(np.float64) ** 2, axis=-1)
-            if best_sse is None:
-                best_sse, best = sse, (cand, enc, recon)
-            else:
-                assert best is not None
-                take = sse < best_sse  # strict: a tie keeps the LOWER exponent
-                best_sse = np.where(take, sse, best_sse)
-                best = (
-                    np.where(take, cand, best[0]),
-                    np.where(take[..., None], enc, best[1]),
-                    np.where(take[..., None], recon, best[2]),
-                )
-        assert best is not None
-        chosen, enc, recon = best
-        scale = np.power(np.float32(2.0), (chosen - 127.0).astype(np.float32))[..., None]
-        acc.sat += int(np.count_nonzero(np.abs(blk) / scale > E4M3_MAX))
+        enc, recon, sse = _mxfp8_candidate(blk, byte_lo)
+        enc_hi, recon_hi, sse_hi = _mxfp8_candidate(blk, byte_hi)
+        take = sse_hi < sse  # strict: a tie keeps the LOWER exponent
+        chosen = np.where(take, byte_hi, byte_lo)
+        np.copyto(enc, enc_hi, where=take[..., None])
+        np.copyto(recon, recon_hi, where=take[..., None])
+        scale = np.power(np.float32(2.0), (chosen - 127.0).astype(np.float32))
+        # Only a block whose largest element exceeds the E4M3 range can saturate.
+        over = bamax / scale > E4M3_MAX
+        if over.any():
+            acc.sat += int(np.count_nonzero(np.abs(blk[over]) / scale[over][:, None] > E4M3_MAX))
         acc.add(blk.reshape(-1, cols), recon.reshape(-1, cols))
         payload[sl] = enc.reshape(-1, cols)
         scales[sl] = chosen.astype(np.uint8)
@@ -362,6 +370,26 @@ def encode_mxfp8(key: str, values: np.ndarray) -> Encoded:
     )
 
 
+def _block_amax(blk: np.ndarray) -> np.ndarray:
+    """max |x| over the last axis by halving: exact, and far cheaper than a short-axis reduce."""
+    m = np.abs(blk)
+    while m.shape[-1] > 1:
+        m = np.maximum(m[..., : m.shape[-1] // 2], m[..., m.shape[-1] // 2 :])
+    return m[..., 0]
+
+
+def _mxfp8_candidate(blk: np.ndarray, exponent: np.ndarray) -> tuple[np.ndarray, ...]:
+    """One candidate exponent per block, quantized THROUGH the stored representation."""
+    scale = np.power(np.float32(2.0), (exponent - 127.0).astype(np.float32))[..., None]
+    scaled = blk / scale
+    np.clip(scaled, -E4M3_MAX, E4M3_MAX, out=scaled)
+    enc = _e4m3_signed(scaled, np.abs(scaled))
+    recon = E4M3_DECODE32.take(enc, mode="clip")
+    recon *= scale
+    diff = (recon - blk).astype(np.float64)
+    return enc, recon, np.sum(np.square(diff, out=diff), axis=-1)
+
+
 # ---------------------------------------------------------------------- fp8 rowwise
 
 
@@ -373,15 +401,19 @@ def encode_fp8_rowwise(key: str, values: np.ndarray) -> Encoded:
     payload = np.empty((rows, cols), dtype=np.uint8)
     row_scale = np.empty((rows,), dtype=np.float32)
     acc = _Accum()
-    for sl in row_chunks(rows, cols):
+    for sl in row_chunks(rows, cols, CACHE_ELEMENTS):
         v = np.ascontiguousarray(values[sl], dtype=np.float32)
-        scale = np.maximum(
-            np.max(np.abs(v), axis=-1) / np.float32(E4M3_MAX), np.float32(1e-12)
-        ).astype(np.float32)
+        amax = np.maximum(v.max(axis=-1), -v.min(axis=-1))
+        scale = np.maximum(amax / np.float32(E4M3_MAX), np.float32(1e-12)).astype(np.float32)
         rescaled = v / scale[:, None]
-        acc.sat += int(np.count_nonzero(np.abs(rescaled) > E4M3_MAX))
-        enc = e4m3_encode(np.clip(rescaled, -E4M3_MAX, E4M3_MAX))
-        recon = (e4m3_decode(enc) * scale[:, None]).astype(np.float32)
+        # Division is monotone, so only a row whose largest element exceeds 448 saturates.
+        over = amax / scale > E4M3_MAX
+        if over.any():
+            acc.sat += int(np.count_nonzero(np.abs(rescaled[over]) > E4M3_MAX))
+            np.clip(rescaled, -E4M3_MAX, E4M3_MAX, out=rescaled)
+        enc = _e4m3_signed(rescaled, np.abs(rescaled))
+        recon = E4M3_DECODE32.take(enc, mode="clip")
+        recon *= scale[:, None]
         acc.add(v, recon)
         payload[sl] = enc
         row_scale[sl] = scale
