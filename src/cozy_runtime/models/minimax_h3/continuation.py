@@ -183,9 +183,11 @@ class AVContext:
         ):
             _refuse("context must contain all three independently encoded AV windows")
         if (
-            type(self.height) is not int or type(self.width) is not int
+            type(self.height) is not int
+            or type(self.width) is not int
             or min(self.height, self.width) < 32
-            or self.height % 32 or self.width % 32
+            or self.height % 32
+            or self.width % 32
             or self.height * self.width > MAX_CONTEXT_PIXELS
         ):
             _refuse("context canvas is outside the qualified H3 geometry")
@@ -193,7 +195,8 @@ class AVContext:
             _refuse("context source frame clock is invalid")
         audio_sample_range(self.source_end_frame - 56, self.source_end_frame, self.sample_rate)
         if (
-            not isinstance(self.provenance, str) or not self.provenance
+            not isinstance(self.provenance, str)
+            or not self.provenance
             or len(self.provenance.encode("utf-8")) > 16384
         ):
             _refuse("context requires bounded renderer provenance")
@@ -208,7 +211,8 @@ class AVContext:
             for tensor, shape in zip((video, audio), shapes, strict=True):
                 if (
                     not isinstance(tensor, torch.Tensor)
-                    or tensor.device.type != "cpu" or tensor.dtype != torch.float32
+                    or tensor.device.type != "cpu"
+                    or tensor.dtype != torch.float32
                     or tuple(tensor.shape) != shape
                     or not bool(torch.isfinite(tensor).all())
                 ):
@@ -219,8 +223,13 @@ class AVContext:
         if type(frames) is not int or frames not in CONTEXT_FRAMES:
             _refuse("requested continuation window is absent from the completed tail")
         return AVContext(
-            self.windows, self.height, self.width, self.source_end_frame,
-            self.provenance, frames, self.sample_rate,
+            self.windows,
+            self.height,
+            self.width,
+            self.source_end_frame,
+            self.provenance,
+            frames,
+            self.sample_rate,
         )
 
 
@@ -239,14 +248,18 @@ def encode_context(context: AVContext) -> bytes:
         for n, pair in context.windows.items()
         for kind, tensor in zip(("video", "audio"), pair, strict=True)
     }
-    data = save(tensors, metadata={
-        "schema": CONTEXT_SCHEMA,
-        "sample_rate": str(context.sample_rate),
-        "height": str(context.height), "width": str(context.width),
-        "frame_count": str(context.frame_count),
-        "source_end_frame": str(context.source_end_frame),
-        "provenance": context.provenance,
-    })
+    data = save(
+        tensors,
+        metadata={
+            "schema": CONTEXT_SCHEMA,
+            "sample_rate": str(context.sample_rate),
+            "height": str(context.height),
+            "width": str(context.width),
+            "frame_count": str(context.frame_count),
+            "source_end_frame": str(context.source_end_frame),
+            "provenance": context.provenance,
+        },
+    )
     if len(data) > MAX_CONTEXT_BYTES:
         _refuse("encoded context exceeds its 64 MiB bound")
     return cast(bytes, data)
@@ -263,11 +276,17 @@ def decode_context(data: bytes) -> AVContext:
         metadata = header.get("__metadata__", {})
         keys = {f"{kind}_{n}" for n in CONTEXT_FRAMES for kind in ("video", "audio")}
         if (
-            set(header) != keys | {"__metadata__"}
-            or set(metadata) != {
-                "schema", "sample_rate", "height", "width", "frame_count",
-                "source_end_frame", "provenance",
+            not keys <= set(header)
+            or not {
+                "schema",
+                "sample_rate",
+                "height",
+                "width",
+                "frame_count",
+                "source_end_frame",
+                "provenance",
             }
+            <= set(metadata)
             or metadata["schema"] != CONTEXT_SCHEMA
         ):
             _refuse("context schema or fields do not match")
@@ -275,9 +294,12 @@ def decode_context(data: bytes) -> AVContext:
         tensors = load(data)
         return AVContext(
             {n: (tensors[f"video_{n}"], tensors[f"audio_{n}"]) for n in CONTEXT_FRAMES},
-            int(metadata["height"]), int(metadata["width"]),
-            int(metadata["source_end_frame"]), metadata["provenance"],
-            int(metadata["frame_count"]), int(metadata["sample_rate"]),
+            int(metadata["height"]),
+            int(metadata["width"]),
+            int(metadata["source_end_frame"]),
+            metadata["provenance"],
+            int(metadata["frame_count"]),
+            int(metadata["sample_rate"]),
         )
     except InvalidRequest:
         raise

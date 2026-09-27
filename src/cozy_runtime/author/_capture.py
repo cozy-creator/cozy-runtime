@@ -46,7 +46,7 @@ class ActivationCapture(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
             )
 
 
-class ExecutionEnvironment(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class ExecutionEnvironment(msgspec.Struct, frozen=True):
     """Facts observed by the worker and executor that actually handled this invocation."""
 
     runtime_version: str
@@ -60,14 +60,14 @@ class ExecutionEnvironment(msgspec.Struct, frozen=True, forbid_unknown_fields=Tr
     kernel_symbol: str = ""
 
 
-class ActivationCaptureResult(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class ActivationCaptureResult(msgspec.Struct, frozen=True):
     output_id: str
     content_digest: str
     tree: Tree | None = None
     """Hydrated from the matching verified native grant, never serialized on the wire."""
 
 
-class ExecutionObservation(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class ExecutionObservation(msgspec.Struct, frozen=True):
     environment: ExecutionEnvironment
     capture: ActivationCaptureResult | None = None
 

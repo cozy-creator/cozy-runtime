@@ -165,10 +165,8 @@ def _read(path: Path) -> Census | None:
             fit_ok=bool(fit["ok"]),
             fit_detail=str(fit["detail"]),
         )
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise CensusRefusal("package_prepare_census_invalid", f"{path}: {exc}") from exc
+    except (OSError, ValueError, KeyError, TypeError):
+        return None  # Absent, torn or foreign entries are misses; the rewrite replaces them.
 
 
 def _write(root: Path, name: str, census: Census) -> None:

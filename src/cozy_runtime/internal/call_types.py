@@ -8,7 +8,6 @@ from dataclasses import replace
 from types import ModuleType
 from typing import Any
 
-from cozy_runtime.author import ConformanceError
 from cozy_runtime.author._calls import _CallType, _export
 from cozy_runtime.author._walker import is_struct
 from cozy_runtime.internal import schema
@@ -17,8 +16,9 @@ from cozy_runtime.internal import schema
 def public_result(module: ModuleType, binding: _CallType) -> _CallType:
     """Names locate a public type; its complete wire shape establishes the join.
 
-    The wire decoder retains its generated type and strict unknown-field policy.
-    Only an admitted result is converted to this installed class for the author.
+    The wire decoder retains its generated type. Only an admitted result is converted
+    to an installed class whose shape matches; otherwise the author receives the
+    generated type rather than a refused call.
     """
     function = getattr(module, binding.export, None)
     exported = _export(function) if callable(function) else None
@@ -43,11 +43,8 @@ def public_result(module: ModuleType, binding: _CallType) -> _CallType:
         if not is_struct(candidate):
             continue
         if (
-            schema.render(candidate, decoded_bounds=True) != expected
-            or candidate.__struct_config__.array_like
+            schema.render(candidate, decoded_bounds=True) == expected
+            and not candidate.__struct_config__.array_like
         ):
-            raise ConformanceError(
-                "installed result differs from the captured interface", code="child_interface"
-            )
-        return replace(binding, python_result=candidate)
+            return replace(binding, python_result=candidate)
     return binding

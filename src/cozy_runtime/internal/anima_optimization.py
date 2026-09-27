@@ -1,4 +1,4 @@
-"""Exact post-fill execution plan for Diffusers 0.40 Anima.
+"""Reviewed post-fill execution plan for Diffusers Anima.
 
 The package constructs and TensorFS fills the ordinary Diffusers module tree first.  Only
 then does this module replace Python callables: parameters, buffers, state-dict names and
@@ -123,30 +123,12 @@ def _source_digest(value: Callable[..., object]) -> str:
     return hashlib.sha256(inspect.getsource(value).encode()).hexdigest()
 
 
-def _require_source(name: str, value: Callable[..., object]) -> None:
+def _source_refusal(name: str, value: Callable[..., object]) -> str:
     actual = _source_digest(value)
     expected = _SOURCE_DIGESTS[name]
-    if actual != expected:
-        raise _refuse(
-            "anima_optimization_source_mismatch",
-            f"{name} has source sha256:{actual}, expected sha256:{expected}; refusing the "
-            "Diffusers 0.40 execution plan rather than guessing across patched source",
-        )
-
-
-def _version(distribution: str, expected: str) -> None:
-    try:
-        actual = metadata.version(distribution)
-    except metadata.PackageNotFoundError as exc:
-        raise _refuse(
-            "anima_optimization_dependency_absent",
-            f"{distribution}=={expected} is required by the Anima execution plan",
-        ) from exc
-    if actual != expected:
-        raise _refuse(
-            "anima_optimization_dependency_mismatch",
-            f"the Anima execution plan requires {distribution}=={expected}, found {actual}",
-        )
+    if actual == expected:
+        return ""
+    return f"{name} has source sha256:{actual}, not the reviewed sha256:{expected}"
 
 
 def _installed_version(distribution: str) -> str | None:
@@ -457,25 +439,8 @@ def _install_transformer_plan(transformer: Any, *, anima_kernels: Any, torch: An
     transformer.forward = MethodType(forward, transformer)
 
 
-def _require_transformer_config(transformer: Any) -> None:
-    actual = json.loads(json.dumps(dict(transformer.config)))
-    if actual != _TRANSFORMER_CONFIG:
-        raise _refuse(
-            "anima_optimization_config",
-            "the filled Cosmos transformer config is not the exact Anima Base 1.0 config",
-        )
-
-
-def fused_anima_capability_refusal(*, application: str, model_class: str) -> str:
-    """WHY the fused lane is unavailable, in one line, or "" when it is available.
-
-    `_fused_anima_cuda_capability` has six silent `return None` edges and an operator who
-    sees a slow run cannot tell which one fired — or that any fired at all (cr-102 /
-    proto-038). This recomputes the same gate for REPORTING only; it decides nothing and
-    never enters generation identity.
-    """
-    if application != _APPLICATION or model_class != _MODEL_CLASS:
-        return ""
+def _capability() -> tuple[Any, Any] | str:
+    """The supported Torch/native pair, or why this generation runs eager."""
     torch_version = _installed_version("torch")
     if torch_version is None:
         return "torch is not installed"
@@ -505,59 +470,28 @@ def fused_anima_capability_refusal(*, application: str, model_class: str) -> str
         return f"torch.cuda.is_available() raised {type(exc).__name__}"
     try:
         import_module(FUSED_ANIMA_CUDA_KERNEL_MODULE + "._C")
+        anima_kernels = import_module(FUSED_ANIMA_CUDA_KERNEL_MODULE)
     except ImportError as exc:
         return (
             f"{FUSED_ANIMA_CUDA_KERNEL_MODULE}._C does not import ({exc}) — this wheel "
             "carries no compiled kernels, so this generation runs the eager path"
         )
-    return ""
-
-
-def _fused_anima_cuda_capability() -> tuple[Any, Any] | None:
-    """Return the exact supported Torch/native pair, or ``None`` for eager execution."""
-    torch_version = _installed_version("torch")
-    if torch_version is None:
-        return None
-    try:
-        installed_torch = Version(torch_version)
-    except InvalidVersion:
-        return None
-    if installed_torch.public not in FUSED_ANIMA_TORCH_RELEASES:
-        return None
-    try:
-        torch = import_module("torch")
-    except ImportError:
-        return None
-    if getattr(getattr(torch, "version", None), "cuda", None) != FUSED_ANIMA_CUDA_RELEASE:
-        return None
-    cuda = getattr(torch, "cuda", None)
-    try:
-        if cuda is None or not cuda.is_available():
-            return None
-    except (AttributeError, RuntimeError):
-        return None
-    try:
-        import_module(FUSED_ANIMA_CUDA_KERNEL_MODULE + "._C")
-        anima_kernels = import_module(FUSED_ANIMA_CUDA_KERNEL_MODULE)
-    except ImportError:
-        return None
     return torch, anima_kernels
 
 
-def _apply_fused_anima_cuda_plan(
-    model: object, *, torch: Any, anima_kernels: Any
-) -> AppliedAnimaOptimization:
-    """Apply the strict post-capability plan; all source/config/tensor-schema drift refuses."""
-    _version("diffusers", DIFFUSERS_VERSION)
-    from diffusers.models.normalization import RMSNorm
-    from diffusers.models.transformers.transformer_cosmos import (
-        CosmosAttnProcessor2_0,
-        CosmosRotaryPosEmbed,
-        CosmosTransformer3DModel,
-        CosmosTransformerBlock,
-    )
-    from diffusers.modular_pipelines.anima.before_denoise import AnimaPrepareLatentsStep
-
+def _plan_refusal(model: object, anima_kernels: Any) -> str:
+    """Why this construction is not the reviewed Anima graph, or "" when it is."""
+    try:
+        from diffusers.models.normalization import RMSNorm
+        from diffusers.models.transformers.transformer_cosmos import (
+            CosmosAttnProcessor2_0,
+            CosmosRotaryPosEmbed,
+            CosmosTransformer3DModel,
+            CosmosTransformerBlock,
+        )
+        from diffusers.modular_pipelines.anima.before_denoise import AnimaPrepareLatentsStep
+    except ImportError as exc:
+        return f"diffusers does not expose the reviewed Anima modules: {exc}"
     sources: dict[str, Callable[..., object]] = {
         "RMSNorm.forward": RMSNorm.forward,
         "CosmosAttnProcessor2_0.__call__": CosmosAttnProcessor2_0.__call__,
@@ -567,19 +501,14 @@ def _apply_fused_anima_cuda_plan(
         "cozy_runtime._kernels.rms_rope_split_half": anima_kernels.rms_rope_split_half,
     }
     for name, source in sources.items():
-        _require_source(name, source)
-
+        refusal = _source_refusal(name, source)
+        if refusal:
+            return refusal
     if _type_name(model) != _MODEL_CLASS:
-        raise _refuse(
-            "anima_optimization_model_class",
-            f"the binding names {_MODEL_CLASS}, but construction returned {_type_name(model)}",
-        )
+        return f"construction returned {_type_name(model)}, not {_MODEL_CLASS}"
     pipe = getattr(model, "pipe", None)
     if _type_name(pipe) != "anima:AnimaPipeline":
-        raise _refuse(
-            "anima_optimization_pipeline_class",
-            f"the exact Anima pipeline is anima:AnimaPipeline, found {_type_name(pipe)}",
-        )
+        return f"the pipeline is {_type_name(pipe)}, not anima:AnimaPipeline"
     components = getattr(pipe, "components", None)
     if not isinstance(components, dict) or set(components) != {
         "transformer",
@@ -587,19 +516,22 @@ def _apply_fused_anima_cuda_plan(
         "text_conditioner",
         "vae",
     }:
-        raise _refuse(
-            "anima_optimization_components",
-            "Anima pipeline components do not match transformer/text_encoder/text_conditioner/vae",
-        )
+        return "Anima pipeline components are not transformer/text_encoder/text_conditioner/vae"
     transformer = components["transformer"]
     if type(transformer) is not CosmosTransformer3DModel:
-        raise _refuse(
-            "anima_optimization_transformer_class",
-            "the exact transformer is Diffusers CosmosTransformer3DModel, found "
-            f"{_type_name(transformer)}",
-        )
-    _require_transformer_config(transformer)
+        return f"the transformer is {_type_name(transformer)}, not CosmosTransformer3DModel"
+    if json.loads(json.dumps(dict(transformer.config))) != _TRANSFORMER_CONFIG:
+        return "the filled Cosmos transformer config is not the Anima Base 1.0 config"
+    return ""
 
+
+def _apply_fused_anima_cuda_plan(
+    model: object, *, torch: Any, anima_kernels: Any
+) -> AppliedAnimaOptimization:
+    """Install the plan on a construction `_plan_refusal` admitted; storage never moves."""
+    from diffusers.modular_pipelines.anima.before_denoise import AnimaPrepareLatentsStep
+
+    transformer = model.pipe.components["transformer"]  # type: ignore[attr-defined]
     before = _tensor_census(transformer)
     _install_transformer_plan(transformer, anima_kernels=anima_kernels, torch=torch)
     after = _tensor_census(transformer)
@@ -611,7 +543,7 @@ def _apply_fused_anima_cuda_plan(
     AnimaPrepareLatentsStep.__call__ = _latent_prepare_call
     return AppliedAnimaOptimization(
         OPTIMIZATION_ID,
-        f"diffusers=={DIFFUSERS_VERSION};"
+        f"diffusers=={_installed_version('diffusers')};"
         f"{FUSED_ANIMA_CUDA_KERNEL_MODULE}=={FUSED_ANIMA_CUDA_KERNEL_REVISION}",
         (
             "fused_rmsnorm_split_half_rope",
@@ -625,12 +557,15 @@ def _apply_fused_anima_cuda_plan(
 
 def apply_anima_execution_plan(
     model: object, *, application: str, model_class: str
-) -> AppliedAnimaOptimization | None:
-    """Apply fused Anima CUDA kernels when supported; otherwise retain eager execution."""
+) -> tuple[AppliedAnimaOptimization | None, str]:
+    """Apply fused Anima CUDA kernels when supported; otherwise run eager and say why."""
     if application != _APPLICATION or model_class != _MODEL_CLASS:
-        return None
-    capability = _fused_anima_cuda_capability()
-    if capability is None:
-        return None
+        return None, ""
+    capability = _capability()
+    if isinstance(capability, str):
+        return None, capability
     torch, anima_kernels = capability
-    return _apply_fused_anima_cuda_plan(model, torch=torch, anima_kernels=anima_kernels)
+    refusal = _plan_refusal(model, anima_kernels)
+    if refusal:
+        return None, refusal
+    return _apply_fused_anima_cuda_plan(model, torch=torch, anima_kernels=anima_kernels), ""

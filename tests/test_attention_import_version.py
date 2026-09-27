@@ -1,4 +1,4 @@
-"""Exercise real Python package shadowing, without replacing attention arithmetic."""
+"""Attention admission reads Diffusers capability, not its version string."""
 
 from __future__ import annotations
 
@@ -11,33 +11,26 @@ from pathlib import Path
 import pytest
 
 from cozy_runtime.internal import attention
-from cozy_runtime.internal.anima_optimization import DIFFUSERS_VERSION
 
 
-def test_matching_loaded_diffusers_registry_is_accepted() -> None:
-    diffusers = pytest.importorskip("diffusers")
-    if diffusers.__version__ != DIFFUSERS_VERSION:
-        pytest.skip("requires the reviewed Diffusers package")
+def test_loaded_diffusers_registry_is_accepted() -> None:
     registry = pytest.importorskip("diffusers.models.attention_dispatch")
     assert attention._registry() is registry._AttentionBackendRegistry
 
 
-def test_imported_version_cannot_shadow_distribution_metadata(
-    tmp_path: Path,
-) -> None:
+def test_another_diffusers_version_with_the_registry_is_accepted(tmp_path: Path) -> None:
     diffusers = pytest.importorskip("diffusers")
-    if diffusers.__version__ != DIFFUSERS_VERSION:
-        pytest.skip("requires the reviewed Diffusers package")
+    pytest.importorskip("diffusers.models.attention_dispatch")
     original = Path(diffusers.__file__).parent
     shadow = tmp_path / "diffusers"
     shadow.mkdir()
     # Reuse every real module, changing only the shadow package's version declaration.
-    # Distribution metadata remains the installed 0.40 package; no kernel is mocked.
+    # Distribution metadata keeps the installed version; no kernel is mocked.
     for child in original.iterdir():
         if child.name not in {"__init__.py", "__pycache__"}:
             (shadow / child.name).symlink_to(child, target_is_directory=child.is_dir())
     text = (original / "__init__.py").read_text()
-    declaration = f'__version__ = "{DIFFUSERS_VERSION}"'
+    declaration = f'__version__ = "{diffusers.__version__}"'
     assert declaration in text
     (shadow / "__init__.py").write_text(text.replace(declaration, '__version__ = "0.41.0.dev0"'))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONDONTWRITEBYTECODE="1")
@@ -67,7 +60,5 @@ print(json.dumps(facts))
         check=True,
     )
     facts = json.loads(result.stdout)
-    assert facts["installed"] == DIFFUSERS_VERSION
     assert facts["loaded"] == "0.41.0.dev0" and facts["path"].startswith(str(shadow))
-    assert facts["code"] == "attention_kernel_absent", facts
-    assert "0.41.0.dev0" in facts["detail"] and str(shadow) in facts["detail"]
+    assert facts["code"] == "accepted", facts
