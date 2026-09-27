@@ -97,6 +97,7 @@ from cozy_runtime.internal.worker.child import (
     GRACE_SECONDS,
     INTERFACE_DOCUMENT,
     ExecutorGone,
+    ExecutorProtocolMismatch,
     ExecutorSupervision,
     socket_path_refusal,
 )
@@ -122,6 +123,7 @@ from cozy_runtime.internal.worker.machine_publication import PublicationAuthorit
 from cozy_runtime.internal.worker.plan import (
     DeclaredBinding,
     JobBinding,
+    PlanRefusal,
     PreparedModel,
     PreparedRequest,
 )
@@ -514,9 +516,10 @@ def desired_state_body(desired: pb.DesiredWorkerState) -> bytes:
     """The canonical bytes of a DesiredWorkerState's DESIRED STATE — envelope excluded (#494a).
 
     A DesiredWorkerState carries two unrelated things: what the RecordOwner wants this worker
-    to be (revision, posture, wire minor, drain grace, the mode's set or job), and the
-    per-stream envelope that routes it (record_owner_epoch, control_stream_epoch,
-    worker_boot_id). Only the first is the body §3's same-revision rule is about.
+    to be (revision, posture, drain grace, the mode's set or job), and the per-connection
+    facts that route it (record_owner_epoch, control_stream_epoch, worker_boot_id, and the
+    wire minor the sender speaks). Only the first is the body §3's same-revision rule is
+    about: an owner restarted on a newer Creator re-sends the same revision at its own minor.
 
     Hashing the whole message made `control_stream_epoch` — which the WORKER mints
     afresh for every accepted stream, by design — part of the body, so the identical desired
@@ -530,6 +533,7 @@ def desired_state_body(desired: pb.DesiredWorkerState) -> bytes:
     body.record_owner_epoch = 0
     body.control_stream_epoch = 0
     body.worker_boot_id = ""
+    body.wire_minor = 0
     return documents.canonical_bytes(body)
 
 
@@ -1886,10 +1890,14 @@ class Worker:
                         },
                         timeout=None,
                     )
-            except ExecutorGone as exc:
+            except ExecutorProtocolMismatch as exc:
                 raise package_prepare.PreparationRefusal(
                     "package_prepare_executor_failed", exc.detail
                 ) from exc
+            except ExecutorGone as exc:
+                # A dead or silent describe executor is this pod's condition, not a verdict
+                # on the package: answer it without recording a permanent refusal.
+                raise _InterfaceFault(f"package_prepare_executor_failed: {exc.detail}") from exc
             if not reply.get("ok"):
                 # THE EXECUTOR ALREADY DECIDED THIS AND WE WERE THROWING IT AWAY. Its
                 # reply carries `terminal` and `origin` beside `code` and `detail`
@@ -3920,7 +3928,7 @@ class Worker:
         # Minor skew is additive compatibility, not an equality gate. Never report a
         # RecordOwner's future minor as if this worker had applied capabilities it does not
         # implement; an older owner's lower minor remains visible as the effective level.
-        self.fence.wire_minor = min(WIRE_MINOR, desired.wire_minor)
+        self.fence.wire_minor = min(WIRE_MINOR, desired.wire_minor or self.fence.wire_minor)
         self.accepted.drain_grace_ms = desired.drain_grace_ms
         if self.accepted.mode == "job" and mode != "job":
             self.lanes.envelope.forget("")  # the job generation's row leaves with the job
@@ -4098,8 +4106,13 @@ class Worker:
             # placement whose rollback pin is gone — evicted under a bytes/age cap, or never
             # materialized — cannot accept a new spec until it re-materializes one, so the
             # replacement PAUSES here and is recorded as such. Proceeding without a pin is an
-            # explicit administrative act and there is no default that performs one.
-            if previous.materialization != pb.MaterializationState.MATERIALIZATION_STATE_STAGED:
+            # explicit administrative act and there is no default that performs one. A
+            # placement that is not serving has nothing to fall back to, so replacing it is a
+            # standing start rather than a lost rollback.
+            if (
+                previous.materialization != pb.MaterializationState.MATERIALIZATION_STATE_STAGED
+                and previous.serving != pb.ServingState.SERVING_STATE_OFFLINE
+            ):
                 self.note(
                     "desired_state",
                     f"revision {desired.revision} PAUSES the replacement of "
@@ -4949,12 +4962,6 @@ class Worker:
                 binding = JobBinding.read(json.loads(record.read_text()))
                 declaration = self.engine._job_declaration(binding, parent.job_descriptor_id)
                 if (
-                    binding.installation_id != parent.installation_id
-                    or binding.job_descriptor_id != parent.job_descriptor_id
-                    or not parent.reclaim_on_terminal
-                ):
-                    raise ValueError("orchestration directive differs from its prepared job")
-                if (
                     parent.device_count
                     or parent.resource_caps.device_required
                     or parent.resource_caps.max_device_memory_bytes
@@ -5150,21 +5157,20 @@ class Worker:
             self.latched = "unresolved_job_descriptor"
             self._settle()
             return
-        binding = JobBinding.read(json.loads(record.read_text()))
-        if (
-            binding.job_descriptor_id != job.job_descriptor_id
-            or binding.installation_id != job.installation_id
-            or not job.reclaim_on_terminal
-        ):
+        # The plan is found by the directive's own installation and descriptor ids, and
+        # the directive's reclaim policy is applied below as sent.
+        try:
+            binding = JobBinding.read(json.loads(record.read_text()))
+        except (OSError, ValueError, TypeError, PlanRefusal) as exc:
             self.engine.fault(
                 pb.Fault(
-                    kind=pb.FaultKind.FAULT_KIND_CONFIG_REFUSED,
+                    kind=pb.FaultKind.FAULT_KIND_BINDING_UNAVAILABLE,
                     subject=job.job_descriptor_id,
-                    reason="job_plan_mismatch",
-                    detail="JobDirective does not equal the prepared package job plan",
+                    reason="job_plan_unreadable",
+                    detail=f"re-prepare the package: {type(exc).__name__}: {exc}"[:512],
                 )
             )
-            self.latched = "job_plan_mismatch"
+            self.latched = "job_plan_unreadable"
             self._settle()
             return
         self.supervision.use_environment(binding.python, binding.installation_id)
@@ -5639,7 +5645,16 @@ class Worker:
             )
         self.monitor.end(subject, "filled")
         facts = dict(reply.get("facts") or {})
-        resolved = PreparedModel.from_reply(reply)
+        try:
+            resolved = PreparedModel.from_reply(reply)
+        except (KeyError, TypeError, ValueError) as exc:
+            # An executor from another Runtime version answered without a fact this worker
+            # needs: refuse this attempt, never the lane or the worker.
+            raise AttemptRefusal(
+                "construction_reply_incomplete",
+                f"construction {label} reply lacks {exc}",
+                cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+            ) from exc
         with self.control_lock:
             executor.loaded[key] = child.LoadedConstruction(
                 key=key,
