@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import dataclasses
 import hashlib
 import hmac
 import itertools
@@ -58,6 +59,7 @@ from cozy_runtime.internal import (
     child_env,
     fill,
     hostfacts,
+    job_plan,
     package_environment,
     package_installation,
     prepare_diagnostics,
@@ -73,6 +75,10 @@ from cozy_runtime.internal.worker import (
     downloads,
     grants,
     lane_wire,
+    machine_byte_inputs,
+    machine_capture,
+    machine_lanes,
+    machine_slots,
     model_source_prepare,
     observe,
     page_warm,
@@ -107,6 +113,7 @@ from cozy_runtime.internal.worker.control import (
     WatchFanout,
     _loopback_preparation_listener,
 )
+from cozy_runtime.internal.worker.gpu_scheduler import Demand, GpuScheduler, width_for
 from cozy_runtime.internal.worker.lanes import (
     LANE_RELEASED,
     LANE_RUNNING,
@@ -1193,9 +1200,9 @@ class Worker:
         from .machine_effects import Effects
 
         self.machine_calls = MachineCalls(self) if self.workspace is not None else None
-        from .machine_groups import Groups
-
-        self.machine_groups = Groups(self) if self.executions is not None else None
+        self.gpu = GpuScheduler(len(self.lanes.entries))
+        self._gpu_shapes: dict[str, machine_lanes.Shape] = {}
+        self._dead_replicas: dict[str, child.Executor] = {}
         from .machine_sources import Sources as MachineSources
 
         self.machine_sources = MachineSources(self)
@@ -1405,15 +1412,12 @@ class Worker:
         bindings: Mapping[str, DeclaredBinding],
         supervision: ExecutorSupervision,
     ) -> bool:
-        """Assign one placement to a measured lane, or latch a typed lane refusal.
+        """Bind one placement to a lane, or latch a typed lane refusal.
 
-        The declared bytes are the placement's model weight bytes from its bindings' MCC
-        census; the measured side is each lane's driver-reported free and total bytes, read
-        now. Full weight size ranks single-device lanes. Group preflight uses the declared
-        simultaneous component requirement on each rank; measured preparation and actual
-        construction/residency still determine fit. Assignment grants no bytes. The row
-        the lane keeps for it remembers `supervision`, the slot the lane asks to vacate
-        when a co-tenant needs the card (cr-022).
+        A machine replica runs on exactly its scheduler grant. A placement the owner sent
+        runs at the largest degree its bindings declare within its pin (or the envelope),
+        chosen by measured fit. The row remembers `supervision`, the slot the lane asks to
+        vacate when a co-tenant needs the card (cr-022).
         """
         model_bearing = any(not binding.weightless for binding in bindings.values())
         # A placement executes one entrypoint at a time. Each binding already sums
@@ -1424,28 +1428,25 @@ class Worker:
             kind = accel.host_backend_family()
             for ordinal, entry in enumerate(self.lanes.entries):
                 measured[ordinal] = accel.device_memory(entry, kind)
-        # THE PIN (cr-068): the RecordOwner's placement of this placement on THIS worker;
-        # the lane set runs it at the largest declared degree the pin can form.
         pin = placement.device_pin
-        if pin is not None and len(pin) > 1:
-            declared = max(
-                (binding.group_weight_bytes() for binding in bindings.values()), default=0
-            )
-        degrees: set[int] | None = None
-        for binding in bindings.values():
-            if binding.weightless:
-                continue
-            held = set(binding.sequence_parallel_degrees())
-            degrees = held if degrees is None else degrees & held
         revision = self.lanes.revision
         try:
-            lane = self.lanes.assign(
-                placement.placement_id,
-                model_bearing=model_bearing,
-                declared_bytes=declared,
-                measured=measured,
-                pin=pin,
-                degrees=tuple(sorted(degrees or ())),
+            if placement.placement_id.startswith(machine_lanes.REPLICA):
+                ordinals = pin or ()  # its scheduler grant exactly; none for weightless work
+            else:
+                candidates = pin or tuple(range(len(self.lanes.entries)))
+                degrees = [
+                    b.sequence_parallel_degrees() for b in bindings.values() if not b.weightless
+                ]
+                ordinals = self.lanes.choose(
+                    candidates,
+                    width_for(degrees, len(candidates)) if model_bearing else 1,
+                    model_bearing=model_bearing,
+                    declared_bytes=declared,
+                    measured=measured,
+                )
+            lane = self.lanes.bind(
+                placement.placement_id, ordinals, model_bearing=model_bearing, measured=measured
             )
         except LaneRefusal as exc:
             placement.lane_id = ""
@@ -1460,8 +1461,6 @@ class Worker:
             self.note("materialization", f"{placement.placement_id!r} refused: {exc}"[:256])
             return False
         placement.lane_id = lane.lane_id
-        if warning := self.lanes.notes.get(placement.placement_id):
-            self.note("warning", warning)
         row = lane.row(placement.placement_id)
         row.model_bearing = model_bearing
         row.supervision = supervision
@@ -1476,6 +1475,8 @@ class Worker:
             + (f"; shares the device with {tenants} by residency arbitration" if tenants else "")
             + ")",
         )
+        if not lane.ordinals:
+            self._sync_lane_consumers()
         if self.lanes.revision != revision:
             self._sync_lane_consumers()
             self.bump_admission(
@@ -1488,7 +1489,8 @@ class Worker:
         if placement is not None:
             placement.lane_id = ""
         revision = self.lanes.revision
-        self.lanes.release(placement_id)
+        if self.lanes.release(placement_id):
+            self._sync_lane_consumers()
         if self.lanes.revision != revision:
             self._sync_lane_consumers()
             self.bump_admission(f"a group lane split when {placement_id!r} left it")
@@ -2278,7 +2280,7 @@ class Worker:
             return
 
     def _drive_executions(self) -> None:
-        """Admit retained roots through the existing lanes, independently of observers."""
+        """Admit retained executions; every GPU phase runs on its scheduler grant."""
         if self.executions is None or not self.fence.record_owner_recorded:
             return
         with self.control_lock:
@@ -2287,19 +2289,12 @@ class Worker:
             owner = self.fence.record_owner_id
             if self.machine_effects is not None:
                 self.machine_effects.drive(owner)
-            if self.machine_groups is not None:
-                self.machine_groups.refresh(owner)
             if self.machine_calls is not None:
                 self.machine_calls.drive()
             self.executions.retry_due(owner, worker_boot=self.fence.worker_boot_id)
-            requests = self.executions.pending(owner)
-            groups = self.machine_groups
-            if groups is not None:
-                requests = tuple(
-                    sorted(requests, key=lambda request: groups.priority(owner, request))
-                )
-            for request in requests:
-                state = self.executions.status(owner, request)
+            states = {r: self.executions.status(owner, r) for r in self.executions.pending(owner)}
+            grants = self._schedule_gpus(owner, states)
+            for request, state in states.items():
                 held = self.engine.history.get((request, state.attempt_ordinal))
                 if state.state in workspace_executions.TERMINAL:
                     if held is None or held.state == "closed":
@@ -2336,21 +2331,28 @@ class Worker:
                 ):
                     continue
                 offered = self.executions.offer(owner, request)
-                from . import machine_byte_inputs
-
                 machine_byte_inputs.bind_root_grant(owner, offered)
                 spec = documents.read(offered.invocation_spec_canonical_bytes, pb.InvocationSpec)
                 deadline = int(spec.get("deadline_unix_ms", 0))
                 if deadline and self.executions.clock_ms() >= deadline:
                     self.executions.stop_queued(owner, request, deadline=True)
                     continue
-                preparation = self.executions.preparation(owner, request)
+                shape = self._gpu_shapes[request]
+                if shape.refusal:
+                    self.refuse(
+                        offered,
+                        shape.refusal.partition(":")[0],
+                        shape.refusal,
+                        pb.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
+                    )
+                    continue
+                ordinals = grants.get(f"{request}#{state.attempt_ordinal}", ())
+                if shape.kind != "cpu" and not ordinals:
+                    continue
                 try:
-                    if self.machine_groups is not None and not self.machine_groups.admits(
-                        owner, request, preparation
-                    ):
-                        self.machine_groups.wait(owner, request, request, state.attempt_ordinal)
-                        continue
+                    preparation = machine_lanes.placement_for(
+                        self.executions.preparation(owner, request), offered, ordinals
+                    )
                     if preparation and not self._prepare_execution(preparation, request):
                         continue
                 except Exception as exc:
@@ -2361,6 +2363,7 @@ class Worker:
                         pb.CAUSE_CODE_CAPABILITY_UNAVAILABLE,
                     )
                     continue
+                self._revive(offered.placement_id)
                 # Validation precedes waiting for capacity, so malformed work does not
                 # occupy a durable queue forever. The engine still authors its refusal.
                 try:
@@ -2391,6 +2394,156 @@ class Worker:
                     continue
                 offered.admission_epoch = self.admission_epoch
                 self.on_offer(offered, machine_owned=True)
+
+    def _schedule_gpus(
+        self, owner: str, states: Mapping[str, workspace_executions.State]
+    ) -> dict[str, tuple[int, ...]]:
+        """One level-triggered scheduler pass over every execution that needs a GPU now.
+
+        A queued execution demands; an attempt keeps its grant until device release. A
+        GPU held outside this owner's executions (a direct offer) is excluded, and so is
+        an unreadable one for model work: its width is what the readable GPUs can form.
+        """
+        assert self.executions is not None
+        self._gpu_shapes = {r: s for r, s in self._gpu_shapes.items() if r in states}
+        outside = {
+            ordinal
+            for attempt in self.engine.history.values()
+            if attempt.state in self.engine.PRE_RELEASE and attempt.request_id not in states
+            for ordinal in getattr(self.lanes.by_id.get(attempt.lane_id), "ordinals", ())
+        }
+        readable: tuple[int, ...] | None = None
+        demands: list[Demand] = []
+        for request, state in states.items():
+            key = f"{request}#{state.attempt_ordinal}"
+            held = self.engine.history.get((request, state.attempt_ordinal))
+            if held is not None:
+                phase = self.gpu.phase(key)
+                if held.state in self.engine.PRE_RELEASE and phase["phase"] == "granted":
+                    demands.append(Demand(key, self._gpu_shapes[request].root, phase["width"]))
+                continue
+            if state.state != "queued" or not self.executions.assigned_here(
+                owner, request, state.attempt_ordinal, self.fence.worker_boot_id
+            ):
+                continue
+            if request not in self._gpu_shapes:
+                try:
+                    self._gpu_shapes[request] = machine_lanes.shape(self, owner, request)
+                except Exception as exc:  # only this execution is refused
+                    self._gpu_shapes[request] = machine_lanes.Shape(
+                        request, "cpu", refusal=f"gpu_shape_unreadable: {type(exc).__name__}: {exc}"
+                    )
+            shape = self._gpu_shapes[request]
+            if shape.kind == "cpu" or shape.refusal:
+                continue
+            exclude = set(outside)
+            width = len(self.lanes.entries)
+            if shape.kind == "serving":
+                if readable is None:
+                    family = accel.host_backend_family()
+                    readable = tuple(
+                        o
+                        for o, entry in enumerate(self.lanes.entries)
+                        if accel.device_memory(entry, family).state == "measured"
+                    )
+                if not readable:
+                    self._gpu_shapes[request] = dataclasses.replace(
+                        shape, refusal="gpu_unavailable: no GPU on this worker is readable"
+                    )
+                    continue
+                exclude.update(set(range(width)) - set(readable))
+                width = width_for(shape.degrees, len(readable))
+            demands.append(
+                Demand(key, shape.root, width, self._warm(shape.template), tuple(sorted(exclude)))
+            )
+        grants = self.gpu.sync(self.executions.scheduling_roots(owner), demands)
+        for root, event, body in self.gpu.drain():
+            with contextlib.suppress(WorkspaceRefusal):
+                self.executions.record(owner, root, event, body)
+            if event == "gpu.wait":
+                self._gpu_waiting(owner, body)
+        return grants
+
+    def _warm(self, template: tuple[str, str]) -> tuple[int, ...]:
+        """Ordinals where a replica of this template is resident, so a grant reuses it."""
+        placements = [self.placement, *(hosted.placement for hosted in self.hosted.values())]
+        return tuple(
+            sorted(
+                {
+                    ordinal
+                    for placement in placements
+                    if placement is not None
+                    and placement.placement_id.startswith(machine_lanes.REPLICA)
+                    and (placement.installation_id, placement.document.get("bindings_digest"))
+                    == template
+                    for ordinal in placement.device_pin or ()
+                }
+            )
+        )
+
+    def _gpu_waiting(self, owner: str, body: dict[str, Any]) -> None:
+        """Once per transition, tell the waiting call's parent (or root) why it waits."""
+        assert self.executions is not None
+        request = str(body["key"]).rpartition("#")[0]
+        _root, parent = self.executions.scheduling_root(owner, request)
+        target = self.engine.live.get(parent or request)
+        blocked = ", ".join(body["blocked_by"]) or "released devices"
+        if target is not None:
+            self.emit_progress(
+                target.request_id,
+                target.attempt,
+                {
+                    "kind": "progress",
+                    "stage": f"Waiting for GPU (needs {body['width']}, behind {blocked})"[:120],
+                },
+            )
+
+    def _defer_rebuild(self, placement_id: str) -> bool:
+        """A dead GPU replica rebuilds on its next grant, never on devices it no longer holds."""
+        placement = self._placement_by_id(placement_id)
+        if (
+            placement is None
+            or not placement.placement_id.startswith(machine_lanes.REPLICA)
+            or not placement.device_pin
+            or any(
+                attempt.placement_id == placement_id and attempt.state in self.engine.PRE_RELEASE
+                for attempt in self.engine.history.values()
+            )
+        ):
+            return False
+        hosted = self.hosted.get(placement_id)
+        current = (hosted.supervision if hosted is not None else self.supervision).current
+        if current is not None:
+            self._dead_replicas[placement_id] = current
+        return current is not None
+
+    def _revive(self, placement_id: str) -> None:
+        """Rebuild a deferred dead replica now that a grant holds its devices."""
+        executor = self._dead_replicas.pop(placement_id, None)
+        if executor is not None and self._placement_by_id(placement_id) is not None:
+            lane = self.lanes.lane_of(placement_id)
+            if lane is not None:
+                lane.work.put(ExecutorDeath(executor, placement_id, granted=True))
+
+    def _cpu_job(self, job: pb.JobDirective) -> bool:
+        """An orchestration job that declares no device, Model or weights holds no GPU."""
+        if not job.orchestration:
+            return False
+        binding = JobBinding.read(
+            json.loads(
+                job_plan.path(
+                    self.config.cozy_home / "job-plans", job.installation_id, job.job_descriptor_id
+                ).read_bytes()
+            )
+        )
+        declaration = self.engine._job_declaration(binding, binding.job_descriptor_id)
+        return not (
+            job.device_count
+            or job.resource_caps.device_required
+            or job.resource_caps.max_device_memory_bytes
+            or declaration.get("models")
+            or declaration.get("weights_outputs")
+        )
 
     def _failed_execution_binding(self, attempt: AttemptRecord) -> str | None:
         """A known construction refusal is terminal before waiting for a GPU seat.
@@ -2433,16 +2586,8 @@ class Worker:
             detail = fault.reason if fault is not None else "worker entered FAILED state"
             raise WorkspaceRefusal(f"worker preparation stopped: {detail}")
 
-        from . import machine_capture
-
-        desired = pb.DesiredWorkerState.FromString(
-            base64.b64decode(preparation["state"], validate=True)
-        )
-        if request_id and desired.WhichOneof("mode") == "job" and desired.job.orchestration:
-            from cozy_runtime.internal import job_plan
-
-            from . import machine_slots
-
+        desired = machine_lanes.state(preparation)
+        if request_id and desired.WhichOneof("mode") == "job" and self._cpu_job(desired.job):
             held = self.job_slots.get(machine_slots.key(request_id))
             if held is not None and held.ready():
                 return True
@@ -2455,20 +2600,10 @@ class Worker:
                     ).read_bytes()
                 )
             )
-            declaration = self.engine._job_declaration(binding, binding.job_descriptor_id)
-            if not (
-                desired.job.device_count
-                or desired.job.resource_caps.device_required
-                or desired.job.resource_caps.max_device_memory_bytes
-                or declaration.get("models")
-                or declaration.get("weights_outputs")
-            ):
-                machine_capture.restore(self, preparation)
-                return machine_slots.ensure(self, request_id, desired.job, binding)
+            machine_capture.restore(self, preparation)
+            return machine_slots.ensure(self, request_id, desired.job, binding)
         managed_placement = request_id and desired.WhichOneof("mode") == "placement_set"
-        if managed_placement and desired.placement_set.device_pins:
-            from . import machine_lanes
-
+        if managed_placement:
             combined = machine_lanes.compose(self, desired)
             if combined is None:
                 return False
@@ -2499,14 +2634,11 @@ class Worker:
                         )
                         raise WorkspaceRefusal(f"model preparation failed: {detail}")
             return True
-        if (
-            managed_placement
-            and desired.placement_set.device_pins
-            and self.accepted.converged_revision < self.accepted.accepted_desired_state_revision
-        ):
-            # Finish the retained topology transition before adding another replica.
-            return False
-        if not (managed_placement and desired.placement_set.device_pins) and any(
+        if managed_placement and self.accepted.mode == "serving":
+            if self.accepted.converged_revision < self.accepted.accepted_desired_state_revision:
+                # Finish the retained topology transition before adding another replica.
+                return False
+        elif any(
             (attempt.state in self.engine.PRE_RELEASE or attempt.state in self.engine.HELD)
             and not (
                 (
@@ -6885,7 +7017,7 @@ class Worker:
                 elif lane is self.lanes.orchestration:
                     self._rebuild_orchestration()
                 else:
-                    self.rebuild_exited(item.executor, item.placement_id)
+                    self.rebuild_exited(item.executor, item.placement_id, granted=item.granted)
                 continue
             attempt = item
             # A job offer arrives `queued` and admits here; a serving attempt arrives
@@ -6902,6 +7034,10 @@ class Worker:
             with lane.device:
                 if self.enter(attempt) if staged else self.admit(attempt):
                     self.execute(attempt, lane)
+            # Per-rank pid, GPU and interval (execution_evidence) prove where it ran.
+            self.gpu.release(
+                f"{attempt.request_id}#{attempt.attempt}", ranks=attempt.execution.get("ranks", [])
+            )
             # Rebuild on REFUSALS too (#458): a poisoned generation refuses every attempt,
             # so a rebuild gated on admission could never run again.
             if lane.lane_id.startswith("cpu-"):
@@ -7272,8 +7408,8 @@ class Worker:
             else:
                 current = self.supervision.current
                 rebuild = current is None or not current.alive() or bool(current.poisoned)
-        if not rebuild:
-            return
+            if not rebuild or self._defer_rebuild(placement_id):
+                return
         if hosted is not None:
             self._prepare_hosted_executor(hosted, fresh=False)
         elif current is None or not current.alive():
@@ -7281,15 +7417,18 @@ class Worker:
         else:
             self._rebuild(f"poisoned: {current.poisoned}")
 
-    def rebuild_exited(self, executor: child.Executor, placement_id: str = "") -> None:
+    def rebuild_exited(
+        self, executor: child.Executor, placement_id: str = "", *, granted: bool = False
+    ) -> None:
         """Rebuild only if the queued death still names the owned dead epoch."""
 
         with self.control_lock:
             hosted = self.hosted.get(placement_id)
-            if hosted is not None:
-                if hosted.supervision.current is not executor or executor.alive():
-                    return
-            elif self.supervision.current is not executor or executor.alive():
+            supervision = hosted.supervision if hosted is not None else self.supervision
+            if supervision.current is not executor or (executor.alive() and not executor.poisoned):
+                return
+            primary = self.placement.placement_id if self.placement is not None else ""
+            if not granted and self._defer_rebuild(placement_id or primary):
                 return
         if hosted is not None:
             self._prepare_hosted_executor(hosted, fresh=False)

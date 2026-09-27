@@ -128,19 +128,10 @@ class Serving:
         stage = f"{label} / {name}"[:120] if label else name
         self._progress(call, request, {"kind": "progress", "stage": stage})
         succeeded = False
-        groups = (
-            getattr(self.worker, "machine_groups", None)
-            if name == "Downloading model weights"
-            else None
-        )
-        if groups is not None:
-            groups.transfer(self.worker.fence.record_owner_id, call.parent_request, 1)
         try:
             yield
             succeeded = True
         finally:
-            if groups is not None:
-                groups.transfer(self.worker.fence.record_owner_id, call.parent_request, -1)
             self._progress(
                 call,
                 request,
@@ -246,15 +237,6 @@ class Serving:
             name: value for name, value in models.items() if name in names and value is not None
         }
         defaults = machine_model_defaults.select(self.worker, owner, call, target, models)
-        groups = getattr(self.worker, "machine_groups", None)
-        if groups is not None:
-            from .machine_lanes import degree
-
-            groups.announce(
-                owner,
-                call.parent_request,
-                degree(self.worker, target.declaration.get("models", []), defaults),
-            )
         identity = hashlib.sha256(
             canonical_json.encode(
                 {
@@ -331,7 +313,7 @@ class Serving:
         future = self.pending.get(key)
         if future is None:
             if len(self.pending) >= MAX_ACTIVE_CALLS:
-                raise WorkspaceRefusal("captured inference preparation capacity is exhausted")
+                return  # a later drive pass starts it once a preparation completes
             _, models = arguments(target, request.request_canonical_bytes)
             future = self._shared(owner, call, target, request, models, speculative=False)
             if future is not None:
@@ -340,43 +322,10 @@ class Serving:
         if not future.done():
             return
         prepared = None
-        keep_prepared = False
-        reservation_active = False
         try:
             prepared = future.result()
-            from . import machine_lanes
-
-            replica = machine_lanes.replica(
-                self.worker,
-                owner,
-                prepared.placement,
-                target.declaration.get("models", []),
-                prepared.defaults,
-                parent_request=call.parent_request,
-            )
-            if replica is None:
-                keep_prepared = True
-                groups = self.worker.machine_groups
-                assert groups is not None
-                groups.wait(
-                    owner, call.child_request, call.parent_request, request.parent_attempt_ordinal
-                )
-                return
-            placement, pins = replica
-            groups = self.worker.machine_groups
-            if groups is not None:
-                groups.waiting.discard(call.child_request)
-                # ``replica`` runs before the child execution is durable.  Reserve this
-                # selected lane in the parent root so sibling children admitted in this
-                # same drive pass choose disjoint devices instead of all taking ordinal 0.
-                groups.reserve(
-                    owner,
-                    call.parent_request,
-                    call.child_request,
-                    pins[0].device_ordinals if pins else (),
-                )
-                reservation_active = True
-            # Recipient custody begins only when this child can enter its GPU group.
+            placement = prepared.placement
+            # The durable row holds the placement template; its devices are chosen at grant.
             _, models = arguments(target, request.request_canonical_bytes)
             names = {row["path"].rpartition(".")[2] for row in target.declaration.get("models", [])}
             for name, supplied in models.items():
@@ -479,7 +428,6 @@ class Serving:
                 placement_set=pb.DesiredPlacementSet(
                     placement_set_digest=hashlib.sha256(placement_bytes).digest(),
                     placement_set_canonical_bytes=placement_bytes,
-                    device_pins=pins,
                 ),
             )
             preparation = canonical_json.encode(
@@ -522,32 +470,10 @@ class Serving:
                     max_attempts=attempts,
                     retry_delay_ms=delay,
                 )
-            if reservation_active:
-                groups = self.worker.machine_groups
-                if groups is not None:
-                    groups.release_reservation(owner, call.child_request)
-                reservation_active = False
-            if executions.status(owner, call.child_request).state == "queued":
-                label = self.worker.calls.progress_label(
-                    call.parent_request, request.parent_attempt_ordinal, call.call_index
-                )
-                self.worker.emit_progress(
-                    call.parent_request,
-                    request.parent_attempt_ordinal,
-                    {
-                        "kind": "progress",
-                        "stage": (label + " / " if label else "") + "Waiting for GPUs",
-                    },
-                )
         finally:
-            if reservation_active:
-                groups = self.worker.machine_groups
-                if groups is not None:
-                    groups.release_reservation(owner, call.child_request)
             if prepared is not None:
                 prepared.access.close()
-            if not keep_prepared:
-                self.pending.pop(key, None)
+            self.pending.pop(key, None)
 
     def _prepare(
         self,

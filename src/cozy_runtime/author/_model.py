@@ -284,9 +284,10 @@ def sequence_parallel(*, degrees: Sequence[int]) -> Callable[[type[ModelT]], typ
     The author's statement, and only the author can make it: at each degree K the class's
     attention heads divide by K, its quantization is shard-invariant (rowwise activation
     scales), and the whole pipeline is built identically on every rank. The runtime reads
-    it into the interface slot (`sequence_parallel.degrees`); a placement pinned to K
-    devices runs at the largest declared degree <= K, or on one device when none fits.
-    "Qualified" is the measured half, recorded per device class like any other proof.
+    it into the interface slot (`sequence_parallel.degrees`). Every Model slot of one
+    callable declares a common degree, or the package is refused. A call runs on the largest
+    declared degree the machine's GPUs can form (one GPU only on a machine narrower than
+    every degree). "Qualified" is the measured half, recorded per device class.
     """
     if not degrees:
         raise ConformanceError(

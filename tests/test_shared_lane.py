@@ -887,15 +887,11 @@ def test_a_second_tenant_takes_another_lane_when_one_has_room(
             # step-1 rule can be shown choosing the empty lane over sharing lane 0.
             # PINNED to ordinal 1 (cr-068): on a wide envelope the RecordOwner names the
             # device; the worker validates the pin against the reading and never chooses.
-            lane_q = worker.lanes.assign(
+            lane_q = worker.lanes.bind(
                 "plc-q",
+                (1,),
                 model_bearing=True,
-                declared_bytes=store.weight_bytes,
-                measured={
-                    0: accel.device_memory("0", accel.host_backend_family()),
-                    1: accel.DeviceMemory("measured", 8 << 30, 8 << 30),
-                },
-                pin=(1,),
+                measured={1: accel.DeviceMemory("measured", 8 << 30, 8 << 30)},
             )
             assert lane_q.lane_id == "lane-1", lane_q
             hosted_placement.lane_id = "lane-1"

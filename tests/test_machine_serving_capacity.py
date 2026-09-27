@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 from dataclasses import replace
 
 import pytest
 
+from cozy_runtime import canonical_json
+from cozy_runtime.internal.worker import machine_lanes
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.session import (
     HostedPlacement,
@@ -31,12 +34,23 @@ def test_failed_machine_preparation_is_not_an_endless_capacity_wait() -> None:
         try:
             placement = _placement("failed")
             worker.placement = placement
+            raw = canonical_json.encode(
+                {
+                    "format": "cozy.worker.v1.PlacementSet/1",
+                    "placements": [{"placement_id": "failed"}],
+                }
+            )
+            placement.placement_set_digest = hashlib.sha256(raw).digest()
             desired = pb.DesiredWorkerState(
                 placement_set=pb.DesiredPlacementSet(
-                    placement_set_digest=placement.placement_set_digest
+                    placement_set_digest=placement.placement_set_digest,
+                    placement_set_canonical_bytes=raw,
                 )
             )
-            worker.accepted.desired_state_body = desired_state_body(desired)
+            # The retained machine placement, composed exactly as the drive loop applied it.
+            composed = machine_lanes.compose(worker, desired)
+            assert composed is not None
+            worker.accepted.desired_state_body = desired_state_body(composed)
             preparation = {"state": base64.b64encode(desired.SerializeToString()).decode()}
             placement.materialization = pb.MATERIALIZATION_STATE_FAILED
             worker.engine.fault(

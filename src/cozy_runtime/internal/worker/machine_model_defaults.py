@@ -166,26 +166,23 @@ def select(
     facts = hostfacts.measure(worker.options.accelerator_backend)
     if "gpu_name" in facts.unreadable:
         raise WorkspaceRefusal("captured Model default cannot select an unreadable accelerator")
+    entries = getattr(getattr(worker, "lanes", None), "entries", None)
     selected = []
     for parameter in sorted(missing):
-        row = defaults[parameter]
-        rung = None
-        lanes = getattr(worker, "lanes", None)
-        entries = getattr(lanes, "entries", None)
-        for candidate in row["rungs"]:
+        fitting = []
+        for candidate in defaults[parameter]["rungs"]:
             if not matches(candidate["gpu"], facts.gpu_name):
                 continue
             count = candidate.get("gpus", 0)
-            if count:
-                if entries is None and "gpu_count" in facts.unreadable:
-                    raise WorkspaceRefusal(
-                        "counted Model default requires a readable granted GPU count"
-                    )
-                capacity = len(entries) if entries is not None else facts.gpu_count
-                if count > capacity:
-                    continue
-            rung = candidate
-            break
+            if count and entries is None and "gpu_count" in facts.unreadable:
+                raise WorkspaceRefusal(
+                    "counted Model default requires a readable granted GPU count"
+                )
+            if not count or count <= (len(entries) if entries is not None else facts.gpu_count):
+                fitting.append(candidate)
+        # The widest rung this machine holds: the width itself is the declared degree.
+        rung = max(fitting, key=lambda candidate: candidate.get("gpus", 0), default=None)
+        row = defaults[parameter]
         if rung is None:
             raise WorkspaceRefusal("captured Model default has no rung for this accelerator")
         selected.append({"parameter": parameter, "public_origin": row["public_origin"], **rung})

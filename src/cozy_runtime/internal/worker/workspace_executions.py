@@ -417,54 +417,40 @@ class Executions:
                 )
             )
 
-    def scheduling_root(self, owner: str, request: str) -> tuple[str, int]:
-        """The original accepted parent orders descendants, including unsubmitted calls."""
+    def scheduling_root(self, owner: str, request: str) -> tuple[str, str]:
+        """(root, parent): the original accepted ancestor orders descendants."""
         with self.workspace.locked() as db:
-            seen: set[str] = set()
+            seen: list[str] = []
             while request not in seen and len(seen) <= 32:
-                seen.add(request)
+                seen.append(request)
                 parent = db.execute(
                     "SELECT parent_request FROM execution_calls WHERE owner=? AND child_request=?",
                     (owner, request),
                 ).fetchone()
                 if parent is None:
-                    row = self._row(db, owner, request)
-                    return request, row["accepted_ms"]
+                    self._row(db, owner, request)
+                    return request, seen[1] if len(seen) > 1 else ""
                 request = parent[0]
         raise WorkspaceRefusal("execution has no bounded scheduling ancestry")
 
     def scheduling_roots(self, owner: str) -> dict[str, int]:
+        """Open roots and their priority: the durable, monotonic acceptance order."""
         with self.workspace.locked() as db:
             return {
-                row["request"]: row["accepted_ms"]
+                row["request"]: row["rowid"]
                 for row in db.execute(
-                    "SELECT e.request,e.accepted_ms FROM executions e WHERE e.owner=? "
-                    "AND e.desired='run' AND e.state IN ('queued','running','retrying') "
+                    "SELECT e.rowid,e.request FROM executions e WHERE e.owner=? "
+                    "AND e.desired='run' AND e.state IN ('queued','running') "
                     "AND NOT EXISTS(SELECT 1 FROM execution_calls c "
                     "WHERE c.owner=e.owner AND c.child_request=e.request)",
                     (owner,),
                 )
             }
 
-    def scheduling_history(self, owner: str) -> list[tuple[str, bytes]]:
-        """Recover GPU groups from retained child preparation, without another journal."""
-        with self.workspace.locked() as db:
-            return [
-                (row["root"], row["preparation"])
-                for row in db.execute(
-                    "WITH RECURSIVE family(root,request,depth) AS ("
-                    "SELECT e.request,e.request,0 FROM executions e WHERE e.owner=? "
-                    "AND e.desired='run' AND e.state IN ('queued','running','retrying') "
-                    "AND NOT EXISTS(SELECT 1 FROM execution_calls c "
-                    "WHERE c.owner=e.owner AND c.child_request=e.request) UNION ALL "
-                    "SELECT f.root,c.child_request,f.depth+1 FROM family f "
-                    "JOIN execution_calls c ON c.parent_request=f.request AND c.owner=? "
-                    "WHERE f.depth<32) SELECT f.root,e.preparation FROM family f "
-                    "JOIN executions e ON e.owner=? AND e.request=f.request "
-                    "WHERE e.preparation<>x'' ORDER BY e.accepted_ms,e.request",
-                    (owner, owner, owner),
-                )
-            ]
+    def record(self, owner: str, request: str, kind: str, document: dict[str, Any]) -> None:
+        """Journal one bounded worker observation on an execution, terminal or not."""
+        with self.workspace.locked() as db, transaction(db):
+            self._event(db, self._row(db, owner, request), kind, canonical_json.encode(document))
 
     def active(self, owner: str) -> bool:
         with self.workspace.locked() as db:
