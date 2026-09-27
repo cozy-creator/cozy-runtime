@@ -465,13 +465,16 @@ class Model[PipelineT]:
             code="no_load",
         )
 
-    def choose_attention(self, context: AttentionContext) -> str | None:
+    def choose_attention(self, context: AttentionContext) -> str | Sequence[str] | None:
         """Select an eligible backend before warm-up, or retain Runtime's recommendation.
 
         This hook chooses a name, not a kernel implementation or device operation.
-        Explicit choices are validated and never silently replaced. Approximate
-        attention remains the model author's quality decision, independent of FP8
-        checkpoint storage. Developer request overrides take precedence temporarily.
+        A name is an explicit choice: validated and never silently replaced. A sequence
+        of names is a preference: Runtime takes the first one this site, device,
+        environment and numerical probe admit on each rank, records why each earlier
+        one was skipped, and falls back to its recommendation when none serves.
+        Approximate attention remains the model author's quality decision, independent
+        of FP8 checkpoint storage. Developer request overrides take precedence.
         """
         return None
 

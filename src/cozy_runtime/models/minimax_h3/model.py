@@ -6,7 +6,14 @@ import sys
 from collections.abc import Callable
 from typing import Any, Literal
 
-from cozy_runtime.author import Context, Loader, Model, sequence_parallel, uses_components
+from cozy_runtime.author import (
+    AttentionContext,
+    Context,
+    Loader,
+    Model,
+    sequence_parallel,
+    uses_components,
+)
 
 from .continuation import AVContext
 from .official import (
@@ -21,6 +28,12 @@ from .official import (
     build_h3_turbo_lora,
 )
 from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
+
+#: Every H3 DiT's attention preference (Paul, 2026-09-27, h3a-060): Sol's sparse steps, then
+#: SageAttention2 INT8 Q/K + FP8 P/V, then FA3 BF16, then SDPA. FA3 FP8 garbles H3 output
+#: (H100 Ulysses-4 runs 1240-1252) and is never preferred. The VAEs keep Runtime's ranking.
+DIT_ATTENTION: tuple[str, ...] = ("sol-attn", "sageattention", "flash-attn3", "sdpa")
+DIT_COMPONENTS: frozenset[str] = frozenset({"fl2va_dit", "ref2va_dit"})
 
 
 @sequence_parallel(degrees=(2, 4, 7, 8))
@@ -47,6 +60,9 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
 
     def unload(self, loader: Loader) -> None:
         return None
+
+    def choose_attention(self, context: AttentionContext) -> tuple[str, ...] | None:
+        return DIT_ATTENTION if context.component in DIT_COMPONENTS else None
 
     def warm(self, ctx: Context) -> None:
         """One dry DiT forward per entrypoint DiT this device ADMITS, before serving.

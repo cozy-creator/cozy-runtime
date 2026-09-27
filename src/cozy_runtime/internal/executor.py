@@ -2264,6 +2264,9 @@ class Executor:
                                 f"rank 0 built {ours!r}, rank {follower.rank} built {other!r}",
                             )
                         )
+            refused = self._agree_attention(applied)
+            if refused is not None:
+                return refused
         self.facts = {}
         refused = self._install_group(torch, model)
         if refused is not None:
@@ -3181,9 +3184,77 @@ class Executor:
             return None
         return attention.plan(self._attention_device(pin), roots, pin, self.world)
 
+    def _agree_attention(self, applied: attention.Applied) -> dict[str, Any] | None:
+        """THE GROUP SERVES RANK 0'S PREPARED SELECTION. Each rank selected beside rank 0
+        under its own probes, so a follower takes rank 0's per-component kernels before the
+        group installs; one that cannot serve them refuses the group instead of serving a
+        mixed selection that every request would then refuse."""
+        assert self.group is not None
+        chosen = {c: next(iter(k)) for c, k in applied.hosts.items() if len(k) == 1}
+        try:
+            self.group.broadcast(
+                {
+                    "cmd": "attention",
+                    "construction": self.construction,
+                    "model_key": self._group_model_key,
+                    "adopt": chosen,
+                }
+            )
+            replies = self.group.collect("attention")
+        except GroupRefusal as exc:
+            return self._group_refusal(exc)
+        for follower, reply in zip(self.group.followers, replies, strict=True):
+            if not reply.get("ok") or reply.get("hosts") != applied.hosts:
+                return self._group_refusal(
+                    RankDivergence(
+                        follower.rank,
+                        "attention",
+                        f"rank 0 prepared {applied.hosts}, rank {follower.rank} holds "
+                        f"{reply.get('hosts')} {reply.get('code', '')} {reply.get('detail', '')}",
+                    )
+                )
+        return None
+
+    def _adopt_attention(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        """A follower's half of `_agree_attention`: take rank 0's kernel per component as
+        this construction's prepared selection."""
+        container = self.constructions.get(str(command.get("construction") or ""))
+        members = (container.model_executors or [container]) if container is not None else []
+        target = next((m for m in members if m._group_model_key == command.get("model_key")), None)
+        if self.rank == 0 or target is None or target.backend is None:
+            return {"ok": False, "code": "rank_divergence", "detail": "no such construction"}
+        roots = {**target.backend.components, **target.backend.parked}
+        held = attention.observed(roots).hosts
+        try:
+            for component, name in sorted(dict(command["adopt"]).items()):
+                if set(held.get(component) or ()) == {name}:
+                    continue
+                if component not in roots or target.device_facts is None:
+                    raise attention.AttentionRefusal(
+                        "attention_kernel_unsupported", f"rank {self.rank} holds no {component}"
+                    )
+                attention.plan(
+                    target.device_facts, {component: roots[component]}, name, self.world
+                ).apply()
+                print(
+                    f"[attention] rank {self.rank} {component}: took rank 0's {name} over "
+                    f"its own {sorted(held.get(component) or ())}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except attention.AttentionRefusal as exc:
+            return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "rank": self.rank}
+        target.attention_defaults = attention.snapshot(roots)
+        hosts = attention.observed(roots).hosts
+        if target.attention is not None:
+            target.attention = replace(target.attention, hosts=hosts)
+        return {"ok": True, "rank": self.rank, "hosts": hosts}
+
     def select_attention(self, command: dict[str, Any]) -> dict[str, Any]:
         """A FOLLOWER restores its prepared selection and, given rank 0's `pin` for the next
         attempt (empty is the prepared one), holds it and answers what its sites now hold."""
+        if "adopt" in command:
+            return self._adopt_attention(command)
         self._attention_hold.close()
         if "pin" not in command:
             return {"ok": True, "rank": self.rank}
