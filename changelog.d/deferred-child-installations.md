@@ -1,0 +1,1 @@
+Install a published callee on its first selection when the capture lists it as a deferred installation (workspace `deferred_installations`): acceptance no longer waits for every callee, unselected callees are never installed, and a failed install fails only that child call. Vendors worker-protocol 6b627c6.

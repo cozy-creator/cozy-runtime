@@ -1836,17 +1836,31 @@ class Worker:
         root = self.executions.capture_root(owner, attempt.request_id)
         capture = self.executions.capture(owner, root)
         prepared = self.executions.preparation(owner, root)["installations"]
+        from cozy_runtime.internal import package_interface
+
+        from . import machine_child_target, machine_deferred
+
+        deferred = machine_deferred.rows(capture)
+        callers = {
+            attempt.job.installation_id,
+            machine_child_target._deferred_key(self, attempt.job.installation_id),
+        }
         rows = []
         described_modules: set[tuple[str, str]] = set()
         for binding in capture.get("bindings", []):
-            if binding["caller_installation_id"] != attempt.job.installation_id:
+            if (
+                binding.get("caller_installation_id") or binding.get("caller_deferred_key")
+            ) not in callers:
                 continue
-            identifier = binding["callee_installation_id"]
-            placement = prepared[identifier]["placement"]
-            raw = base64.b64decode(placement["package_interface"], validate=True)
-            from cozy_runtime.internal import package_interface
-
-            body = package_interface.read_bytes(raw)
+            identifier = binding.get("callee_installation_id") or binding.get(
+                "callee_deferred_key", ""
+            )
+            if identifier in deferred:
+                body = machine_deferred.interface(deferred[identifier])
+            else:
+                placement = prepared[identifier]["placement"]
+                raw = base64.b64decode(placement["package_interface"], validate=True)
+                body = package_interface.read_bytes(raw)
             kind = (
                 "job"
                 if any(row["name"] == binding["entrypoint"] for row in body["jobs"])

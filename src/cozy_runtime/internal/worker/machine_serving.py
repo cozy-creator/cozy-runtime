@@ -24,6 +24,7 @@ from cozy_runtime.protocol import worker_pb2 as pb
 
 from . import (
     grants,
+    machine_builtin,
     machine_byte_inputs,
     machine_byte_results,
     machine_capture,
@@ -155,9 +156,12 @@ class Serving:
     def prefetch(self, parent: AttemptRecord, frame: Mapping[str, Any]) -> dict[str, Any]:
         """A model-only hint; never accepts a child execution or chooses a GPU lane."""
         owner = self.worker.fence.record_owner_id
-        target = machine_child_target.resolve_export(
-            self.worker, parent, str(frame.get("module", "")), str(frame.get("export", ""))
-        )
+        try:
+            target = machine_child_target.resolve_export(
+                self.worker, parent, str(frame.get("module", "")), str(frame.get("export", ""))
+            )
+        except machine_builtin.Preparing:
+            return {"ok": True, "scheduled": False}  # the callee installs on its call
         if target.binding is not None:
             raise WorkspaceRefusal("model prefetch requires a serving callable")
         raw = frame.get("payload")

@@ -15,7 +15,7 @@ from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
-from . import machine_model_defaults
+from . import machine_deferred, machine_model_defaults
 
 if TYPE_CHECKING:
     from .session import Worker
@@ -68,13 +68,16 @@ def verify(worker: Worker, request: pb.MachineExecutionSubmit) -> bytes:
         prepared[identifier] = {"placement": selected.document, "installation_id": identifier}
     if root not in prepared:
         raise WorkspaceRefusal("execution capture root is not installed")
+    deferred = machine_deferred.rows(capture)
+    for key, row in deferred.items():
+        interfaces[key] = machine_deferred.interface(row)
     targets: dict[tuple[str, str, str], tuple[str, str]] = {}
     for binding in capture.get("bindings", []):
-        fields = {"caller_installation_id", "callee_installation_id", "module", "export"}
-        if not isinstance(binding, dict) or not {*fields, "entrypoint"} <= set(binding):
+        if not isinstance(binding, dict) or not {"module", "export", "entrypoint"} <= set(binding):
             raise WorkspaceRefusal("execution callable binding has invalid fields")
-        caller, callee = binding["caller_installation_id"], binding["callee_installation_id"]
-        if caller not in prepared or callee not in prepared:
+        caller = binding.get("caller_installation_id") or binding.get("caller_deferred_key", "")
+        callee = binding.get("callee_installation_id") or binding.get("callee_deferred_key", "")
+        if caller not in interfaces or callee not in interfaces:
             raise WorkspaceRefusal("execution callable names an uninstalled package")
         target = binding["module"], binding["export"]
         # A repeated identical binding is one binding; one import bound two ways is ambiguous.

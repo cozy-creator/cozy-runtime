@@ -40,8 +40,10 @@ class Calls:
 
         self.serving = Serving(worker)
         from .machine_builtin import Builtins
+        from .machine_deferred import Deferred
 
         self.builtins = Builtins(worker)
+        self.deferred = Deferred(worker)
 
     def close(self) -> None:
         self.builtins.close()
