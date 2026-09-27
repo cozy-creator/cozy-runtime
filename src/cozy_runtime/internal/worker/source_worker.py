@@ -12,6 +12,7 @@ import hashlib
 import os
 import sys
 import threading
+import traceback
 from typing import Any
 
 from cozy_runtime import canonical_json
@@ -277,7 +278,9 @@ def main() -> None:
         threading.Thread(target=parent_lifetime, daemon=True, name="source-parent").start()
         result = {"ok": True, **execute(command)}
     except Exception as exc:
-        # Exception text may include an input URL. Only the fixed native code leaves.
+        # Only the fixed code is the result. The parent redacts this stderr tail into the
+        # failure's diagnosis, never into the result.
+        traceback.print_exc()
         code = getattr(exc, "code", "native_source_failed")
         result = {"ok": False, "code": code if isinstance(code, str) else "native_source_failed"}
     body = canonical_json.encode(result)

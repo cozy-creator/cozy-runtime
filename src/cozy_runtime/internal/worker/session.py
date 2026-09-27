@@ -3523,7 +3523,7 @@ class Worker:
         return epoch, outbound
 
     def mark_claim_ready(self) -> None:
-        """Open Claim only after fixed-host listener proof and readiness publication."""
+        """Open Claim after fixed-host listener proof, before readiness publication."""
 
         self._publish_restart_fact("restart-capability.json", {"supports_guarded_restart": True})
         self.claim_ready.set()

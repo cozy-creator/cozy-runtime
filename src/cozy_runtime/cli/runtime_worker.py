@@ -184,8 +184,9 @@ def _run(
             media_internal_port=config.media_internal_port,
             gpus=gpus,
         )
-        readiness.publish(layout.readiness_payload, payload, owner=identity.host_owner)
+        # Claims open before the payload that tells a claimant to claim.
         worker.mark_claim_ready()
+        readiness.publish(layout.readiness_payload, payload, owner=identity.host_owner)
 
     host.on_bound = ready
 
