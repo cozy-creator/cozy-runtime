@@ -6145,9 +6145,9 @@ class Worker:
         # This evicts nothing, so it runs before the arbitration below rather than instead
         # of it: what it cannot restore, `_make_room` is still free to make room for.
         self._restore_residency(lane, tenant, row, why, declared, attempt.prepared)
-        # THEN, THE RETRY RULE. A retry under the residency picture that already produced a
-        # device OOM is the same request asked twice and cannot get a different answer.
-        self._break_oom_repeat(lane, tenant, row, fits, why)
+        # THEN, THE RETRY RULE. The same invocation under the residency picture that already
+        # produced its device OOM cannot get a different answer. Any other request can.
+        self._break_oom_repeat(lane, tenant, row, attempt.digest, cell, why)
         self._make_room(lane, tenant, fits, why)
 
     def _restore_residency(
@@ -6274,7 +6274,8 @@ class Worker:
         lane: DeviceLane,
         slot: str,
         row: LaneRow,
-        fits: Callable[[accel.DeviceMemory], bool],
+        invocation: bytes,
+        cell: str,
         why: str,
     ) -> None:
         """A RETRY MUST BE A DIFFERENT REQUEST, or it must refuse (cr-097).
@@ -6287,34 +6288,39 @@ class Worker:
         until the requeue budget ran out. Roughly two and a half minutes of paid GPU to
         prove the same thing four times.
 
-        So when this tenant's last attempt died on the device and the lane looks exactly as
-        it did then, the co-tenants vacate — LRU-first, the ordinary arbitration, just with
-        a demand the chooser's own `fits` is not allowed to talk it out of. If nothing can
-        be freed, the picture cannot change and the attempt refuses TYPED and quantified
+        So when THIS invocation already died on the device and the lane looks exactly as it
+        did then, the co-tenants vacate — LRU-first, the ordinary arbitration, just with a
+        demand the chooser's own `fits` is not allowed to talk it out of. If nothing can be
+        freed, the picture cannot change and the attempt refuses TYPED and quantified
         instead of spending the handler to rediscover the allocator.
+
+        The memory is per invocation, never per placement (cr-190): one oversized request
+        is not evidence about a different, smaller one.
         """
-        if not row.oom_signature or row.oom_signature != lane.residency_signature():
+        signature = row.oom_signatures.get(invocation, "")
+        if not signature or signature != lane.residency_signature():
             return
         self.note(
             "residency",
-            f"{lane.lane_id}: {slot!r} last died on the device under this exact residency "
-            f"({row.oom_signature}); making room before {why} rather than repeating it",
+            f"{lane.lane_id}: {slot!r} already died on the device for this invocation under "
+            f"this exact residency ({signature}); making room before {why} rather than "
+            "repeating it",
         )
-        # `fits` deliberately ignored: it is what admitted the attempt that OOMed.
+        # Never the chooser's `fits`: its verdict is what admitted the attempt that OOMed.
         self._make_room(lane, slot, lambda _memory: False, f"{why} after a device OOM")
-        if row.oom_signature != lane.residency_signature():
-            row.oom_signature = ""
+        if signature != lane.residency_signature():
+            row.oom_signatures.pop(invocation, None)
             return
         kind = accel.host_backend_family()
         memory = lane.memory(kind)
-        floor = max(row.ledger.carried_shortfall_by_cell.values(), default=0)
+        floor = row.ledger.carried_shortfall_by_cell.get(cell, 0)
         raise AttemptRefusal(
             "device_shortfall",
-            f"an attempt for this placement already failed on the device with "
-            f"{floor} B free on {lane.lane_id}, no co-tenant holds bytes that could be "
-            f"given back, and the lane is unchanged ({row.oom_signature}). Retrying would "
-            f"run the same request against the same device and reach the same allocator; "
-            f"the driver reports {memory.free_bytes} B free",
+            f"this exact invocation already failed on the device with {floor} B free on "
+            f"{lane.lane_id}, no co-tenant holds bytes that could be given back, and the "
+            f"lane is unchanged ({signature}). Retrying would run the same request against "
+            f"the same device and reach the same allocator; the driver reports "
+            f"{memory.free_bytes} B free",
             cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE,
             origin=ORIGIN.CAUSE_ORIGIN_RUNTIME,
         )
@@ -7121,11 +7127,18 @@ class Worker:
         if row is None:
             return
         if str(outcome.get("terminal", "")) == "succeeded":
-            # A serve got through under this picture, so nothing about it is a trap.
-            row.oom_signature = ""
+            # This invocation got through, so its earlier OOM is no longer a trap.
+            row.oom_signatures.pop(attempt.digest, None)
             return
         if str(outcome.get("code", "")) in DEVICE_SHORTFALL_CODES:
-            row.oom_signature = lane.residency_signature()
+            signature = lane.residency_signature()
+            # An entry under another picture describes a lane that no longer exists.
+            row.oom_signatures = {
+                invocation: seen
+                for invocation, seen in row.oom_signatures.items()
+                if seen == signature
+            }
+            row.oom_signatures[attempt.digest] = signature
 
     def finish(self, released: Released) -> None:
         """POST PHASE -> OUTCOME -> SEND, on the lane's post thread.

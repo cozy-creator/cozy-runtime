@@ -497,7 +497,11 @@ class TwoTenantOwner(LocalRecordOwner):
 
 
 def _drive(
-    store: TenantStore, turns: list[Turn], root: Path, package: Path = PACKAGE
+    store: TenantStore,
+    turns: list[Turn],
+    root: Path,
+    package: Path = PACKAGE,
+    owner_type: type[TwoTenantOwner] = TwoTenantOwner,
 ) -> tuple[TwoTenantOwner, Worker, list[tuple[str, str]]]:
     """Two placements of `corpus/tenant` on the one-card worker, `turns` dispatched in order."""
     config = _config(root / "home")
@@ -523,7 +527,7 @@ def _drive(
         placement.placement_id = placement_id
         placements.append(placement)
     holder: list[Worker] = []
-    owner = TwoTenantOwner(
+    owner = owner_type(
         turns,
         dict(staged.bindings),
         workspace,
