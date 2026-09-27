@@ -694,6 +694,10 @@ def read_input(
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def _cause(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"[:300]
+
+
 def hydrate_inputs(
     grant: BoundGrant,
     auth: Authorizer,
@@ -813,7 +817,8 @@ def hydrate_inputs(
                             raise
                         except Exception as exc:
                             raise GrantRefusal(
-                                "grant_native_unavailable", "native input bytes are unavailable"
+                                "grant_native_unavailable",
+                                f"native input bytes are unavailable: {_cause(exc)}",
                             ) from exc
                 declared = normalize(entry.kind_mime)
                 actual = sniff(receipt.prefix)
@@ -918,7 +923,7 @@ def read_trees(
             except Exception as exc:
                 byte_inputs.remove_checkout(root)
                 raise GrantRefusal(
-                    "grant_native_unavailable", "native tree bytes are unavailable"
+                    "grant_native_unavailable", f"native tree bytes are unavailable: {_cause(exc)}"
                 ) from exc
             out[ref] = (root, "sha256:" + entry.digest.hex())
             continue
