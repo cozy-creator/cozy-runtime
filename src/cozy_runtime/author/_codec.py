@@ -729,9 +729,11 @@ class StreamingMP4Encoder:
 
 
 def probe_mp4(path: Path) -> EncodedVideoFacts:
-    """Stream-probe the final bytes; no decoded frame or PCM timeline is retained."""
-    from cozy_runtime.author._decode import _valid_audio_samples
+    """Read the final bytes' container facts: stream headers and packet clocks.
 
+    No picture or PCM is decoded: this process encoded those packets, and a second decode
+    would only prove the codec agrees with itself.
+    """
     av = _av()
     with av.open(str(path), "r") as container:
         videos = list(container.streams.video)
@@ -744,58 +746,40 @@ def probe_mp4(path: Path) -> EncodedVideoFacts:
         video = videos[0]
         width = int(video.codec_context.width or 0)
         height = int(video.codec_context.height or 0)
-        frame_rate = Fraction(0)
-        video_frames = 0
-        prior_video_time: Fraction | None = None
-        video_step: Fraction | None = None
-        color_facts: tuple[int, int, int, int] | None = None
-        audio_samples = 0
-        selected = (video, *audios)
-        for packet in container.demux(*selected):
-            for frame in packet.decode():
-                if packet.stream.index == video.index:
-                    video_frames += 1
-                    if int(frame.width) != width or int(frame.height) != height:
-                        raise OutputError(
-                            "encoded video geometry changes during probe", code="output_probe"
-                        )
-                    frame_color = (
-                        int(frame.color_primaries),
-                        int(frame.color_trc),
-                        int(frame.colorspace),
-                        int(frame.color_range),
-                    )
-                    if color_facts is None:
-                        color_facts = frame_color
-                    elif frame_color != color_facts:
-                        raise OutputError(
-                            "encoded video color facts change during probe", code="output_probe"
-                        )
-                    if frame.pts is None or frame.time_base is None:
-                        raise OutputError(
-                            "encoded video frame has no exact clock", code="output_probe"
-                        )
-                    video_time = int(frame.pts) * Fraction(frame.time_base)
-                    if prior_video_time is not None:
-                        step = video_time - prior_video_time
-                        if step <= 0 or (video_step is not None and step != video_step):
-                            raise OutputError(
-                                f"encoded video frame clock is discontinuous: prior="
-                                f"{prior_video_time} current={video_time} step={step} "
-                                f"expected={video_step}",
-                                code="output_probe",
-                            )
-                        video_step = step
-                    prior_video_time = video_time
-                else:
-                    samples = int(frame.samples or 0)
-                    rate = int(frame.sample_rate or 0)
-                    audio_samples += _valid_audio_samples(frame, samples, rate)
-        if video_step is not None:
-            frame_rate = 1 / video_step
-        elif video.average_rate is not None:
-            frame_rate = Fraction(video.average_rate)
-        if video_frames == 0 or width <= 0 or height <= 0 or frame_rate <= 0 or color_facts is None:
+        times: list[int] = []
+        audio_ticks = 0
+        for packet in container.demux(video, *audios):
+            if packet.size == 0:
+                continue
+            if packet.pts is None:
+                raise OutputError("encoded packet has no exact clock", code="output_probe")
+            if packet.stream.index == video.index:
+                times.append(int(packet.pts))
+            else:
+                # Priming before zero is not audio; the edit list removes it on playback.
+                start = int(packet.pts)
+                audio_ticks += max(0, start + int(packet.duration or 0)) - max(0, start)
+        times.sort()
+        steps = {later - earlier for earlier, later in zip(times, times[1:], strict=False)}
+        if len(steps) > 1 or min(steps, default=1) <= 0:
+            raise OutputError(
+                f"encoded video frame clock is discontinuous: steps={sorted(steps)[:4]}",
+                code="output_probe",
+            )
+        frame_rate = (
+            1 / (steps.pop() * Fraction(video.time_base))
+            if steps
+            else Fraction(video.average_rate or 0)
+        )
+        context = video.codec_context
+        color_facts = (
+            int(context.color_primaries),
+            int(context.color_trc),
+            int(context.colorspace),
+            int(context.color_range),
+        )
+        video_frames = len(times)
+        if video_frames == 0 or width <= 0 or height <= 0 or frame_rate <= 0:
             raise OutputError("encoded MP4 has no valid video clock", code="output_probe")
         audio = audios[0] if audios else None
         pixel_aspect_ratio = Fraction(video.sample_aspect_ratio or 1)
@@ -826,7 +810,11 @@ def probe_mp4(path: Path) -> EncodedVideoFacts:
             audio_frame_samples=int(audio.codec_context.frame_size or 0)
             if audio is not None
             else 0,
-            audio_decoded_samples=audio_samples,
+            audio_decoded_samples=round(
+                audio_ticks * Fraction(audio.time_base) * int(audio.codec_context.sample_rate)
+            )
+            if audio is not None
+            else 0,
             color_primaries=color_facts[0],
             color_transfer=color_facts[1],
             color_matrix=color_facts[2],
